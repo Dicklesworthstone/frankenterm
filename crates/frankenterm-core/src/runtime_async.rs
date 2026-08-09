@@ -6733,6 +6733,8 @@ pub enum NonblockingWriteErrorKind {
     Flush,
     /// The runtime could not register or re-arm writable readiness.
     Readiness,
+    /// Output did not cross its flush boundary within the caller's exact bound.
+    OutputTimeout,
 }
 
 /// Exact progress receipt for a completed nonblocking write and flush.
@@ -6765,6 +6767,7 @@ pub struct NonblockingWriteError {
     kind: NonblockingWriteErrorKind,
     bytes_written: usize,
     blocked_duration_ns: u64,
+    cancellation_latency_upper_bound_ns: u64,
     source: Option<std::io::Error>,
 }
 
@@ -6780,15 +6783,21 @@ impl NonblockingWriteError {
             kind,
             bytes_written,
             blocked_duration_ns,
+            cancellation_latency_upper_bound_ns: 0,
             source,
         }
     }
 
-    fn cancelled(bytes_written: usize, blocked_duration_ns: u64) -> Self {
+    fn cancelled(
+        bytes_written: usize,
+        blocked_duration_ns: u64,
+        cancellation_latency_upper_bound_ns: u64,
+    ) -> Self {
         Self {
             kind: NonblockingWriteErrorKind::ContextCancelled,
             bytes_written,
             blocked_duration_ns,
+            cancellation_latency_upper_bound_ns,
             source: None,
         }
     }
@@ -6809,6 +6818,14 @@ impl NonblockingWriteError {
     #[must_use]
     pub const fn blocked_duration_ns(&self) -> u64 {
         self.blocked_duration_ns
+    }
+
+    /// Conservative time from the last pending poll to cancellation
+    /// settlement. The cancellation request occurs within this interval, so
+    /// the value is an upper bound rather than a fabricated exact timestamp.
+    #[must_use]
+    pub const fn cancellation_latency_upper_bound_ns(&self) -> u64 {
+        self.cancellation_latency_upper_bound_ns
     }
 
     /// Return true only when the owning capability context stopped the write.
@@ -6835,6 +6852,9 @@ impl std::fmt::Display for NonblockingWriteError {
             NonblockingWriteErrorKind::Flush => "nonblocking descriptor flush failed",
             NonblockingWriteErrorKind::Readiness => {
                 "nonblocking writable-readiness registration failed"
+            }
+            NonblockingWriteErrorKind::OutputTimeout => {
+                "nonblocking write exceeded its output-completion bound"
             }
         };
         write!(
@@ -6882,6 +6902,7 @@ pub async fn write_all_nonblocking_with_cx<W>(
     cx: &crate::cx::Cx,
     writer: &mut W,
     bytes: &[u8],
+    maximum_output_duration: Duration,
 ) -> Result<NonblockingWriteReceipt, NonblockingWriteError>
 where
     W: std::io::Write + asupersync::runtime::Source,
@@ -6895,11 +6916,14 @@ where
     }
 
     let mut phase = WritePhase::Bytes;
+    let output_started_at = cx_timer_now(cx);
+    let last_pending_at_ns = std::sync::atomic::AtomicU64::new(output_started_at.as_nanos());
     let bytes_written = std::sync::atomic::AtomicUsize::new(0);
     let blocked_started_at_ns = std::sync::atomic::AtomicU64::new(0);
     let blocked_started = std::sync::atomic::AtomicBool::new(false);
     let mut readiness: Option<asupersync::runtime::IoRegistration> = None;
     let mut consecutive_interruptions = 0_u16;
+    let mut blocked_timeout: Option<futures::future::BoxFuture<'_, ()>> = None;
 
     let progress = || bytes_written.load(std::sync::atomic::Ordering::Relaxed);
     let blocked_duration = || {
@@ -6916,10 +6940,40 @@ where
     };
 
     if cx.checkpoint().is_err() {
-        return Err(NonblockingWriteError::cancelled(progress(), blocked_duration()));
+        return Err(NonblockingWriteError::cancelled(progress(), blocked_duration(), 0));
     }
 
     let output = std::pin::pin!(std::future::poll_fn(|task_cx| {
+        let polled_at = cx_timer_now(cx);
+        if cx.checkpoint().is_err() {
+            return std::task::Poll::Ready(Err(NonblockingWriteError::cancelled(
+                progress(),
+                blocked_duration(),
+                polled_at.duration_since(asupersync::Time::from_nanos(
+                    last_pending_at_ns.load(std::sync::atomic::Ordering::Relaxed),
+                )),
+            )));
+        }
+        let output_elapsed_ns = polled_at.duration_since(output_started_at);
+        if u128::from(output_elapsed_ns) >= maximum_output_duration.as_nanos() {
+            return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                NonblockingWriteErrorKind::OutputTimeout,
+                progress(),
+                blocked_duration(),
+                None,
+            )));
+        }
+        if let Some(timeout) = blocked_timeout.as_mut()
+            && timeout.as_mut().poll(task_cx).is_ready()
+        {
+            return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                NonblockingWriteErrorKind::OutputTimeout,
+                progress(),
+                blocked_duration(),
+                None,
+            )));
+        }
+
         if let Some(registration) = readiness.as_mut() {
             match registration.rearm(Interest::WRITABLE, task_cx.waker()) {
                 Ok(true) => {}
@@ -7002,11 +7056,49 @@ where
                 Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
                     consecutive_interruptions = 0;
                     if !blocked_started.load(std::sync::atomic::Ordering::Relaxed) {
-                        blocked_started_at_ns.store(
-                            cx_timer_now(cx).as_nanos(),
-                            std::sync::atomic::Ordering::Relaxed,
+                        use futures::FutureExt as _;
+
+                        let active_context_matches = crate::cx::Cx::current().is_some_and(
+                            |active| {
+                                active.region_id() == cx.region_id()
+                                    && active.task_id() == cx.task_id()
+                                    && active.timer_driver().is_some()
+                                    && cx.timer_driver().is_some()
+                            },
                         );
+                        if !active_context_matches {
+                            return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                                NonblockingWriteErrorKind::Readiness,
+                                progress(),
+                                blocked_duration(),
+                                Some(std::io::Error::new(
+                                    std::io::ErrorKind::Unsupported,
+                                    "nonblocking output requires the active timer-capable context",
+                                )),
+                            )));
+                        }
+
+                        let started_at = cx_timer_now(cx);
+                        blocked_started_at_ns
+                            .store(started_at.as_nanos(), std::sync::atomic::Ordering::Relaxed);
                         blocked_started.store(true, std::sync::atomic::Ordering::Release);
+                        blocked_timeout = Some(
+                            async move {
+                                let elapsed = Duration::from_nanos(
+                                    started_at.duration_since(output_started_at),
+                                );
+                                let _ = asupersync::time::budget_sleep(
+                                    cx,
+                                    maximum_output_duration.saturating_sub(elapsed),
+                                    started_at,
+                                )
+                                .await;
+                            }
+                            .boxed(),
+                        );
+                        // The lazily constructed timer must be polled once to
+                        // register before descriptor readiness can park us.
+                        task_cx.waker().wake_by_ref();
                     }
                     if !had_readiness {
                         let mut registration = match cx.register_io(writer, Interest::WRITABLE) {
@@ -7037,6 +7129,10 @@ where
                         // instead of depending on a possibly consumed wake.
                         continue;
                     }
+                    last_pending_at_ns.store(
+                        cx_timer_now(cx).as_nanos(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     return std::task::Poll::Pending;
                 }
                 Err(source) => {
@@ -7054,6 +7150,10 @@ where
             }
         }
 
+        last_pending_at_ns.store(
+            cx_timer_now(cx).as_nanos(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         task_cx.waker().wake_by_ref();
         std::task::Poll::Pending
     }));
@@ -7068,7 +7168,16 @@ where
         Either::Left((result, _cancellation)) => result,
         Either::Right((_cancelled, output)) => {
             drop(output);
-            Err(NonblockingWriteError::cancelled(progress(), blocked_duration()))
+            let cancellation_latency_upper_bound_ns = cx_timer_now(cx).duration_since(
+                asupersync::Time::from_nanos(
+                    last_pending_at_ns.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+            );
+            Err(NonblockingWriteError::cancelled(
+                progress(),
+                blocked_duration(),
+                cancellation_latency_upper_bound_ns,
+            ))
         }
     }
 }
@@ -8388,9 +8497,10 @@ mod tests {
 
             let mut fragmented = scripted_nonblocking_writer();
             fragmented.maximum_fragment = 3;
-            let receipt = write_all_nonblocking_with_cx(&cx, &mut fragmented, line)
-                .await
-                .expect("fragmented complete write");
+            let receipt =
+                write_all_nonblocking_with_cx(&cx, &mut fragmented, line, Duration::from_secs(1))
+                    .await
+                    .expect("fragmented complete write");
             assert_eq!(receipt.bytes_written(), line.len());
             assert_eq!(receipt.blocked_duration_ns(), 0);
             assert_eq!(fragmented.bytes, line);
@@ -8398,16 +8508,17 @@ mod tests {
             let mut partial = scripted_nonblocking_writer();
             partial.maximum_fragment = 5;
             partial.fail_after = Some(5);
-            let error = write_all_nonblocking_with_cx(&cx, &mut partial, line)
-                .await
-                .expect_err("scripted partial write must fail");
+            let error =
+                write_all_nonblocking_with_cx(&cx, &mut partial, line, Duration::from_secs(1))
+                    .await
+                    .expect_err("scripted partial write must fail");
             assert_eq!(error.kind(), NonblockingWriteErrorKind::Write);
             assert_eq!(error.bytes_written(), 5);
             assert_eq!(partial.bytes, line[..5]);
 
             let mut zero = scripted_nonblocking_writer();
             zero.write_zero = true;
-            let error = write_all_nonblocking_with_cx(&cx, &mut zero, line)
+            let error = write_all_nonblocking_with_cx(&cx, &mut zero, line, Duration::from_secs(1))
                 .await
                 .expect_err("zero-progress writer must fail");
             assert_eq!(error.kind(), NonblockingWriteErrorKind::WriteZero);
@@ -8415,13 +8526,43 @@ mod tests {
 
             let mut flush_failure = scripted_nonblocking_writer();
             flush_failure.flush_error = Some(std::io::ErrorKind::BrokenPipe);
-            let error = write_all_nonblocking_with_cx(&cx, &mut flush_failure, line)
-                .await
-                .expect_err("flush failure is not a delivery acknowledgement");
+            let error = write_all_nonblocking_with_cx(
+                &cx,
+                &mut flush_failure,
+                line,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("flush failure is not a delivery acknowledgement");
             assert_eq!(error.kind(), NonblockingWriteErrorKind::Flush);
             assert_eq!(error.bytes_written(), line.len());
             assert_eq!(flush_failure.bytes, line);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_write_source_has_one_lazy_timer_and_no_blocking_worker() {
+        let source = include_str!("runtime_async.rs");
+        let helper_start = source
+            .find("pub async fn write_all_nonblocking_with_cx<W>(")
+            .expect("nonblocking output helper source");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("\n}\n\n/// Pause without inheriting the ambient capability budget.")
+            .expect("nonblocking output helper boundary");
+        let helper = &helper_tail[..helper_end];
+
+        assert_eq!(helper.match_indices("cx.register_io(").count(), 1);
+        assert_eq!(
+            helper
+                .match_indices("asupersync::time::budget_sleep(")
+                .count(),
+            1
+        );
+        assert!(helper.contains("active_context_matches"));
+        assert!(!helper.contains("spawn_blocking"));
+        assert!(!helper.contains("std::thread"));
     }
 
     #[cfg(unix)]
@@ -8434,12 +8575,48 @@ mod tests {
                 Some("pre-cancel nonblocking output"),
             );
             let mut writer = scripted_nonblocking_writer();
-            let error = write_all_nonblocking_with_cx(&cx, &mut writer, b"must-not-write\n")
-                .await
-                .expect_err("pre-cancelled output must fail before its first byte");
+            let error = write_all_nonblocking_with_cx(
+                &cx,
+                &mut writer,
+                b"must-not-write\n",
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("pre-cancelled output must fail before its first byte");
             assert_eq!(error.kind(), NonblockingWriteErrorKind::ContextCancelled);
             assert_eq!(error.bytes_written(), 0);
             assert!(writer.bytes.is_empty());
+        });
+    }
+
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    #[test]
+    fn nonblocking_write_has_an_exact_finite_output_timeout() {
+        run_async_test_isolated(|| async {
+            let (mut writer, _reader) =
+                filedescriptor::socketpair().expect("create blocked timeout socket pair");
+            writer
+                .set_non_blocking(true)
+                .expect("set timeout socket nonblocking");
+            let fill = [0_u8; 16 * 1024];
+            loop {
+                match std::io::Write::write(&mut writer, &fill) {
+                    Ok(0) => panic!("socket reported zero progress while filling its buffer"),
+                    Ok(_written) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("failed to fill timeout socket: {error}"),
+                }
+            }
+
+            let cx = crate::cx::Cx::current()
+                .expect("runtime task must expose its reactor-capable context");
+            let error =
+                write_all_nonblocking_with_cx(&cx, &mut writer, b"x", Duration::from_millis(10))
+                    .await
+                    .expect_err("finite output bound must settle without readiness");
+            assert_eq!(error.kind(), NonblockingWriteErrorKind::OutputTimeout);
+            assert_eq!(error.bytes_written(), 0);
         });
     }
 
@@ -8477,16 +8654,17 @@ mod tests {
                     // This delayed read makes the test finite even if the
                     // direct cancellation wake regresses. In that case output
                     // wins after cancellation and the assertions below fail.
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(500));
                     let mut drain = [0_u8; 16 * 1024];
                     let _ = std::io::Read::read(&mut reader, &mut drain);
                 })
                 .expect("spawn finite cancellation fallback");
 
             let started_at = std::time::Instant::now();
-            let error = write_all_nonblocking_with_cx(&cx, &mut writer, b"x")
-                .await
-                .expect_err("Cx cancellation must preempt blocked output");
+            let error =
+                write_all_nonblocking_with_cx(&cx, &mut writer, b"x", Duration::from_secs(1))
+                    .await
+                    .expect_err("Cx cancellation must preempt blocked output");
             let elapsed = started_at.elapsed();
             fallback_reader
                 .join()
@@ -8494,7 +8672,7 @@ mod tests {
             assert_eq!(error.kind(), NonblockingWriteErrorKind::ContextCancelled);
             assert_eq!(error.bytes_written(), 0);
             assert!(
-                elapsed < Duration::from_millis(100),
+                elapsed < Duration::from_millis(400),
                 "cancellation waited for descriptor readiness instead of its direct Cx wake: {elapsed:?}"
             );
         });

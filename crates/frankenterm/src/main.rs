@@ -27098,6 +27098,7 @@ const WATCH_EVENTS_CLAIM_STATUS: &str = "claimed";
 const WATCH_EVENTS_CLAIM_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
+const WATCH_EVENTS_CLAIM_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const WATCH_EVENTS_BATCH_LIMIT_MAX: usize = 1_000;
 const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=1000";
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
@@ -27585,6 +27586,7 @@ struct WatchClaimOutputMetrics {
     expiry_recoveries: u64,
     descriptor_restore_failures: u64,
     max_blocked_duration_ns: u64,
+    max_cancellation_latency_upper_bound_ns: u64,
     cancellation_poll_interval_ns: u64,
 }
 
@@ -27602,6 +27604,7 @@ struct WatchClaimOutputCoordinator {
     expiry_recoveries: std::sync::atomic::AtomicU64,
     descriptor_restore_failures: std::sync::atomic::AtomicU64,
     max_blocked_duration_ns: std::sync::atomic::AtomicU64,
+    max_cancellation_latency_upper_bound_ns: std::sync::atomic::AtomicU64,
 }
 
 impl WatchClaimOutputCoordinator {
@@ -27620,6 +27623,7 @@ impl WatchClaimOutputCoordinator {
             expiry_recoveries: std::sync::atomic::AtomicU64::new(0),
             descriptor_restore_failures: std::sync::atomic::AtomicU64::new(0),
             max_blocked_duration_ns: std::sync::atomic::AtomicU64::new(0),
+            max_cancellation_latency_upper_bound_ns: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -27655,11 +27659,15 @@ impl WatchClaimOutputCoordinator {
         self.queued_bytes
             .store(queued_bytes, std::sync::atomic::Ordering::Release);
         saturating_increment_watch_counter(&self.admissions);
+        let (completion_sender, completion_receiver) = std::sync::mpsc::sync_channel(1);
         Ok(WatchClaimOutputAdmission {
             service: self,
             event_id,
             cursor_generation,
             lease: None,
+            completion_sender: Some(completion_sender),
+            completion_receiver,
+            completion: None,
             queued_bytes,
         })
     }
@@ -27667,6 +27675,11 @@ impl WatchClaimOutputCoordinator {
     fn record_blocked_duration(&self, blocked_duration_ns: u64) {
         self.max_blocked_duration_ns
             .fetch_max(blocked_duration_ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_cancellation_latency_upper_bound(&self, latency_ns: u64) {
+        self.max_cancellation_latency_upper_bound_ns
+            .fetch_max(latency_ns, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -27705,6 +27718,9 @@ impl WatchClaimOutputCoordinator {
             max_blocked_duration_ns: self
                 .max_blocked_duration_ns
                 .load(std::sync::atomic::Ordering::Relaxed),
+            max_cancellation_latency_upper_bound_ns: self
+                .max_cancellation_latency_upper_bound_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
             // Cancellation registers the task waker directly with Cx. There
             // is no timer-poll slice contributing to cancellation latency.
             cancellation_poll_interval_ns: 0,
@@ -27717,13 +27733,64 @@ struct WatchClaimOutputAdmission {
     event_id: i64,
     cursor_generation: String,
     lease: Option<frankenterm_core::storage::EventDeliveryLease>,
+    completion_sender:
+        Option<std::sync::mpsc::SyncSender<WatchClaimOutputCompletion>>,
+    completion_receiver: std::sync::mpsc::Receiver<WatchClaimOutputCompletion>,
+    completion: Option<WatchClaimOutputCompletion>,
     queued_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchClaimOutputCompletion {
+    ReservationFailed,
+    NotOwned,
+    ReleasedWithoutOutput,
+    SettlementFailedWithoutOutput,
+    Finalized,
+    FinalizationLost,
+    FinalizationFailed,
+    OutputAmbiguous,
+    DescriptorRestoreLost,
 }
 
 impl WatchClaimOutputAdmission {
     fn bind_lease(&mut self, lease: &frankenterm_core::storage::EventDeliveryLease) {
         debug_assert_eq!(self.event_id, lease.event_id());
         self.lease = Some(lease.clone());
+    }
+
+    fn complete(&mut self, completion: WatchClaimOutputCompletion) {
+        debug_assert!(self.completion.is_none());
+        let Some(sender) = self.completion_sender.take() else {
+            tracing::error!(
+                event_id = self.event_id,
+                "watch-events output completion channel was already consumed"
+            );
+            self.completion = Some(completion);
+            return;
+        };
+        let completion = match sender.try_send(completion) {
+            Ok(()) => match self.completion_receiver.try_recv() {
+                Ok(completion) => completion,
+                Err(error) => {
+                    tracing::error!(
+                        event_id = self.event_id,
+                        error = ?error,
+                        "watch-events output completion channel did not return its published result"
+                    );
+                    completion
+                }
+            },
+            Err(std::sync::mpsc::TrySendError::Full(completion))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(completion)) => {
+                tracing::error!(
+                    event_id = self.event_id,
+                    "watch-events output completion channel rejected its sole bounded result"
+                );
+                completion
+            }
+        };
+        self.completion = Some(completion);
     }
 
     fn trace_fields(&self) -> (i64, &str, Option<i64>) {
@@ -27747,6 +27814,10 @@ impl Drop for WatchClaimOutputAdmission {
             .swap(0, std::sync::atomic::Ordering::AcqRel);
         debug_assert_eq!(previous_bytes, self.queued_bytes);
         debug_assert_eq!(previous_records, 1);
+        debug_assert!(
+            self.completion.is_some(),
+            "claimed output admission dropped without a terminal completion"
+        );
     }
 }
 
@@ -27765,6 +27836,7 @@ enum WatchClaimOutputFailureKind {
     Write,
     Flush,
     Readiness,
+    OutputTimeout,
     DescriptorRestore,
 }
 
@@ -27773,6 +27845,7 @@ struct WatchClaimOutputFailure {
     kind: WatchClaimOutputFailureKind,
     bytes_written: usize,
     blocked_duration_ns: u64,
+    cancellation_latency_upper_bound_ns: u64,
     source: Option<std::io::Error>,
 }
 
@@ -27786,6 +27859,7 @@ impl WatchClaimOutputFailure {
                 .as_ref()
                 .map_or(std::io::ErrorKind::Other, std::io::Error::kind),
             WatchClaimOutputFailureKind::Readiness => std::io::ErrorKind::Other,
+            WatchClaimOutputFailureKind::OutputTimeout => std::io::ErrorKind::TimedOut,
             WatchClaimOutputFailureKind::DescriptorRestore => std::io::ErrorKind::Other,
         };
         let message = match self.kind {
@@ -27799,6 +27873,9 @@ impl WatchClaimOutputFailure {
             WatchClaimOutputFailureKind::Flush => "claimed watch output flush failed",
             WatchClaimOutputFailureKind::Readiness => {
                 "claimed watch output readiness registration failed"
+            }
+            WatchClaimOutputFailureKind::OutputTimeout => {
+                "claimed watch output exceeded its completion bound"
             }
             WatchClaimOutputFailureKind::DescriptorRestore => {
                 "claimed watch output descriptor restoration failed"
@@ -27847,6 +27924,7 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                     kind: WatchClaimOutputFailureKind::WriteZero,
                     bytes_written,
                     blocked_duration_ns: 0,
+                    cancellation_latency_upper_bound_ns: 0,
                     source: None,
                 });
             }
@@ -27859,6 +27937,7 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                     kind: WatchClaimOutputFailureKind::Write,
                     bytes_written,
                     blocked_duration_ns: 0,
+                    cancellation_latency_upper_bound_ns: 0,
                     source: Some(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "writer reported progress beyond the supplied buffer",
@@ -27872,6 +27951,7 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written,
                         blocked_duration_ns: 0,
+                        cancellation_latency_upper_bound_ns: 0,
                         source: Some(source),
                     });
                 }
@@ -27881,6 +27961,7 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                     kind: WatchClaimOutputFailureKind::Write,
                     bytes_written,
                     blocked_duration_ns: 0,
+                    cancellation_latency_upper_bound_ns: 0,
                     source: Some(source),
                 });
             }
@@ -27903,6 +27984,7 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                         kind: WatchClaimOutputFailureKind::Flush,
                         bytes_written,
                         blocked_duration_ns: 0,
+                        cancellation_latency_upper_bound_ns: 0,
                         source: Some(source),
                     });
                 }
@@ -27912,6 +27994,7 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                     kind: WatchClaimOutputFailureKind::Flush,
                     bytes_written,
                     blocked_duration_ns: 0,
+                    cancellation_latency_upper_bound_ns: 0,
                     source: Some(source),
                 });
             }
@@ -28005,6 +28088,7 @@ impl WatchClaimStdoutWriter {
             cx,
             &mut self.descriptor.descriptor,
             &line,
+            WATCH_EVENTS_CLAIM_OUTPUT_TIMEOUT,
         )
         .await;
         let restore = self.descriptor.restore();
@@ -28037,6 +28121,9 @@ impl WatchClaimStdoutWriter {
                         NonblockingWriteErrorKind::Flush => WatchClaimOutputFailureKind::Flush,
                         NonblockingWriteErrorKind::Readiness => {
                             WatchClaimOutputFailureKind::Readiness
+                        }
+                        NonblockingWriteErrorKind::OutputTimeout => {
+                            WatchClaimOutputFailureKind::OutputTimeout
                         }
                     }
                 };
@@ -28090,26 +28177,32 @@ where
     let line = serialize_watch_claim_record(&record)?;
     let mut admission =
         WATCH_CLAIM_OUTPUT_COORDINATOR.try_admit(event_id, cursor_generation, line.len())?;
-    let reservation = storage
+    let reservation = match storage
         .reserve_event_delivery_with_cx(cx, event_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
         .await
-        .map_err(|error| {
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            admission.complete(WatchClaimOutputCompletion::ReservationFailed);
             let kind = if watch_core_failure_source(&error) == WatchFailureSource::Cancellation {
                 std::io::ErrorKind::Interrupted
             } else {
                 std::io::ErrorKind::Other
             };
-            std::io::Error::new(
+            return Err(std::io::Error::new(
                 kind,
                 format!("failed to reserve watch event {event_id} for delivery: {error}"),
-            )
-        })?;
+            ));
+        }
+    };
     let lease = match reservation {
         EventDeliveryReservation::Acquired(lease) => lease,
         EventDeliveryReservation::LeasedUntil { expires_at_ms } => {
+            admission.complete(WatchClaimOutputCompletion::NotOwned);
             return Ok(WatchEventClaimDelivery::LeasedUntil { expires_at_ms });
         }
         EventDeliveryReservation::AlreadyHandledOrMissing => {
+            admission.complete(WatchClaimOutputCompletion::NotOwned);
             return Ok(WatchEventClaimDelivery::AlreadyHandledOrMissing);
         }
     };
@@ -28122,16 +28215,19 @@ where
         return match release_watch_claim_bounded(storage, &lease).await {
             Ok(true) => {
                 saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.releases);
+                admission.complete(WatchClaimOutputCompletion::ReleasedWithoutOutput);
                 Err(cancel_error)
             }
             Ok(false) => {
                 saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.stale_tokens);
+                admission.complete(WatchClaimOutputCompletion::SettlementFailedWithoutOutput);
                 Err(cancel_error)
             }
             Err(release_error) => {
                 saturating_increment_watch_counter(
                     &WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries,
                 );
+                admission.complete(WatchClaimOutputCompletion::SettlementFailedWithoutOutput);
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     format!(
@@ -28224,6 +28320,7 @@ where
                 finalized = ?finalized,
                 "watch-events restored durable truth after stdout descriptor restoration failed"
             );
+            admission.complete(WatchClaimOutputCompletion::DescriptorRestoreLost);
             return Ok(WatchEventClaimDelivery::DescriptorRestoreLost {
                 flushed_at: Some(success.flushed_at),
             });
@@ -28233,14 +28330,13 @@ where
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.zero_byte_failures);
             let cancellation_poll_interval_ns = 0_u64;
             let pipe_closed = failure.is_broken_pipe();
-            let descriptor_restore_lost = matches!(
-                failure.kind,
-                WatchClaimOutputFailureKind::DescriptorRestore
-            );
+            let descriptor_restore_lost =
+                matches!(failure.kind, WatchClaimOutputFailureKind::DescriptorRestore);
             let write_error = failure.into_io_error();
             return match release_watch_claim_bounded(storage, &lease).await {
                 Ok(true) => {
                     saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.releases);
+                    admission.complete(WatchClaimOutputCompletion::ReleasedWithoutOutput);
                     if descriptor_restore_lost {
                         Ok(WatchEventClaimDelivery::DescriptorRestoreLost { flushed_at: None })
                     } else if pipe_closed {
@@ -28260,6 +28356,7 @@ where
                         cancellation_poll_interval_ns,
                         "watch-events zero-byte output failure lost delivery-lease ownership before release"
                     );
+                    admission.complete(WatchClaimOutputCompletion::SettlementFailedWithoutOutput);
                     if descriptor_restore_lost {
                         Ok(WatchEventClaimDelivery::DescriptorRestoreLost { flushed_at: None })
                     } else {
@@ -28270,6 +28367,7 @@ where
                     saturating_increment_watch_counter(
                         &WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries,
                     );
+                    admission.complete(WatchClaimOutputCompletion::SettlementFailedWithoutOutput);
                     if descriptor_restore_lost {
                         tracing::error!(
                             event_id = queued_event_id,
@@ -28305,6 +28403,7 @@ where
                 failure_kind = ?failure.kind,
                 "watch-events partial output is ambiguous; stream must stop and lease remains for expiry recovery"
             );
+            admission.complete(WatchClaimOutputCompletion::OutputAmbiguous);
             return Ok(WatchEventClaimDelivery::OutputAmbiguous {
                 bytes_written: failure.bytes_written,
                 lease_expires_at_ms: lease.expires_at_ms(),
@@ -28314,20 +28413,24 @@ where
 
     WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(success.blocked_duration_ns);
 
-    let finalized = finalize_watch_claim_bounded(storage, &lease)
-        .await
-        .map_err(|error| {
-            std::io::Error::other(format!(
+    let finalized = match finalize_watch_claim_bounded(storage, &lease).await {
+        Ok(finalized) => finalized,
+        Err(error) => {
+            admission.complete(WatchClaimOutputCompletion::FinalizationFailed);
+            return Err(std::io::Error::other(format!(
                 "event {event_id} was flushed but delivery finalization failed: {error}"
-            ))
-        })?;
+            )));
+        }
+    };
     Ok(if finalized {
         saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.finalizations);
+        admission.complete(WatchClaimOutputCompletion::Finalized);
         WatchEventClaimDelivery::Delivered {
             flushed_at: success.flushed_at,
         }
     } else {
         saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.stale_tokens);
+        admission.complete(WatchClaimOutputCompletion::FinalizationLost);
         WatchEventClaimDelivery::FinalizationLost {
             flushed_at: success.flushed_at,
         }
@@ -30824,6 +30927,17 @@ mod watch_events_tests {
     }
 
     #[test]
+    fn claimed_output_and_settlement_finish_before_lease_steal_boundary() {
+        let owned_window = WATCH_EVENTS_CLAIM_OUTPUT_TIMEOUT
+            .checked_add(WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT)
+            .expect("claim timing constants must fit Duration");
+        assert!(
+            owned_window < WATCH_EVENTS_CLAIM_LEASE_TTL,
+            "output plus independent settlement needs a safety margin before lease stealing"
+        );
+    }
+
+    #[test]
     fn claimed_delivery_is_flush_before_handle_and_releases_known_failures() {
         let _output_guard = WATCH_CLAIM_OUTPUT_TEST_LOCK
             .lock()
@@ -31296,7 +31410,7 @@ mod watch_events_tests {
 
             let saturated_id = event_ids[11];
             let saturation_before = watch_claim_output_metrics();
-            let occupying_admission = WATCH_CLAIM_OUTPUT_COORDINATOR
+            let mut occupying_admission = WATCH_CLAIM_OUTPUT_COORDINATOR
                 .try_admit(-1, "test-generation".to_string(), 1)
                 .expect("occupy the single output slot");
             let saturated_writer_called =
@@ -31322,6 +31436,7 @@ mod watch_events_tests {
             .expect_err("a full coordinator must reject before durable ownership");
             assert_eq!(saturation_error.kind(), std::io::ErrorKind::WouldBlock);
             assert!(!saturated_writer_called.load(std::sync::atomic::Ordering::SeqCst));
+            occupying_admission.complete(WatchClaimOutputCompletion::NotOwned);
             drop(occupying_admission);
             let byte_saturation = WATCH_CLAIM_OUTPUT_COORDINATOR
                 .try_admit(

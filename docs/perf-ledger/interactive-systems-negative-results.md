@@ -3660,6 +3660,50 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace the bounded one-registration timer only after another Cx-aware design proves prompt cancellation, exact heartbeat/lease/Await boundaries, finite admission and memory, truthful terminal counters, deterministic shutdown and clock behavior, and no per-delay thread or blocking-pool work under strict-remote scale tests.
 
+### IS-N128 — A durable output lease does not make a blocking stdout write safe
+
+- **Classification:** cancellation, bounded-memory, and at-least-once delivery
+  rejection; single-owner nonblocking coordinator retained
+- **Bead:** `ft-7h5da.4.6.1`
+- **Rejected inference:** reserving an event before a synchronous stdout
+  `write` plus `flush`, then releasing the lease on `io::Error`, is sufficient
+  to keep claimed NDJSON delivery cancellation-safe and duplicate-bounded.
+- **Negative evidence:** an undrained pipe can block inside the OS write while
+  the durable lease remains held, so the caller's `Cx`, the five-second
+  compensation window, and the 30-second lease cannot run. The old boolean
+  pipe result also erased byte progress: a broken pipe before byte zero is
+  safely releasable, while a write or flush failure after a prefix is
+  ambiguous and immediate release permits a duplicate suffix after malformed
+  NDJSON. A lease may also become stealable while the original blocking writer
+  is still alive. Neither synchronous syntax nor the lease token bounded
+  memory, thread occupancy, or the unresolved output prefix.
+- **Decision:** serialize and annotate the complete line before durable
+  ownership, admit at most one record and 1 MiB into a process-wide
+  single-owner coordinator, and duplicate stdout under an exact POSIX flag
+  guard. Unix output uses nonblocking writes, one asupersync writable-reactor
+  registration, a direct `Cx` cancellation waker, and a 20-second total output
+  completion bound whose timer is armed lazily only if the descriptor blocks.
+  That leaves five seconds for independent settlement
+  plus a five-second margin before lease stealing. Exact byte receipts permit
+  immediate bounded release only at zero bytes. Any nonzero write/flush,
+  cancellation, timeout, or restoration ambiguity retains the lease for expiry
+  recovery and closes the stream without a later row. Full line plus newline
+  and flush acknowledgement precedes token-matched finalization. Exact
+  descriptor flags are restored on success, error, cancellation, timeout, and
+  Drop; restoration loss always closes the stream even if finalization or
+  compensation also fails. Content-free counters retain queue depth/bytes,
+  admissions/saturation, zero-byte releases, partial ambiguity, expiry
+  recovery, finalization/stale-token outcomes, descriptor restoration failure,
+  blocked duration, and the zero polling interval of direct cancellation.
+  Deterministic source tests cover fragmented/full/zero/partial/flush output,
+  real full-socket cancellation and timeout, coordinator item/byte saturation,
+  stale-token finalization, prefix retention, and explicit/Drop flag
+  restoration. Strict-remote execution remains absent while RCH reports every
+  worker unreachable; no product-path, stdout latency, mux, render, M4/M5, or
+  Threadripper performance claim follows yet.
+- **Primary retry condition:**
+  > Replace the bounded single-owner nonblocking coordinator only after another design proves finite item and byte admission, direct structured cancellation, a pre-steal output deadline, exact byte and flush acknowledgement, zero-byte-only release, partial-prefix expiry recovery, token-matched finalization, no row after ambiguity, exact descriptor restoration, and deterministic saturation, shutdown, stale-token, and real-pipe behavior under strict-remote tests.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
