@@ -6527,28 +6527,32 @@ impl Drop for PersistenceLockTelemetry {
                 .record(released_at.saturating_duration_since(acquired_at));
         }
         if let Some(stats) = self.byte_admission {
-            let as_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
+            // `metrics::Histogram::record` only accepts integer inputs that
+            // convert to f64 without losing precision.  Saturating at u32::MAX
+            // preserves that contract while still making overflow visible as
+            // the largest lossless integer input supported by the API.
+            let as_histogram_count = |value| u32::try_from(value).unwrap_or(u32::MAX);
             metrics::histogram!("window_state.byte_admission.candidates")
-                .record(as_u64(stats.candidate_count));
+                .record(as_histogram_count(stats.candidate_count));
             metrics::histogram!("window_state.byte_admission.leave_one_out_trials")
-                .record(as_u64(stats.leave_one_out_trials));
+                .record(as_histogram_count(stats.leave_one_out_trials));
             metrics::histogram!("window_state.byte_admission.peel_removals")
-                .record(as_u64(stats.peel_removals));
+                .record(as_histogram_count(stats.peel_removals));
             metrics::histogram!("window_state.byte_admission.backfill_queries")
-                .record(as_u64(stats.backfill_queries));
+                .record(as_histogram_count(stats.backfill_queries));
             metrics::histogram!("window_state.byte_admission.backfill_candidate_trials")
-                .record(as_u64(stats.backfill_candidate_trials));
+                .record(as_histogram_count(stats.backfill_candidate_trials));
             metrics::histogram!("window_state.byte_admission.final_rejection_trials")
-                .record(as_u64(stats.final_rejection_trials));
+                .record(as_histogram_count(stats.final_rejection_trials));
             metrics::histogram!("window_state.byte_admission.backfill_index_rebuilds")
-                .record(as_u64(stats.backfill_index_rebuilds));
+                .record(as_histogram_count(stats.backfill_index_rebuilds));
             metrics::histogram!("window_state.byte_admission.backfill_index_entries_peak")
-                .record(as_u64(stats.backfill_index_entries_peak));
+                .record(as_histogram_count(stats.backfill_index_entries_peak));
         }
         if let Some(compacted_tombstones) = self.creation_epoch_compaction {
             metrics::counter!("window_state.creation_epoch.compaction_attempts").increment(1);
             metrics::histogram!("window_state.creation_epoch.compacted_tombstones")
-                .record(u64::try_from(compacted_tombstones).unwrap_or(u64::MAX));
+                .record(u32::try_from(compacted_tombstones).unwrap_or(u32::MAX));
         }
         if self.initial_publish_attempt {
             metrics::counter!("window_state.initial_publish.attempts").increment(1);
@@ -6556,7 +6560,7 @@ impl Drop for PersistenceLockTelemetry {
         if let Some(retired_count) = self.initial_retirement_count {
             metrics::counter!("window_state.initial_publish.attempt_retirements").increment(1);
             metrics::histogram!("window_state.initial_publish.slot_retired_count")
-                .record(retired_count);
+                .record(u32::try_from(retired_count).unwrap_or(u32::MAX));
             if self.initial_retirement_had_valid_encoding {
                 metrics::counter!("window_state.initial_publish.retired_valid_encodings")
                     .increment(1);
