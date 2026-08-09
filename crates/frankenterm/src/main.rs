@@ -30957,7 +30957,7 @@ mod watch_events_tests {
         let _output_guard = WATCH_CLAIM_OUTPUT_TEST_LOCK
             .lock()
             .expect("serialize global claimed-output coordinator tests");
-        let (_directory, database_path, event_ids) = watch_claim_fixture(13);
+        let (_directory, database_path, event_ids) = watch_claim_fixture(14);
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
             let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
@@ -31452,6 +31452,44 @@ mod watch_events_tests {
             );
             assert!(partial_after.max_blocked_duration_ns >= 123);
             assert!(partial_after.max_cancellation_latency_upper_bound_ns >= 42);
+
+            let partial_write_id = event_ids[13];
+            let partial_write = deliver_claimed_watch_event(
+                &cx,
+                &storage,
+                partial_write_id,
+                claimed_ipc_persisted_event(partial_write_id),
+                |_line| {
+                    std::future::ready(WatchClaimOutputAttempt::Failed(
+                        WatchClaimOutputFailure {
+                            kind: WatchClaimOutputFailureKind::Write,
+                            bytes_written: 3,
+                            blocked_duration_ns: 0,
+                            cancellation_latency_upper_bound_ns: 0,
+                            source: Some(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "consumer closed after a three-byte prefix",
+                            )),
+                        },
+                    ))
+                },
+            )
+            .await
+            .expect("partial write is a typed ambiguity");
+            assert!(matches!(
+                partial_write,
+                WatchEventClaimDelivery::OutputAmbiguous {
+                    bytes_written: 3,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                storage
+                    .reserve_event_delivery(partial_write_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+                    .await
+                    .expect("inspect partial-write lease"),
+                frankenterm_core::storage::EventDeliveryReservation::LeasedUntil { .. }
+            ));
 
             let flush_failure_id = event_ids[10];
             let mut flush_failure_output = FlushErrorWriter {
