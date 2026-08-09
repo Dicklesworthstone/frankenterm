@@ -46,8 +46,8 @@ use super::mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, validate_render_batch_panes,
 };
 use codec::{
-    GetLinesResponse, GetPaneRenderChangesResponse, GetSemanticZonesResponse, ListPanesResponse,
-    SpawnResponse, SpawnV2, SplitPane, UnitResponse,
+    GetLinesResponse, GetPaneRenderChangesResponse, GetPaneTieredScrollbackStatusesV1Response,
+    GetSemanticZonesResponse, ListPanesResponse, SpawnResponse, SpawnV2, SplitPane, UnitResponse,
 };
 
 /// Error type for mux pool operations.
@@ -100,6 +100,13 @@ impl MuxPoolError {
             Self::Mux(error) => mux_recovery_decision(error).cancelled,
             Self::Pool(_) | Self::IndeterminateMutation(_) => false,
         }
+    }
+
+    /// Whether local wire admission proved that the negotiated peer dialect
+    /// cannot understand one named additive PDU.
+    #[must_use]
+    pub fn is_unsupported_pdu(&self, expected_pdu: &str) -> bool {
+        matches!(self, Self::Mux(error) if error.is_unsupported_pdu(expected_pdu))
     }
 }
 
@@ -950,6 +957,33 @@ impl MuxPool {
                     .await
             })
         })
+        .await
+    }
+
+    /// Fetch a bounded batch of lightweight tiered-scrollback status records.
+    pub async fn get_pane_tiered_scrollback_statuses_with_cx(
+        &self,
+        cx: &Cx,
+        pane_ids: Vec<usize>,
+    ) -> Result<Option<GetPaneTieredScrollbackStatusesV1Response>, MuxPoolError> {
+        let op_cx = cx.clone();
+        self.execute_with_recovery_with_cx(
+            cx,
+            "get_pane_tiered_scrollback_statuses_v1",
+            move |client| {
+                let op_cx = op_cx.clone();
+                let pane_ids = pane_ids.clone();
+                Box::pin(async move {
+                    if !client.supports_tiered_scrollback_status_batch()? {
+                        return Ok(None);
+                    }
+                    client
+                        .get_pane_tiered_scrollback_statuses_with_cx(&op_cx, pane_ids)
+                        .await
+                        .map(Some)
+                })
+            },
+        )
         .await
     }
 

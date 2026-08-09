@@ -10,11 +10,13 @@ use codec::{
     GetClientListResponse, GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines,
     GetLinesResponse, GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges,
     GetPaneRenderChangesResponse, GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse,
-    GetSemanticZones, GetSemanticZonesResponse, GetTlsCredsResponse, InputSerial, KillPane,
+    GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones, GetSemanticZonesResponse,
+    GetTlsCredsResponse, InputSerial, KillPane,
     ListPanes, ListPanesCoherent, ListPanesCoherentOutcome, ListPanesCoherentResponse,
     ListPanesResponse, ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse,
     LivenessResponse, MoveFloatingPane, MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert,
-    Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
+    PaneTieredScrollbackStatusEntryV1, PaneTieredScrollbackStatusOutcomeV1, Pdu, Ping, Pong,
+    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
     SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
     SetActiveWorkspace, SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
     SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
@@ -3636,6 +3638,93 @@ fn with_current_pane<R>(
     })?
 }
 
+/// Sample one exact pane registration without allowing a faulty pane callback
+/// to fail or unwind sibling entries in a bounded fleet-health response.
+fn sample_tiered_scrollback_status(
+    authority: &SessionAuthority,
+    pane_id: PaneId,
+) -> PaneTieredScrollbackStatusOutcomeV1 {
+    let sampled = catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| -> anyhow::Result<PaneTieredScrollbackStatusOutcomeV1> {
+            let Some(registration) = authority.capture_current_pane_opt(pane_id)? else {
+                return Ok(PaneTieredScrollbackStatusOutcomeV1::Missing);
+            };
+            authority.try_run(|| {
+                Ok(match registration
+                    .try_with_current(|current| current.get_tiered_scrollback_status())
+                {
+                    Some(Some(status)) => {
+                        PaneTieredScrollbackStatusOutcomeV1::Available(status)
+                    }
+                    Some(None) => PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                    None => PaneTieredScrollbackStatusOutcomeV1::Closed,
+                })
+            })?
+        }),
+    );
+    match sampled {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            log::debug!(
+                "tiered scrollback health sample could not retain pane {pane_id} authority: {error:#}"
+            );
+            PaneTieredScrollbackStatusOutcomeV1::Closed
+        }
+        Err(error) => {
+            log::warn!(
+                "tiered scrollback health callback panicked for pane {pane_id}: {error}"
+            );
+            PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked
+        }
+    }
+}
+
+fn record_tiered_scrollback_batch_outcomes(entries: &[PaneTieredScrollbackStatusEntryV1]) {
+    let mut available = 0_u64;
+    let mut unavailable = 0_u64;
+    let mut missing = 0_u64;
+    let mut closed = 0_u64;
+    let mut panicked = 0_u64;
+    for entry in entries {
+        match entry.outcome {
+            PaneTieredScrollbackStatusOutcomeV1::Available(_) => {
+                available = available.saturating_add(1);
+            }
+            PaneTieredScrollbackStatusOutcomeV1::Unavailable => {
+                unavailable = unavailable.saturating_add(1);
+            }
+            PaneTieredScrollbackStatusOutcomeV1::Missing => {
+                missing = missing.saturating_add(1);
+            }
+            PaneTieredScrollbackStatusOutcomeV1::Closed => {
+                closed = closed.saturating_add(1);
+            }
+            PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked => {
+                panicked = panicked.saturating_add(1);
+            }
+        }
+    }
+    metrics::counter!("mux.server.tiered_scrollback_batch_outcomes", "outcome" => "available")
+        .increment(available);
+    metrics::counter!("mux.server.tiered_scrollback_batch_outcomes", "outcome" => "unavailable")
+        .increment(unavailable);
+    metrics::counter!("mux.server.tiered_scrollback_batch_outcomes", "outcome" => "missing")
+        .increment(missing);
+    metrics::counter!("mux.server.tiered_scrollback_batch_outcomes", "outcome" => "closed")
+        .increment(closed);
+    metrics::counter!("mux.server.tiered_scrollback_batch_outcomes", "outcome" => "panicked")
+        .increment(panicked);
+    if unavailable
+        .saturating_add(missing)
+        .saturating_add(closed)
+        .saturating_add(panicked)
+        > 0
+    {
+        metrics::counter!("mux.server.tiered_scrollback_partial_batches").increment(1);
+    }
+}
+
 fn unregister_owned_client(mux: &Mux, client_id: &Arc<ClientId>) {
     let _ = mux.unregister_client_if_same(client_id);
 }
@@ -4579,6 +4668,44 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::GetPaneTieredScrollbackStatusesV1(request) => {
+                if let Err(error) = request.validate() {
+                    send_response(Err(error.into()));
+                    return;
+                }
+                let queued_at = Instant::now();
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let queue_delay = queued_at.elapsed();
+                            metrics::counter!("mux.server.tiered_scrollback_batch_requests")
+                                .increment(1);
+                            metrics::histogram!(
+                                "mux.server.tiered_scrollback_batch_queue_delay_ms"
+                            )
+                            .record(queue_delay.as_secs_f64() * 1_000.0);
+                            metrics::histogram!("mux.server.tiered_scrollback_batch_panes")
+                                .record(request.pane_ids.len() as f64);
+
+                            let entries = request
+                                .pane_ids
+                                .into_iter()
+                                .map(|pane_id| PaneTieredScrollbackStatusEntryV1 {
+                                    pane_id,
+                                    outcome: sample_tiered_scrollback_status(&authority, pane_id),
+                                })
+                                .collect();
+                            record_tiered_scrollback_batch_outcomes(&entries);
+                            let response = GetPaneTieredScrollbackStatusesV1Response { entries };
+                            response.validate()?;
+                            Ok(Pdu::GetPaneTieredScrollbackStatusesV1Response(response))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
+
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
                 let Some(registration) =
                     capture_pane_or_respond_liveness(&authority, pane_id, &send_response)
@@ -5134,6 +5261,7 @@ impl SessionHandler {
             | Pdu::MovePaneToNewTabResponse { .. }
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
+            | Pdu::GetPaneTieredScrollbackStatusesV1Response { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)));
             }
@@ -5371,6 +5499,7 @@ mod tests {
         key_down_count: AtomicUsize,
         paste_count: AtomicUsize,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+        tiered_scrollback_status_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         seqno_on_dimensions: Option<SequenceNo>,
         cursor_line_start_override: Option<StableRowIndex>,
         // Writer sink for the Pane::writer() trait obligation. FakePane
@@ -5396,6 +5525,7 @@ mod tests {
             Self {
                 pane_id,
                 callback_probe: None,
+                tiered_scrollback_status_probe: None,
                 seqno_on_dimensions: None,
                 cursor_line_start_override: None,
                 writer_sink: ParkingMutex::new(std::io::sink()),
@@ -5440,6 +5570,16 @@ mod tests {
         ) -> Self {
             let mut pane = Self::new_with_id(pane_id, None);
             pane.callback_probe = Some(callback_probe);
+            pane
+        }
+
+        fn new_with_tiered_scrollback_status_probe(
+            pane_id: PaneId,
+            tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
+            probe: Arc<dyn Fn() + Send + Sync>,
+        ) -> Self {
+            let mut pane = Self::new_with_id(pane_id, tiered_scrollback_status);
+            pane.tiered_scrollback_status_probe = Some(probe);
             pane
         }
 
@@ -5547,6 +5687,9 @@ mod tests {
         }
 
         fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
+            if let Some(probe) = &self.tiered_scrollback_status_probe {
+                probe();
+            }
             self.state.lock().unwrap().tiered_scrollback_status
         }
 
@@ -6306,6 +6449,134 @@ mod tests {
             }
             other => panic!("expected GetPaneRenderableDimensionsResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tiered_scrollback_bulk_status_is_ordered_lightweight_and_typed() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let render_callback_calls = Arc::new(AtomicUsize::new(0));
+        let render_callback_calls_for_probe = Arc::clone(&render_callback_calls);
+        let available = Arc::new(FakePane::new_with_callback_probe(
+            7,
+            Arc::new(move || {
+                render_callback_calls_for_probe.fetch_add(1, Ordering::Relaxed);
+            }),
+        ));
+        available.set_tiered_scrollback_status(Some(sample_tiered_scrollback_status(41)));
+        let unavailable = Arc::new(FakePane::new_with_id(8, None));
+        let available_dyn: Arc<dyn Pane> = available;
+        let unavailable_dyn: Arc<dyn Pane> = unavailable;
+        mux.add_pane(&available_dyn).expect("register available pane");
+        mux.add_pane(&unavailable_dyn)
+            .expect("register unavailable pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+        render_callback_calls.store(0, Ordering::Relaxed);
+
+        handler.process_one(DecodedPdu {
+            serial: 401,
+            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(
+                codec::GetPaneTieredScrollbackStatusesV1 {
+                    pane_ids: vec![7, 8, 9],
+                },
+            ),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) =
+            take_response(&captured).pdu
+        else {
+            panic!("expected bulk tiered-scrollback status response");
+        };
+        assert_eq!(
+            response.entries,
+            vec![
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 7,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Available(
+                        sample_tiered_scrollback_status(41),
+                    ),
+                },
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 8,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                },
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 9,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Missing,
+                },
+            ]
+        );
+        assert_eq!(
+            render_callback_calls.load(Ordering::Relaxed),
+            0,
+            "health sampling must not enter the render-delta callback graph"
+        );
+    }
+
+    #[test]
+    fn tiered_scrollback_bulk_status_contains_one_callback_panic_to_its_entry() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let panicking: Arc<dyn Pane> = Arc::new(
+            FakePane::new_with_tiered_scrollback_status_probe(
+                17,
+                Some(sample_tiered_scrollback_status(17)),
+                Arc::new(|| panic!("synthetic tiered-scrollback callback failure")),
+            ),
+        );
+        let healthy: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(
+            18,
+            Some(sample_tiered_scrollback_status(18)),
+        ));
+        mux.add_pane(&panicking)
+            .expect("register panicking pane");
+        mux.add_pane(&healthy).expect("register healthy pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+
+        handler.process_one(DecodedPdu {
+            serial: 402,
+            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(
+                codec::GetPaneTieredScrollbackStatusesV1 {
+                    pane_ids: vec![17, 18],
+                },
+            ),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) =
+            take_response(&captured).pdu
+        else {
+            panic!("expected panic-contained bulk status response");
+        };
+        assert_eq!(
+            response.entries,
+            vec![
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 17,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked,
+                },
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 18,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Available(
+                        sample_tiered_scrollback_status(18),
+                    ),
+                },
+            ],
+            "one faulty pane callback must not abort or reorder sibling samples"
+        );
     }
 
     #[test]

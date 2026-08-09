@@ -103,8 +103,9 @@ use crate::vendored::{DirectMuxClient, DirectMuxClientConfig, PaneDelta, Subscri
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
     MuxSemanticSnapshot, MuxSemanticZoneKind, PaneInfo, PaneTextSource,
-    PaneTieredScrollbackSummary, WeztermHandle, WeztermHandleSource, WeztermInterface,
-    wezterm_handle_with_timeout,
+    PANE_TIERED_SCROLLBACK_BULK_MAX_PANES, PaneTieredScrollbackBatchEntry,
+    PaneTieredScrollbackBatchOutcome, PaneTieredScrollbackSummary, WeztermHandle,
+    WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
 };
 
 fn runtime_cx_error(operation: &'static str, cx: &crate::cx::Cx, fallback: &'static str) -> Error {
@@ -4992,23 +4993,15 @@ impl ObservationRuntime {
                     // ── Fleet scrollback coordinator tick (ft-dwjtm) ────────
                     //
                     let observed_pane_count = observed_pane_ids.len();
-                    let tiered_scrollback_fetch = match collect_pane_tiered_scrollback_summaries(
+                    let tiered_scrollback_fetch = collect_pane_tiered_scrollback_summaries(
                         &loop_cx,
                         &wezterm_handle,
                         &observed_pane_ids,
                     )
-                    .await
-                    {
-                        Ok(fetch) => fetch,
-                        Err(error) if is_runtime_cancellation(&error) => break,
-                        Err(_error) => {
-                            warn!(
-                                error_class = "pane_summary_collection_failed",
-                                "Failed to collect mux-side tiered scrollback telemetry"
-                            );
-                            PaneTieredScrollbackFetch::default()
-                        }
-                    };
+                    .await;
+                    if tiered_scrollback_fetch.cancelled {
+                        break;
+                    }
                     if loop_cx.checkpoint().is_err() {
                         break;
                     }
@@ -5164,6 +5157,10 @@ impl ObservationRuntime {
                                 "pane_scrollback_snapshots": pane_scrollback_snapshot_count,
                                 "pane_status_errors": tiered_scrollback_fetch.errors,
                                 "pane_status_error_samples": pane_status_error_samples,
+                                "tiered_scrollback_bulk_requests": tiered_scrollback_fetch.bulk_requests,
+                                "tiered_scrollback_bulk_chunks_completed": tiered_scrollback_fetch.bulk_chunks_completed,
+                                "tiered_scrollback_legacy_fallback_batches": tiered_scrollback_fetch.legacy_fallback_batches,
+                                "tiered_scrollback_legacy_fallback_requests": tiered_scrollback_fetch.legacy_fallback_requests,
                                 "tiered_scrollback_telemetry_blind": telemetry_blind,
                                 "tiered_scrollback_telemetry_partial": telemetry_partial,
                                 "tiered_scrollback_blind_reason": blind_reason,
@@ -9224,7 +9221,12 @@ fn build_fleet_pressure_signals(
 struct PaneTieredScrollbackFetch {
     summaries: HashMap<u64, PaneTieredScrollbackSummary>,
     errors: usize,
-    error_sample_pane_ids: Vec<u64>,
+    error_samples: Vec<(u64, &'static str)>,
+    bulk_requests: usize,
+    bulk_chunks_completed: usize,
+    legacy_fallback_batches: usize,
+    legacy_fallback_requests: usize,
+    cancelled: bool,
 }
 
 /// Bound maintenance telemetry fan-out below the default mux-pool pipeline
@@ -9235,15 +9237,23 @@ const PANE_TIERED_SCROLLBACK_FETCH_CONCURRENCY: usize = 16;
 
 impl PaneTieredScrollbackFetch {
     fn note_error(&mut self, pane_id: u64) {
+        self.note_error_with_class(pane_id, "summary_unavailable");
+    }
+
+    fn note_error_with_class(&mut self, pane_id: u64, error_class: &'static str) {
         self.errors = self.errors.saturating_add(1);
         // Concurrent probes may finish in any order. Retain the four smallest
         // failing pane identities so persisted diagnostics remain stable and
-        // do not depend on scheduler timing.
-        match self.error_sample_pane_ids.binary_search(&pane_id) {
-            Ok(_) => {}
+        // do not depend on scheduler timing. The error class is a finite local
+        // enum projection and never reflects backend-controlled text.
+        match self
+            .error_samples
+            .binary_search_by_key(&pane_id, |(sample_pane_id, _)| *sample_pane_id)
+        {
+            Ok(index) => self.error_samples[index].1 = error_class,
             Err(index) if index < 4 => {
-                self.error_sample_pane_ids.insert(index, pane_id);
-                self.error_sample_pane_ids.truncate(4);
+                self.error_samples.insert(index, (pane_id, error_class));
+                self.error_samples.truncate(4);
             }
             Err(_) => {}
         }
@@ -9254,9 +9264,9 @@ impl PaneTieredScrollbackFetch {
         // content, or arbitrarily large caller-controlled strings. Pane ids
         // plus a finite failure class retain enough information to locate the
         // failing probes.
-        self.error_sample_pane_ids
+        self.error_samples
             .iter()
-            .map(|pane_id| format!("pane {pane_id}: summary_unavailable"))
+            .map(|(pane_id, error_class)| format!("pane {pane_id}: {error_class}"))
             .collect()
     }
 
@@ -9321,55 +9331,176 @@ fn record_pane_tiered_scrollback_summary_result(
     }
 }
 
+fn record_pane_tiered_scrollback_bulk_entry(
+    fetch: &mut PaneTieredScrollbackFetch,
+    entry: PaneTieredScrollbackBatchEntry,
+) {
+    match entry.outcome {
+        PaneTieredScrollbackBatchOutcome::Available(summary) => {
+            fetch.summaries.insert(entry.pane_id, summary);
+        }
+        PaneTieredScrollbackBatchOutcome::Unavailable => {
+            fetch.note_error_with_class(entry.pane_id, "status_unavailable");
+        }
+        PaneTieredScrollbackBatchOutcome::Missing => {
+            fetch.note_error_with_class(entry.pane_id, "pane_missing");
+        }
+        PaneTieredScrollbackBatchOutcome::Closed => {
+            fetch.note_error_with_class(entry.pane_id, "pane_closed");
+        }
+        PaneTieredScrollbackBatchOutcome::CallbackPanicked => {
+            fetch.note_error_with_class(entry.pane_id, "callback_panicked");
+        }
+    }
+}
+
+fn finish_pane_tiered_scrollback_fetch(
+    fetch: PaneTieredScrollbackFetch,
+    started_at: Instant,
+) -> PaneTieredScrollbackFetch {
+    metrics::histogram!("frankenterm.runtime.tiered_scrollback_cycle_ms")
+        .record(started_at.elapsed().as_secs_f64() * 1_000.0);
+    metrics::histogram!("frankenterm.runtime.tiered_scrollback_bulk_requests")
+        .record(fetch.bulk_requests as f64);
+    metrics::histogram!("frankenterm.runtime.tiered_scrollback_bulk_chunks_completed")
+        .record(fetch.bulk_chunks_completed as f64);
+    metrics::histogram!("frankenterm.runtime.tiered_scrollback_legacy_fallback_requests")
+        .record(fetch.legacy_fallback_requests as f64);
+    if fetch.legacy_fallback_batches > 0 {
+        metrics::counter!("frankenterm.runtime.tiered_scrollback_fallback_cycles").increment(1);
+    }
+    if fetch.errors > 0 {
+        metrics::counter!("frankenterm.runtime.tiered_scrollback_partial_failure_cycles")
+            .increment(1);
+    }
+    if fetch.cancelled {
+        metrics::counter!("frankenterm.runtime.tiered_scrollback_cancelled_cycles").increment(1);
+    }
+    fetch
+}
+
 async fn collect_pane_tiered_scrollback_summaries(
     runtime_cx: &RuntimeLoopCx,
     wezterm_handle: &WeztermHandle,
     pane_ids: &[u64],
-) -> Result<PaneTieredScrollbackFetch> {
-    runtime_cx.checkpoint().map_err(|_| {
-        runtime_cx_error(
-            "tiered scrollback collection",
-            runtime_cx,
-            "capability checkpoint failed before dispatch",
-        )
-    })?;
+) -> PaneTieredScrollbackFetch {
+    let started_at = Instant::now();
     let mut fetch = PaneTieredScrollbackFetch::default();
-    let mut remaining = pane_ids.iter().copied();
-    let probe = |pane_id| {
-        let wezterm_handle = Arc::clone(wezterm_handle);
-        async move {
-            let result = wezterm_handle
-                .pane_tiered_scrollback_summary_with_cx(runtime_cx, pane_id)
-                .await;
-            (pane_id, result)
-        }
-    };
-    let mut pending = FuturesUnordered::new();
-    for pane_id in remaining
-        .by_ref()
-        .take(PANE_TIERED_SCROLLBACK_FETCH_CONCURRENCY)
-    {
-        pending.push(probe(pane_id));
+    if runtime_cx.checkpoint().is_err() {
+        fetch.cancelled = true;
+        return finish_pane_tiered_scrollback_fetch(fetch, started_at);
     }
 
-    while let Some((pane_id, result)) = pending.next().await {
-        match result {
-            Err(error) if is_runtime_cancellation(&error) => return Err(error),
-            result => record_pane_tiered_scrollback_summary_result(&mut fetch, pane_id, result),
+    let mut unique_pane_ids = pane_ids.to_vec();
+    unique_pane_ids.sort_unstable();
+    unique_pane_ids.dedup();
+    let mut use_legacy_fallback = false;
+
+    for pane_chunk in unique_pane_ids.chunks(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES) {
+        if runtime_cx.checkpoint().is_err() {
+            fetch.cancelled = true;
+            return finish_pane_tiered_scrollback_fetch(fetch, started_at);
         }
-        runtime_cx.checkpoint().map_err(|_| {
-            runtime_cx_error(
-                "tiered scrollback collection",
-                runtime_cx,
-                "capability checkpoint failed after pane summary",
-            )
-        })?;
-        if let Some(next_pane_id) = remaining.next() {
-            pending.push(probe(next_pane_id));
+
+        if !use_legacy_fallback {
+            fetch.bulk_requests = fetch.bulk_requests.saturating_add(1);
+            match wezterm_handle
+                .pane_tiered_scrollback_summaries_bulk_with_cx(runtime_cx, pane_chunk)
+                .await
+            {
+                Ok(Some(entries)) => {
+                    let response_is_exact = entries.len() == pane_chunk.len()
+                        && entries
+                            .iter()
+                            .zip(pane_chunk)
+                            .all(|(entry, requested_pane_id)| {
+                                entry.pane_id == *requested_pane_id
+                            });
+                    if response_is_exact {
+                        fetch.bulk_chunks_completed =
+                            fetch.bulk_chunks_completed.saturating_add(1);
+                        for entry in entries {
+                            record_pane_tiered_scrollback_bulk_entry(&mut fetch, entry);
+                        }
+                    } else {
+                        for pane_id in pane_chunk {
+                            fetch.note_error_with_class(*pane_id, "bulk_contract_failure");
+                        }
+                        warn!(
+                            pane_count = pane_chunk.len(),
+                            error_class = "bulk_contract_failure",
+                            "Mux tiered-scrollback bulk response violated request order or cardinality"
+                        );
+                    }
+                    if runtime_cx.checkpoint().is_err() {
+                        fetch.cancelled = true;
+                        return finish_pane_tiered_scrollback_fetch(fetch, started_at);
+                    }
+                    continue;
+                }
+                Ok(None) => {
+                    use_legacy_fallback = true;
+                }
+                Err(error) if is_runtime_cancellation(&error) => {
+                    fetch.cancelled = true;
+                    return finish_pane_tiered_scrollback_fetch(fetch, started_at);
+                }
+                Err(_error) => {
+                    for pane_id in pane_chunk {
+                        fetch.note_error_with_class(*pane_id, "bulk_request_failed");
+                    }
+                    warn!(
+                        pane_count = pane_chunk.len(),
+                        error_class = "bulk_request_failed",
+                        "Failed to collect a bounded mux tiered-scrollback health batch"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        fetch.legacy_fallback_batches = fetch.legacy_fallback_batches.saturating_add(1);
+        fetch.legacy_fallback_requests = fetch
+            .legacy_fallback_requests
+            .saturating_add(pane_chunk.len());
+        let mut remaining = pane_chunk.iter().copied();
+        let probe = |pane_id| {
+            let wezterm_handle = Arc::clone(wezterm_handle);
+            async move {
+                let result = wezterm_handle
+                    .pane_tiered_scrollback_summary_with_cx(runtime_cx, pane_id)
+                    .await;
+                (pane_id, result)
+            }
+        };
+        let mut pending = FuturesUnordered::new();
+        for pane_id in remaining
+            .by_ref()
+            .take(PANE_TIERED_SCROLLBACK_FETCH_CONCURRENCY)
+        {
+            pending.push(probe(pane_id));
+        }
+        while let Some((pane_id, result)) = pending.next().await {
+            match result {
+                Err(error) if is_runtime_cancellation(&error) => {
+                    fetch.cancelled = true;
+                    return finish_pane_tiered_scrollback_fetch(fetch, started_at);
+                }
+                result => {
+                    record_pane_tiered_scrollback_summary_result(&mut fetch, pane_id, result);
+                }
+            }
+            if runtime_cx.checkpoint().is_err() {
+                fetch.cancelled = true;
+                return finish_pane_tiered_scrollback_fetch(fetch, started_at);
+            }
+            if let Some(next_pane_id) = remaining.next() {
+                pending.push(probe(next_pane_id));
+            }
         }
     }
 
-    Ok(fetch)
+    finish_pane_tiered_scrollback_fetch(fetch, started_at)
 }
 
 fn approximate_warm_page_count(summary: &PaneTieredScrollbackSummary) -> usize {
@@ -15785,6 +15916,148 @@ mod tests {
                 "pane 11: summary_unavailable".to_string(),
             ]
         );
+    }
+
+    fn available_bulk_outcomes(
+        pane_ids: impl IntoIterator<Item = u64>,
+    ) -> HashMap<u64, PaneTieredScrollbackBatchOutcome> {
+        pane_ids
+            .into_iter()
+            .map(|pane_id| {
+                (
+                    pane_id,
+                    PaneTieredScrollbackBatchOutcome::Available(
+                        PaneTieredScrollbackSummary::default(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_bulk_fetch_collapses_200_panes_to_one_request() {
+        run_async_test(async {
+            let pane_ids = (0_u64..200).collect::<Vec<_>>();
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.configure_tiered_scrollback_bulk_for_test(Some(available_bulk_outcomes(
+                pane_ids.iter().copied(),
+            )));
+            let handle: WeztermHandle = mock.clone();
+            let cx = runtime_loop_cx();
+
+            let fetch = collect_pane_tiered_scrollback_summaries(&cx, &handle, &pane_ids).await;
+
+            assert!(!fetch.cancelled);
+            assert_eq!(fetch.summaries.len(), 200);
+            assert_eq!(fetch.errors, 0);
+            assert_eq!(fetch.bulk_requests, 1);
+            assert_eq!(fetch.bulk_chunks_completed, 1);
+            assert_eq!(fetch.legacy_fallback_batches, 0);
+            assert_eq!(fetch.legacy_fallback_requests, 0);
+            assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (1, 0));
+        });
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_bulk_fetch_chunks_above_wire_bound() {
+        run_async_test(async {
+            let pane_ids = (0_u64..513).rev().collect::<Vec<_>>();
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.configure_tiered_scrollback_bulk_for_test(Some(available_bulk_outcomes(
+                pane_ids.iter().copied(),
+            )));
+            let handle: WeztermHandle = mock.clone();
+            let cx = runtime_loop_cx();
+
+            let fetch = collect_pane_tiered_scrollback_summaries(&cx, &handle, &pane_ids).await;
+
+            assert!(!fetch.cancelled);
+            assert_eq!(fetch.summaries.len(), 513);
+            assert_eq!(fetch.bulk_requests, 3);
+            assert_eq!(fetch.bulk_chunks_completed, 3);
+            assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (3, 0));
+        });
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_old_peer_fallback_is_bounded_and_observable() {
+        run_async_test(async {
+            let pane_ids = (0_u64..33).collect::<Vec<_>>();
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.configure_tiered_scrollback_bulk_for_test(None);
+            let handle: WeztermHandle = mock.clone();
+            let cx = runtime_loop_cx();
+
+            let fetch = collect_pane_tiered_scrollback_summaries(&cx, &handle, &pane_ids).await;
+
+            assert!(!fetch.cancelled);
+            assert_eq!(fetch.errors, 33);
+            assert_eq!(fetch.bulk_requests, 1);
+            assert_eq!(fetch.bulk_chunks_completed, 0);
+            assert_eq!(fetch.legacy_fallback_batches, 1);
+            assert_eq!(fetch.legacy_fallback_requests, 33);
+            assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (1, 33));
+        });
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_bulk_preserves_typed_outcomes_without_backend_text() {
+        run_async_test(async {
+            let pane_ids = vec![10, 11, 12, 13, 14];
+            let outcomes = HashMap::from([
+                (
+                    10,
+                    PaneTieredScrollbackBatchOutcome::Available(
+                        PaneTieredScrollbackSummary::default(),
+                    ),
+                ),
+                (11, PaneTieredScrollbackBatchOutcome::Unavailable),
+                (12, PaneTieredScrollbackBatchOutcome::Missing),
+                (13, PaneTieredScrollbackBatchOutcome::Closed),
+                (14, PaneTieredScrollbackBatchOutcome::CallbackPanicked),
+            ]);
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.configure_tiered_scrollback_bulk_for_test(Some(outcomes));
+            let handle: WeztermHandle = mock;
+            let cx = runtime_loop_cx();
+
+            let fetch = collect_pane_tiered_scrollback_summaries(&cx, &handle, &pane_ids).await;
+
+            assert_eq!(fetch.summaries.len(), 1);
+            assert_eq!(fetch.errors, 4);
+            assert_eq!(
+                fetch.error_samples(),
+                [
+                    "pane 11: status_unavailable".to_string(),
+                    "pane 12: pane_missing".to_string(),
+                    "pane 13: pane_closed".to_string(),
+                    "pane 14: callback_panicked".to_string(),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_cancellation_retains_completed_bulk_chunk() {
+        run_async_test(async {
+            let pane_ids = (0_u64..300).collect::<Vec<_>>();
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.configure_tiered_scrollback_bulk_for_test(Some(available_bulk_outcomes(
+                pane_ids.iter().copied(),
+            )));
+            mock.cancel_after_tiered_scrollback_bulk_calls_for_test(1);
+            let handle: WeztermHandle = mock.clone();
+            let cx = runtime_loop_cx();
+
+            let fetch = collect_pane_tiered_scrollback_summaries(&cx, &handle, &pane_ids).await;
+
+            assert!(fetch.cancelled);
+            assert_eq!(fetch.summaries.len(), PANE_TIERED_SCROLLBACK_BULK_MAX_PANES);
+            assert_eq!(fetch.bulk_requests, 1);
+            assert_eq!(fetch.bulk_chunks_completed, 1);
+            assert_eq!(fetch.errors, 0);
+            assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (1, 0));
+        });
     }
 
     #[test]

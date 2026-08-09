@@ -22,8 +22,9 @@ use crate::error::{StorageError, WeztermError};
 use crate::patterns::AgentType;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
-    MoveDirection, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackSummary, SpawnTarget,
-    SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
+    MoveDirection, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackBatchEntry,
+    PaneTieredScrollbackSummary, SpawnTarget, SplitDirection, WeztermFuture, WeztermHandle,
+    WeztermInterface,
 };
 
 // =============================================================================
@@ -2426,6 +2427,92 @@ impl WeztermInterface for ShardedWeztermClient {
                         Some(pane_id),
                         err,
                     )
+                })
+        })
+    }
+
+    fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_ids: &'a [u64],
+    ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        Box::pin(async move {
+            let mut by_shard = std::collections::BTreeMap::<
+                ShardId,
+                Vec<(usize, u64, u64)>,
+            >::new();
+            for (request_index, global_pane_id) in pane_ids.iter().copied().enumerate() {
+                let route = self.route_for_global_pane_id_with_cx(cx, global_pane_id)?;
+                by_shard.entry(route.shard_id).or_default().push((
+                    request_index,
+                    route.local_pane_id,
+                    global_pane_id,
+                ));
+            }
+
+            let mut ordered = vec![None; pane_ids.len()];
+            for (shard_id, routed) in by_shard {
+                let backend = self.backend_for_id(shard_id)?;
+                let local_pane_ids = routed
+                    .iter()
+                    .map(|(_, local_pane_id, _)| *local_pane_id)
+                    .collect::<Vec<_>>();
+                let Some(entries) = backend
+                    .handle
+                    .pane_tiered_scrollback_summaries_bulk_with_cx(cx, &local_pane_ids)
+                    .await
+                    .map_err(|error| {
+                        Self::backend_error(
+                            shard_id,
+                            "pane_tiered_scrollback_summaries_bulk",
+                            None,
+                            error,
+                        )
+                    })?
+                else {
+                    return Ok(None);
+                };
+                if entries.len() != routed.len() {
+                    return Err(Self::backend_error(
+                        shard_id,
+                        "pane_tiered_scrollback_summaries_bulk",
+                        None,
+                        WeztermError::CommandFailed(
+                            "bulk tiered-scrollback response cardinality mismatch".to_string(),
+                        )
+                        .into(),
+                    ));
+                }
+                for ((request_index, local_pane_id, global_pane_id), entry) in
+                    routed.into_iter().zip(entries)
+                {
+                    if entry.pane_id != local_pane_id {
+                        return Err(Self::backend_error(
+                            shard_id,
+                            "pane_tiered_scrollback_summaries_bulk",
+                            Some(global_pane_id),
+                            WeztermError::CommandFailed(
+                                "bulk tiered-scrollback response order mismatch".to_string(),
+                            )
+                            .into(),
+                        ));
+                    }
+                    ordered[request_index] = Some(PaneTieredScrollbackBatchEntry {
+                        pane_id: global_pane_id,
+                        outcome: entry.outcome,
+                    });
+                }
+            }
+
+            ordered
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .map(Some)
+                .ok_or_else(|| {
+                    WeztermError::CommandFailed(
+                        "bulk tiered-scrollback response left an unfilled request slot".to_string(),
+                    )
+                    .into()
                 })
         })
     }

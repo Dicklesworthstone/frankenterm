@@ -22,12 +22,13 @@ use crate::runtime_async::{task, timeout};
 use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
     CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
-    GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, GetSemanticZones,
-    GetSemanticZonesResponse, InputSerial, ListPanes, ListPanesResponse, MoveFloatingPane, Pdu,
-    PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize, SelectStackPane,
-    SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane,
-    StreamingPduBuffer, SwapToLayout, ToggleFloatingPane, TopologyCapabilities, UnitResponse,
-    UpdatePaneConstraints, WriteToPane,
+    GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
+    GetPaneTieredScrollbackStatusesV1, GetPaneTieredScrollbackStatusesV1Response,
+    GetSemanticZones, GetSemanticZonesResponse, InputSerial, ListPanes, ListPanesResponse,
+    MoveFloatingPane, Pdu, PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize,
+    SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse,
+    SpawnV2, SplitPane, StreamingPduBuffer, SwapToLayout, ToggleFloatingPane,
+    TopologyCapabilities, UnitResponse, UpdatePaneConstraints, WriteToPane,
 };
 use config as wezterm_config;
 use frankenterm_term::TerminalSize;
@@ -356,6 +357,18 @@ impl DirectMuxError {
                 ..
             }
         )
+    }
+
+    /// Whether local codec admission proved that this peer cannot understand
+    /// one named additive PDU. This is the only condition under which a
+    /// higher-level read may take its bounded compatibility fallback.
+    #[must_use]
+    pub(crate) fn is_unsupported_pdu(&self, expected_pdu: &str) -> bool {
+        match self {
+            Self::OutboundPduRequiresCodec { pdu, .. } => *pdu == expected_pdu,
+            Self::ProvenPreWriteRejection(source) => source.is_unsupported_pdu(expected_pdu),
+            _ => false,
+        }
     }
 }
 
@@ -1944,6 +1957,75 @@ impl DirectMuxClient {
             Pdu::ListPanesResponse(payload) => Ok(payload),
             other => self.unexpected_response("ListPanesResponse", &other, true),
         }
+    }
+
+    /// Check whether the negotiated peer dialect admits the additive batch PDU.
+    pub(crate) fn supports_tiered_scrollback_status_batch(
+        &self,
+    ) -> Result<bool, DirectMuxError> {
+        let probe = Pdu::GetPaneTieredScrollbackStatusesV1(
+            GetPaneTieredScrollbackStatusesV1 { pane_ids: vec![0] },
+        );
+        match self.preflight_outbound_pdu(&probe) {
+            Ok(()) => Ok(true),
+            Err(error) if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Read only the bounded tiered-scrollback health fields for a pane batch.
+    pub async fn get_pane_tiered_scrollback_statuses_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_ids: Vec<usize>,
+    ) -> Result<GetPaneTieredScrollbackStatusesV1Response, DirectMuxError> {
+        let request = GetPaneTieredScrollbackStatusesV1 { pane_ids };
+        request.validate().map_err(|error| {
+            DirectMuxError::proven_pre_write_rejection(DirectMuxError::Codec(error.to_string()))
+        })?;
+        let requested_pane_ids = request.pane_ids.clone();
+        let response = self
+            .send_request_with_cx(cx, Pdu::GetPaneTieredScrollbackStatusesV1(request))
+            .await?;
+        let result = match response {
+            Pdu::GetPaneTieredScrollbackStatusesV1Response(response) => {
+                if let Err(error) = response.validate() {
+                    Err(DirectMuxError::AlignedUnexpectedResponse {
+                        expected: "bounded unique tiered-scrollback status response".to_string(),
+                        got: error.to_string(),
+                    })
+                } else {
+                    let response_pane_ids = response
+                        .entries
+                        .iter()
+                        .map(|entry| entry.pane_id)
+                        .collect::<Vec<_>>();
+                    if response_pane_ids != requested_pane_ids {
+                        Err(DirectMuxError::AlignedUnexpectedResponse {
+                            expected: format!(
+                                "tiered-scrollback statuses for panes {requested_pane_ids:?}"
+                            ),
+                            got: format!(
+                                "tiered-scrollback statuses for panes {response_pane_ids:?}"
+                            ),
+                        })
+                    } else {
+                        Ok(response)
+                    }
+                }
+            }
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "GetPaneTieredScrollbackStatusesV1Response".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        };
+        self.settle_transport_result(
+            result,
+            "tiered-scrollback batch response contract failure",
+            true,
+        )
     }
 
     /// Spawn a new mux pane/tab through the native mux protocol.
@@ -5038,6 +5120,25 @@ mod tests {
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         stream.write_all(&out).await?;
         stream.flush().await
+    }
+
+    async fn read_test_request_pdu(
+        stream: &mut compat_unix::UnixStream,
+        read_buf: &mut StreamingPduBuffer,
+    ) -> DecodedPdu {
+        loop {
+            if let Some(decoded) = codec::Pdu::stream_decode(read_buf)
+                .expect("decode synthetic mux request")
+            {
+                return decoded;
+            }
+            let mut temp = vec![0_u8; 4096];
+            let read = unix_stream_read(stream, &mut temp)
+                .await
+                .expect("read synthetic mux request");
+            assert!(read > 0, "client disconnected before synthetic request");
+            read_buf.extend_from_slice(&temp[..read]);
+        }
     }
 
     async fn accept_direct_mux_handshake(
@@ -13029,6 +13130,184 @@ mod tests {
                 drop(client);
                 drop(server.await.expect("server task"));
             }
+        });
+    }
+
+    #[test]
+    fn tiered_scrollback_bulk_round_trip_preserves_order_and_typed_outcomes() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("mux-tiered-scrollback-bulk.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+            let server = task::spawn(async move {
+                let mut stream = accept_direct_mux_handshake(
+                    listener,
+                    CODEC_VERSION,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                )
+                .await;
+                let mut read_buf = StreamingPduBuffer::new();
+                let decoded = read_test_request_pdu(&mut stream, &mut read_buf).await;
+                let Pdu::GetPaneTieredScrollbackStatusesV1(request) = decoded.pdu else {
+                    panic!("expected bulk tiered-scrollback request");
+                };
+                assert_eq!(request.pane_ids, vec![7, 11, 19]);
+                let response = codec::GetPaneTieredScrollbackStatusesV1Response {
+                    entries: vec![
+                        codec::PaneTieredScrollbackStatusEntryV1 {
+                            pane_id: 7,
+                            outcome: codec::PaneTieredScrollbackStatusOutcomeV1::Available(
+                                mux::renderable::PaneTieredScrollbackStatus::default(),
+                            ),
+                        },
+                        codec::PaneTieredScrollbackStatusEntryV1 {
+                            pane_id: 11,
+                            outcome: codec::PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                        },
+                        codec::PaneTieredScrollbackStatusEntryV1 {
+                            pane_id: 19,
+                            outcome: codec::PaneTieredScrollbackStatusOutcomeV1::Missing,
+                        },
+                    ],
+                };
+                write_response_pdu(
+                    &mut stream,
+                    &Pdu::GetPaneTieredScrollbackStatusesV1Response(response.clone()),
+                    decoded.serial,
+                )
+                .await
+                .expect("write bulk tiered-scrollback response");
+                response
+            });
+
+            let cx = crate::cx::for_testing();
+            let mut client = DirectMuxClient::connect_with_cx(
+                &cx,
+                direct_mux_client_config(socket_path),
+            )
+            .await
+            .expect("connect bulk tiered-scrollback client");
+            let response = client
+                .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11, 19])
+                .await
+                .expect("bulk tiered-scrollback request must succeed");
+            assert_eq!(response, server.await.expect("server task"));
+            assert!(!client.is_connection_poisoned());
+        });
+    }
+
+    #[test]
+    fn tiered_scrollback_bulk_rejects_old_peer_and_invalid_batches_before_wire() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir
+                .path()
+                .join("mux-tiered-scrollback-prewrite-rejections.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+            let server = task::spawn(async move {
+                let mut stream = accept_direct_mux_handshake(listener, 56, 56).await;
+                let mut read_buf = StreamingPduBuffer::new();
+                let decoded = read_test_request_pdu(&mut stream, &mut read_buf).await;
+                assert!(
+                    matches!(decoded.pdu, Pdu::ListPanes(_)),
+                    "a rejected bulk request reached the wire"
+                );
+                assert_eq!(decoded.serial, 3, "pre-write rejection consumed a serial");
+                write_response_pdu(
+                    &mut stream,
+                    &empty_list_panes_response(),
+                    decoded.serial,
+                )
+                .await
+                .expect("write negative-control response");
+            });
+
+            let cx = crate::cx::for_testing();
+            let mut client = DirectMuxClient::connect_with_cx(
+                &cx,
+                direct_mux_client_config(socket_path),
+            )
+            .await
+            .expect("connect v56 peer");
+            let old_peer = client
+                .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11])
+                .await
+                .expect_err("v56 peer must reject PDU93 locally");
+            assert!(old_peer.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1"));
+
+            for invalid in [
+                vec![7, 7],
+                (0..=codec::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES).collect(),
+            ] {
+                let error = client
+                    .get_pane_tiered_scrollback_statuses_with_cx(&cx, invalid)
+                    .await
+                    .expect_err("invalid batch must fail before wire emission");
+                assert!(error.is_proven_pre_write_rejection());
+            }
+            assert_eq!(client.serial, 2);
+            client
+                .list_panes_with_cx(&cx)
+                .await
+                .expect("negative-control request must retain aligned connection");
+            assert!(!client.is_connection_poisoned());
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn tiered_scrollback_bulk_order_mismatch_poisons_aligned_connection() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("mux-tiered-scrollback-reordered.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+            let server = task::spawn(async move {
+                let mut stream = accept_direct_mux_handshake(
+                    listener,
+                    CODEC_VERSION,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                )
+                .await;
+                let mut read_buf = StreamingPduBuffer::new();
+                let decoded = read_test_request_pdu(&mut stream, &mut read_buf).await;
+                write_response_pdu(
+                    &mut stream,
+                    &Pdu::GetPaneTieredScrollbackStatusesV1Response(
+                        codec::GetPaneTieredScrollbackStatusesV1Response {
+                            entries: vec![
+                                codec::PaneTieredScrollbackStatusEntryV1 {
+                                    pane_id: 11,
+                                    outcome:
+                                        codec::PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                                },
+                                codec::PaneTieredScrollbackStatusEntryV1 {
+                                    pane_id: 7,
+                                    outcome:
+                                        codec::PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                                },
+                            ],
+                        },
+                    ),
+                    decoded.serial,
+                )
+                .await
+                .expect("write reordered response");
+            });
+
+            let cx = crate::cx::for_testing();
+            let mut client = DirectMuxClient::connect_with_cx(
+                &cx,
+                direct_mux_client_config(socket_path),
+            )
+            .await
+            .expect("connect reordered-response client");
+            let error = client
+                .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11])
+                .await
+                .expect_err("reordered response must fail contract validation");
+            assert!(matches!(error, DirectMuxError::AlignedUnexpectedResponse { .. }));
+            assert!(client.is_connection_poisoned());
+            server.await.expect("server task");
         });
     }
 

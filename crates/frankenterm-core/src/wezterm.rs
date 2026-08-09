@@ -513,6 +513,20 @@ pub trait MuxInterface: Send + Sync {
     ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
         self.pane_tiered_scrollback_summary(pane_id)
     }
+
+    /// Fetch lightweight tiered-scrollback status for a bounded pane batch.
+    ///
+    /// `Ok(None)` means that this backend or negotiated peer does not expose
+    /// the additive bulk operation; callers may then use a bounded legacy
+    /// fallback. `Ok(Some(_))` preserves request order and returns one typed
+    /// outcome per requested pane.
+    fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        _pane_ids: &'a [u64],
+    ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Backward-compatibility alias for the pre-ft-zoxxq.1 trait name.
@@ -838,6 +852,32 @@ pub struct PaneTieredScrollbackSummary {
     pub warm_spill_lines_total: u64,
     pub warm_spill_bytes_total: u64,
 }
+
+/// Bounded, content-free result class for one bulk scrollback-health sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneTieredScrollbackBatchOutcome {
+    Available(PaneTieredScrollbackSummary),
+    Unavailable,
+    Missing,
+    Closed,
+    CallbackPanicked,
+}
+
+/// One request-ordered result in a bulk scrollback-health response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneTieredScrollbackBatchEntry {
+    pub pane_id: u64,
+    pub outcome: PaneTieredScrollbackBatchOutcome,
+}
+
+/// Maximum pane cardinality of one mux-owned bulk health turn.
+pub const PANE_TIERED_SCROLLBACK_BULK_MAX_PANES: usize = 256;
+
+#[cfg(all(feature = "vendored", unix))]
+const _: () = assert!(
+    PANE_TIERED_SCROLLBACK_BULK_MAX_PANES
+        == codec::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES
+);
 
 #[cfg(all(feature = "vendored", unix))]
 impl From<mux::renderable::PaneTieredScrollbackStatus> for PaneTieredScrollbackSummary {
@@ -1811,6 +1851,100 @@ impl WeztermClient {
             "tiered scrollback telemetry unavailable for pane {pane_id}: CLI-only backend does not expose tiered scrollback status (no mux pool configured)"
         ))
         .into())
+    }
+
+    /// Fetch lightweight mux-owned scrollback health for a bounded pane batch.
+    ///
+    /// The v57 operation avoids `GetPaneRenderChanges` and therefore never
+    /// materializes row deltas merely to read health counters. A negotiated
+    /// v56 peer returns `Ok(None)` from local pre-write admission, authorizing
+    /// the runtime's bounded legacy fallback without poisoning the connection.
+    #[cfg(all(feature = "vendored", unix))]
+    pub async fn pane_tiered_scrollback_summaries_bulk_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_ids: &[u64],
+    ) -> Result<Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        if pane_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(pool) = self.mux_pool.as_ref() else {
+            return Ok(None);
+        };
+        if !self.mux_circuit_guard() {
+            return Err(WeztermError::CircuitOpen { retry_after_ms: 0 }.into());
+        }
+
+        let mux_pane_ids = pane_ids
+            .iter()
+            .map(|pane_id| Self::mux_pane_id(*pane_id, "tiered scrollback bulk status"))
+            .collect::<Result<Vec<_>>>()?;
+        match pool
+            .get_pane_tiered_scrollback_statuses_with_cx(cx, mux_pane_ids)
+            .await
+        {
+            Ok(Some(response)) => {
+                let entries = response
+                    .entries
+                    .into_iter()
+                    .zip(pane_ids.iter().copied())
+                    .map(|(entry, requested_pane_id)| PaneTieredScrollbackBatchEntry {
+                        pane_id: requested_pane_id,
+                        outcome: match entry.outcome {
+                            codec::PaneTieredScrollbackStatusOutcomeV1::Available(status) => {
+                                PaneTieredScrollbackBatchOutcome::Available(status.into())
+                            }
+                            codec::PaneTieredScrollbackStatusOutcomeV1::Unavailable => {
+                                PaneTieredScrollbackBatchOutcome::Unavailable
+                            }
+                            codec::PaneTieredScrollbackStatusOutcomeV1::Missing => {
+                                PaneTieredScrollbackBatchOutcome::Missing
+                            }
+                            codec::PaneTieredScrollbackStatusOutcomeV1::Closed => {
+                                PaneTieredScrollbackBatchOutcome::Closed
+                            }
+                            codec::PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked => {
+                                PaneTieredScrollbackBatchOutcome::CallbackPanicked
+                            }
+                        },
+                    })
+                    .collect();
+                self.mux_circuit_record_success();
+                Ok(Some(entries))
+            }
+            Ok(None) => Ok(None),
+            Err(error)
+                if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") =>
+            {
+                Ok(None)
+            }
+            Err(error) => {
+                self.mux_circuit_record_error(&error);
+                if !self.mux_error_should_fallback_to_cli_for_client(&error) {
+                    return Err(Self::mux_cancelled_error(
+                        "pane_tiered_scrollback_summaries_bulk_with_cx",
+                        error,
+                    ));
+                }
+                Err(WeztermError::CommandFailed(format!(
+                    "tiered scrollback bulk telemetry unavailable: mux failure class {}",
+                    Self::mux_error_public_code(&error),
+                ))
+                .into())
+            }
+        }
+    }
+
+    /// Bulk-status stub for builds without the vendored Unix mux client.
+    #[cfg(not(all(feature = "vendored", unix)))]
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async_trait_impl)]
+    pub async fn pane_tiered_scrollback_summaries_bulk_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        _pane_ids: &[u64],
+    ) -> Result<Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        Ok(None)
     }
 
     /// Stub `pane_tiered_scrollback_summary_with_cx` for configurations
@@ -3714,6 +3848,16 @@ impl WeztermInterface for WeztermClient {
             WeztermClient::pane_tiered_scrollback_summary_with_cx(self, cx, pane_id).await
         })
     }
+
+    fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_ids: &'a [u64],
+    ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        Box::pin(async move {
+            WeztermClient::pane_tiered_scrollback_summaries_bulk_with_cx(self, cx, pane_ids).await
+        })
+    }
 }
 
 impl WeztermInterface for Arc<dyn WeztermInterface> {
@@ -4002,6 +4146,15 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
     ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
         self.as_ref()
             .pane_tiered_scrollback_summary_with_cx(cx, pane_id)
+    }
+
+    fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_ids: &'a [u64],
+    ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        self.as_ref()
+            .pane_tiered_scrollback_summaries_bulk_with_cx(cx, pane_ids)
     }
 }
 
@@ -8749,6 +8902,15 @@ impl WeztermInterface for UnifiedClient {
         self.inner
             .pane_tiered_scrollback_summary_with_cx(cx, pane_id)
     }
+
+    fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_ids: &'a [u64],
+    ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        self.inner
+            .pane_tiered_scrollback_summaries_bulk_with_cx(cx, pane_ids)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8766,6 +8928,15 @@ pub struct MockWezterm {
     next_window_id: std::sync::atomic::AtomicU64,
     next_tab_id: std::sync::atomic::AtomicU64,
     watchdog_state: crate::runtime_async::RwLock<MockWatchdogState>,
+    #[cfg(test)]
+    tiered_scrollback_bulk_outcomes:
+        Mutex<Option<std::collections::HashMap<u64, PaneTieredScrollbackBatchOutcome>>>,
+    #[cfg(test)]
+    tiered_scrollback_bulk_calls: AtomicU64,
+    #[cfg(test)]
+    tiered_scrollback_legacy_calls: AtomicU64,
+    #[cfg(test)]
+    tiered_scrollback_cancel_after_bulk_calls: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -8912,7 +9083,45 @@ impl MockWezterm {
             next_window_id: std::sync::atomic::AtomicU64::new(0),
             next_tab_id: std::sync::atomic::AtomicU64::new(0),
             watchdog_state: crate::runtime_async::RwLock::new(MockWatchdogState::default()),
+            #[cfg(test)]
+            tiered_scrollback_bulk_outcomes: Mutex::new(None),
+            #[cfg(test)]
+            tiered_scrollback_bulk_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            tiered_scrollback_legacy_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            tiered_scrollback_cancel_after_bulk_calls: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_tiered_scrollback_bulk_for_test(
+        &self,
+        outcomes: Option<std::collections::HashMap<u64, PaneTieredScrollbackBatchOutcome>>,
+    ) {
+        *self
+            .tiered_scrollback_bulk_outcomes
+            .lock()
+            .unwrap_or_else(record_poison_and_recover) = outcomes;
+        self.tiered_scrollback_bulk_calls.store(0, Ordering::Relaxed);
+        self.tiered_scrollback_legacy_calls
+            .store(0, Ordering::Relaxed);
+        self.tiered_scrollback_cancel_after_bulk_calls
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_after_tiered_scrollback_bulk_calls_for_test(&self, calls: u64) {
+        self.tiered_scrollback_cancel_after_bulk_calls
+            .store(calls, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tiered_scrollback_call_counts_for_test(&self) -> (u64, u64) {
+        (
+            self.tiered_scrollback_bulk_calls.load(Ordering::Relaxed),
+            self.tiered_scrollback_legacy_calls.load(Ordering::Relaxed),
+        )
     }
 
     /// Add a pre-configured pane.
@@ -9741,10 +9950,70 @@ impl WeztermInterface for MockWezterm {
     ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
         Box::pin(async move {
             mock_checkpoint(cx, "mock tiered scrollback summary")?;
+            #[cfg(test)]
+            {
+                saturating_increment_u64(&self.tiered_scrollback_legacy_calls);
+                let outcomes = self
+                    .tiered_scrollback_bulk_outcomes
+                    .lock()
+                    .unwrap_or_else(record_poison_and_recover);
+                if let Some(outcomes) = outcomes.as_ref() {
+                    return match outcomes.get(&pane_id).copied() {
+                        Some(PaneTieredScrollbackBatchOutcome::Available(summary)) => Ok(summary),
+                        _ => Err(WeztermError::CommandFailed(
+                            "mock tiered scrollback status unavailable".to_string(),
+                        )
+                        .into()),
+                    };
+                }
+            }
             Err(WeztermError::CommandFailed(format!(
                 "tiered scrollback telemetry unavailable for pane {pane_id}: mock backend does not expose tiered scrollback status"
             ))
             .into())
+        })
+    }
+
+    fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_ids: &'a [u64],
+    ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        Box::pin(async move {
+            mock_checkpoint(cx, "mock tiered scrollback bulk summary")?;
+            #[cfg(test)]
+            {
+                let call_number = saturating_increment_u64(&self.tiered_scrollback_bulk_calls)
+                    .saturating_add(1);
+                let outcomes = self
+                    .tiered_scrollback_bulk_outcomes
+                    .lock()
+                    .unwrap_or_else(record_poison_and_recover);
+                if let Some(outcomes) = outcomes.as_ref() {
+                    let entries = pane_ids
+                        .iter()
+                        .copied()
+                        .map(|pane_id| PaneTieredScrollbackBatchEntry {
+                            pane_id,
+                            outcome: outcomes.get(&pane_id).copied().unwrap_or(
+                                PaneTieredScrollbackBatchOutcome::Missing,
+                            ),
+                        })
+                        .collect();
+                    if self
+                        .tiered_scrollback_cancel_after_bulk_calls
+                        .load(Ordering::Relaxed)
+                        == call_number
+                    {
+                        cx.cancel_with(
+                            crate::outcome::CancelKind::User,
+                            Some("mock tiered-scrollback bulk cancellation"),
+                        );
+                    }
+                    return Ok(Some(entries));
+                }
+            }
+            Ok(None)
         })
     }
 
