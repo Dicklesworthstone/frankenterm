@@ -966,6 +966,15 @@ impl MuxPool {
         cx: &Cx,
         pane_ids: Vec<usize>,
     ) -> Result<Option<GetPaneTieredScrollbackStatusesV1Response>, MuxPoolError> {
+        codec::GetPaneTieredScrollbackStatusesV1 {
+            pane_ids: pane_ids.clone(),
+        }
+        .validate()
+        .map_err(|error| {
+            MuxPoolError::Mux(DirectMuxError::proven_pre_write_rejection(
+                DirectMuxError::Codec(error.to_string()),
+            ))
+        })?;
         let op_cx = cx.clone();
         self.execute_with_recovery_with_cx(
             cx,
@@ -2103,6 +2112,24 @@ mod tests {
             let socket_path = spawn_mock_server_with_codec_version(&temp_dir, 56).await;
             let pool = MuxPool::new(pool_config(socket_path, 4));
             let cx = crate::cx::for_testing();
+
+            for invalid in [
+                Vec::new(),
+                vec![7, 7],
+                (0..=codec::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES).collect(),
+            ] {
+                let error = pool
+                    .get_pane_tiered_scrollback_statuses_with_cx(&cx, invalid)
+                    .await
+                    .expect_err("invalid batches must fail before old-peer negotiation");
+                assert!(
+                    matches!(
+                        &error,
+                        MuxPoolError::Mux(source) if source.is_proven_pre_write_rejection()
+                    ),
+                    "invalid batches must retain a pre-write rejection: {error:?}",
+                );
+            }
 
             let statuses = pool
                 .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11])

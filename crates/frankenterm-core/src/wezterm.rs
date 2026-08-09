@@ -519,12 +519,16 @@ pub trait MuxInterface: Send + Sync {
     /// `Ok(None)` means that this backend or negotiated peer does not expose
     /// the additive bulk operation; callers may then use a bounded legacy
     /// fallback. `Ok(Some(_))` preserves request order and returns one typed
-    /// outcome per requested pane.
+    /// outcome per requested pane. Requests must contain 1..=256 unique pane
+    /// identities; malformed batches fail before backend admission.
     fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
-        _pane_ids: &'a [u64],
+        pane_ids: &'a [u64],
     ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        if let Err(error) = validate_pane_tiered_scrollback_bulk_request(pane_ids) {
+            return Box::pin(async move { Err(error) });
+        }
         Box::pin(async { Ok(None) })
     }
 }
@@ -872,6 +876,35 @@ pub struct PaneTieredScrollbackBatchEntry {
 
 /// Maximum pane cardinality of one mux-owned bulk health turn.
 pub const PANE_TIERED_SCROLLBACK_BULK_MAX_PANES: usize = 256;
+
+pub(crate) fn validate_pane_tiered_scrollback_bulk_request(pane_ids: &[u64]) -> Result<()> {
+    if pane_ids.is_empty() {
+        return Err(WeztermError::CommandFailed(
+            "bulk tiered-scrollback request must contain at least one pane".to_string(),
+        )
+        .into());
+    }
+    if pane_ids.len() > PANE_TIERED_SCROLLBACK_BULK_MAX_PANES {
+        return Err(WeztermError::CommandFailed(format!(
+            "bulk tiered-scrollback request contains {} panes; maximum is {}",
+            pane_ids.len(),
+            PANE_TIERED_SCROLLBACK_BULK_MAX_PANES,
+        ))
+        .into());
+    }
+    let mut unique = std::collections::HashSet::with_capacity(pane_ids.len());
+    if let Some(duplicate) = pane_ids
+        .iter()
+        .copied()
+        .find(|pane_id| !unique.insert(*pane_id))
+    {
+        return Err(WeztermError::CommandFailed(format!(
+            "bulk tiered-scrollback request repeats pane {duplicate}",
+        ))
+        .into());
+    }
+    Ok(())
+}
 
 #[cfg(all(feature = "vendored", unix))]
 const _: () = assert!(
@@ -1883,9 +1916,7 @@ impl WeztermClient {
         cx: &crate::cx::Cx,
         pane_ids: &[u64],
     ) -> Result<Option<Vec<PaneTieredScrollbackBatchEntry>>> {
-        if pane_ids.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
+        validate_pane_tiered_scrollback_bulk_request(pane_ids)?;
         let Some(pool) = self.mux_pool.as_ref() else {
             return Ok(None);
         };
@@ -1968,8 +1999,9 @@ impl WeztermClient {
     pub async fn pane_tiered_scrollback_summaries_bulk_with_cx(
         &self,
         _cx: &crate::cx::Cx,
-        _pane_ids: &[u64],
+        pane_ids: &[u64],
     ) -> Result<Option<Vec<PaneTieredScrollbackBatchEntry>>> {
+        validate_pane_tiered_scrollback_bulk_request(pane_ids)?;
         Ok(None)
     }
 
@@ -4958,6 +4990,34 @@ mod tests {
         assert_eq!(normalize_split_percent(99), 99);
         assert_eq!(normalize_split_percent(100), 99);
         assert_eq!(normalize_split_percent(u8::MAX), 99);
+    }
+
+    #[test]
+    fn tiered_scrollback_bulk_request_validation_is_uniform_and_bounded() {
+        assert!(
+            validate_pane_tiered_scrollback_bulk_request(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("at least one pane")
+        );
+        let maximum = u64::try_from(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES)
+            .expect("bulk pane maximum fits u64");
+        let oversized = (0..=maximum).collect::<Vec<_>>();
+        assert!(
+            validate_pane_tiered_scrollback_bulk_request(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("maximum is 256")
+        );
+        assert!(
+            validate_pane_tiered_scrollback_bulk_request(&[3, 5, 3])
+                .unwrap_err()
+                .to_string()
+                .contains("repeats pane 3")
+        );
+        let exact = (0..maximum).collect::<Vec<_>>();
+        validate_pane_tiered_scrollback_bulk_request(&exact)
+            .expect("the exact unique maximum must remain admissible");
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -10004,9 +10064,10 @@ impl WeztermInterface for MockWezterm {
     fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
-        _pane_ids: &'a [u64],
+        pane_ids: &'a [u64],
     ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
         Box::pin(async move {
+            validate_pane_tiered_scrollback_bulk_request(pane_ids)?;
             mock_checkpoint(cx, "mock tiered scrollback bulk summary")?;
             #[cfg(test)]
             {
@@ -10027,7 +10088,7 @@ impl WeztermInterface for MockWezterm {
                     .lock()
                     .unwrap_or_else(record_poison_and_recover);
                 if let Some(outcomes) = outcomes.as_ref() {
-                    let entries = _pane_ids
+                    let entries = pane_ids
                         .iter()
                         .copied()
                         .map(|pane_id| PaneTieredScrollbackBatchEntry {

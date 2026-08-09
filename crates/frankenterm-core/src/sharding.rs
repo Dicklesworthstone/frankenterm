@@ -24,8 +24,8 @@ use crate::patterns::AgentType;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
     MoveDirection, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackBatchEntry,
-    PaneTieredScrollbackSummary, PANE_TIERED_SCROLLBACK_BULK_MAX_PANES, SpawnTarget,
-    SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
+    PaneTieredScrollbackSummary, SpawnTarget, SplitDirection, WeztermFuture, WeztermHandle,
+    WeztermInterface,
 };
 
 // =============================================================================
@@ -2444,25 +2444,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_ids: &'a [u64],
     ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
         Box::pin(async move {
-            if pane_ids.len() > PANE_TIERED_SCROLLBACK_BULK_MAX_PANES {
-                return Err(WeztermError::CommandFailed(format!(
-                    "bulk tiered-scrollback request contains {} panes; maximum is {}",
-                    pane_ids.len(),
-                    PANE_TIERED_SCROLLBACK_BULK_MAX_PANES,
-                ))
-                .into());
-            }
-            let mut unique = HashSet::with_capacity(pane_ids.len());
-            if let Some(duplicate) = pane_ids
-                .iter()
-                .copied()
-                .find(|pane_id| !unique.insert(*pane_id))
-            {
-                return Err(WeztermError::CommandFailed(format!(
-                    "bulk tiered-scrollback request repeats pane {duplicate}",
-                ))
-                .into());
-            }
+            crate::wezterm::validate_pane_tiered_scrollback_bulk_request(pane_ids)?;
             if cx.checkpoint().is_err() {
                 return Err(crate::wezterm::wezterm_cx_error(
                     cx,
@@ -5216,7 +5198,13 @@ mod tests {
             .unwrap();
             let cx = crate::cx::for_testing();
 
-            let maximum = u64::try_from(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES)
+            let empty_error = client
+                .pane_tiered_scrollback_summaries_bulk_with_cx(&cx, &[])
+                .await
+                .expect_err("empty global batch must fail before shard routing");
+            assert!(empty_error.to_string().contains("at least one pane"));
+
+            let maximum = u64::try_from(crate::wezterm::PANE_TIERED_SCROLLBACK_BULK_MAX_PANES)
                 .expect("bulk pane maximum fits u64");
             let oversized = (0..=maximum).collect::<Vec<_>>();
             let oversized_error = client

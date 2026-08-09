@@ -3661,10 +3661,8 @@ fn sample_tiered_scrollback_status(
     );
     match sampled {
         Ok(outcome) => outcome,
-        Err(error) => {
-            log::warn!(
-                "tiered scrollback health callback panicked for pane {pane_id}: {error}"
-            );
+        Err(_error) => {
+            log::warn!("tiered scrollback health callback panicked for pane {pane_id}");
             PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked
         }
     }

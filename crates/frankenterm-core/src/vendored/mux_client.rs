@@ -278,7 +278,7 @@ pub enum DirectMuxError {
 }
 
 impl DirectMuxError {
-    fn proven_pre_write_rejection(error: Self) -> Self {
+    pub(crate) fn proven_pre_write_rejection(error: Self) -> Self {
         debug_assert!(!matches!(&error, Self::ProvenPreWriteRejection(_)));
         Self::ProvenPreWriteRejection(Box::new(error))
     }
@@ -13236,6 +13236,7 @@ mod tests {
             assert!(old_peer.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1"));
 
             for invalid in [
+                Vec::new(),
                 vec![7, 7],
                 (0..=codec::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES).collect(),
             ] {
