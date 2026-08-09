@@ -3010,6 +3010,23 @@ mod tests {
         }
     }
 
+    fn wait_for_native_discovery_state_blocking(
+        predicate: impl Fn(NativeDiscoveryRuntimeMetrics) -> bool,
+    ) {
+        let started = std::time::Instant::now();
+        loop {
+            let snapshot = native_discovery_runtime_metrics();
+            if predicate(snapshot) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "native discovery blocking lifecycle did not converge: {snapshot:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     // -- AgentProvider --
 
     #[test]
@@ -4925,6 +4942,82 @@ mod tests {
     }
 
     #[test]
+    fn runtime_shutdown_cancels_and_drains_native_discovery_owner() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
+        let worker_barrier = Arc::clone(&barrier);
+        let (cancellation_tx, cancellation_rx) = std::sync::mpsc::sync_channel(1);
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("native discovery shutdown runtime");
+        runtime.spawn_detached(async move {
+            let request_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let _ = run_owned_native_discovery_with_cx(
+                &request_cx,
+                move |cancellation, scan_cx| {
+                    cancellation_tx
+                        .send(cancellation.clone())
+                        .expect("publish native shutdown cancellation token");
+                    worker_barrier.wait_in_worker();
+                    cancellation.checkpoint(&scan_cx)?;
+                    Ok(SessionDiscoveryResult::default())
+                },
+            )
+            .await;
+        });
+
+        let cancellation = cancellation_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("native shutdown worker must start");
+        wait_for_native_discovery_state_blocking(|snapshot| {
+            barrier.started.load(Ordering::Acquire)
+                && snapshot.active_scans == before.active_scans + 1
+                && snapshot.active_workers == before.active_workers + 1
+                && snapshot.active_observers == before.active_observers + 1
+        });
+
+        let release_barrier = Arc::clone(&barrier);
+        let shutdown_observed = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while !cancellation.runtime_shutdown.is_shutdown_requested()
+                && started.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let observed = cancellation.runtime_shutdown.is_shutdown_requested();
+            release_barrier.release();
+            observed
+        });
+
+        drop(runtime);
+        assert!(
+            shutdown_observed
+                .join()
+                .expect("native shutdown observer thread must not panic"),
+            "runtime drop must publish shutdown before draining native work"
+        );
+        wait_for_native_discovery_state_blocking(|snapshot| {
+            snapshot.active_scans == before.active_scans
+                && snapshot.active_workers == before.active_workers
+                && snapshot.active_observers == before.active_observers
+        });
+
+        let after = native_discovery_runtime_metrics();
+        assert_eq!(after.admitted_total, before.admitted_total + 1);
+        assert_eq!(after.completed_total, before.completed_total + 1);
+        assert_eq!(
+            after.cancel_requested_total,
+            before.cancel_requested_total + 1
+        );
+        assert_eq!(
+            after.undelivered_receipt_total,
+            before.undelivered_receipt_total + 1
+        );
+    }
+
+    #[test]
     fn native_discovery_runtime_rejection_releases_permit_without_work() {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
@@ -4968,7 +5061,10 @@ mod tests {
         assert_eq!(after.active_scans, before.active_scans);
         assert_eq!(after.active_workers, before.active_workers);
         assert_eq!(after.active_observers, before.active_observers);
-        assert_eq!(after.admitted_total, before.admitted_total + 1);
+        assert_eq!(
+            after.admitted_total, before.admitted_total,
+            "missing application-runtime authority must reject before subsystem admission"
+        );
         assert_eq!(
             after.runtime_rejected_total,
             before.runtime_rejected_total + 1
