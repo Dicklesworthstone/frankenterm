@@ -224,6 +224,7 @@ const SESSION_COMMAND_CANCEL_REQUESTED: u8 = 1;
 const SESSION_COMMAND_WORKER_SETTLED: u8 = 2;
 
 static NATIVE_DISCOVERY_ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_DISCOVERY_ACTIVE_OWNERS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_DISCOVERY_ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_DISCOVERY_ACTIVE_OBSERVERS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_DISCOVERY_MAX_ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
@@ -248,10 +249,12 @@ fn saturating_increment(counter: &AtomicU64) {
 /// or error payload can cross this observability boundary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeDiscoveryRuntimeMetrics {
-    /// Subsystem-admitted scans whose blocking-work object has not yet settled.
-    /// This includes work queued behind the blocking pool as well as work that
-    /// has begun running.
+    /// Subsystem-admitted transactions not yet settled through terminal receipt.
+    /// This includes work queued behind the blocking pool, work that has begun
+    /// running, and owner tasks delivering their result.
     pub active_scans: usize,
+    /// Runtime-region supervisors admitted but not yet fully returned.
+    pub active_owners: usize,
     /// Blocking closures that have actually begun executing.
     pub active_workers: usize,
     /// Caller futures still waiting for their typed terminal receipt.
@@ -282,6 +285,7 @@ pub struct NativeDiscoveryRuntimeMetrics {
 pub fn native_discovery_runtime_metrics() -> NativeDiscoveryRuntimeMetrics {
     NativeDiscoveryRuntimeMetrics {
         active_scans: NATIVE_DISCOVERY_ACTIVE_SCANS.load(Ordering::Acquire),
+        active_owners: NATIVE_DISCOVERY_ACTIVE_OWNERS.load(Ordering::Acquire),
         active_workers: NATIVE_DISCOVERY_ACTIVE_WORKERS.load(Ordering::Acquire),
         active_observers: NATIVE_DISCOVERY_ACTIVE_OBSERVERS.load(Ordering::Acquire),
         max_active_scans: NATIVE_DISCOVERY_MAX_ACTIVE_SCANS.load(Ordering::Acquire),
@@ -2276,6 +2280,22 @@ impl Drop for NativeDiscoveryPermit {
 
 struct NativeDiscoveryWorkerGuard;
 
+struct NativeDiscoveryOwnerGuard;
+
+impl NativeDiscoveryOwnerGuard {
+    fn new() -> Self {
+        NATIVE_DISCOVERY_ACTIVE_OWNERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for NativeDiscoveryOwnerGuard {
+    fn drop(&mut self) {
+        let previous = NATIVE_DISCOVERY_ACTIVE_OWNERS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "native discovery owner counter underflow");
+    }
+}
+
 impl NativeDiscoveryWorkerGuard {
     fn new() -> Self {
         NATIVE_DISCOVERY_ACTIVE_WORKERS.fetch_add(1, Ordering::AcqRel);
@@ -2443,15 +2463,18 @@ where
             reason: SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown,
         });
     };
-    let permit = NativeDiscoveryPermit::try_acquire().ok_or(
+    let permit = Arc::new(NativeDiscoveryPermit::try_acquire().ok_or(
         SessionResumeError::DiscoveryAdmissionRejected {
             reason: SessionDiscoveryAdmissionRejection::SubsystemSaturated,
         },
-    )?;
+    )?);
     let cancellation = NativeDiscoveryCancellation::new(runtime_shutdown);
     let owner_cancellation = cancellation.clone();
     let scan_cx = cx.clone();
     let (receipt_tx, receipt_rx) = crate::runtime_async::oneshot::channel();
+    // Reserve owner accounting before spawn so runtime-queued supervisors are
+    // visible too. A rejected spawn drops the captured guard with its future.
+    let owner_guard = NativeDiscoveryOwnerGuard::new();
 
     // The owner context has an independent cancellation identity so caller
     // drop cannot abandon the blocking join, but it retains the caller's exact
@@ -2462,14 +2485,15 @@ where
     let owner = crate::runtime_async::task::try_spawn_with_cx(
         &owner_cx,
         move |_owner_cx| async move {
+            let _owner_guard = owner_guard;
             let worker_cancellation = owner_cancellation.clone();
             let worker_scan_cx = scan_cx.clone();
+            let worker_permit = Arc::clone(&permit);
             let worker = crate::runtime_async::spawn_blocking(move || {
-                // The permit belongs to the blocking-work object, not merely
-                // to the async supervisor. If runtime shutdown drops the
-                // supervisor after this closure starts, the hard concurrency
-                // ceiling must remain occupied until the closure settles.
-                let _permit = permit;
+                // The blocking-work object shares the permit with its owner.
+                // If either side is dropped first, the hard ceiling remains
+                // occupied until both work and terminal receipt have settled.
+                let _permit = worker_permit;
                 let _worker_guard = NativeDiscoveryWorkerGuard::new();
                 worker_cancellation.checkpoint(&worker_scan_cx)?;
                 work(worker_cancellation, worker_scan_cx)
@@ -2488,6 +2512,10 @@ where
             if receipt_tx.send_with_cx(&delivery_cx, receipt).is_err() {
                 saturating_increment(&NATIVE_DISCOVERY_UNDELIVERED_RECEIPT_TOTAL);
             }
+            // The same hard cap spans queued/running blocking work and result
+            // delivery, so ready-but-unpolled owners cannot accumulate behind
+            // repeated permit reuse under scheduler unfairness.
+            drop(permit);
             // Runtime::drop waits on this lease before tearing down the
             // scheduler. Release only after the one terminal receipt has been
             // delivered or conclusively found undeliverable.
@@ -4512,6 +4540,21 @@ mod tests {
         assert!(native_cx_surface.contains("NativeDiscoveryObserverGuard"));
         assert!(native_cx_surface.contains("NativeDiscoveryTerminalReceipt"));
         assert!(native_cx_surface.contains("oneshot_recv_with_cx"));
+        let shared_permit = native_cx_surface
+            .find("let worker_permit = Arc::clone(&permit)")
+            .expect("blocking work must share the transaction permit");
+        let receipt_delivery = native_cx_surface
+            .find("receipt_tx.send_with_cx")
+            .expect("owner must publish one typed receipt");
+        let permit_release = native_cx_surface
+            .find("drop(permit)")
+            .expect("owner must release its transaction permit");
+        let shutdown_lease_release = native_cx_surface
+            .find("drop(shutdown_lease)")
+            .expect("owner must release its runtime shutdown lease");
+        assert!(shared_permit < receipt_delivery);
+        assert!(receipt_delivery < permit_release);
+        assert!(permit_release < shutdown_lease_release);
         assert!(
             native_cx_surface
                 .contains("discover_antigravity_conversations_from_home_with_checkpoint")
@@ -4568,6 +4611,7 @@ mod tests {
             assert!(report.entries.is_empty());
             wait_for_native_discovery_state(&cx, |snapshot| {
                 snapshot.active_scans == before.active_scans
+                    && snapshot.active_owners == before.active_owners
                     && snapshot.active_workers == before.active_workers
                     && snapshot.active_observers == before.active_observers
             })
@@ -4620,6 +4664,7 @@ mod tests {
             assert_eq!(error, SessionResumeError::AsyncInfrastructureFailure);
             wait_for_native_discovery_state(&cx, |snapshot| {
                 snapshot.active_scans == before.active_scans
+                    && snapshot.active_owners == before.active_owners
                     && snapshot.active_workers == before.active_workers
                     && snapshot.active_observers == before.active_observers
             })
@@ -4633,7 +4678,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_native_discovery_observer_cancels_but_owner_settles() {
+    fn dropping_native_discovery_observer_discards_undeliverable_success_receipt() {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
         let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
@@ -4654,11 +4699,14 @@ mod tests {
                 move |_child_cx| async move {
                     run_owned_native_discovery_with_cx(
                         &task_cx,
-                        move |cancellation, scan_cx| {
+                        move |_cancellation, _scan_cx| {
                             worker_barrier.wait_in_worker();
-                            let result = cancellation.checkpoint(&scan_cx);
+                            // Model work that crosses its indivisible blocking
+                            // boundary just before observer cancellation and
+                            // therefore still returns a successful payload. The
+                            // owner must settle and drop that payload after the
+                            // receiver has deterministically disappeared.
                             worker_settled_inner.store(true, Ordering::Release);
-                            result?;
                             Ok(SessionDiscoveryResult::default())
                         },
                     )
@@ -4669,6 +4717,7 @@ mod tests {
             wait_for_native_discovery_state(&request_cx, |snapshot| {
                 barrier.started.load(Ordering::Acquire)
                     && snapshot.active_scans == before.active_scans + 1
+                    && snapshot.active_owners == before.active_owners + 1
                     && snapshot.active_workers == before.active_workers + 1
                     && snapshot.active_observers == before.active_observers + 1
             })
@@ -4680,6 +4729,7 @@ mod tests {
             barrier.release();
             wait_for_native_discovery_state(&request_cx, |snapshot| {
                 snapshot.active_scans == before.active_scans
+                    && snapshot.active_owners == before.active_owners
                     && snapshot.active_workers == before.active_workers
                     && snapshot.active_observers == before.active_observers
             })
@@ -4763,6 +4813,7 @@ mod tests {
                 wait_for_native_discovery_state(&request_cx, |snapshot| {
                     gate.reached.load(Ordering::Acquire) >= target
                         && snapshot.active_scans == before.active_scans + 1
+                        && snapshot.active_owners == before.active_owners + 1
                         && snapshot.active_workers == before.active_workers + 1
                         && snapshot.active_observers == before.active_observers + 1
                 })
@@ -4775,6 +4826,7 @@ mod tests {
                 gate.release();
                 wait_for_native_discovery_state(&request_cx, |snapshot| {
                     snapshot.active_scans == before.active_scans
+                        && snapshot.active_owners == before.active_owners
                         && snapshot.active_workers == before.active_workers
                         && snapshot.active_observers == before.active_observers
                 })
@@ -4844,6 +4896,7 @@ mod tests {
             wait_for_native_discovery_state(&settlement_cx, |snapshot| {
                 barrier.started.load(Ordering::Acquire)
                     && snapshot.active_scans == before.active_scans + 1
+                    && snapshot.active_owners == before.active_owners + 1
                     && snapshot.active_workers == before.active_workers + 1
                     && snapshot.active_observers == before.active_observers + 1
             })
@@ -4862,6 +4915,7 @@ mod tests {
             barrier.release();
             wait_for_native_discovery_state(&settlement_cx, |snapshot| {
                 snapshot.active_scans == before.active_scans
+                    && snapshot.active_owners == before.active_owners
                     && snapshot.active_workers == before.active_workers
                     && snapshot.active_observers == before.active_observers
             })
@@ -4918,6 +4972,7 @@ mod tests {
             wait_for_native_discovery_state(&settlement_cx, |snapshot| {
                 barrier.started.load(Ordering::Acquire)
                     && snapshot.active_scans == before.active_scans + 1
+                    && snapshot.active_owners == before.active_owners + 1
                     && snapshot.active_workers == before.active_workers + 1
                     && snapshot.active_observers == before.active_observers + 1
             })
@@ -4936,6 +4991,7 @@ mod tests {
             barrier.release();
             wait_for_native_discovery_state(&settlement_cx, |snapshot| {
                 snapshot.active_scans == before.active_scans
+                    && snapshot.active_owners == before.active_owners
                     && snapshot.active_workers == before.active_workers
                     && snapshot.active_observers == before.active_observers
             })
@@ -4992,6 +5048,7 @@ mod tests {
         wait_for_native_discovery_state_blocking(|snapshot| {
             barrier.started.load(Ordering::Acquire)
                 && snapshot.active_scans == before.active_scans + 1
+                && snapshot.active_owners == before.active_owners + 1
                 && snapshot.active_workers == before.active_workers + 1
                 && snapshot.active_observers == before.active_observers + 1
         });
@@ -5018,6 +5075,7 @@ mod tests {
         );
         wait_for_native_discovery_state_blocking(|snapshot| {
             snapshot.active_scans == before.active_scans
+                && snapshot.active_owners == before.active_owners
                 && snapshot.active_workers == before.active_workers
                 && snapshot.active_observers == before.active_observers
         });
@@ -5036,6 +5094,7 @@ mod tests {
             assert!(report.entries.is_empty());
             wait_for_native_discovery_state(&replacement_cx, |snapshot| {
                 snapshot.active_scans == before.active_scans
+                    && snapshot.active_owners == before.active_owners
                     && snapshot.active_workers == before.active_workers
                     && snapshot.active_observers == before.active_observers
             })
@@ -5064,6 +5123,7 @@ mod tests {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
         assert_eq!(before.active_scans, 0, "lifecycle tests must start quiescent");
+        assert_eq!(before.active_owners, 0, "lifecycle tests must start quiescent");
         let work_ran = Arc::new(AtomicBool::new(false));
         let work_ran_inner = Arc::clone(&work_ran);
 
@@ -5101,6 +5161,7 @@ mod tests {
         let after = native_discovery_runtime_metrics();
         assert!(!work_ran.load(Ordering::Acquire));
         assert_eq!(after.active_scans, before.active_scans);
+        assert_eq!(after.active_owners, before.active_owners);
         assert_eq!(after.active_workers, before.active_workers);
         assert_eq!(after.active_observers, before.active_observers);
         assert_eq!(
@@ -5118,6 +5179,7 @@ mod tests {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
         assert_eq!(before.active_scans, 0, "lifecycle tests must start quiescent");
+        assert_eq!(before.active_owners, 0, "lifecycle tests must start quiescent");
         let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
         let started = Arc::new(AtomicUsize::new(0));
         let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
@@ -5153,6 +5215,7 @@ mod tests {
             wait_for_native_discovery_state(&wait_cx, |snapshot| {
                 started.load(Ordering::Acquire) == MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS
                     && snapshot.active_scans == MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS
+                    && snapshot.active_owners == MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS
             })
             .await;
 
@@ -5184,6 +5247,7 @@ mod tests {
             barrier.release();
             wait_for_native_discovery_state(&wait_cx, |snapshot| {
                 snapshot.active_scans == 0
+                    && snapshot.active_owners == 0
                     && snapshot.active_workers == 0
                     && snapshot.active_observers == 0
             })
