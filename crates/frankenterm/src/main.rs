@@ -27584,7 +27584,7 @@ struct WatchClaimOutputMetrics {
     expiry_recoveries: u64,
     descriptor_restore_failures: u64,
     max_blocked_duration_ns: u64,
-    max_cancellation_latency_ns: u64,
+    cancellation_poll_interval_ns: u64,
 }
 
 struct WatchClaimOutputCoordinator {
@@ -27601,7 +27601,6 @@ struct WatchClaimOutputCoordinator {
     expiry_recoveries: std::sync::atomic::AtomicU64,
     descriptor_restore_failures: std::sync::atomic::AtomicU64,
     max_blocked_duration_ns: std::sync::atomic::AtomicU64,
-    max_cancellation_latency_ns: std::sync::atomic::AtomicU64,
 }
 
 impl WatchClaimOutputCoordinator {
@@ -27620,7 +27619,6 @@ impl WatchClaimOutputCoordinator {
             expiry_recoveries: std::sync::atomic::AtomicU64::new(0),
             descriptor_restore_failures: std::sync::atomic::AtomicU64::new(0),
             max_blocked_duration_ns: std::sync::atomic::AtomicU64::new(0),
-            max_cancellation_latency_ns: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -27670,13 +27668,6 @@ impl WatchClaimOutputCoordinator {
             .fetch_max(blocked_duration_ns, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn record_cancellation_latency(&self, cancellation_latency_ns: u64) {
-        self.max_cancellation_latency_ns.fetch_max(
-            cancellation_latency_ns,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
     #[cfg(test)]
     fn snapshot(&self) -> WatchClaimOutputMetrics {
         WatchClaimOutputMetrics {
@@ -27713,9 +27704,9 @@ impl WatchClaimOutputCoordinator {
             max_blocked_duration_ns: self
                 .max_blocked_duration_ns
                 .load(std::sync::atomic::Ordering::Relaxed),
-            max_cancellation_latency_ns: self
-                .max_cancellation_latency_ns
-                .load(std::sync::atomic::Ordering::Relaxed),
+            // Cancellation registers the task waker directly with Cx. There
+            // is no timer-poll slice contributing to cancellation latency.
+            cancellation_poll_interval_ns: 0,
         }
     }
 }
@@ -27781,7 +27772,6 @@ struct WatchClaimOutputFailure {
     kind: WatchClaimOutputFailureKind,
     bytes_written: usize,
     blocked_duration_ns: u64,
-    cancellation_latency_ns: u64,
     source: Option<std::io::Error>,
 }
 
@@ -27856,7 +27846,6 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                     kind: WatchClaimOutputFailureKind::WriteZero,
                     bytes_written,
                     blocked_duration_ns: 0,
-                    cancellation_latency_ns: 0,
                     source: None,
                 });
             }
@@ -27869,7 +27858,6 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                     kind: WatchClaimOutputFailureKind::Write,
                     bytes_written,
                     blocked_duration_ns: 0,
-                    cancellation_latency_ns: 0,
                     source: Some(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "writer reported progress beyond the supplied buffer",
@@ -27883,7 +27871,6 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written,
                         blocked_duration_ns: 0,
-                        cancellation_latency_ns: 0,
                         source: Some(source),
                     });
                 }
@@ -27893,7 +27880,6 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                     kind: WatchClaimOutputFailureKind::Write,
                     bytes_written,
                     blocked_duration_ns: 0,
-                    cancellation_latency_ns: 0,
                     source: Some(source),
                 });
             }
@@ -27916,7 +27902,6 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                         kind: WatchClaimOutputFailureKind::Flush,
                         bytes_written,
                         blocked_duration_ns: 0,
-                        cancellation_latency_ns: 0,
                         source: Some(source),
                     });
                 }
@@ -27926,7 +27911,6 @@ fn write_watch_claim_line_synchronously<W: std::io::Write>(
                     kind: WatchClaimOutputFailureKind::Flush,
                     bytes_written,
                     blocked_duration_ns: 0,
-                    cancellation_latency_ns: 0,
                     source: Some(source),
                 });
             }
@@ -28057,13 +28041,11 @@ impl WatchClaimStdoutWriter {
                 };
                 let bytes_written = error.bytes_written();
                 let blocked_duration_ns = error.blocked_duration_ns();
-                let cancellation_latency_ns = error.cancellation_latency_ns();
                 let source = restore.err().or_else(|| error.into_source());
                 WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
                     kind,
                     bytes_written,
                     blocked_duration_ns,
-                    cancellation_latency_ns,
                     source,
                 })
             }
@@ -28167,7 +28149,6 @@ where
                 kind: WatchClaimOutputFailureKind::Write,
                 bytes_written: success.bytes_written,
                 blocked_duration_ns: success.blocked_duration_ns,
-                cancellation_latency_ns: 0,
                 source: Some(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "writer reported a flushed byte count different from the admitted line",
@@ -28189,7 +28170,6 @@ where
                 kind: WatchClaimOutputFailureKind::Write,
                 bytes_written: success.bytes_written,
                 blocked_duration_ns: success.blocked_duration_ns,
-                cancellation_latency_ns: 0,
                 source: Some(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "writer reported a flushed byte count different from the admitted line",
@@ -28241,10 +28221,7 @@ where
         WatchClaimOutputAttempt::Failed(failure) if failure.bytes_written == 0 => {
             WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(failure.blocked_duration_ns);
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.zero_byte_failures);
-            if matches!(failure.kind, WatchClaimOutputFailureKind::ContextCancelled) {
-                WATCH_CLAIM_OUTPUT_COORDINATOR
-                    .record_cancellation_latency(failure.cancellation_latency_ns);
-            }
+            let cancellation_poll_interval_ns = 0_u64;
             let pipe_closed = failure.is_broken_pipe();
             let write_error = failure.into_io_error();
             return match release_watch_claim_bounded(storage, &lease).await {
@@ -28264,6 +28241,7 @@ where
                         event_id = queued_event_id,
                         cursor_generation = queued_cursor_generation,
                         lease_expires_at_ms = queued_lease_expiry,
+                        cancellation_poll_interval_ns,
                         "watch-events zero-byte output failure lost delivery-lease ownership before release"
                     );
                     Err(write_error)
@@ -28283,10 +28261,7 @@ where
         }
         WatchClaimOutputAttempt::Failed(failure) => {
             WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(failure.blocked_duration_ns);
-            if matches!(failure.kind, WatchClaimOutputFailureKind::ContextCancelled) {
-                WATCH_CLAIM_OUTPUT_COORDINATOR
-                    .record_cancellation_latency(failure.cancellation_latency_ns);
-            }
+            let cancellation_poll_interval_ns = 0_u64;
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.partial_ambiguities);
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries);
             tracing::warn!(
@@ -28295,6 +28270,7 @@ where
                 lease_expires_at_ms = queued_lease_expiry,
                 bytes_written = failure.bytes_written,
                 blocked_duration_ns = failure.blocked_duration_ns,
+                cancellation_poll_interval_ns,
                 failure_kind = ?failure.kind,
                 "watch-events partial output is ambiguous; stream must stop and lease remains for expiry recovery"
             );

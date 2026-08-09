@@ -6765,7 +6765,6 @@ pub struct NonblockingWriteError {
     kind: NonblockingWriteErrorKind,
     bytes_written: usize,
     blocked_duration_ns: u64,
-    cancellation_latency_ns: u64,
     source: Option<std::io::Error>,
 }
 
@@ -6781,24 +6780,15 @@ impl NonblockingWriteError {
             kind,
             bytes_written,
             blocked_duration_ns,
-            cancellation_latency_ns: 0,
             source,
         }
     }
 
-    fn cancelled(
-        cx: &crate::cx::Cx,
-        bytes_written: usize,
-        blocked_duration_ns: u64,
-    ) -> Self {
-        let cancellation_latency_ns = cx.root_cancel_cause().map_or(0, |reason| {
-            cx_timer_now(cx).duration_since(reason.timestamp)
-        });
+    fn cancelled(bytes_written: usize, blocked_duration_ns: u64) -> Self {
         Self {
             kind: NonblockingWriteErrorKind::ContextCancelled,
             bytes_written,
             blocked_duration_ns,
-            cancellation_latency_ns,
             source: None,
         }
     }
@@ -6819,12 +6809,6 @@ impl NonblockingWriteError {
     #[must_use]
     pub const fn blocked_duration_ns(&self) -> u64 {
         self.blocked_duration_ns
-    }
-
-    /// Time from the structural cancellation request to output settlement.
-    #[must_use]
-    pub const fn cancellation_latency_ns(&self) -> u64 {
-        self.cancellation_latency_ns
     }
 
     /// Return true only when the owning capability context stopped the write.
@@ -6932,11 +6916,7 @@ where
     };
 
     if cx.checkpoint().is_err() {
-        return Err(NonblockingWriteError::cancelled(
-            cx,
-            progress(),
-            blocked_duration(),
-        ));
+        return Err(NonblockingWriteError::cancelled(progress(), blocked_duration()));
     }
 
     let output = std::pin::pin!(std::future::poll_fn(|task_cx| {
@@ -7088,11 +7068,7 @@ where
         Either::Left((result, _cancellation)) => result,
         Either::Right((_cancelled, output)) => {
             drop(output);
-            Err(NonblockingWriteError::cancelled(
-                cx,
-                progress(),
-                blocked_duration(),
-            ))
+            Err(NonblockingWriteError::cancelled(progress(), blocked_duration()))
         }
     }
 }
