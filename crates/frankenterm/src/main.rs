@@ -28208,14 +28208,8 @@ where
                 finalized,
                 "watch-events restored durable truth after stdout descriptor restoration failed"
             );
-            return Ok(if finalized {
-                WatchEventClaimDelivery::DescriptorRestoreLost {
-                    flushed_at: success.flushed_at,
-                }
-            } else {
-                WatchEventClaimDelivery::FinalizationLost {
-                    flushed_at: success.flushed_at,
-                }
+            return Ok(WatchEventClaimDelivery::DescriptorRestoreLost {
+                flushed_at: success.flushed_at,
             });
         }
         WatchClaimOutputAttempt::Failed(failure) if failure.bytes_written == 0 => {
