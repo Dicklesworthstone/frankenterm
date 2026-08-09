@@ -3770,6 +3770,53 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace the runtime-owned supervisor only after another design proves that caller-future drop, caller cancellation, saturation, runtime rejection, and shutdown cannot orphan an admitted blocking join; preserves exactly one typed terminal receipt; bounds live owners, workers, observers, queued work, directory entries, path and metadata bytes, and syscall exposure; and converges under deterministic barriers plus strict-remote exact-source tests.
 
+### IS-N130 — Fleet health must not reuse per-pane render-delta RPCs
+
+- **Classification:** kept structural; performance promotion withheld for
+  missing target-hardware evidence
+- **Bead:** `ft-interactive-systems-performance-4tenz.29`
+- **Baseline revision:** `b20f16ae715a2ca179f38fca95de177ce6864076`
+- **Candidate revision:** `df2e495c458c355a70636cb49c94fa778722550c`
+- **Target identity:** strict-remote `ovh-a` Linux compile/test worker for source
+  proof only; no M4/M5 macOS, 128-core Threadripper, display, LAN, thermal, or
+  production-session identity was measured
+- **Workload identity:** deterministic codec, mux-client, mux-server, shard,
+  runtime, panic, cancellation, old-peer, 200-pane, and 513-pane structural
+  fixtures; no retained real 20/50/200-pane workload run
+- **Focused command/artifact:** exact-source strict-remote
+  `cargo test -p codec -p frankenterm-core -p frankenterm-mux-server-impl tiered_scrollback -- --nocapture`
+  under RCH job `j-29969059034431491`; result pending at ledger write time
+- **Broad command/artifact:** real-remote package all-targets `cargo check -p
+  codec -p frankenterm-core -p frankenterm-mux-server-impl --all-targets`
+  passed under RCH job `j-29969059034431490`; final exact-source workspace
+  check, Clippy, and format proof remain separate gates
+- **Samples/statistics:** none; no runtime A/B, sample distribution,
+  confidence interval, or coefficient of variation was collected
+- **Equivalence:** deterministic source tests cover stable result order, typed
+  missing/closed/unavailable/panic siblings, cancellation, partial completion,
+  malformed request rejection, response cardinality, and old-peer fallback;
+  byte/state replay plus visual, cursor, IME, accessibility, resize, and zoom
+  equivalence remain unproved
+- **Measured result:** none. The source now uses codec-v57 `PDU93`/`PDU94` with
+  at most 256 unique nonempty pane IDs, 4 KiB request and 32 KiB response codec
+  ceilings, one frozen-registration mux turn per chunk, ten bounded wire
+  fields, fair inter-chunk yields, a sixteen-shard admission cap, and a
+  separately bounded old-peer fallback. Those bounds are not a latency result.
+- **Rejected hypotheses:** a nineteen-field or 64 KiB health response was not
+  justified; serial shard fanout needlessly extends wall time; unbounded shard
+  fanout converts a health read into an admission burst; treating an old peer
+  as a transport failure poisons a reusable pool connection; counters charged
+  before admission or under ambiguous names overstate work; render-delta RPCs
+  perform unrelated viewport work; and empty, duplicate, oversize, or otherwise
+  malformed batches must not be masked as an unsupported-peer `None` result.
+- **Decision:** kept durable infrastructure. The dedicated bounded path,
+  uniform pre-write validation, frozen server snapshot, typed sibling
+  containment, bounded concurrency, cancellation convergence, honest metrics,
+  and old-peer circuit remove avoidable work and ambiguity. Performance
+  promotion is explicitly withheld.
+- **Primary retry condition:**
+  > Promote the bulk health path as a performance improvement only after retained same-source 20/50/200-pane runs on the intended M4/M5 Mac and 128-core Threadripper/LAN target record request count, health wall time, mux queue wait, interactive latency tails, resource envelopes, deterministic state equivalence, and resize/zoom visual equivalence while all exact-source release gates pass.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

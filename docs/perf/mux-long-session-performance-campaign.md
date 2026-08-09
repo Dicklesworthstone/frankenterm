@@ -1672,6 +1672,25 @@ substrate, but the user-level result promised above has not yet been proved:
   but the negotiated production path is still dormant. Its presence is not a
   latency or allocation win until capability activation and real workload
   evidence prove that the legacy path is no longer serving supported sessions.
+- Fleet tiered-scrollback health now has a dedicated codec-v57 bulk path
+  (`PDU93`/`PDU94`) instead of borrowing per-pane render, viewport, reflow, or
+  delta RPCs. Each logical request is sorted and deduplicated, admitted in
+  chunks of at most 256 panes, and yields between chunks. The server freezes
+  all pane registrations before invoking any pane callback and resolves one
+  bounded chunk in one mux turn; one missing, closed, unavailable, or panicking
+  pane becomes a typed sibling result rather than aborting the batch. The wire
+  result carries ten bounded health fields rather than render payloads, with a
+  4 KiB request ceiling and a 32 KiB response ceiling. Sharded domains admit at
+  most sixteen shard requests concurrently, restore global request order, stop
+  admitting new work on cancellation or terminal error, and drain already
+  admitted work. Old peers are capability-fenced before the new PDU is written
+  and retain a healthy pooled connection while the runtime uses a separately
+  bounded legacy fallback. Content-free counters distinguish logical bulk
+  requests, admitted batches, server wire requests, queue/snapshot duration,
+  response size, partial outcomes, cancellation, and fallback. These are
+  structural work-, memory-, fairness-, and failure-containment properties.
+  They do not establish a wall-time, interactive-latency, rendering, visual,
+  M4/M5, or Threadripper improvement without retained same-source target runs.
 - The current source candidate adds atomic dirty source fences, exact damage
   settlement, one-lock local hyperlink/render traversal, generation-safe
   overlay search publication, revision-bound decoded-image validation, bounded
