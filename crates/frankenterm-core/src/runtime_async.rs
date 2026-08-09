@@ -470,6 +470,7 @@ impl RuntimeShutdownToken {
     }
 
     /// Acquire one cleanup lease while admission remains open.
+    #[cfg(any(feature = "session-resume", test))]
     pub(crate) fn try_acquire(&self) -> Option<RuntimeShutdownLease> {
         let mut active = self
             .state
@@ -486,6 +487,7 @@ impl RuntimeShutdownToken {
     }
 
     /// Return whether this runtime has begun its one-way shutdown transition.
+    #[cfg(any(feature = "session-resume", test))]
     pub(crate) fn is_shutdown_requested(&self) -> bool {
         self.state
             .requested
@@ -524,10 +526,12 @@ impl RuntimeShutdownToken {
 
 /// Proof that one admitted cleanup transaction still belongs to a live
 /// runtime shutdown drain.
+#[cfg(any(feature = "session-resume", test))]
 pub(crate) struct RuntimeShutdownLease {
     state: Option<std::sync::Arc<RuntimeShutdownState>>,
 }
 
+#[cfg(any(feature = "session-resume", test))]
 impl Drop for RuntimeShutdownLease {
     fn drop(&mut self) {
         let Some(state) = self.state.take() else {
