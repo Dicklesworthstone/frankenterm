@@ -3785,7 +3785,10 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   fixtures; no retained real 20/50/200-pane workload run
 - **Focused command/artifact:** exact-source strict-remote
   `cargo test -p codec -p frankenterm-core -p frankenterm-mux-server-impl tiered_scrollback -- --nocapture`
-  under RCH job `j-29969059034431491`; result pending at ledger write time
+  under RCH job `j-29969059034431491` failed before tests ran because the
+  `ovh-a` worker exhausted its filesystem while the package-level command was
+  linking unrelated `frankenterm-core` integration-test binaries (`No space
+  left on device`); no local substitute ran and this is not focused proof
 - **Broad command/artifact:** real-remote package all-targets `cargo check -p
   codec -p frankenterm-core -p frankenterm-mux-server-impl --all-targets`
   passed under RCH job `j-29969059034431490`; final exact-source workspace
