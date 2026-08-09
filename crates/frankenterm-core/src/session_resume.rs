@@ -2293,12 +2293,14 @@ impl Drop for NativeDiscoveryWorkerGuard {
 #[derive(Clone)]
 struct NativeDiscoveryCancellation {
     requested: Arc<AtomicBool>,
+    runtime_shutdown: crate::runtime_async::RuntimeShutdownToken,
 }
 
 impl NativeDiscoveryCancellation {
-    fn new() -> Self {
+    fn new(runtime_shutdown: crate::runtime_async::RuntimeShutdownToken) -> Self {
         Self {
             requested: Arc::new(AtomicBool::new(false)),
+            runtime_shutdown,
         }
     }
 
@@ -2309,6 +2311,10 @@ impl NativeDiscoveryCancellation {
     }
 
     fn checkpoint(&self, cx: &crate::cx::Cx) -> Result<(), SessionResumeError> {
+        if self.runtime_shutdown.is_shutdown_requested() {
+            self.request();
+            return Err(SessionResumeError::Cancelled);
+        }
         if self.requested.load(Ordering::Acquire) {
             return Err(SessionResumeError::Cancelled);
         }
@@ -2387,8 +2393,12 @@ fn native_discovery_owner_cx(caller_cx: &crate::cx::Cx) -> crate::cx::Cx {
 
 async fn wait_for_native_discovery_cancellation(
     cx: &crate::cx::Cx,
+    cancellation: &NativeDiscoveryCancellation,
 ) -> NativeDiscoveryCancellationWait {
     loop {
+        if cancellation.runtime_shutdown.is_shutdown_requested() {
+            return NativeDiscoveryCancellationWait::ContextEnded(SessionResumeError::Cancelled);
+        }
         if crate::runtime_async::sleep_with_cx(cx, SESSION_RESUME_CX_POLL_INTERVAL)
             .await
             .is_err()
@@ -2421,12 +2431,24 @@ where
 {
     cx.checkpoint()
         .map_err(|_| session_resume_cx_termination(cx))?;
+    let Some(runtime_shutdown) = crate::runtime_async::current_runtime_shutdown_token() else {
+        saturating_increment(&NATIVE_DISCOVERY_RUNTIME_REJECTED_TOTAL);
+        return Err(SessionResumeError::DiscoveryAdmissionRejected {
+            reason: SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown,
+        });
+    };
+    let Some(shutdown_lease) = runtime_shutdown.try_acquire() else {
+        saturating_increment(&NATIVE_DISCOVERY_RUNTIME_REJECTED_TOTAL);
+        return Err(SessionResumeError::DiscoveryAdmissionRejected {
+            reason: SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown,
+        });
+    };
     let permit = NativeDiscoveryPermit::try_acquire().ok_or(
         SessionResumeError::DiscoveryAdmissionRejected {
             reason: SessionDiscoveryAdmissionRejection::SubsystemSaturated,
         },
     )?;
-    let cancellation = NativeDiscoveryCancellation::new();
+    let cancellation = NativeDiscoveryCancellation::new(runtime_shutdown);
     let owner_cancellation = cancellation.clone();
     let scan_cx = cx.clone();
     let (receipt_tx, receipt_rx) = crate::runtime_async::oneshot::channel();
@@ -2466,6 +2488,10 @@ where
             if receipt_tx.send_with_cx(&delivery_cx, receipt).is_err() {
                 saturating_increment(&NATIVE_DISCOVERY_UNDELIVERED_RECEIPT_TOTAL);
             }
+            // Runtime::drop waits on this lease before tearing down the
+            // scheduler. Release only after the one terminal receipt has been
+            // delivered or conclusively found undeliverable.
+            drop(shutdown_lease);
         },
     );
     let owner = match owner {
@@ -2482,13 +2508,17 @@ where
     // drop the supervisor's blocking join.
     drop(owner);
 
+    let cancellation_wait_signal = cancellation.clone();
     let mut observer = NativeDiscoveryObserverGuard::new(cancellation);
     let receipt_cx = crate::cx::for_request();
     let receipt = std::pin::pin!(crate::runtime_async::oneshot_recv_with_cx(
         &receipt_cx,
         receipt_rx
     ));
-    let cancellation_wait = std::pin::pin!(wait_for_native_discovery_cancellation(cx));
+    let cancellation_wait = std::pin::pin!(wait_for_native_discovery_cancellation(
+        cx,
+        &cancellation_wait_signal
+    ));
     use futures::future::{Either, select};
     match select(receipt, cancellation_wait).await {
         Either::Left((Ok(NativeDiscoveryTerminalReceipt::Settled(result)), _)) => {
