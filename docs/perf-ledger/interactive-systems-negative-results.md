@@ -3466,6 +3466,38 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace the mux-owned spill counters only after another bounded production surface proves the same fixed-population hot-to-warm transition with complete pane coverage, distinct producer identity, and no self-declared transition boolean or synthetic-only field.
 
+### IS-N122 — Exact cyclic backfill can be quadratic while holding the layout-state lock
+
+- **Classification:** source-level algorithmic denial-of-service; bounded exact
+  dominance selection retained
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.2.1`
+- **Rejected inference:** the existing `O(C log C)` quota-conflict peel also
+  bounds the exact fixed-point reconstruction that follows it.
+- **Negative evidence:** the peel handed rejected lineages to a cyclic
+  `VecDeque` scan and restarted the scan after every successful restoration.
+  An alternating live-overlay/tab-slack chain can make only the immediately
+  preceding candidate admissible after each restoration, producing the
+  triangular `C * (C + 1) / 2` trial count. At the supported 4,096-lineage
+  envelope that is 8,390,656 exact candidate probes inside the exclusive
+  cross-process persistence-lock interval. The retained source test constructs
+  this family and compares it with 4,096 dominance queries, but strict-remote
+  execution is still absent because RCH refused local fallback while every
+  worker was unreachable.
+- **Decision:** retain the aggregate-valid and exact-singleton fast paths, then
+  index removed candidates by the three resources that can improve during
+  backfill: live-overlay count, total tabs, and the exact normalized-byte
+  ceiling. Workspace, binding, and tombstone counts are monotonic; normalized
+  and physical candidate byte deltas are identical. A deletion-only outer
+  segment tree with per-node tab-prefix/min-byte trees gives bounded
+  `O(C log^2 C)` build/update/query work and `O(C log C)` memory. Rebuild only
+  on the finitely bounded empty/nonempty JSON collection transitions, retain
+  the final exact one-addition-maximal rejection check, and publish
+  cardinality-free candidate-trial plus lock wait/hold histograms after the
+  file lock drops. No M4/M5/Threadripper or native GUI latency claim follows
+  from the source construction.
+- **Primary retry condition:**
+  > Replace the dominance selector only after another exact deterministic algorithm proves one-addition-maximal rejection, preserves normalized and physical byte authority plus every cardinality limit, and retains a strictly better worst-case bound with strict-remote tests and same-window 4,096-lineage measurements.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
