@@ -30803,6 +30803,7 @@ mod watch_events_tests {
             let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
                 .await
                 .expect("open watch claim storage");
+            let campaign_metrics_before = watch_claim_output_metrics();
 
             let success_id = event_ids[0];
             let mut success_output = Vec::new();
@@ -30855,7 +30856,6 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
-                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::other("injected watch write failure")),
                     }))
                 },
@@ -30889,7 +30889,6 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
-                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "consumer closed before the first byte",
@@ -31095,7 +31094,6 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
-                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "consumer closed before the first byte",
@@ -31146,7 +31144,6 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
-                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::other(
                             "injected error after writer cancellation",
                         )),
@@ -31189,7 +31186,6 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 7,
                         blocked_duration_ns: 123,
-                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "consumer closed after a prefix",
@@ -31321,6 +31317,10 @@ mod watch_events_tests {
             );
             assert_eq!(saturation_after.queued_records, 0);
             assert_eq!(saturation_after.queued_bytes, 0);
+            assert_eq!(
+                saturation_after.cancellation_poll_interval_ns, 0,
+                "Cx cancellation uses a direct waker rather than a polling timer"
+            );
             let never_leased = storage
                 .reserve_event_delivery(saturated_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
                 .await
@@ -31334,6 +31334,32 @@ mod watch_events_tests {
                     .release_event_delivery(&never_leased)
                     .await
                     .expect("release saturation verification lease")
+            );
+
+            let campaign_metrics_after = watch_claim_output_metrics();
+            assert!(
+                campaign_metrics_after.admissions
+                    >= campaign_metrics_before.admissions.saturating_add(11)
+            );
+            assert!(
+                campaign_metrics_after.zero_byte_failures
+                    >= campaign_metrics_before.zero_byte_failures.saturating_add(4)
+            );
+            assert!(
+                campaign_metrics_after.finalizations
+                    >= campaign_metrics_before.finalizations.saturating_add(2)
+            );
+            assert!(
+                campaign_metrics_after.releases
+                    >= campaign_metrics_before.releases.saturating_add(4)
+            );
+            assert!(
+                campaign_metrics_after.stale_tokens
+                    >= campaign_metrics_before.stale_tokens.saturating_add(1)
+            );
+            assert!(
+                campaign_metrics_after.descriptor_restore_failures
+                    >= campaign_metrics_before.descriptor_restore_failures
             );
 
             storage
