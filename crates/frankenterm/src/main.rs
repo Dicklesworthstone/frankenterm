@@ -30879,6 +30879,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
+                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::other("injected watch write failure")),
                     }))
                 },
@@ -30912,6 +30913,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
+                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "consumer closed before the first byte",
@@ -31117,6 +31119,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
+                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "consumer closed before the first byte",
@@ -31167,6 +31170,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
+                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::other(
                             "injected error after writer cancellation",
                         )),
@@ -31209,6 +31213,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 7,
                         blocked_duration_ns: 123,
+                        cancellation_latency_ns: 0,
                         source: Some(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "consumer closed after a prefix",
