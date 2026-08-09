@@ -128,7 +128,7 @@ fn spawn_bounded_helper_limits_concurrency_and_preserves_order() {
         })
         .collect::<Vec<_>>();
 
-    let outputs = runtime.block_on(spawn_bounded_with_cx(&handle, &root_cx, 3, tasks));
+    let outputs = runtime.block_on(spawn_bounded_with_cx(&root_cx, 3, tasks));
     assert_eq!(outputs, (0usize..12).collect::<Vec<_>>());
     assert!(max_seen.load(Ordering::SeqCst) <= 3);
     assert_eq!(in_flight.load(Ordering::SeqCst), 0);
@@ -178,7 +178,7 @@ fn spawn_bounded_helper_clamps_zero_concurrency_to_one() {
         })
         .collect::<Vec<_>>();
 
-    let outputs = runtime.block_on(spawn_bounded_with_cx(&handle, &root_cx, 0, tasks));
+    let outputs = runtime.block_on(spawn_bounded_with_cx(&root_cx, 0, tasks));
     assert_eq!(outputs, (0usize..8).collect::<Vec<_>>());
     assert_eq!(
         max_seen.load(Ordering::SeqCst),
@@ -211,7 +211,7 @@ fn spawn_bounded_children_observe_parent_cancellation() {
         .map(|_| move |child_cx: Cx| async move { child_cx.checkpoint().is_err() })
         .collect::<Vec<_>>();
 
-    let outputs = runtime.block_on(spawn_bounded_with_cx(&handle, &root_cx, 3, tasks));
+    let outputs = runtime.block_on(spawn_bounded_with_cx(&root_cx, 3, tasks));
     assert_eq!(outputs, vec![true; 5]);
 }
 
@@ -228,10 +228,7 @@ fn spawn_with_timeout_returns_output_before_deadline() {
         .expect("build runtime");
 
     let root_cx = for_testing();
-    let handle = runtime.handle();
-
     let output = runtime.block_on(spawn_with_timeout(
-        &handle,
         &root_cx,
         Duration::from_millis(100),
         |_child_cx| async move { 42usize },
@@ -253,10 +250,7 @@ fn spawn_with_timeout_errors_when_deadline_expires() {
         .expect("build runtime");
 
     let root_cx = for_testing();
-    let handle = runtime.handle();
-
     let result = runtime.block_on(spawn_with_timeout(
-        &handle,
         &root_cx,
         Duration::from_millis(5),
         |_child_cx| async move {

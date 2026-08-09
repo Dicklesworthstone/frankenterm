@@ -438,7 +438,7 @@ proptest! {
                 })
                 .collect();
         let results = rt.block_on(async {
-            spawn_bounded_with_cx(&handle, &cx, concurrency, tasks).await
+            spawn_bounded_with_cx(&cx, concurrency, tasks).await
         });
         prop_assert_eq!(results.len(), n);
     }
@@ -459,7 +459,7 @@ proptest! {
                 })
                 .collect();
         let results = rt.block_on(async {
-            spawn_bounded_with_cx(&handle, &cx, 2, tasks).await
+            spawn_bounded_with_cx(&cx, 2, tasks).await
         });
         prop_assert_eq!(results, expected);
     }
@@ -472,7 +472,7 @@ proptest! {
         let handle = rt.handle();
         let tasks: Vec<CxTask<()>> = Vec::new();
         let results =
-            rt.block_on(async { spawn_bounded_with_cx(&handle, &cx, concurrency, tasks).await });
+            rt.block_on(async { spawn_bounded_with_cx(&cx, concurrency, tasks).await });
         prop_assert!(results.is_empty());
     }
 }
@@ -487,9 +487,8 @@ proptest! {
     fn timeout_fast_task_succeeds(val in any::<i32>()) {
         let rt = make_runtime();
         let cx = for_testing();
-        let handle = rt.handle();
         let result = rt.block_on(async {
-            spawn_with_timeout(&handle, &cx, Duration::from_secs(5), move |_cx| async move {
+            spawn_with_timeout(&cx, Duration::from_secs(5), move |_cx| async move {
                 val
             })
             .await
@@ -503,10 +502,9 @@ proptest! {
     fn timeout_preserves_return_type(s in "[a-z]{1,10}") {
         let rt = make_runtime();
         let cx = for_testing();
-        let handle = rt.handle();
         let expected = s.clone();
         let result = rt.block_on(async {
-            spawn_with_timeout(&handle, &cx, Duration::from_secs(5), move |_cx| async move {
+            spawn_with_timeout(&cx, Duration::from_secs(5), move |_cx| async move {
                 s
             })
             .await

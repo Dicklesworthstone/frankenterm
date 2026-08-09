@@ -266,10 +266,8 @@ pub(crate) fn capability_mask_test_cases() -> [(asupersync::cx::CapMask, [bool; 
 }
 
 struct HandleContextFuture<F> {
-    /// Only direct, caller-owned futures may retain an explicit strong handle.
-    /// Runtime-owned spawned futures leave this `None` to avoid an ownership
-    /// cycle and acquire the scheduler's current handle per poll instead.
-    explicit_runtime_handle: Option<RuntimeHandle>,
+    /// Runtime-instance shutdown authority. This token does not own the
+    /// runtime, so retaining it while Pending cannot create an ownership cycle.
     runtime_shutdown: Option<crate::runtime_async::RuntimeShutdownToken>,
     task_cx: Cx,
     task_cap_mask: asupersync::cx::CapMask,
@@ -280,13 +278,11 @@ impl<F: Future> Future for HandleContextFuture<F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Acquire the scheduler's ambient handle only for this poll. Keeping
-        // the caller's strong handle inside a runtime-owned pending future
-        // would form an ownership cycle and prevent runtime shutdown.
-        let runtime_handle = self
-            .explicit_runtime_handle
-            .clone()
-            .or_else(Runtime::current_handle)
+        // Acquire the scheduler's ambient handle only for this poll. This
+        // wrapper can be nested inside another runtime-owned future, so even an
+        // apparently caller-owned strong handle stored here could form an
+        // ownership cycle and prevent runtime shutdown.
+        let runtime_handle = Runtime::current_handle()
             .expect("runtime task polled without scheduler handle");
         let _runtime_handle_guard = install_runtime_handle_for_poll(runtime_handle);
         let _runtime_shutdown_guard = crate::runtime_async::install_runtime_shutdown_token_scoped(
@@ -317,7 +313,6 @@ where
 {
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
-        explicit_runtime_handle: None,
         runtime_shutdown: crate::runtime_async::current_runtime_shutdown_token(),
         task_cx: child_cx.clone(),
         task_cap_mask: effective_cap_mask(&child_cx),
@@ -339,7 +334,6 @@ where
 {
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
-        explicit_runtime_handle: None,
         runtime_shutdown: crate::runtime_async::current_runtime_shutdown_token(),
         task_cx: child_cx.clone(),
         task_cap_mask: effective_cap_mask(&child_cx),
@@ -357,7 +351,6 @@ where
 /// Prefer this helper at migration boundaries that previously used a
 /// `JoinSet` or ad-hoc task vector for bounded fanout.
 pub async fn spawn_bounded_with_cx<F, Fut, T>(
-    handle: &RuntimeHandle,
     cx: &Cx,
     max_concurrency: usize,
     tasks: Vec<F>,
@@ -374,7 +367,11 @@ where
     iter(
         tasks
             .into_iter()
-            .map(|task| spawn_with_cx(handle, cx, task)),
+            .map(|task| {
+                let handle = Runtime::current_handle()
+                    .expect("bounded Cx task spawned without scheduler handle");
+                spawn_with_cx(&handle, cx, task)
+            }),
     )
     .buffered(limit)
     .collect::<Vec<_>>()
@@ -482,8 +479,9 @@ impl std::error::Error for SpawnWithTimeoutError {}
 /// error. Driving the future inline means a timeout drops (cooperatively
 /// cancels) the direct outer task future, so that future cannot outlive the
 /// timeout. The
-/// `HandleContextFuture` wrapper still installs the `RuntimeHandle`, so nested
-/// `task::spawn` / `spawn_*_with_cx` calls inside the task keep working.
+/// `HandleContextFuture` still installs the scheduler's current runtime handle
+/// for each poll, so nested `task::spawn` / `spawn_*_with_cx` calls inside the
+/// task keep working without retaining strong runtime ownership while Pending.
 /// Those nested spawns are independently scheduled: if their JoinHandles are
 /// dropped before the outer future times out, they are detached and may
 /// outlive this helper. The timeout owns and drops only the direct `task`
@@ -491,7 +489,6 @@ impl std::error::Error for SpawnWithTimeoutError {}
 /// detached nested work; they must retain and settle an explicit structured
 /// owner before the direct future can return or be dropped.
 pub async fn spawn_with_timeout<F, Fut, T>(
-    handle: &RuntimeHandle,
     cx: &Cx,
     timeout: Duration,
     task: F,
@@ -507,7 +504,6 @@ where
 
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
-        explicit_runtime_handle: Some(handle.clone()),
         runtime_shutdown: crate::runtime_async::current_runtime_shutdown_token(),
         task_cx: child_cx.clone(),
         task_cap_mask: effective_cap_mask(&child_cx),
@@ -965,13 +961,12 @@ mod tests {
     fn spawn_bounded_empty_tasks() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let tasks: Vec<
             Box<dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = i32> + Send>> + Send>,
         > = Vec::new();
         let results: Vec<i32> =
-            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 4, tasks).await });
+            runtime.block_on(async { spawn_bounded_with_cx(&cx, 4, tasks).await });
         assert!(results.is_empty());
     }
 
@@ -980,7 +975,6 @@ mod tests {
     fn spawn_bounded_preserves_order() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let tasks: Vec<
             Box<dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>> + Send>,
@@ -994,7 +988,7 @@ mod tests {
             .collect();
 
         let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 2, tasks).await });
+            runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
         assert_eq!(results, vec![0, 1, 2, 3, 4]);
     }
 
@@ -1003,7 +997,6 @@ mod tests {
     fn spawn_bounded_preserves_order_when_tasks_finish_out_of_order() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let tasks: Vec<
             Box<dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>> + Send>,
@@ -1025,7 +1018,7 @@ mod tests {
             .collect();
 
         let results = runtime
-            .block_on(async { spawn_bounded_with_cx(&handle, &cx, tasks.len(), tasks).await });
+            .block_on(async { spawn_bounded_with_cx(&cx, tasks.len(), tasks).await });
         assert_eq!(results, vec![0, 1, 2, 3]);
     }
 
@@ -1037,7 +1030,6 @@ mod tests {
 
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let counter = Arc::new(AtomicU32::new(0));
         let tasks: Vec<
@@ -1058,7 +1050,7 @@ mod tests {
             .collect();
 
         let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 1, tasks).await });
+            runtime.block_on(async { spawn_bounded_with_cx(&cx, 1, tasks).await });
         assert_eq!(results.len(), 3);
         assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
@@ -1071,7 +1063,6 @@ mod tests {
 
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let completed = Arc::new(AtomicUsize::new(0));
         let tasks: Vec<
@@ -1094,7 +1085,7 @@ mod tests {
             .collect();
 
         let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 2, tasks).await });
+            runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
         assert_eq!(results, vec![0, 1, 2, 3]);
         assert_eq!(
             completed.load(Ordering::SeqCst),
@@ -1111,7 +1102,6 @@ mod tests {
 
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -1137,7 +1127,7 @@ mod tests {
             .collect();
 
         let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 2, tasks).await });
+            runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
 
         assert_eq!(results, vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(
@@ -1160,7 +1150,6 @@ mod tests {
 
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -1186,7 +1175,7 @@ mod tests {
             .collect();
 
         let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 0, tasks).await });
+            runtime.block_on(async { spawn_bounded_with_cx(&cx, 0, tasks).await });
 
         assert_eq!(results, vec![0, 1, 2, 3]);
         assert_eq!(
@@ -1206,7 +1195,6 @@ mod tests {
     fn spawn_bounded_supports_nested_runtime_async_spawn() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let tasks: Vec<
             Box<dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>> + Send>,
@@ -1226,7 +1214,7 @@ mod tests {
             .collect();
 
         let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&handle, &cx, 2, tasks).await });
+            runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
         assert_eq!(results, vec![10, 11, 12, 13]);
     }
 
@@ -1238,10 +1226,9 @@ mod tests {
     fn spawn_with_timeout_completes_in_time() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(&handle, &cx, Duration::from_secs(5), |_cx| async { "fast" }).await
+            spawn_with_timeout(&cx, Duration::from_secs(5), |_cx| async { "fast" }).await
         });
         assert_eq!(result.unwrap(), "fast");
     }
@@ -1258,13 +1245,11 @@ mod tests {
 
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dropped_by_child = std::sync::Arc::clone(&dropped);
 
         let result = runtime.block_on(async {
             spawn_with_timeout(
-                &handle,
                 &cx,
                 Duration::from_millis(1),
                 move |_cx| async move {
@@ -1291,14 +1276,12 @@ mod tests {
             crate::outcome::CancelKind::User,
             Some("SECRET spawn_with_timeout pre-cancel"),
         );
-        let handle = runtime.handle();
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let polls_by_child = std::sync::Arc::clone(&polls);
 
         let started = std::time::Instant::now();
         let result = runtime.block_on(async {
             spawn_with_timeout(
-                &handle,
                 &cx,
                 Duration::from_secs(30),
                 move |_cx| async move {
@@ -1329,10 +1312,9 @@ mod tests {
         let cx = Cx::for_testing_with_budget(
             Budget::new().with_deadline(seed_now + Duration::from_millis(20)),
         );
-        let handle = runtime.handle();
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(&handle, &cx, Duration::from_secs(5), |_cx| async {
+            spawn_with_timeout(&cx, Duration::from_secs(5), |_cx| async {
                 std::future::pending::<()>().await;
             })
             .await
@@ -1361,7 +1343,6 @@ mod tests {
 
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
         let direct_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let nested_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let direct_dropped_by_child = std::sync::Arc::clone(&direct_dropped);
@@ -1371,7 +1352,6 @@ mod tests {
 
         runtime.block_on(async {
             let result = spawn_with_timeout(
-                &handle,
                 &cx,
                 Duration::from_millis(1),
                 move |_cx| async move {
@@ -1422,10 +1402,9 @@ mod tests {
     fn spawn_with_timeout_supports_nested_runtime_async_spawn() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(&handle, &cx, Duration::from_secs(1), |_cx| async move {
+            spawn_with_timeout(&cx, Duration::from_secs(1), |_cx| async move {
                 crate::runtime_async::task::spawn(async { 41_u32 })
                     .await
                     .expect("nested spawn should succeed")
@@ -1441,12 +1420,9 @@ mod tests {
     fn spawn_with_timeout_supports_nested_spawn_bounded_with_cx() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
-        let handle = runtime.handle();
-        let nested_handle = handle.clone();
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(&handle, &cx, Duration::from_secs(1), move |nested_cx| {
-                let nested_handle = nested_handle.clone();
+            spawn_with_timeout(&cx, Duration::from_secs(1), move |nested_cx| {
                 async move {
                     let tasks: Vec<
                         Box<
@@ -1477,7 +1453,7 @@ mod tests {
                         })
                         .collect();
 
-                    spawn_bounded_with_cx(&nested_handle, &nested_cx, 2, tasks).await
+                    spawn_bounded_with_cx(&nested_cx, 2, tasks).await
                 }
             })
             .await
