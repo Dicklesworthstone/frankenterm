@@ -2800,14 +2800,20 @@ pub mod task {
         }
     }
 
-    /// Wrapper future that installs the asupersync `RuntimeHandle` into
-    /// thread-local storage before each poll, enabling nested `task::spawn`
-    /// calls from within spawned futures.
+    /// Wrapper future that installs the scheduler's current asupersync
+    /// `RuntimeHandle` into project thread-local storage before each poll,
+    /// enabling nested `task::spawn` calls from within spawned futures.
+    ///
+    /// The handle is deliberately acquired per poll rather than stored in the
+    /// future. A spawned future is owned by `RuntimeInner`; storing a strong
+    /// handle here would create a `RuntimeInner -> future -> RuntimeInner`
+    /// ownership cycle whenever the future remains pending. Asupersync worker
+    /// threads expose a weak current handle specifically so task-local ambient
+    /// access cannot keep a replaced or shutting-down runtime alive.
     ///
     /// Visible to the parent module so that `spawn_detached` can also wrap
     /// futures with the correct runtime context.
     pub(super) struct HandleContextFuture<F> {
-        pub(super) handle: asupersync::runtime::RuntimeHandle,
         /// Explicit task capability context to expose through `Cx::current()`
         /// for each poll. Plain `task::spawn` leaves this unset so the
         /// scheduler-owned ambient context remains authoritative.
@@ -2823,7 +2829,9 @@ pub mod task {
         type Output = F::Output;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let _runtime_handle_guard = super::install_runtime_handle_scoped(self.handle.clone());
+            let runtime_handle = asupersync::runtime::Runtime::current_handle()
+                .expect("runtime task polled without scheduler handle");
+            let _runtime_handle_guard = super::install_runtime_handle_scoped(runtime_handle);
             // asupersync installs a scheduler-owned Cx while polling a task,
             // but `spawn_with_cx` promises that ambient adapters inside the
             // child observe the explicitly threaded context. Install it only
@@ -2861,7 +2869,6 @@ pub mod task {
         let task_cx = crate::cx::Cx::current();
         let task_cap_mask = task_cx.as_ref().map(crate::cx::effective_cap_mask);
         let wrapped = HandleContextFuture {
-            handle: handle.clone(),
             task_cx,
             task_cap_mask,
             future: Box::pin(future),
@@ -2899,7 +2906,6 @@ pub mod task {
         let child_cx = cx.clone();
         let child_cap_mask = crate::cx::effective_cap_mask(&child_cx);
         let wrapped = HandleContextFuture {
-            handle: handle.clone(),
             task_cx: Some(child_cx.clone()),
             task_cap_mask: Some(child_cap_mask),
             future: Box::pin(async move { task(child_cx).await }),
@@ -2943,7 +2949,6 @@ pub mod task {
         let child_cx = cx.clone();
         let child_cap_mask = crate::cx::effective_cap_mask(&child_cx);
         let wrapped = HandleContextFuture {
-            handle: handle.clone(),
             task_cx: Some(child_cx.clone()),
             task_cap_mask: Some(child_cap_mask),
             future: Box::pin(async move { task(child_cx).await }),
@@ -6176,7 +6181,6 @@ impl CompatRuntime for Runtime {
         // root scheduler Cx and a detached child could escape cancellation or
         // regain denied authority.
         let wrapped = task::HandleContextFuture {
-            handle: handle.clone(),
             task_cx,
             task_cap_mask,
             future: Box::pin(future),
@@ -8266,6 +8270,37 @@ mod tests {
             // Can't directly test the spawned task completes, but ensure no panic
         });
         rt.spawn_detached(async {});
+    }
+
+    #[test]
+    fn pending_detached_task_does_not_keep_runtime_alive() {
+        struct PendingTaskDropProbe(Arc<AtomicBool>);
+
+        impl Drop for PendingTaskDropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        // Do not call block_on here: this fixture intentionally avoids the
+        // separate long-lived caller-thread TLS handle contract and isolates
+        // ownership held by the spawned future itself.
+        let runtime = RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime-cycle fixture");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = PendingTaskDropProbe(Arc::clone(&dropped));
+        runtime.spawn_detached(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        });
+
+        drop(runtime);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "a pending task future must be dropped during runtime shutdown"
+        );
     }
 
     fn run_async_test<F>(future: F)

@@ -266,7 +266,6 @@ pub(crate) fn capability_mask_test_cases() -> [(asupersync::cx::CapMask, [bool; 
 }
 
 struct HandleContextFuture<F> {
-    handle: RuntimeHandle,
     task_cx: Cx,
     task_cap_mask: asupersync::cx::CapMask,
     future: Pin<Box<F>>,
@@ -276,7 +275,12 @@ impl<F: Future> Future for HandleContextFuture<F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let _runtime_handle_guard = install_runtime_handle_for_poll(self.handle.clone());
+        // Acquire the scheduler's ambient handle only for this poll. Keeping
+        // the caller's strong handle inside a runtime-owned pending future
+        // would form an ownership cycle and prevent runtime shutdown.
+        let runtime_handle = Runtime::current_handle()
+            .expect("runtime task polled without scheduler handle");
+        let _runtime_handle_guard = install_runtime_handle_for_poll(runtime_handle);
         // `RuntimeHandle::spawn` installs its own scheduler context. The
         // adapter's contract is stronger: ambient Cx-aware helpers inside the
         // child must observe the exact explicitly threaded context. Scope the
@@ -302,7 +306,6 @@ where
 {
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
-        handle: handle.clone(),
         task_cx: child_cx.clone(),
         task_cap_mask: effective_cap_mask(&child_cx),
         future: Box::pin(async move { task(child_cx).await }),
@@ -323,7 +326,6 @@ where
 {
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
-        handle: handle.clone(),
         task_cx: child_cx.clone(),
         task_cap_mask: effective_cap_mask(&child_cx),
         future: Box::pin(async move { task(child_cx).await }),
@@ -851,6 +853,38 @@ mod tests {
             join.await
         });
         assert!(result);
+    }
+
+    #[test]
+    fn pending_spawn_with_cx_task_does_not_keep_runtime_alive() {
+        struct PendingTaskDropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for PendingTaskDropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let runtime = CxRuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime-cycle fixture");
+        let handle = runtime.handle();
+        let cx = for_testing();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = PendingTaskDropProbe(std::sync::Arc::clone(&dropped));
+        let join = spawn_with_cx(&handle, &cx, move |_child_cx| async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        });
+
+        drop(join);
+        drop(handle);
+        drop(runtime);
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "the Cx adapter must not retain its spawning runtime"
+        );
     }
 
     #[test]
