@@ -3713,6 +3713,46 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace the bounded single-owner nonblocking coordinator only after another design proves finite item and byte admission, direct structured cancellation, a pre-steal output deadline, exact byte and flush acknowledgement, zero-byte-only release, partial-prefix expiry recovery, token-matched finalization, no row after ambiguity, exact descriptor restoration, and deterministic saturation, shutdown, stale-token, and real-pipe behavior under strict-remote tests.
 
+### IS-N129 — Awaiting `spawn_blocking` does not make its work request-owned
+
+- **Classification:** structured-cancellation and blocking-pool ownership
+  rejection; runtime-owned supervisor retained
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.11`
+- **Rejected inference:** an async native-discovery function that directly
+  awaits `spawn_blocking` owns its filesystem scan for as long as needed
+  because the ordinary call path awaits that future to completion.
+- **Negative evidence:** the only blocking join lived inside the caller
+  future. Dropping that future discarded the join and the cloned caller `Cx`
+  remained live, so an already-started scan could continue through directory
+  open, enumeration, metadata, header reads, sorting, and result construction
+  with no surviving request observation. Repetition could consume blocking
+  workers independently of the number of live callers. The 10,000-entry cap
+  also bounded count but did not independently charge root depth/bytes,
+  aggregate entry names, repeated retained result paths, logical metadata, or
+  filesystem-operation exposure.
+- **Decision:** admit at most four scans with zero subsystem queue, then spawn
+  one independent runtime-region supervisor per admitted request. The caller
+  observes a typed oneshot terminal receipt; observer Drop or caller-context
+  termination requests a private one-way cooperative cancellation without
+  cancelling the shared caller `Cx`, while the supervisor retains the blocking
+  join until settlement. Content-free counters expose owners, workers,
+  observers, high-water mark, admissions, completions, cancellation requests,
+  dropped observers, undelivered receipts, saturation, runtime rejection, and
+  worker failure. The concurrency permit belongs to the blocking-work object,
+  so loss of its async supervisor cannot make an already-running scan disappear
+  from admission accounting. Native scans additionally reject finite
+  root-byte/component, entry-name, retained-path, logical-metadata, and syscall
+  charges before the corresponding effect; explicit-home root limits run
+  before cloning caller-controlled path data. Deterministic isolated tests
+  cover ordinary receipt delivery, observer-drop settlement, explicit caller
+  cancellation, runtime rejection, saturation-before-work, pre-runtime root
+  rejection, and each resource ceiling. Strict-remote execution remains absent
+  because RCH refused local fallback while every worker was unreachable; no
+  native product-path, shutdown-drain, M4/M5, Threadripper, mux, render, or
+  latency qualification follows yet.
+- **Primary retry condition:**
+  > Replace the runtime-owned supervisor only after another design proves that caller-future drop, caller cancellation, saturation, runtime rejection, and shutdown cannot orphan an admitted blocking join; preserves exactly one typed terminal receipt; bounds live owners, workers, observers, queued work, directory entries, path and metadata bytes, and syscall exposure; and converges under deterministic barriers plus strict-remote exact-source tests.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

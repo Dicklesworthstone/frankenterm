@@ -11,7 +11,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -192,6 +192,27 @@ pub const MAX_SESSION_RESUME_TIMEOUT_SECS: u64 = 30 * 60;
 /// Maximum number of filesystem entries examined per native scan and sessions
 /// admitted from all discovery sources combined.
 pub const MAX_SESSION_DISCOVERY_ENTRIES: usize = 10_000;
+/// Maximum number of native Antigravity scans that may own blocking work at
+/// once. Admission is fail-fast rather than queued, so caller-future drop can
+/// never accumulate an unbounded backlog behind the blocking pool.
+pub const MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS: usize = 4;
+/// Maximum byte length of one caller-selected native-discovery root.
+pub const MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES: usize = 32 * 1024;
+/// Maximum number of path components walked while opening a discovery root.
+pub const MAX_NATIVE_DISCOVERY_HOME_COMPONENTS: usize = 256;
+/// Aggregate directory-entry name bytes charged by one native scan.
+pub const MAX_NATIVE_DISCOVERY_ENTRY_NAME_BYTES: usize = 4 * 1024 * 1024;
+/// Aggregate bytes charged for result paths retained by one native scan.
+pub const MAX_NATIVE_DISCOVERY_RESULT_PATH_BYTES: usize = 16 * 1024 * 1024;
+/// Conservative logical metadata charge for one candidate. This accounts for
+/// file-type, metadata, and fixed SQLite-header state without depending on a
+/// platform-specific `Metadata` representation.
+const NATIVE_DISCOVERY_METADATA_CHARGE_PER_ENTRY: usize = 2 * 1024;
+/// Aggregate logical metadata bytes charged by one native scan.
+pub const MAX_NATIVE_DISCOVERY_METADATA_BYTES: usize =
+    MAX_SESSION_DISCOVERY_ENTRIES * NATIVE_DISCOVERY_METADATA_CHARGE_PER_ENTRY;
+/// Maximum filesystem-operation exposure charged by one native scan.
+pub const MAX_NATIVE_DISCOVERY_SYSCALLS: usize = 64 * 1024;
 /// Maximum bytes admitted for a session identifier crossing into argv or a
 /// public discovery result.
 pub const MAX_SESSION_RESUME_ID_BYTES: usize = 256;
@@ -202,6 +223,80 @@ const SESSION_COMMAND_RUNNING: u8 = 0;
 const SESSION_COMMAND_CANCEL_REQUESTED: u8 = 1;
 const SESSION_COMMAND_WORKER_SETTLED: u8 = 2;
 
+static NATIVE_DISCOVERY_ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_DISCOVERY_ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_DISCOVERY_ACTIVE_OBSERVERS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_DISCOVERY_MAX_ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_DISCOVERY_ADMITTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static NATIVE_DISCOVERY_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static NATIVE_DISCOVERY_CANCEL_REQUESTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static NATIVE_DISCOVERY_DROPPED_OBSERVER_TOTAL: AtomicU64 = AtomicU64::new(0);
+static NATIVE_DISCOVERY_UNDELIVERED_RECEIPT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static NATIVE_DISCOVERY_SATURATED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static NATIVE_DISCOVERY_RUNTIME_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static NATIVE_DISCOVERY_WORKER_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(1))
+    });
+}
+
+/// Process-local ownership and settlement telemetry for native discovery.
+///
+/// Every field is content-free: no home path, session identifier, filename,
+/// or error payload can cross this observability boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDiscoveryRuntimeMetrics {
+    /// Subsystem-admitted scans whose blocking-work object has not yet settled.
+    /// This includes work queued behind the blocking pool as well as work that
+    /// has begun running.
+    pub active_scans: usize,
+    /// Blocking closures that have actually begun executing.
+    pub active_workers: usize,
+    /// Caller futures still waiting for their typed terminal receipt.
+    pub active_observers: usize,
+    /// Highest simultaneous admitted scan count observed by this process.
+    pub max_active_scans: usize,
+    /// Total scans admitted through the subsystem concurrency ceiling. Runtime
+    /// admission failures are counted separately in `runtime_rejected_total`.
+    pub admitted_total: u64,
+    /// Total owner tasks that reached one terminal receipt.
+    pub completed_total: u64,
+    /// Total private cooperative-cancellation requests.
+    pub cancel_requested_total: u64,
+    /// Caller futures dropped before observing a terminal receipt.
+    pub dropped_observer_total: u64,
+    /// Terminal receipts whose caller receiver no longer existed.
+    pub undelivered_receipt_total: u64,
+    /// Fail-fast rejections at the subsystem concurrency ceiling.
+    pub saturated_total: u64,
+    /// Admissions rejected because no live runtime region accepted the owner.
+    pub runtime_rejected_total: u64,
+    /// Blocking joins that failed before returning a scanner result.
+    pub worker_failed_total: u64,
+}
+
+/// Snapshot native-discovery ownership telemetry without acquiring a lock.
+#[must_use]
+pub fn native_discovery_runtime_metrics() -> NativeDiscoveryRuntimeMetrics {
+    NativeDiscoveryRuntimeMetrics {
+        active_scans: NATIVE_DISCOVERY_ACTIVE_SCANS.load(Ordering::Acquire),
+        active_workers: NATIVE_DISCOVERY_ACTIVE_WORKERS.load(Ordering::Acquire),
+        active_observers: NATIVE_DISCOVERY_ACTIVE_OBSERVERS.load(Ordering::Acquire),
+        max_active_scans: NATIVE_DISCOVERY_MAX_ACTIVE_SCANS.load(Ordering::Acquire),
+        admitted_total: NATIVE_DISCOVERY_ADMITTED_TOTAL.load(Ordering::Relaxed),
+        completed_total: NATIVE_DISCOVERY_COMPLETED_TOTAL.load(Ordering::Relaxed),
+        cancel_requested_total: NATIVE_DISCOVERY_CANCEL_REQUESTED_TOTAL.load(Ordering::Relaxed),
+        dropped_observer_total: NATIVE_DISCOVERY_DROPPED_OBSERVER_TOTAL.load(Ordering::Relaxed),
+        undelivered_receipt_total: NATIVE_DISCOVERY_UNDELIVERED_RECEIPT_TOTAL
+            .load(Ordering::Relaxed),
+        saturated_total: NATIVE_DISCOVERY_SATURATED_TOTAL.load(Ordering::Relaxed),
+        runtime_rejected_total: NATIVE_DISCOVERY_RUNTIME_REJECTED_TOTAL.load(Ordering::Relaxed),
+        worker_failed_total: NATIVE_DISCOVERY_WORKER_FAILED_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
 /// Finite identity for a session-discovery source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +304,52 @@ pub enum SessionDiscoverySource {
     Casr,
     NativeAntigravity,
     Merged,
+}
+
+/// Finite resource class for native discovery admission failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDiscoveryResource {
+    HomePathBytes,
+    HomePathComponents,
+    EntryNameBytes,
+    ResultPathBytes,
+    MetadataBytes,
+    Syscalls,
+}
+
+/// Finite reason a native scan could not acquire structured runtime ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDiscoveryAdmissionRejection {
+    SubsystemSaturated,
+    RuntimeUnavailableOrShuttingDown,
+    RuntimeAtCapacity,
+    RuntimeRejected,
+}
+
+impl std::fmt::Display for SessionDiscoveryAdmissionRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SubsystemSaturated => "subsystem_saturated",
+            Self::RuntimeUnavailableOrShuttingDown => "runtime_unavailable_or_shutting_down",
+            Self::RuntimeAtCapacity => "runtime_at_capacity",
+            Self::RuntimeRejected => "runtime_rejected",
+        })
+    }
+}
+
+impl std::fmt::Display for SessionDiscoveryResource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::HomePathBytes => "home_path_bytes",
+            Self::HomePathComponents => "home_path_components",
+            Self::EntryNameBytes => "entry_name_bytes",
+            Self::ResultPathBytes => "result_path_bytes",
+            Self::MetadataBytes => "metadata_bytes",
+            Self::Syscalls => "syscalls",
+        })
+    }
 }
 
 impl std::fmt::Display for SessionDiscoverySource {
@@ -596,6 +737,17 @@ pub enum SessionResumeError {
         source: SessionDiscoverySource,
         limit: usize,
     },
+    /// A native filesystem scan crossed a finite non-entry resource budget.
+    DiscoveryResourceLimitExceeded {
+        resource: SessionDiscoveryResource,
+        observed: usize,
+        limit: usize,
+    },
+    /// No live structured owner accepted the native scan before filesystem
+    /// effects began.
+    DiscoveryAdmissionRejected {
+        reason: SessionDiscoveryAdmissionRejection,
+    },
     /// A partial inventory cannot prove that an absent mutation target does
     /// not exist.
     DiscoveryIncomplete {
@@ -700,6 +852,18 @@ impl std::fmt::Display for SessionResumeError {
                 f,
                 "{source} session discovery exceeded the {limit}-entry limit"
             ),
+            Self::DiscoveryResourceLimitExceeded {
+                resource,
+                observed,
+                limit,
+            } => write!(
+                f,
+                "native session discovery exceeded the {resource} budget (observed={observed}, limit={limit})"
+            ),
+            Self::DiscoveryAdmissionRejected { reason } => write!(
+                f,
+                "native session discovery admission rejected ({reason})"
+            ),
             Self::DiscoveryIncomplete { source, reason } => write!(
                 f,
                 "session discovery incomplete (source={source}, reason={reason})"
@@ -785,6 +949,112 @@ fn validate_session_resume_home(home_dir: &Path) -> Result<(), SessionResumeErro
         return Err(SessionResumeError::InvalidHomeDirectory);
     }
     Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NativeDiscoveryResourceBudget {
+    entry_name_bytes: usize,
+    result_path_bytes: usize,
+    metadata_bytes: usize,
+    syscalls: usize,
+}
+
+impl NativeDiscoveryResourceBudget {
+    fn for_root(root: &Path) -> Result<Self, SessionResumeError> {
+        let path_bytes = root.as_os_str().as_encoded_bytes().len();
+        if path_bytes > MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES {
+            return Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+                resource: SessionDiscoveryResource::HomePathBytes,
+                observed: path_bytes,
+                limit: MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES,
+            });
+        }
+        let components = root.components().count();
+        if components > MAX_NATIVE_DISCOVERY_HOME_COMPONENTS {
+            return Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+                resource: SessionDiscoveryResource::HomePathComponents,
+                observed: components,
+                limit: MAX_NATIVE_DISCOVERY_HOME_COMPONENTS,
+            });
+        }
+
+        let mut budget = Self::default();
+        // Opening each component performs at most one open plus one metadata
+        // verification. Charge the root/base operation as one component too.
+        budget.charge_syscalls(components.saturating_add(1).saturating_mul(2))?;
+        Ok(budget)
+    }
+
+    fn charge_fixed_child(&mut self, component: &str) -> Result<(), SessionResumeError> {
+        self.charge_entry_name_bytes(component.len())?;
+        self.charge_syscalls(2)
+    }
+
+    fn charge_directory_entry(
+        &mut self,
+        file_name: &std::ffi::OsStr,
+    ) -> Result<(), SessionResumeError> {
+        self.charge_entry_name_bytes(file_name.as_encoded_bytes().len())?;
+        self.charge_syscalls(1)
+    }
+
+    fn charge_candidate_metadata(&mut self) -> Result<(), SessionResumeError> {
+        self.metadata_bytes = checked_discovery_resource_add(
+            SessionDiscoveryResource::MetadataBytes,
+            self.metadata_bytes,
+            NATIVE_DISCOVERY_METADATA_CHARGE_PER_ENTRY,
+            MAX_NATIVE_DISCOVERY_METADATA_BYTES,
+        )?;
+        // file_type + no-follow open + metadata + fixed header read.
+        self.charge_syscalls(4)
+    }
+
+    fn charge_result_path(&mut self, path: &Path) -> Result<(), SessionResumeError> {
+        self.result_path_bytes = checked_discovery_resource_add(
+            SessionDiscoveryResource::ResultPathBytes,
+            self.result_path_bytes,
+            path.as_os_str().as_encoded_bytes().len(),
+            MAX_NATIVE_DISCOVERY_RESULT_PATH_BYTES,
+        )?;
+        Ok(())
+    }
+
+    fn charge_entry_name_bytes(&mut self, bytes: usize) -> Result<(), SessionResumeError> {
+        self.entry_name_bytes = checked_discovery_resource_add(
+            SessionDiscoveryResource::EntryNameBytes,
+            self.entry_name_bytes,
+            bytes,
+            MAX_NATIVE_DISCOVERY_ENTRY_NAME_BYTES,
+        )?;
+        Ok(())
+    }
+
+    fn charge_syscalls(&mut self, count: usize) -> Result<(), SessionResumeError> {
+        self.syscalls = checked_discovery_resource_add(
+            SessionDiscoveryResource::Syscalls,
+            self.syscalls,
+            count,
+            MAX_NATIVE_DISCOVERY_SYSCALLS,
+        )?;
+        Ok(())
+    }
+}
+
+fn checked_discovery_resource_add(
+    resource: SessionDiscoveryResource,
+    current: usize,
+    additional: usize,
+    limit: usize,
+) -> Result<usize, SessionResumeError> {
+    let observed = current.checked_add(additional).unwrap_or(usize::MAX);
+    if observed > limit {
+        return Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+            resource,
+            observed,
+            limit,
+        });
+    }
+    Ok(observed)
 }
 
 fn map_spawn_blocking_error(
@@ -1637,6 +1907,7 @@ fn discover_antigravity_conversations_from_home_with_checkpoint(
     mut checkpoint: impl FnMut() -> Result<(), SessionResumeError>,
 ) -> Result<SessionDiscoveryResult, SessionResumeError> {
     checkpoint()?;
+    let mut resource_budget = NativeDiscoveryResourceBudget::for_root(home_dir)?;
     let mut directory = match open_session_directory_tree_nofollow(home_dir) {
         Ok(directory) => directory,
         Err(error) => {
@@ -1650,6 +1921,7 @@ fn discover_antigravity_conversations_from_home_with_checkpoint(
     };
     for component in ANTIGRAVITY_CONVERSATIONS_RELATIVE_DIR {
         checkpoint()?;
+        resource_budget.charge_fixed_child(component)?;
         directory = match open_session_child_directory_nofollow(&directory, Path::new(component)) {
             Ok(directory) => directory,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1669,6 +1941,7 @@ fn discover_antigravity_conversations_from_home_with_checkpoint(
     discover_antigravity_conversations_in_open_dir_with_checkpoint(
         directory,
         &antigravity_conversations_dir(home_dir),
+        &mut resource_budget,
         checkpoint,
     )
 }
@@ -1678,6 +1951,7 @@ fn discover_antigravity_conversations_in_dir_with_checkpoint(
     mut checkpoint: impl FnMut() -> Result<(), SessionResumeError>,
 ) -> Result<SessionDiscoveryResult, SessionResumeError> {
     checkpoint()?;
+    let mut resource_budget = NativeDiscoveryResourceBudget::for_root(conversations_dir)?;
     let directory = match open_session_directory_tree_nofollow(conversations_dir) {
         Ok(directory) => directory,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1701,6 +1975,7 @@ fn discover_antigravity_conversations_in_dir_with_checkpoint(
     discover_antigravity_conversations_in_open_dir_with_checkpoint(
         directory,
         conversations_dir,
+        &mut resource_budget,
         checkpoint,
     )
 }
@@ -1708,8 +1983,10 @@ fn discover_antigravity_conversations_in_dir_with_checkpoint(
 fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
     directory: cap_std::fs::Dir,
     conversations_dir: &Path,
+    resource_budget: &mut NativeDiscoveryResourceBudget,
     mut checkpoint: impl FnMut() -> Result<(), SessionResumeError>,
 ) -> Result<SessionDiscoveryResult, SessionResumeError> {
+    resource_budget.charge_syscalls(1)?;
     let dir_entries = match directory.entries() {
         Ok(entries) => entries,
         Err(err) => {
@@ -1742,6 +2019,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
         let dir_entry = match dir_entry {
             Ok(entry) => entry,
             Err(_) => {
+                resource_budget.charge_syscalls(1)?;
                 unreadable_entry_count = unreadable_entry_count.saturating_add(1);
                 report.mark_incomplete(
                     SessionDiscoverySource::NativeAntigravity,
@@ -1751,6 +2029,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
             }
         };
         let file_name = dir_entry.file_name();
+        resource_budget.charge_directory_entry(&file_name)?;
         let relative_path = Path::new(&file_name);
         if relative_path.extension().and_then(|ext| ext.to_str()) != Some("db") {
             continue;
@@ -1768,6 +2047,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
             invalid_candidate_count = invalid_candidate_count.saturating_add(1);
             continue;
         };
+        resource_budget.charge_candidate_metadata()?;
         let file_type = match dir_entry.file_type() {
             Ok(file_type) => file_type,
             Err(_) => {
@@ -1846,6 +2126,8 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
             .map(cap_std::time::SystemTime::into_std)
             .and_then(system_time_to_epoch_millis);
         let resume_plan = antigravity_native_resume_plan(&session_id)?;
+        let result_path = conversations_dir.join(relative_path);
+        resource_budget.charge_result_path(&result_path)?;
         let mut extra = std::collections::HashMap::new();
         extra.insert(
             "discovery_source".to_string(),
@@ -1882,7 +2164,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
             messages: 0,
             workspace: None,
             started_at,
-            path: Some(conversations_dir.join(relative_path).display().to_string()),
+            path: Some(result_path.display().to_string()),
             extra,
         });
     }
@@ -1922,18 +2204,287 @@ pub fn discover_current_home_antigravity_conversations()
     discover_antigravity_conversations_from_home(&home)
 }
 
+struct NativeDiscoveryPermit;
+
+impl NativeDiscoveryPermit {
+    fn try_acquire() -> Option<Self> {
+        let previous = NATIVE_DISCOVERY_ACTIVE_SCANS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS).then_some(active + 1)
+            });
+        let active = match previous {
+            Ok(previous) => previous + 1,
+            Err(_) => {
+                saturating_increment(&NATIVE_DISCOVERY_SATURATED_TOTAL);
+                return None;
+            }
+        };
+
+        NATIVE_DISCOVERY_MAX_ACTIVE_SCANS.fetch_max(active, Ordering::Relaxed);
+        saturating_increment(&NATIVE_DISCOVERY_ADMITTED_TOTAL);
+        Some(Self)
+    }
+}
+
+impl Drop for NativeDiscoveryPermit {
+    fn drop(&mut self) {
+        let previous = NATIVE_DISCOVERY_ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "native discovery permit underflow");
+    }
+}
+
+struct NativeDiscoveryWorkerGuard;
+
+impl NativeDiscoveryWorkerGuard {
+    fn new() -> Self {
+        NATIVE_DISCOVERY_ACTIVE_WORKERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for NativeDiscoveryWorkerGuard {
+    fn drop(&mut self) {
+        let previous = NATIVE_DISCOVERY_ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "native discovery worker counter underflow");
+    }
+}
+
+#[derive(Clone)]
+struct NativeDiscoveryCancellation {
+    requested: Arc<AtomicBool>,
+}
+
+impl NativeDiscoveryCancellation {
+    fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn request(&self) {
+        if !self.requested.swap(true, Ordering::AcqRel) {
+            saturating_increment(&NATIVE_DISCOVERY_CANCEL_REQUESTED_TOTAL);
+        }
+    }
+
+    fn checkpoint(&self, cx: &crate::cx::Cx) -> Result<(), SessionResumeError> {
+        if self.requested.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+            return Err(SessionResumeError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
+struct NativeDiscoveryObserverGuard {
+    cancellation: NativeDiscoveryCancellation,
+    request_on_drop: bool,
+}
+
+impl NativeDiscoveryObserverGuard {
+    fn new(cancellation: NativeDiscoveryCancellation) -> Self {
+        NATIVE_DISCOVERY_ACTIVE_OBSERVERS.fetch_add(1, Ordering::AcqRel);
+        Self {
+            cancellation,
+            request_on_drop: true,
+        }
+    }
+
+    fn request_cancellation(&mut self) {
+        self.cancellation.request();
+        self.request_on_drop = false;
+    }
+
+    fn disarm(&mut self) {
+        self.request_on_drop = false;
+    }
+}
+
+impl Drop for NativeDiscoveryObserverGuard {
+    fn drop(&mut self) {
+        if self.request_on_drop {
+            self.cancellation.request();
+            saturating_increment(&NATIVE_DISCOVERY_DROPPED_OBSERVER_TOTAL);
+        }
+        let previous = NATIVE_DISCOVERY_ACTIVE_OBSERVERS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "native discovery observer counter underflow");
+    }
+}
+
+enum NativeDiscoveryTerminalReceipt {
+    Settled(Result<SessionDiscoveryResult, SessionResumeError>),
+    WorkerFailed,
+}
+
+enum NativeDiscoveryCancellationWait {
+    ContextEnded,
+    TimerFailed,
+}
+
+fn classify_native_discovery_spawn_rejection(
+    error: &crate::runtime_async::task::SpawnError,
+) -> SessionDiscoveryAdmissionRejection {
+    match error.code() {
+        // Asupersync's stable lifecycle codes cover unavailable, closed, and
+        // shutdown-racing regions. None admits filesystem work.
+        "ASUP-E001" | "ASUP-E002" | "ASUP-E003" => {
+            SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown
+        }
+        "ASUP-E006" => SessionDiscoveryAdmissionRejection::RuntimeAtCapacity,
+        _ => SessionDiscoveryAdmissionRejection::RuntimeRejected,
+    }
+}
+
+fn native_discovery_owner_cx(caller_cx: &crate::cx::Cx) -> crate::cx::Cx {
+    let caller_capabilities = crate::cx::effective_cap_mask(caller_cx);
+    let _owner_context = crate::cx::Cx::set_current(Some(crate::cx::for_request()));
+    let _caller_capability_ceiling = crate::cx::Cx::push_restriction(caller_capabilities);
+    crate::cx::Cx::current().expect("fresh native-discovery owner context must be installed")
+}
+
+async fn wait_for_native_discovery_cancellation(
+    cx: &crate::cx::Cx,
+) -> NativeDiscoveryCancellationWait {
+    loop {
+        if crate::runtime_async::sleep_with_cx(cx, SESSION_RESUME_CX_POLL_INTERVAL)
+            .await
+            .is_err()
+        {
+            return if cx.checkpoint().is_err() {
+                NativeDiscoveryCancellationWait::ContextEnded
+            } else {
+                NativeDiscoveryCancellationWait::TimerFailed
+            };
+        }
+        if cx.checkpoint().is_err() {
+            return NativeDiscoveryCancellationWait::ContextEnded;
+        }
+    }
+}
+
+async fn run_owned_native_discovery_with_cx<F>(
+    cx: &crate::cx::Cx,
+    work: F,
+) -> Result<SessionDiscoveryResult, SessionResumeError>
+where
+    F: FnOnce(
+            NativeDiscoveryCancellation,
+            crate::cx::Cx,
+        ) -> Result<SessionDiscoveryResult, SessionResumeError>
+        + Send
+        + 'static,
+{
+    cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)?;
+    let permit = NativeDiscoveryPermit::try_acquire().ok_or(
+        SessionResumeError::DiscoveryAdmissionRejected {
+            reason: SessionDiscoveryAdmissionRejection::SubsystemSaturated,
+        },
+    )?;
+    let cancellation = NativeDiscoveryCancellation::new();
+    let owner_cancellation = cancellation.clone();
+    let scan_cx = cx.clone();
+    let (receipt_tx, receipt_rx) = crate::runtime_async::oneshot::channel();
+
+    // The owner context has an independent cancellation identity so caller
+    // drop cannot abandon the blocking join, but it retains the caller's exact
+    // effective capability ceiling. The scanner itself keeps the exact caller
+    // Cx plus a private drop-cancellation signal. Runtime shutdown still owns
+    // and drains this task through the region that accepted it.
+    let owner_cx = native_discovery_owner_cx(cx);
+    let owner = crate::runtime_async::task::try_spawn_with_cx(
+        &owner_cx,
+        move |_owner_cx| async move {
+            let worker_cancellation = owner_cancellation.clone();
+            let worker_scan_cx = scan_cx.clone();
+            let worker = crate::runtime_async::spawn_blocking(move || {
+                // The permit belongs to the blocking-work object, not merely
+                // to the async supervisor. If runtime shutdown drops the
+                // supervisor after this closure starts, the hard concurrency
+                // ceiling must remain occupied until the closure settles.
+                let _permit = permit;
+                let _worker_guard = NativeDiscoveryWorkerGuard::new();
+                worker_cancellation.checkpoint(&worker_scan_cx)?;
+                work(worker_cancellation, worker_scan_cx)
+            })
+            .await;
+
+            let receipt = match worker {
+                Ok(result) => NativeDiscoveryTerminalReceipt::Settled(result),
+                Err(_) => {
+                    saturating_increment(&NATIVE_DISCOVERY_WORKER_FAILED_TOTAL);
+                    NativeDiscoveryTerminalReceipt::WorkerFailed
+                }
+            };
+            saturating_increment(&NATIVE_DISCOVERY_COMPLETED_TOTAL);
+            let delivery_cx = crate::cx::for_request();
+            if receipt_tx.send_with_cx(&delivery_cx, receipt).is_err() {
+                saturating_increment(&NATIVE_DISCOVERY_UNDELIVERED_RECEIPT_TOTAL);
+            }
+        },
+    );
+    let owner = match owner {
+        Ok(owner) => owner,
+        Err(error) => {
+            saturating_increment(&NATIVE_DISCOVERY_RUNTIME_REJECTED_TOTAL);
+            return Err(SessionResumeError::DiscoveryAdmissionRejected {
+                reason: classify_native_discovery_spawn_rejection(&error),
+            });
+        }
+    };
+    // The accepted runtime region now owns the async supervisor. The caller
+    // observes only the typed receipt, so dropping this request future cannot
+    // drop the supervisor's blocking join.
+    drop(owner);
+
+    let mut observer = NativeDiscoveryObserverGuard::new(cancellation);
+    let receipt_cx = crate::cx::for_request();
+    let receipt = std::pin::pin!(crate::runtime_async::oneshot_recv_with_cx(
+        &receipt_cx,
+        receipt_rx
+    ));
+    let cancellation_wait = std::pin::pin!(wait_for_native_discovery_cancellation(cx));
+    use futures::future::{Either, select};
+    match select(receipt, cancellation_wait).await {
+        Either::Left((Ok(NativeDiscoveryTerminalReceipt::Settled(result)), _)) => {
+            observer.disarm();
+            result
+        }
+        Either::Left((Ok(NativeDiscoveryTerminalReceipt::WorkerFailed), _)) => {
+            observer.disarm();
+            Err(SessionResumeError::AsyncInfrastructureFailure)
+        }
+        Either::Left((Err(_), _)) => {
+            // A vanished supervisor is not worker settlement. The blocking
+            // closure may already be running, so request its private
+            // cooperative cancellation before releasing the observer.
+            observer.request_cancellation();
+            Err(SessionResumeError::AsyncInfrastructureFailure)
+        }
+        Either::Right((NativeDiscoveryCancellationWait::ContextEnded, _)) => {
+            observer.request_cancellation();
+            Err(SessionResumeError::Cancelled)
+        }
+        Either::Right((NativeDiscoveryCancellationWait::TimerFailed, _)) => {
+            observer.request_cancellation();
+            Err(SessionResumeError::AsyncInfrastructureFailure)
+        }
+    }
+}
+
 /// Cx-first native Antigravity discovery under an explicit home directory.
-/// The bounded filesystem scan runs on the canonical blocking executor and
-/// cooperatively checkpoints between directory entries. While this future is
-/// polled to completion it retains the blocking join; dropping the future can
-/// still detach an already-started blocking closure, which is tracked as a
-/// remaining structured-settlement gap. One already-started filesystem syscall
-/// is the indivisible cooperative cancellation boundary.
+/// The bounded filesystem scan runs on the canonical blocking executor under
+/// a runtime-owned supervisor. Dropping the caller future requests private
+/// cooperative cancellation while that supervisor retains the blocking join
+/// through a typed terminal receipt. One already-started filesystem syscall is
+/// the indivisible cooperative cancellation boundary.
 pub async fn discover_antigravity_conversations_from_home_with_cx(
     cx: &crate::cx::Cx,
     home_dir: &Path,
 ) -> Result<SessionDiscoveryResult, SessionResumeError> {
     validate_session_resume_home(home_dir)?;
+    // Reject caller-controlled path amplification before cloning the path into
+    // the owned blocking-work closure. The scanner constructs the full budget
+    // again so all later filesystem charges share one accumulator.
+    NativeDiscoveryResourceBudget::for_root(home_dir)?;
     discover_antigravity_conversations_for_optional_home_with_cx(cx, Some(home_dir.to_path_buf()))
         .await
 }
@@ -1955,17 +2506,12 @@ async fn discover_antigravity_conversations_for_optional_home_with_cx(
         cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)?;
         return Ok(unavailable_native_discovery());
     };
-    cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)?;
-    let scan_cx = cx.clone();
-    crate::runtime_async::spawn_blocking(move || {
+    run_owned_native_discovery_with_cx(cx, move |cancellation, scan_cx| {
         discover_antigravity_conversations_from_home_with_checkpoint(&home_dir, || {
-            scan_cx
-                .checkpoint()
-                .map_err(|_| SessionResumeError::Cancelled)
+            cancellation.checkpoint(&scan_cx)
         })
     })
     .await
-    .map_err(|_| SessionResumeError::AsyncInfrastructureFailure)?
 }
 
 fn unavailable_native_discovery() -> SessionDiscoveryResult {
@@ -2091,6 +2637,8 @@ fn casr_discovery_incomplete_reason(
             ..
         } => Some(SessionDiscoveryIncompleteReason::LimitExceeded),
         SessionResumeError::DiscoveryLimitExceeded { .. }
+        | SessionResumeError::DiscoveryResourceLimitExceeded { .. }
+        | SessionResumeError::DiscoveryAdmissionRejected { .. }
         | SessionResumeError::DiscoveryIncomplete { .. }
         | SessionResumeError::InvalidOutputLimit { .. }
         | SessionResumeError::InvalidTimeout { .. }
@@ -2168,6 +2716,14 @@ fn discovery_error_incomplete_evidence(
         SessionResumeError::DiscoveryLimitExceeded { source, .. } => {
             (*source, SessionDiscoveryIncompleteReason::LimitExceeded)
         }
+        SessionResumeError::DiscoveryResourceLimitExceeded { .. } => (
+            SessionDiscoverySource::NativeAntigravity,
+            SessionDiscoveryIncompleteReason::LimitExceeded,
+        ),
+        SessionResumeError::DiscoveryAdmissionRejected { .. } => (
+            SessionDiscoverySource::NativeAntigravity,
+            SessionDiscoveryIncompleteReason::AsyncInfrastructureFailure,
+        ),
         SessionResumeError::InvalidOutputLimit { .. }
         | SessionResumeError::InvalidTimeout { .. } => (
             SessionDiscoverySource::Merged,
@@ -2255,8 +2811,75 @@ fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> &str {
 mod tests {
     use super::*;
     use crate::casr_types::MessageRole;
+    use crate::runtime_async::CompatRuntime;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct NativeDiscoveryTestBarrier {
+        started: AtomicBool,
+        released: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl NativeDiscoveryTestBarrier {
+        fn wait_in_worker(&self) {
+            self.started.store(true, Ordering::Release);
+            let mut released = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = self
+                    .changed
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        fn release(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct ReleaseNativeDiscoveryBarrierOnDrop(Arc<NativeDiscoveryTestBarrier>);
+
+    impl Drop for ReleaseNativeDiscoveryBarrierOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    fn native_discovery_lifecycle_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn wait_for_native_discovery_state(
+        cx: &crate::cx::Cx,
+        predicate: impl Fn(NativeDiscoveryRuntimeMetrics) -> bool,
+    ) {
+        let started = std::time::Instant::now();
+        loop {
+            let snapshot = native_discovery_runtime_metrics();
+            if predicate(snapshot) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "native discovery lifecycle did not converge: {snapshot:?}"
+            );
+            crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(1))
+                .await
+                .expect("test lifecycle poll must remain live");
+        }
+    }
 
     // -- AgentProvider --
 
@@ -2446,6 +3069,118 @@ mod tests {
         assert!(report.entries.is_empty());
         assert!(report.is_complete());
         assert_eq!(report.require_complete_for_absence_claim(), Ok(()));
+    }
+
+    #[test]
+    fn native_discovery_root_path_budgets_fail_before_filesystem_effects() {
+        let oversized = PathBuf::from(format!(
+            "/{}",
+            "a".repeat(MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES)
+        ));
+        assert_eq!(
+            NativeDiscoveryResourceBudget::for_root(&oversized),
+            Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+                resource: SessionDiscoveryResource::HomePathBytes,
+                observed: MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES + 1,
+                limit: MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES,
+            })
+        );
+
+        let too_many_components = PathBuf::from(format!(
+            "/{}",
+            std::iter::repeat_n("a", MAX_NATIVE_DISCOVERY_HOME_COMPONENTS)
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
+        assert_eq!(
+            NativeDiscoveryResourceBudget::for_root(&too_many_components),
+            Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+                resource: SessionDiscoveryResource::HomePathComponents,
+                observed: MAX_NATIVE_DISCOVERY_HOME_COMPONENTS + 1,
+                limit: MAX_NATIVE_DISCOVERY_HOME_COMPONENTS,
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_native_discovery_rejects_oversized_home_before_runtime_admission() {
+        use std::future::Future as _;
+
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let oversized = PathBuf::from(format!(
+            "/{}",
+            "a".repeat(MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES)
+        ));
+        let cx = crate::cx::for_request();
+        let mut request = Box::pin(discover_antigravity_conversations_from_home_with_cx(
+            &cx, &oversized,
+        ));
+        let waker = futures::task::noop_waker();
+        let mut poll_cx = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            request.as_mut().poll(&mut poll_cx),
+            std::task::Poll::Ready(Err(
+                SessionResumeError::DiscoveryResourceLimitExceeded {
+                    resource: SessionDiscoveryResource::HomePathBytes,
+                    observed,
+                    limit: MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES,
+                }
+            )) if observed == MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES + 1
+        ));
+        assert_eq!(
+            native_discovery_runtime_metrics(),
+            before,
+            "root preflight must not acquire runtime ownership"
+        );
+    }
+
+    #[test]
+    fn native_discovery_charged_resources_stop_at_exact_limits() {
+        let mut names = NativeDiscoveryResourceBudget::default();
+        names.entry_name_bytes = MAX_NATIVE_DISCOVERY_ENTRY_NAME_BYTES;
+        assert_eq!(
+            names.charge_entry_name_bytes(1),
+            Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+                resource: SessionDiscoveryResource::EntryNameBytes,
+                observed: MAX_NATIVE_DISCOVERY_ENTRY_NAME_BYTES + 1,
+                limit: MAX_NATIVE_DISCOVERY_ENTRY_NAME_BYTES,
+            })
+        );
+
+        let mut result_paths = NativeDiscoveryResourceBudget::default();
+        result_paths.result_path_bytes = MAX_NATIVE_DISCOVERY_RESULT_PATH_BYTES;
+        assert_eq!(
+            result_paths.charge_result_path(Path::new("x")),
+            Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+                resource: SessionDiscoveryResource::ResultPathBytes,
+                observed: MAX_NATIVE_DISCOVERY_RESULT_PATH_BYTES + 1,
+                limit: MAX_NATIVE_DISCOVERY_RESULT_PATH_BYTES,
+            })
+        );
+
+        let mut metadata = NativeDiscoveryResourceBudget::default();
+        metadata.metadata_bytes = MAX_NATIVE_DISCOVERY_METADATA_BYTES;
+        assert_eq!(
+            metadata.charge_candidate_metadata(),
+            Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+                resource: SessionDiscoveryResource::MetadataBytes,
+                observed: MAX_NATIVE_DISCOVERY_METADATA_BYTES
+                    + NATIVE_DISCOVERY_METADATA_CHARGE_PER_ENTRY,
+                limit: MAX_NATIVE_DISCOVERY_METADATA_BYTES,
+            })
+        );
+
+        let mut syscalls = NativeDiscoveryResourceBudget::default();
+        syscalls.syscalls = MAX_NATIVE_DISCOVERY_SYSCALLS;
+        assert_eq!(
+            syscalls.charge_syscalls(1),
+            Err(SessionResumeError::DiscoveryResourceLimitExceeded {
+                resource: SessionDiscoveryResource::Syscalls,
+                observed: MAX_NATIVE_DISCOVERY_SYSCALLS + 1,
+                limit: MAX_NATIVE_DISCOVERY_SYSCALLS,
+            })
+        );
     }
 
     #[test]
@@ -3601,14 +4336,18 @@ mod tests {
             .next()
             .expect("production source prefix");
         let start = production
-            .find("pub async fn discover_antigravity_conversations_from_home_with_cx(")
-            .expect("explicit-home native Cx API");
+            .find("struct NativeDiscoveryPermit;")
+            .expect("runtime-owned native discovery boundary");
         let end = production[start..]
             .find("fn validate_discovery_entry(")
             .map(|offset| start + offset)
             .expect("native Cx API boundary");
         let native_cx_surface = &production[start..end];
         assert!(native_cx_surface.contains("runtime_async::spawn_blocking"));
+        assert!(native_cx_surface.contains("task::try_spawn_with_cx"));
+        assert!(native_cx_surface.contains("NativeDiscoveryObserverGuard"));
+        assert!(native_cx_surface.contains("NativeDiscoveryTerminalReceipt"));
+        assert!(native_cx_surface.contains("oneshot_recv_with_cx"));
         assert!(
             native_cx_surface
                 .contains("discover_antigravity_conversations_from_home_with_checkpoint")
@@ -3618,6 +4357,357 @@ mod tests {
         assert!(!native_cx_surface.contains("spawn_blocking_with_cx"));
         assert!(!native_cx_surface.contains("run_casr"));
         assert!(!native_cx_surface.contains("build_casr_command"));
+    }
+
+    #[test]
+    fn native_discovery_owner_is_cancel_independent_without_capability_escalation() {
+        for (mask, expected) in crate::cx::capability_mask_test_cases() {
+            let caller_cx = {
+                let _caller_context =
+                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _caller_capability_ceiling = crate::cx::Cx::push_restriction(mask);
+                crate::cx::Cx::current().expect("restricted caller context")
+            };
+            let owner_cx = native_discovery_owner_cx(&caller_cx);
+            assert_eq!(
+                crate::cx::effective_capability_bits(&owner_cx),
+                expected,
+                "cleanup ownership must not regain a denied caller capability"
+            );
+
+            caller_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel caller after deriving native discovery owner"),
+            );
+            assert!(caller_cx.checkpoint().is_err());
+            assert!(
+                owner_cx.checkpoint().is_ok(),
+                "cleanup ownership must survive caller cancellation"
+            );
+        }
+    }
+
+    #[test]
+    fn native_discovery_owner_publishes_one_terminal_receipt() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native discovery test runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::for_request();
+            let report = run_owned_native_discovery_with_cx(&cx, |_cancellation, _scan_cx| {
+                Ok(SessionDiscoveryResult::default())
+            })
+            .await
+            .expect("runtime-owned native discovery must return its receipt");
+            assert!(report.entries.is_empty());
+            wait_for_native_discovery_state(&cx, |snapshot| {
+                snapshot.active_scans == before.active_scans
+                    && snapshot.active_workers == before.active_workers
+                    && snapshot.active_observers == before.active_observers
+            })
+            .await;
+        });
+        let after = native_discovery_runtime_metrics();
+        assert_eq!(after.admitted_total, before.admitted_total + 1);
+        assert_eq!(after.completed_total, before.completed_total + 1);
+        assert_eq!(
+            after.undelivered_receipt_total,
+            before.undelivered_receipt_total
+        );
+    }
+
+    #[test]
+    fn dropping_native_discovery_observer_cancels_but_owner_settles() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
+        let worker_settled = Arc::new(AtomicBool::new(false));
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native discovery test runtime");
+        // Declared after the runtime so unwinding releases a blocked worker
+        // before Runtime::drop begins its structured drain.
+        let _release_on_drop = ReleaseNativeDiscoveryBarrierOnDrop(Arc::clone(&barrier));
+        runtime.block_on(async {
+            let request_cx = crate::cx::for_request();
+            let task_cx = request_cx.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            let worker_settled_inner = Arc::clone(&worker_settled);
+            let request = crate::runtime_async::task::spawn_with_cx(
+                &request_cx,
+                move |_child_cx| async move {
+                    run_owned_native_discovery_with_cx(
+                        &task_cx,
+                        move |cancellation, scan_cx| {
+                            worker_barrier.wait_in_worker();
+                            let result = cancellation.checkpoint(&scan_cx);
+                            worker_settled_inner.store(true, Ordering::Release);
+                            result?;
+                            Ok(SessionDiscoveryResult::default())
+                        },
+                    )
+                    .await
+                },
+            );
+
+            wait_for_native_discovery_state(&request_cx, |snapshot| {
+                barrier.started.load(Ordering::Acquire)
+                    && snapshot.active_scans == before.active_scans + 1
+                    && snapshot.active_workers == before.active_workers + 1
+                    && snapshot.active_observers == before.active_observers + 1
+            })
+            .await;
+            request.abort();
+            let request_result = request.await;
+            assert!(request_result.is_err(), "aborted observer must terminate");
+
+            barrier.release();
+            wait_for_native_discovery_state(&request_cx, |snapshot| {
+                snapshot.active_scans == before.active_scans
+                    && snapshot.active_workers == before.active_workers
+                    && snapshot.active_observers == before.active_observers
+            })
+            .await;
+        });
+
+        let after = native_discovery_runtime_metrics();
+        assert!(worker_settled.load(Ordering::Acquire));
+        assert_eq!(after.admitted_total, before.admitted_total + 1);
+        assert_eq!(after.completed_total, before.completed_total + 1);
+        assert_eq!(
+            after.cancel_requested_total,
+            before.cancel_requested_total + 1
+        );
+        assert_eq!(
+            after.dropped_observer_total,
+            before.dropped_observer_total + 1
+        );
+        assert_eq!(
+            after.undelivered_receipt_total,
+            before.undelivered_receipt_total + 1
+        );
+    }
+
+    #[test]
+    fn cancelling_native_discovery_context_cancels_but_owner_settles() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
+        let worker_settled = Arc::new(AtomicBool::new(false));
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native discovery test runtime");
+        // Declared after the runtime so unwinding releases a blocked worker
+        // before Runtime::drop begins its structured drain.
+        let _release_on_drop = ReleaseNativeDiscoveryBarrierOnDrop(Arc::clone(&barrier));
+        runtime.block_on(async {
+            let request_cx = crate::cx::for_request();
+            let task_cx = request_cx.clone();
+            let settlement_cx = crate::cx::for_request();
+            let worker_barrier = Arc::clone(&barrier);
+            let worker_settled_inner = Arc::clone(&worker_settled);
+            let request = crate::runtime_async::task::spawn_with_cx(
+                &request_cx,
+                move |_child_cx| async move {
+                    run_owned_native_discovery_with_cx(
+                        &task_cx,
+                        move |cancellation, scan_cx| {
+                            worker_barrier.wait_in_worker();
+                            let result = cancellation.checkpoint(&scan_cx);
+                            worker_settled_inner.store(true, Ordering::Release);
+                            result?;
+                            Ok(SessionDiscoveryResult::default())
+                        },
+                    )
+                    .await
+                },
+            );
+
+            wait_for_native_discovery_state(&settlement_cx, |snapshot| {
+                barrier.started.load(Ordering::Acquire)
+                    && snapshot.active_scans == before.active_scans + 1
+                    && snapshot.active_workers == before.active_workers + 1
+                    && snapshot.active_observers == before.active_observers + 1
+            })
+            .await;
+            request_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel native discovery caller context"),
+            );
+            assert_eq!(
+                request
+                    .await
+                    .expect("observer task must return its typed result"),
+                Err(SessionResumeError::Cancelled)
+            );
+
+            barrier.release();
+            wait_for_native_discovery_state(&settlement_cx, |snapshot| {
+                snapshot.active_scans == before.active_scans
+                    && snapshot.active_workers == before.active_workers
+                    && snapshot.active_observers == before.active_observers
+            })
+            .await;
+        });
+
+        let after = native_discovery_runtime_metrics();
+        assert!(worker_settled.load(Ordering::Acquire));
+        assert_eq!(after.admitted_total, before.admitted_total + 1);
+        assert_eq!(after.completed_total, before.completed_total + 1);
+        assert_eq!(
+            after.cancel_requested_total,
+            before.cancel_requested_total + 1
+        );
+        assert_eq!(
+            after.dropped_observer_total, before.dropped_observer_total,
+            "explicit context cancellation is not an abandoned observer"
+        );
+        assert_eq!(
+            after.undelivered_receipt_total,
+            before.undelivered_receipt_total + 1
+        );
+    }
+
+    #[test]
+    fn native_discovery_runtime_rejection_releases_permit_without_work() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        assert_eq!(before.active_scans, 0, "lifecycle tests must start quiescent");
+        let work_ran = Arc::new(AtomicBool::new(false));
+        let work_ran_inner = Arc::clone(&work_ran);
+
+        // A fresh OS thread has no installed runtime handle. Polling once is
+        // sufficient because rejection occurs before the first suspension or
+        // filesystem effect.
+        std::thread::spawn(move || {
+            use std::future::Future as _;
+
+            let cx = crate::cx::for_request();
+            let mut request = Box::pin(run_owned_native_discovery_with_cx(
+                &cx,
+                move |_cancellation, _scan_cx| {
+                    work_ran_inner.store(true, Ordering::Release);
+                    Ok(SessionDiscoveryResult::default())
+                },
+            ));
+            let waker = futures::task::noop_waker();
+            let mut poll_cx = std::task::Context::from_waker(&waker);
+            let error = match request.as_mut().poll(&mut poll_cx) {
+                std::task::Poll::Ready(Err(error)) => error,
+                other => panic!("missing runtime must reject before suspending: {other:?}"),
+            };
+            assert_eq!(
+                error,
+                SessionResumeError::DiscoveryAdmissionRejected {
+                    reason:
+                        SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown,
+                }
+            );
+        })
+        .join()
+        .expect("runtime-rejection probe thread must not panic");
+
+        let after = native_discovery_runtime_metrics();
+        assert!(!work_ran.load(Ordering::Acquire));
+        assert_eq!(after.active_scans, before.active_scans);
+        assert_eq!(after.active_workers, before.active_workers);
+        assert_eq!(after.active_observers, before.active_observers);
+        assert_eq!(after.admitted_total, before.admitted_total + 1);
+        assert_eq!(
+            after.runtime_rejected_total,
+            before.runtime_rejected_total + 1
+        );
+    }
+
+    #[test]
+    fn native_discovery_saturation_rejects_without_running_work() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        assert_eq!(before.active_scans, 0, "lifecycle tests must start quiescent");
+        let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
+        let started = Arc::new(AtomicUsize::new(0));
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native discovery test runtime");
+        // Declared after the runtime so unwinding releases every worker before
+        // Runtime::drop begins its structured drain.
+        let _release_on_drop = ReleaseNativeDiscoveryBarrierOnDrop(Arc::clone(&barrier));
+        runtime.block_on(async {
+            let wait_cx = crate::cx::for_request();
+            let mut observers = Vec::with_capacity(MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS);
+            for _ in 0..MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS {
+                let request_cx = crate::cx::for_request();
+                let task_cx = request_cx.clone();
+                let worker_barrier = Arc::clone(&barrier);
+                let worker_started = Arc::clone(&started);
+                observers.push(crate::runtime_async::task::spawn_with_cx(
+                    &request_cx,
+                    move |_child_cx| async move {
+                        run_owned_native_discovery_with_cx(
+                            &task_cx,
+                            move |cancellation, scan_cx| {
+                                worker_started.fetch_add(1, Ordering::AcqRel);
+                                worker_barrier.wait_in_worker();
+                                cancellation.checkpoint(&scan_cx)?;
+                                Ok(SessionDiscoveryResult::default())
+                            },
+                        )
+                        .await
+                    },
+                ));
+            }
+            wait_for_native_discovery_state(&wait_cx, |snapshot| {
+                started.load(Ordering::Acquire) == MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS
+                    && snapshot.active_scans == MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS
+            })
+            .await;
+
+            let rejected_work_ran = Arc::new(AtomicBool::new(false));
+            let rejected_work_ran_inner = Arc::clone(&rejected_work_ran);
+            let error = run_owned_native_discovery_with_cx(
+                &wait_cx,
+                move |_cancellation, _scan_cx| {
+                    rejected_work_ran_inner.store(true, Ordering::Release);
+                    Ok(SessionDiscoveryResult::default())
+                },
+            )
+            .await
+            .expect_err("the fifth concurrent scan must fail before owner admission");
+            assert_eq!(
+                error,
+                SessionResumeError::DiscoveryAdmissionRejected {
+                    reason: SessionDiscoveryAdmissionRejection::SubsystemSaturated,
+                }
+            );
+            assert!(!rejected_work_ran.load(Ordering::Acquire));
+
+            for observer in &observers {
+                observer.abort();
+            }
+            for observer in observers {
+                assert!(observer.await.is_err());
+            }
+            barrier.release();
+            wait_for_native_discovery_state(&wait_cx, |snapshot| {
+                snapshot.active_scans == 0
+                    && snapshot.active_workers == 0
+                    && snapshot.active_observers == 0
+            })
+            .await;
+        });
+
+        let after = native_discovery_runtime_metrics();
+        assert_eq!(
+            after.saturated_total,
+            before.saturated_total + 1,
+            "one rejected admission must remain observable"
+        );
+        assert_eq!(
+            after.admitted_total,
+            before.admitted_total + MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS as u64
+        );
     }
 
     #[test]

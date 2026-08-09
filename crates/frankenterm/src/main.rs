@@ -13273,6 +13273,32 @@ fn robot_session_resume_error_response<T>(
                 elapsed_ms,
             )
         }
+        SessionResumeError::DiscoveryResourceLimitExceeded {
+            resource,
+            observed,
+            limit,
+        } => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME,
+            format!(
+                "native session discovery exceeded the {resource} budget (observed={observed}, limit={limit})"
+            ),
+            Some(
+                "Narrow the selected home scope or archive stale provider entries before retrying."
+                    .to_string(),
+            ),
+            elapsed_ms,
+        ),
+        SessionResumeError::DiscoveryAdmissionRejected { reason } => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_SESSION_RESUME,
+                format!("native session discovery admission rejected ({reason})"),
+                Some(
+                    "Retry after active discovery settles and the application runtime is healthy."
+                        .to_string(),
+                ),
+                elapsed_ms,
+            )
+        }
         SessionResumeError::DiscoveryIncomplete { source, reason } => {
             RobotResponse::error_with_code(
                 ROBOT_ERR_SESSION_RESUME,
