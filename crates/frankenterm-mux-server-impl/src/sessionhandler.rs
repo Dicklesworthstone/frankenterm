@@ -3641,36 +3641,26 @@ fn with_current_pane<R>(
 /// Sample one exact pane registration without allowing a faulty pane callback
 /// to fail or unwind sibling entries in a bounded fleet-health response.
 fn sample_tiered_scrollback_status(
-    authority: &SessionAuthority,
+    session: &CurrentSession,
     pane_id: PaneId,
 ) -> PaneTieredScrollbackStatusOutcomeV1 {
     let sampled = catch_recoverable(
         RecoverablePanicSite::MuxPaneCallback,
-        AssertUnwindSafe(|| -> anyhow::Result<PaneTieredScrollbackStatusOutcomeV1> {
-            let Some(registration) = authority.capture_current_pane_opt(pane_id)? else {
-                return Ok(PaneTieredScrollbackStatusOutcomeV1::Missing);
+        AssertUnwindSafe(|| {
+            let Some(registration) = session.capture_current_pane(pane_id) else {
+                return PaneTieredScrollbackStatusOutcomeV1::Missing;
             };
-            authority.try_run(|| {
-                Ok(match registration
-                    .try_with_current(|current| current.get_tiered_scrollback_status())
-                {
-                    Some(Some(status)) => {
-                        PaneTieredScrollbackStatusOutcomeV1::Available(status)
-                    }
-                    Some(None) => PaneTieredScrollbackStatusOutcomeV1::Unavailable,
-                    None => PaneTieredScrollbackStatusOutcomeV1::Closed,
-                })
-            })?
+            match registration
+                .try_with_current(|current| current.get_tiered_scrollback_status())
+            {
+                Some(Some(status)) => PaneTieredScrollbackStatusOutcomeV1::Available(status.into()),
+                Some(None) => PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                None => PaneTieredScrollbackStatusOutcomeV1::Closed,
+            }
         }),
     );
     match sampled {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(error)) => {
-            log::debug!(
-                "tiered scrollback health sample could not retain pane {pane_id} authority: {error:#}"
-            );
-            PaneTieredScrollbackStatusOutcomeV1::Closed
-        }
+        Ok(outcome) => outcome,
         Err(error) => {
             log::warn!(
                 "tiered scrollback health callback panicked for pane {pane_id}: {error}"
@@ -4687,14 +4677,20 @@ impl SessionHandler {
                             metrics::histogram!("mux.server.tiered_scrollback_batch_panes")
                                 .record(request.pane_ids.len() as f64);
 
+                            let snapshot_started_at = Instant::now();
+                            let session = authority.acquire()?;
                             let entries = request
                                 .pane_ids
                                 .into_iter()
                                 .map(|pane_id| PaneTieredScrollbackStatusEntryV1 {
                                     pane_id,
-                                    outcome: sample_tiered_scrollback_status(&authority, pane_id),
+                                    outcome: sample_tiered_scrollback_status(&session, pane_id),
                                 })
                                 .collect();
+                            metrics::histogram!(
+                                "mux.server.tiered_scrollback_batch_snapshot_ms"
+                            )
+                            .record(snapshot_started_at.elapsed().as_secs_f64() * 1_000.0);
                             record_tiered_scrollback_batch_outcomes(&entries);
                             let response = GetPaneTieredScrollbackStatusesV1Response { entries };
                             response.validate()?;
@@ -6500,7 +6496,7 @@ mod tests {
                 PaneTieredScrollbackStatusEntryV1 {
                     pane_id: 7,
                     outcome: PaneTieredScrollbackStatusOutcomeV1::Available(
-                        sample_tiered_scrollback_status(41),
+                        sample_tiered_scrollback_status(41).into(),
                     ),
                 },
                 PaneTieredScrollbackStatusEntryV1 {
@@ -6571,7 +6567,7 @@ mod tests {
                 PaneTieredScrollbackStatusEntryV1 {
                     pane_id: 18,
                     outcome: PaneTieredScrollbackStatusOutcomeV1::Available(
-                        sample_tiered_scrollback_status(18),
+                        sample_tiered_scrollback_status(18).into(),
                     ),
                 },
             ],

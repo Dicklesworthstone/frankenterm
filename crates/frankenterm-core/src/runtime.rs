@@ -9379,6 +9379,17 @@ fn finish_pane_tiered_scrollback_fetch(
     fetch
 }
 
+async fn yield_between_pane_tiered_scrollback_chunks(runtime_cx: &RuntimeLoopCx) -> bool {
+    if crate::runtime_async::task::yield_now_with_cx(runtime_cx)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    metrics::counter!("frankenterm.runtime.tiered_scrollback_inter_chunk_yields").increment(1);
+    true
+}
+
 async fn collect_pane_tiered_scrollback_summaries(
     runtime_cx: &RuntimeLoopCx,
     wezterm_handle: &WeztermHandle,
@@ -9396,7 +9407,13 @@ async fn collect_pane_tiered_scrollback_summaries(
     unique_pane_ids.dedup();
     let mut use_legacy_fallback = false;
 
-    for pane_chunk in unique_pane_ids.chunks(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES) {
+    let chunk_count = unique_pane_ids
+        .len()
+        .div_ceil(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES);
+    for (chunk_index, pane_chunk) in unique_pane_ids
+        .chunks(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES)
+        .enumerate()
+    {
         if runtime_cx.checkpoint().is_err() {
             fetch.cancelled = true;
             return finish_pane_tiered_scrollback_fetch(fetch, started_at);
@@ -9436,6 +9453,12 @@ async fn collect_pane_tiered_scrollback_summaries(
                         fetch.cancelled = true;
                         return finish_pane_tiered_scrollback_fetch(fetch, started_at);
                     }
+                    if chunk_index + 1 < chunk_count
+                        && !yield_between_pane_tiered_scrollback_chunks(runtime_cx).await
+                    {
+                        fetch.cancelled = true;
+                        return finish_pane_tiered_scrollback_fetch(fetch, started_at);
+                    }
                     continue;
                 }
                 Ok(None) => {
@@ -9454,6 +9477,12 @@ async fn collect_pane_tiered_scrollback_summaries(
                         error_class = "bulk_request_failed",
                         "Failed to collect a bounded mux tiered-scrollback health batch"
                     );
+                    if chunk_index + 1 < chunk_count
+                        && !yield_between_pane_tiered_scrollback_chunks(runtime_cx).await
+                    {
+                            fetch.cancelled = true;
+                            return finish_pane_tiered_scrollback_fetch(fetch, started_at);
+                    }
                     continue;
                 }
             }
@@ -9497,6 +9526,12 @@ async fn collect_pane_tiered_scrollback_summaries(
             if let Some(next_pane_id) = remaining.next() {
                 pending.push(probe(next_pane_id));
             }
+        }
+        if chunk_index + 1 < chunk_count
+            && !yield_between_pane_tiered_scrollback_chunks(runtime_cx).await
+        {
+            fetch.cancelled = true;
+            return finish_pane_tiered_scrollback_fetch(fetch, started_at);
         }
     }
 

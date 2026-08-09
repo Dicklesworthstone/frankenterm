@@ -13157,7 +13157,7 @@ mod tests {
                         codec::PaneTieredScrollbackStatusEntryV1 {
                             pane_id: 7,
                             outcome: codec::PaneTieredScrollbackStatusOutcomeV1::Available(
-                                mux::renderable::PaneTieredScrollbackStatus::default(),
+                                codec::PaneTieredScrollbackSummaryV1::default(),
                             ),
                         },
                         codec::PaneTieredScrollbackStatusEntryV1 {

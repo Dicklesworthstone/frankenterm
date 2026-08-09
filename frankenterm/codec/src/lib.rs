@@ -9882,9 +9882,9 @@ pub const MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES: usize = 256;
 pub const MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES: usize = 4 * 1024;
 pub const MAX_TIERED_SCROLLBACK_STATUS_REQUEST_ZSTD_ENCODED_BYTES: usize =
     MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES + 128;
-pub const MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES: usize = 64 * 1024;
+pub const MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES: usize = 32 * 1024;
 pub const MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES: usize =
-    MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES + 512;
+    MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES + 256;
 
 fn serialize_tiered_scrollback_batch_pane_ids<S>(
     pane_ids: &[PaneId],
@@ -9956,9 +9956,40 @@ where
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PaneTieredScrollbackSummaryV1 {
+    pub tiering_enabled: bool,
+    pub configured_scrollback_rows: usize,
+    pub configured_hot_lines: usize,
+    pub configured_warm_max_bytes: usize,
+    pub visible_rows: usize,
+    pub in_memory_scrollback_rows: usize,
+    pub warm_resident_lines: usize,
+    pub warm_resident_bytes: usize,
+    pub warm_spill_lines_total: u64,
+    pub warm_spill_bytes_total: u64,
+}
+
+impl From<PaneTieredScrollbackStatus> for PaneTieredScrollbackSummaryV1 {
+    fn from(status: PaneTieredScrollbackStatus) -> Self {
+        Self {
+            tiering_enabled: status.tiering_enabled,
+            configured_scrollback_rows: status.configured_scrollback_rows,
+            configured_hot_lines: status.configured_hot_lines,
+            configured_warm_max_bytes: status.configured_warm_max_bytes,
+            visible_rows: status.visible_rows,
+            in_memory_scrollback_rows: status.in_memory_scrollback_rows,
+            warm_resident_lines: status.warm_resident_lines,
+            warm_resident_bytes: status.warm_resident_bytes,
+            warm_spill_lines_total: status.warm_spill_lines_total,
+            warm_spill_bytes_total: status.warm_spill_bytes_total,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PaneTieredScrollbackStatusOutcomeV1 {
-    Available(PaneTieredScrollbackStatus),
+    Available(PaneTieredScrollbackSummaryV1),
     /// The pane is live but its implementation has no tiered-scrollback state.
     Unavailable,
     /// No pane registration existed for the requested identity in this turn.
@@ -18212,8 +18243,8 @@ mod test {
         }
     }
 
-    fn maximal_tiered_scrollback_status() -> PaneTieredScrollbackStatus {
-        PaneTieredScrollbackStatus {
+    fn maximal_tiered_scrollback_summary_v1() -> PaneTieredScrollbackSummaryV1 {
+        PaneTieredScrollbackSummaryV1 {
             tiering_enabled: true,
             configured_scrollback_rows: usize::MAX,
             configured_hot_lines: usize::MAX,
@@ -18224,15 +18255,6 @@ mod test {
             warm_resident_bytes: usize::MAX,
             warm_spill_lines_total: u64::MAX,
             warm_spill_bytes_total: u64::MAX,
-            cold_spill_lines_total: u64::MAX,
-            cold_spill_bytes_total: u64::MAX,
-            cold_sink_retained_lines: usize::MAX,
-            cold_sink_retained_bytes: usize::MAX,
-            cold_worker_peak_backlog_depth: usize::MAX,
-            cold_worker_completion_throughput_lines_per_sec: u64::MAX,
-            cold_worker_completed_lines_total: u64::MAX,
-            cold_worker_completed_batches_total: u64::MAX,
-            cold_worker_cancellation_count: u64::MAX,
         }
     }
 
@@ -18243,7 +18265,7 @@ mod test {
                 pane_id,
                 outcome: match pane_id % 5 {
                     0 => PaneTieredScrollbackStatusOutcomeV1::Available(
-                        maximal_tiered_scrollback_status(),
+                        maximal_tiered_scrollback_summary_v1(),
                     ),
                     1 => PaneTieredScrollbackStatusOutcomeV1::Unavailable,
                     2 => PaneTieredScrollbackStatusOutcomeV1::Missing,

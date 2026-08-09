@@ -897,6 +897,24 @@ impl From<mux::renderable::PaneTieredScrollbackStatus> for PaneTieredScrollbackS
     }
 }
 
+#[cfg(all(feature = "vendored", unix))]
+impl From<codec::PaneTieredScrollbackSummaryV1> for PaneTieredScrollbackSummary {
+    fn from(status: codec::PaneTieredScrollbackSummaryV1) -> Self {
+        Self {
+            tiering_enabled: status.tiering_enabled,
+            configured_scrollback_rows: status.configured_scrollback_rows,
+            configured_hot_lines: status.configured_hot_lines,
+            configured_warm_max_bytes: status.configured_warm_max_bytes,
+            visible_rows: status.visible_rows,
+            in_memory_scrollback_rows: status.in_memory_scrollback_rows,
+            warm_resident_lines: status.warm_resident_lines,
+            warm_resident_bytes: status.warm_resident_bytes,
+            warm_spill_lines_total: status.warm_spill_lines_total,
+            warm_spill_bytes_total: status.warm_spill_bytes_total,
+        }
+    }
+}
+
 /// Convert a `ListPanesResponse` from the mux protocol into a flat `Vec<PaneInfo>`.
 ///
 /// The mux protocol returns a tree of `PaneNode` per tab. This function walks
