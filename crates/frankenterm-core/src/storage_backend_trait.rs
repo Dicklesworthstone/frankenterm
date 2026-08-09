@@ -873,12 +873,7 @@ impl StorageBackend for MockBackend {
         state.executed.push(sql.to_string());
         let normalized = sql.trim().to_ascii_uppercase();
         match normalized.as_str() {
-            "BEGIN" | "BEGIN TRANSACTION" => {
-                state.in_tx = true;
-                state.explicit_transaction = true;
-                state.tx_committed = false;
-            }
-            "BEGIN IMMEDIATE" => {
+            "BEGIN" | "BEGIN TRANSACTION" | "BEGIN IMMEDIATE" => {
                 state.in_tx = true;
                 state.explicit_transaction = true;
                 state.tx_committed = false;
