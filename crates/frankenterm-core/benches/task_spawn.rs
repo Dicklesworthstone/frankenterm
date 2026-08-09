@@ -85,6 +85,7 @@ fn bench_region_batch(c: &mut Criterion) {
 
 fn bench_structured_overhead(c: &mut Criterion) {
     let runtime = build_asupersync_runtime();
+    let handle = runtime.handle();
     let cx = for_testing();
 
     let mut group = c.benchmark_group("task_spawn/structured_overhead");
