@@ -38625,6 +38625,7 @@ async fn run_distributed_agent(
         pane_filter: config.ingest.panes.clone(),
         pane_priorities: config.ingest.priorities.clone(),
         capture_budgets: config.ingest.budgets.clone(),
+        fleet_scrollback: config.fleet_scrollback.clone(),
         patterns: config.patterns.clone(),
         patterns_root,
         channel_buffer: 1024,
@@ -39643,6 +39644,7 @@ async fn run_watcher(
         pane_filter: config.ingest.panes.clone(),
         pane_priorities: config.ingest.priorities.clone(),
         capture_budgets: config.ingest.budgets.clone(),
+        fleet_scrollback: config.fleet_scrollback.clone(),
         patterns: config.patterns.clone(),
         patterns_root: patterns_root.clone(),
         channel_buffer: 1024,
@@ -78282,6 +78284,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: Some(summary),
             leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
         }

@@ -3442,6 +3442,30 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Relax exact trigger-set admission only after a replacement receipt proves canonical trigger presence, identity, and one-to-one settlement without schema-specific fixture setup or retained-payload rereads.
 
+### IS-N121 — A synthetic transition field cannot prove a mux-owned scrollback spill
+
+- **Classification:** wrong evidence pipeline and false-green-proof rejection
+- **Bead:** `ft-d0ez0.5`
+- **Rejected inference:** a retained report containing a self-declared
+  `hot_to_warm_transitions_total` is authoritative evidence that the real mux
+  moved scrollback from its hot tier into its warm tier.
+- **Negative evidence:** the term and mux already own cumulative
+  `warm_spill_lines_total` and `warm_spill_bytes_total` counters, but
+  `PaneTieredScrollbackSummary` discarded both before runtime health
+  publication. The 50-pane verifier instead required an invented transition
+  field that had no production producer, and its runnable collector never
+  populated any scrollback samples. A synthetic verifier fixture could pass
+  while no native report could establish the same claim.
+- **Decision:** preserve the mux-owned warm-spill counters through the runtime
+  summary, publish bounded complete/partial/blind fleet coverage in each
+  source-timestamped health snapshot, and require a nondecreasing line/byte
+  series with a line-total increase across two distinct producer snapshots.
+  Fixture transport and stale/replayed snapshots remain
+  `skipped_not_proven`; no native performance claim exists until the isolated
+  full-duration run is retained.
+- **Primary retry condition:**
+  > Replace the mux-owned spill counters only after another bounded production surface proves the same fixed-population hot-to-warm transition with complete pane coverage, distinct producer identity, and no self-declared transition boolean or synthetic-only field.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

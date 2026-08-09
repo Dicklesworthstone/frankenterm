@@ -16,6 +16,7 @@
 //! - `safety`: Capability gates, rate limits, approval, redaction, reservations
 //! - `agent_detection`: Agent pane state thresholds and pane chrome hints
 //! - `metrics`: Enable, bind address
+//! - `fleet_scrollback`: Mux-owned per-pane resident scrollback budget thresholds
 //! - `mcp_client`: Outbound MCP client discovery/selection settings
 //!
 //! # Forward Compatibility
@@ -35,6 +36,46 @@ use std::time::Duration;
 // =============================================================================
 // Main Config
 // =============================================================================
+
+/// Per-pane resident scrollback budget used by the fleet pressure controller.
+///
+/// The runtime classifies mux-owned hot/warm scrollback estimates against this
+/// budget. This is intentionally separate from [`crate::memory_budget`], whose
+/// cgroup and OOM policy is not installed by the observation runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FleetScrollbackBudgetConfig {
+    /// Enable mux scrollback budget pressure in the compound fleet tier.
+    pub enabled: bool,
+    /// Per-pane resident scrollback budget in bytes.
+    pub per_pane_budget_bytes: u64,
+    /// Fraction of the budget that raises the pane to throttled pressure.
+    pub high_ratio: f64,
+}
+
+impl Default for FleetScrollbackBudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            per_pane_budget_bytes: 1024 * 1024 * 1024,
+            high_ratio: 0.8,
+        }
+    }
+}
+
+impl FleetScrollbackBudgetConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.per_pane_budget_bytes == 0 {
+            return Err(
+                "fleet_scrollback.per_pane_budget_bytes must be >= 1 when enabled".to_string(),
+            );
+        }
+        if !self.high_ratio.is_finite() || !(0.0..1.0).contains(&self.high_ratio) {
+            return Err("fleet_scrollback.high_ratio must be finite and in (0, 1)".to_string());
+        }
+        Ok(())
+    }
+}
 
 /// Main configuration structure for ft
 ///
@@ -99,6 +140,10 @@ pub struct Config {
 
     /// Backpressure policy settings (tiered queue-depth responses)
     pub backpressure: crate::backpressure::BackpressureConfig,
+
+    /// Mux-owned per-pane resident scrollback budget used by runtime
+    /// fleet-pressure classification.
+    pub fleet_scrollback: FleetScrollbackBudgetConfig,
 
     /// CLI subprocess settings (owned-child timeouts and reserved cleanup policy)
     pub cli: CliConfig,
@@ -5134,6 +5179,14 @@ impl Config {
             });
         }
 
+        if self.fleet_scrollback != new_config.fleet_scrollback {
+            forbidden.push(ForbiddenChange {
+                name: "fleet_scrollback".to_string(),
+                reason: "Fleet scrollback budget settings are captured by the runtime health loop and require restart"
+                    .to_string(),
+            });
+        }
+
         if self.backup.scheduled != new_config.backup.scheduled {
             forbidden.push(ForbiddenChange {
                 name: "backup.scheduled".to_string(),
@@ -5687,6 +5740,10 @@ impl Config {
             .map_err(crate::error::ConfigError::ValidationError)?;
 
         self.gc
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
+        self.fleet_scrollback
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
 
@@ -6518,6 +6575,69 @@ log_report = false
         assert_eq!(config.gc.interval_seconds, 120);
         assert!((config.gc.vacuum_threshold - 0.35).abs() < f64::EPSILON);
         assert!(!config.gc.log_report);
+    }
+
+    #[test]
+    fn fleet_scrollback_budget_toml_parses_and_validates() {
+        let config = Config::from_toml(
+            r"
+[fleet_scrollback]
+enabled = true
+per_pane_budget_bytes = 65536
+high_ratio = 0.8
+",
+        )
+        .expect("valid fleet scrollback budget must parse");
+
+        assert!(config.fleet_scrollback.enabled);
+        assert_eq!(config.fleet_scrollback.per_pane_budget_bytes, 65_536);
+        assert!((config.fleet_scrollback.high_ratio - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fleet_scrollback_budget_rejects_zero_enabled_budget() {
+        let error = Config::from_toml(
+            r"
+[fleet_scrollback]
+enabled = true
+per_pane_budget_bytes = 0
+",
+        )
+        .expect_err("enabled zero-byte budget must fail closed")
+        .to_string();
+
+        assert!(error.contains("fleet_scrollback.per_pane_budget_bytes"));
+    }
+
+    #[test]
+    fn fleet_scrollback_budget_allows_zero_when_disabled() {
+        let config = Config::from_toml(
+            r"
+[fleet_scrollback]
+enabled = false
+per_pane_budget_bytes = 0
+",
+        )
+        .expect("disabled budget may use zero bytes");
+
+        assert!(!config.fleet_scrollback.enabled);
+        assert_eq!(config.fleet_scrollback.per_pane_budget_bytes, 0);
+    }
+
+    #[test]
+    fn fleet_scrollback_budget_rejects_non_interior_ratios() {
+        for ratio in ["0.0", "1.0", "-0.1", "nan", "inf"] {
+            let input = format!(
+                "[fleet_scrollback]\nenabled = true\nper_pane_budget_bytes = 65536\nhigh_ratio = {ratio}\n"
+            );
+            let error = Config::from_toml(&input)
+                .expect_err("ratio outside finite open interval must fail closed")
+                .to_string();
+            assert!(
+                error.contains("fleet_scrollback.high_ratio"),
+                "ratio {ratio} produced unexpected error: {error}",
+            );
+        }
     }
 
     #[test]
@@ -8177,6 +8297,23 @@ max_bytes_per_sec = 1048576
 
         assert!(!result.allowed);
         assert!(result.forbidden.iter().any(|f| f.name == "mcp_client"));
+    }
+
+    #[test]
+    fn hot_reload_forbids_fleet_scrollback_budget_change() {
+        let config1 = Config::default();
+        let mut config2 = Config::default();
+        config2.fleet_scrollback.per_pane_budget_bytes = 65_536;
+
+        let result = config1.diff_for_hot_reload(&config2);
+
+        assert!(!result.allowed);
+        assert!(
+            result
+                .forbidden
+                .iter()
+                .any(|change| change.name == "fleet_scrollback")
+        );
     }
 
     #[test]

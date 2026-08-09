@@ -820,9 +820,11 @@ impl PaneInfo {
 
 /// Stable tiered scrollback telemetry surfaced by pane backends.
 ///
-/// This intentionally carries only the fields used by runtime maintenance so
-/// the `WeztermInterface` can expose it even when the vendored mux types are
-/// not compiled in.
+/// This intentionally carries only the fields used by runtime maintenance and
+/// its health evidence so the `WeztermInterface` can expose it even when the
+/// vendored mux types are not compiled in. The cumulative warm-spill counters
+/// are part of the evidence contract: dropping them here makes a real
+/// hot-to-warm transition impossible to prove outside the mux process.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneTieredScrollbackSummary {
     pub tiering_enabled: bool,
@@ -833,6 +835,8 @@ pub struct PaneTieredScrollbackSummary {
     pub in_memory_scrollback_rows: usize,
     pub warm_resident_lines: usize,
     pub warm_resident_bytes: usize,
+    pub warm_spill_lines_total: u64,
+    pub warm_spill_bytes_total: u64,
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -847,6 +851,8 @@ impl From<mux::renderable::PaneTieredScrollbackStatus> for PaneTieredScrollbackS
             in_memory_scrollback_rows: status.in_memory_scrollback_rows,
             warm_resident_lines: status.warm_resident_lines,
             warm_resident_bytes: status.warm_resident_bytes,
+            warm_spill_lines_total: status.warm_spill_lines_total,
+            warm_spill_bytes_total: status.warm_spill_bytes_total,
         }
     }
 }
@@ -6000,6 +6006,20 @@ mod tests {
         };
         assert_eq!(status.state, CircuitStateKind::Open);
         assert_eq!(status.consecutive_failures, 1);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn tiered_scrollback_summary_preserves_hot_to_warm_spill_counters() {
+        let summary =
+            PaneTieredScrollbackSummary::from(mux::renderable::PaneTieredScrollbackStatus {
+                warm_spill_lines_total: 41,
+                warm_spill_bytes_total: 8_192,
+                ..Default::default()
+            });
+
+        assert_eq!(summary.warm_spill_lines_total, 41);
+        assert_eq!(summary.warm_spill_bytes_total, 8_192);
     }
 
     #[test]

@@ -848,6 +848,12 @@ pub struct HealthSnapshot {
     #[serde(default)]
     pub fleet_pressure_tier: Option<String>,
 
+    /// Bounded aggregate of mux-owned tiered-scrollback counters sampled by
+    /// the runtime health loop. `None` means the producing runtime predates
+    /// this contract or did not attempt the mux telemetry read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_scrollback_telemetry: Option<FleetScrollbackTelemetrySnapshot>,
+
     /// Redacted swarm capacity certificate/controller summary for robot and doctor surfaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swarm_capacity: Option<crate::runtime_telemetry::SwarmCapacityOperatorSummary>,
@@ -855,6 +861,33 @@ pub struct HealthSnapshot {
     /// Leak-risk lifecycle inventory for retention debugging.
     #[serde(default)]
     pub leak_risk_inventory: LeakRiskInventorySnapshot,
+}
+
+/// Aggregate mux tiered-scrollback evidence retained in a health snapshot.
+///
+/// The spill totals are sums of the per-pane cumulative counters for the
+/// fixed pane population identified by this snapshot. Consumers that need a
+/// transition proof must require exact identity coverage and compare snapshots
+/// with distinct source timestamps; a single total is not itself proof that a
+/// transition occurred during a measurement window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetScrollbackTelemetrySnapshot {
+    /// Number of panes the runtime intended to sample.
+    pub observed_panes: usize,
+    /// Number of panes for which the mux returned authoritative status.
+    pub sampled_panes: usize,
+    /// Sorted pane identities the runtime intended to sample.
+    pub observed_pane_ids: Vec<u64>,
+    /// Sorted pane identities for which authoritative mux status was returned.
+    pub sampled_pane_ids: Vec<u64>,
+    /// Whether every pane status read failed or was unavailable.
+    pub telemetry_blind: bool,
+    /// Whether only a strict subset of pane status reads succeeded.
+    pub telemetry_partial: bool,
+    /// Sum of mux-owned cumulative hot-to-warm line spill counters.
+    pub warm_spill_lines_total: u64,
+    /// Sum of mux-owned cumulative hot-to-warm byte spill counters.
+    pub warm_spill_bytes_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -948,6 +981,8 @@ struct CrashHealthSnapshot<'a> {
     in_crash_loop: bool,
     fleet_pressure_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    fleet_scrollback_telemetry: Option<&'a FleetScrollbackTelemetrySnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     swarm_capacity: Option<&'a crate::runtime_telemetry::SwarmCapacityOperatorSummary>,
     leak_risk_inventory: &'a LeakRiskInventorySnapshot,
 }
@@ -1014,6 +1049,7 @@ fn redacted_health_snapshot<'a>(
         current_backoff_ms: snapshot.current_backoff_ms,
         in_crash_loop: snapshot.in_crash_loop,
         fleet_pressure_tier,
+        fleet_scrollback_telemetry: snapshot.fleet_scrollback_telemetry.as_ref(),
         swarm_capacity: snapshot.swarm_capacity.as_ref(),
         leak_risk_inventory: &snapshot.leak_risk_inventory,
     }
@@ -8232,6 +8268,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         }
@@ -8357,6 +8394,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
@@ -12259,6 +12297,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: Some("Normal".to_string()),
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot {
                 tracked_pane_entries: 10,
@@ -12335,12 +12374,13 @@ mod tests {
         assert_eq!(parsed.current_backoff_ms, 0);
         assert!(!parsed.in_crash_loop);
         assert!(parsed.fleet_pressure_tier.is_none());
+        assert!(parsed.fleet_scrollback_telemetry.is_none());
         assert!(parsed.swarm_capacity.is_none());
         assert!(parsed.leak_risk_inventory.is_empty());
     }
 
     #[test]
-    fn health_snapshot_fleet_pressure_tier_roundtrip() {
+    fn health_snapshot_fleet_pressure_and_scrollback_telemetry_roundtrip() {
         let snapshot = HealthSnapshot {
             timestamp: 2000,
             observed_panes: 10,
@@ -12362,13 +12402,28 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: Some("Critical".to_string()),
+            fleet_scrollback_telemetry: Some(FleetScrollbackTelemetrySnapshot {
+                observed_panes: 10,
+                sampled_panes: 10,
+                observed_pane_ids: (1..=10).collect(),
+                sampled_pane_ids: (1..=10).collect(),
+                telemetry_blind: false,
+                telemetry_partial: false,
+                warm_spill_lines_total: 55,
+                warm_spill_bytes_total: 4_096,
+            }),
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let parsed: HealthSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.fleet_pressure_tier.as_deref(), Some("Critical"));
+        assert_eq!(
+            parsed.fleet_scrollback_telemetry,
+            snapshot.fleet_scrollback_telemetry
+        );
         assert!(json.contains("fleet_pressure_tier"));
+        assert!(json.contains("fleet_scrollback_telemetry"));
         assert!(json.contains("Critical"));
     }
 

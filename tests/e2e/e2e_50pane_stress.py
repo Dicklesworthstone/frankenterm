@@ -53,8 +53,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = REPO_ROOT / "tests" / "e2e" / "output"
 SKIP_EXIT_CODE = 77
 REPORT_CONTRACT_ID = "ft.e2e_50pane_stress"
-REPORT_SCHEMA_VERSION = 2
-VERIFIER_VERSION = "ft.e2e_50pane_stress.verifier.v1"
+REPORT_SCHEMA_VERSION = 3
+VERIFIER_VERSION = "ft.e2e_50pane_stress.verifier.v2"
 AUTHORIZATION_RECEIPT_SCHEMA_VERSION = 1
 AUTHORIZATION_SCOPE = "ft-d0ez0.5.native-isolated-50-pane.v1"
 FULL_DURATION_SECS = 300.0
@@ -72,11 +72,18 @@ RSS_LIMIT_KB = 1024 * 1024
 RSS_SAMPLE_INTERVAL_SECS = 10.0
 RSS_MAX_SAMPLE_GAP_SECS = 15.0
 RSS_FINAL_COVERAGE_SLACK_SECS = 2.0
+MAX_SUPPORTED_DURATION_SECS = (
+    MAX_TELEMETRY_SAMPLES - 2
+) * RSS_SAMPLE_INTERVAL_SECS
 DETECTION_RULE_ID = "codex.usage.warning_25"
 NORMAL_LINES_PER_SECOND_PER_PANE = 2.0
 HIGH_LINES_PER_SECOND_PER_PANE = 20.0
 HIGH_OUTPUT_PHASE_FRACTION = 0.6
 HIGH_OUTPUT_PHASE_TOLERANCE_SECS = 15.0
+OUTPUT_RATE_MINIMUM_FRACTION = 0.85
+OUTPUT_PAYLOAD_BYTES_PER_LINE = 448
+FLEET_SCROLLBACK_PER_PANE_BUDGET_BYTES = 512 * 1024
+FLEET_SCROLLBACK_HIGH_RATIO = 0.8
 DETECTION_PROBE_PHASE_FRACTION = 0.8
 DETECTION_PROBE_PHASE_TOLERANCE_SECS = 15.0
 ROBOT_BENCHMARK_PHASE_FRACTION = 0.9
@@ -96,6 +103,11 @@ CONFIG_TEMPLATE = """\
 poll_interval_ms = 200
 batch_size = 50
 max_segment_bytes = 65536
+
+[fleet_scrollback]
+enabled = true
+per_pane_budget_bytes = 524288
+high_ratio = 0.8
 
 [storage]
 retention_days = 1
@@ -489,6 +501,18 @@ def is_lower_hex(value: Any, length: int) -> bool:
     )
 
 
+def minimum_output_lines_for_pane(pane_index: int, requested_duration: float) -> int:
+    high_phase_start = requested_duration * HIGH_OUTPUT_PHASE_FRACTION
+    expected_lines = NORMAL_LINES_PER_SECOND_PER_PANE * requested_duration
+    if pane_index in HIGH_OUTPUT_PANES:
+        expected_lines = (
+            NORMAL_LINES_PER_SECOND_PER_PANE * high_phase_start
+            + HIGH_LINES_PER_SECOND_PER_PANE
+            * (requested_duration - high_phase_start)
+        )
+    return math.floor(expected_lines * OUTPUT_RATE_MINIMUM_FRACTION)
+
+
 def is_utc_timestamp(value: Any) -> bool:
     if not isinstance(value, str) or not value.endswith("Z") or len(value) > 64:
         return False
@@ -563,6 +587,44 @@ def telemetry_elapsed_error(samples: Any, observed_duration: Any) -> str | None:
     return None
 
 
+def source_snapshot_timestamp_error(
+    samples: Any,
+    minimum_source_timestamp_ms: Any,
+) -> str | None:
+    """Validate producer-owned snapshot identity without inventing freshness."""
+    if not isinstance(samples, list):
+        return "samples_not_array"
+    if (
+        not isinstance(minimum_source_timestamp_ms, int)
+        or isinstance(minimum_source_timestamp_ms, bool)
+        or minimum_source_timestamp_ms < 0
+    ):
+        return "sustained_start_timestamp_invalid"
+    previous_source_timestamp: int | None = None
+    for sample in samples:
+        if not isinstance(sample, dict):
+            return "sample_not_object"
+        source_timestamp = sample.get("source_snapshot_timestamp_ms")
+        observed_timestamp = sample.get("timestamp_ms")
+        if (
+            not isinstance(source_timestamp, int)
+            or isinstance(source_timestamp, bool)
+            or source_timestamp < 0
+            or not isinstance(observed_timestamp, int)
+            or isinstance(observed_timestamp, bool)
+            or source_timestamp < minimum_source_timestamp_ms
+            or source_timestamp > observed_timestamp
+        ):
+            return "source_snapshot_timestamp_invalid"
+        if (
+            previous_source_timestamp is not None
+            and source_timestamp <= previous_source_timestamp
+        ):
+            return "source_snapshot_timestamp_not_strictly_increasing"
+        previous_source_timestamp = source_timestamp
+    return None
+
+
 def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
     """Recompute every authority gate from raw evidence; never trust stored pass booleans."""
     checks: list[VerificationCheck] = []
@@ -599,6 +661,7 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
     thresholds = report.get("thresholds")
     expected_thresholds = {
         "minimum_sustained_duration_secs": FULL_DURATION_SECS,
+        "maximum_supported_duration_secs": MAX_SUPPORTED_DURATION_SECS,
         "detection_latency_limit_ms_exclusive": DETECTION_LATENCY_LIMIT_MS,
         "robot_state_latency_limit_ms_exclusive": ROBOT_STATE_LATENCY_LIMIT_MS,
         "robot_search_latency_limit_ms_exclusive": ROBOT_SEARCH_LATENCY_LIMIT_MS,
@@ -608,6 +671,10 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         "rss_final_coverage_slack_secs": RSS_FINAL_COVERAGE_SLACK_SECS,
         "high_output_phase_fraction": HIGH_OUTPUT_PHASE_FRACTION,
         "high_output_phase_tolerance_secs": HIGH_OUTPUT_PHASE_TOLERANCE_SECS,
+        "output_rate_minimum_fraction": OUTPUT_RATE_MINIMUM_FRACTION,
+        "output_payload_bytes_per_line": OUTPUT_PAYLOAD_BYTES_PER_LINE,
+        "fleet_scrollback_per_pane_budget_bytes": FLEET_SCROLLBACK_PER_PANE_BUDGET_BYTES,
+        "fleet_scrollback_high_ratio": FLEET_SCROLLBACK_HIGH_RATIO,
         "detection_probe_phase_fraction": DETECTION_PROBE_PHASE_FRACTION,
         "detection_probe_phase_tolerance_secs": DETECTION_PROBE_PHASE_TOLERANCE_SECS,
         "robot_benchmark_phase_fraction": ROBOT_BENCHMARK_PHASE_FRACTION,
@@ -690,6 +757,10 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
     binary = provenance.get("binary") if isinstance(provenance.get("binary"), dict) else {}
     config = provenance.get("config") if isinstance(provenance.get("config"), dict) else {}
     hardware = provenance.get("hardware") if isinstance(provenance.get("hardware"), dict) else {}
+    config_content = config.get("content")
+    config_content_bytes = (
+        config_content.encode("utf-8") if isinstance(config_content, str) else b""
+    )
     provenance_missing = [
         field
         for field, present in {
@@ -709,6 +780,11 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
             "config.size_bytes": isinstance(config.get("size_bytes"), int)
             and not isinstance(config.get("size_bytes"), bool)
             and config.get("size_bytes", 0) > 0,
+            "config.content": config_content == CONFIG_TEMPLATE,
+            "config.content_sha256": bool(config_content_bytes)
+            and hashlib.sha256(config_content_bytes).hexdigest() == config.get("sha256"),
+            "config.content_size": bool(config_content_bytes)
+            and len(config_content_bytes) == config.get("size_bytes"),
             "hardware.system": isinstance(hardware.get("system"), str) and bool(hardware.get("system")),
             "hardware.machine": isinstance(hardware.get("machine"), str) and bool(hardware.get("machine")),
             "hardware.release": isinstance(hardware.get("release"), str) and bool(hardware.get("release")),
@@ -730,7 +806,7 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         ),
         expected=(
             "clean exact source; release-interactive/release-perf binary identity; "
-            "config digest; and target hardware identity"
+            "frozen embedded config with matching digest; and target hardware identity"
         ),
         actual={"missing_or_invalid": provenance_missing, "provenance": provenance},
     )
@@ -746,11 +822,15 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         requested_duration_present
         and duration_present
         and float(requested_duration) >= FULL_DURATION_SECS
+        and float(requested_duration) <= MAX_SUPPORTED_DURATION_SECS
         and float(observed_duration) >= float(requested_duration)
     )
     if not requested_duration_present or not duration_present:
         duration_outcome = "skipped_not_proven"
         duration_reason = "duration.missing_or_invalid"
+    elif float(requested_duration) > MAX_SUPPORTED_DURATION_SECS:
+        duration_outcome = "fail"
+        duration_reason = "duration.above_supported_sample_bound"
     elif not duration_ok:
         duration_outcome = "fail"
         duration_reason = "duration.below_minimum"
@@ -764,7 +844,8 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         reason_code=duration_reason,
         expected=(
             f"requested duration >= {FULL_DURATION_SECS:.0f}s and observed duration "
-            f">= requested duration"
+            f">= requested duration, with requested duration <= "
+            f"{MAX_SUPPORTED_DURATION_SECS:.0f}s"
         ),
         actual={"requested": requested_duration, "observed": observed_duration},
     )
@@ -798,6 +879,11 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
     output_bytes = workload.get("observed_output_bytes")
     output_bytes_at_start = workload.get("output_bytes_at_sustained_start")
     output_bytes_at_end = workload.get("output_bytes_at_sustained_end")
+    output_lines = workload.get("observed_output_lines")
+    output_lines_at_start = workload.get("output_lines_at_sustained_start")
+    output_lines_at_end = workload.get("output_lines_at_sustained_end")
+    spawned_pane_ids = workload.get("spawned_pane_ids")
+    pane_output_deltas = workload.get("pane_output_deltas")
     normal_rate = workload.get("normal_lines_per_second_per_pane")
     high_rate = workload.get("high_lines_per_second_per_pane")
     configured_phase_fraction = workload.get("configured_high_output_phase_fraction")
@@ -809,9 +895,15 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
             "high_output_phase_started",
             "configured_high_output_phase_fraction",
             "high_output_phase_started_elapsed_secs",
+            "sustained_started_epoch_ms",
             "observed_output_bytes",
             "output_bytes_at_sustained_start",
             "output_bytes_at_sustained_end",
+            "observed_output_lines",
+            "output_lines_at_sustained_start",
+            "output_lines_at_sustained_end",
+            "spawned_pane_ids",
+            "pane_output_deltas",
             "normal_lines_per_second_per_pane",
             "high_lines_per_second_per_pane",
         )
@@ -821,10 +913,85 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         if requested_duration_present
         else None
     )
+    pane_output_error: str | None = None
+    pane_output_total = 0
+    pane_output_byte_total = 0
+    if (
+        not isinstance(spawned_pane_ids, list)
+        or len(spawned_pane_ids) != NUM_PANES
+        or any(
+            not isinstance(pane_id, int) or isinstance(pane_id, bool) or pane_id <= 0
+            for pane_id in spawned_pane_ids
+        )
+        or len(set(spawned_pane_ids)) != NUM_PANES
+        or not isinstance(pane_output_deltas, list)
+        or len(pane_output_deltas) != NUM_PANES
+        or not requested_duration_present
+    ):
+        pane_output_error = "pane_output_population_invalid"
+    else:
+        seen_indexes: set[int] = set()
+        for sample in pane_output_deltas:
+            if not isinstance(sample, dict):
+                pane_output_error = "pane_output_sample_not_object"
+                break
+            pane_index = sample.get("pane_index")
+            pane_id = sample.get("pane_id")
+            lines_at_start = sample.get("lines_at_start")
+            lines_at_end = sample.get("lines_at_end")
+            observed_lines = sample.get("observed_lines")
+            bytes_at_start = sample.get("bytes_at_start")
+            bytes_at_end = sample.get("bytes_at_end")
+            observed_bytes = sample.get("observed_bytes")
+            integer_fields = (
+                pane_index,
+                pane_id,
+                lines_at_start,
+                lines_at_end,
+                observed_lines,
+                bytes_at_start,
+                bytes_at_end,
+                observed_bytes,
+            )
+            if any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in integer_fields
+            ):
+                pane_output_error = "pane_output_integer_field_invalid"
+                break
+            if (
+                pane_index < 1
+                or pane_index > NUM_PANES
+                or pane_index in seen_indexes
+                or pane_id != spawned_pane_ids[pane_index - 1]
+                or lines_at_start < 0
+                or lines_at_end < lines_at_start
+                or observed_lines != lines_at_end - lines_at_start
+                or bytes_at_start < 0
+                or bytes_at_end < bytes_at_start
+                or observed_bytes != bytes_at_end - bytes_at_start
+                or observed_lines
+                < minimum_output_lines_for_pane(
+                    pane_index,
+                    float(requested_duration),
+                )
+                or observed_bytes
+                < observed_lines * OUTPUT_PAYLOAD_BYTES_PER_LINE
+            ):
+                pane_output_error = "pane_output_rate_or_identity_breached"
+                break
+            seen_indexes.add(pane_index)
+            pane_output_total += observed_lines
+            pane_output_byte_total += observed_bytes
+        if pane_output_error is None and seen_indexes != set(range(1, NUM_PANES + 1)):
+            pane_output_error = "pane_output_index_set_incomplete"
     workload_shape_ok = (
         isinstance(workload.get("high_output_panes"), list)
         and workload.get("high_output_panes") == HIGH_OUTPUT_PANES
         and workload.get("high_output_phase_started") is True
+        and isinstance(workload.get("sustained_started_epoch_ms"), int)
+        and not isinstance(workload.get("sustained_started_epoch_ms"), bool)
+        and workload.get("sustained_started_epoch_ms", -1) >= 0
         and isinstance(output_bytes, int)
         and not isinstance(output_bytes, bool)
         and output_bytes > 0
@@ -835,6 +1002,19 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         and not isinstance(output_bytes_at_end, bool)
         and output_bytes_at_end > output_bytes_at_start
         and output_bytes == output_bytes_at_end - output_bytes_at_start
+        and output_bytes == pane_output_byte_total
+        and isinstance(output_lines, int)
+        and not isinstance(output_lines, bool)
+        and output_lines > 0
+        and isinstance(output_lines_at_start, int)
+        and not isinstance(output_lines_at_start, bool)
+        and output_lines_at_start >= 0
+        and isinstance(output_lines_at_end, int)
+        and not isinstance(output_lines_at_end, bool)
+        and output_lines_at_end > output_lines_at_start
+        and output_lines == output_lines_at_end - output_lines_at_start
+        and output_lines == pane_output_total
+        and pane_output_error is None
         and normal_rate == NORMAL_LINES_PER_SECOND_PER_PANE
         and high_rate == HIGH_LINES_PER_SECOND_PER_PANE
         and configured_phase_fraction == HIGH_OUTPUT_PHASE_FRACTION
@@ -857,8 +1037,13 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         name="workload_rates_bound",
         outcome=workload_outcome,
         reason_code=workload_reason,
-        expected="exact high-output pane set, phase transition, configured rates, and positive observed bytes",
-        actual=workload,
+        expected=(
+            "exact pane identities, per-pane line deltas at >= "
+            f"{OUTPUT_RATE_MINIMUM_FRACTION:.0%} of the configured rates, phase "
+            f"transition, >= {OUTPUT_PAYLOAD_BYTES_PER_LINE} payload bytes per line, "
+            "and exact positive aggregate line/byte deltas"
+        ),
+        actual={"pane_output_error": pane_output_error, "workload": workload},
     )
 
     evidence = report.get("evidence") if isinstance(report.get("evidence"), dict) else {}
@@ -961,36 +1146,78 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         },
     )
 
+    expected_pane_ids = (
+        sorted(spawned_pane_ids)
+        if isinstance(spawned_pane_ids, list)
+        and len(spawned_pane_ids) == NUM_PANES
+        and all(
+            isinstance(pane_id, int)
+            and not isinstance(pane_id, bool)
+            and pane_id > 0
+            for pane_id in spawned_pane_ids
+        )
+        and len(set(spawned_pane_ids)) == NUM_PANES
+        else None
+    )
+    scrollback_samples = evidence.get("scrollback_samples")
+    scrollback_source_timestamps = (
+        {
+            sample.get("source_snapshot_timestamp_ms")
+            for sample in scrollback_samples
+            if isinstance(sample, dict)
+            and isinstance(sample.get("source_snapshot_timestamp_ms"), int)
+            and not isinstance(sample.get("source_snapshot_timestamp_ms"), bool)
+        }
+        if isinstance(scrollback_samples, list)
+        else set()
+    )
     pressure_samples = evidence.get("fleet_pressure_samples")
     pressure_error = telemetry_sequence_error(
         pressure_samples,
         required_fields=(
             "timestamp_ms",
+            "source_snapshot_timestamp_ms",
             "elapsed_secs",
             "tier",
+            "observed_panes",
+            "observed_pane_ids",
             "source",
             "evidence_state",
         ),
     )
     if pressure_error is None:
         pressure_error = telemetry_elapsed_error(pressure_samples, observed_duration)
+    if pressure_error is None:
+        pressure_error = source_snapshot_timestamp_error(
+            pressure_samples,
+            workload.get("sustained_started_epoch_ms"),
+        )
     pressure_transition = False
     if pressure_error is None and pressure_samples:
         rank = {"normal": 0, "elevated": 1, "critical": 2, "emergency": 3}
-        normalized: list[int] = []
+        normalized: list[tuple[int, int]] = []
         for sample in pressure_samples:
             tier = str(sample["tier"]).lower()
             if (
                 sample["source"] != "runtime_health_snapshot"
                 or sample["evidence_state"] != "measured"
+                or not isinstance(sample["observed_panes"], int)
+                or isinstance(sample["observed_panes"], bool)
+                or sample["observed_panes"] != NUM_PANES
+                or expected_pane_ids is None
+                or sample["observed_pane_ids"] != expected_pane_ids
+                or sample["source_snapshot_timestamp_ms"]
+                not in scrollback_source_timestamps
                 or tier not in rank
             ):
                 pressure_error = "pressure_sample_not_authoritative"
                 break
-            normalized.append(rank[tier])
+            normalized.append((rank[tier], sample["source_snapshot_timestamp_ms"]))
         if pressure_error is None:
             pressure_transition = any(
-                normalized[earlier] == 0 and normalized[later] > 0
+                normalized[earlier][0] == 0
+                and normalized[later][0] > 0
+                and normalized[later][1] > normalized[earlier][1]
                 for earlier in range(len(normalized))
                 for later in range(earlier + 1, len(normalized))
             )
@@ -1008,51 +1235,87 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         name="fleet_pressure_transition",
         outcome=pressure_outcome,
         reason_code=pressure_reason,
-        expected="strictly ordered measured Normal sample followed by Elevated, Critical, or Emergency",
+        expected=(
+            "strictly ordered measured Normal snapshot followed by a distinct newer "
+            "Elevated, Critical, or Emergency snapshot for the exact spawned pane "
+            "identities and paired mux telemetry source timestamps"
+        ),
         actual=pressure_samples,
     )
 
-    scrollback_samples = evidence.get("scrollback_samples")
     scrollback_error = telemetry_sequence_error(
         scrollback_samples,
         required_fields=(
             "timestamp_ms",
+            "source_snapshot_timestamp_ms",
             "elapsed_secs",
             "source",
             "evidence_state",
-            "hot_to_warm_transitions_total",
+            "observed_panes",
+            "sampled_panes",
+            "observed_pane_ids",
+            "sampled_pane_ids",
+            "telemetry_blind",
+            "telemetry_partial",
             "warm_spill_lines_total",
+            "warm_spill_bytes_total",
         ),
     )
     if scrollback_error is None:
         scrollback_error = telemetry_elapsed_error(scrollback_samples, observed_duration)
+    if scrollback_error is None:
+        scrollback_error = source_snapshot_timestamp_error(
+            scrollback_samples,
+            workload.get("sustained_started_epoch_ms"),
+        )
     scrollback_transition = False
     if scrollback_error is None and scrollback_samples:
-        previous_transitions: int | None = None
-        previous_spills: int | None = None
+        previous_lines: int | None = None
+        previous_bytes: int | None = None
+        previous_source_timestamp: int | None = None
         for sample in scrollback_samples:
-            transitions = sample["hot_to_warm_transitions_total"]
-            spills = sample["warm_spill_lines_total"]
+            lines = sample["warm_spill_lines_total"]
+            byte_count = sample["warm_spill_bytes_total"]
+            source_timestamp = sample["source_snapshot_timestamp_ms"]
+            observed_ids = sample["observed_pane_ids"]
+            sampled_ids = sample["sampled_pane_ids"]
             if (
-                sample["source"] != "mux_tiered_scrollback_status"
+                sample["source"]
+                != "runtime_health_snapshot.fleet_scrollback_telemetry"
                 or sample["evidence_state"] != "measured"
-                or not isinstance(transitions, int)
-                or isinstance(transitions, bool)
-                or transitions < 0
-                or not isinstance(spills, int)
-                or isinstance(spills, bool)
-                or spills < 0
-                or (previous_transitions is not None and transitions < previous_transitions)
-                or (previous_spills is not None and spills < previous_spills)
+                or not isinstance(sample["observed_panes"], int)
+                or isinstance(sample["observed_panes"], bool)
+                or sample["observed_panes"] != NUM_PANES
+                or not isinstance(sample["sampled_panes"], int)
+                or isinstance(sample["sampled_panes"], bool)
+                or sample["sampled_panes"] != NUM_PANES
+                or expected_pane_ids is None
+                or observed_ids != expected_pane_ids
+                or sampled_ids != expected_pane_ids
+                or sample["telemetry_blind"] is not False
+                or sample["telemetry_partial"] is not False
+                or not isinstance(lines, int)
+                or isinstance(lines, bool)
+                or lines < 0
+                or not isinstance(byte_count, int)
+                or isinstance(byte_count, bool)
+                or byte_count < 0
+                or (previous_lines is not None and lines < previous_lines)
+                or (previous_bytes is not None and byte_count < previous_bytes)
             ):
                 scrollback_error = "scrollback_sample_not_authoritative"
                 break
-            if previous_transitions is not None and previous_spills is not None:
+            if (
+                previous_lines is not None
+                and previous_source_timestamp is not None
+                and source_timestamp > previous_source_timestamp
+            ):
                 scrollback_transition |= (
-                    transitions > previous_transitions and spills > previous_spills
+                    lines > previous_lines
                 )
-            previous_transitions = transitions
-            previous_spills = spills
+            previous_lines = lines
+            previous_bytes = byte_count
+            previous_source_timestamp = source_timestamp
     if scrollback_error is not None or not scrollback_samples:
         scrollback_outcome = "skipped_not_proven"
         scrollback_reason = f"scrollback.{scrollback_error or 'samples_missing'}"
@@ -1067,7 +1330,11 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         name="hot_to_warm_scrollback_transition",
         outcome=scrollback_outcome,
         reason_code=scrollback_reason,
-        expected="measured mux tier counters increase monotonically across at least one hot-to-warm transition",
+        expected=(
+            "complete measured mux coverage for the exact spawned pane identities, "
+            "with nondecreasing warm-spill line/byte totals and a line-total "
+            "increase across distinct runtime snapshots"
+        ),
         actual=scrollback_samples,
     )
 
@@ -1243,7 +1510,10 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         name="robot_get_text_completed",
         outcome=get_text_outcome,
         reason_code=get_text_reason,
-        expected="successful measured get-text --all completion; latency is recorded but has no frozen v1 threshold",
+        expected=(
+            "successful measured get-text --all completion; latency is recorded "
+            "but this contract has no frozen get-text latency threshold"
+        ),
         actual=get_text_sample,
     )
 
@@ -1485,6 +1755,7 @@ def pane_script_text(
         "#!/bin/bash",
         "set -euo pipefail",
         f"PANE_INDEX={index}",
+        f"PAYLOAD={'x' * OUTPUT_PAYLOAD_BYTES_PER_LINE}",
         "COUNTER=0",
         "while true; do",
         "  LINES_PER_CYCLE=1",
@@ -1503,7 +1774,8 @@ def pane_script_text(
             "  while [[ $i -le $LINES_PER_CYCLE ]]; do",
             (
                 '    printf "[pane-%02d] heartbeat counter=%d line=%d '
-                'elapsed_s=%d\\n" "$PANE_INDEX" "$COUNTER" "$i" "$SECONDS"'
+                'elapsed_s=%d payload=%s\\n" "$PANE_INDEX" "$COUNTER" "$i" '
+                '"$SECONDS" "$PAYLOAD"'
             ),
             "    i=$((i + 1))",
             "  done",
@@ -1825,10 +2097,12 @@ def collect_binary_provenance(binary_path: str, resolution_source: str | None) -
 
 def collect_config_provenance(config_path: Path) -> dict[str, Any]:
     resolved = config_path.resolve()
+    content = resolved.read_text(encoding="utf-8")
     return {
         "path": str(resolved),
         "sha256": sha256_file(resolved),
         "size_bytes": resolved.stat().st_size,
+        "content": content,
     }
 
 
@@ -1849,21 +2123,45 @@ def next_sample_timestamp(previous_timestamp_ms: int | None) -> int:
     return timestamp
 
 
-def collect_observed_output_bytes(fake_state_dir: Path) -> int:
+def count_file_lines(path: Path) -> int:
+    count = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            count += chunk.count(b"\n")
+    return count
+
+
+def collect_pane_output_stats(
+    fake_state_dir: Path,
+    pane_ids: list[int],
+) -> list[dict[str, int]]:
     log_dir = fake_state_dir / "logs"
-    if not log_dir.is_dir():
-        return 0
-    total = 0
-    for log_path in log_dir.glob("pane_*.log"):
+    stats: list[dict[str, int]] = []
+    for pane_index, pane_id in enumerate(pane_ids, start=1):
+        log_path = log_dir / f"pane_{pane_id}.log"
         if log_path.is_file():
-            total += log_path.stat().st_size
-    return total
+            size_bytes = log_path.stat().st_size
+            line_count = count_file_lines(log_path)
+        else:
+            size_bytes = 0
+            line_count = 0
+        stats.append(
+            {
+                "pane_index": pane_index,
+                "pane_id": pane_id,
+                "size_bytes": size_bytes,
+                "line_count": line_count,
+            }
+        )
+    return stats
 
 
 def collect_fleet_pressure_sample(
     result: CmdResult,
     previous_timestamp_ms: int | None,
+    previous_source_snapshot_timestamp_ms: int | None,
     elapsed_secs: float,
+    minimum_source_timestamp_ms: int,
 ) -> dict[str, Any] | None:
     if result.returncode != 0:
         return None
@@ -1874,15 +2172,77 @@ def collect_fleet_pressure_sample(
     health = data.get("health")
     if not isinstance(health, dict):
         return None
+    source_snapshot_timestamp = health.get("timestamp")
+    scrollback_telemetry = health.get("fleet_scrollback_telemetry")
+    if (
+        not isinstance(source_snapshot_timestamp, int)
+        or isinstance(source_snapshot_timestamp, bool)
+        or source_snapshot_timestamp < minimum_source_timestamp_ms
+        or (
+            previous_source_snapshot_timestamp_ms is not None
+            and source_snapshot_timestamp <= previous_source_snapshot_timestamp_ms
+        )
+        or not isinstance(scrollback_telemetry, dict)
+    ):
+        return None
     tier = health.get("fleet_pressure_tier")
     if not isinstance(tier, str) or not tier:
         return None
     return {
         "timestamp_ms": next_sample_timestamp(previous_timestamp_ms),
+        "source_snapshot_timestamp_ms": source_snapshot_timestamp,
         "elapsed_secs": round(elapsed_secs, 3),
         "tier": tier,
+        "observed_panes": health.get("observed_panes"),
+        "observed_pane_ids": scrollback_telemetry.get("observed_pane_ids"),
         "source": "runtime_health_snapshot",
         "evidence_state": "measured",
+    }
+
+
+def collect_scrollback_sample(
+    result: CmdResult,
+    previous_timestamp_ms: int | None,
+    previous_source_snapshot_timestamp_ms: int | None,
+    elapsed_secs: float,
+    minimum_source_timestamp_ms: int,
+) -> dict[str, Any] | None:
+    if result.returncode != 0:
+        return None
+    payload = parse_json_output(result)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or data.get("watcher_running") is not True:
+        return None
+    health = data.get("health")
+    if not isinstance(health, dict):
+        return None
+    source_snapshot_timestamp = health.get("timestamp")
+    telemetry = health.get("fleet_scrollback_telemetry")
+    if (
+        not isinstance(source_snapshot_timestamp, int)
+        or isinstance(source_snapshot_timestamp, bool)
+        or source_snapshot_timestamp < minimum_source_timestamp_ms
+        or (
+            previous_source_snapshot_timestamp_ms is not None
+            and source_snapshot_timestamp <= previous_source_snapshot_timestamp_ms
+        )
+        or not isinstance(telemetry, dict)
+    ):
+        return None
+    return {
+        "timestamp_ms": next_sample_timestamp(previous_timestamp_ms),
+        "source_snapshot_timestamp_ms": source_snapshot_timestamp,
+        "elapsed_secs": round(elapsed_secs, 3),
+        "source": "runtime_health_snapshot.fleet_scrollback_telemetry",
+        "evidence_state": "measured",
+        "observed_panes": telemetry.get("observed_panes"),
+        "sampled_panes": telemetry.get("sampled_panes"),
+        "observed_pane_ids": telemetry.get("observed_pane_ids"),
+        "sampled_pane_ids": telemetry.get("sampled_pane_ids"),
+        "telemetry_blind": telemetry.get("telemetry_blind"),
+        "telemetry_partial": telemetry.get("telemetry_partial"),
+        "warm_spill_lines_total": telemetry.get("warm_spill_lines_total"),
+        "warm_spill_bytes_total": telemetry.get("warm_spill_bytes_total"),
     }
 
 
@@ -1961,6 +2321,39 @@ def persist_report(report_path: Path, report: dict[str, Any]) -> None:
 def verifier_fixture_report() -> dict[str, Any]:
     """Construct a complete synthetic report for pure verifier boundary tests."""
     run_id = "ft-d0ez0.5-verifier-self-test"
+    pane_output_deltas = [
+        {
+            "pane_index": pane_index,
+            "pane_id": pane_index,
+            "lines_at_start": 0,
+            "lines_at_end": minimum_output_lines_for_pane(
+                pane_index,
+                FULL_DURATION_SECS,
+            ),
+            "observed_lines": minimum_output_lines_for_pane(
+                pane_index,
+                FULL_DURATION_SECS,
+            ),
+            "bytes_at_start": 0,
+            "bytes_at_end": minimum_output_lines_for_pane(
+                pane_index,
+                FULL_DURATION_SECS,
+            )
+            * OUTPUT_PAYLOAD_BYTES_PER_LINE,
+            "observed_bytes": minimum_output_lines_for_pane(
+                pane_index,
+                FULL_DURATION_SECS,
+            )
+            * OUTPUT_PAYLOAD_BYTES_PER_LINE,
+        }
+        for pane_index in range(1, NUM_PANES + 1)
+    ]
+    observed_output_lines = sum(
+        sample["observed_lines"] for sample in pane_output_deltas
+    )
+    observed_output_bytes = sum(
+        sample["observed_bytes"] for sample in pane_output_deltas
+    )
     receipt = {
         "schema_version": AUTHORIZATION_RECEIPT_SCHEMA_VERSION,
         "scope": AUTHORIZATION_SCOPE,
@@ -1979,6 +2372,7 @@ def verifier_fixture_report() -> dict[str, Any]:
         "generated_at_utc": "2026-08-08T00:05:00Z",
         "thresholds": {
             "minimum_sustained_duration_secs": FULL_DURATION_SECS,
+            "maximum_supported_duration_secs": MAX_SUPPORTED_DURATION_SECS,
             "detection_latency_limit_ms_exclusive": DETECTION_LATENCY_LIMIT_MS,
             "robot_state_latency_limit_ms_exclusive": ROBOT_STATE_LATENCY_LIMIT_MS,
             "robot_search_latency_limit_ms_exclusive": ROBOT_SEARCH_LATENCY_LIMIT_MS,
@@ -1988,6 +2382,10 @@ def verifier_fixture_report() -> dict[str, Any]:
             "rss_final_coverage_slack_secs": RSS_FINAL_COVERAGE_SLACK_SECS,
             "high_output_phase_fraction": HIGH_OUTPUT_PHASE_FRACTION,
             "high_output_phase_tolerance_secs": HIGH_OUTPUT_PHASE_TOLERANCE_SECS,
+            "output_rate_minimum_fraction": OUTPUT_RATE_MINIMUM_FRACTION,
+            "output_payload_bytes_per_line": OUTPUT_PAYLOAD_BYTES_PER_LINE,
+            "fleet_scrollback_per_pane_budget_bytes": FLEET_SCROLLBACK_PER_PANE_BUDGET_BYTES,
+            "fleet_scrollback_high_ratio": FLEET_SCROLLBACK_HIGH_RATIO,
             "detection_probe_phase_fraction": DETECTION_PROBE_PHASE_FRACTION,
             "detection_probe_phase_tolerance_secs": DETECTION_PROBE_PHASE_TOLERANCE_SECS,
             "robot_benchmark_phase_fraction": ROBOT_BENCHMARK_PHASE_FRACTION,
@@ -2020,8 +2418,9 @@ def verifier_fixture_report() -> dict[str, Any]:
             },
             "config": {
                 "path": "/isolated/ft.toml",
-                "sha256": "d" * 64,
-                "size_bytes": 1,
+                "sha256": hashlib.sha256(CONFIG_TEMPLATE.encode("utf-8")).hexdigest(),
+                "size_bytes": len(CONFIG_TEMPLATE.encode("utf-8")),
+                "content": CONFIG_TEMPLATE,
             },
             "hardware": {
                 "system": "VerifierOS",
@@ -2036,15 +2435,21 @@ def verifier_fixture_report() -> dict[str, Any]:
             "observed_sustained_duration_secs": FULL_DURATION_SECS,
             "panes_spawned": NUM_PANES,
             "panes_observed": NUM_PANES,
+            "spawned_pane_ids": list(range(1, NUM_PANES + 1)),
             "high_output_panes": HIGH_OUTPUT_PANES,
             "high_output_phase_started": True,
             "configured_high_output_phase_fraction": HIGH_OUTPUT_PHASE_FRACTION,
             "high_output_phase_started_elapsed_secs": (
                 FULL_DURATION_SECS * HIGH_OUTPUT_PHASE_FRACTION
             ),
-            "observed_output_bytes": 1,
+            "sustained_started_epoch_ms": 1,
+            "observed_output_bytes": observed_output_bytes,
             "output_bytes_at_sustained_start": 0,
-            "output_bytes_at_sustained_end": 1,
+            "output_bytes_at_sustained_end": observed_output_bytes,
+            "observed_output_lines": observed_output_lines,
+            "output_lines_at_sustained_start": 0,
+            "output_lines_at_sustained_end": observed_output_lines,
+            "pane_output_deltas": pane_output_deltas,
             "normal_lines_per_second_per_pane": NORMAL_LINES_PER_SECOND_PER_PANE,
             "high_lines_per_second_per_pane": HIGH_LINES_PER_SECOND_PER_PANE,
         },
@@ -2069,15 +2474,21 @@ def verifier_fixture_report() -> dict[str, Any]:
             "fleet_pressure_samples": [
                 {
                     "timestamp_ms": 1,
+                    "source_snapshot_timestamp_ms": 1,
                     "elapsed_secs": 0.0,
                     "tier": "Normal",
+                    "observed_panes": NUM_PANES,
+                    "observed_pane_ids": list(range(1, NUM_PANES + 1)),
                     "source": "runtime_health_snapshot",
                     "evidence_state": "measured",
                 },
                 {
                     "timestamp_ms": 2,
+                    "source_snapshot_timestamp_ms": 2,
                     "elapsed_secs": 180.0,
                     "tier": "Elevated",
+                    "observed_panes": NUM_PANES,
+                    "observed_pane_ids": list(range(1, NUM_PANES + 1)),
                     "source": "runtime_health_snapshot",
                     "evidence_state": "measured",
                 },
@@ -2085,19 +2496,33 @@ def verifier_fixture_report() -> dict[str, Any]:
             "scrollback_samples": [
                 {
                     "timestamp_ms": 1,
+                    "source_snapshot_timestamp_ms": 1,
                     "elapsed_secs": 0.0,
-                    "source": "mux_tiered_scrollback_status",
+                    "source": "runtime_health_snapshot.fleet_scrollback_telemetry",
                     "evidence_state": "measured",
-                    "hot_to_warm_transitions_total": 0,
+                    "observed_panes": NUM_PANES,
+                    "sampled_panes": NUM_PANES,
+                    "observed_pane_ids": list(range(1, NUM_PANES + 1)),
+                    "sampled_pane_ids": list(range(1, NUM_PANES + 1)),
+                    "telemetry_blind": False,
+                    "telemetry_partial": False,
                     "warm_spill_lines_total": 0,
+                    "warm_spill_bytes_total": 0,
                 },
                 {
                     "timestamp_ms": 2,
+                    "source_snapshot_timestamp_ms": 2,
                     "elapsed_secs": 200.0,
-                    "source": "mux_tiered_scrollback_status",
+                    "source": "runtime_health_snapshot.fleet_scrollback_telemetry",
                     "evidence_state": "measured",
-                    "hot_to_warm_transitions_total": 1,
+                    "observed_panes": NUM_PANES,
+                    "sampled_panes": NUM_PANES,
+                    "observed_pane_ids": list(range(1, NUM_PANES + 1)),
+                    "sampled_pane_ids": list(range(1, NUM_PANES + 1)),
+                    "telemetry_blind": False,
+                    "telemetry_partial": False,
                     "warm_spill_lines_total": 100,
+                    "warm_spill_bytes_total": 8_192,
                 },
             ],
             "rss_samples": [
@@ -2190,6 +2615,19 @@ def run_verifier_self_tests() -> None:
         "duration.below_minimum"
     )
 
+    unbounded_duration = clone_json(baseline)
+    unbounded_duration["workload"]["requested_sustained_duration_secs"] = (
+        MAX_SUPPORTED_DURATION_SECS + 1.0
+    )
+    unbounded_duration["workload"]["observed_sustained_duration_secs"] = (
+        MAX_SUPPORTED_DURATION_SECS + 1.0
+    )
+    unbounded_result = verify_stress_report(unbounded_duration)
+    assert unbounded_result["status"] == "failed"
+    assert verification_check(unbounded_result, "full_sustained_duration")[
+        "reason_code"
+    ] == "duration.above_supported_sample_bound"
+
     detection_boundary = clone_json(baseline)
     detection_boundary["evidence"]["detection_probe"]["matching_events"][0][
         "captured_at"
@@ -2215,11 +2653,51 @@ def run_verifier_self_tests() -> None:
     no_pressure_transition["evidence"]["fleet_pressure_samples"][1]["tier"] = "Normal"
     assert verify_stress_report(no_pressure_transition)["status"] == "failed"
 
+    stale_pressure_snapshot = clone_json(baseline)
+    stale_pressure_snapshot["evidence"]["fleet_pressure_samples"][1][
+        "source_snapshot_timestamp_ms"
+    ] = 1
+    assert (
+        verify_stress_report(stale_pressure_snapshot)["status"]
+        == "skipped_not_proven"
+    )
+
+    mismatched_pressure_population = clone_json(baseline)
+    mismatched_pressure_population["evidence"]["fleet_pressure_samples"][1][
+        "observed_pane_ids"
+    ][-1] = NUM_PANES + 1
+    assert (
+        verify_stress_report(mismatched_pressure_population)["status"]
+        == "skipped_not_proven"
+    )
+
     spill_without_transition = clone_json(baseline)
     spill_without_transition["evidence"]["scrollback_samples"][1][
-        "hot_to_warm_transitions_total"
+        "warm_spill_lines_total"
     ] = 0
     assert verify_stress_report(spill_without_transition)["status"] == "failed"
+
+    stale_scrollback_snapshot = clone_json(baseline)
+    stale_scrollback_snapshot["evidence"]["scrollback_samples"][1][
+        "source_snapshot_timestamp_ms"
+    ] = 1
+    assert (
+        verify_stress_report(stale_scrollback_snapshot)["status"]
+        == "skipped_not_proven"
+    )
+
+    blind_scrollback = clone_json(baseline)
+    blind_scrollback["evidence"]["scrollback_samples"][1]["telemetry_blind"] = True
+    assert verify_stress_report(blind_scrollback)["status"] == "skipped_not_proven"
+
+    mismatched_scrollback_population = clone_json(baseline)
+    mismatched_scrollback_population["evidence"]["scrollback_samples"][1][
+        "sampled_pane_ids"
+    ][-1] = NUM_PANES + 1
+    assert (
+        verify_stress_report(mismatched_scrollback_population)["status"]
+        == "skipped_not_proven"
+    )
 
     missing_pressure = clone_json(baseline)
     missing_pressure["evidence"]["fleet_pressure_samples"] = []
@@ -2228,6 +2706,24 @@ def run_verifier_self_tests() -> None:
     forged_receipt = clone_json(baseline)
     forged_receipt["authority"]["authorization_receipt"]["authorized_by"] = "mutated"
     assert verify_stress_report(forged_receipt)["status"] == "skipped_not_proven"
+
+    drifted_budget = clone_json(baseline)
+    drifted_budget["thresholds"]["fleet_scrollback_per_pane_budget_bytes"] += 1
+    assert verify_stress_report(drifted_budget)["status"] == "failed"
+
+    tampered_config = clone_json(baseline)
+    tampered_content = CONFIG_TEMPLATE.replace(
+        "per_pane_budget_bytes = 524288",
+        "per_pane_budget_bytes = 524289",
+    )
+    tampered_config["provenance"]["config"]["content"] = tampered_content
+    tampered_config["provenance"]["config"]["sha256"] = hashlib.sha256(
+        tampered_content.encode("utf-8")
+    ).hexdigest()
+    tampered_config["provenance"]["config"]["size_bytes"] = len(
+        tampered_content.encode("utf-8")
+    )
+    assert verify_stress_report(tampered_config)["status"] == "skipped_not_proven"
 
     corrupted = clone_json(baseline)
     corrupted["evidence"]["runtime"]["sqlite_quick_check"] = "quick_check_failed"
@@ -2256,6 +2752,31 @@ def run_verifier_self_tests() -> None:
     wrong_rate = clone_json(baseline)
     wrong_rate["workload"]["high_lines_per_second_per_pane"] = 2.0
     assert verify_stress_report(wrong_rate)["status"] == "failed"
+
+    underproducing_pane = clone_json(baseline)
+    underproducing_pane["workload"]["pane_output_deltas"][0][
+        "lines_at_end"
+    ] = 1
+    underproducing_pane["workload"]["pane_output_deltas"][0][
+        "observed_lines"
+    ] = 1
+    assert verify_stress_report(underproducing_pane)["status"] == "failed"
+
+    undersized_payload = clone_json(baseline)
+    payload_sample = undersized_payload["workload"]["pane_output_deltas"][0]
+    original_observed_bytes = payload_sample["observed_bytes"]
+    payload_sample["observed_bytes"] = (
+        payload_sample["observed_lines"] * (OUTPUT_PAYLOAD_BYTES_PER_LINE - 1)
+    )
+    payload_sample["bytes_at_end"] = payload_sample["observed_bytes"]
+    removed_bytes = original_observed_bytes - payload_sample["observed_bytes"]
+    undersized_payload["workload"]["observed_output_bytes"] -= removed_bytes
+    undersized_payload["workload"]["output_bytes_at_sustained_end"] -= removed_bytes
+    assert verify_stress_report(undersized_payload)["status"] == "failed"
+
+    duplicate_pane_identity = clone_json(baseline)
+    duplicate_pane_identity["workload"]["spawned_pane_ids"][1] = 1
+    assert verify_stress_report(duplicate_pane_identity)["status"] == "failed"
 
     debug_binary = clone_json(baseline)
     debug_binary["provenance"]["binary"]["build_profile"] = "debug"
@@ -2309,6 +2830,9 @@ def run_verifier_self_tests() -> None:
         assert syntax.returncode == 0, syntax.stderr
     assert str(marker) not in normal_script
     assert shlex.quote(str(marker)) in high_script
+    expected_payload_assignment = f"PAYLOAD={'x' * OUTPUT_PAYLOAD_BYTES_PER_LINE}"
+    assert expected_payload_assignment in normal_script
+    assert expected_payload_assignment in high_script
 
     print("E2E_50PANE_VERIFIER_SELF_TEST_SUCCESS")
 
@@ -2362,6 +2886,11 @@ def main() -> int:
         return 1
     if not is_finite_number(args.duration_secs) or args.duration_secs <= 0.0:
         parser.error("--duration-secs must be a positive finite number")
+    if args.duration_secs > MAX_SUPPORTED_DURATION_SECS:
+        parser.error(
+            "--duration-secs exceeds the bounded telemetry capacity "
+            f"({MAX_SUPPORTED_DURATION_SECS:.0f}s maximum)"
+        )
     if not is_finite_number(args.timeout_secs) or args.timeout_secs <= 0.0:
         parser.error("--timeout-secs must be a positive finite number")
 
@@ -2385,6 +2914,7 @@ def main() -> int:
         "watch_log_path": repo_relative(watch_log_path),
         "thresholds": {
             "minimum_sustained_duration_secs": FULL_DURATION_SECS,
+            "maximum_supported_duration_secs": MAX_SUPPORTED_DURATION_SECS,
             "detection_latency_limit_ms_exclusive": DETECTION_LATENCY_LIMIT_MS,
             "robot_state_latency_limit_ms_exclusive": ROBOT_STATE_LATENCY_LIMIT_MS,
             "robot_search_latency_limit_ms_exclusive": ROBOT_SEARCH_LATENCY_LIMIT_MS,
@@ -2394,6 +2924,10 @@ def main() -> int:
             "rss_final_coverage_slack_secs": RSS_FINAL_COVERAGE_SLACK_SECS,
             "high_output_phase_fraction": HIGH_OUTPUT_PHASE_FRACTION,
             "high_output_phase_tolerance_secs": HIGH_OUTPUT_PHASE_TOLERANCE_SECS,
+            "output_rate_minimum_fraction": OUTPUT_RATE_MINIMUM_FRACTION,
+            "output_payload_bytes_per_line": OUTPUT_PAYLOAD_BYTES_PER_LINE,
+            "fleet_scrollback_per_pane_budget_bytes": FLEET_SCROLLBACK_PER_PANE_BUDGET_BYTES,
+            "fleet_scrollback_high_ratio": FLEET_SCROLLBACK_HIGH_RATIO,
             "detection_probe_phase_fraction": DETECTION_PROBE_PHASE_FRACTION,
             "detection_probe_phase_tolerance_secs": DETECTION_PROBE_PHASE_TOLERANCE_SECS,
             "robot_benchmark_phase_fraction": ROBOT_BENCHMARK_PHASE_FRACTION,
@@ -2420,13 +2954,19 @@ def main() -> int:
             "observed_sustained_duration_secs": None,
             "panes_spawned": None,
             "panes_observed": None,
+            "spawned_pane_ids": [],
             "high_output_panes": HIGH_OUTPUT_PANES,
             "high_output_phase_started": False,
             "configured_high_output_phase_fraction": HIGH_OUTPUT_PHASE_FRACTION,
             "high_output_phase_started_elapsed_secs": None,
+            "sustained_started_epoch_ms": None,
             "observed_output_bytes": 0,
             "output_bytes_at_sustained_start": None,
             "output_bytes_at_sustained_end": None,
+            "observed_output_lines": 0,
+            "output_lines_at_sustained_start": None,
+            "output_lines_at_sustained_end": None,
+            "pane_output_deltas": [],
             "normal_lines_per_second_per_pane": NORMAL_LINES_PER_SECOND_PER_PANE,
             "high_lines_per_second_per_pane": HIGH_LINES_PER_SECOND_PER_PANE,
         },
@@ -2523,6 +3063,7 @@ def main() -> int:
             pane_id = spawn_pane(fake_wezterm, workspace, script_path, env)
             spawned_panes.append(pane_id)
         report["workload"]["panes_spawned"] = len(spawned_panes)
+        report["workload"]["spawned_pane_ids"] = list(spawned_panes)
 
         # Wait for ft watch to discover all panes
         def all_panes_discovered() -> bool:
@@ -2557,15 +3098,32 @@ def main() -> int:
         # Phase 2: Sustained load — monitor metrics, inject pattern mid-run
         # ---------------------------------------------------------------
         phase2_start = time.monotonic()
+        phase2_started_epoch_ms = now_ms()
+        report["workload"]["sustained_started_epoch_ms"] = phase2_started_epoch_ms
         phase2_end = phase2_start + args.duration_secs
-        output_bytes_at_sustained_start = collect_observed_output_bytes(fake_state_dir)
+        output_stats_at_sustained_start = collect_pane_output_stats(
+            fake_state_dir,
+            spawned_panes,
+        )
+        output_bytes_at_sustained_start = sum(
+            sample["size_bytes"] for sample in output_stats_at_sustained_start
+        )
+        output_lines_at_sustained_start = sum(
+            sample["line_count"] for sample in output_stats_at_sustained_start
+        )
         report["workload"][
             "output_bytes_at_sustained_start"
         ] = output_bytes_at_sustained_start
+        report["workload"][
+            "output_lines_at_sustained_start"
+        ] = output_lines_at_sustained_start
         sample_interval = RSS_SAMPLE_INTERVAL_SECS
         rss_samples: list[dict[str, Any]] = report["evidence"]["rss_samples"]
         pressure_samples: list[dict[str, Any]] = report["evidence"][
             "fleet_pressure_samples"
+        ]
+        scrollback_samples: list[dict[str, Any]] = report["evidence"][
+            "scrollback_samples"
         ]
         health_commands: list[dict[str, Any]] = []
         report["commands"]["robot_health_samples"] = health_commands
@@ -2593,9 +3151,24 @@ def main() -> int:
             timeout=5.0,
         )
         health_commands.append(initial_health.as_dict())
-        initial_pressure = collect_fleet_pressure_sample(initial_health, None, 0.0)
+        initial_pressure = collect_fleet_pressure_sample(
+            initial_health,
+            None,
+            None,
+            0.0,
+            phase2_started_epoch_ms,
+        )
         if initial_pressure is not None:
             pressure_samples.append(initial_pressure)
+        initial_scrollback = collect_scrollback_sample(
+            initial_health,
+            None,
+            None,
+            0.0,
+            phase2_started_epoch_ms,
+        )
+        if initial_scrollback is not None:
+            scrollback_samples.append(initial_scrollback)
 
         next_sample = phase2_start + sample_interval
         inject_at = phase2_start + (
@@ -2717,10 +3290,33 @@ def main() -> int:
                     pressure_sample = collect_fleet_pressure_sample(
                         health_result,
                         pressure_samples[-1]["timestamp_ms"] if pressure_samples else None,
+                        (
+                            pressure_samples[-1]["source_snapshot_timestamp_ms"]
+                            if pressure_samples
+                            else None
+                        ),
                         elapsed,
+                        phase2_started_epoch_ms,
                     )
                     if pressure_sample is not None:
                         pressure_samples.append(pressure_sample)
+                    scrollback_sample = collect_scrollback_sample(
+                        health_result,
+                        (
+                            scrollback_samples[-1]["timestamp_ms"]
+                            if scrollback_samples
+                            else None
+                        ),
+                        (
+                            scrollback_samples[-1]["source_snapshot_timestamp_ms"]
+                            if scrollback_samples
+                            else None
+                        ),
+                        elapsed,
+                        phase2_started_epoch_ms,
+                    )
+                    if scrollback_sample is not None:
+                        scrollback_samples.append(scrollback_sample)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -2732,12 +3328,51 @@ def main() -> int:
             time.monotonic() - phase2_start,
             3,
         )
-        output_bytes_at_sustained_end = collect_observed_output_bytes(fake_state_dir)
+        output_stats_at_sustained_end = collect_pane_output_stats(
+            fake_state_dir,
+            spawned_panes,
+        )
+        output_bytes_at_sustained_end = sum(
+            sample["size_bytes"] for sample in output_stats_at_sustained_end
+        )
+        output_lines_at_sustained_end = sum(
+            sample["line_count"] for sample in output_stats_at_sustained_end
+        )
         report["workload"]["output_bytes_at_sustained_end"] = output_bytes_at_sustained_end
+        report["workload"][
+            "output_lines_at_sustained_end"
+        ] = output_lines_at_sustained_end
         report["workload"]["observed_output_bytes"] = max(
             0,
             output_bytes_at_sustained_end - output_bytes_at_sustained_start,
         )
+        report["workload"]["observed_output_lines"] = max(
+            0,
+            output_lines_at_sustained_end - output_lines_at_sustained_start,
+        )
+        report["workload"]["pane_output_deltas"] = [
+            {
+                "pane_index": start_sample["pane_index"],
+                "pane_id": start_sample["pane_id"],
+                "lines_at_start": start_sample["line_count"],
+                "lines_at_end": end_sample["line_count"],
+                "observed_lines": max(
+                    0,
+                    end_sample["line_count"] - start_sample["line_count"],
+                ),
+                "bytes_at_start": start_sample["size_bytes"],
+                "bytes_at_end": end_sample["size_bytes"],
+                "observed_bytes": max(
+                    0,
+                    end_sample["size_bytes"] - start_sample["size_bytes"],
+                ),
+            }
+            for start_sample, end_sample in zip(
+                output_stats_at_sustained_start,
+                output_stats_at_sustained_end,
+                strict=True,
+            )
+        ]
         if probe is not None:
             report["evidence"]["detection_probe"] = {
                 "pane_id": probe.pane_id,

@@ -82,6 +82,7 @@ fn arb_health_snapshot() -> impl Strategy<Value = HealthSnapshot> {
                     current_backoff_ms: 0,
                     in_crash_loop: false,
                     fleet_pressure_tier: None,
+                    fleet_scrollback_telemetry: None,
                     swarm_capacity: None,
                     leak_risk_inventory:
                         frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
@@ -1057,6 +1058,7 @@ proptest! {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
         };
@@ -1259,6 +1261,7 @@ proptest! {
             current_backoff_ms: if in_crash_loop { 30000 } else { 0 },
             in_crash_loop,
             fleet_pressure_tier: fp_tiers[fleet_idx].map(String::from),
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot {
                 storage_lock_contention_events: contention_events,

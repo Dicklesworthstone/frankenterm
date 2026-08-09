@@ -42,8 +42,9 @@ use crate::capture_authority::{
     CaptureSourceKind, CaptureViewEpoch, PaneIncarnation,
 };
 use crate::config::{
-    CaptureBudgetConfig, CompiledRetentionPolicy, HotReloadableConfig, PaneFilterConfig,
-    PanePriorityConfig, PatternsConfig, SnapshotConfig, SnapshotSchedulingMode, StorageConfig,
+    CaptureBudgetConfig, CompiledRetentionPolicy, FleetScrollbackBudgetConfig, HotReloadableConfig,
+    PaneFilterConfig, PanePriorityConfig, PatternsConfig, SnapshotConfig, SnapshotSchedulingMode,
+    StorageConfig,
 };
 use crate::connector_inbound_bridge::{
     BridgeRouteResult, ConnectorBridgeError, ConnectorInboundBridge, ConnectorInboundBridgeConfig,
@@ -55,8 +56,8 @@ use crate::connector_outbound_bridge::{
 };
 use crate::connector_reliability::ConnectorErrorKind;
 use crate::crash::{
-    HealthSnapshot, LeakRiskInventorySnapshot, LeakRiskWatchdogComponentSnapshot,
-    LeakRiskWatchdogSnapshot, ShutdownSummary,
+    FleetScrollbackTelemetrySnapshot, HealthSnapshot, LeakRiskInventorySnapshot,
+    LeakRiskWatchdogComponentSnapshot, LeakRiskWatchdogSnapshot, ShutdownSummary,
 };
 use crate::error::{Result, RuntimeOperationSource};
 use crate::events::{Event, EventBus, UserVarPayload, event_identity_key};
@@ -72,7 +73,7 @@ use crate::ingest::{
     bounded_segment_for_persistence, persist_authorized_captured_segment_with_zone_with_cx,
 };
 use crate::lru_cache::LruCache;
-use crate::memory_budget::{BudgetLevel, MemoryBudgetConfig};
+use crate::memory_budget::BudgetLevel;
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
@@ -1591,6 +1592,8 @@ pub struct RuntimeConfig {
     pub pane_priorities: PanePriorityConfig,
     /// Capture budget configuration
     pub capture_budgets: CaptureBudgetConfig,
+    /// Mux-owned per-pane resident scrollback budget used by fleet pressure.
+    pub fleet_scrollback: FleetScrollbackBudgetConfig,
     /// Pattern detection configuration
     pub patterns: PatternsConfig,
     /// Optional root for resolving file-based pattern packs
@@ -1634,6 +1637,7 @@ impl Default for RuntimeConfig {
             pane_filter: PaneFilterConfig::default(),
             pane_priorities: PanePriorityConfig::default(),
             capture_budgets: CaptureBudgetConfig::default(),
+            fleet_scrollback: FleetScrollbackBudgetConfig::default(),
             patterns: PatternsConfig::default(),
             patterns_root: None,
             channel_buffer: 1024,
@@ -4371,6 +4375,7 @@ impl ObservationRuntime {
         let initial_retention_max_mb = self.config.retention_max_mb;
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
         let initial_cache_gc_settings = self.config.gc;
+        let pane_budget_config = self.config.fleet_scrollback.clone();
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
@@ -4404,14 +4409,12 @@ impl ObservationRuntime {
             let backpressure_manager = BackpressureManager::new(BackpressureConfig::default());
             let memory_pressure_monitor =
                 MemoryPressureMonitor::new(MemoryPressureConfig::default());
-            // Per-pane logical memory budget used to derive the fleet
-            // budget-pressure dimension from PaneRegistry arena accounting on
-            // each health tick (ft-6n7hs). The RSS/cgroup MemoryBudgetManager
-            // is not wired into the observation runtime; the scrollback
-            // coordinator is driven from the same per-pane *logical* accounting
-            // sampled here, which is the eviction-relevant signal.
-            let pane_budget_config = MemoryBudgetConfig::default();
-
+            // Per-pane resident-memory budget used to derive the fleet
+            // budget-pressure dimension from mux-owned hot/warm scrollback
+            // telemetry on each health tick. PaneRegistry arena accounting is
+            // retained as a metadata-only fallback when mux telemetry is
+            // unavailable; it must not be described as growing scrollback.
+            // The RSS/cgroup MemoryBudgetManager remains a separate surface.
             // Fleet scrollback coordinator (ft-dwjtm): evaluates fleet memory
             // pressure from queue depths and triggers warm-page eviction when
             // TieredScrollback instances are available.
@@ -4875,7 +4878,7 @@ impl ObservationRuntime {
                 }
 
                 if health_schedule.should_run(Instant::now(), health_interval) {
-                    let (health_panes, leak_risk_inventory, worst_pane_budget) = {
+                    let (health_panes, leak_risk_inventory, observed_pane_ids) = {
                         let reg = registry.read().await;
                         let cursors = cursors.read().await;
                         let mut tracker = pane_activity_tracker.write().await;
@@ -4887,14 +4890,8 @@ impl ObservationRuntime {
                         );
                         let leak_risk_inventory =
                             build_leak_risk_inventory(&reg, &metrics, &heartbeats);
-                        let worst_pane_budget = worst_pane_budget_level(
-                            reg.pane_arena_stats_snapshot()
-                                .iter()
-                                .map(|s| u64::try_from(s.stats.tracked_bytes).unwrap_or(u64::MAX)),
-                            pane_budget_config.default_budget_bytes,
-                            pane_budget_config.high_ratio,
-                        );
-                        (health_panes, leak_risk_inventory, worst_pane_budget)
+                        let observed_pane_ids = reg.observed_pane_ids();
+                        (health_panes, leak_risk_inventory, observed_pane_ids)
                     };
                     let observed_panes = health_panes.observed_panes;
                     let last_activity_by_pane = health_panes.last_activity_by_pane;
@@ -4994,27 +4991,6 @@ impl ObservationRuntime {
 
                     // ── Fleet scrollback coordinator tick (ft-dwjtm) ────────
                     //
-                    // Drive the coordinator from the runtime's actual pressure
-                    // surfaces instead of cursor-derived placeholders:
-                    // - queue depths via BackpressureManager
-                    // - host memory sampling via MemoryPressureMonitor
-                    // - per-pane logical accounting via PaneRegistry arenas
-                    let fleet_signals = build_fleet_pressure_signals(
-                        &backpressure_manager,
-                        &QueueDepths {
-                            capture_depth,
-                            capture_capacity: capture_cap,
-                            write_depth,
-                            write_capacity: write_cap,
-                        },
-                        memory_pressure_monitor.sample().tier,
-                        worst_pane_budget,
-                        observed_panes,
-                    );
-                    let observed_pane_ids = {
-                        let reg = registry.read().await;
-                        reg.observed_pane_ids()
-                    };
                     let observed_pane_count = observed_pane_ids.len();
                     let tiered_scrollback_fetch = match collect_pane_tiered_scrollback_summaries(
                         &loop_cx,
@@ -5036,7 +5012,9 @@ impl ObservationRuntime {
                     if loop_cx.checkpoint().is_err() {
                         break;
                     }
-                    let (fleet_pane_infos, fleet_pane_snapshots) = {
+                    let observed_pane_id_set: HashSet<u64> =
+                        observed_pane_ids.iter().copied().collect();
+                    let (mut fleet_pane_infos, fleet_pane_snapshots) = {
                         let reg = registry.read().await;
                         let cur = cursors.read().await;
                         (
@@ -5052,6 +5030,36 @@ impl ObservationRuntime {
                             ),
                         )
                     };
+                    fleet_pane_infos.retain(|pane| observed_pane_id_set.contains(&pane.pane_id));
+                    let worst_pane_budget = if pane_budget_config.enabled {
+                        worst_pane_budget_level(
+                            fleet_pane_infos.iter().map(|pane| {
+                                u64::try_from(pane.estimated_memory_bytes).unwrap_or(u64::MAX)
+                            }),
+                            pane_budget_config.per_pane_budget_bytes,
+                            pane_budget_config.high_ratio,
+                        )
+                    } else {
+                        BudgetLevel::Normal
+                    };
+                    // Drive the coordinator from the runtime's actual pressure
+                    // surfaces instead of cursor-derived placeholders:
+                    // - queue depths via BackpressureManager
+                    // - host memory sampling via MemoryPressureMonitor
+                    // - mux-owned hot/warm scrollback resident bytes, with
+                    //   PaneRegistry metadata accounting only as a fallback
+                    let fleet_signals = build_fleet_pressure_signals(
+                        &backpressure_manager,
+                        &QueueDepths {
+                            capture_depth,
+                            capture_capacity: capture_cap,
+                            write_depth,
+                            write_capacity: write_cap,
+                        },
+                        memory_pressure_monitor.sample().tier,
+                        worst_pane_budget,
+                        observed_panes,
+                    );
                     let pane_scrollback_snapshot_count = fleet_pane_snapshots.len();
                     let mut pane_snapshots =
                         SnapshotPaneScrollbackAccess::new(fleet_pane_snapshots);
@@ -5246,6 +5254,9 @@ impl ObservationRuntime {
                         current_backoff_ms: metrics.crash_loop_diagnostics().current_backoff_ms,
                         in_crash_loop: metrics.crash_loop_diagnostics().in_crash_loop,
                         fleet_pressure_tier: Some(format!("{:?}", fleet_eval.compound_tier)),
+                        fleet_scrollback_telemetry: Some(
+                            tiered_scrollback_fetch.health_snapshot(&observed_pane_ids),
+                        ),
                         swarm_capacity: Some(
                             crate::runtime_telemetry::live_swarm_capacity_operator_summary(
                                 snapshot_timestamp,
@@ -9140,10 +9151,11 @@ fn classify_pane_budget_level(
     if budget_bytes == 0 {
         return BudgetLevel::Normal;
     }
-    // Mirror memory_budget::normalize_high_ratio: NaN falls back to the
-    // default soft-limit ratio, otherwise clamp into [0.0, 1.0].
+    // Config validation rejects non-finite/non-interior ratios. Keep this
+    // helper defensive for direct RuntimeConfig construction in tests and
+    // embedders: NaN falls back to the default and finite values are clamped.
     let high_ratio = if high_ratio.is_nan() {
-        MemoryBudgetConfig::default().high_ratio
+        FleetScrollbackBudgetConfig::default().high_ratio
     } else {
         high_ratio.clamp(0.0, 1.0)
     };
@@ -9162,8 +9174,7 @@ fn classify_pane_budget_level(
     }
 }
 
-/// Derive the worst per-pane memory budget level from the registry's
-/// logical arena accounting (ft-6n7hs).
+/// Derive the worst per-pane memory budget level from resident-byte estimates.
 ///
 /// The worst (highest) level across all reserved panes is returned; an
 /// empty iterator is `BudgetLevel::Normal`.
@@ -9172,10 +9183,10 @@ fn classify_pane_budget_level(
 /// `fleet_memory_controller::map_budget_level` folds into the compound
 /// fleet tier driving scrollback eviction. Previously the runtime passed
 /// a literal `BudgetLevel::Normal`, freezing this dimension so per-pane
-/// budget pressure could never raise the fleet tier on its own. The
-/// RSS/cgroup `MemoryBudgetManager` is not wired into the observation
-/// runtime; the logical arena accounting sampled here is the
-/// eviction-relevant per-pane signal.
+/// budget pressure could never raise the fleet tier on its own. Callers feed
+/// mux-owned hot/warm scrollback estimates when available and fall back to
+/// PaneRegistry metadata accounting only for panes whose mux telemetry is
+/// unavailable. The RSS/cgroup `MemoryBudgetManager` is a separate surface.
 fn worst_pane_budget_level<I>(
     tracked_bytes_iter: I,
     budget_bytes: u64,
@@ -9250,11 +9261,43 @@ impl PaneTieredScrollbackFetch {
     }
 
     fn telemetry_blind(&self, pane_count: usize) -> bool {
-        pane_count > 0 && self.summaries.is_empty() && self.errors > 0
+        pane_count > 0 && self.summaries.is_empty()
     }
 
     fn telemetry_partial(&self, pane_count: usize) -> bool {
-        pane_count > self.summaries.len() && self.errors > 0 && !self.telemetry_blind(pane_count)
+        pane_count > self.summaries.len() && !self.telemetry_blind(pane_count)
+    }
+
+    fn health_snapshot(&self, observed_pane_ids: &[u64]) -> FleetScrollbackTelemetrySnapshot {
+        let mut observed_pane_ids = observed_pane_ids.to_vec();
+        observed_pane_ids.sort_unstable();
+        observed_pane_ids.dedup();
+        let sampled_pane_ids: Vec<u64> = observed_pane_ids
+            .iter()
+            .copied()
+            .filter(|pane_id| self.summaries.contains_key(pane_id))
+            .collect();
+        let pane_count = observed_pane_ids.len();
+        let sampled_pane_count = sampled_pane_ids.len();
+        let (warm_spill_lines_total, warm_spill_bytes_total) = sampled_pane_ids
+            .iter()
+            .filter_map(|pane_id| self.summaries.get(pane_id))
+            .fold((0_u64, 0_u64), |(lines, bytes), summary| {
+                (
+                    lines.saturating_add(summary.warm_spill_lines_total),
+                    bytes.saturating_add(summary.warm_spill_bytes_total),
+                )
+            });
+        FleetScrollbackTelemetrySnapshot {
+            observed_panes: pane_count,
+            sampled_panes: sampled_pane_count,
+            observed_pane_ids,
+            sampled_pane_ids,
+            telemetry_blind: pane_count > 0 && sampled_pane_count == 0,
+            telemetry_partial: pane_count > sampled_pane_count && sampled_pane_count > 0,
+            warm_spill_lines_total,
+            warm_spill_bytes_total,
+        }
     }
 }
 
@@ -9350,9 +9393,10 @@ fn approximate_warm_page_count(summary: &PaneTieredScrollbackSummary) -> usize {
 }
 
 fn estimated_memory_bytes_from_tiered_scrollback(summary: &PaneTieredScrollbackSummary) -> usize {
-    // Runtime arena accounting already tracks captured segments; augment it
-    // with mux-side warm tier bytes and the in-memory scrollback rows that are
-    // not represented in the compressed warm tier.
+    // Mux telemetry exposes exact warm resident bytes but only a row count for
+    // the hot in-memory tier. Use a conservative finite estimate for those hot
+    // rows; PaneRegistry accounting tracks metadata, not captured segments or
+    // terminal scrollback, so it cannot substitute for this growing signal.
     const APPROX_IN_MEMORY_SCROLLBACK_LINE_BYTES: usize = 200;
 
     summary.warm_resident_bytes.saturating_add(
@@ -10326,6 +10370,7 @@ impl RuntimeHandle {
             current_backoff_ms: self.metrics.crash_loop_diagnostics().current_backoff_ms,
             in_crash_loop: self.metrics.crash_loop_diagnostics().in_crash_loop,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: Some(
                 crate::runtime_telemetry::live_swarm_capacity_operator_summary(
                     snapshot_timestamp,
@@ -14291,6 +14336,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
@@ -15629,6 +15675,15 @@ mod tests {
     }
 
     #[test]
+    fn pane_tiered_scrollback_fetch_marks_unexplained_missing_samples_blind() {
+        let fetch = PaneTieredScrollbackFetch::default();
+
+        assert!(fetch.telemetry_blind(2));
+        assert!(!fetch.telemetry_partial(2));
+        assert!(!fetch.telemetry_blind(0));
+    }
+
+    #[test]
     fn pane_tiered_scrollback_fetch_marks_partial_when_some_samples_succeed() {
         let mut fetch = PaneTieredScrollbackFetch::default();
         fetch
@@ -15638,6 +15693,57 @@ mod tests {
 
         assert!(!fetch.telemetry_blind(2));
         assert!(fetch.telemetry_partial(2));
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_health_snapshot_saturates_real_spill_totals() {
+        let mut fetch = PaneTieredScrollbackFetch::default();
+        fetch.summaries.insert(
+            11,
+            PaneTieredScrollbackSummary {
+                warm_spill_lines_total: u64::MAX,
+                warm_spill_bytes_total: 4_096,
+                ..Default::default()
+            },
+        );
+        fetch.summaries.insert(
+            12,
+            PaneTieredScrollbackSummary {
+                warm_spill_lines_total: 1,
+                warm_spill_bytes_total: u64::MAX,
+                ..Default::default()
+            },
+        );
+
+        let snapshot = fetch.health_snapshot(&[11, 12]);
+        assert_eq!(snapshot.observed_panes, 2);
+        assert_eq!(snapshot.sampled_panes, 2);
+        assert_eq!(snapshot.observed_pane_ids, vec![11, 12]);
+        assert_eq!(snapshot.sampled_pane_ids, vec![11, 12]);
+        assert!(!snapshot.telemetry_blind);
+        assert!(!snapshot.telemetry_partial);
+        assert_eq!(snapshot.warm_spill_lines_total, u64::MAX);
+        assert_eq!(snapshot.warm_spill_bytes_total, u64::MAX);
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_health_snapshot_excludes_unobserved_summaries() {
+        let mut fetch = PaneTieredScrollbackFetch::default();
+        fetch.summaries.insert(
+            99,
+            PaneTieredScrollbackSummary {
+                warm_spill_lines_total: 7,
+                warm_spill_bytes_total: 700,
+                ..Default::default()
+            },
+        );
+
+        let snapshot = fetch.health_snapshot(&[11]);
+        assert_eq!(snapshot.observed_pane_ids, vec![11]);
+        assert!(snapshot.sampled_pane_ids.is_empty());
+        assert!(snapshot.telemetry_blind);
+        assert_eq!(snapshot.warm_spill_lines_total, 0);
+        assert_eq!(snapshot.warm_spill_bytes_total, 0);
     }
 
     #[test]
@@ -15904,6 +16010,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
@@ -15953,6 +16060,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
@@ -16002,6 +16110,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
@@ -16831,6 +16940,17 @@ mod tests {
     fn runtime_config_default_max_concurrent_captures() {
         let config = RuntimeConfig::default();
         assert_eq!(config.max_concurrent_captures, 10);
+    }
+
+    #[test]
+    fn runtime_config_default_uses_one_gib_fleet_scrollback_budget() {
+        let config = RuntimeConfig::default();
+        assert!(config.fleet_scrollback.enabled);
+        assert_eq!(
+            config.fleet_scrollback.per_pane_budget_bytes,
+            1024 * 1024 * 1024
+        );
+        assert!((config.fleet_scrollback.high_ratio - 0.8).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -18174,7 +18294,8 @@ mod tests {
     #[test]
     fn classify_pane_budget_level_nan_ratio_falls_back_to_default() {
         let budget = TEST_PANE_BUDGET_BYTES;
-        let default_high = (budget as f64 * MemoryBudgetConfig::default().high_ratio) as u64;
+        let default_high =
+            (budget as f64 * FleetScrollbackBudgetConfig::default().high_ratio) as u64;
         // NaN ratio must not classify a small pane as throttled.
         assert_eq!(
             classify_pane_budget_level(default_high - 1, budget, f64::NAN),
@@ -18295,6 +18416,8 @@ mod tests {
                 in_memory_scrollback_rows: 64,
                 warm_resident_lines: 600,
                 warm_resident_bytes: 120_000,
+                warm_spill_lines_total: 700,
+                warm_spill_bytes_total: 140_000,
             },
         );
 
@@ -18345,6 +18468,8 @@ mod tests {
                 in_memory_scrollback_rows: 64,
                 warm_resident_lines: 600,
                 warm_resident_bytes: 120_000,
+                warm_spill_lines_total: 700,
+                warm_spill_bytes_total: 140_000,
             },
         );
         tiered_scrollback.insert(2, PaneTieredScrollbackSummary::default());
@@ -18386,6 +18511,8 @@ mod tests {
                 in_memory_scrollback_rows: 64,
                 warm_resident_lines: 600,
                 warm_resident_bytes: 120_000,
+                warm_spill_lines_total: 700,
+                warm_spill_bytes_total: 140_000,
             },
         );
 
@@ -18396,6 +18523,73 @@ mod tests {
         assert_eq!(infos[0].warm_bytes, 120_000);
         assert_eq!(infos[0].warm_pages, 3);
         assert_eq!(infos[0].estimated_memory_bytes, 132_800);
+    }
+
+    #[test]
+    fn mux_scrollback_growth_drives_per_pane_budget_pressure() {
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(1, "bash")]);
+        let cursors = HashMap::new();
+        let budget_bytes = 150_000;
+        let high_ratio = 0.8;
+
+        let metadata_only = fleet_pane_infos_from_registry(&registry, &cursors, &HashMap::new());
+        assert_eq!(metadata_only.len(), 1);
+        assert_eq!(
+            worst_pane_budget_level(
+                metadata_only
+                    .iter()
+                    .map(|pane| u64::try_from(pane.estimated_memory_bytes).unwrap_or(u64::MAX)),
+                budget_bytes,
+                high_ratio,
+            ),
+            BudgetLevel::Normal,
+        );
+
+        let mut growing_scrollback = HashMap::new();
+        growing_scrollback.insert(
+            1,
+            PaneTieredScrollbackSummary {
+                tiering_enabled: true,
+                configured_scrollback_rows: 3_500,
+                configured_hot_lines: 1_000,
+                configured_warm_max_bytes: 50 * 1024 * 1024,
+                visible_rows: 24,
+                in_memory_scrollback_rows: 64,
+                warm_resident_lines: 600,
+                warm_resident_bytes: 120_000,
+                warm_spill_lines_total: 600,
+                warm_spill_bytes_total: 120_000,
+            },
+        );
+        let infos = fleet_pane_infos_from_registry(&registry, &cursors, &growing_scrollback);
+        assert_eq!(infos[0].estimated_memory_bytes, 132_800);
+        assert_eq!(
+            worst_pane_budget_level(
+                infos
+                    .iter()
+                    .map(|pane| u64::try_from(pane.estimated_memory_bytes).unwrap_or(u64::MAX)),
+                budget_bytes,
+                high_ratio,
+            ),
+            BudgetLevel::Throttled,
+        );
+
+        growing_scrollback
+            .get_mut(&1)
+            .expect("inserted pane summary")
+            .warm_resident_bytes = usize::try_from(budget_bytes).expect("test budget fits usize");
+        let over_budget = fleet_pane_infos_from_registry(&registry, &cursors, &growing_scrollback);
+        assert_eq!(
+            worst_pane_budget_level(
+                over_budget
+                    .iter()
+                    .map(|pane| u64::try_from(pane.estimated_memory_bytes).unwrap_or(u64::MAX)),
+                budget_bytes,
+                high_ratio,
+            ),
+            BudgetLevel::OverBudget,
+        );
     }
 
     // -----------------------------------------------------------------------

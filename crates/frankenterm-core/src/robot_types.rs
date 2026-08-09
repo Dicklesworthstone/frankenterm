@@ -3170,6 +3170,9 @@ pub struct HealthDiagnosticsData {
     /// Fleet scrollback pressure tier: "Normal", "Elevated", "Critical", "Emergency".
     #[serde(default)]
     pub fleet_pressure_tier: Option<String>,
+    /// Complete or degraded mux tiered-scrollback evidence for this health tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_scrollback_telemetry: Option<crate::crash::FleetScrollbackTelemetrySnapshot>,
 
     // -- Crash / restart resilience --
     /// Total watcher restarts since process start.
@@ -3275,6 +3278,7 @@ impl HealthDiagnosticsData {
             db_writable: snap.db_writable,
             backpressure_tier: snap.backpressure_tier.clone(),
             fleet_pressure_tier: snap.fleet_pressure_tier.clone(),
+            fleet_scrollback_telemetry: snap.fleet_scrollback_telemetry.clone(),
             restart_count: snap.restart_count,
             consecutive_crashes: snap.consecutive_crashes,
             in_crash_loop: snap.in_crash_loop,
@@ -7364,6 +7368,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: Some("Normal".to_string()),
+            fleet_scrollback_telemetry: None,
             swarm_capacity: None,
             leak_risk_inventory: Default::default(),
         }
@@ -7599,8 +7604,22 @@ mod tests {
         let mut snap = make_test_health_snapshot();
         snap.backpressure_tier = Some("Yellow".to_string());
         snap.fleet_pressure_tier = Some("Elevated".to_string());
+        snap.fleet_scrollback_telemetry = Some(crate::crash::FleetScrollbackTelemetrySnapshot {
+            observed_panes: 42,
+            sampled_panes: 42,
+            observed_pane_ids: (1..=42).collect(),
+            sampled_pane_ids: (1..=42).collect(),
+            telemetry_blind: false,
+            telemetry_partial: false,
+            warm_spill_lines_total: 12,
+            warm_spill_bytes_total: 1_024,
+        });
         let data = HealthDiagnosticsData::from_health_snapshot(&snap);
         assert_eq!(data.backpressure_tier.as_deref(), Some("Yellow"));
         assert_eq!(data.fleet_pressure_tier.as_deref(), Some("Elevated"));
+        assert_eq!(
+            data.fleet_scrollback_telemetry,
+            snap.fleet_scrollback_telemetry
+        );
     }
 }

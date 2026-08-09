@@ -432,8 +432,40 @@
         "ingest_lag_avg_ms": { "type": "number", "minimum": 0 },
         "ingest_lag_max_ms": { "type": "integer", "minimum": 0 },
         "db_writable": { "type": "boolean" },
-        "backpressure_tier": { "type": "string" },
-        "fleet_pressure_tier": { "type": "string" },
+        "backpressure_tier": { "type": ["string", "null"] },
+        "fleet_pressure_tier": { "type": ["string", "null"] },
+        "fleet_scrollback_telemetry": {
+          "type": "object",
+          "required": [
+            "observed_panes",
+            "sampled_panes",
+            "observed_pane_ids",
+            "sampled_pane_ids",
+            "telemetry_blind",
+            "telemetry_partial",
+            "warm_spill_lines_total",
+            "warm_spill_bytes_total"
+          ],
+          "properties": {
+            "observed_panes": { "type": "integer", "minimum": 0 },
+            "sampled_panes": { "type": "integer", "minimum": 0 },
+            "observed_pane_ids": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 },
+              "uniqueItems": true
+            },
+            "sampled_pane_ids": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 },
+              "uniqueItems": true
+            },
+            "telemetry_blind": { "type": "boolean" },
+            "telemetry_partial": { "type": "boolean" },
+            "warm_spill_lines_total": { "type": "integer", "minimum": 0 },
+            "warm_spill_bytes_total": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
         "restart_count": { "type": "integer", "minimum": 0 },
         "consecutive_crashes": { "type": "integer", "minimum": 0 },
         "in_crash_loop": { "type": "boolean" },
