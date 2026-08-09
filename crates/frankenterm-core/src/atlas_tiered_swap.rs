@@ -391,7 +391,10 @@ impl DiskTierHandoffQueue {
     /// This is the hot-path batching API for the cold-tier driver: callers keep
     /// `demotes` and `promotes` as scratch buffers across frames, and this
     /// method moves every queued handoff exactly once while preserving push
-    /// order within each direction.
+    /// order within each direction. Existing scratch contents are preserved
+    /// as a prefix; the caller processes and clears each batch before reusing
+    /// it for the next frame. Capacity is retained by both the queue and the
+    /// caller-owned batches.
     pub fn drain_by_direction_into(
         &mut self,
         demotes: &mut Vec<DiskTierHandoff>,
@@ -407,7 +410,9 @@ impl DiskTierHandoffQueue {
         }
     }
 
-    /// Drain pending handoffs into demote/promote batches in one pass.
+    /// Allocating convenience wrapper that returns newly owned direction
+    /// batches. Per-frame hot paths should retain scratch and call
+    /// [`Self::drain_by_direction_into`] instead.
     #[must_use]
     pub fn drain_partitioned_by_direction(
         &mut self,
@@ -2619,6 +2624,18 @@ mod tests {
         }
     }
 
+    fn observe_vec_reallocation<T>(
+        capacity: usize,
+        pointer: *const T,
+        prior_capacity: &mut usize,
+        prior_pointer: &mut *const T,
+    ) -> usize {
+        let changed = capacity != *prior_capacity || !std::ptr::eq(pointer, *prior_pointer);
+        *prior_capacity = capacity;
+        *prior_pointer = pointer;
+        usize::from(changed)
+    }
+
     #[test]
     fn disk_handoff_queue_starts_empty() {
         let q = DiskTierHandoffQueue::new();
@@ -2713,6 +2730,302 @@ mod tests {
         assert_eq!(demotes[7].region_id, 7);
         assert_eq!(promotes[0].region_id, 100);
         assert_eq!(promotes[7].region_id, 107);
+    }
+
+    #[test]
+    fn disk_handoff_queue_reusable_batches_have_zero_steady_state_reallocations() {
+        const BURST_HANDOFFS: usize = 256;
+        const MEASURED_FRAMES: usize = 2_048;
+
+        fn direction(frame: usize, index: usize) -> DiskHandoffDirection {
+            match frame % 5 {
+                0 => {
+                    if index.is_multiple_of(2) {
+                        DiskHandoffDirection::Demote
+                    } else {
+                        DiskHandoffDirection::Promote
+                    }
+                }
+                1 => {
+                    if index.is_multiple_of(4) {
+                        DiskHandoffDirection::Promote
+                    } else {
+                        DiskHandoffDirection::Demote
+                    }
+                }
+                2 => {
+                    if index.is_multiple_of(4) {
+                        DiskHandoffDirection::Demote
+                    } else {
+                        DiskHandoffDirection::Promote
+                    }
+                }
+                3 => DiskHandoffDirection::Demote,
+                _ => DiskHandoffDirection::Promote,
+            }
+        }
+
+        fn burst_len(frame: usize) -> usize {
+            match frame % 7 {
+                0 => 0,
+                1 => 1,
+                2 => 17,
+                3 => 64,
+                4 => 255,
+                _ => BURST_HANDOFFS,
+            }
+        }
+
+        fn measured_handoff(frame: usize, index: usize) -> DiskTierHandoff {
+            let direction = direction(frame, index);
+            let frame = u64::try_from(frame).expect("measured frame fits u64");
+            let index = u64::try_from(index).expect("burst index fits u64");
+            handoff(
+                frame
+                    .checked_mul(u64::try_from(BURST_HANDOFFS).expect("burst fits u64"))
+                    .and_then(|base| base.checked_add(index))
+                    .expect("measured region identity fits u64"),
+                direction,
+                index
+                    .checked_add(1)
+                    .and_then(|ordinal| ordinal.checked_mul(4_096))
+                    .expect("measured byte count fits u64"),
+                frame,
+            )
+        }
+
+        let mut queue = DiskTierHandoffQueue::new();
+        let mut demotes = Vec::new();
+        let mut promotes = Vec::new();
+
+        // Warm all three retained buffers through the production API. The
+        // alternating frame makes both direction batches nonempty, while the
+        // conservative one-pass reserve gives each enough capacity for the
+        // later all-demote and all-promote frames.
+        for index in 0..BURST_HANDOFFS {
+            queue.push(measured_handoff(0, index));
+        }
+        queue.drain_by_direction_into(&mut demotes, &mut promotes);
+        assert_eq!(demotes.len(), BURST_HANDOFFS / 2);
+        assert_eq!(promotes.len(), BURST_HANDOFFS / 2);
+        demotes.clear();
+        promotes.clear();
+
+        let mut queue_capacity = queue.handoffs.capacity();
+        let mut demote_capacity = demotes.capacity();
+        let mut promote_capacity = promotes.capacity();
+        let mut queue_pointer = queue.handoffs.as_ptr();
+        let mut demote_pointer = demotes.as_ptr();
+        let mut promote_pointer = promotes.as_ptr();
+        assert!(queue_capacity >= BURST_HANDOFFS);
+        assert!(demote_capacity >= BURST_HANDOFFS);
+        assert!(promote_capacity >= BURST_HANDOFFS);
+
+        let mut queue_reallocations = 0usize;
+        let mut demote_reallocations = 0usize;
+        let mut promote_reallocations = 0usize;
+        let mut empty_frames = 0usize;
+        let mut mixed_frames = 0usize;
+        let mut maximum_demotes = 0usize;
+        let mut maximum_promotes = 0usize;
+        for frame in 1..=MEASURED_FRAMES {
+            let frame_burst = burst_len(frame);
+            for index in 0..frame_burst {
+                queue.push(measured_handoff(frame, index));
+            }
+            queue.drain_by_direction_into(&mut demotes, &mut promotes);
+
+            queue_reallocations = queue_reallocations.saturating_add(observe_vec_reallocation(
+                queue.handoffs.capacity(),
+                queue.handoffs.as_ptr(),
+                &mut queue_capacity,
+                &mut queue_pointer,
+            ));
+            demote_reallocations = demote_reallocations.saturating_add(observe_vec_reallocation(
+                demotes.capacity(),
+                demotes.as_ptr(),
+                &mut demote_capacity,
+                &mut demote_pointer,
+            ));
+            promote_reallocations = promote_reallocations.saturating_add(observe_vec_reallocation(
+                promotes.capacity(),
+                promotes.as_ptr(),
+                &mut promote_capacity,
+                &mut promote_pointer,
+            ));
+
+            let mut demote_index = 0usize;
+            let mut promote_index = 0usize;
+            for index in 0..frame_burst {
+                let expected = measured_handoff(frame, index);
+                match expected.direction {
+                    DiskHandoffDirection::Demote => {
+                        assert_eq!(demotes[demote_index], expected);
+                        demote_index = demote_index.saturating_add(1);
+                    }
+                    DiskHandoffDirection::Promote => {
+                        assert_eq!(promotes[promote_index], expected);
+                        promote_index = promote_index.saturating_add(1);
+                    }
+                }
+            }
+            assert_eq!(demote_index, demotes.len());
+            assert_eq!(promote_index, promotes.len());
+            assert!(queue.is_empty());
+            if frame_burst == 0 {
+                empty_frames = empty_frames.saturating_add(1);
+            }
+            if !demotes.is_empty() && !promotes.is_empty() {
+                mixed_frames = mixed_frames.saturating_add(1);
+            }
+            maximum_demotes = maximum_demotes.max(demotes.len());
+            maximum_promotes = maximum_promotes.max(promotes.len());
+            demotes.clear();
+            promotes.clear();
+        }
+
+        eprintln!(
+            "atlas disk handoff reusable path: frames={MEASURED_FRAMES} maximum_burst={BURST_HANDOFFS} empty_frames={empty_frames} mixed_frames={mixed_frames} maximum_demotes={maximum_demotes} maximum_promotes={maximum_promotes} queue_reallocations={queue_reallocations} demote_reallocations={demote_reallocations} promote_reallocations={promote_reallocations} queue_capacity={queue_capacity} demote_capacity={demote_capacity} promote_capacity={promote_capacity}"
+        );
+        assert!(empty_frames > 0);
+        assert!(mixed_frames > 0);
+        assert_eq!(maximum_demotes, BURST_HANDOFFS);
+        assert_eq!(maximum_promotes, BURST_HANDOFFS);
+        assert_eq!(queue_reallocations, 0);
+        assert_eq!(demote_reallocations, 0);
+        assert_eq!(promote_reallocations, 0);
+    }
+
+    #[test]
+    fn disk_handoff_queue_reallocation_witness_detects_capacity_growth() {
+        let mut values = Vec::with_capacity(1);
+        let mut prior_capacity = values.capacity();
+        let mut prior_pointer = values.as_ptr();
+        assert!(prior_capacity > 0);
+        for index in 0..=prior_capacity {
+            values.push(handoff(
+                u64::try_from(index).expect("negative-control index fits u64"),
+                DiskHandoffDirection::Demote,
+                4_096,
+                0,
+            ));
+        }
+        assert_eq!(
+            observe_vec_reallocation(
+                values.capacity(),
+                values.as_ptr(),
+                &mut prior_capacity,
+                &mut prior_pointer,
+            ),
+            1,
+            "the zero-reallocation oracle must detect a deliberately over-capacity burst"
+        );
+    }
+
+    #[test]
+    fn disk_handoff_queue_reusable_batches_preserve_existing_prefixes() {
+        let demote_prefix = handoff(1, DiskHandoffDirection::Demote, 1_024, 1);
+        let promote_prefix = handoff(2, DiskHandoffDirection::Promote, 2_048, 1);
+        let demote_new = handoff(3, DiskHandoffDirection::Demote, 4_096, 2);
+        let promote_new = handoff(4, DiskHandoffDirection::Promote, 8_192, 2);
+        let mut queue = DiskTierHandoffQueue::new();
+        let mut demotes = vec![demote_prefix];
+        let mut promotes = vec![promote_prefix];
+
+        queue.drain_by_direction_into(&mut demotes, &mut promotes);
+        assert_eq!(demotes, vec![demote_prefix]);
+        assert_eq!(promotes, vec![promote_prefix]);
+
+        queue.push(promote_new);
+        queue.push(demote_new);
+        queue.drain_by_direction_into(&mut demotes, &mut promotes);
+        assert_eq!(demotes, vec![demote_prefix, demote_new]);
+        assert_eq!(promotes, vec![promote_prefix, promote_new]);
+    }
+
+    #[test]
+    fn disk_handoff_queue_allocating_convenience_path_reports_owned_batch_capacity() {
+        const MEASURED_FRAMES: usize = 64;
+        const BURST_HANDOFFS: usize = 64;
+
+        fn measured_handoff_for_allocating_path(frame: usize, index: usize) -> DiskTierHandoff {
+            let frame = u64::try_from(frame).expect("measured frame fits u64");
+            let index = u64::try_from(index).expect("burst index fits u64");
+            handoff(
+                frame
+                    .checked_mul(u64::try_from(BURST_HANDOFFS).expect("burst fits u64"))
+                    .and_then(|base| base.checked_add(index))
+                    .expect("measured region identity fits u64"),
+                if index.is_multiple_of(2) {
+                    DiskHandoffDirection::Demote
+                } else {
+                    DiskHandoffDirection::Promote
+                },
+                index
+                    .checked_add(1)
+                    .and_then(|ordinal| ordinal.checked_mul(4_096))
+                    .expect("measured byte count fits u64"),
+                frame,
+            )
+        }
+
+        let mut queue = DiskTierHandoffQueue::new();
+        let mut capacity_bearing_owned_batches = 0usize;
+        let mut returned_capacity = 0usize;
+
+        for frame in 0..MEASURED_FRAMES {
+            for index in 0..BURST_HANDOFFS {
+                queue.push(measured_handoff_for_allocating_path(frame, index));
+            }
+            let (demotes, promotes) = queue.drain_partitioned_by_direction();
+            assert_eq!(demotes.len(), BURST_HANDOFFS / 2);
+            assert_eq!(promotes.len(), BURST_HANDOFFS / 2);
+            assert!(
+                demotes
+                    .iter()
+                    .all(|handoff| { handoff.direction == DiskHandoffDirection::Demote })
+            );
+            assert!(
+                promotes
+                    .iter()
+                    .all(|handoff| { handoff.direction == DiskHandoffDirection::Promote })
+            );
+            for (offset, (demote, promote)) in demotes.iter().zip(&promotes).enumerate() {
+                assert_eq!(
+                    *demote,
+                    measured_handoff_for_allocating_path(frame, offset.saturating_mul(2))
+                );
+                assert_eq!(
+                    *promote,
+                    measured_handoff_for_allocating_path(
+                        frame,
+                        offset.saturating_mul(2).saturating_add(1),
+                    )
+                );
+            }
+            // This labels the wrapper separately using a source-visible fact:
+            // every nonempty returned Vec owns capacity. It intentionally does
+            // not claim unique addresses or prevent the allocator from
+            // recycling a previously freed block.
+            if demotes.capacity() > 0 {
+                capacity_bearing_owned_batches = capacity_bearing_owned_batches.saturating_add(1);
+            }
+            if promotes.capacity() > 0 {
+                capacity_bearing_owned_batches = capacity_bearing_owned_batches.saturating_add(1);
+            }
+            returned_capacity = returned_capacity
+                .saturating_add(demotes.capacity())
+                .saturating_add(promotes.capacity());
+        }
+
+        let expected_owned_batches = MEASURED_FRAMES
+            .checked_mul(2)
+            .expect("owned batch count fits usize");
+        eprintln!(
+            "atlas disk handoff allocating convenience path: frames={MEASURED_FRAMES} burst={BURST_HANDOFFS} capacity_bearing_owned_batches={capacity_bearing_owned_batches} returned_capacity={returned_capacity}"
+        );
+        assert_eq!(capacity_bearing_owned_batches, expected_owned_batches);
+        assert!(returned_capacity >= MEASURED_FRAMES.saturating_mul(BURST_HANDOFFS));
     }
 
     #[test]
