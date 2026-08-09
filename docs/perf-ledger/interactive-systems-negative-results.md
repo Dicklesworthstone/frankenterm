@@ -3693,7 +3693,11 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   and flush acknowledgement precedes token-matched finalization. Exact
   descriptor flags are restored on success, error, cancellation, timeout, and
   Drop; restoration loss always closes the stream even if finalization or
-  compensation also fails. Content-free counters retain queue depth/bytes,
+  compensation also fails. A second command-lifetime flag guard keeps stdout
+  nonblocking for the complete `--claim` loop, so a large event that fills the
+  pipe cannot leave its subsequent cursor checkpoint, heartbeat, gap, or
+  terminal record blocked after the lease settles; `claim=false` never creates
+  that guard. Content-free counters retain queue depth/bytes,
   admissions/saturation, zero-byte releases, partial ambiguity, expiry
   recovery, finalization/stale-token outcomes, descriptor restoration failure,
   blocked duration, the conservative last-pending-poll-to-settlement upper
@@ -3701,9 +3705,10 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   cancellation.
   Deterministic source tests cover fragmented/full/zero/partial/flush output,
   real full-socket cancellation and timeout, coordinator item/byte saturation,
-  stale-token finalization, prefix retention, and explicit/Drop flag
-  restoration. Strict-remote execution remains absent while RCH reports every
-  worker unreachable; no product-path, stdout latency, mux, render, M4/M5, or
+  stale-token finalization, prefix retention, explicit/Drop flag restoration,
+  and prompt `WouldBlock` from a full pipe on the post-finalization control-row
+  path. Strict-remote execution remains absent while RCH reports every worker
+  unreachable; no product-path, stdout latency, mux, render, M4/M5, or
   Threadripper performance claim follows yet.
 - **Primary retry condition:**
   > Replace the bounded single-owner nonblocking coordinator only after another design proves finite item and byte admission, direct structured cancellation, a pre-steal output deadline, exact byte and flush acknowledgement, zero-byte-only release, partial-prefix expiry recovery, token-matched finalization, no row after ambiguity, exact descriptor restoration, and deterministic saturation, shutdown, stale-token, and real-pipe behavior under strict-remote tests.
