@@ -3564,6 +3564,38 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace fixed candidates plus durable retirement receipts only after another protocol proves unlimited interruption recovery, finite privacy-safe evidence, no partial authority, no unbounded enumeration, and deterministic crash/restart/concurrent-writer behavior under the strict remote fault matrix.
 
+### IS-N125 — One preallocated drain cannot prove zero steady-state batch reallocation
+
+- **Classification:** allocation-proof false green; repeated pointer-and-capacity
+  witness retained
+- **Bead:** `ft-prove-disk-handoff-batching-hk39c`
+- **Rejected inference:** one drain of eight demotions and eight promotions into
+  two vectors created with capacity 16 proves that the reusable disk-handoff
+  path performs no recurring allocation under production-shaped frame bursts.
+- **Negative evidence:** the single-cycle assertion never reused the queue or
+  scratch buffers, never cleared and refilled them, never exercised empty,
+  skewed, all-demote, all-promote, near-capacity, or maximum-capacity frames,
+  and had no negative control showing that its oracle could detect growth. It
+  also did not distinguish the retained-scratch API from the convenience
+  wrapper that constructs two newly owned vectors on every call. Capacity
+  equality in that one hand-picked case was true but materially weaker than
+  the claimed steady-state contract.
+- **Decision:** warm the queue and both direction buffers through the actual
+  `drain_by_direction_into` API, then retain each vector allocation pointer and
+  capacity across 2,048 deterministic frames bounded at 256 handoffs. The
+  workload includes empty, tiny, mixed, 3:1-skewed, 1:3-skewed, all-demote,
+  all-promote, 255-entry, and 256-entry frames and validates every handoff in
+  direction-relative push order. Count any pointer or capacity change as a
+  reallocation, require zero for the queue and both scratch buffers, and retain
+  an over-capacity negative control that must increment the witness. Measure
+  the allocating wrapper separately as two capacity-bearing owned result
+  buffers per nonempty mixed frame without claiming unique allocator addresses
+  or preventing block recycling. Strict-remote execution remains absent while
+  RCH reports every worker unreachable; no product-path or frame-time claim
+  follows yet.
+- **Primary retry condition:**
+  > Replace the repeated pointer-and-capacity witness only with an equally deterministic allocation-sensitive oracle that turns red on forced growth, covers the full bounded burst envelope, preserves exact contents and order, and separates retained scratch from allocating convenience results.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
