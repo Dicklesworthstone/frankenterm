@@ -6974,6 +6974,21 @@ where
         if let Some(timeout) = blocked_timeout.as_mut()
             && timeout.as_mut().poll(task_cx).is_ready()
         {
+            // `budget_sleep` also settles when an earlier capability deadline
+            // terminates the owning Cx. Re-check after polling it so caller
+            // cancellation/deadline remains control flow instead of being
+            // misreported as the longer output-completion timeout (which could
+            // otherwise authorize a terminal follow-up record).
+            let settled_at = cx_timer_now(cx);
+            if cx.checkpoint().is_err() {
+                return std::task::Poll::Ready(Err(NonblockingWriteError::cancelled(
+                    progress(),
+                    blocked_duration(),
+                    settled_at.duration_since(asupersync::Time::from_nanos(
+                        last_pending_at_ns.load(std::sync::atomic::Ordering::Relaxed),
+                    )),
+                )));
+            }
             return std::task::Poll::Ready(Err(NonblockingWriteError::new(
                 NonblockingWriteErrorKind::OutputTimeout,
                 progress(),
