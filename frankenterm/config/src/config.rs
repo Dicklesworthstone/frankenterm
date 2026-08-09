@@ -1522,8 +1522,9 @@ impl Config {
                 // `promise::spawn::block_on`, whose main-thread-dispatch guard
                 // panics when config is (re)loaded on the GUI main thread
                 // (e.g. TermWindow::config_was_reloaded). Upstream relied on
-                // `smol::block_on` tolerating that; the asupersync-era block_on
-                // does not. Sync eval avoids the runtime entirely.
+                // the prior runtime's block_on tolerating that; the
+                // asupersync-era block_on does not. Sync eval avoids the
+                // runtime entirely.
                 //
                 // Skip a potential BOM that Windows software may have placed in
                 // the file. Note that we can't catch this happening for files

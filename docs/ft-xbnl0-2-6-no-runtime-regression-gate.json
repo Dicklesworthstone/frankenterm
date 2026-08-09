@@ -220,6 +220,7 @@
   },
   "doc_narrative_allowlist": [
     "AGENTS.md",
+    "README.md",
     "docs/asupersync-architecture-doctrine.md",
     "docs/asupersync-cutover-runtime-guard-validation.json",
     "docs/asupersync-cutover-runtime-guardrails.json",
@@ -238,25 +239,36 @@
     "docs/ft-xbnl0-2-6-no-runtime-regression-validation.json",
     "docs/COMPREHENSIVE_ANALYSIS_OF_coding_agent_usage_tracker.md",
     "docs/adr/0008-query-facade-contract.md",
+    "docs/attestations/0.0.0-dev.json",
+    "docs/attestations/doctrine/tokio-eradication-status.json",
+    "docs/attestations/manifest.json",
     "docs/attestations/doctrine/agents-md-counts.json",
     "docs/attestations/proofs/runtime-proof-trait.json",
     "docs/audit-checklist.md",
     "docs/contributing/auto-stamped-counts.md",
     "docs/ftui-pty-fixture-strategy.md",
     "docs/ftui-subprocess-forwarding-contract.md",
+    "docs/proofs/runtime-proof-soundness.md",
+    "docs/reality-check-bridge-plan-2026-05-12.md",
     "docs/reality-check-bridge-plan.md",
     "docs/reports/reality-check-2026-05-02.md",
     "docs/replay-test-taxonomy.md",
     "docs/review/deadlock-audit.md",
     "docs/runtime/loom-conventions.md",
     "docs/runtime/runtime-proof-trait.md",
-    "docs/timing-determinism.md"
+    "docs/timing-determinism.md",
+    "docs/tokio-test-classification.md"
   ],
   "doc_narrative_rewrite_owner": {
     "AGENTS.md": {
       "owner": "ft-deexl",
       "reason": "Repo operating instructions intentionally name forbidden Tokio tokens to define the policy agents must avoid; this is policy narrative, not an implementation dependency.",
       "removal_bead": "ft-deexl"
+    },
+    "README.md": {
+      "owner": "ft-tf6g3.7",
+      "reason": "User-facing runtime doctrine intentionally names the sealed-trait foreign type and forbidden async-test attribute as negative canaries.",
+      "removal_bead": "ft-tf6g3.7"
     },
     "docs/COMPREHENSIVE_ANALYSIS_OF_coding_agent_usage_tracker.md": {
       "owner": "ft-xbnl0.5.1",
@@ -268,10 +280,25 @@
       "reason": "ADR captures migration-era query facade runtime contract; rewritten to native asupersync narrative under ft-xbnl0.5.1 doc sweep.",
       "removal_bead": "ft-xbnl0.5.1"
     },
+    "docs/attestations/0.0.0-dev.json": {
+      "owner": "ft-tf6g3.7",
+      "reason": "Generated development bundle preserves the producing artifact's exact negative-canary doctrine description.",
+      "removal_bead": "ft-tf6g3.7"
+    },
     "docs/attestations/doctrine/agents-md-counts.json": {
       "owner": "ft-tf6g3.2",
       "reason": "Machine-readable count-stamp proof preserves the AGENTS.md command that scans for forbidden Tokio test attributes; this is guard evidence, not implementation usage.",
       "removal_bead": "ft-tf6g3.2"
+    },
+    "docs/attestations/doctrine/tokio-eradication-status.json": {
+      "owner": "ft-tf6g3.7",
+      "reason": "Machine-readable doctrine artifact intentionally records the exact forbidden async-test attribute and its zero-match validation command.",
+      "removal_bead": "ft-tf6g3.7"
+    },
+    "docs/attestations/manifest.json": {
+      "owner": "ft-tf6g3.7",
+      "reason": "The canonical attestation slot description identifies the exact negative-canary doctrine proven by its producing artifact.",
+      "removal_bead": "ft-tf6g3.7"
     },
     "docs/attestations/proofs/runtime-proof-trait.json": {
       "owner": "ft-e87u6.13",
@@ -297,6 +324,16 @@
       "owner": "ft-xbnl0.5.1",
       "reason": "ftui subprocess contract still references tokio::sync::watch as the shutdown signal type; replaced under ft-xbnl0.5.1 doc sweep.",
       "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/proofs/runtime-proof-soundness.md": {
+      "owner": "ft-i2eni.1",
+      "reason": "RuntimeProof soundness evidence intentionally names the foreign mutex type used by the negative compilation canary.",
+      "removal_bead": "ft-i2eni.1"
+    },
+    "docs/reality-check-bridge-plan-2026-05-12.md": {
+      "owner": "ft-tf6g3.7",
+      "reason": "Historical reality-check plan preserves the exact forbidden async-test attribute in its diagnosed baseline and completed remediation lane.",
+      "removal_bead": "ft-tf6g3.7"
     },
     "docs/reality-check-bridge-plan.md": {
       "owner": "ft-deexl",
@@ -332,6 +369,11 @@
       "owner": "ft-xbnl0.5.1",
       "reason": "Timing-determinism guidance references tokio::time::pause and tokio::time::sleep as both anti-pattern and recommended test primitives; replaced with native asupersync timing primitives under ft-xbnl0.5.1 doc sweep.",
       "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/tokio-test-classification.md": {
+      "owner": "ft-tf6g3.7",
+      "reason": "The classification and enforcement document intentionally names the exact forbidden async-test attribute its guards reject.",
+      "removal_bead": "ft-tf6g3.7"
     }
   },
   "doc_narrative_rule": {

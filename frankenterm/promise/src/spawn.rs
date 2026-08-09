@@ -305,9 +305,9 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// to completion independently, so parking the caller on the join handle cannot
 /// self-deadlock the GUI the way a directly-polled `block_on` would. (It does
 /// briefly block the event loop until the I/O completes — acceptable for the
-/// short mux RPCs this is used for, and the behavior `smol::block_on` had before
-/// the asupersync migration. A future, fully-async rewrite of those sync write
-/// paths is the proper end state.)
+/// short mux RPCs this is used for, and the behavior the prior runtime had
+/// before the asupersync migration. A future, fully-async rewrite of those sync
+/// write paths is the proper end state.)
 ///
 /// The future MUST NOT depend on the calling thread making progress (e.g. it
 /// must not block on `spawn_into_main_thread`), or it will deadlock when invoked
