@@ -4507,6 +4507,14 @@ struct CandidateSubsetSelection {
     stats: ByteAdmissionStats,
 }
 
+#[derive(Debug)]
+struct InclusionBackfillState {
+    projection: AdmissionProjection,
+    accepted: Vec<bool>,
+    pending: Vec<bool>,
+    accepted_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdmissionCollectionShape([bool; 4]);
 
@@ -4861,12 +4869,15 @@ fn build_backfill_dominance_index(
     pending_backfill: &[bool],
     stats: &mut ByteAdmissionStats,
 ) -> Result<BackfillDominanceIndex, PersistenceFailure> {
-    if stats.backfill_index_rebuilds == MAX_BACKFILL_INDEX_REBUILDS {
+    if stats.backfill_index_rebuilds >= MAX_BACKFILL_INDEX_REBUILDS {
         return Err(PersistenceFailure::corrupt(
             "byte-admission collection shape changed more often than its bounded mutation model",
         ));
     }
-    stats.backfill_index_rebuilds += 1;
+    stats.backfill_index_rebuilds = stats
+        .backfill_index_rebuilds
+        .checked_add(1)
+        .ok_or_else(encoded_size_overflow)?;
     let points = candidates
         .iter()
         .enumerate()
@@ -4881,51 +4892,49 @@ fn build_backfill_dominance_index(
 fn restore_inclusion_maximal_subset(
     base: AdmissionProjection,
     candidates: &[ByteAdmissionCandidate],
-    aggregate: &mut AdmissionProjection,
-    remaining: &mut [bool],
-    pending_backfill: &mut [bool],
-    remaining_count: &mut usize,
+    state: &mut InclusionBackfillState,
     maximum_bytes: u64,
     stats: &mut ByteAdmissionStats,
 ) -> Result<(), PersistenceFailure> {
     let normalized_byte_ceiling = normalized_admission_ceiling(base, maximum_bytes)?;
-    let mut shape = AdmissionCollectionShape::from_projection(*aggregate)?;
+    let mut shape = AdmissionCollectionShape::from_projection(state.projection)?;
     let mut index =
-        build_backfill_dominance_index(*aggregate, candidates, pending_backfill, stats)?;
+        build_backfill_dominance_index(state.projection, candidates, &state.pending, stats)?;
 
     loop {
         let (live_overlay_slack, tab_slack, byte_slack) =
-            admission_backfill_slack(*aggregate, normalized_byte_ceiling)?;
+            admission_backfill_slack(state.projection, normalized_byte_ceiling)?;
         stats.backfill_queries = stats.backfill_queries.saturating_add(1);
         let Some(candidate_index) = index.query(live_overlay_slack, tab_slack, byte_slack) else {
             break;
         };
-        if !pending_backfill[candidate_index] || remaining[candidate_index] {
+        if !state.pending[candidate_index] || state.accepted[candidate_index] {
             return Err(PersistenceFailure::corrupt(
                 "dominance index selected a byte-admission candidate outside backfill",
             ));
         }
 
         stats.backfill_candidate_trials = stats.backfill_candidate_trials.saturating_add(1);
-        let mut projected = *aggregate;
+        let mut projected = state.projection;
         projected.apply(&candidates[candidate_index])?;
         let violation_mask = admission_violation_mask(base, projected, maximum_bytes, true)?;
         index.remove(candidate_index)?;
-        pending_backfill[candidate_index] = false;
+        state.pending[candidate_index] = false;
 
         if violation_mask == 0 {
-            *aggregate = projected;
-            remaining[candidate_index] = true;
-            *remaining_count = remaining_count
+            state.projection = projected;
+            state.accepted[candidate_index] = true;
+            state.accepted_count = state
+                .accepted_count
                 .checked_add(1)
                 .ok_or_else(encoded_size_overflow)?;
-            let next_shape = AdmissionCollectionShape::from_projection(*aggregate)?;
+            let next_shape = AdmissionCollectionShape::from_projection(state.projection)?;
             if next_shape != shape {
                 shape = next_shape;
                 index = build_backfill_dominance_index(
-                    *aggregate,
+                    state.projection,
                     candidates,
-                    pending_backfill,
+                    &state.pending,
                     stats,
                 )?;
             }
@@ -5133,16 +5142,16 @@ fn select_compatible_candidate_subset(
     for index in removed {
         pending_backfill[index] = true;
     }
-    restore_inclusion_maximal_subset(
-        base,
-        candidates,
-        &mut aggregate,
-        &mut remaining,
-        &mut pending_backfill,
-        &mut remaining_count,
-        maximum_bytes,
-        &mut stats,
-    )?;
+    let mut backfill = InclusionBackfillState {
+        projection: aggregate,
+        accepted: remaining,
+        pending: pending_backfill,
+        accepted_count: remaining_count,
+    };
+    restore_inclusion_maximal_subset(base, candidates, &mut backfill, maximum_bytes, &mut stats)?;
+    aggregate = backfill.projection;
+    remaining = backfill.accepted;
+    remaining_count = backfill.accepted_count;
 
     let accepted_count = remaining_count;
     let final_violation_mask = admission_violation_mask(
@@ -9315,35 +9324,28 @@ mod tests {
         let candidates = (0..CANDIDATES)
             .map(|index| mixed_sign_unlock_candidate(index, CANDIDATES))
             .collect::<Vec<_>>();
-        let mut aggregate = base;
-        let mut remaining = vec![false; CANDIDATES];
-        let mut pending_backfill = vec![true; CANDIDATES];
-        let mut remaining_count = 0usize;
+        let mut backfill = InclusionBackfillState {
+            projection: base,
+            accepted: vec![false; CANDIDATES],
+            pending: vec![true; CANDIDATES],
+            accepted_count: 0,
+        };
         let mut stats = ByteAdmissionStats {
             candidate_count: CANDIDATES,
             ..ByteAdmissionStats::default()
         };
 
-        restore_inclusion_maximal_subset(
-            base,
-            &candidates,
-            &mut aggregate,
-            &mut remaining,
-            &mut pending_backfill,
-            &mut remaining_count,
-            u64::MAX,
-            &mut stats,
-        )
-        .expect("restore the exact mixed-sign unlock chain");
+        restore_inclusion_maximal_subset(base, &candidates, &mut backfill, u64::MAX, &mut stats)
+            .expect("restore the exact mixed-sign unlock chain");
 
-        assert_eq!(remaining_count, CANDIDATES);
-        assert!(remaining.into_iter().all(|accepted| accepted));
-        assert!(pending_backfill.into_iter().all(|pending| !pending));
+        assert_eq!(backfill.accepted_count, CANDIDATES);
+        assert!(backfill.accepted.into_iter().all(|accepted| accepted));
+        assert!(backfill.pending.into_iter().all(|pending| !pending));
         assert_eq!(stats.backfill_candidate_trials, CANDIDATES);
         assert_eq!(stats.backfill_queries, CANDIDATES + 1);
         assert_eq!(stats.backfill_index_rebuilds, 1);
         assert_eq!(
-            admission_violation_mask(base, aggregate, u64::MAX, true)
+            admission_violation_mask(base, backfill.projection, u64::MAX, true)
                 .expect("classify final aggregate"),
             0
         );
