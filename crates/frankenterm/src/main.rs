@@ -27364,16 +27364,17 @@ enum WatchEventClaimDelivery {
         flushed_at: std::time::Instant,
     },
     DescriptorRestoreLost {
-        flushed_at: std::time::Instant,
+        flushed_at: Option<std::time::Instant>,
     },
 }
 
 impl WatchEventClaimDelivery {
     fn flushed_at(self) -> Option<std::time::Instant> {
         match self {
-            Self::Delivered { flushed_at }
-            | Self::FinalizationLost { flushed_at }
-            | Self::DescriptorRestoreLost { flushed_at } => Some(flushed_at),
+            Self::Delivered { flushed_at } | Self::FinalizationLost { flushed_at } => {
+                Some(flushed_at)
+            }
+            Self::DescriptorRestoreLost { flushed_at } => flushed_at,
             Self::PipeClosed
             | Self::OutputAmbiguous { .. }
             | Self::LeasedUntil { .. }
@@ -28224,7 +28225,7 @@ where
                 "watch-events restored durable truth after stdout descriptor restoration failed"
             );
             return Ok(WatchEventClaimDelivery::DescriptorRestoreLost {
-                flushed_at: success.flushed_at,
+                flushed_at: Some(success.flushed_at),
             });
         }
         WatchClaimOutputAttempt::Failed(failure) if failure.bytes_written == 0 => {
@@ -28232,11 +28233,17 @@ where
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.zero_byte_failures);
             let cancellation_poll_interval_ns = 0_u64;
             let pipe_closed = failure.is_broken_pipe();
+            let descriptor_restore_lost = matches!(
+                failure.kind,
+                WatchClaimOutputFailureKind::DescriptorRestore
+            );
             let write_error = failure.into_io_error();
             return match release_watch_claim_bounded(storage, &lease).await {
                 Ok(true) => {
                     saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.releases);
-                    if pipe_closed {
+                    if descriptor_restore_lost {
+                        Ok(WatchEventClaimDelivery::DescriptorRestoreLost { flushed_at: None })
+                    } else if pipe_closed {
                         Ok(WatchEventClaimDelivery::PipeClosed)
                     } else {
                         Err(write_error)
@@ -28253,18 +28260,33 @@ where
                         cancellation_poll_interval_ns,
                         "watch-events zero-byte output failure lost delivery-lease ownership before release"
                     );
-                    Err(write_error)
+                    if descriptor_restore_lost {
+                        Ok(WatchEventClaimDelivery::DescriptorRestoreLost { flushed_at: None })
+                    } else {
+                        Err(write_error)
+                    }
                 }
                 Err(release_error) => {
                     saturating_increment_watch_counter(
                         &WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries,
                     );
-                    Err(std::io::Error::new(
-                        write_error.kind(),
-                        format!(
-                            "{write_error}; event {event_id} zero-byte failure lease release also failed: {release_error}"
-                        ),
-                    ))
+                    if descriptor_restore_lost {
+                        tracing::error!(
+                            event_id = queued_event_id,
+                            cursor_generation = queued_cursor_generation,
+                            lease_expires_at_ms = queued_lease_expiry,
+                            error = %release_error,
+                            "watch-events lease release also failed after stdout descriptor restoration was lost"
+                        );
+                        Ok(WatchEventClaimDelivery::DescriptorRestoreLost { flushed_at: None })
+                    } else {
+                        Err(std::io::Error::new(
+                            write_error.kind(),
+                            format!(
+                                "{write_error}; event {event_id} zero-byte failure lease release also failed: {release_error}"
+                            ),
+                        ))
+                    }
                 }
             };
         }
@@ -31463,7 +31485,7 @@ mod watch_events_tests {
         assert_eq!(ambiguous.flushed_at(), None);
 
         let restore_lost = WatchEventClaimDelivery::DescriptorRestoreLost {
-            flushed_at: std::time::Instant::now(),
+            flushed_at: Some(std::time::Instant::now()),
         };
         assert!(restore_lost.stops_stream_without_followup_output());
         assert!(restore_lost.flushed_at().is_some());
