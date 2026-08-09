@@ -418,6 +418,36 @@ struct RuntimeShutdownState {
     changed: std::sync::Condvar,
 }
 
+static RUNTIME_SHUTDOWN_REQUESTED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static RUNTIME_SHUTDOWN_DRAINED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static RUNTIME_SHUTDOWN_DRAIN_TIMEOUT_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Content-free process totals for finite runtime cleanup drains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeShutdownMetrics {
+    /// Runtime wrappers that began their one-way shutdown transition.
+    pub requested_total: u64,
+    /// Shutdown transitions whose cleanup leases settled before the deadline.
+    pub drained_total: u64,
+    /// Shutdown transitions that reached the finite lease-drain deadline.
+    pub drain_timeout_total: u64,
+}
+
+/// Snapshot process-local runtime shutdown outcomes without acquiring a lock.
+#[must_use]
+pub fn runtime_shutdown_metrics() -> RuntimeShutdownMetrics {
+    RuntimeShutdownMetrics {
+        requested_total: RUNTIME_SHUTDOWN_REQUESTED_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+        drained_total: RUNTIME_SHUTDOWN_DRAINED_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        drain_timeout_total: RUNTIME_SHUTDOWN_DRAIN_TIMEOUT_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 /// Runtime-instance shutdown authority shared with bounded cleanup work.
 ///
 /// This token never owns the runtime. It can therefore be retained by a task
@@ -449,7 +479,7 @@ impl RuntimeShutdownToken {
         if self.is_shutdown_requested() {
             return None;
         }
-        *active = active.checked_add(1)?;
+        *active = (*active).checked_add(1)?;
         Some(RuntimeShutdownLease {
             state: Some(std::sync::Arc::clone(&self.state)),
         })
@@ -508,7 +538,7 @@ impl Drop for RuntimeShutdownLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = *active;
-        *active = active.saturating_sub(1);
+        *active = previous.saturating_sub(1);
         debug_assert!(previous > 0, "runtime shutdown lease underflow");
         state.changed.notify_all();
     }
@@ -6288,10 +6318,14 @@ const RUNTIME_SHUTDOWN_LEASE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        if !self
+        saturating_increment_counter(&RUNTIME_SHUTDOWN_REQUESTED_TOTAL);
+        if self
             .shutdown_token
             .request_shutdown_and_wait(RUNTIME_SHUTDOWN_LEASE_DRAIN_TIMEOUT)
         {
+            saturating_increment_counter(&RUNTIME_SHUTDOWN_DRAINED_TOTAL);
+        } else {
+            saturating_increment_counter(&RUNTIME_SHUTDOWN_DRAIN_TIMEOUT_TOTAL);
             tracing::warn!(
                 timeout_ms = RUNTIME_SHUTDOWN_LEASE_DRAIN_TIMEOUT.as_millis(),
                 "runtime shutdown cleanup leases did not settle before the finite drain deadline"
@@ -8416,6 +8450,29 @@ mod tests {
         // current_thread doesn't support worker_threads; should not panic
         let rt = RuntimeBuilder::current_thread().worker_threads(4).build();
         assert!(rt.is_ok());
+    }
+
+    #[test]
+    fn runtime_shutdown_token_closes_admission_until_held_lease_drains() {
+        let token = RuntimeShutdownToken::new();
+        let lease = token.try_acquire().expect("live token must admit a lease");
+
+        assert!(!token.is_shutdown_requested());
+        assert!(
+            !token.request_shutdown_and_wait(Duration::ZERO),
+            "a held lease must prevent a false clean-drain result"
+        );
+        assert!(token.is_shutdown_requested());
+        assert!(
+            token.try_acquire().is_none(),
+            "shutdown admission must remain one-way closed"
+        );
+
+        drop(lease);
+        assert!(
+            token.request_shutdown_and_wait(Duration::ZERO),
+            "dropping the final lease must make the drain observably quiescent"
+        );
     }
 
     #[test]

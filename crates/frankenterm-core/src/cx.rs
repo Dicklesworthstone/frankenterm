@@ -350,6 +350,12 @@ where
 ///
 /// Prefer this helper at migration boundaries that previously used a
 /// `JoinSet` or ad-hoc task vector for bounded fanout.
+///
+/// # Panics
+///
+/// Panics if polled without an active asupersync scheduler. The helper acquires
+/// only the scheduler's per-poll handle so a pending batch cannot retain its
+/// runtime through a strong-handle ownership cycle.
 pub async fn spawn_bounded_with_cx<F, Fut, T>(
     cx: &Cx,
     max_concurrency: usize,
@@ -488,6 +494,11 @@ impl std::error::Error for SpawnWithTimeoutError {}
 /// future. Callers requiring a no-descendant-survival guarantee must not spawn
 /// detached nested work; they must retain and settle an explicit structured
 /// owner before the direct future can return or be dropped.
+///
+/// # Panics
+///
+/// Panics if polled without an active asupersync scheduler. The direct future
+/// intentionally retains no strong runtime handle while Pending.
 pub async fn spawn_with_timeout<F, Fut, T>(
     cx: &Cx,
     timeout: Duration,
@@ -1265,6 +1276,46 @@ mod tests {
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "timeout result must follow destruction of the direct child future"
+        );
+    }
+
+    #[test]
+    fn pending_spawn_with_timeout_task_does_not_keep_runtime_alive() {
+        struct PendingTaskDropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for PendingTaskDropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let runtime = CxRuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("timeout runtime-cycle fixture");
+        let cx = for_testing();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = PendingTaskDropProbe(std::sync::Arc::clone(&dropped));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let join = runtime.handle().spawn(async move {
+            let _ = spawn_with_timeout(&cx, Duration::from_secs(60), move |_child_cx| async move {
+                let _probe = probe;
+                entered_tx
+                    .send(())
+                    .expect("timeout cycle probe receiver must remain live");
+                std::future::pending::<()>().await;
+            })
+            .await;
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timeout child must enter Pending before runtime drop");
+        drop(join);
+        drop(runtime);
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "the inline timeout adapter must not retain its polling runtime"
         );
     }
 

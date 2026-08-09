@@ -2903,15 +2903,24 @@ mod tests {
     impl NativeDiscoveryTestBarrier {
         fn wait_in_worker(&self) {
             self.started.store(true, Ordering::Release);
+            let started = std::time::Instant::now();
             let mut released = self
                 .released
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             while !*released {
-                released = self
+                let remaining = Duration::from_secs(5)
+                    .checked_sub(started.elapsed())
+                    .expect("native discovery test barrier release timed out");
+                let (next, wait) = self
                     .changed
-                    .wait(released)
+                    .wait_timeout(released, remaining)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                released = next;
+                assert!(
+                    !wait.timed_out() || *released,
+                    "native discovery test barrier release timed out"
+                );
             }
         }
 
@@ -2954,15 +2963,24 @@ mod tests {
             if stage != self.target {
                 return;
             }
+            let started = std::time::Instant::now();
             let mut released = self
                 .released
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             while !*released {
-                released = self
+                let remaining = Duration::from_secs(5)
+                    .checked_sub(started.elapsed())
+                    .expect("native discovery checkpoint gate release timed out");
+                let (next, wait) = self
                     .changed
-                    .wait(released)
+                    .wait_timeout(released, remaining)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                released = next;
+                assert!(
+                    !wait.timed_out() || *released,
+                    "native discovery checkpoint gate release timed out"
+                );
             }
         }
 
@@ -5021,7 +5039,7 @@ mod tests {
     }
 
     #[test]
-    fn native_discovery_runtime_rejection_releases_permit_without_work() {
+    fn native_discovery_without_runtime_rejects_before_subsystem_admission() {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
         assert_eq!(before.active_scans, 0, "lifecycle tests must start quiescent");
@@ -5166,11 +5184,23 @@ mod tests {
     #[test]
     fn native_scan_observes_cancellation_after_empty_enumeration() {
         let directory = tempfile::tempdir().expect("empty native scan directory");
+        let mut terminal_checkpoint = 0_usize;
+        let report = discover_antigravity_conversations_in_dir_with_checkpoint(
+            directory.path(),
+            || {
+                terminal_checkpoint = terminal_checkpoint.saturating_add(1);
+                Ok(())
+            },
+        )
+        .expect("measure empty native scan checkpoints");
+        assert!(report.entries.is_empty());
+        assert!(terminal_checkpoint >= 3);
+
         let mut checkpoints = 0_usize;
         let error =
             discover_antigravity_conversations_in_dir_with_checkpoint(directory.path(), || {
                 checkpoints = checkpoints.saturating_add(1);
-                if checkpoints == 2 {
+                if checkpoints == terminal_checkpoint {
                     Err(SessionResumeError::Cancelled)
                 } else {
                     Ok(())
@@ -5190,11 +5220,23 @@ mod tests {
             b"SQLite format 3\0fixture",
         )
         .expect("write native SQLite fixture");
+        let mut terminal_checkpoint = 0_usize;
+        let report = discover_antigravity_conversations_in_dir_with_checkpoint(
+            directory.path(),
+            || {
+                terminal_checkpoint = terminal_checkpoint.saturating_add(1);
+                Ok(())
+            },
+        )
+        .expect("measure populated native scan checkpoints");
+        assert_eq!(report.entries.len(), 1);
+        assert!(terminal_checkpoint > 3);
+
         let mut checkpoints = 0_usize;
         let error =
             discover_antigravity_conversations_in_dir_with_checkpoint(directory.path(), || {
                 checkpoints = checkpoints.saturating_add(1);
-                if checkpoints == 3 {
+                if checkpoints == terminal_checkpoint {
                     Err(SessionResumeError::Cancelled)
                 } else {
                     Ok(())
