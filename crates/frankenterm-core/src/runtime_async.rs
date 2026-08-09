@@ -6719,6 +6719,325 @@ async fn sleep_with_cx_interruptible_using(
     }
 }
 
+/// Terminal class for [`write_all_nonblocking_with_cx`].
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonblockingWriteErrorKind {
+    /// The owning capability context was cancelled before completion.
+    ContextCancelled,
+    /// The writer returned `Ok(0)` while bytes remained.
+    WriteZero,
+    /// A non-retryable descriptor write failed.
+    Write,
+    /// The required flush boundary failed.
+    Flush,
+    /// The runtime could not register or re-arm writable readiness.
+    Readiness,
+}
+
+/// Exact progress receipt for a completed nonblocking write and flush.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonblockingWriteReceipt {
+    bytes_written: usize,
+    blocked_duration_ns: u64,
+}
+
+#[cfg(unix)]
+impl NonblockingWriteReceipt {
+    /// Number of bytes acknowledged by the writer before flush succeeded.
+    #[must_use]
+    pub const fn bytes_written(self) -> usize {
+        self.bytes_written
+    }
+
+    /// Time spent after the first `WouldBlock`, in the caller's timer domain.
+    #[must_use]
+    pub const fn blocked_duration_ns(self) -> u64 {
+        self.blocked_duration_ns
+    }
+}
+
+/// Exact byte progress and finite failure class for a nonblocking write.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct NonblockingWriteError {
+    kind: NonblockingWriteErrorKind,
+    bytes_written: usize,
+    blocked_duration_ns: u64,
+    source: Option<std::io::Error>,
+}
+
+#[cfg(unix)]
+impl NonblockingWriteError {
+    fn new(
+        kind: NonblockingWriteErrorKind,
+        bytes_written: usize,
+        blocked_duration_ns: u64,
+        source: Option<std::io::Error>,
+    ) -> Self {
+        Self {
+            kind,
+            bytes_written,
+            blocked_duration_ns,
+            source,
+        }
+    }
+
+    /// Return the finite structural failure class.
+    #[must_use]
+    pub const fn kind(&self) -> NonblockingWriteErrorKind {
+        self.kind
+    }
+
+    /// Return the exact number of bytes accepted before failure.
+    #[must_use]
+    pub const fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Return time spent after the first `WouldBlock`, in the caller's clock.
+    #[must_use]
+    pub const fn blocked_duration_ns(&self) -> u64 {
+        self.blocked_duration_ns
+    }
+
+    /// Return true only when the owning capability context stopped the write.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self.kind, NonblockingWriteErrorKind::ContextCancelled)
+    }
+
+    /// Consume the receipt and return its underlying descriptor error, if any.
+    pub fn into_source(self) -> Option<std::io::Error> {
+        self.source
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for NonblockingWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self.kind {
+            NonblockingWriteErrorKind::ContextCancelled => {
+                "nonblocking write cancelled by capability context"
+            }
+            NonblockingWriteErrorKind::WriteZero => "nonblocking writer made zero progress",
+            NonblockingWriteErrorKind::Write => "nonblocking descriptor write failed",
+            NonblockingWriteErrorKind::Flush => "nonblocking descriptor flush failed",
+            NonblockingWriteErrorKind::Readiness => {
+                "nonblocking writable-readiness registration failed"
+            }
+        };
+        write!(
+            formatter,
+            "{message} after {} acknowledged bytes",
+            self.bytes_written
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for NonblockingWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+#[cfg(unix)]
+fn nonblocking_write_blocked_duration_ns(
+    cx: &crate::cx::Cx,
+    blocked_started_at: Option<asupersync::Time>,
+) -> u64 {
+    blocked_started_at.map_or(0, |started_at| cx_timer_now(cx).duration_since(started_at))
+}
+
+/// Write one complete byte slice and cross its flush boundary using a
+/// nonblocking Unix descriptor registered with the owning asupersync reactor.
+///
+/// The function records exact accepted-byte progress, retries `Interrupted`,
+/// and parks on one writable-readiness registration after `WouldBlock`. The
+/// registration is re-armed before retrying and dropped on every terminal
+/// path. A second write attempt immediately after first registration closes
+/// the register-vs-ready race for the required single-owner writer.
+///
+/// # Errors
+///
+/// Returns [`NonblockingWriteError`] with exact byte progress when the caller
+/// is cancelled, the writer reports zero progress, a write/flush fails, or the
+/// runtime cannot register writable readiness. Callers must treat every error
+/// with non-zero progress as partial or ambiguous delivery.
+#[cfg(unix)]
+pub async fn write_all_nonblocking_with_cx<W>(
+    cx: &crate::cx::Cx,
+    writer: &mut W,
+    bytes: &[u8],
+) -> Result<NonblockingWriteReceipt, NonblockingWriteError>
+where
+    W: std::io::Write + asupersync::runtime::Source,
+{
+    use asupersync::runtime::Interest;
+    use futures::future::{Either, select};
+
+    enum WritePhase {
+        Bytes,
+        Flush,
+    }
+
+    let mut phase = WritePhase::Bytes;
+    let mut bytes_written = 0_usize;
+    let mut blocked_started_at = None;
+    let mut readiness: Option<asupersync::runtime::IoRegistration> = None;
+
+    if cx.checkpoint().is_err() {
+        return Err(NonblockingWriteError::new(
+            NonblockingWriteErrorKind::ContextCancelled,
+            bytes_written,
+            nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+            None,
+        ));
+    }
+
+    let output = std::pin::pin!(std::future::poll_fn(|task_cx| {
+        if let Some(registration) = readiness.as_mut() {
+            match registration.rearm(Interest::WRITABLE, task_cx.waker()) {
+                Ok(true) => {}
+                Ok(false) => readiness = None,
+                Err(source) => {
+                    return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                        NonblockingWriteErrorKind::Readiness,
+                        bytes_written,
+                        nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                        Some(source),
+                    )));
+                }
+            }
+        }
+
+        // Bound one cooperative poll even for pathological writers that keep
+        // returning Interrupted or tiny successful fragments.
+        for _ in 0..64 {
+            let had_readiness = readiness.is_some();
+            let result = match phase {
+                WritePhase::Bytes if bytes_written < bytes.len() => {
+                    writer.write(&bytes[bytes_written..]).map(Some)
+                }
+                WritePhase::Bytes => {
+                    phase = WritePhase::Flush;
+                    continue;
+                }
+                WritePhase::Flush => writer.flush().map(|()| None),
+            };
+
+            match result {
+                Ok(Some(0)) => {
+                    return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                        NonblockingWriteErrorKind::WriteZero,
+                        bytes_written,
+                        nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                        None,
+                    )));
+                }
+                Ok(Some(written)) => {
+                    let remaining = bytes.len().saturating_sub(bytes_written);
+                    if written > remaining {
+                        return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                            NonblockingWriteErrorKind::Write,
+                            bytes_written,
+                            nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                            Some(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "writer reported progress beyond the supplied buffer",
+                            )),
+                        )));
+                    }
+                    bytes_written += written;
+                    readiness = None;
+                }
+                Ok(None) => {
+                    readiness = None;
+                    return std::task::Poll::Ready(Ok(NonblockingWriteReceipt {
+                        bytes_written,
+                        blocked_duration_ns: nonblocking_write_blocked_duration_ns(
+                            cx,
+                            blocked_started_at,
+                        ),
+                    }));
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                    blocked_started_at.get_or_insert_with(|| cx_timer_now(cx));
+                    if !had_readiness {
+                        let mut registration = match cx.register_io(writer, Interest::WRITABLE) {
+                            Ok(registration) => registration,
+                            Err(source) => {
+                                return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                                    NonblockingWriteErrorKind::Readiness,
+                                    bytes_written,
+                                    nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                                    Some(source),
+                                )));
+                            }
+                        };
+                        match registration.rearm(Interest::WRITABLE, task_cx.waker()) {
+                            Ok(true) => readiness = Some(registration),
+                            Ok(false) => continue,
+                            Err(source) => {
+                                return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                                    NonblockingWriteErrorKind::Readiness,
+                                    bytes_written,
+                                    nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                                    Some(source),
+                                )));
+                            }
+                        }
+                        // Retry once while registered. If readiness raced with
+                        // registration, the single owner now observes progress
+                        // instead of depending on a possibly consumed wake.
+                        continue;
+                    }
+                    return std::task::Poll::Pending;
+                }
+                Err(source) => {
+                    let kind = match phase {
+                        WritePhase::Bytes => NonblockingWriteErrorKind::Write,
+                        WritePhase::Flush => NonblockingWriteErrorKind::Flush,
+                    };
+                    return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                        kind,
+                        bytes_written,
+                        nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                        Some(source),
+                    )));
+                }
+            }
+        }
+
+        task_cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }));
+    // The private cell is never initialized. Its wait future registers the
+    // current task waker directly with the explicit Cx and resolves only when
+    // cancellation, a deadline, or a capability budget terminates the Cx.
+    // `select` polls `output` first, so a completed flush wins a same-poll
+    // cancellation race and remains a truthful downstream acknowledgement.
+    let cancellation_signal = asupersync::sync::OnceCell::<()>::new();
+    let cancellation = std::pin::pin!(cancellation_signal.wait(cx));
+    match select(output, cancellation).await {
+        Either::Left((result, _cancellation)) => result,
+        Either::Right((_cancelled, output)) => {
+            drop(output);
+            Err(NonblockingWriteError::new(
+                NonblockingWriteErrorKind::ContextCancelled,
+                bytes_written,
+                nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                None,
+            ))
+        }
+    }
+}
+
 /// Pause without inheriting the ambient capability budget.
 ///
 /// Reserved for trusted terminal-settlement loops that must retain ownership
@@ -7963,6 +8282,187 @@ mod tests {
         assert!(!helper.contains("spawn_blocking"));
         assert!(!helper.contains("std::thread"));
         assert!(!helper.contains("loop {"));
+    }
+
+    #[cfg(unix)]
+    struct ScriptedNonblockingWriter {
+        descriptor: filedescriptor::FileDescriptor,
+        bytes: Vec<u8>,
+        maximum_fragment: usize,
+        fail_after: Option<usize>,
+        write_zero: bool,
+        flush_error: Option<std::io::ErrorKind>,
+    }
+
+    #[cfg(unix)]
+    impl std::os::fd::AsRawFd for ScriptedNonblockingWriter {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            std::os::fd::AsRawFd::as_raw_fd(&self.descriptor)
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::io::Write for ScriptedNonblockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.write_zero {
+                return Ok(0);
+            }
+            if self
+                .fail_after
+                .is_some_and(|fail_after| self.bytes.len() >= fail_after)
+            {
+                return Err(std::io::Error::other("scripted write failure"));
+            }
+            let permitted = self
+                .fail_after
+                .map_or(bytes.len(), |fail_after| {
+                    fail_after.saturating_sub(self.bytes.len()).min(bytes.len())
+                })
+                .min(self.maximum_fragment.max(1));
+            self.bytes.extend_from_slice(&bytes[..permitted]);
+            Ok(permitted)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_error.map_or(Ok(()), |kind| {
+                Err(std::io::Error::new(kind, "scripted flush failure"))
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn scripted_nonblocking_writer() -> ScriptedNonblockingWriter {
+        let (descriptor, _peer) =
+            filedescriptor::socketpair().expect("create scripted writer descriptor");
+        ScriptedNonblockingWriter {
+            descriptor,
+            bytes: Vec::new(),
+            maximum_fragment: usize::MAX,
+            fail_after: None,
+            write_zero: false,
+            flush_error: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_write_receipts_preserve_exact_progress_and_flush_boundary() {
+        run_async_test(async {
+            let cx = crate::cx::Cx::for_testing();
+            let line = b"one-complete-ndjson-line\n";
+
+            let mut fragmented = scripted_nonblocking_writer();
+            fragmented.maximum_fragment = 3;
+            let receipt = write_all_nonblocking_with_cx(&cx, &mut fragmented, line)
+                .await
+                .expect("fragmented complete write");
+            assert_eq!(receipt.bytes_written(), line.len());
+            assert_eq!(receipt.blocked_duration_ns(), 0);
+            assert_eq!(fragmented.bytes, line);
+
+            let mut partial = scripted_nonblocking_writer();
+            partial.maximum_fragment = 5;
+            partial.fail_after = Some(5);
+            let error = write_all_nonblocking_with_cx(&cx, &mut partial, line)
+                .await
+                .expect_err("scripted partial write must fail");
+            assert_eq!(error.kind(), NonblockingWriteErrorKind::Write);
+            assert_eq!(error.bytes_written(), 5);
+            assert_eq!(partial.bytes, line[..5]);
+
+            let mut zero = scripted_nonblocking_writer();
+            zero.write_zero = true;
+            let error = write_all_nonblocking_with_cx(&cx, &mut zero, line)
+                .await
+                .expect_err("zero-progress writer must fail");
+            assert_eq!(error.kind(), NonblockingWriteErrorKind::WriteZero);
+            assert_eq!(error.bytes_written(), 0);
+
+            let mut flush_failure = scripted_nonblocking_writer();
+            flush_failure.flush_error = Some(std::io::ErrorKind::BrokenPipe);
+            let error = write_all_nonblocking_with_cx(&cx, &mut flush_failure, line)
+                .await
+                .expect_err("flush failure is not a delivery acknowledgement");
+            assert_eq!(error.kind(), NonblockingWriteErrorKind::Flush);
+            assert_eq!(error.bytes_written(), line.len());
+            assert_eq!(flush_failure.bytes, line);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_write_rejects_precancellation_without_output() {
+        run_async_test(async {
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::Shutdown,
+                Some("pre-cancel nonblocking output"),
+            );
+            let mut writer = scripted_nonblocking_writer();
+            let error = write_all_nonblocking_with_cx(&cx, &mut writer, b"must-not-write\n")
+                .await
+                .expect_err("pre-cancelled output must fail before its first byte");
+            assert_eq!(error.kind(), NonblockingWriteErrorKind::ContextCancelled);
+            assert_eq!(error.bytes_written(), 0);
+            assert!(writer.bytes.is_empty());
+        });
+    }
+
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    #[test]
+    fn blocked_nonblocking_write_wakes_directly_on_cx_cancellation() {
+        run_async_test_isolated(|| async {
+            let (mut writer, mut reader) =
+                filedescriptor::socketpair().expect("create blocked output socket pair");
+            writer
+                .set_non_blocking(true)
+                .expect("set output socket nonblocking");
+            let fill = [0_u8; 16 * 1024];
+            loop {
+                match std::io::Write::write(&mut writer, &fill) {
+                    Ok(0) => panic!("socket reported zero progress while filling its buffer"),
+                    Ok(_written) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("failed to fill output socket: {error}"),
+                }
+            }
+
+            let cx = crate::cx::Cx::current()
+                .expect("runtime task must expose its reactor-capable context");
+            let cancel_cx = cx.clone();
+            let fallback_reader = std::thread::Builder::new()
+                .name("nonblocking-write-cancel-fallback".to_string())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_millis(10));
+                    cancel_cx.cancel_with(
+                        crate::outcome::CancelKind::Shutdown,
+                        Some("cancel blocked output"),
+                    );
+                    // This delayed read makes the test finite even if the
+                    // direct cancellation wake regresses. In that case output
+                    // wins after cancellation and the assertions below fail.
+                    std::thread::sleep(Duration::from_millis(100));
+                    let mut drain = [0_u8; 16 * 1024];
+                    let _ = std::io::Read::read(&mut reader, &mut drain);
+                })
+                .expect("spawn finite cancellation fallback");
+
+            let started_at = std::time::Instant::now();
+            let error = write_all_nonblocking_with_cx(&cx, &mut writer, b"x")
+                .await
+                .expect_err("Cx cancellation must preempt blocked output");
+            let elapsed = started_at.elapsed();
+            fallback_reader
+                .join()
+                .expect("join finite cancellation fallback");
+            assert_eq!(error.kind(), NonblockingWriteErrorKind::ContextCancelled);
+            assert_eq!(error.bytes_written(), 0);
+            assert!(
+                elapsed < Duration::from_millis(100),
+                "cancellation waited for descriptor readiness instead of its direct Cx wake: {elapsed:?}"
+            );
+        });
     }
 
     #[test]

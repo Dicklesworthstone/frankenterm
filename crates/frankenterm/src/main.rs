@@ -27103,6 +27103,8 @@ const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=10
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
 const WATCH_EVENTS_IPC_CANCELLATION_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(500);
+const WATCH_CLAIM_OUTPUT_MAX_QUEUED_RECORDS: usize = 1;
+const WATCH_CLAIM_OUTPUT_MAX_QUEUED_BYTES: usize = 1024 * 1024;
 
 fn watch_events_unhandled_only(unhandled: bool, claim: bool) -> bool {
     unhandled || claim
@@ -27346,21 +27348,44 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchEventClaimDelivery {
-    Delivered { flushed_at: std::time::Instant },
+    Delivered {
+        flushed_at: std::time::Instant,
+    },
     PipeClosed,
-    LeasedUntil { expires_at_ms: i64 },
+    OutputAmbiguous {
+        bytes_written: usize,
+        lease_expires_at_ms: i64,
+    },
+    LeasedUntil {
+        expires_at_ms: i64,
+    },
     AlreadyHandledOrMissing,
-    FinalizationLost { flushed_at: std::time::Instant },
+    FinalizationLost {
+        flushed_at: std::time::Instant,
+    },
+    DescriptorRestoreLost {
+        flushed_at: std::time::Instant,
+    },
 }
 
 impl WatchEventClaimDelivery {
     fn flushed_at(self) -> Option<std::time::Instant> {
         match self {
-            Self::Delivered { flushed_at } | Self::FinalizationLost { flushed_at } => {
-                Some(flushed_at)
-            }
-            Self::PipeClosed | Self::LeasedUntil { .. } | Self::AlreadyHandledOrMissing => None,
+            Self::Delivered { flushed_at }
+            | Self::FinalizationLost { flushed_at }
+            | Self::DescriptorRestoreLost { flushed_at } => Some(flushed_at),
+            Self::PipeClosed
+            | Self::OutputAmbiguous { .. }
+            | Self::LeasedUntil { .. }
+            | Self::AlreadyHandledOrMissing => None,
         }
+    }
+
+    const fn stops_stream_without_followup_output(self) -> bool {
+        matches!(
+            self,
+            Self::PipeClosed | Self::OutputAmbiguous { .. } | Self::DescriptorRestoreLost { .. }
+        )
     }
 }
 
@@ -27509,6 +27534,534 @@ fn annotate_watch_event_claim_delivery(
     Ok(())
 }
 
+fn serialize_watch_claim_record(record: &serde_json::Value) -> std::io::Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(record).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to serialize claimed watch event: {error}"),
+        )
+    })?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn watch_claim_cursor_generation(record: &serde_json::Value) -> std::io::Result<String> {
+    record
+        .get("cursor_epoch")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "claimed watch event is missing its cursor generation",
+            )
+        })
+}
+
+fn saturating_increment_watch_counter(counter: &std::sync::atomic::AtomicU64) {
+    let _ = counter.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |value| Some(value.saturating_add(1)),
+    );
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchClaimOutputMetrics {
+    capacity_records: usize,
+    capacity_bytes: usize,
+    queued_records: usize,
+    queued_bytes: usize,
+    admissions: u64,
+    item_saturations: u64,
+    byte_saturations: u64,
+    zero_byte_failures: u64,
+    partial_ambiguities: u64,
+    finalizations: u64,
+    releases: u64,
+    stale_tokens: u64,
+    expiry_recoveries: u64,
+    descriptor_restore_failures: u64,
+    max_blocked_duration_ns: u64,
+    max_cancellation_latency_bound_ns: u64,
+}
+
+struct WatchClaimOutputCoordinator {
+    queued_records: std::sync::atomic::AtomicUsize,
+    queued_bytes: std::sync::atomic::AtomicUsize,
+    admissions: std::sync::atomic::AtomicU64,
+    item_saturations: std::sync::atomic::AtomicU64,
+    byte_saturations: std::sync::atomic::AtomicU64,
+    zero_byte_failures: std::sync::atomic::AtomicU64,
+    partial_ambiguities: std::sync::atomic::AtomicU64,
+    finalizations: std::sync::atomic::AtomicU64,
+    releases: std::sync::atomic::AtomicU64,
+    stale_tokens: std::sync::atomic::AtomicU64,
+    expiry_recoveries: std::sync::atomic::AtomicU64,
+    descriptor_restore_failures: std::sync::atomic::AtomicU64,
+    max_blocked_duration_ns: std::sync::atomic::AtomicU64,
+    max_cancellation_latency_bound_ns: std::sync::atomic::AtomicU64,
+}
+
+impl WatchClaimOutputCoordinator {
+    const fn new() -> Self {
+        Self {
+            queued_records: std::sync::atomic::AtomicUsize::new(0),
+            queued_bytes: std::sync::atomic::AtomicUsize::new(0),
+            admissions: std::sync::atomic::AtomicU64::new(0),
+            item_saturations: std::sync::atomic::AtomicU64::new(0),
+            byte_saturations: std::sync::atomic::AtomicU64::new(0),
+            zero_byte_failures: std::sync::atomic::AtomicU64::new(0),
+            partial_ambiguities: std::sync::atomic::AtomicU64::new(0),
+            finalizations: std::sync::atomic::AtomicU64::new(0),
+            releases: std::sync::atomic::AtomicU64::new(0),
+            stale_tokens: std::sync::atomic::AtomicU64::new(0),
+            expiry_recoveries: std::sync::atomic::AtomicU64::new(0),
+            descriptor_restore_failures: std::sync::atomic::AtomicU64::new(0),
+            max_blocked_duration_ns: std::sync::atomic::AtomicU64::new(0),
+            max_cancellation_latency_bound_ns: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn try_admit(
+        &'static self,
+        event_id: i64,
+        cursor_generation: String,
+        queued_bytes: usize,
+    ) -> std::io::Result<WatchClaimOutputAdmission> {
+        if queued_bytes > WATCH_CLAIM_OUTPUT_MAX_QUEUED_BYTES {
+            saturating_increment_watch_counter(&self.byte_saturations);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "claimed watch event {event_id} requires {queued_bytes} output bytes; bounded capacity is {WATCH_CLAIM_OUTPUT_MAX_QUEUED_BYTES}"
+                ),
+            ));
+        }
+        self.queued_records
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_active| {
+                saturating_increment_watch_counter(&self.item_saturations);
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "claimed watch output coordinator is at its one-record bound",
+                )
+            })?;
+        self.queued_bytes
+            .store(queued_bytes, std::sync::atomic::Ordering::Release);
+        saturating_increment_watch_counter(&self.admissions);
+        Ok(WatchClaimOutputAdmission {
+            service: self,
+            event_id,
+            cursor_generation,
+            lease: None,
+            queued_bytes,
+        })
+    }
+
+    fn record_blocked_duration(&self, blocked_duration_ns: u64) {
+        self.max_blocked_duration_ns
+            .fetch_max(blocked_duration_ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_cancellation_bound(&self, cancellation_latency_bound_ns: u64) {
+        self.max_cancellation_latency_bound_ns.fetch_max(
+            cancellation_latency_bound_ns,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> WatchClaimOutputMetrics {
+        WatchClaimOutputMetrics {
+            capacity_records: WATCH_CLAIM_OUTPUT_MAX_QUEUED_RECORDS,
+            capacity_bytes: WATCH_CLAIM_OUTPUT_MAX_QUEUED_BYTES,
+            queued_records: self
+                .queued_records
+                .load(std::sync::atomic::Ordering::Acquire),
+            queued_bytes: self.queued_bytes.load(std::sync::atomic::Ordering::Acquire),
+            admissions: self.admissions.load(std::sync::atomic::Ordering::Relaxed),
+            item_saturations: self
+                .item_saturations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            byte_saturations: self
+                .byte_saturations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            zero_byte_failures: self
+                .zero_byte_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            partial_ambiguities: self
+                .partial_ambiguities
+                .load(std::sync::atomic::Ordering::Relaxed),
+            finalizations: self
+                .finalizations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            releases: self.releases.load(std::sync::atomic::Ordering::Relaxed),
+            stale_tokens: self.stale_tokens.load(std::sync::atomic::Ordering::Relaxed),
+            expiry_recoveries: self
+                .expiry_recoveries
+                .load(std::sync::atomic::Ordering::Relaxed),
+            descriptor_restore_failures: self
+                .descriptor_restore_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            max_blocked_duration_ns: self
+                .max_blocked_duration_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            max_cancellation_latency_bound_ns: self
+                .max_cancellation_latency_bound_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+struct WatchClaimOutputAdmission {
+    service: &'static WatchClaimOutputCoordinator,
+    event_id: i64,
+    cursor_generation: String,
+    lease: Option<frankenterm_core::storage::EventDeliveryLease>,
+    queued_bytes: usize,
+}
+
+impl WatchClaimOutputAdmission {
+    fn bind_lease(&mut self, lease: &frankenterm_core::storage::EventDeliveryLease) {
+        debug_assert_eq!(self.event_id, lease.event_id());
+        self.lease = Some(lease.clone());
+    }
+
+    fn trace_fields(&self) -> (i64, &str, Option<i64>) {
+        (
+            self.event_id,
+            &self.cursor_generation,
+            self.lease.as_ref().map(|lease| lease.expires_at_ms()),
+        )
+    }
+}
+
+impl Drop for WatchClaimOutputAdmission {
+    fn drop(&mut self) {
+        let previous_bytes = self
+            .service
+            .queued_bytes
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        let previous_records = self
+            .service
+            .queued_records
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        debug_assert_eq!(previous_bytes, self.queued_bytes);
+        debug_assert_eq!(previous_records, 1);
+    }
+}
+
+static WATCH_CLAIM_OUTPUT_COORDINATOR: WatchClaimOutputCoordinator =
+    WatchClaimOutputCoordinator::new();
+
+#[cfg(test)]
+fn watch_claim_output_metrics() -> WatchClaimOutputMetrics {
+    WATCH_CLAIM_OUTPUT_COORDINATOR.snapshot()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchClaimOutputFailureKind {
+    ContextCancelled,
+    WriteZero,
+    Write,
+    Flush,
+    Readiness,
+    DescriptorRestore,
+}
+
+#[derive(Debug)]
+struct WatchClaimOutputFailure {
+    kind: WatchClaimOutputFailureKind,
+    bytes_written: usize,
+    blocked_duration_ns: u64,
+    source: Option<std::io::Error>,
+}
+
+impl WatchClaimOutputFailure {
+    fn into_io_error(self) -> std::io::Error {
+        let kind = match self.kind {
+            WatchClaimOutputFailureKind::ContextCancelled => std::io::ErrorKind::Interrupted,
+            WatchClaimOutputFailureKind::WriteZero => std::io::ErrorKind::WriteZero,
+            WatchClaimOutputFailureKind::Write | WatchClaimOutputFailureKind::Flush => self
+                .source
+                .as_ref()
+                .map_or(std::io::ErrorKind::Other, std::io::Error::kind),
+            WatchClaimOutputFailureKind::Readiness => std::io::ErrorKind::Other,
+            WatchClaimOutputFailureKind::DescriptorRestore => std::io::ErrorKind::Other,
+        };
+        let message = match self.kind {
+            WatchClaimOutputFailureKind::ContextCancelled => {
+                "claimed watch output cancelled before flush"
+            }
+            WatchClaimOutputFailureKind::WriteZero => {
+                "claimed watch output made zero write progress"
+            }
+            WatchClaimOutputFailureKind::Write => "claimed watch output write failed",
+            WatchClaimOutputFailureKind::Flush => "claimed watch output flush failed",
+            WatchClaimOutputFailureKind::Readiness => {
+                "claimed watch output readiness registration failed"
+            }
+            WatchClaimOutputFailureKind::DescriptorRestore => {
+                "claimed watch output descriptor restoration failed"
+            }
+        };
+        std::io::Error::new(
+            kind,
+            format!("{message} after {} acknowledged bytes", self.bytes_written),
+        )
+    }
+
+    fn is_broken_pipe(&self) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| source.kind() == std::io::ErrorKind::BrokenPipe)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WatchClaimOutputSuccess {
+    flushed_at: std::time::Instant,
+    bytes_written: usize,
+    blocked_duration_ns: u64,
+}
+
+#[derive(Debug)]
+enum WatchClaimOutputAttempt {
+    Flushed(WatchClaimOutputSuccess),
+    FlushedRestoreLost {
+        success: WatchClaimOutputSuccess,
+        source: std::io::Error,
+    },
+    Failed(WatchClaimOutputFailure),
+}
+
+fn write_watch_claim_line_synchronously<W: std::io::Write>(
+    writer: &mut W,
+    line: &[u8],
+) -> WatchClaimOutputAttempt {
+    let mut bytes_written = 0_usize;
+    let mut interrupted_writes = 0_u8;
+    while bytes_written < line.len() {
+        match writer.write(&line[bytes_written..]) {
+            Ok(0) => {
+                return WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                    kind: WatchClaimOutputFailureKind::WriteZero,
+                    bytes_written,
+                    blocked_duration_ns: 0,
+                    source: None,
+                });
+            }
+            Ok(written) if written <= line.len() - bytes_written => {
+                bytes_written += written;
+                interrupted_writes = 0;
+            }
+            Ok(_written) => {
+                return WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                    kind: WatchClaimOutputFailureKind::Write,
+                    bytes_written,
+                    blocked_duration_ns: 0,
+                    source: Some(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "writer reported progress beyond the supplied buffer",
+                    )),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {
+                interrupted_writes = interrupted_writes.saturating_add(1);
+                if interrupted_writes == 64 {
+                    return WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Write,
+                        bytes_written,
+                        blocked_duration_ns: 0,
+                        source: Some(source),
+                    });
+                }
+            }
+            Err(source) => {
+                return WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                    kind: WatchClaimOutputFailureKind::Write,
+                    bytes_written,
+                    blocked_duration_ns: 0,
+                    source: Some(source),
+                });
+            }
+        }
+    }
+    let mut interrupted_flushes = 0_u8;
+    loop {
+        match writer.flush() {
+            Ok(()) => {
+                return WatchClaimOutputAttempt::Flushed(WatchClaimOutputSuccess {
+                    flushed_at: std::time::Instant::now(),
+                    bytes_written,
+                    blocked_duration_ns: 0,
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {
+                interrupted_flushes = interrupted_flushes.saturating_add(1);
+                if interrupted_flushes == 64 {
+                    return WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Flush,
+                        bytes_written,
+                        blocked_duration_ns: 0,
+                        source: Some(source),
+                    });
+                }
+            }
+            Err(source) => {
+                return WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                    kind: WatchClaimOutputFailureKind::Flush,
+                    bytes_written,
+                    blocked_duration_ns: 0,
+                    source: Some(source),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct WatchClaimNonblockingDescriptor {
+    descriptor: filedescriptor::FileDescriptor,
+    original_flags: nix::fcntl::OFlag,
+    restored: bool,
+}
+
+#[cfg(unix)]
+impl WatchClaimNonblockingDescriptor {
+    fn duplicate_stdout(stdout: &std::io::Stdout) -> std::io::Result<Self> {
+        let lock = stdout.lock();
+        let descriptor = filedescriptor::FileDescriptor::dup(&lock)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        drop(lock);
+        Self::enable(descriptor)
+    }
+
+    fn enable(descriptor: filedescriptor::FileDescriptor) -> std::io::Result<Self> {
+        let raw_flags = nix::fcntl::fcntl(&descriptor, nix::fcntl::FcntlArg::F_GETFL)
+            .map_err(std::io::Error::other)?;
+        let original_flags = nix::fcntl::OFlag::from_bits_retain(raw_flags);
+        nix::fcntl::fcntl(
+            &descriptor,
+            nix::fcntl::FcntlArg::F_SETFL(original_flags | nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(Self {
+            descriptor,
+            original_flags,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        nix::fcntl::fcntl(
+            &self.descriptor,
+            nix::fcntl::FcntlArg::F_SETFL(self.original_flags),
+        )
+        .map_err(std::io::Error::other)?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WatchClaimNonblockingDescriptor {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            saturating_increment_watch_counter(
+                &WATCH_CLAIM_OUTPUT_COORDINATOR.descriptor_restore_failures,
+            );
+            tracing::error!(
+                error_kind = ?error.kind(),
+                "watch-events failed to restore exact stdout descriptor flags during cleanup"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+struct WatchClaimStdoutWriter {
+    descriptor: WatchClaimNonblockingDescriptor,
+}
+
+#[cfg(unix)]
+impl WatchClaimStdoutWriter {
+    fn new(stdout: &std::io::Stdout) -> std::io::Result<Self> {
+        Ok(Self {
+            descriptor: WatchClaimNonblockingDescriptor::duplicate_stdout(stdout)?,
+        })
+    }
+
+    async fn write_and_flush(
+        mut self,
+        cx: &frankenterm_core::cx::Cx,
+        line: Vec<u8>,
+    ) -> WatchClaimOutputAttempt {
+        use frankenterm_core::runtime_async::NonblockingWriteErrorKind;
+
+        let write = frankenterm_core::runtime_async::write_all_nonblocking_with_cx(
+            cx,
+            &mut self.descriptor.descriptor,
+            &line,
+        )
+        .await;
+        let restore = self.descriptor.restore();
+        match (write, restore) {
+            (Ok(receipt), Ok(())) => WatchClaimOutputAttempt::Flushed(WatchClaimOutputSuccess {
+                flushed_at: std::time::Instant::now(),
+                bytes_written: receipt.bytes_written(),
+                blocked_duration_ns: receipt.blocked_duration_ns(),
+            }),
+            (Ok(receipt), Err(source)) => WatchClaimOutputAttempt::FlushedRestoreLost {
+                success: WatchClaimOutputSuccess {
+                    flushed_at: std::time::Instant::now(),
+                    bytes_written: receipt.bytes_written(),
+                    blocked_duration_ns: receipt.blocked_duration_ns(),
+                },
+                source,
+            },
+            (Err(error), restore) => {
+                let kind = if restore.is_err() {
+                    WatchClaimOutputFailureKind::DescriptorRestore
+                } else {
+                    match error.kind() {
+                        NonblockingWriteErrorKind::ContextCancelled => {
+                            WatchClaimOutputFailureKind::ContextCancelled
+                        }
+                        NonblockingWriteErrorKind::WriteZero => {
+                            WatchClaimOutputFailureKind::WriteZero
+                        }
+                        NonblockingWriteErrorKind::Write => WatchClaimOutputFailureKind::Write,
+                        NonblockingWriteErrorKind::Flush => WatchClaimOutputFailureKind::Flush,
+                        NonblockingWriteErrorKind::Readiness => {
+                            WatchClaimOutputFailureKind::Readiness
+                        }
+                    }
+                };
+                let bytes_written = error.bytes_written();
+                let blocked_duration_ns = error.blocked_duration_ns();
+                let source = restore.err().or_else(|| error.into_source());
+                WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                    kind,
+                    bytes_written,
+                    blocked_duration_ns,
+                    source,
+                })
+            }
+        }
+    }
+}
+
 /// Reserve one event, write and flush its truthful pre-finalization record,
 /// then atomically mark it handled. A process crash leaves an expiring lease;
 /// a known output failure attempts to release it immediately and falls back to
@@ -27520,9 +28073,12 @@ fn annotate_watch_event_claim_delivery(
 /// [`WatchEventClaimDelivery::AlreadyHandledOrMissing`] result requires an
 /// exact row/retention reconciliation before the caller may advance.
 ///
-/// The supplied writer is synchronous. This function can bound settlement
-/// after it returns, but cannot preempt a blocking OS write from this layer.
-async fn deliver_claimed_watch_event<F>(
+/// Admission and complete NDJSON serialization happen before durable ownership.
+/// The supplied output future must report exact accepted-byte progress. A
+/// zero-byte failure is safe to compensate immediately; any non-zero failure
+/// is ambiguous and deliberately leaves the lease to expiry recovery while the
+/// caller closes the stream without emitting a later record.
+async fn deliver_claimed_watch_event<F, Fut>(
     cx: &frankenterm_core::cx::Cx,
     storage: &frankenterm_core::storage::StorageHandle,
     event_id: i64,
@@ -27530,13 +28086,18 @@ async fn deliver_claimed_watch_event<F>(
     write_and_flush: F,
 ) -> std::io::Result<WatchEventClaimDelivery>
 where
-    F: FnOnce(&serde_json::Value) -> std::io::Result<bool>,
+    F: FnOnce(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = WatchClaimOutputAttempt>,
 {
     use frankenterm_core::storage::EventDeliveryReservation;
 
     // Validate and annotate the record before acquiring durable ownership so a
     // local serialization-shape bug cannot strand a known lease until expiry.
     annotate_watch_event_claim_delivery(&mut record, event_id)?;
+    let cursor_generation = watch_claim_cursor_generation(&record)?;
+    let line = serialize_watch_claim_record(&record)?;
+    let mut admission =
+        WATCH_CLAIM_OUTPUT_COORDINATOR.try_admit(event_id, cursor_generation, line.len())?;
     let reservation = storage
         .reserve_event_delivery_with_cx(cx, event_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
         .await
@@ -27560,65 +28121,180 @@ where
             return Ok(WatchEventClaimDelivery::AlreadyHandledOrMissing);
         }
     };
+    admission.bind_lease(&lease);
 
     // Reservation may have completed in the same poll that cancelled the
     // caller. Do not start a synchronous output write after cancellation; use
     // an independent bounded compensation Cx to release the acquired lease.
     if let Err(cancel_error) = watch_checkpoint(cx, "claimed output pre-write") {
         return match release_watch_claim_bounded(storage, &lease).await {
-            Ok(_) => Err(cancel_error),
-            Err(release_error) => Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                format!(
-                    "{cancel_error}; event {event_id} lease release after cancellation failed: {release_error}"
-                ),
-            )),
+            Ok(true) => {
+                saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.releases);
+                Err(cancel_error)
+            }
+            Ok(false) => {
+                saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.stale_tokens);
+                Err(cancel_error)
+            }
+            Err(release_error) => {
+                saturating_increment_watch_counter(
+                    &WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries,
+                );
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!(
+                        "{cancel_error}; event {event_id} lease release after cancellation failed: {release_error}"
+                    ),
+                ))
+            }
         };
     }
 
-    let flushed_at = match write_and_flush(&record) {
-        Ok(true) => std::time::Instant::now(),
-        Ok(false) => {
-            match release_watch_claim_bounded(storage, &lease).await {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!(
-                    event_id,
-                    "watch-events output pipe closed after delivery-lease ownership was lost"
-                ),
-                Err(release_error) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        format!(
-                            "watch-events output pipe closed and event {event_id} lease release failed: {release_error}"
-                        ),
-                    ));
-                }
-            }
-            return Ok(WatchEventClaimDelivery::PipeClosed);
+    let attempt = match write_and_flush(line).await {
+        WatchClaimOutputAttempt::Flushed(success)
+            if success.bytes_written != admission.queued_bytes =>
+        {
+            WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                kind: WatchClaimOutputFailureKind::Write,
+                bytes_written: success.bytes_written,
+                blocked_duration_ns: success.blocked_duration_ns,
+                source: Some(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "writer reported a flushed byte count different from the admitted line",
+                )),
+            })
         }
-        Err(write_error) => {
-            let error_kind = write_error.kind();
-            let error_message = write_error.to_string();
-            match release_watch_claim_bounded(storage, &lease).await {
-                Ok(true) => return Err(write_error),
+        WatchClaimOutputAttempt::FlushedRestoreLost { success, source }
+            if success.bytes_written != admission.queued_bytes =>
+        {
+            saturating_increment_watch_counter(
+                &WATCH_CLAIM_OUTPUT_COORDINATOR.descriptor_restore_failures,
+            );
+            tracing::error!(
+                event_id,
+                error_kind = ?source.kind(),
+                "watch-events descriptor restoration failed alongside an invalid flush receipt"
+            );
+            WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                kind: WatchClaimOutputFailureKind::Write,
+                bytes_written: success.bytes_written,
+                blocked_duration_ns: success.blocked_duration_ns,
+                source: Some(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "writer reported a flushed byte count different from the admitted line",
+                )),
+            })
+        }
+        attempt => attempt,
+    };
+    let (queued_event_id, queued_cursor_generation, queued_lease_expiry) = admission.trace_fields();
+    let success = match attempt {
+        WatchClaimOutputAttempt::Flushed(success) => success,
+        WatchClaimOutputAttempt::FlushedRestoreLost { success, source } => {
+            WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(success.blocked_duration_ns);
+            saturating_increment_watch_counter(
+                &WATCH_CLAIM_OUTPUT_COORDINATOR.descriptor_restore_failures,
+            );
+            let finalized = finalize_watch_claim_bounded(storage, &lease)
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "event {event_id} was flushed, stdout descriptor restoration failed, and delivery finalization failed: {error}"
+                    ))
+                })?;
+            if finalized {
+                saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.finalizations);
+            } else {
+                saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.stale_tokens);
+            }
+            tracing::error!(
+                event_id = queued_event_id,
+                cursor_generation = queued_cursor_generation,
+                lease_expires_at_ms = queued_lease_expiry,
+                bytes_written = success.bytes_written,
+                blocked_duration_ns = success.blocked_duration_ns,
+                error_kind = ?source.kind(),
+                finalized,
+                "watch-events restored durable truth after stdout descriptor restoration failed"
+            );
+            return Ok(if finalized {
+                WatchEventClaimDelivery::DescriptorRestoreLost {
+                    flushed_at: success.flushed_at,
+                }
+            } else {
+                WatchEventClaimDelivery::FinalizationLost {
+                    flushed_at: success.flushed_at,
+                }
+            });
+        }
+        WatchClaimOutputAttempt::Failed(failure) if failure.bytes_written == 0 => {
+            WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(failure.blocked_duration_ns);
+            saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.zero_byte_failures);
+            if matches!(failure.kind, WatchClaimOutputFailureKind::ContextCancelled) {
+                WATCH_CLAIM_OUTPUT_COORDINATOR
+                    .record_cancellation_bound(failure.blocked_duration_ns);
+            }
+            let pipe_closed = failure.is_broken_pipe();
+            let write_error = failure.into_io_error();
+            return match release_watch_claim_bounded(storage, &lease).await {
+                Ok(true) => {
+                    saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.releases);
+                    if pipe_closed {
+                        Ok(WatchEventClaimDelivery::PipeClosed)
+                    } else {
+                        Err(write_error)
+                    }
+                }
                 Ok(false) => {
-                    tracing::warn!(
-                        event_id,
-                        "watch-events output failed after delivery-lease ownership was lost"
+                    saturating_increment_watch_counter(
+                        &WATCH_CLAIM_OUTPUT_COORDINATOR.stale_tokens,
                     );
-                    return Err(write_error);
+                    tracing::warn!(
+                        event_id = queued_event_id,
+                        cursor_generation = queued_cursor_generation,
+                        lease_expires_at_ms = queued_lease_expiry,
+                        "watch-events zero-byte output failure lost delivery-lease ownership before release"
+                    );
+                    Err(write_error)
                 }
                 Err(release_error) => {
-                    return Err(std::io::Error::new(
-                        error_kind,
+                    saturating_increment_watch_counter(
+                        &WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries,
+                    );
+                    Err(std::io::Error::new(
+                        write_error.kind(),
                         format!(
-                            "{error_message}; event {event_id} lease release also failed: {release_error}"
+                            "{write_error}; event {event_id} zero-byte failure lease release also failed: {release_error}"
                         ),
-                    ));
+                    ))
                 }
+            };
+        }
+        WatchClaimOutputAttempt::Failed(failure) => {
+            WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(failure.blocked_duration_ns);
+            if matches!(failure.kind, WatchClaimOutputFailureKind::ContextCancelled) {
+                WATCH_CLAIM_OUTPUT_COORDINATOR
+                    .record_cancellation_bound(failure.blocked_duration_ns);
             }
+            saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.partial_ambiguities);
+            saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries);
+            tracing::warn!(
+                event_id = queued_event_id,
+                cursor_generation = queued_cursor_generation,
+                lease_expires_at_ms = queued_lease_expiry,
+                bytes_written = failure.bytes_written,
+                blocked_duration_ns = failure.blocked_duration_ns,
+                failure_kind = ?failure.kind,
+                "watch-events partial output is ambiguous; stream must stop and lease remains for expiry recovery"
+            );
+            return Ok(WatchEventClaimDelivery::OutputAmbiguous {
+                bytes_written: failure.bytes_written,
+                lease_expires_at_ms: lease.expires_at_ms(),
+            });
         }
     };
+
+    WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(success.blocked_duration_ns);
 
     let finalized = finalize_watch_claim_bounded(storage, &lease)
         .await
@@ -27628,9 +28304,15 @@ where
             ))
         })?;
     Ok(if finalized {
-        WatchEventClaimDelivery::Delivered { flushed_at }
+        saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.finalizations);
+        WatchEventClaimDelivery::Delivered {
+            flushed_at: success.flushed_at,
+        }
     } else {
-        WatchEventClaimDelivery::FinalizationLost { flushed_at }
+        saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.stale_tokens);
+        WatchEventClaimDelivery::FinalizationLost {
+            flushed_at: success.flushed_at,
+        }
     })
 }
 
@@ -29278,6 +29960,12 @@ mod watch_events_tests {
         })
     }
 
+    fn claimed_ipc_persisted_event(id: i64) -> serde_json::Value {
+        let mut record = ipc_persisted_event(id);
+        record["cursor_epoch"] = serde_json::Value::String(TEST_CURSOR_EPOCH.to_string());
+        record
+    }
+
     #[cfg(unix)]
     fn ipc_live_event(event_type: &str) -> serde_json::Value {
         let extracted = if event_type == "pane_discovered" {
@@ -29339,6 +30027,8 @@ mod watch_events_tests {
         drop(connection);
         (directory, path.to_string_lossy().into_owned(), event_ids)
     }
+
+    static WATCH_CLAIM_OUTPUT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn run_watch_claim_async(future: impl std::future::Future<Output = ()>) {
         let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
@@ -30117,7 +30807,10 @@ mod watch_events_tests {
 
     #[test]
     fn claimed_delivery_is_flush_before_handle_and_releases_known_failures() {
-        let (_directory, database_path, event_ids) = watch_claim_fixture(9);
+        let _output_guard = WATCH_CLAIM_OUTPUT_TEST_LOCK
+            .lock()
+            .expect("serialize global claimed-output coordinator tests");
+        let (_directory, database_path, event_ids) = watch_claim_fixture(12);
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
             let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
@@ -30126,13 +30819,16 @@ mod watch_events_tests {
 
             let success_id = event_ids[0];
             let mut success_output = Vec::new();
-            let mut success_record = ipc_persisted_event(success_id);
+            let mut success_record = claimed_ipc_persisted_event(success_id);
             success_record["cursor"] = serde_json::Value::from(0);
             success_record["cursor_epoch"] =
                 serde_json::Value::String(TEST_CURSOR_EPOCH.to_string());
             let success =
-                deliver_claimed_watch_event(&cx, &storage, success_id, success_record, |record| {
-                    write_ndjson_line(&mut success_output, record)
+                deliver_claimed_watch_event(&cx, &storage, success_id, success_record, |line| {
+                    std::future::ready(write_watch_claim_line_synchronously(
+                        &mut success_output,
+                        &line,
+                    ))
                 })
                 .await
                 .expect("deliver claimed event");
@@ -30166,8 +30862,15 @@ mod watch_events_tests {
                 &cx,
                 &storage,
                 write_failure_id,
-                ipc_persisted_event(write_failure_id),
-                |_record| Err(std::io::Error::other("injected watch write failure")),
+                claimed_ipc_persisted_event(write_failure_id),
+                |_line| {
+                    std::future::ready(WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Write,
+                        bytes_written: 0,
+                        blocked_duration_ns: 0,
+                        source: Some(std::io::Error::other("injected watch write failure")),
+                    }))
+                },
             )
             .await
             .expect_err("write failure must propagate");
@@ -30192,13 +30895,17 @@ mod watch_events_tests {
                 &cx,
                 &storage,
                 broken_pipe_id,
-                ipc_persisted_event(broken_pipe_id),
-                |record| {
-                    let mut writer = FlushErrorWriter {
-                        bytes: Vec::new(),
-                        error_kind: std::io::ErrorKind::BrokenPipe,
-                    };
-                    write_ndjson_line(&mut writer, record)
+                claimed_ipc_persisted_event(broken_pipe_id),
+                |_line| {
+                    std::future::ready(WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Write,
+                        bytes_written: 0,
+                        blocked_duration_ns: 0,
+                        source: Some(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "consumer closed before the first byte",
+                        )),
+                    }))
                 },
             )
             .await
@@ -30234,10 +30941,14 @@ mod watch_events_tests {
                 &cx,
                 &storage,
                 contended_id,
-                ipc_persisted_event(contended_id),
+                claimed_ipc_persisted_event(contended_id),
                 move |_record| {
                     writer_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok(true)
+                    std::future::ready(WatchClaimOutputAttempt::Flushed(WatchClaimOutputSuccess {
+                        flushed_at: std::time::Instant::now(),
+                        bytes_written: 0,
+                        blocked_duration_ns: 0,
+                    }))
                 },
             )
             .await
@@ -30268,11 +30979,15 @@ mod watch_events_tests {
                 &cx,
                 &storage,
                 already_handled_id,
-                ipc_persisted_event(already_handled_id),
+                claimed_ipc_persisted_event(already_handled_id),
                 move |_record| {
                     already_writer_called_in_closure
                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok(true)
+                    std::future::ready(WatchClaimOutputAttempt::Flushed(WatchClaimOutputSuccess {
+                        flushed_at: std::time::Instant::now(),
+                        bytes_written: 0,
+                        blocked_duration_ns: 0,
+                    }))
                 },
             )
             .await
@@ -30288,11 +31003,12 @@ mod watch_events_tests {
                 &cx,
                 &storage,
                 finalization_lost_id,
-                ipc_persisted_event(finalization_lost_id),
-                |record| {
-                    assert!(write_ndjson_line(&mut lost_output, record)?);
+                claimed_ipc_persisted_event(finalization_lost_id),
+                |line| {
+                    let attempt = write_watch_claim_line_synchronously(&mut lost_output, &line);
+                    assert!(matches!(attempt, WatchClaimOutputAttempt::Flushed(_)));
                     let connection = rusqlite::Connection::open(&stolen_database_path)
-                        .map_err(std::io::Error::other)?;
+                        .expect("open competing finalizer connection");
                     connection
                         .execute(
                             "UPDATE events
@@ -30306,8 +31022,8 @@ mod watch_events_tests {
                                 finalization_lost_id,
                             ],
                         )
-                        .map_err(std::io::Error::other)?;
-                    Ok(true)
+                        .expect("steal finalization lease token");
+                    std::future::ready(attempt)
                 },
             )
             .await
@@ -30346,13 +31062,14 @@ mod watch_events_tests {
                 &cancelled_success_cx,
                 &storage,
                 cancelled_success_id,
-                ipc_persisted_event(cancelled_success_id),
-                move |_record| {
+                claimed_ipc_persisted_event(cancelled_success_id),
+                move |line| {
                     cancel_in_success.cancel_with(
                         frankenterm_core::outcome::CancelKind::User,
                         Some("writer cancelled before successful completion"),
                     );
-                    Ok(true)
+                    let mut output = Vec::new();
+                    std::future::ready(write_watch_claim_line_synchronously(&mut output, &line))
                 },
             )
             .await
@@ -30379,13 +31096,21 @@ mod watch_events_tests {
                 &cancelled_pipe_cx,
                 &storage,
                 cancelled_pipe_id,
-                ipc_persisted_event(cancelled_pipe_id),
+                claimed_ipc_persisted_event(cancelled_pipe_id),
                 move |_record| {
                     cancel_in_pipe.cancel_with(
                         frankenterm_core::outcome::CancelKind::User,
                         Some("writer cancelled before closed-pipe result"),
                     );
-                    Ok(false)
+                    std::future::ready(WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Write,
+                        bytes_written: 0,
+                        blocked_duration_ns: 0,
+                        source: Some(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "consumer closed before the first byte",
+                        )),
+                    }))
                 },
             )
             .await
@@ -30421,15 +31146,20 @@ mod watch_events_tests {
                 &cancelled_error_cx,
                 &storage,
                 cancelled_error_id,
-                ipc_persisted_event(cancelled_error_id),
+                claimed_ipc_persisted_event(cancelled_error_id),
                 move |_record| {
                     cancel_in_error.cancel_with(
                         frankenterm_core::outcome::CancelKind::User,
                         Some("writer cancelled before error result"),
                     );
-                    Err(std::io::Error::other(
-                        "injected error after writer cancellation",
-                    ))
+                    std::future::ready(WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Write,
+                        bytes_written: 0,
+                        blocked_duration_ns: 0,
+                        source: Some(std::io::Error::other(
+                            "injected error after writer cancellation",
+                        )),
+                    }))
                 },
             )
             .await
@@ -30456,11 +31186,212 @@ mod watch_events_tests {
                     .expect("release cancellation error verification lease")
             );
 
+            let partial_id = event_ids[9];
+            let partial_before = watch_claim_output_metrics();
+            let partial = deliver_claimed_watch_event(
+                &cx,
+                &storage,
+                partial_id,
+                claimed_ipc_persisted_event(partial_id),
+                |_line| {
+                    std::future::ready(WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Write,
+                        bytes_written: 7,
+                        blocked_duration_ns: 123,
+                        source: Some(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "consumer closed after a prefix",
+                        )),
+                    }))
+                },
+            )
+            .await
+            .expect("partial delivery is a typed ambiguity, not a release");
+            let partial_expiry = match partial {
+                WatchEventClaimDelivery::OutputAmbiguous {
+                    bytes_written,
+                    lease_expires_at_ms,
+                } => {
+                    assert_eq!(bytes_written, 7);
+                    lease_expires_at_ms
+                }
+                other => panic!("expected partial ambiguity, got {other:?}"),
+            };
+            let still_leased = storage
+                .reserve_event_delivery(partial_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+                .await
+                .expect("inspect partial-delivery lease");
+            assert_eq!(
+                still_leased,
+                frankenterm_core::storage::EventDeliveryReservation::LeasedUntil {
+                    expires_at_ms: partial_expiry,
+                },
+                "a partial prefix must never be released for immediate duplicate delivery"
+            );
+            let partial_after = watch_claim_output_metrics();
+            assert_eq!(
+                partial_after.partial_ambiguities,
+                partial_before.partial_ambiguities.saturating_add(1)
+            );
+            assert_eq!(
+                partial_after.expiry_recoveries,
+                partial_before.expiry_recoveries.saturating_add(1)
+            );
+            assert!(partial_after.max_blocked_duration_ns >= 123);
+
+            let flush_failure_id = event_ids[10];
+            let mut flush_failure_output = FlushErrorWriter {
+                bytes: Vec::new(),
+                error_kind: std::io::ErrorKind::BrokenPipe,
+            };
+            let flush_failure = deliver_claimed_watch_event(
+                &cx,
+                &storage,
+                flush_failure_id,
+                claimed_ipc_persisted_event(flush_failure_id),
+                |line| {
+                    std::future::ready(write_watch_claim_line_synchronously(
+                        &mut flush_failure_output,
+                        &line,
+                    ))
+                },
+            )
+            .await
+            .expect("flush failure after full write remains ambiguous");
+            assert!(matches!(
+                flush_failure,
+                WatchEventClaimDelivery::OutputAmbiguous { bytes_written, .. }
+                    if bytes_written == flush_failure_output.bytes.len()
+                        && bytes_written > 0
+            ));
+            assert!(
+                matches!(
+                    storage
+                        .reserve_event_delivery(flush_failure_id, WATCH_EVENTS_CLAIM_LEASE_TTL,)
+                        .await
+                        .expect("inspect flush-ambiguous lease"),
+                    frankenterm_core::storage::EventDeliveryReservation::LeasedUntil { .. }
+                ),
+                "a complete write without flush acknowledgement must retain its lease"
+            );
+
+            let saturated_id = event_ids[11];
+            let saturation_before = watch_claim_output_metrics();
+            let occupying_admission = WATCH_CLAIM_OUTPUT_COORDINATOR
+                .try_admit(-1, "test-generation".to_string(), 1)
+                .expect("occupy the single output slot");
+            let saturated_writer_called =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let saturated_writer_called_in_closure =
+                std::sync::Arc::clone(&saturated_writer_called);
+            let saturation_error = deliver_claimed_watch_event(
+                &cx,
+                &storage,
+                saturated_id,
+                claimed_ipc_persisted_event(saturated_id),
+                move |_line| {
+                    saturated_writer_called_in_closure
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(WatchClaimOutputAttempt::Flushed(WatchClaimOutputSuccess {
+                        flushed_at: std::time::Instant::now(),
+                        bytes_written: 0,
+                        blocked_duration_ns: 0,
+                    }))
+                },
+            )
+            .await
+            .expect_err("a full coordinator must reject before durable ownership");
+            assert_eq!(saturation_error.kind(), std::io::ErrorKind::WouldBlock);
+            assert!(!saturated_writer_called.load(std::sync::atomic::Ordering::SeqCst));
+            drop(occupying_admission);
+            let byte_saturation = WATCH_CLAIM_OUTPUT_COORDINATOR
+                .try_admit(
+                    -2,
+                    "test-generation".to_string(),
+                    WATCH_CLAIM_OUTPUT_MAX_QUEUED_BYTES.saturating_add(1),
+                )
+                .err()
+                .expect("oversized record must fail before occupying the slot");
+            assert_eq!(byte_saturation.kind(), std::io::ErrorKind::InvalidData);
+            let saturation_after = watch_claim_output_metrics();
+            assert_eq!(
+                saturation_after.item_saturations,
+                saturation_before.item_saturations.saturating_add(1)
+            );
+            assert_eq!(
+                saturation_after.byte_saturations,
+                saturation_before.byte_saturations.saturating_add(1)
+            );
+            assert_eq!(saturation_after.capacity_records, 1);
+            assert_eq!(
+                saturation_after.capacity_bytes,
+                WATCH_CLAIM_OUTPUT_MAX_QUEUED_BYTES
+            );
+            assert_eq!(saturation_after.queued_records, 0);
+            assert_eq!(saturation_after.queued_bytes, 0);
+            let never_leased = storage
+                .reserve_event_delivery(saturated_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+                .await
+                .expect("saturation must leave the event immediately reservable");
+            let never_leased = match never_leased {
+                frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("saturated output unexpectedly changed durable state: {other:?}"),
+            };
+            assert!(
+                storage
+                    .release_event_delivery(&never_leased)
+                    .await
+                    .expect("release saturation verification lease")
+            );
+
             storage
                 .shutdown()
                 .await
                 .expect("shutdown watch claim storage");
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claimed_output_restores_exact_descriptor_flags_on_success_and_drop() {
+        let _output_guard = WATCH_CLAIM_OUTPUT_TEST_LOCK
+            .lock()
+            .expect("serialize global claimed-output coordinator tests");
+
+        for explicitly_restore in [true, false] {
+            let (descriptor, _peer) =
+                filedescriptor::socketpair().expect("create descriptor-restoration socket pair");
+            let observer = filedescriptor::FileDescriptor::dup(&descriptor)
+                .expect("duplicate descriptor restoration observer");
+            let original_raw = nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
+                .expect("read original descriptor flags");
+            let original = nix::fcntl::OFlag::from_bits_retain(original_raw);
+            let mut nonblocking = WatchClaimNonblockingDescriptor::enable(descriptor)
+                .expect("enable bounded nonblocking output");
+            let enabled_raw =
+                nix::fcntl::fcntl(&nonblocking.descriptor, nix::fcntl::FcntlArg::F_GETFL)
+                    .expect("read enabled descriptor flags");
+            let enabled = nix::fcntl::OFlag::from_bits_retain(enabled_raw);
+            assert!(enabled.contains(nix::fcntl::OFlag::O_NONBLOCK));
+            assert_eq!(
+                enabled & !nix::fcntl::OFlag::O_NONBLOCK,
+                original & !nix::fcntl::OFlag::O_NONBLOCK,
+                "enabling output may change only O_NONBLOCK"
+            );
+            if explicitly_restore {
+                nonblocking
+                    .restore()
+                    .expect("restore exact flags explicitly");
+            }
+            drop(nonblocking);
+            let restored_raw = nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
+                .expect("read restored descriptor flags");
+            assert_eq!(
+                nix::fcntl::OFlag::from_bits_retain(restored_raw),
+                original,
+                "both explicit completion and Drop must restore the exact original flags"
+            );
+        }
     }
 
     #[test]
@@ -30492,6 +31423,30 @@ mod watch_events_tests {
             ),
             std::time::Duration::ZERO,
             "post-finalization pacing must not hide an already-due heartbeat"
+        );
+    }
+
+    #[test]
+    fn partial_or_unrestorable_claim_output_forbids_every_followup_row() {
+        let ambiguous = WatchEventClaimDelivery::OutputAmbiguous {
+            bytes_written: 17,
+            lease_expires_at_ms: 30_000,
+        };
+        assert!(ambiguous.stops_stream_without_followup_output());
+        assert_eq!(ambiguous.flushed_at(), None);
+
+        let restore_lost = WatchEventClaimDelivery::DescriptorRestoreLost {
+            flushed_at: std::time::Instant::now(),
+        };
+        assert!(restore_lost.stops_stream_without_followup_output());
+        assert!(restore_lost.flushed_at().is_some());
+
+        assert!(WatchEventClaimDelivery::PipeClosed.stops_stream_without_followup_output());
+        assert!(
+            !WatchEventClaimDelivery::Delivered {
+                flushed_at: std::time::Instant::now(),
+            }
+            .stops_stream_without_followup_output()
         );
     }
 
@@ -45892,18 +46847,36 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                     );
 
                                     if claim {
-                                        let delivery = match deliver_claimed_watch_event(
+                                        #[cfg(unix)]
+                                        let delivery_result = {
+                                            let writer = WatchClaimStdoutWriter::new(&stdout)?;
+                                            let output_cx = cx.clone();
+                                            deliver_claimed_watch_event(
+                                                &cx,
+                                                &storage,
+                                                redacted.id,
+                                                record,
+                                                move |line| async move {
+                                                    writer.write_and_flush(&output_cx, line).await
+                                                },
+                                            )
+                                            .await
+                                        };
+                                        #[cfg(not(unix))]
+                                        let delivery_result = deliver_claimed_watch_event(
                                             &cx,
                                             &storage,
                                             redacted.id,
                                             record,
-                                            |record| {
+                                            |line| async {
                                                 let mut lock = stdout.lock();
-                                                write_ndjson_line(&mut lock, record)
+                                                write_watch_claim_line_synchronously(
+                                                    &mut lock, &line,
+                                                )
                                             },
                                         )
-                                        .await
-                                        {
+                                        .await;
+                                        let delivery = match delivery_result {
                                             Ok(delivery) => delivery,
                                             Err(error)
                                                 if error.kind()
@@ -45959,7 +46932,20 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                                 }
                                                 current_cursor = Some(redacted.id);
                                             }
-                                            WatchEventClaimDelivery::PipeClosed => break 'follow,
+                                            delivery
+                                                @ (WatchEventClaimDelivery::PipeClosed
+                                                | WatchEventClaimDelivery::OutputAmbiguous {
+                                                    ..
+                                                }
+                                                | WatchEventClaimDelivery::DescriptorRestoreLost {
+                                                    ..
+                                                }) => {
+                                                    debug_assert!(
+                                                        delivery
+                                                            .stops_stream_without_followup_output()
+                                                    );
+                                                    break 'follow;
+                                                }
                                             WatchEventClaimDelivery::AlreadyHandledOrMissing => {
                                                 let resolution =
                                                     match resolve_watch_claim_skip_with_cx(
