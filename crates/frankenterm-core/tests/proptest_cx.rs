@@ -428,7 +428,6 @@ proptest! {
     fn spawn_bounded_preserves_count(n in 0..=8usize, concurrency in 1..=4usize) {
         let rt = make_runtime();
         let cx = for_testing();
-        let handle = rt.handle();
         let tasks: Vec<CxTask<u32>> =
             (0..n as u32)
                 .map(|i| {
@@ -448,7 +447,6 @@ proptest! {
     fn spawn_bounded_preserves_order(n in 1..=6usize) {
         let rt = make_runtime();
         let cx = for_testing();
-        let handle = rt.handle();
         let expected: Vec<u32> = (0..n as u32).collect();
         let tasks: Vec<CxTask<u32>> =
             (0..n as u32)
@@ -469,7 +467,6 @@ proptest! {
     fn spawn_bounded_empty_returns_empty(concurrency in 1..=4usize) {
         let rt = make_runtime();
         let cx = for_testing();
-        let handle = rt.handle();
         let tasks: Vec<CxTask<()>> = Vec::new();
         let results =
             rt.block_on(async { spawn_bounded_with_cx(&cx, concurrency, tasks).await });

@@ -97,7 +97,6 @@ fn spawn_bounded_helper_limits_concurrency_and_preserves_order() {
         .expect("build runtime");
 
     let root_cx = for_testing();
-    let handle = runtime.handle();
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
 
@@ -147,7 +146,6 @@ fn spawn_bounded_helper_clamps_zero_concurrency_to_one() {
         .expect("build runtime");
 
     let root_cx = for_testing();
-    let handle = runtime.handle();
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
 
@@ -205,8 +203,6 @@ fn spawn_bounded_children_observe_parent_cancellation() {
         CancelKind::User,
         Some("wa-1bznu cancellation propagation test"),
     );
-    let handle = runtime.handle();
-
     let tasks = (0..5)
         .map(|_| move |child_cx: Cx| async move { child_cx.checkpoint().is_err() })
         .collect::<Vec<_>>();

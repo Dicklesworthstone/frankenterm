@@ -59,7 +59,6 @@ fn bench_spawn_noop(c: &mut Criterion) {
 
 fn bench_region_batch(c: &mut Criterion) {
     let as_runtime = build_asupersync_runtime();
-    let as_handle = as_runtime.handle();
     let as_cx = for_testing();
     let mut group = c.benchmark_group("task_spawn/region_batch");
     for fanout in FANOUT_SIZES {
@@ -72,7 +71,6 @@ fn bench_region_batch(c: &mut Criterion) {
                         .map(|_| |_child_cx: Cx| async move { 1_u8 })
                         .collect();
                     let results = as_runtime.block_on(spawn_bounded_with_cx(
-                        &as_handle,
                         &as_cx,
                         n.max(1),
                         tasks,
@@ -87,7 +85,6 @@ fn bench_region_batch(c: &mut Criterion) {
 
 fn bench_structured_overhead(c: &mut Criterion) {
     let runtime = build_asupersync_runtime();
-    let handle = runtime.handle();
     let cx = for_testing();
 
     let mut group = c.benchmark_group("task_spawn/structured_overhead");
@@ -101,7 +98,7 @@ fn bench_structured_overhead(c: &mut Criterion) {
                         .map(|_| |_child_cx: Cx| async move { 1_u8 })
                         .collect();
                     let completed = runtime
-                        .block_on(spawn_bounded_with_cx(&handle, &cx, n.max(1), tasks))
+                        .block_on(spawn_bounded_with_cx(&cx, n.max(1), tasks))
                         .len();
                     black_box(completed);
                 });
