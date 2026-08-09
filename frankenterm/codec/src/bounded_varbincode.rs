@@ -29,6 +29,10 @@ pub(crate) const SERIALIZED_HYPERLINK_COORDINATES_V1_NEWTYPE: &str =
     "frankenterm.codec.SerializedHyperlinkCoordinatesV1";
 pub(crate) const SERIALIZED_IMAGE_REFERENCES_V1_NEWTYPE: &str =
     "frankenterm.codec.SerializedImageReferencesV1";
+pub(crate) const TIERED_SCROLLBACK_BATCH_PANE_IDS_V1_NEWTYPE: &str =
+    "frankenterm.codec.TieredScrollbackBatchPaneIdsV1";
+pub(crate) const TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE: &str =
+    "frankenterm.codec.TieredScrollbackBatchEntriesV1";
 pub(crate) const IMAGE_WIRE_BYTES_V1_NEWTYPE: &str = termwiz::image::IMAGE_WIRE_BYTES_V1_NEWTYPE;
 pub(crate) const EXACT_RENDER_ROW_UTF8_V1_MAX_BYTES: usize = 1_000_000;
 pub(crate) const EXACT_RENDER_METADATA_UTF8_V1_MAX_BYTES: usize = 65_536;
@@ -45,6 +49,8 @@ pub(crate) const SERIALIZED_HYPERLINK_COORDINATES_V1_MAX_ITEMS: usize =
     super::MAX_RENDER_APPLICATION_HYPERLINK_SPANS;
 pub(crate) const SERIALIZED_IMAGE_REFERENCES_V1_MAX_ITEMS: usize =
     super::MAX_RENDER_APPLICATION_IMAGE_REFERENCES;
+pub(crate) const TIERED_SCROLLBACK_BATCH_V1_MAX_ITEMS: usize =
+    super::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES;
 pub(crate) const IMAGE_WIRE_BYTES_V1_MAX_BYTES: usize = super::MAX_IMAGE_HYDRATION_DECODED_BYTES;
 
 /// Default hard byte budget for an unmarked varbincode container or byte
@@ -140,6 +146,18 @@ impl ContainerAdmission {
         label: "serialized image references",
         maximum: SERIALIZED_IMAGE_REFERENCES_V1_MAX_ITEMS,
         preallocation_maximum: SERIALIZED_IMAGE_REFERENCES_V1_MAX_ITEMS,
+    };
+
+    const TIERED_SCROLLBACK_BATCH_PANE_IDS: Self = Self {
+        label: "tiered scrollback batch pane ids",
+        maximum: TIERED_SCROLLBACK_BATCH_V1_MAX_ITEMS,
+        preallocation_maximum: TIERED_SCROLLBACK_BATCH_V1_MAX_ITEMS,
+    };
+
+    const TIERED_SCROLLBACK_BATCH_ENTRIES: Self = Self {
+        label: "tiered scrollback batch entries",
+        maximum: TIERED_SCROLLBACK_BATCH_V1_MAX_ITEMS,
+        preallocation_maximum: TIERED_SCROLLBACK_BATCH_V1_MAX_ITEMS,
     };
 
     const fn restricted_by(self, requested: Self) -> Self {
@@ -513,6 +531,10 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
             Some(ContainerAdmission::SERIALIZED_HYPERLINK_COORDINATES)
         } else if name == SERIALIZED_IMAGE_REFERENCES_V1_NEWTYPE {
             Some(ContainerAdmission::SERIALIZED_IMAGE_REFERENCES)
+        } else if name == TIERED_SCROLLBACK_BATCH_PANE_IDS_V1_NEWTYPE {
+            Some(ContainerAdmission::TIERED_SCROLLBACK_BATCH_PANE_IDS)
+        } else if name == TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE {
+            Some(ContainerAdmission::TIERED_SCROLLBACK_BATCH_ENTRIES)
         } else {
             None
         };

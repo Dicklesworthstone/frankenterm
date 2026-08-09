@@ -2240,6 +2240,18 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    (GetPaneTieredScrollbackStatusesV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (GetPaneTieredScrollbackStatusesV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetImageCellResponse, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_GET_IMAGE_CELL_RESPONSE_DECOMPRESSED_BYTES,
@@ -2789,7 +2801,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 56;
+pub const CODEC_VERSION: usize = 57;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -2993,6 +3005,10 @@ pdu! {
         => deserialize_get_pane_render_delivery_v1;
     GetPaneRenderDeliveryV1Response: 92, 52, server_reply, requires_exact_render
         => deserialize_get_pane_render_delivery_v1_response;
+    GetPaneTieredScrollbackStatusesV1: 93, 57, client_request, none
+        => deserialize_get_pane_tiered_scrollback_statuses_v1;
+    GetPaneTieredScrollbackStatusesV1Response: 94, 57, server_reply, none
+        => deserialize_get_pane_tiered_scrollback_statuses_v1_response;
 }
 
 impl Pdu {
@@ -3006,6 +3022,8 @@ impl Pdu {
             Self::WindowOrderEventV1(value) => value.validate()?,
             Self::GetPaneRenderDeliveryV1(value) => value.validate()?,
             Self::GetPaneRenderDeliveryV1Response(value) => value.validate()?,
+            Self::GetPaneTieredScrollbackStatusesV1(value) => value.validate()?,
+            Self::GetPaneTieredScrollbackStatusesV1Response(value) => value.validate()?,
             _ => {}
         }
         Ok(())
@@ -3945,7 +3963,7 @@ impl TopologyCapabilities {
 
     /// Runtime-advertised capabilities.
     ///
-    /// The v56 codec knows the ordered-window and exact-render bits, but none
+    /// The current codec knows the ordered-window and exact-render bits, but none
     /// may be advertised until their mux authority, server dispatch, and client
     /// reconciliation beads complete. Keep this mask intentionally unchanged.
     pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
@@ -9851,6 +9869,196 @@ pub struct ActivatePaneDirection {
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetPaneRenderChanges {
     pub pane_id: PaneId,
+}
+
+/// Maximum number of panes sampled by one lightweight scrollback-health turn.
+///
+/// The fleet campaign's largest ordinary class is 200 panes, so 256 keeps one
+/// cycle to one RPC while bounding mux-main callback work, decoded collection
+/// allocation, and response bytes independently of session age.
+pub const MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES: usize = 256;
+
+/// Schema-specific wire ceilings for the bounded health request/response.
+pub const MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES: usize = 4 * 1024;
+pub const MAX_TIERED_SCROLLBACK_STATUS_REQUEST_ZSTD_ENCODED_BYTES: usize =
+    MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES + 128;
+pub const MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES: usize = 64 * 1024;
+pub const MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES: usize =
+    MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES + 512;
+
+fn serialize_tiered_scrollback_batch_pane_ids<S>(
+    pane_ids: &[PaneId],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if pane_ids.is_empty() || pane_ids.len() > MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES {
+        return Err(serde::ser::Error::custom(format_args!(
+            "tiered scrollback batch pane-id count {} is outside 1..={}",
+            pane_ids.len(),
+            MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES,
+        )));
+    }
+    serializer.serialize_newtype_struct(
+        bounded_varbincode::TIERED_SCROLLBACK_BATCH_PANE_IDS_V1_NEWTYPE,
+        pane_ids,
+    )
+}
+
+fn deserialize_tiered_scrollback_batch_pane_ids<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PaneId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_newtype_vec::<D, PaneId, MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES>(
+        deserializer,
+        "tiered scrollback batch pane ids",
+        bounded_varbincode::TIERED_SCROLLBACK_BATCH_PANE_IDS_V1_NEWTYPE,
+    )
+}
+
+fn serialize_tiered_scrollback_batch_entries<S>(
+    entries: &[PaneTieredScrollbackStatusEntryV1],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if entries.is_empty() || entries.len() > MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES {
+        return Err(serde::ser::Error::custom(format_args!(
+            "tiered scrollback batch entry count {} is outside 1..={}",
+            entries.len(),
+            MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES,
+        )));
+    }
+    serializer.serialize_newtype_struct(
+        bounded_varbincode::TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE,
+        entries,
+    )
+}
+
+fn deserialize_tiered_scrollback_batch_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PaneTieredScrollbackStatusEntryV1>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_newtype_vec::<
+        D,
+        PaneTieredScrollbackStatusEntryV1,
+        MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES,
+    >(
+        deserializer,
+        "tiered scrollback batch entries",
+        bounded_varbincode::TIERED_SCROLLBACK_BATCH_ENTRIES_V1_NEWTYPE,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PaneTieredScrollbackStatusOutcomeV1 {
+    Available(PaneTieredScrollbackStatus),
+    /// The pane is live but its implementation has no tiered-scrollback state.
+    Unavailable,
+    /// No pane registration existed for the requested identity in this turn.
+    Missing,
+    /// The captured registration stopped being current before its callback.
+    Closed,
+    /// The pane callback panicked inside the canonical recovery boundary.
+    CallbackPanicked,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PaneTieredScrollbackStatusEntryV1 {
+    pub pane_id: PaneId,
+    pub outcome: PaneTieredScrollbackStatusOutcomeV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneTieredScrollbackStatusesV1 {
+    #[serde(
+        serialize_with = "serialize_tiered_scrollback_batch_pane_ids",
+        deserialize_with = "deserialize_tiered_scrollback_batch_pane_ids"
+    )]
+    pub pane_ids: Vec<PaneId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GetPaneTieredScrollbackStatusesV1Response {
+    #[serde(
+        serialize_with = "serialize_tiered_scrollback_batch_entries",
+        deserialize_with = "deserialize_tiered_scrollback_batch_entries"
+    )]
+    pub entries: Vec<PaneTieredScrollbackStatusEntryV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum TieredScrollbackStatusBatchError {
+    #[error("tiered scrollback status batch must contain at least one pane")]
+    Empty,
+    #[error("tiered scrollback status batch contains {count} panes; maximum is {max}")]
+    TooMany { count: usize, max: usize },
+    #[error("tiered scrollback status batch repeats pane {pane_id}")]
+    DuplicatePane { pane_id: PaneId },
+}
+
+fn validate_tiered_scrollback_status_batch_ids(
+    pane_ids: impl IntoIterator<Item = PaneId>,
+    count: usize,
+) -> Result<(), TieredScrollbackStatusBatchError> {
+    if count == 0 {
+        return Err(TieredScrollbackStatusBatchError::Empty);
+    }
+    if count > MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES {
+        return Err(TieredScrollbackStatusBatchError::TooMany {
+            count,
+            max: MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES,
+        });
+    }
+    let mut unique = HashSet::with_capacity(count);
+    for pane_id in pane_ids {
+        if !unique.insert(pane_id) {
+            return Err(TieredScrollbackStatusBatchError::DuplicatePane { pane_id });
+        }
+    }
+    Ok(())
+}
+
+impl GetPaneTieredScrollbackStatusesV1 {
+    pub fn validate(&self) -> Result<(), TieredScrollbackStatusBatchError> {
+        validate_tiered_scrollback_status_batch_ids(
+            self.pane_ids.iter().copied(),
+            self.pane_ids.len(),
+        )
+    }
+}
+
+impl GetPaneTieredScrollbackStatusesV1Response {
+    pub fn validate(&self) -> Result<(), TieredScrollbackStatusBatchError> {
+        validate_tiered_scrollback_status_batch_ids(
+            self.entries.iter().map(|entry| entry.pane_id),
+            self.entries.len(),
+        )
+    }
+}
+
+fn deserialize_get_pane_tiered_scrollback_statuses_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneTieredScrollbackStatusesV1, Error> {
+    let request: GetPaneTieredScrollbackStatusesV1 = deserialize(data, is_compressed)?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_get_pane_tiered_scrollback_statuses_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetPaneTieredScrollbackStatusesV1Response, Error> {
+    let response: GetPaneTieredScrollbackStatusesV1Response = deserialize(data, is_compressed)?;
+    response.validate()?;
+    Ok(response)
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -17110,8 +17318,8 @@ mod test {
     }
 
     #[test]
-    fn codec_v56_requires_atomic_paste_wire_redeploy_and_retains_feature_minima() {
-        assert_eq!(CODEC_VERSION, 56);
+    fn codec_v57_retains_v56_atomic_paste_floor_and_feature_minima() {
+        assert_eq!(CODEC_VERSION, 57);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 56);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -17124,6 +17332,11 @@ mod test {
         assert!(
             check_compat(56, 56, 55, 55).is_err(),
             "the SendPaste byte-schema change requires an atomic v56 redeploy"
+        );
+        assert_eq!(
+            check_compat(57, 56, 56, 56),
+            Ok(CompatDecision::Compatible { agreed: 56 }),
+            "the additive health PDU must preserve interoperability with a v56 peer"
         );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
@@ -17159,7 +17372,7 @@ mod test {
         );
         assert_eq!(
             Pdu::decode(frame.as_slice())
-                .expect("v56 decoder must retain v50 PDU81 for historical fixture decoding")
+                .expect("current decoder must retain v50 PDU81 for historical fixture decoding")
                 .pdu,
             legacy
         );
@@ -17957,7 +18170,146 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 56);
+        assert_eq!(CODEC_VERSION, 57);
+    }
+
+    #[test]
+    fn tiered_scrollback_status_batch_has_schema_specific_wire_caps() {
+        let request_limit = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_ZSTD_ENCODED_BYTES,
+        };
+        let response_limit = PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES,
+        };
+        assert_eq!(
+            <GetPaneTieredScrollbackStatusesV1 as PduWireIdent>::WIRE_SPEC.encoded_body_limit,
+            request_limit
+        );
+        assert_eq!(
+            <GetPaneTieredScrollbackStatusesV1Response as PduWireIdent>::WIRE_SPEC
+                .encoded_body_limit,
+            response_limit
+        );
+        assert!(
+            MAX_TIERED_SCROLLBACK_STATUS_REQUEST_ZSTD_ENCODED_BYTES
+                >= zstd::zstd_safe::compress_bound(
+                    MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES,
+                )
+        );
+        assert!(
+            MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_ZSTD_ENCODED_BYTES
+                >= zstd::zstd_safe::compress_bound(
+                    MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES,
+                )
+        );
+        const {
+            assert!(
+                MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES < MAX_PDU_SIZE,
+                "fleet-health responses must not inherit the global allocation envelope"
+            );
+        }
+    }
+
+    fn maximal_tiered_scrollback_status() -> PaneTieredScrollbackStatus {
+        PaneTieredScrollbackStatus {
+            tiering_enabled: true,
+            configured_scrollback_rows: usize::MAX,
+            configured_hot_lines: usize::MAX,
+            configured_warm_max_bytes: usize::MAX,
+            visible_rows: usize::MAX,
+            in_memory_scrollback_rows: usize::MAX,
+            warm_resident_lines: usize::MAX,
+            warm_resident_bytes: usize::MAX,
+            warm_spill_lines_total: u64::MAX,
+            warm_spill_bytes_total: u64::MAX,
+            cold_spill_lines_total: u64::MAX,
+            cold_spill_bytes_total: u64::MAX,
+            cold_sink_retained_lines: usize::MAX,
+            cold_sink_retained_bytes: usize::MAX,
+            cold_worker_peak_backlog_depth: usize::MAX,
+            cold_worker_completion_throughput_lines_per_sec: u64::MAX,
+            cold_worker_completed_lines_total: u64::MAX,
+            cold_worker_completed_batches_total: u64::MAX,
+            cold_worker_cancellation_count: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn tiered_scrollback_status_batch_round_trips_at_exact_bound_in_order() {
+        let entries = (0..MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES)
+            .map(|pane_id| PaneTieredScrollbackStatusEntryV1 {
+                pane_id,
+                outcome: match pane_id % 5 {
+                    0 => PaneTieredScrollbackStatusOutcomeV1::Available(
+                        maximal_tiered_scrollback_status(),
+                    ),
+                    1 => PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                    2 => PaneTieredScrollbackStatusOutcomeV1::Missing,
+                    3 => PaneTieredScrollbackStatusOutcomeV1::Closed,
+                    _ => PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked,
+                },
+            })
+            .collect::<Vec<_>>();
+        let expected = GetPaneTieredScrollbackStatusesV1Response { entries };
+        let frame = Pdu::GetPaneTieredScrollbackStatusesV1Response(expected.clone())
+            .encode_frame_with_mode(701, CompressionMode::Never)
+            .expect("maximum bounded health response must encode");
+        let raw = decode_raw(frame.as_slice()).expect("maximum response frame must decode raw");
+        assert!(
+            raw.data.len() <= MAX_TIERED_SCROLLBACK_STATUS_RESPONSE_DECOMPRESSED_BYTES,
+            "maximum response body escaped its schema ceiling"
+        );
+        let decoded = Pdu::decode(frame.as_slice()).expect("maximum response must decode");
+        assert_eq!(
+            decoded.pdu,
+            Pdu::GetPaneTieredScrollbackStatusesV1Response(expected)
+        );
+    }
+
+    #[test]
+    fn tiered_scrollback_status_batch_rejects_empty_duplicate_and_oversized_inputs() {
+        let empty = Pdu::GetPaneTieredScrollbackStatusesV1(
+            GetPaneTieredScrollbackStatusesV1 { pane_ids: Vec::new() },
+        );
+        assert!(empty.encode_frame(702).is_err());
+
+        let duplicate = Pdu::GetPaneTieredScrollbackStatusesV1(
+            GetPaneTieredScrollbackStatusesV1 {
+                pane_ids: vec![7, 7],
+            },
+        );
+        assert!(duplicate.encode_frame(703).is_err());
+
+        let oversized = Pdu::GetPaneTieredScrollbackStatusesV1(
+            GetPaneTieredScrollbackStatusesV1 {
+                pane_ids: (0..=MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES).collect(),
+            },
+        );
+        assert!(oversized.encode_frame(704).is_err());
+
+        let (oversized_payload, compressed) = serialize_with_mode(
+            &(vec![0_usize; MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES + 1],),
+            CompressionMode::Never,
+        )
+        .expect("hostile unbounded request tuple must serialize");
+        assert!(!compressed);
+        let mut hostile_frame = Vec::new();
+        encode_raw(
+            GetPaneTieredScrollbackStatusesV1::IDENT,
+            705,
+            &oversized_payload,
+            false,
+            &mut hostile_frame,
+        )
+        .expect("hostile declared-count fixture must frame");
+        let error = Pdu::decode(hostile_frame.as_slice())
+            .expect_err("the 257th declared pane must fail bounded admission");
+        assert!(
+            format!("{error:#}").contains("maximum 256"),
+            "unexpected bounded-admission rejection: {error:#}"
+        );
     }
 
     #[test]
@@ -18073,7 +18425,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=92 {
+        for ident in 0..=94 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -18087,9 +18439,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(93).is_none());
+        assert!(Pdu::wire_spec_for_ident(95).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 93 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 95 - GAPS.len());
     }
 
     #[test]
@@ -18121,6 +18473,7 @@ mod test {
                 84..=85 => 50,
                 86..=90 => 54,
                 91..=92 => 52,
+                93..=94 => 57,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -18155,10 +18508,11 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91,
+            77, 80, 81, 85, 86, 88, 91, 93,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92,
+            94,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -18321,9 +18675,13 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_requires_atomic_v56_window() {
+    fn check_compat_current_build_retains_v56_floor_for_additive_v57() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 56);
-        assert_eq!(CODEC_VERSION, 56);
+        assert_eq!(CODEC_VERSION, 57);
+        assert_eq!(
+            check_compat(57, 56, 56, 56),
+            Ok(CompatDecision::Compatible { agreed: 56 })
+        );
     }
 
     #[test]
