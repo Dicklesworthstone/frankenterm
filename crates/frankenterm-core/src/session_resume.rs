@@ -4862,12 +4862,9 @@ mod tests {
             after.dropped_observer_total, before.dropped_observer_total,
             "explicit context cancellation is not an abandoned observer"
         );
-        assert!(
-            after
-                .undelivered_receipt_total
-                .saturating_sub(before.undelivered_receipt_total)
-                <= 1,
-            "shutdown races receipt consumption against observer cancellation, but emits at most one receipt"
+        assert_eq!(
+            after.undelivered_receipt_total,
+            before.undelivered_receipt_total + 1
         );
     }
 
@@ -5014,9 +5011,12 @@ mod tests {
             after.cancel_requested_total,
             before.cancel_requested_total + 1
         );
-        assert_eq!(
-            after.undelivered_receipt_total,
-            before.undelivered_receipt_total + 1
+        assert!(
+            after
+                .undelivered_receipt_total
+                .saturating_sub(before.undelivered_receipt_total)
+                <= 1,
+            "shutdown races receipt consumption against observer cancellation, but emits at most one receipt"
         );
     }
 
