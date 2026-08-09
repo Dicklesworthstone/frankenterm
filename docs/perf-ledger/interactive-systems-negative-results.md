@@ -3777,9 +3777,10 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Bead:** `ft-interactive-systems-performance-4tenz.29`
 - **Baseline revision:** `b20f16ae715a2ca179f38fca95de177ce6864076`
 - **Candidate revision:** `df2e495c458c355a70636cb49c94fa778722550c`
-- **Target identity:** strict-remote `ovh-a` Linux compile/test worker for source
-  proof only; no M4/M5 macOS, 128-core Threadripper, display, LAN, thermal, or
-  production-session identity was measured
+- **Target identity:** strict-remote `ovh-a`, `vmi1149989`, and `vmi1227854`
+  Linux compile/test workers for source proof only; no M4/M5 macOS, 128-core
+  Threadripper, display, LAN, thermal, or production-session identity was
+  measured
 - **Workload identity:** deterministic codec, mux-client, mux-server, shard,
   runtime, panic, cancellation, old-peer, 200-pane, and 513-pane structural
   fixtures; no retained real 20/50/200-pane workload run
@@ -3788,18 +3789,26 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   under RCH job `j-29969059034431491` failed before tests ran because the
   `ovh-a` worker exhausted its filesystem while the package-level command was
   linking unrelated `frankenterm-core` integration-test binaries (`No space
-  left on device`); no local substitute ran and this is not focused proof
+  left on device`). A narrowed three-package `--lib` retry under job
+  `j-29969059034431494` also reached no tests: `vmi1149989` killed the
+  monolithic `frankenterm-core` lib-test rustc with `SIGKILL` after 31 minutes.
+  Split exact-source jobs then proved the bounded codec schema under
+  `j-29969150772248581` (6 passed, 260 filtered out) and server snapshot/panic
+  containment under `j-29969150772248583` (5 passed, 402 filtered out).
+  Runtime, sharding, direct-client, and pool unit execution remains blocked by
+  the core test-binary resource ceiling; no local substitute ran
 - **Broad command/artifact:** real-remote package all-targets `cargo check -p
   codec -p frankenterm-core -p frankenterm-mux-server-impl --all-targets`
   passed under RCH job `j-29969059034431490`; final exact-source workspace
   check, Clippy, and format proof remain separate gates
 - **Samples/statistics:** none; no runtime A/B, sample distribution,
   confidence interval, or coefficient of variation was collected
-- **Equivalence:** deterministic source tests cover stable result order, typed
-  missing/closed/unavailable/panic siblings, cancellation, partial completion,
-  malformed request rejection, response cardinality, and old-peer fallback;
-  byte/state replay plus visual, cursor, IME, accessibility, resize, and zoom
-  equivalence remain unproved
+- **Equivalence:** executed codec and server tests cover exact-bound wire order,
+  malformed request rejection, typed missing/closed/unavailable/panic siblings,
+  frozen membership, and callback-panic containment. Reviewed but remotely
+  unexecuted core tests cover global order, response cardinality, cancellation,
+  partial completion, and old-peer fallback. Byte/state replay plus visual,
+  cursor, IME, accessibility, resize, and zoom equivalence remain unproved
 - **Measured result:** none. The source now uses codec-v57 `PDU93`/`PDU94` with
   at most 256 unique nonempty pane IDs, 4 KiB request and 32 KiB response codec
   ceilings, one frozen-registration mux turn per chunk, ten bounded wire
