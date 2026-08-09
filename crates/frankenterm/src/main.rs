@@ -28186,18 +28186,33 @@ where
             saturating_increment_watch_counter(
                 &WATCH_CLAIM_OUTPUT_COORDINATOR.descriptor_restore_failures,
             );
-            let finalized = finalize_watch_claim_bounded(storage, &lease)
-                .await
-                .map_err(|error| {
-                    std::io::Error::other(format!(
-                        "event {event_id} was flushed, stdout descriptor restoration failed, and delivery finalization failed: {error}"
-                    ))
-                })?;
-            if finalized {
-                saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.finalizations);
-            } else {
-                saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.stale_tokens);
-            }
+            let finalized = match finalize_watch_claim_bounded(storage, &lease).await {
+                Ok(finalized) => {
+                    if finalized {
+                        saturating_increment_watch_counter(
+                            &WATCH_CLAIM_OUTPUT_COORDINATOR.finalizations,
+                        );
+                    } else {
+                        saturating_increment_watch_counter(
+                            &WATCH_CLAIM_OUTPUT_COORDINATOR.stale_tokens,
+                        );
+                    }
+                    Some(finalized)
+                }
+                Err(finalize_error) => {
+                    saturating_increment_watch_counter(
+                        &WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries,
+                    );
+                    tracing::error!(
+                        event_id = queued_event_id,
+                        cursor_generation = queued_cursor_generation,
+                        lease_expires_at_ms = queued_lease_expiry,
+                        error = %finalize_error,
+                        "watch-events finalization also failed after stdout descriptor restoration was lost"
+                    );
+                    None
+                }
+            };
             tracing::error!(
                 event_id = queued_event_id,
                 cursor_generation = queued_cursor_generation,
@@ -28205,7 +28220,7 @@ where
                 bytes_written = success.bytes_written,
                 blocked_duration_ns = success.blocked_duration_ns,
                 error_kind = ?source.kind(),
-                finalized,
+                finalized = ?finalized,
                 "watch-events restored durable truth after stdout descriptor restoration failed"
             );
             return Ok(WatchEventClaimDelivery::DescriptorRestoreLost {
