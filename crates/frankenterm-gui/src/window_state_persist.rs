@@ -25,7 +25,7 @@
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1313,6 +1313,7 @@ struct RejectedOverlayMutation {
 #[derive(Debug)]
 struct BatchCommit {
     receipt: CommitReceipt,
+    byte_admission: ByteAdmissionStats,
     bindings: BTreeMap<PrivacySafeTargetFingerprint, DomainBindingId>,
     rejected_bindings: BTreeMap<PrivacySafeTargetFingerprint, PersistenceFailure>,
     rejected_workspaces: BTreeMap<String, PersistenceFailure>,
@@ -3497,6 +3498,7 @@ struct BatchPreflight {
     accepted_bindings: BTreeSet<PrivacySafeTargetFingerprint>,
     rejected_bindings: BTreeMap<PrivacySafeTargetFingerprint, PersistenceFailure>,
     encoded_upper_bound: u64,
+    byte_admission: ByteAdmissionStats,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -4486,6 +4488,323 @@ fn signed_usize_delta(after: usize, before: usize) -> Result<i128, PersistenceFa
     Ok(i128::from(after) - i128::from(before))
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ByteAdmissionStats {
+    candidate_count: usize,
+    leave_one_out_trials: usize,
+    peel_removals: usize,
+    backfill_queries: usize,
+    backfill_candidate_trials: usize,
+    backfill_index_rebuilds: usize,
+    backfill_index_entries_peak: usize,
+}
+
+#[derive(Debug)]
+struct CandidateSubsetSelection {
+    projection: AdmissionProjection,
+    rejected: Vec<usize>,
+    accepted_count: usize,
+    stats: ByteAdmissionStats,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionCollectionShape([bool; 4]);
+
+impl AdmissionCollectionShape {
+    fn from_projection(projection: AdmissionProjection) -> Result<Self, PersistenceFailure> {
+        let normalized = projection.normalized_bytes;
+        let physical = projection.physical_bytes;
+        let normalized_counts = [
+            normalized.window_states.item_count,
+            normalized.domain_bindings.item_count,
+            normalized.overlays.item_count,
+            normalized.tombstones.item_count,
+        ];
+        let physical_counts = [
+            physical.window_states.item_count,
+            physical.domain_bindings.item_count,
+            physical.overlays.item_count,
+            physical.tombstones.item_count,
+        ];
+        if normalized_counts != physical_counts {
+            return Err(PersistenceFailure::corrupt(
+                "normalized and physical byte projections disagree on collection cardinality",
+            ));
+        }
+        Ok(Self(normalized_counts.map(|count| count == 0)))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BackfillPoint {
+    candidate_index: usize,
+    live_overlay_delta: i128,
+    tab_delta: i128,
+    normalized_byte_delta: i128,
+}
+
+impl BackfillPoint {
+    fn for_candidate(
+        projection: AdmissionProjection,
+        candidate_index: usize,
+        candidate: &ByteAdmissionCandidate,
+    ) -> Result<Self, PersistenceFailure> {
+        let delta = AdmissionDelta::for_candidate(projection, candidate)?;
+        for resource in [0usize, 1, 3] {
+            if delta.values[resource] < 0 {
+                return Err(PersistenceFailure::corrupt(
+                    "byte-admission candidate frees a monotonic cardinality resource",
+                ));
+            }
+        }
+        if delta.values[5] != delta.values[6] {
+            return Err(PersistenceFailure::corrupt(
+                "normalized and physical candidate byte deltas diverged",
+            ));
+        }
+        Ok(Self {
+            candidate_index,
+            live_overlay_delta: delta.values[2],
+            tab_delta: delta.values[4],
+            normalized_byte_delta: delta.values[5],
+        })
+    }
+}
+
+type DominanceMinimum = (i128, usize);
+
+fn minimum_dominance(
+    left: Option<DominanceMinimum>,
+    right: Option<DominanceMinimum>,
+) -> Option<DominanceMinimum> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug)]
+struct DominanceBucket {
+    keys: Vec<(i128, usize)>,
+    tree_base: usize,
+    minima: Vec<Option<DominanceMinimum>>,
+}
+
+impl DominanceBucket {
+    fn new(mut points: Vec<BackfillPoint>) -> Result<Self, PersistenceFailure> {
+        points.sort_by_key(|point| (point.tab_delta, point.candidate_index));
+        let keys = points
+            .iter()
+            .map(|point| (point.tab_delta, point.candidate_index))
+            .collect::<Vec<_>>();
+        let tree_base = points
+            .len()
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or_else(encoded_size_overflow)?;
+        let tree_len = tree_base
+            .checked_mul(2)
+            .ok_or_else(encoded_size_overflow)?;
+        let mut minima = vec![None; tree_len];
+        for (position, point) in points.into_iter().enumerate() {
+            minima[tree_base + position] =
+                Some((point.normalized_byte_delta, point.candidate_index));
+        }
+        for node in (1..tree_base).rev() {
+            minima[node] = minimum_dominance(minima[node * 2], minima[node * 2 + 1]);
+        }
+        Ok(Self {
+            keys,
+            tree_base,
+            minima,
+        })
+    }
+
+    fn remove(&mut self, point: BackfillPoint) -> Result<(), PersistenceFailure> {
+        let position = self
+            .keys
+            .binary_search(&(point.tab_delta, point.candidate_index))
+            .map_err(|_| {
+                PersistenceFailure::corrupt(
+                    "dominance index lost a byte-admission candidate key",
+                )
+            })?;
+        let mut node = self.tree_base + position;
+        if self.minima[node].take().is_none() {
+            return Err(PersistenceFailure::corrupt(
+                "dominance index removed one byte-admission candidate twice",
+            ));
+        }
+        node /= 2;
+        while node != 0 {
+            self.minima[node] =
+                minimum_dominance(self.minima[node * 2], self.minima[node * 2 + 1]);
+            node /= 2;
+        }
+        Ok(())
+    }
+
+    fn query(
+        &self,
+        maximum_tab_delta: i128,
+        maximum_byte_delta: i128,
+    ) -> Option<DominanceMinimum> {
+        let upper = self
+            .keys
+            .partition_point(|(tab_delta, _)| *tab_delta <= maximum_tab_delta);
+        let mut left = self.tree_base;
+        let mut right = self.tree_base + upper;
+        let mut selected = None;
+        while left < right {
+            if left % 2 == 1 {
+                selected = minimum_dominance(selected, self.minima[left]);
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                selected = minimum_dominance(selected, self.minima[right]);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        selected.filter(|(byte_delta, _)| *byte_delta <= maximum_byte_delta)
+    }
+}
+
+#[derive(Debug)]
+struct BackfillDominanceIndex {
+    live_overlay_deltas: Vec<i128>,
+    tree_base: usize,
+    buckets: Vec<DominanceBucket>,
+    points_by_candidate: Vec<Option<BackfillPoint>>,
+    entry_count: usize,
+}
+
+impl BackfillDominanceIndex {
+    fn build(
+        points: Vec<BackfillPoint>,
+        candidate_count: usize,
+    ) -> Result<Self, PersistenceFailure> {
+        let mut live_overlay_deltas = points
+            .iter()
+            .map(|point| point.live_overlay_delta)
+            .collect::<Vec<_>>();
+        live_overlay_deltas.sort_unstable();
+        live_overlay_deltas.dedup();
+        let tree_base = live_overlay_deltas
+            .len()
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or_else(encoded_size_overflow)?;
+        let tree_len = tree_base
+            .checked_mul(2)
+            .ok_or_else(encoded_size_overflow)?;
+        let mut pending_buckets = vec![Vec::new(); tree_len];
+        let mut points_by_candidate = vec![None; candidate_count];
+        let mut entry_count = 0usize;
+
+        for point in points {
+            let slot = points_by_candidate
+                .get_mut(point.candidate_index)
+                .ok_or_else(|| {
+                    PersistenceFailure::corrupt(
+                        "dominance index candidate identity was out of bounds",
+                    )
+                })?;
+            if slot.replace(point).is_some() {
+                return Err(PersistenceFailure::corrupt(
+                    "dominance index received a duplicate byte-admission candidate",
+                ));
+            }
+            let coordinate = live_overlay_deltas
+                .binary_search(&point.live_overlay_delta)
+                .map_err(|_| {
+                    PersistenceFailure::corrupt(
+                        "dominance index lost a live-overlay coordinate",
+                    )
+                })?;
+            let mut node = tree_base + coordinate;
+            while node != 0 {
+                pending_buckets[node].push(point);
+                entry_count = entry_count
+                    .checked_add(1)
+                    .ok_or_else(encoded_size_overflow)?;
+                node /= 2;
+            }
+        }
+
+        let buckets = pending_buckets
+            .into_iter()
+            .map(DominanceBucket::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            live_overlay_deltas,
+            tree_base,
+            buckets,
+            points_by_candidate,
+            entry_count,
+        })
+    }
+
+    fn remove(&mut self, candidate_index: usize) -> Result<(), PersistenceFailure> {
+        let point = self
+            .points_by_candidate
+            .get_mut(candidate_index)
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                PersistenceFailure::corrupt(
+                    "dominance index removed an absent byte-admission candidate",
+                )
+            })?;
+        let coordinate = self
+            .live_overlay_deltas
+            .binary_search(&point.live_overlay_delta)
+            .map_err(|_| {
+                PersistenceFailure::corrupt("dominance index removal lost its coordinate")
+            })?;
+        let mut node = self.tree_base + coordinate;
+        while node != 0 {
+            self.buckets[node].remove(point)?;
+            node /= 2;
+        }
+        Ok(())
+    }
+
+    fn query(
+        &self,
+        maximum_live_overlay_delta: i128,
+        maximum_tab_delta: i128,
+        maximum_byte_delta: i128,
+    ) -> Option<usize> {
+        let upper = self
+            .live_overlay_deltas
+            .partition_point(|delta| *delta <= maximum_live_overlay_delta);
+        let mut left = self.tree_base;
+        let mut right = self.tree_base + upper;
+        let mut selected = None;
+        while left < right {
+            if left % 2 == 1 {
+                selected = minimum_dominance(
+                    selected,
+                    self.buckets[left].query(maximum_tab_delta, maximum_byte_delta),
+                );
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                selected = minimum_dominance(
+                    selected,
+                    self.buckets[right].query(maximum_tab_delta, maximum_byte_delta),
+                );
+            }
+            left /= 2;
+            right /= 2;
+        }
+        selected.map(|(_, candidate_index)| candidate_index)
+    }
+}
+
 type RemovalPriority = [u64; 17];
 type RemovalHeap = BinaryHeap<(RemovalPriority, usize)>;
 
@@ -4511,13 +4830,143 @@ fn removal_priority(
     priority
 }
 
+const MONOTONIC_ADMISSION_VIOLATIONS: u8 =
+    VIOLATION_WORKSPACES | VIOLATION_BINDINGS | VIOLATION_TOMBSTONES;
+const MAX_BACKFILL_INDEX_REBUILDS: usize = 1 + 2 * 4;
+
+fn normalized_admission_ceiling(
+    base: AdmissionProjection,
+    maximum_bytes: u64,
+) -> Result<u64, PersistenceFailure> {
+    let normalized = base.normalized_bytes.upper_bound()?;
+    let physical = base.physical_bytes.upper_bound()?;
+    let normalization_debt = normalized.checked_sub(physical).ok_or_else(|| {
+        PersistenceFailure::corrupt(
+            "physical byte projection exceeded its conservative normalized projection",
+        )
+    })?;
+    let physical_ceiling_as_normalized = maximum_bytes.saturating_add(normalization_debt);
+    Ok(maximum_bytes.max(normalized.min(physical_ceiling_as_normalized)))
+}
+
+fn admission_backfill_slack(
+    projection: AdmissionProjection,
+    normalized_byte_ceiling: u64,
+) -> Result<(i128, i128, i128), PersistenceFailure> {
+    let live_overlays = u64::try_from(projection.counts.live_overlays)
+        .map_err(|_| encoded_size_overflow())?;
+    let maximum_live_overlays =
+        u64::try_from(MAX_LAYOUT_OVERLAYS).map_err(|_| encoded_size_overflow())?;
+    let tabs = u64::try_from(projection.counts.tabs).map_err(|_| encoded_size_overflow())?;
+    let maximum_tabs =
+        u64::try_from(MAX_TOTAL_OVERLAY_TABS).map_err(|_| encoded_size_overflow())?;
+    let normalized_bytes = projection.normalized_bytes.upper_bound()?;
+    Ok((
+        i128::from(maximum_live_overlays) - i128::from(live_overlays),
+        i128::from(maximum_tabs) - i128::from(tabs),
+        i128::from(normalized_byte_ceiling) - i128::from(normalized_bytes),
+    ))
+}
+
+fn build_backfill_dominance_index(
+    projection: AdmissionProjection,
+    candidates: &[ByteAdmissionCandidate],
+    pending_backfill: &[bool],
+    stats: &mut ByteAdmissionStats,
+) -> Result<BackfillDominanceIndex, PersistenceFailure> {
+    if stats.backfill_index_rebuilds == MAX_BACKFILL_INDEX_REBUILDS {
+        return Err(PersistenceFailure::corrupt(
+            "byte-admission collection shape changed more often than its bounded mutation model",
+        ));
+    }
+    stats.backfill_index_rebuilds += 1;
+    let points = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| pending_backfill[*index])
+        .map(|(index, candidate)| BackfillPoint::for_candidate(projection, index, candidate))
+        .collect::<Result<Vec<_>, _>>()?;
+    let index = BackfillDominanceIndex::build(points, candidates.len())?;
+    stats.backfill_index_entries_peak = stats
+        .backfill_index_entries_peak
+        .max(index.entry_count);
+    Ok(index)
+}
+
+fn restore_inclusion_maximal_subset(
+    base: AdmissionProjection,
+    candidates: &[ByteAdmissionCandidate],
+    aggregate: &mut AdmissionProjection,
+    remaining: &mut [bool],
+    pending_backfill: &mut [bool],
+    remaining_count: &mut usize,
+    maximum_bytes: u64,
+    stats: &mut ByteAdmissionStats,
+) -> Result<(), PersistenceFailure> {
+    let normalized_byte_ceiling = normalized_admission_ceiling(base, maximum_bytes)?;
+    let mut shape = AdmissionCollectionShape::from_projection(*aggregate)?;
+    let mut index =
+        build_backfill_dominance_index(*aggregate, candidates, pending_backfill, stats)?;
+
+    loop {
+        let (live_overlay_slack, tab_slack, byte_slack) =
+            admission_backfill_slack(*aggregate, normalized_byte_ceiling)?;
+        stats.backfill_queries = stats.backfill_queries.saturating_add(1);
+        let Some(candidate_index) =
+            index.query(live_overlay_slack, tab_slack, byte_slack)
+        else {
+            break;
+        };
+        if !pending_backfill[candidate_index] || remaining[candidate_index] {
+            return Err(PersistenceFailure::corrupt(
+                "dominance index selected a byte-admission candidate outside backfill",
+            ));
+        }
+
+        stats.backfill_candidate_trials =
+            stats.backfill_candidate_trials.saturating_add(1);
+        let mut projected = *aggregate;
+        projected.apply(&candidates[candidate_index])?;
+        let violation_mask = admission_violation_mask(base, projected, maximum_bytes, true)?;
+        index.remove(candidate_index)?;
+        pending_backfill[candidate_index] = false;
+
+        if violation_mask == 0 {
+            *aggregate = projected;
+            remaining[candidate_index] = true;
+            *remaining_count = remaining_count
+                .checked_add(1)
+                .ok_or_else(encoded_size_overflow)?;
+            let next_shape = AdmissionCollectionShape::from_projection(*aggregate)?;
+            if next_shape != shape {
+                shape = next_shape;
+                index = build_backfill_dominance_index(
+                    *aggregate,
+                    candidates,
+                    pending_backfill,
+                    stats,
+                )?;
+            }
+        } else if violation_mask & !MONOTONIC_ADMISSION_VIOLATIONS != 0 {
+            return Err(PersistenceFailure::corrupt(
+                "dominance index selected a candidate that violates a mixed-sign resource",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn select_compatible_candidate_subset(
     base: AdmissionProjection,
     candidates: &[ByteAdmissionCandidate],
     pending: &[usize],
     maximum_bytes: u64,
     force_write: bool,
-) -> Result<(AdmissionProjection, Vec<usize>, usize), PersistenceFailure> {
+) -> Result<CandidateSubsetSelection, PersistenceFailure> {
+    let mut stats = ByteAdmissionStats {
+        candidate_count: pending.len(),
+        ..ByteAdmissionStats::default()
+    };
     let mut aggregate = base;
     let mut remaining = vec![false; candidates.len()];
     let mut remaining_count = pending.len();
@@ -4537,7 +4986,12 @@ fn select_compatible_candidate_subset(
         force_write || remaining_count != 0,
     )?;
     if initial_violation_mask == 0 {
-        return Ok((aggregate, Vec::new(), remaining_count));
+        return Ok(CandidateSubsetSelection {
+            projection: aggregate,
+            rejected: Vec::new(),
+            accepted_count: remaining_count,
+            stats,
+        });
     }
 
     // The central isolation contract is exact, not heuristic: when one
@@ -4547,6 +5001,7 @@ fn select_compatible_candidate_subset(
     // multi-conflict selector to dismantle the valid remainder.
     let mut isolating_removal = None;
     for index in pending {
+        stats.leave_one_out_trials = stats.leave_one_out_trials.saturating_add(1);
         let mut without_candidate = aggregate;
         without_candidate.revert(&candidates[*index])?;
         if admission_violation_mask(
@@ -4570,21 +5025,21 @@ fn select_compatible_candidate_subset(
     }
     if let Some((_, index)) = isolating_removal {
         aggregate.revert(&candidates[index])?;
-        return Ok((
-            aggregate,
-            vec![index],
-            remaining_count
+        return Ok(CandidateSubsetSelection {
+            projection: aggregate,
+            rejected: vec![index],
+            accepted_count: remaining_count
                 .checked_sub(1)
                 .ok_or_else(encoded_size_inconsistent)?,
-        ));
+            stats,
+        });
     }
 
     // Seven resources and 128 possible supplier masks are fixed constants.
     // Each candidate enters at most seven heaps, each stale entry is popped
     // once, and each peel probes at most 7 * 128 heap heads. This keeps the
     // peel phase O(C log C) in the number of candidate lineages and prevents
-    // alternating byte/count violations from triggering rescans. The exact
-    // backfill below has a separately retained quadratic worst case.
+    // alternating byte/count violations from triggering rescans.
     let mut relief_heaps: Vec<Vec<RemovalHeap>> = (0..ADMISSION_RESOURCE_BITS.len())
         .map(|_| {
             (0..ADMISSION_SUPPORT_MASKS)
@@ -4662,40 +5117,41 @@ fn select_compatible_candidate_subset(
         remaining_count = remaining_count
             .checked_sub(1)
             .ok_or_else(encoded_size_inconsistent)?;
+        stats.peel_removals = stats.peel_removals.saturating_add(1);
         removed.push(index);
     }
 
     // A removed lineage can become individually admissible after a later
-    // reducer is restored. Cycle in deterministic reverse-removal order until
-    // one complete pass makes no progress. That terminal pass is an exact
-    // proof that every returned rejection is individually inadmissible against
-    // the final projection. Aggregate-valid and single-poison batches return
-    // above without entering this loop; ordinary multi-conflict batches often
-    // need only one pass, while adversarial mixed-sign dependency chains can
-    // require repeated passes and remain a retained performance nonclaim.
-    let mut deferred = removed.into_iter().rev().collect::<VecDeque<_>>();
-    let mut rejections_since_progress = 0usize;
-    while let Some(index) = deferred.pop_front() {
-        debug_assert!(!remaining[index]);
-        let mut projected = aggregate;
-        projected.apply(&candidates[index])?;
-        if admission_violation_mask(base, projected, maximum_bytes, true)? == 0 {
-            aggregate = projected;
-            remaining[index] = true;
-            remaining_count = remaining_count
-                .checked_add(1)
-                .ok_or_else(encoded_size_overflow)?;
-            rejections_since_progress = 0;
-        } else {
-            deferred.push_back(index);
-            rejections_since_progress = rejections_since_progress
-                .checked_add(1)
-                .ok_or_else(encoded_size_overflow)?;
-            if rejections_since_progress == deferred.len() {
-                break;
-            }
-        }
+    // reducer is restored. Exact cyclic rescanning makes an adversarial
+    // alternating dependency chain quadratic while the cross-process lock is
+    // held. The deletion-only dominance index instead asks whether any
+    // rejected point fits the three resources that can improve during
+    // backfill: live overlays, tabs, and the exact normalized-byte ceiling.
+    // Workspace, binding, and tombstone counts only grow, so a candidate that
+    // fails one of those dimensions is permanently rejected after one exact
+    // trial. Normalized and physical byte deltas are identical; their fixed
+    // base offset reduces the two byte predicates to one exact ceiling.
+    //
+    // The outer live-overlay tree and per-node tab-prefix/min-byte trees make
+    // build, deletion, and query O(C log^2 C) with O(C log C) memory. JSON
+    // separator deltas are stable until a collection crosses empty/nonempty;
+    // the mutation model permits at most two crossings per collection, so a
+    // fixed bounded number of complete index rebuilds preserves exact byte
+    // accounting without recurring candidate scans.
+    let mut pending_backfill = vec![false; candidates.len()];
+    for index in removed {
+        pending_backfill[index] = true;
     }
+    restore_inclusion_maximal_subset(
+        base,
+        candidates,
+        &mut aggregate,
+        &mut remaining,
+        &mut pending_backfill,
+        &mut remaining_count,
+        maximum_bytes,
+        &mut stats,
+    )?;
 
     let accepted_count = remaining_count;
     let final_violation_mask = admission_violation_mask(
@@ -4714,9 +5170,17 @@ fn select_compatible_candidate_subset(
             )));
     }
 
-    let mut removed = deferred.into_iter().collect::<Vec<_>>();
-    removed.sort_unstable();
-    Ok((aggregate, removed, accepted_count))
+    let rejected = pending
+        .iter()
+        .copied()
+        .filter(|index| !remaining[*index])
+        .collect::<Vec<_>>();
+    Ok(CandidateSubsetSelection {
+        projection: aggregate,
+        rejected,
+        accepted_count,
+        stats,
+    })
 }
 
 fn enforce_encoded_byte_admission(
@@ -4774,15 +5238,26 @@ fn enforce_encoded_byte_admission(
         counts: AdmissionCountBudget::from_state(state)?,
     };
     let pending = (0..candidates.len()).collect::<Vec<_>>();
-    let (projection, pending, _) = select_compatible_candidate_subset(
+    let CandidateSubsetSelection {
+        projection,
+        rejected,
+        accepted_count,
+        stats,
+    } = select_compatible_candidate_subset(
         base_projection,
         &candidates,
         &pending,
         maximum_bytes,
         force_write,
     )?;
+    if accepted_count.checked_add(rejected.len()) != Some(candidates.len()) {
+        return Err(PersistenceFailure::corrupt(
+            "byte-admission selector lost a candidate lineage",
+        ));
+    }
+    preflight.byte_admission = stats;
 
-    for index in pending {
+    for index in rejected {
         let candidate = &candidates[index];
         let mut projected = projection;
         projected.apply(candidate)?;
@@ -4841,6 +5316,7 @@ fn preflight_batch_with_byte_limit(
         accepted_bindings,
         rejected_bindings,
         encoded_upper_bound: 0,
+        byte_admission: ByteAdmissionStats::default(),
     };
     enforce_encoded_byte_admission(state, batch, &mut preflight, force_write, maximum_bytes)?;
     Ok(preflight)
@@ -5218,6 +5694,7 @@ fn commit_batch_with_byte_limit(
                 coalesced_updates,
                 rejected_updates,
             },
+            byte_admission: preflight.byte_admission,
             bindings,
             rejected_bindings,
             rejected_workspaces: preflight.rejected_workspaces,
@@ -5264,6 +5741,7 @@ fn commit_batch_with_byte_limit(
             coalesced_updates,
             rejected_updates,
         },
+        byte_admission: preflight.byte_admission,
         bindings,
         rejected_bindings,
         rejected_workspaces: preflight.rejected_workspaces,
