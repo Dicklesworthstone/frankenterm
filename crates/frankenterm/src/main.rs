@@ -31694,17 +31694,6 @@ mod watch_events_tests {
             run_watch_claim_async(async move {
                 let cx = frankenterm_core::cx::Cx::current()
                     .expect("test subprocess must expose its reactor-capable context");
-                let cancel_cx = cx.clone();
-                let cancellation = std::thread::Builder::new()
-                    .name("watch-claim-undrained-cancel".to_string())
-                    .spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        cancel_cx.cancel_with(
-                            frankenterm_core::outcome::CancelKind::Shutdown,
-                            Some("cancel isolated undrained claimed output"),
-                        );
-                    })
-                    .expect("spawn isolated cancellation requester");
                 let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
                     .await
                     .expect("open isolated claimed-output storage");
@@ -31714,13 +31703,33 @@ mod watch_events_tests {
                 let stdout = std::io::stdout();
                 let writer = WatchClaimStdoutWriter::new(&stdout)
                     .expect("prepare isolated nonblocking stdout");
+                let (output_started_tx, output_started_rx) = std::sync::mpsc::channel();
+                let cancel_cx = cx.clone();
+                let cancellation = std::thread::Builder::new()
+                    .name("watch-claim-undrained-cancel".to_string())
+                    .spawn(move || {
+                        output_started_rx
+                            .recv()
+                            .expect("wait for isolated output attempt");
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        cancel_cx.cancel_with(
+                            frankenterm_core::outcome::CancelKind::Shutdown,
+                            Some("cancel isolated undrained claimed output"),
+                        );
+                    })
+                    .expect("spawn isolated cancellation requester");
                 let output_cx = cx.clone();
                 let delivery = deliver_claimed_watch_event(
                     &cx,
                     &storage,
                     event_id,
                     record,
-                    move |line| async move { writer.write_and_flush(&output_cx, line).await },
+                    move |line| async move {
+                        output_started_tx
+                            .send(())
+                            .expect("signal isolated output attempt");
+                        writer.write_and_flush(&output_cx, line).await
+                    },
                 )
                 .await
                 .expect("isolated cancellation must return a typed delivery outcome");
@@ -31769,21 +31778,23 @@ mod watch_events_tests {
             .expect("spawn isolated undrained claimed-output test subprocess");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let settled_before_drain = loop {
+        let marker_connection = loop {
             match marker_listener.accept() {
-                Ok((_marker, _peer)) => break true,
+                Ok((marker, _peer)) => break Some(marker),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
-                        break false;
+                        break None;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(error) => panic!("isolated completion channel failed: {error}"),
             }
         };
+        let settled_before_drain = marker_connection.is_some();
         let output = child
             .wait_with_output()
             .expect("drain and join isolated claimed-output subprocess");
+        drop(marker_connection);
         assert!(
             settled_before_drain,
             "the child did not settle while its stdout pipe remained open and undrained; status={:?}, stderr={}",
