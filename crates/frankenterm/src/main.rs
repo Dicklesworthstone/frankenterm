@@ -31685,12 +31685,11 @@ mod watch_events_tests {
     #[test]
     fn claimed_output_undrained_pipe_subprocess_is_cancellation_bounded() {
         const CHILD_ENV: &str = "FT_TEST_WATCH_CLAIM_UNDRAINED_CHILD";
-        const MARKER_ENV: &str = "FT_TEST_WATCH_CLAIM_UNDRAINED_MARKER";
+        const MARKER_ENV: &str = "FT_TEST_WATCH_CLAIM_UNDRAINED_MARKER_ADDR";
 
         if std::env::var_os(CHILD_ENV).is_some() {
-            let marker = std::path::PathBuf::from(
-                std::env::var_os(MARKER_ENV).expect("child completion marker path"),
-            );
+            let marker_address = std::env::var(MARKER_ENV)
+                .expect("child completion marker address");
             let (_directory, database_path, event_ids) = watch_claim_fixture(1);
             run_watch_claim_async(async move {
                 let cx = frankenterm_core::cx::Cx::current()
@@ -31740,20 +31739,29 @@ mod watch_events_tests {
                     .await
                     .expect("shutdown isolated claimed-output storage");
             });
-            std::fs::write(marker, b"settled-before-drain")
+            let mut marker = std::net::TcpStream::connect(marker_address)
+                .expect("connect isolated completion channel");
+            marker
+                .write_all(b"settled-before-drain")
                 .expect("publish isolated completion marker");
             return;
         }
 
-        let directory = tempfile::tempdir().expect("create subprocess marker directory");
-        let marker = directory.path().join("claimed-output-settled.marker");
+        let marker_listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind isolated completion channel");
+        marker_listener
+            .set_nonblocking(true)
+            .expect("make isolated completion channel nonblocking");
+        let marker_address = marker_listener
+            .local_addr()
+            .expect("read isolated completion channel address");
         let executable = std::env::current_exe().expect("resolve current test executable");
         let child = std::process::Command::new(executable)
             .arg("claimed_output_undrained_pipe_subprocess_is_cancellation_bounded")
             .arg("--test-threads=1")
             .arg("--nocapture")
             .env(CHILD_ENV, "1")
-            .env(MARKER_ENV, &marker)
+            .env(MARKER_ENV, marker_address.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -31761,10 +31769,18 @@ mod watch_events_tests {
             .expect("spawn isolated undrained claimed-output test subprocess");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !marker.is_file() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let settled_before_drain = marker.is_file();
+        let settled_before_drain = loop {
+            match marker_listener.accept() {
+                Ok((_marker, _peer)) => break true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("isolated completion channel failed: {error}"),
+            }
+        };
         let output = child
             .wait_with_output()
             .expect("drain and join isolated claimed-output subprocess");
