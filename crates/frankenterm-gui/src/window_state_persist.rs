@@ -15397,10 +15397,17 @@ mod tests {
                     })
                 ),
                 std::cmp::Ordering::Equal => prop_assert_eq!(result, Ok(true)),
-                std::cmp::Ordering::Greater => prop_assert!(matches!(
-                    result,
-                    Err(PersistenceFailure::Invalid { .. })
-                )),
+                std::cmp::Ordering::Greater => {
+                    // Keep the struct-pattern tokens out of `prop_assert!`'s
+                    // implicit diagnostic format string.  On current nightly,
+                    // its `{ .. }` is otherwise parsed as a format placeholder.
+                    let future_epoch_is_invalid =
+                        matches!(result, Err(PersistenceFailure::Invalid { .. }));
+                    prop_assert!(
+                        future_epoch_is_invalid,
+                        "a future creation epoch must fail closed as invalid"
+                    );
+                }
             }
         }
 
