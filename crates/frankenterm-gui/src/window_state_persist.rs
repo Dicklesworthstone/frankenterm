@@ -47,6 +47,9 @@ const MAX_TABS_PER_OVERLAY: usize = 4_096;
 const MAX_TOTAL_OVERLAY_TABS: usize = 16_384;
 const MAX_PENDING_WAITERS: usize = 4_096;
 const MAX_CORRUPT_EVIDENCE_FILES: usize = 8;
+const INITIAL_ATTEMPT_SLOT_COUNT: usize = MAX_CORRUPT_EVIDENCE_FILES;
+const INITIAL_RETIREMENT_RECEIPT_SCHEMA_VERSION: u32 = 1;
+const MAX_INITIAL_RETIREMENT_RECEIPT_BYTES: u64 = 4 * 1024;
 const WRITE_DEBOUNCE: Duration = Duration::from_millis(25);
 
 /// Finite, privacy-safe diagnostic classification for persistence failures.
@@ -1136,6 +1139,33 @@ struct DiskSlotV2 {
 #[derive(Serialize)]
 struct BorrowedDiskSlot<'a> {
     payload: &'a PersistedState,
+    sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InitialRetirementReceipt {
+    schema_version: u32,
+    sequence: u64,
+    retired_count: u64,
+    retired_chain_sha256: [u8; 32],
+}
+
+impl Default for InitialRetirementReceipt {
+    fn default() -> Self {
+        Self {
+            schema_version: INITIAL_RETIREMENT_RECEIPT_SCHEMA_VERSION,
+            sequence: 0,
+            retired_count: 0,
+            retired_chain_sha256: [0; 32],
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InitialRetirementDiskReceipt {
+    payload: InitialRetirementReceipt,
     sha256: [u8; 32],
 }
 
@@ -5954,31 +5984,426 @@ fn write_inactive_slot(
     Ok(())
 }
 
+#[derive(Debug)]
+enum ReadInitialRetirementReceipt {
+    Missing,
+    Valid(InitialRetirementReceipt),
+    Corrupt(PersistenceFailure),
+}
+
+// First publication cannot use the primary/shadow journal until one authority
+// exists. UUID-named temporary files made every interruption consume a new
+// directory entry and eventually locked the writer out at the evidence cap.
+// The v2 first-publish protocol uses exactly eight deterministic candidate
+// slots. Before reusing an occupied slot it durably folds that candidate's
+// digest, encoded-validity bit, and length into a checksummed two-slot rolling
+// receipt. The old bytes are overwritten only after that receipt reaches the
+// directory durability barrier. Thus raw recent evidence, retirement history,
+// enumeration work, and disk growth are all bounded; no candidate without a
+// published primary path can become authority.
+
+#[derive(Debug)]
+struct LoadedInitialRetirementReceipt {
+    state: InitialRetirementReceipt,
+    target: PathBuf,
+}
+
+#[derive(Debug)]
+struct InitialAttemptChoice {
+    candidate: PathBuf,
+    occupied: bool,
+    retirement: Option<LoadedInitialRetirementReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetiredInitialAttempt {
+    receipt: InitialRetirementReceipt,
+    candidate_had_valid_encoding: bool,
+}
+
+fn initial_attempt_path(primary_path: &Path, index: usize) -> PathBuf {
+    let name = primary_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("window-state.json");
+    primary_path.with_file_name(format!("{name}.initial-v2-attempt-{index:02}"))
+}
+
+fn initial_retirement_receipt_path(
+    primary_path: &Path,
+    index: usize,
+    side: SlotPosition,
+) -> PathBuf {
+    let attempt = initial_attempt_path(primary_path, index);
+    let name = attempt
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("window-state.json.initial-v2-attempt");
+    let suffix = match side {
+        SlotPosition::Primary => "a",
+        SlotPosition::Shadow => "b",
+    };
+    attempt.with_file_name(format!("{name}.retirement-{suffix}"))
+}
+
+fn validate_initial_retirement_receipt(
+    receipt: &InitialRetirementReceipt,
+) -> Result<(), PersistenceFailure> {
+    if receipt.schema_version != INITIAL_RETIREMENT_RECEIPT_SCHEMA_VERSION {
+        return Err(PersistenceFailure::corrupt(
+            "initial retirement receipt has an unsupported schema",
+        ));
+    }
+    if receipt.sequence == 0 || receipt.retired_count == 0 {
+        return Err(PersistenceFailure::corrupt(
+            "published initial retirement receipt uses a reserved zero counter",
+        ));
+    }
+    if receipt.sequence != receipt.retired_count {
+        return Err(PersistenceFailure::corrupt(
+            "initial retirement receipt counters disagree",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_initial_retirement_receipt(
+    receipt: InitialRetirementReceipt,
+) -> Result<Vec<u8>, PersistenceFailure> {
+    validate_initial_retirement_receipt(&receipt)?;
+    let payload = serde_json::to_vec(&receipt).map_err(|_| {
+        PersistenceFailure::corrupt("could not serialize initial retirement receipt")
+    })?;
+    let sha256: [u8; 32] = Sha256::digest(&payload).into();
+    let encoded = serde_json::to_vec(&InitialRetirementDiskReceipt {
+        payload: receipt,
+        sha256,
+    })
+    .map_err(|_| PersistenceFailure::corrupt("could not encode initial retirement receipt"))?;
+    let actual = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    if actual > MAX_INITIAL_RETIREMENT_RECEIPT_BYTES {
+        return Err(PersistenceFailure::Oversized {
+            actual,
+            maximum: MAX_INITIAL_RETIREMENT_RECEIPT_BYTES,
+        });
+    }
+    Ok(encoded)
+}
+
+fn read_initial_retirement_receipt(
+    path: &Path,
+) -> Result<ReadInitialRetirementReceipt, PersistenceFailure> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ReadInitialRetirementReceipt::Missing);
+        }
+        Err(error) => {
+            return Err(PersistenceFailure::io(
+                "inspect initial retirement receipt",
+                error,
+            ));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(ReadInitialRetirementReceipt::Corrupt(
+            PersistenceFailure::corrupt("initial retirement receipt is not a regular file"),
+        ));
+    }
+    if metadata.len() > MAX_INITIAL_RETIREMENT_RECEIPT_BYTES {
+        return Ok(ReadInitialRetirementReceipt::Corrupt(
+            PersistenceFailure::Oversized {
+                actual: metadata.len(),
+                maximum: MAX_INITIAL_RETIREMENT_RECEIPT_BYTES,
+            },
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    File::open(path)
+        .map_err(|error| PersistenceFailure::io("open initial retirement receipt", error))?
+        .take(MAX_INITIAL_RETIREMENT_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| PersistenceFailure::io("read initial retirement receipt", error))?;
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual > MAX_INITIAL_RETIREMENT_RECEIPT_BYTES {
+        return Ok(ReadInitialRetirementReceipt::Corrupt(
+            PersistenceFailure::Oversized {
+                actual,
+                maximum: MAX_INITIAL_RETIREMENT_RECEIPT_BYTES,
+            },
+        ));
+    }
+    let disk = match serde_json::from_slice::<InitialRetirementDiskReceipt>(&bytes) {
+        Ok(disk) => disk,
+        Err(_) => {
+            return Ok(ReadInitialRetirementReceipt::Corrupt(
+                PersistenceFailure::corrupt("initial retirement receipt is invalid"),
+            ));
+        }
+    };
+    let payload = serde_json::to_vec(&disk.payload)
+        .map_err(|_| PersistenceFailure::corrupt("could not verify initial retirement receipt"))?;
+    let expected: [u8; 32] = Sha256::digest(&payload).into();
+    if expected != disk.sha256 {
+        return Ok(ReadInitialRetirementReceipt::Corrupt(
+            PersistenceFailure::corrupt("initial retirement receipt checksum mismatch"),
+        ));
+    }
+    match validate_initial_retirement_receipt(&disk.payload) {
+        Ok(()) => Ok(ReadInitialRetirementReceipt::Valid(disk.payload)),
+        Err(failure) => Ok(ReadInitialRetirementReceipt::Corrupt(failure)),
+    }
+}
+
+fn load_initial_retirement_receipt(
+    primary_path: &Path,
+    index: usize,
+) -> Result<LoadedInitialRetirementReceipt, PersistenceFailure> {
+    let left_path = initial_retirement_receipt_path(primary_path, index, SlotPosition::Primary);
+    let right_path = initial_retirement_receipt_path(primary_path, index, SlotPosition::Shadow);
+    let left = read_initial_retirement_receipt(&left_path)?;
+    let right = read_initial_retirement_receipt(&right_path)?;
+    match (left, right) {
+        (ReadInitialRetirementReceipt::Missing, ReadInitialRetirementReceipt::Missing) => {
+            Ok(LoadedInitialRetirementReceipt {
+                state: InitialRetirementReceipt::default(),
+                target: left_path,
+            })
+        }
+        (ReadInitialRetirementReceipt::Valid(state), ReadInitialRetirementReceipt::Missing)
+        | (ReadInitialRetirementReceipt::Valid(state), ReadInitialRetirementReceipt::Corrupt(_)) => {
+            Ok(LoadedInitialRetirementReceipt {
+                state,
+                target: right_path,
+            })
+        }
+        (ReadInitialRetirementReceipt::Missing, ReadInitialRetirementReceipt::Valid(state))
+        | (ReadInitialRetirementReceipt::Corrupt(_), ReadInitialRetirementReceipt::Valid(state)) => {
+            Ok(LoadedInitialRetirementReceipt {
+                state,
+                target: left_path,
+            })
+        }
+        (ReadInitialRetirementReceipt::Valid(left), ReadInitialRetirementReceipt::Valid(right)) => {
+            if left.sequence > right.sequence {
+                Ok(LoadedInitialRetirementReceipt {
+                    state: left,
+                    target: right_path,
+                })
+            } else if right.sequence > left.sequence {
+                Ok(LoadedInitialRetirementReceipt {
+                    state: right,
+                    target: left_path,
+                })
+            } else if left == right {
+                Ok(LoadedInitialRetirementReceipt {
+                    state: left,
+                    target: right_path,
+                })
+            } else {
+                Err(PersistenceFailure::corrupt(
+                    "initial retirement receipts disagree at one sequence",
+                ))
+            }
+        }
+        (ReadInitialRetirementReceipt::Corrupt(_), ReadInitialRetirementReceipt::Missing) => {
+            // A receipt must validate and cross the directory durability
+            // barrier before this protocol mutates its candidate. Therefore a
+            // corrupt sole receipt never authorized an overwrite. Restart the
+            // chain in the missing peer so the corrupt bytes remain available
+            // until the new receipt is itself durable.
+            Ok(LoadedInitialRetirementReceipt {
+                state: InitialRetirementReceipt::default(),
+                target: right_path,
+            })
+        }
+        (ReadInitialRetirementReceipt::Missing, ReadInitialRetirementReceipt::Corrupt(_)) => {
+            Ok(LoadedInitialRetirementReceipt {
+                state: InitialRetirementReceipt::default(),
+                target: left_path,
+            })
+        }
+        (ReadInitialRetirementReceipt::Corrupt(left), ReadInitialRetirementReceipt::Corrupt(_)) => {
+            Err(left)
+        }
+    }
+}
+
+fn initial_attempt_is_occupied(path: &Path) -> Result<bool, PersistenceFailure> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(PersistenceFailure::corrupt(
+            "initial attempt slot is not a regular file",
+        )),
+        Ok(metadata) if metadata.len() > MAX_STATE_FILE_BYTES => {
+            Err(PersistenceFailure::Oversized {
+                actual: metadata.len(),
+                maximum: MAX_STATE_FILE_BYTES,
+            })
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(PersistenceFailure::io(
+            "inspect initial attempt slot",
+            error,
+        )),
+    }
+}
+
+fn choose_initial_attempt_slot(
+    primary_path: &Path,
+) -> Result<InitialAttemptChoice, PersistenceFailure> {
+    let mut occupied = Vec::with_capacity(INITIAL_ATTEMPT_SLOT_COUNT);
+    let mut first_failure = None;
+    for index in 0..INITIAL_ATTEMPT_SLOT_COUNT {
+        let candidate = initial_attempt_path(primary_path, index);
+        match initial_attempt_is_occupied(&candidate) {
+            Ok(false) => {
+                return Ok(InitialAttemptChoice {
+                    candidate,
+                    occupied: false,
+                    retirement: None,
+                });
+            }
+            Ok(true) => {}
+            Err(failure) => {
+                // One malformed fixed slot must not turn into a permanent
+                // writer-wide denial of service while another bounded slot is
+                // usable. Preserve the first exact failure in case all eight
+                // slots are unusable.
+                first_failure.get_or_insert(failure);
+                continue;
+            }
+        }
+        match load_initial_retirement_receipt(primary_path, index) {
+            Ok(retirement) => occupied.push((retirement.state.retired_count, index, retirement)),
+            Err(failure) => {
+                first_failure.get_or_insert(failure);
+            }
+        }
+    }
+    let Some((_, index, retirement)) = occupied
+        .into_iter()
+        .min_by_key(|(retired_count, index, _)| (*retired_count, *index))
+    else {
+        return Err(first_failure.unwrap_or_else(|| {
+            PersistenceFailure::corrupt("no reusable initial attempt slot is available")
+        }));
+    };
+    Ok(InitialAttemptChoice {
+        candidate: initial_attempt_path(primary_path, index),
+        occupied: true,
+        retirement: Some(retirement),
+    })
+}
+
+fn read_initial_attempt_bytes(path: &Path) -> Result<Vec<u8>, PersistenceFailure> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| PersistenceFailure::io("inspect retired initial attempt", error))?;
+    if !metadata.file_type().is_file() {
+        return Err(PersistenceFailure::corrupt(
+            "retired initial attempt is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_STATE_FILE_BYTES {
+        return Err(PersistenceFailure::Oversized {
+            actual: metadata.len(),
+            maximum: MAX_STATE_FILE_BYTES,
+        });
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    File::open(path)
+        .map_err(|error| PersistenceFailure::io("open retired initial attempt", error))?
+        .take(MAX_STATE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| PersistenceFailure::io("read retired initial attempt", error))?;
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual > MAX_STATE_FILE_BYTES {
+        return Err(PersistenceFailure::Oversized {
+            actual,
+            maximum: MAX_STATE_FILE_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+fn initial_attempt_has_valid_current_encoding(bytes: &[u8]) -> bool {
+    let Ok(disk) = serde_json::from_slice::<DiskSlot>(bytes) else {
+        return false;
+    };
+    let Ok(payload) = serde_json::to_vec(&disk.payload) else {
+        return false;
+    };
+    let expected: [u8; 32] = Sha256::digest(&payload).into();
+    expected == disk.sha256 && validate_published_state(&disk.payload).is_ok()
+}
+
+fn retire_initial_attempt(
+    choice: &InitialAttemptChoice,
+) -> Result<RetiredInitialAttempt, PersistenceFailure> {
+    let retirement = choice.retirement.as_ref().ok_or_else(|| {
+        PersistenceFailure::corrupt("occupied initial attempt has no retirement authority")
+    })?;
+    let bytes = read_initial_attempt_bytes(&choice.candidate)?;
+    let candidate_digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let candidate_had_valid_encoding = initial_attempt_has_valid_current_encoding(&bytes);
+    let sequence = retirement
+        .state
+        .sequence
+        .checked_add(1)
+        .ok_or(PersistenceFailure::RevisionExhausted)?;
+    let retired_count = retirement
+        .state
+        .retired_count
+        .checked_add(1)
+        .ok_or(PersistenceFailure::RevisionExhausted)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankenterm.initial-retirement-chain.v1");
+    hasher.update(retirement.state.retired_chain_sha256);
+    hasher.update(candidate_digest);
+    hasher.update([u8::from(candidate_had_valid_encoding)]);
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    let next = InitialRetirementReceipt {
+        schema_version: INITIAL_RETIREMENT_RECEIPT_SCHEMA_VERSION,
+        sequence,
+        retired_count,
+        retired_chain_sha256: hasher.finalize().into(),
+    };
+    let encoded = encode_initial_retirement_receipt(next)?;
+    write_inactive_slot(&retirement.target, &encoded, WriteInterruption::None)?;
+    Ok(RetiredInitialAttempt {
+        receipt: next,
+        candidate_had_valid_encoding,
+    })
+}
+
 fn write_initial_slot(
     path: &Path,
     bytes: &[u8],
     interruption: WriteInterruption,
+    telemetry: &mut PersistenceLockTelemetry,
 ) -> Result<(), PersistenceFailure> {
     let _ = interruption;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
         .map_err(|error| PersistenceFailure::io("create state directory", error))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("window-state.json");
-    let prefix = format!("{name}.initial-");
-    let retained = count_retained_evidence(parent, &prefix, "list initial-state evidence")?;
-    if retained >= MAX_CORRUPT_EVIDENCE_FILES {
-        return Err(PersistenceFailure::quota(format!(
-            "initial-state evidence count reached {MAX_CORRUPT_EVIDENCE_FILES}"
-        )));
+    telemetry.initial_publish_attempt();
+    let choice = choose_initial_attempt_slot(path)?;
+    if choice.occupied {
+        let retired = retire_initial_attempt(&choice)?;
+        telemetry.initial_attempt_retirement(
+            retired.receipt.retired_count,
+            retired.candidate_had_valid_encoding,
+        );
     }
-    let temporary = path.with_file_name(format!("{prefix}{}", uuid::Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if choice.occupied {
+        options.truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut file = options
+        .open(&choice.candidate)
         .map_err(|error| PersistenceFailure::io("create initial state slot", error))?;
     #[cfg(test)]
     if interruption == WriteInterruption::AfterTruncate {
@@ -6010,7 +6435,7 @@ fn write_initial_slot(
             "injected crash before initial slot publish",
         ));
     }
-    std::fs::rename(&temporary, path)
+    std::fs::rename(&choice.candidate, path)
         .map_err(|error| PersistenceFailure::io("publish initial state slot", error))?;
     sync_parent_directory(path)?;
     #[cfg(test)]
@@ -6052,6 +6477,9 @@ struct PersistenceLockTelemetry {
     acquired_at: Option<Instant>,
     byte_admission: Option<ByteAdmissionStats>,
     creation_epoch_compaction: Option<usize>,
+    initial_publish_attempt: bool,
+    initial_retirement_count: Option<u64>,
+    initial_retirement_had_valid_encoding: bool,
 }
 
 impl PersistenceLockTelemetry {
@@ -6061,6 +6489,9 @@ impl PersistenceLockTelemetry {
             acquired_at: None,
             byte_admission: None,
             creation_epoch_compaction: None,
+            initial_publish_attempt: false,
+            initial_retirement_count: None,
+            initial_retirement_had_valid_encoding: false,
         }
     }
 
@@ -6074,6 +6505,15 @@ impl PersistenceLockTelemetry {
 
     fn creation_epoch_compaction(&mut self, compacted_tombstones: usize) {
         self.creation_epoch_compaction = Some(compacted_tombstones);
+    }
+
+    fn initial_publish_attempt(&mut self) {
+        self.initial_publish_attempt = true;
+    }
+
+    fn initial_attempt_retirement(&mut self, retired_count: u64, had_valid_encoding: bool) {
+        self.initial_retirement_count = Some(retired_count);
+        self.initial_retirement_had_valid_encoding = had_valid_encoding;
     }
 }
 
@@ -6109,6 +6549,21 @@ impl Drop for PersistenceLockTelemetry {
             metrics::counter!("window_state.creation_epoch.compaction_attempts").increment(1);
             metrics::histogram!("window_state.creation_epoch.compacted_tombstones")
                 .record(u64::try_from(compacted_tombstones).unwrap_or(u64::MAX));
+        }
+        if self.initial_publish_attempt {
+            metrics::counter!("window_state.initial_publish.attempts").increment(1);
+        }
+        if let Some(retired_count) = self.initial_retirement_count {
+            metrics::counter!("window_state.initial_publish.attempt_retirements").increment(1);
+            metrics::histogram!("window_state.initial_publish.slot_retired_count")
+                .record(retired_count);
+            if self.initial_retirement_had_valid_encoding {
+                metrics::counter!("window_state.initial_publish.retired_valid_encodings")
+                    .increment(1);
+            } else {
+                metrics::counter!("window_state.initial_publish.retired_invalid_encodings")
+                    .increment(1);
+            }
         }
     }
 }
@@ -6260,7 +6715,7 @@ fn commit_batch_with_byte_limit(
         quarantine_corrupt_evidence(evidence)?;
     }
     if source == StoreSource::Empty {
-        write_initial_slot(primary_path, &encoded, interruption)?;
+        write_initial_slot(primary_path, &encoded, interruption, &mut lock_telemetry)?;
     } else {
         write_inactive_slot(&loaded.target, &encoded, interruption)?;
     }
@@ -13759,6 +14214,413 @@ mod tests {
                 .expect("load committed first generation")
                 .window_states["default"]
                 .maximized
+        );
+    }
+
+    #[test]
+    fn repeated_first_publish_interruptions_remain_bounded_and_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut first = PendingBatch::default();
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue bounded first-publish state");
+        let interruption_count = INITIAL_ATTEMPT_SLOT_COUNT
+            .checked_mul(3)
+            .and_then(|count| count.checked_add(5))
+            .expect("bounded interruption count fits usize");
+        let interruptions = [
+            WriteInterruption::AfterTruncate,
+            WriteInterruption::AfterPartialWrite,
+            WriteInterruption::AfterFullWrite,
+            WriteInterruption::AfterSync,
+        ];
+        for index in 0..interruption_count {
+            let interruption = interruptions[index % interruptions.len()];
+            assert_eq!(
+                commit_for_test(&path, &first, interruption)
+                    .expect_err("inject repeated first-publish interruption")
+                    .code(),
+                PersistenceFailureCode::Io
+            );
+            let empty = load_snapshot_at(&path).expect("unpublished attempts are not authority");
+            assert_eq!(empty.source, StoreSource::Empty);
+            assert!(empty.window_states.is_empty());
+        }
+
+        assert_eq!(
+            commit_for_test(&path, &first, WriteInterruption::AfterDirectorySync)
+                .expect_err("inject acknowledgement loss after the recovered first publish")
+                .code(),
+            PersistenceFailureCode::Io
+        );
+        let published = load_snapshot_at(&path).expect("load recovered first generation");
+        assert_eq!(published.source, StoreSource::Primary);
+        assert_eq!(published.store_revision, 1);
+        assert!(published.degraded_recovery);
+        assert!(published.window_states["default"].maximized);
+
+        let healthy = commit_for_test(&path, &first, WriteInterruption::None)
+            .expect("healthy retry adopts and repairs the directory-synced authority");
+        assert!(healthy.receipt.wrote_new_generation);
+        assert_eq!(healthy.receipt.store_revision, 2);
+        assert!(
+            !load_snapshot_at(&path)
+                .expect("load repaired redundant authority")
+                .degraded_recovery
+        );
+
+        let mut candidate_files = 0usize;
+        let mut receipt_files = 0usize;
+        for entry in std::fs::read_dir(temp.path()).expect("list bounded test authority") {
+            let name = entry
+                .expect("read bounded test entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if name.contains(".initial-v2-attempt-") {
+                if name.contains(".retirement-") {
+                    receipt_files = receipt_files.saturating_add(1);
+                } else {
+                    candidate_files = candidate_files.saturating_add(1);
+                }
+            }
+        }
+        assert!(candidate_files < INITIAL_ATTEMPT_SLOT_COUNT);
+        assert!(receipt_files <= INITIAL_ATTEMPT_SLOT_COUNT.saturating_mul(2));
+
+        let total_retired = (0..INITIAL_ATTEMPT_SLOT_COUNT)
+            .map(|index| {
+                load_initial_retirement_receipt(&path, index)
+                    .map(|loaded| loaded.state.retired_count)
+            })
+            .try_fold(0u64, |total, retired| {
+                total
+                    .checked_add(retired?)
+                    .ok_or_else(|| PersistenceFailure::corrupt("test retirement count overflowed"))
+            })
+            .expect("sum bounded retirement receipts");
+        let expected_retired = u64::try_from(
+            interruption_count
+                .checked_add(1)
+                .and_then(|attempts| attempts.checked_sub(INITIAL_ATTEMPT_SLOT_COUNT))
+                .expect("expected retirement count fits usize"),
+        )
+        .expect("expected retirement count fits u64");
+        assert_eq!(total_retired, expected_retired);
+        eprintln!(
+            "window_state_persist initial recovery: interrupted={} candidates={} receipts={} retired={} published_revision={}",
+            interruption_count,
+            candidate_files,
+            receipt_files,
+            total_retired,
+            published.store_revision
+        );
+    }
+
+    #[test]
+    fn initial_retirement_receipt_recovers_one_peer_and_rejects_split_brain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let left = initial_retirement_receipt_path(&path, 0, SlotPosition::Primary);
+        let right = initial_retirement_receipt_path(&path, 0, SlotPosition::Shadow);
+        let first = InitialRetirementReceipt {
+            schema_version: INITIAL_RETIREMENT_RECEIPT_SCHEMA_VERSION,
+            sequence: 1,
+            retired_count: 1,
+            retired_chain_sha256: [0x11; 32],
+        };
+        write_inactive_slot(
+            &left,
+            &encode_initial_retirement_receipt(first).expect("encode first receipt"),
+            WriteInterruption::None,
+        )
+        .expect("write first receipt");
+        std::fs::write(&right, b"truncated receipt").expect("write corrupt peer");
+
+        let recovered = load_initial_retirement_receipt(&path, 0)
+            .expect("one valid receipt remains authoritative");
+        assert_eq!(recovered.state, first);
+        assert_eq!(recovered.target, right);
+
+        let second = InitialRetirementReceipt {
+            schema_version: INITIAL_RETIREMENT_RECEIPT_SCHEMA_VERSION,
+            sequence: 2,
+            retired_count: 2,
+            retired_chain_sha256: [0x22; 32],
+        };
+        write_inactive_slot(
+            &recovered.target,
+            &encode_initial_retirement_receipt(second).expect("encode successor receipt"),
+            WriteInterruption::None,
+        )
+        .expect("repair corrupt peer with successor");
+        let advanced = load_initial_retirement_receipt(&path, 0)
+            .expect("higher receipt sequence becomes authoritative");
+        assert_eq!(advanced.state, second);
+        assert_eq!(advanced.target, left);
+
+        let conflicting = InitialRetirementReceipt {
+            retired_chain_sha256: [0x33; 32],
+            ..second
+        };
+        write_inactive_slot(
+            &advanced.target,
+            &encode_initial_retirement_receipt(conflicting).expect("encode conflicting receipt"),
+            WriteInterruption::None,
+        )
+        .expect("write same-sequence conflict");
+        assert_eq!(
+            load_initial_retirement_receipt(&path, 0)
+                .expect_err("same-sequence disagreement must fail closed")
+                .code(),
+            PersistenceFailureCode::Corrupt
+        );
+    }
+
+    #[test]
+    fn retirement_receipt_write_faults_leave_candidate_recoverable() {
+        for interruption in [
+            WriteInterruption::AfterTruncate,
+            WriteInterruption::AfterPartialWrite,
+            WriteInterruption::AfterFullWrite,
+            WriteInterruption::AfterSync,
+            WriteInterruption::AfterDirectorySync,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("window-state.json");
+            let candidate = initial_attempt_path(&path, 0);
+            let candidate_bytes = b"bounded interrupted initial candidate";
+            std::fs::write(&candidate, candidate_bytes).expect("write candidate");
+
+            let first = InitialRetirementReceipt {
+                schema_version: INITIAL_RETIREMENT_RECEIPT_SCHEMA_VERSION,
+                sequence: 1,
+                retired_count: 1,
+                retired_chain_sha256: [0x41; 32],
+            };
+            let left = initial_retirement_receipt_path(&path, 0, SlotPosition::Primary);
+            write_inactive_slot(
+                &left,
+                &encode_initial_retirement_receipt(first).expect("encode first receipt"),
+                WriteInterruption::None,
+            )
+            .expect("write first receipt");
+            let target = load_initial_retirement_receipt(&path, 0)
+                .expect("load first receipt")
+                .target;
+            let second = InitialRetirementReceipt {
+                schema_version: INITIAL_RETIREMENT_RECEIPT_SCHEMA_VERSION,
+                sequence: 2,
+                retired_count: 2,
+                retired_chain_sha256: [0x42; 32],
+            };
+            assert_eq!(
+                write_inactive_slot(
+                    &target,
+                    &encode_initial_retirement_receipt(second).expect("encode second receipt"),
+                    interruption,
+                )
+                .expect_err("inject receipt write fault")
+                .code(),
+                PersistenceFailureCode::Io
+            );
+            let after_fault =
+                std::fs::read(&candidate).expect("receipt fault leaves candidate untouched");
+            assert_eq!(after_fault.as_slice(), candidate_bytes);
+
+            let recovered = load_initial_retirement_receipt(&path, 0)
+                .expect("at least one complete receipt survives every injected fault");
+            assert!(recovered.state == first || recovered.state == second);
+            let choice = InitialAttemptChoice {
+                candidate: candidate.clone(),
+                occupied: true,
+                retirement: Some(recovered),
+            };
+            let retired = retire_initial_attempt(&choice)
+                .expect("a later healthy retirement crosses its durability barrier");
+            assert!(retired.receipt.sequence >= 2);
+            let after_retirement =
+                std::fs::read(&candidate).expect("retirement precedes candidate mutation");
+            assert_eq!(after_retirement.as_slice(), candidate_bytes);
+        }
+    }
+
+    #[test]
+    fn corrupt_first_receipt_restarts_in_peer_without_exposing_candidate_content() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let candidate = initial_attempt_path(&path, 0);
+        let sensitive_candidate = b"credential_value_that_must_not_escape";
+        std::fs::write(&candidate, sensitive_candidate).expect("write interrupted candidate");
+        let corrupt = initial_retirement_receipt_path(&path, 0, SlotPosition::Primary);
+        let peer = initial_retirement_receipt_path(&path, 0, SlotPosition::Shadow);
+        std::fs::write(&corrupt, b"partial receipt").expect("write interrupted first receipt");
+
+        let choice = choose_initial_attempt_slot(&path)
+            .expect("corrupt first receipt can restart in its missing peer");
+        assert!(choice.occupied);
+        assert_eq!(choice.candidate, candidate);
+        assert_eq!(
+            choice
+                .retirement
+                .as_ref()
+                .expect("occupied candidate has retirement state")
+                .target,
+            peer
+        );
+        let retired = retire_initial_attempt(&choice).expect("retire candidate into valid peer");
+        assert_eq!(retired.receipt.sequence, 1);
+        assert_eq!(retired.receipt.retired_count, 1);
+        assert!(!retired.candidate_had_valid_encoding);
+        let retained_candidate =
+            std::fs::read(&candidate).expect("candidate remains until caller overwrites it");
+        assert_eq!(retained_candidate.as_slice(), sensitive_candidate);
+        let retained_corrupt =
+            std::fs::read(&corrupt).expect("corrupt forensic peer remains retained");
+        assert_eq!(retained_corrupt.as_slice(), b"partial receipt");
+
+        let encoded = std::fs::read(&peer).expect("read durable retirement receipt");
+        assert!(
+            encoded.len()
+                <= usize::try_from(MAX_INITIAL_RETIREMENT_RECEIPT_BYTES)
+                    .expect("receipt limit fits usize")
+        );
+        assert!(
+            !encoded
+                .windows(sensitive_candidate.len())
+                .any(|window| window == sensitive_candidate),
+            "retirement receipts must contain only a digest, counters, and finite metadata"
+        );
+        let disk: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("receipt is valid JSON");
+        let top = disk.as_object().expect("receipt is an object");
+        assert_eq!(top.len(), 2);
+        assert!(top.contains_key("payload"));
+        assert!(top.contains_key("sha256"));
+        let payload = top
+            .get("payload")
+            .and_then(serde_json::Value::as_object)
+            .expect("payload is an object");
+        assert_eq!(payload.len(), 4);
+        for field in [
+            "schema_version",
+            "sequence",
+            "retired_count",
+            "retired_chain_sha256",
+        ] {
+            assert!(payload.contains_key(field), "missing finite field {field}");
+        }
+    }
+
+    #[test]
+    fn malformed_fixed_attempt_does_not_block_another_bounded_slot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let malformed = initial_attempt_path(&path, 0);
+        std::fs::create_dir(&malformed).expect("create non-regular fixed slot");
+
+        let mut first = PendingBatch::default();
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue first publish around malformed slot");
+        let committed = commit_for_test(&path, &first, WriteInterruption::None)
+            .expect("a malformed slot must not deny all bounded slots");
+        assert!(committed.receipt.wrote_new_generation);
+        assert!(malformed.is_dir());
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load authority published through another slot")
+                .window_states["default"]
+                .fullscreen
+        );
+    }
+
+    #[test]
+    fn saturated_legacy_initial_artifacts_no_longer_lock_out_healthy_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        for index in 0..MAX_CORRUPT_EVIDENCE_FILES {
+            let legacy = path.with_file_name(format!("window-state.json.initial-legacy-{index}"));
+            std::fs::write(legacy, [u8::try_from(index).expect("legacy index fits u8")])
+                .expect("write saturated legacy initial artifact");
+        }
+        assert_eq!(
+            count_retained_evidence(
+                temp.path(),
+                "window-state.json.initial-",
+                "count saturated legacy artifacts",
+            )
+            .expect("count saturated legacy artifacts"),
+            MAX_CORRUPT_EVIDENCE_FILES
+        );
+
+        let mut first = PendingBatch::default();
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue post-legacy-saturation publish");
+        let committed = commit_for_test(&path, &first, WriteInterruption::None)
+            .expect("fixed attempt slots bypass legacy quota lockout");
+        assert!(committed.receipt.wrote_new_generation);
+        assert!(
+            load_snapshot_at(&path)
+                .expect("load post-legacy-saturation authority")
+                .window_states["default"]
+                .fullscreen
+        );
+    }
+
+    #[test]
+    fn directory_synced_first_publish_acknowledgement_loss_replays_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut first = PendingBatch::default();
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue directory-synced first publish");
+        assert_eq!(
+            commit_for_test(&path, &first, WriteInterruption::AfterDirectorySync)
+                .expect_err("inject first-publish acknowledgement loss")
+                .code(),
+            PersistenceFailureCode::Io
+        );
+        let published = load_snapshot_at(&path).expect("directory-synced authority is visible");
+        assert_eq!(published.store_revision, 1);
+        assert!(published.window_states["default"].maximized);
+        assert!(published.window_states["default"].fullscreen);
+
+        let replay = commit_for_test(&path, &first, WriteInterruption::None)
+            .expect("replay exact directory-synced first publish");
+        assert!(replay.receipt.wrote_new_generation);
+        assert_eq!(replay.receipt.store_revision, 2);
+        assert!(
+            !load_snapshot_at(&path)
+                .expect("load redundancy-repaired first authority")
+                .degraded_recovery
         );
     }
 

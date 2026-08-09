@@ -3530,6 +3530,40 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace the monotonic epoch fence only after another bounded deterministic authority proves exact no-resurrection for every delayed create and update across unlimited churn, crash/restart, concurrent writers, migration, and namespace exhaustion without probabilistic false negatives or random-ID assumptions.
 
+### IS-N124 — Unique first-publish artifacts plus a shared evidence cap cannot guarantee recovery
+
+- **Classification:** crash-liveness and bounded-storage design rejection;
+  fixed-slot durable retirement retained
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.8`
+- **Rejected inference:** preserving every interrupted first-publish attempt under
+  a unique filename and refusing new attempts at the corrupt-evidence cap is a
+  fail-closed forensic policy rather than a permanent availability failure.
+- **Negative evidence:** before either journal slot exists, each truncate,
+  partial-write, complete-unsynced, or synced-unpublished interruption left a
+  new `window-state.json.initial-<uuid>` file. The loader could authorize none
+  of those paths, the writer could retire none of them, and the ninth attempt
+  failed at the shared eight-file quota even if it was healthy. Every retry
+  also enumerated the state directory while holding the cross-process writer
+  lock. The cap bounded bytes only by permanently denying the first durable
+  authority; unique names did not provide crash recovery.
+- **Decision:** use exactly eight deterministic candidate paths. Before an
+  occupied candidate is reused, fold its digest, validated-encoding bit, and
+  byte length into a checksummed two-slot receipt chain and cross both file and
+  directory durability barriers. Only then may the worker truncate that fixed
+  candidate. One valid receipt repairs a missing or corrupt peer; equal-sequence
+  disagreement fails closed; a corrupt sole first receipt restarts in its
+  missing peer without mutating the candidate; malformed candidates are skipped
+  while another fixed slot remains usable. The primary path remains the only
+  first-generation authority, so complete but unpublished candidate bytes are
+  never adopted. Source tests cover 29 consecutive pre-publication failures,
+  directory-sync acknowledgement loss, healthy retry, receipt-write faults,
+  split brain, legacy-quota saturation, malformed slots, privacy, and fixed
+  artifact counts. Strict-remote execution remains absent because RCH refused
+  local fallback while every worker was unreachable; no runtime durability or
+  performance claim follows yet.
+- **Primary retry condition:**
+  > Replace fixed candidates plus durable retirement receipts only after another protocol proves unlimited interruption recovery, finite privacy-safe evidence, no partial authority, no unbounded enumeration, and deterministic crash/restart/concurrent-writer behavior under the strict remote fault matrix.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
