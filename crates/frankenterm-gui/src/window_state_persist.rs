@@ -1313,7 +1313,6 @@ struct RejectedOverlayMutation {
 #[derive(Debug)]
 struct BatchCommit {
     receipt: CommitReceipt,
-    byte_admission: ByteAdmissionStats,
     bindings: BTreeMap<PrivacySafeTargetFingerprint, DomainBindingId>,
     rejected_bindings: BTreeMap<PrivacySafeTargetFingerprint, PersistenceFailure>,
     rejected_workspaces: BTreeMap<String, PersistenceFailure>,
@@ -5611,6 +5610,59 @@ fn sync_parent_directory(_path: &Path) -> Result<(), PersistenceFailure> {
     Ok(())
 }
 
+struct PersistenceLockTelemetry {
+    requested_at: Instant,
+    acquired_at: Option<Instant>,
+    byte_admission: Option<ByteAdmissionStats>,
+}
+
+impl PersistenceLockTelemetry {
+    fn begin() -> Self {
+        Self {
+            requested_at: Instant::now(),
+            acquired_at: None,
+            byte_admission: None,
+        }
+    }
+
+    fn acquired(&mut self) {
+        self.acquired_at = Some(Instant::now());
+    }
+
+    fn byte_admission(&mut self, stats: ByteAdmissionStats) {
+        self.byte_admission = Some(stats);
+    }
+}
+
+impl Drop for PersistenceLockTelemetry {
+    fn drop(&mut self) {
+        let released_at = Instant::now();
+        if let Some(acquired_at) = self.acquired_at {
+            metrics::histogram!("window_state.persistence_lock_wait")
+                .record(acquired_at.saturating_duration_since(self.requested_at));
+            metrics::histogram!("window_state.persistence_lock_hold")
+                .record(released_at.saturating_duration_since(acquired_at));
+        }
+        if let Some(stats) = self.byte_admission {
+            let as_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
+            metrics::histogram!("window_state.byte_admission.candidates")
+                .record(as_u64(stats.candidate_count));
+            metrics::histogram!("window_state.byte_admission.leave_one_out_trials")
+                .record(as_u64(stats.leave_one_out_trials));
+            metrics::histogram!("window_state.byte_admission.peel_removals")
+                .record(as_u64(stats.peel_removals));
+            metrics::histogram!("window_state.byte_admission.backfill_queries")
+                .record(as_u64(stats.backfill_queries));
+            metrics::histogram!("window_state.byte_admission.backfill_candidate_trials")
+                .record(as_u64(stats.backfill_candidate_trials));
+            metrics::histogram!("window_state.byte_admission.backfill_index_rebuilds")
+                .record(as_u64(stats.backfill_index_rebuilds));
+            metrics::histogram!("window_state.byte_admission.backfill_index_entries_peak")
+                .record(as_u64(stats.backfill_index_entries_peak));
+        }
+    }
+}
+
 fn commit_batch(
     primary_path: &Path,
     batch: &PendingBatch,
@@ -5625,9 +5677,14 @@ fn commit_batch_with_byte_limit(
     interruption: WriteInterruption,
     maximum_bytes: u64,
 ) -> Result<BatchCommit, PersistenceFailure> {
+    // Declared before `lock` so Rust drops the file lock first and records the
+    // finite, label-free metrics outside the cross-process critical section on
+    // every return path.
+    let mut lock_telemetry = PersistenceLockTelemetry::begin();
     let lock = open_lock_file(primary_path)?;
     fs2::FileExt::lock_exclusive(&lock)
         .map_err(|error| PersistenceFailure::io("lock state for writing", error))?;
+    lock_telemetry.acquired();
 
     let loaded = load_authoritative_unlocked(primary_path)?;
     let source = loaded.source;
@@ -5640,6 +5697,7 @@ fn commit_batch_with_byte_limit(
         requires_schema_upgrade || degraded_recovery,
         maximum_bytes,
     )?;
+    lock_telemetry.byte_admission(preflight.byte_admission);
     let reserved_retirement_revision = if preflight.overlays.new_tombstones == 0 {
         None
     } else {
@@ -5694,7 +5752,6 @@ fn commit_batch_with_byte_limit(
                 coalesced_updates,
                 rejected_updates,
             },
-            byte_admission: preflight.byte_admission,
             bindings,
             rejected_bindings,
             rejected_workspaces: preflight.rejected_workspaces,
@@ -5741,7 +5798,6 @@ fn commit_batch_with_byte_limit(
             coalesced_updates,
             rejected_updates,
         },
-        byte_admission: preflight.byte_admission,
         bindings,
         rejected_bindings,
         rejected_workspaces: preflight.rejected_workspaces,
@@ -9036,9 +9092,13 @@ mod tests {
             replacement(0x84, 10, 5, 0, 2, 0),
         ];
 
-        let (selected, rejected, accepted_count) =
-            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2, 3], 100, false)
-                .expect("select an inclusion-maximal fixed point");
+        let CandidateSubsetSelection {
+            projection: selected,
+            rejected,
+            accepted_count,
+            ..
+        } = select_compatible_candidate_subset(base, &candidates, &[0, 1, 2, 3], 100, false)
+            .expect("select an inclusion-maximal fixed point");
 
         assert_eq!(accepted_count, 2);
         assert_eq!(rejected, vec![1, 2]);
@@ -9115,9 +9175,13 @@ mod tests {
             );
         }
 
-        let (selected, rejected, accepted_count) =
-            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
-                .expect("reconstruct exact separator-safe subset");
+        let CandidateSubsetSelection {
+            projection: selected,
+            rejected,
+            accepted_count,
+            ..
+        } = select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
+            .expect("reconstruct exact separator-safe subset");
 
         assert_eq!(accepted_count, 1);
         assert_eq!(rejected.len(), 2);
@@ -9166,7 +9230,7 @@ mod tests {
 
         let unchanged = select_compatible_candidate_subset(base, &[], &[], 100, false)
             .expect("candidate-free no-write base remains admissible");
-        assert_eq!(unchanged.0, base);
+        assert_eq!(unchanged.projection, base);
 
         let failure = select_compatible_candidate_subset(base, &[], &[], 100, true)
             .expect_err("forced publication must prove its physical byte bound");
@@ -9263,9 +9327,13 @@ mod tests {
             },
         ];
 
-        let (selected, rejected, accepted_count) =
-            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
-                .expect("select mutually enabling exchange");
+        let CandidateSubsetSelection {
+            projection: selected,
+            rejected,
+            accepted_count,
+            ..
+        } = select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
+            .expect("select mutually enabling exchange");
         assert_eq!(rejected, vec![2]);
         assert_eq!(accepted_count, 2);
         assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
@@ -9327,9 +9395,13 @@ mod tests {
             replacement(0x63, 40, 41, 1, 0, 2),
         ];
 
-        let (selected, rejected, accepted_count) =
-            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
-                .expect("select balanced exchange over smaller inactive supplier");
+        let CandidateSubsetSelection {
+            projection: selected,
+            rejected,
+            accepted_count,
+            ..
+        } = select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
+            .expect("select balanced exchange over smaller inactive supplier");
         assert_eq!(rejected, vec![2]);
         assert_eq!(accepted_count, 2);
         assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
@@ -9432,9 +9504,13 @@ mod tests {
             },
         ];
 
-        let (selected, rejected, accepted_count) =
-            select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
-                .expect("isolate one mixed-sign poison exactly");
+        let CandidateSubsetSelection {
+            projection: selected,
+            rejected,
+            accepted_count,
+            ..
+        } = select_compatible_candidate_subset(base, &candidates, &[0, 1, 2], maximum_bytes, false)
+            .expect("isolate one mixed-sign poison exactly");
         assert_eq!(rejected, vec![1]);
         assert_eq!(accepted_count, 2);
         assert_eq!(selected.counts.tabs, MAX_TOTAL_OVERLAY_TABS);
