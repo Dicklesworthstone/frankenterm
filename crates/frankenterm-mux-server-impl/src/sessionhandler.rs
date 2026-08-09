@@ -3641,13 +3641,13 @@ fn with_current_pane<R>(
 /// Sample one exact pane registration without allowing a faulty pane callback
 /// to fail or unwind sibling entries in a bounded fleet-health response.
 fn sample_tiered_scrollback_status(
-    session: &CurrentSession,
     pane_id: PaneId,
+    registration: Option<PaneRegistrationHandle>,
 ) -> PaneTieredScrollbackStatusOutcomeV1 {
     let sampled = catch_recoverable(
         RecoverablePanicSite::MuxPaneCallback,
         AssertUnwindSafe(|| {
-            let Some(registration) = session.capture_current_pane(pane_id) else {
+            let Some(registration) = registration else {
                 return PaneTieredScrollbackStatusOutcomeV1::Missing;
             };
             match registration
@@ -4679,14 +4679,29 @@ impl SessionHandler {
 
                             let snapshot_started_at = Instant::now();
                             let session = authority.acquire()?;
-                            let entries = request
+                            // Freeze registration identity for the complete request before
+                            // invoking any pane callback. A callback for an earlier pane can
+                            // therefore retire a later registration, but cannot change a pane
+                            // that existed at turn admission from `Closed` into `Missing`.
+                            let registrations = request
                                 .pane_ids
                                 .into_iter()
-                                .map(|pane_id| PaneTieredScrollbackStatusEntryV1 {
-                                    pane_id,
-                                    outcome: sample_tiered_scrollback_status(&session, pane_id),
+                                .map(|pane_id| {
+                                    (pane_id, session.capture_current_pane(pane_id))
                                 })
-                                .collect();
+                                .collect::<Vec<_>>();
+                            let entries = registrations
+                                .into_iter()
+                                .map(|(pane_id, registration)| {
+                                    PaneTieredScrollbackStatusEntryV1 {
+                                        pane_id,
+                                        outcome: sample_tiered_scrollback_status(
+                                            pane_id,
+                                            registration,
+                                        ),
+                                    }
+                                })
+                                .collect::<Vec<_>>();
                             metrics::histogram!(
                                 "mux.server.tiered_scrollback_batch_snapshot_ms"
                             )
@@ -6572,6 +6587,84 @@ mod tests {
                 },
             ],
             "one faulty pane callback must not abort or reorder sibling samples"
+        );
+    }
+
+    #[test]
+    fn tiered_scrollback_bulk_freezes_membership_before_callbacks() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let later_registration = Arc::new(Mutex::new(None::<PaneRegistrationHandle>));
+        let later_registration_for_callback = Arc::clone(&later_registration);
+        let first: Arc<dyn Pane> = Arc::new(
+            FakePane::new_with_tiered_scrollback_status_probe(
+                27,
+                Some(sample_tiered_scrollback_status(27)),
+                Arc::new(move || {
+                    if let Some(registration) = later_registration_for_callback
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .as_ref()
+                    {
+                        let _ = registration.retire_if_current();
+                    }
+                }),
+            ),
+        );
+        let later: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(
+            28,
+            Some(sample_tiered_scrollback_status(28)),
+        ));
+        mux.add_pane(&first).expect("register first pane");
+        mux.add_pane(&later).expect("register later pane");
+        *later_registration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(
+            mux.capture_current_pane(28)
+                .expect("capture later registration"),
+        );
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+
+        handler.process_one(DecodedPdu {
+            serial: 403,
+            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(
+                codec::GetPaneTieredScrollbackStatusesV1 {
+                    pane_ids: vec![27, 28, 29],
+                },
+            ),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) =
+            take_response(&captured).pdu
+        else {
+            panic!("expected frozen-membership bulk status response");
+        };
+        assert_eq!(
+            response.entries,
+            vec![
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 27,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Available(
+                        sample_tiered_scrollback_status(27).into(),
+                    ),
+                },
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 28,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Closed,
+                },
+                PaneTieredScrollbackStatusEntryV1 {
+                    pane_id: 29,
+                    outcome: PaneTieredScrollbackStatusOutcomeV1::Missing,
+                },
+            ],
+            "membership must be captured before the first callback, preserving closed versus missing",
         );
     }
 

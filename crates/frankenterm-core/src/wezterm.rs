@@ -1930,10 +1930,18 @@ impl WeztermClient {
                 self.mux_circuit_record_success();
                 Ok(Some(entries))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                // Unsupported is an expected capability result from a healthy,
+                // aligned transport. Clear prior transient mux failures so an
+                // old peer cannot strand the legacy health path behind an open
+                // circuit merely because it lacks this additive PDU.
+                self.mux_circuit_record_success();
+                Ok(None)
+            }
             Err(error)
                 if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") =>
             {
+                self.mux_circuit_record_success();
                 Ok(None)
             }
             Err(error) => {
@@ -4425,7 +4433,8 @@ fn wait_remaining(deadline: RuntimeTime, now: RuntimeTime) -> Duration {
 
 const WAIT_CX_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
-fn wezterm_cx_error(
+/// Project a failed explicit-Cx checkpoint into finite mux/runtime error text.
+pub(crate) fn wezterm_cx_error(
     cx: &crate::cx::Cx,
     operation: &'static str,
     fallback: &'static str,
@@ -9995,7 +10004,7 @@ impl WeztermInterface for MockWezterm {
     fn pane_tiered_scrollback_summaries_bulk_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
-        pane_ids: &'a [u64],
+        _pane_ids: &'a [u64],
     ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
         Box::pin(async move {
             mock_checkpoint(cx, "mock tiered scrollback bulk summary")?;
@@ -10003,12 +10012,22 @@ impl WeztermInterface for MockWezterm {
             {
                 let call_number = saturating_increment_u64(&self.tiered_scrollback_bulk_calls)
                     .saturating_add(1);
+                if self
+                    .tiered_scrollback_cancel_after_bulk_calls
+                    .load(Ordering::Relaxed)
+                    == call_number
+                {
+                    cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("mock tiered-scrollback bulk cancellation"),
+                    );
+                }
                 let outcomes = self
                     .tiered_scrollback_bulk_outcomes
                     .lock()
                     .unwrap_or_else(record_poison_and_recover);
                 if let Some(outcomes) = outcomes.as_ref() {
-                    let entries = pane_ids
+                    let entries = _pane_ids
                         .iter()
                         .copied()
                         .map(|pane_id| PaneTieredScrollbackBatchEntry {
@@ -10018,16 +10037,6 @@ impl WeztermInterface for MockWezterm {
                             ),
                         })
                         .collect();
-                    if self
-                        .tiered_scrollback_cancel_after_bulk_calls
-                        .load(Ordering::Relaxed)
-                        == call_number
-                    {
-                        cx.cancel_with(
-                            crate::outcome::CancelKind::User,
-                            Some("mock tiered-scrollback bulk cancellation"),
-                        );
-                    }
                     return Ok(Some(entries));
                 }
             }

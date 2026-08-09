@@ -1966,7 +1966,7 @@ impl DirectMuxClient {
         let probe = Pdu::GetPaneTieredScrollbackStatusesV1(
             GetPaneTieredScrollbackStatusesV1 { pane_ids: vec![0] },
         );
-        match self.preflight_outbound_pdu(&probe) {
+        match self.authorize_outbound_pdu(&probe) {
             Ok(()) => Ok(true),
             Err(error) if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") => {
                 Ok(false)

@@ -239,7 +239,7 @@ static NATIVE_DISCOVERY_RUNTIME_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static NATIVE_DISCOVERY_WORKER_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn saturating_increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(1))
     });
 }
@@ -2255,7 +2255,7 @@ struct NativeDiscoveryPermit;
 impl NativeDiscoveryPermit {
     fn try_acquire() -> Option<Self> {
         let previous = NATIVE_DISCOVERY_ACTIVE_SCANS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS).then_some(active + 1)
             });
         let active = match previous {
@@ -4906,11 +4906,12 @@ mod tests {
                 crate::outcome::CancelKind::User,
                 Some("cancel native discovery caller context"),
             );
-            assert_eq!(
-                request
-                    .await
-                    .expect("observer task must return its typed result"),
-                Err(SessionResumeError::Cancelled)
+            let request_result = request
+                .await
+                .expect("observer task must return its typed result");
+            assert!(
+                matches!(&request_result, Err(SessionResumeError::Cancelled)),
+                "caller cancellation must stay typed: {request_result:?}",
             );
 
             barrier.release();
@@ -4982,11 +4983,12 @@ mod tests {
                 crate::outcome::CancelKind::Deadline,
                 Some("expire synthetic native discovery deadline"),
             );
-            assert_eq!(
-                request
-                    .await
-                    .expect("deadline observer task must return its typed result"),
-                Err(SessionResumeError::Timeout)
+            let request_result = request
+                .await
+                .expect("deadline observer task must return its typed result");
+            assert!(
+                matches!(&request_result, Err(SessionResumeError::Timeout)),
+                "deadline cancellation must stay typed: {request_result:?}",
             );
 
             barrier.release();

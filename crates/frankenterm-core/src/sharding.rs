@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -23,8 +24,8 @@ use crate::patterns::AgentType;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
     MoveDirection, MuxSemanticSnapshot, PaneInfo, PaneTieredScrollbackBatchEntry,
-    PaneTieredScrollbackSummary, SpawnTarget, SplitDirection, WeztermFuture, WeztermHandle,
-    WeztermInterface,
+    PaneTieredScrollbackSummary, PANE_TIERED_SCROLLBACK_BULK_MAX_PANES, SpawnTarget,
+    SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
 };
 
 // =============================================================================
@@ -95,6 +96,12 @@ pub const MAX_GLOBAL_PANE_ID: u64 = (1u64 << 63) - 1;
 /// here prevents a compensating task from outliving its useful recovery window
 /// even if a custom backend ignores Cx budgets.
 const PANE_CREATION_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum independent mux domains probed concurrently by one lightweight
+/// scrollback-health turn. The global request itself is capped at 256 panes;
+/// this second bound prevents a maintenance cycle from bursting one request
+/// into every configured shard at once and competing with interactive work.
+const PANE_TIERED_SCROLLBACK_SHARD_FANOUT: usize = 16;
 
 /// Bounded, content-free errors for the two audited rollback panic phases.
 /// Never include the original panic payload here: backend implementations may
@@ -2437,6 +2444,33 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_ids: &'a [u64],
     ) -> WeztermFuture<'a, Option<Vec<PaneTieredScrollbackBatchEntry>>> {
         Box::pin(async move {
+            if pane_ids.len() > PANE_TIERED_SCROLLBACK_BULK_MAX_PANES {
+                return Err(WeztermError::CommandFailed(format!(
+                    "bulk tiered-scrollback request contains {} panes; maximum is {}",
+                    pane_ids.len(),
+                    PANE_TIERED_SCROLLBACK_BULK_MAX_PANES,
+                ))
+                .into());
+            }
+            let mut unique = HashSet::with_capacity(pane_ids.len());
+            if let Some(duplicate) = pane_ids
+                .iter()
+                .copied()
+                .find(|pane_id| !unique.insert(*pane_id))
+            {
+                return Err(WeztermError::CommandFailed(format!(
+                    "bulk tiered-scrollback request repeats pane {duplicate}",
+                ))
+                .into());
+            }
+            if cx.checkpoint().is_err() {
+                return Err(crate::wezterm::wezterm_cx_error(
+                    cx,
+                    "pane_tiered_scrollback_summaries_bulk",
+                    "capability checkpoint failed before shard fanout",
+                ));
+            }
+
             let mut by_shard = std::collections::BTreeMap::<
                 ShardId,
                 Vec<(usize, u64, u64)>,
@@ -2450,58 +2484,144 @@ impl WeztermInterface for ShardedWeztermClient {
                 ));
             }
 
-            let mut ordered = vec![None; pane_ids.len()];
-            for (shard_id, routed) in by_shard {
-                let backend = self.backend_for_id(shard_id)?;
+            // A health turn may span independent mux domains. Dispatch one
+            // bounded request per touched shard concurrently; serial shard
+            // round trips would make the cycle wall time the sum of every LAN
+            // and mux-queue delay. Completion order is projected back through
+            // the frozen request indices below.
+            let mut shard_jobs = by_shard.into_iter();
+            let start_shard_request =
+                |(shard_id, routed): (ShardId, Vec<(usize, u64, u64)>)| {
+                let backend = self.backend_for_id(shard_id)?.handle.clone();
                 let local_pane_ids = routed
                     .iter()
                     .map(|(_, local_pane_id, _)| *local_pane_id)
                     .collect::<Vec<_>>();
-                let Some(entries) = backend
-                    .handle
-                    .pane_tiered_scrollback_summaries_bulk_with_cx(cx, &local_pane_ids)
-                    .await
-                    .map_err(|error| {
-                        Self::backend_error(
-                            shard_id,
-                            "pane_tiered_scrollback_summaries_bulk",
-                            None,
-                            error,
-                        )
-                    })?
-                else {
-                    return Ok(None);
-                };
-                if entries.len() != routed.len() {
-                    return Err(Self::backend_error(
-                        shard_id,
-                        "pane_tiered_scrollback_summaries_bulk",
-                        None,
-                        WeztermError::CommandFailed(
-                            "bulk tiered-scrollback response cardinality mismatch".to_string(),
-                        )
-                        .into(),
-                    ));
-                }
-                for ((request_index, local_pane_id, global_pane_id), entry) in
-                    routed.into_iter().zip(entries)
-                {
-                    if entry.pane_id != local_pane_id {
-                        return Err(Self::backend_error(
-                            shard_id,
-                            "pane_tiered_scrollback_summaries_bulk",
-                            Some(global_pane_id),
-                            WeztermError::CommandFailed(
-                                "bulk tiered-scrollback response order mismatch".to_string(),
+                Ok::<_, crate::Error>(async move {
+                    let result = match catch_recoverable(
+                        RecoverablePanicSite::ClientCallback,
+                        std::panic::AssertUnwindSafe(|| {
+                            backend.pane_tiered_scrollback_summaries_bulk_with_cx(
+                                cx,
+                                &local_pane_ids,
                             )
-                            .into(),
-                        ));
+                        }),
+                    ) {
+                        Ok(future) => match catch_recoverable_future(
+                            RecoverablePanicSite::ClientCallback,
+                            future,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_panic) => Err(backend_callback_panic_error()),
+                        },
+                        Err(_panic) => Err(backend_callback_panic_error()),
+                    };
+                    (shard_id, routed, result)
+                })
+            };
+            let mut pending = FuturesUnordered::new();
+            for job in shard_jobs
+                .by_ref()
+                .take(PANE_TIERED_SCROLLBACK_SHARD_FANOUT)
+            {
+                pending.push(start_shard_request(job)?);
+            }
+
+            let mut ordered = vec![None; pane_ids.len()];
+            let mut unsupported = false;
+            let mut terminal_error = None;
+            while let Some((shard_id, routed, result)) = pending.next().await {
+                if terminal_error.is_none() {
+                    match result {
+                        Err(error) => {
+                            let cancelled = matches!(
+                                classify_backend_error(&error),
+                                ShardBackendErrorClass::Cancelled
+                            );
+                            let error = Self::backend_error(
+                                shard_id,
+                                "pane_tiered_scrollback_summaries_bulk",
+                                None,
+                                error,
+                            );
+                            if cancelled {
+                                return Err(error);
+                            }
+                            terminal_error = Some(error);
+                        }
+                        Ok(None) => {
+                            // Capability absence is expected during rolling upgrades.
+                            // Drain the already-dispatched siblings so their pooled
+                            // transports return aligned instead of being dropped in
+                            // flight; the caller will then use legacy fallback for the
+                            // complete global batch.
+                            unsupported = true;
+                        }
+                        Ok(Some(entries)) if entries.len() != routed.len() => {
+                            terminal_error = Some(Self::backend_error(
+                                shard_id,
+                                "pane_tiered_scrollback_summaries_bulk",
+                                None,
+                                WeztermError::CommandFailed(
+                                    "bulk tiered-scrollback response cardinality mismatch"
+                                        .to_string(),
+                                )
+                                .into(),
+                            ));
+                        }
+                        Ok(Some(entries)) => {
+                            for ((request_index, local_pane_id, global_pane_id), entry) in
+                                routed.into_iter().zip(entries)
+                            {
+                                if entry.pane_id != local_pane_id {
+                                    terminal_error = Some(Self::backend_error(
+                                        shard_id,
+                                        "pane_tiered_scrollback_summaries_bulk",
+                                        Some(global_pane_id),
+                                        WeztermError::CommandFailed(
+                                            "bulk tiered-scrollback response order mismatch"
+                                                .to_string(),
+                                        )
+                                        .into(),
+                                    ));
+                                    break;
+                                }
+                                ordered[request_index] = Some(PaneTieredScrollbackBatchEntry {
+                                    pane_id: global_pane_id,
+                                    outcome: entry.outcome,
+                                });
+                            }
+                        }
                     }
-                    ordered[request_index] = Some(PaneTieredScrollbackBatchEntry {
-                        pane_id: global_pane_id,
-                        outcome: entry.outcome,
-                    });
                 }
+
+                if !unsupported && terminal_error.is_none() {
+                    if cx.checkpoint().is_err() {
+                        return Err(crate::wezterm::wezterm_cx_error(
+                            cx,
+                            "pane_tiered_scrollback_summaries_bulk",
+                            "capability checkpoint failed during shard fanout",
+                        ));
+                    } else if let Some(job) = shard_jobs.next() {
+                        pending.push(start_shard_request(job)?);
+                    }
+                }
+            }
+
+            if terminal_error.is_none() && cx.checkpoint().is_err() {
+                return Err(crate::wezterm::wezterm_cx_error(
+                    cx,
+                    "pane_tiered_scrollback_summaries_bulk",
+                    "capability checkpoint failed after shard fanout",
+                ));
+            }
+            if let Some(error) = terminal_error {
+                return Err(error);
+            }
+            if unsupported {
+                return Ok(None);
             }
 
             ordered
@@ -5081,6 +5201,210 @@ mod tests {
             err.to_string().contains("persistence-safe signed-64 range"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn bulk_tiered_scrollback_rejects_oversized_and_duplicate_inputs_before_fanout() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.configure_tiered_scrollback_bulk_for_test(None);
+            let handle: WeztermHandle = mock.clone();
+            let client = ShardedWeztermClient::new(
+                vec![ShardBackend::new(ShardId(0), handle)],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+            let cx = crate::cx::for_testing();
+
+            let maximum = u64::try_from(PANE_TIERED_SCROLLBACK_BULK_MAX_PANES)
+                .expect("bulk pane maximum fits u64");
+            let oversized = (0..=maximum).collect::<Vec<_>>();
+            let oversized_error = client
+                .pane_tiered_scrollback_summaries_bulk_with_cx(&cx, &oversized)
+                .await
+                .expect_err("oversized global batch must fail before shard routing");
+            assert!(oversized_error.to_string().contains("maximum is 256"));
+
+            let duplicate_error = client
+                .pane_tiered_scrollback_summaries_bulk_with_cx(&cx, &[7, 7])
+                .await
+                .expect_err("duplicate global pane must fail before shard routing");
+            assert!(duplicate_error.to_string().contains("repeats pane 7"));
+            assert_eq!(
+                mock.tiered_scrollback_call_counts_for_test(),
+                (0, 0),
+                "malformed global batches must not dispatch to a shard",
+            );
+        });
+    }
+
+    #[test]
+    fn bulk_tiered_scrollback_fans_out_once_per_shard_and_restores_global_order() {
+        run_async_test(async {
+            let shard_zero = Arc::new(MockWezterm::new());
+            shard_zero.configure_tiered_scrollback_bulk_for_test(Some(HashMap::from([(
+                3,
+                crate::wezterm::PaneTieredScrollbackBatchOutcome::Available(
+                    PaneTieredScrollbackSummary::default(),
+                ),
+            )])));
+            let shard_one = Arc::new(MockWezterm::new());
+            shard_one.configure_tiered_scrollback_bulk_for_test(Some(HashMap::from([
+                (
+                    7,
+                    crate::wezterm::PaneTieredScrollbackBatchOutcome::Unavailable,
+                ),
+                (
+                    9,
+                    crate::wezterm::PaneTieredScrollbackBatchOutcome::Missing,
+                ),
+            ])));
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(ShardId(0), shard_zero.clone()),
+                    ShardBackend::new(ShardId(1), shard_one.clone()),
+                ],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+            let pane_1_7 = try_encode_sharded_pane_id(ShardId(1), 7).unwrap();
+            let pane_0_3 = try_encode_sharded_pane_id(ShardId(0), 3).unwrap();
+            let pane_1_9 = try_encode_sharded_pane_id(ShardId(1), 9).unwrap();
+            let cx = crate::cx::for_testing();
+
+            let entries = client
+                .pane_tiered_scrollback_summaries_bulk_with_cx(
+                    &cx,
+                    &[pane_1_7, pane_0_3, pane_1_9],
+                )
+                .await
+                .expect("bounded sharded health fanout must succeed")
+                .expect("both shard backends advertise bulk health");
+
+            assert_eq!(
+                entries,
+                vec![
+                    PaneTieredScrollbackBatchEntry {
+                        pane_id: pane_1_7,
+                        outcome: crate::wezterm::PaneTieredScrollbackBatchOutcome::Unavailable,
+                    },
+                    PaneTieredScrollbackBatchEntry {
+                        pane_id: pane_0_3,
+                        outcome: crate::wezterm::PaneTieredScrollbackBatchOutcome::Available(
+                            PaneTieredScrollbackSummary::default(),
+                        ),
+                    },
+                    PaneTieredScrollbackBatchEntry {
+                        pane_id: pane_1_9,
+                        outcome: crate::wezterm::PaneTieredScrollbackBatchOutcome::Missing,
+                    },
+                ],
+            );
+            assert_eq!(shard_zero.tiered_scrollback_call_counts_for_test(), (1, 0));
+            assert_eq!(shard_one.tiered_scrollback_call_counts_for_test(), (1, 0));
+        });
+    }
+
+    #[test]
+    fn bulk_tiered_scrollback_old_peer_stops_admission_after_bounded_window() {
+        run_async_test(async {
+            let mut mocks = Vec::new();
+            let mut backends = Vec::new();
+            let mut pane_ids = Vec::new();
+            for shard_index in 0..=PANE_TIERED_SCROLLBACK_SHARD_FANOUT {
+                let mock = Arc::new(MockWezterm::new());
+                if shard_index < PANE_TIERED_SCROLLBACK_SHARD_FANOUT {
+                    mock.configure_tiered_scrollback_bulk_for_test(None);
+                } else {
+                    mock.configure_tiered_scrollback_bulk_for_test(Some(HashMap::from([(
+                        1,
+                        crate::wezterm::PaneTieredScrollbackBatchOutcome::Available(
+                            PaneTieredScrollbackSummary::default(),
+                        ),
+                    )])));
+                }
+                let shard_id = ShardId(shard_index);
+                pane_ids.push(try_encode_sharded_pane_id(shard_id, 1).unwrap());
+                backends.push(ShardBackend::new(shard_id, mock.clone()));
+                mocks.push(mock);
+            }
+            let client =
+                ShardedWeztermClient::new(backends, AssignmentStrategy::RoundRobin).unwrap();
+            let cx = crate::cx::for_testing();
+
+            let result = client
+                .pane_tiered_scrollback_summaries_bulk_with_cx(&cx, &pane_ids)
+                .await
+                .expect("mixed-version shard capability probe must stay aligned");
+
+            assert!(result.is_none(), "one old peer requires global fallback");
+            let admitted = mocks
+                .iter()
+                .map(|mock| mock.tiered_scrollback_call_counts_for_test().0)
+                .sum::<u64>();
+            assert_eq!(
+                admitted,
+                u64::try_from(PANE_TIERED_SCROLLBACK_SHARD_FANOUT)
+                    .expect("shard fanout fits u64"),
+                "only the frozen initial shard window may be admitted",
+            );
+            assert_eq!(
+                mocks[PANE_TIERED_SCROLLBACK_SHARD_FANOUT]
+                    .tiered_scrollback_call_counts_for_test(),
+                (0, 0),
+                "a not-yet-started shard must not be admitted after capability absence",
+            );
+        });
+    }
+
+    #[test]
+    fn bulk_tiered_scrollback_cancellation_stops_new_shard_admission() {
+        run_async_test(async {
+            let mut mocks = Vec::new();
+            let mut backends = Vec::new();
+            let mut pane_ids = Vec::new();
+            for shard_index in 0..=PANE_TIERED_SCROLLBACK_SHARD_FANOUT {
+                let mock = Arc::new(MockWezterm::new());
+                mock.configure_tiered_scrollback_bulk_for_test(Some(HashMap::from([(
+                    1,
+                    crate::wezterm::PaneTieredScrollbackBatchOutcome::Available(
+                        PaneTieredScrollbackSummary::default(),
+                    ),
+                )])));
+                if shard_index < PANE_TIERED_SCROLLBACK_SHARD_FANOUT {
+                    mock.cancel_after_tiered_scrollback_bulk_calls_for_test(1);
+                }
+                let shard_id = ShardId(shard_index);
+                pane_ids.push(try_encode_sharded_pane_id(shard_id, 1).unwrap());
+                backends.push(ShardBackend::new(shard_id, mock.clone()));
+                mocks.push(mock);
+            }
+            let client =
+                ShardedWeztermClient::new(backends, AssignmentStrategy::RoundRobin).unwrap();
+            let cx = crate::cx::for_testing();
+
+            let error = client
+                .pane_tiered_scrollback_summaries_bulk_with_cx(&cx, &pane_ids)
+                .await
+                .expect_err("caller cancellation must terminate sharded bulk health");
+
+            assert!(
+                matches!(
+                    &error,
+                    crate::Error::RuntimeOperation {
+                        source: crate::error::RuntimeOperationSource::Cancelled(_),
+                        ..
+                    }
+                ),
+                "cancellation must retain its typed runtime classification: {error:?}",
+            );
+            assert_eq!(
+                mocks[PANE_TIERED_SCROLLBACK_SHARD_FANOUT]
+                    .tiered_scrollback_call_counts_for_test(),
+                (0, 0),
+                "a shard beyond the active window must not start after cancellation",
+            );
+        });
     }
 
     // -----------------------------------------------------------------------

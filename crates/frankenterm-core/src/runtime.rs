@@ -5157,10 +5157,10 @@ impl ObservationRuntime {
                                 "pane_scrollback_snapshots": pane_scrollback_snapshot_count,
                                 "pane_status_errors": tiered_scrollback_fetch.errors,
                                 "pane_status_error_samples": pane_status_error_samples,
-                                "tiered_scrollback_bulk_requests": tiered_scrollback_fetch.bulk_requests,
+                                "tiered_scrollback_bulk_batches_attempted": tiered_scrollback_fetch.bulk_batches_attempted,
                                 "tiered_scrollback_bulk_chunks_completed": tiered_scrollback_fetch.bulk_chunks_completed,
                                 "tiered_scrollback_legacy_fallback_batches": tiered_scrollback_fetch.legacy_fallback_batches,
-                                "tiered_scrollback_legacy_fallback_requests": tiered_scrollback_fetch.legacy_fallback_requests,
+                                "tiered_scrollback_legacy_fallback_requests_admitted": tiered_scrollback_fetch.legacy_fallback_requests_admitted,
                                 "tiered_scrollback_telemetry_blind": telemetry_blind,
                                 "tiered_scrollback_telemetry_partial": telemetry_partial,
                                 "tiered_scrollback_blind_reason": blind_reason,
@@ -9222,10 +9222,16 @@ struct PaneTieredScrollbackFetch {
     summaries: HashMap<u64, PaneTieredScrollbackSummary>,
     errors: usize,
     error_samples: Vec<(u64, &'static str)>,
-    bulk_requests: usize,
+    /// Global `MuxInterface` bulk calls admitted. A sharded implementation can
+    /// expand one call into multiple physical mux requests, so server-side
+    /// request telemetry remains the authority for wire-count measurements.
+    bulk_batches_attempted: usize,
     bulk_chunks_completed: usize,
     legacy_fallback_batches: usize,
-    legacy_fallback_requests: usize,
+    /// Legacy pane probes admitted into the bounded local fanout. Cancellation
+    /// may drop an admitted future before it reaches the mux transport, so this
+    /// intentionally does not claim to be the server-observed wire count.
+    legacy_fallback_requests_admitted: usize,
     cancelled: bool,
 }
 
@@ -9360,12 +9366,14 @@ fn finish_pane_tiered_scrollback_fetch(
 ) -> PaneTieredScrollbackFetch {
     metrics::histogram!("frankenterm.runtime.tiered_scrollback_cycle_ms")
         .record(started_at.elapsed().as_secs_f64() * 1_000.0);
-    metrics::histogram!("frankenterm.runtime.tiered_scrollback_bulk_requests")
-        .record(fetch.bulk_requests as f64);
+    metrics::histogram!("frankenterm.runtime.tiered_scrollback_bulk_batches_attempted")
+        .record(fetch.bulk_batches_attempted as f64);
     metrics::histogram!("frankenterm.runtime.tiered_scrollback_bulk_chunks_completed")
         .record(fetch.bulk_chunks_completed as f64);
-    metrics::histogram!("frankenterm.runtime.tiered_scrollback_legacy_fallback_requests")
-        .record(fetch.legacy_fallback_requests as f64);
+    metrics::histogram!(
+        "frankenterm.runtime.tiered_scrollback_legacy_fallback_requests_admitted"
+    )
+    .record(fetch.legacy_fallback_requests_admitted as f64);
     if fetch.legacy_fallback_batches > 0 {
         metrics::counter!("frankenterm.runtime.tiered_scrollback_fallback_cycles").increment(1);
     }
@@ -9420,7 +9428,7 @@ async fn collect_pane_tiered_scrollback_summaries(
         }
 
         if !use_legacy_fallback {
-            fetch.bulk_requests = fetch.bulk_requests.saturating_add(1);
+            fetch.bulk_batches_attempted = fetch.bulk_batches_attempted.saturating_add(1);
             match wezterm_handle
                 .pane_tiered_scrollback_summaries_bulk_with_cx(runtime_cx, pane_chunk)
                 .await
@@ -9463,6 +9471,13 @@ async fn collect_pane_tiered_scrollback_summaries(
                 }
                 Ok(None) => {
                     use_legacy_fallback = true;
+                    // Capability negotiation itself is an await point. Do not
+                    // admit legacy probes if cancellation arrived while the
+                    // clean old-peer fallback was being established.
+                    if runtime_cx.checkpoint().is_err() {
+                        fetch.cancelled = true;
+                        return finish_pane_tiered_scrollback_fetch(fetch, started_at);
+                    }
                 }
                 Err(error) if is_runtime_cancellation(&error) => {
                     fetch.cancelled = true;
@@ -9480,8 +9495,8 @@ async fn collect_pane_tiered_scrollback_summaries(
                     if chunk_index + 1 < chunk_count
                         && !yield_between_pane_tiered_scrollback_chunks(runtime_cx).await
                     {
-                            fetch.cancelled = true;
-                            return finish_pane_tiered_scrollback_fetch(fetch, started_at);
+                        fetch.cancelled = true;
+                        return finish_pane_tiered_scrollback_fetch(fetch, started_at);
                     }
                     continue;
                 }
@@ -9489,9 +9504,6 @@ async fn collect_pane_tiered_scrollback_summaries(
         }
 
         fetch.legacy_fallback_batches = fetch.legacy_fallback_batches.saturating_add(1);
-        fetch.legacy_fallback_requests = fetch
-            .legacy_fallback_requests
-            .saturating_add(pane_chunk.len());
         let mut remaining = pane_chunk.iter().copied();
         let probe = |pane_id| {
             let wezterm_handle = Arc::clone(wezterm_handle);
@@ -9507,6 +9519,9 @@ async fn collect_pane_tiered_scrollback_summaries(
             .by_ref()
             .take(PANE_TIERED_SCROLLBACK_FETCH_CONCURRENCY)
         {
+            fetch.legacy_fallback_requests_admitted = fetch
+                .legacy_fallback_requests_admitted
+                .saturating_add(1);
             pending.push(probe(pane_id));
         }
         while let Some((pane_id, result)) = pending.next().await {
@@ -9524,6 +9539,9 @@ async fn collect_pane_tiered_scrollback_summaries(
                 return finish_pane_tiered_scrollback_fetch(fetch, started_at);
             }
             if let Some(next_pane_id) = remaining.next() {
+                fetch.legacy_fallback_requests_admitted = fetch
+                    .legacy_fallback_requests_admitted
+                    .saturating_add(1);
                 pending.push(probe(next_pane_id));
             }
         }
@@ -15985,10 +16003,10 @@ mod tests {
             assert!(!fetch.cancelled);
             assert_eq!(fetch.summaries.len(), 200);
             assert_eq!(fetch.errors, 0);
-            assert_eq!(fetch.bulk_requests, 1);
+            assert_eq!(fetch.bulk_batches_attempted, 1);
             assert_eq!(fetch.bulk_chunks_completed, 1);
             assert_eq!(fetch.legacy_fallback_batches, 0);
-            assert_eq!(fetch.legacy_fallback_requests, 0);
+            assert_eq!(fetch.legacy_fallback_requests_admitted, 0);
             assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (1, 0));
         });
     }
@@ -16008,7 +16026,7 @@ mod tests {
 
             assert!(!fetch.cancelled);
             assert_eq!(fetch.summaries.len(), 513);
-            assert_eq!(fetch.bulk_requests, 3);
+            assert_eq!(fetch.bulk_batches_attempted, 3);
             assert_eq!(fetch.bulk_chunks_completed, 3);
             assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (3, 0));
         });
@@ -16027,10 +16045,10 @@ mod tests {
 
             assert!(!fetch.cancelled);
             assert_eq!(fetch.errors, 33);
-            assert_eq!(fetch.bulk_requests, 1);
+            assert_eq!(fetch.bulk_batches_attempted, 1);
             assert_eq!(fetch.bulk_chunks_completed, 0);
             assert_eq!(fetch.legacy_fallback_batches, 1);
-            assert_eq!(fetch.legacy_fallback_requests, 33);
+            assert_eq!(fetch.legacy_fallback_requests_admitted, 33);
             assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (1, 33));
         });
     }
@@ -16088,9 +16106,31 @@ mod tests {
 
             assert!(fetch.cancelled);
             assert_eq!(fetch.summaries.len(), PANE_TIERED_SCROLLBACK_BULK_MAX_PANES);
-            assert_eq!(fetch.bulk_requests, 1);
+            assert_eq!(fetch.bulk_batches_attempted, 1);
             assert_eq!(fetch.bulk_chunks_completed, 1);
             assert_eq!(fetch.errors, 0);
+            assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (1, 0));
+        });
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_cancellation_after_old_peer_probe_admits_no_fallback() {
+        run_async_test(async {
+            let pane_ids = (0_u64..33).collect::<Vec<_>>();
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.configure_tiered_scrollback_bulk_for_test(None);
+            mock.cancel_after_tiered_scrollback_bulk_calls_for_test(1);
+            let handle: WeztermHandle = mock.clone();
+            let cx = runtime_loop_cx();
+
+            let fetch = collect_pane_tiered_scrollback_summaries(&cx, &handle, &pane_ids).await;
+
+            assert!(fetch.cancelled);
+            assert!(fetch.summaries.is_empty());
+            assert_eq!(fetch.bulk_batches_attempted, 1);
+            assert_eq!(fetch.bulk_chunks_completed, 0);
+            assert_eq!(fetch.legacy_fallback_batches, 0);
+            assert_eq!(fetch.legacy_fallback_requests_admitted, 0);
             assert_eq!(mock.tiered_scrollback_call_counts_for_test(), (1, 0));
         });
     }

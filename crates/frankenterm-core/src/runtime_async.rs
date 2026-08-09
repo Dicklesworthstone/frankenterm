@@ -6587,7 +6587,7 @@ impl InterruptibleTimerService {
     }
 
     fn try_admit(&self) -> Result<InterruptibleTimerAdmission<'_>, SleepWithCxError> {
-        let admitted = self.active.fetch_update(
+        let admitted = self.active.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |active| (active < self.capacity).then_some(active + 1),
@@ -6881,7 +6881,7 @@ async fn sleep_with_cx_interruptible_using(
     // `wait` registers directly with the explicit Cx and can only resolve via
     // cancellation because this private cell is never initialized.
     let cancellation_signal = asupersync::sync::OnceCell::<()>::new();
-    let cancellation_wait = std::pin::pin!(cancellation_signal.wait(cx));
+    let mut cancellation_wait = std::pin::pin!(cancellation_signal.wait(cx));
     let mut cancellation_poll_count = 0_u64;
     let cancellation = std::pin::pin!(std::future::poll_fn(|task_cx| {
         let poll = cancellation_wait.as_mut().poll(task_cx);
@@ -8493,11 +8493,12 @@ mod tests {
 
     #[test]
     fn pending_detached_task_does_not_keep_runtime_alive() {
-        struct PendingTaskDropProbe(Arc<AtomicBool>);
+        struct PendingTaskDropProbe(Arc<std::sync::atomic::AtomicBool>);
 
         impl Drop for PendingTaskDropProbe {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
+                self.0
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
         }
 
@@ -8508,7 +8509,7 @@ mod tests {
             .worker_threads(1)
             .build()
             .expect("runtime-cycle fixture");
-        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe = PendingTaskDropProbe(Arc::clone(&dropped));
         runtime.spawn_detached(async move {
             let _probe = probe;
@@ -8517,7 +8518,7 @@ mod tests {
 
         drop(runtime);
         assert!(
-            dropped.load(Ordering::Acquire),
+            dropped.load(std::sync::atomic::Ordering::Acquire),
             "a pending task future must be dropped during runtime shutdown"
         );
     }

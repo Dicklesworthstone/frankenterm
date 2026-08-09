@@ -1537,6 +1537,14 @@ mod tests {
     /// Spawn a mock mux server that handles handshake + ListPanes.
     /// Returns the socket path.
     async fn spawn_mock_server(temp_dir: &tempfile::TempDir) -> PathBuf {
+        spawn_mock_server_with_codec_version(temp_dir, CODEC_VERSION).await
+    }
+
+    /// Spawn a mock mux server at an exact negotiated codec version.
+    async fn spawn_mock_server_with_codec_version(
+        temp_dir: &tempfile::TempDir,
+        codec_version: usize,
+    ) -> PathBuf {
         let socket_path = temp_dir.path().join("mux-pool-test.sock");
         let listener = compat_unix::bind(&socket_path)
             .await
@@ -1564,7 +1572,7 @@ mod tests {
                             let response = match decoded.pdu {
                                 Pdu::GetCodecVersion(_) => {
                                     Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                        codec_vers: CODEC_VERSION,
+                                        codec_vers: codec_version,
                                         version_string: "mock-mux-pool-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
@@ -2085,6 +2093,32 @@ mod tests {
                 "explicit-Cx path should have created only one connection"
             );
             assert_eq!(stats.pool.total_acquired, 2, "two acquire calls");
+        });
+    }
+
+    #[test]
+    fn pool_old_peer_bulk_capability_fallback_keeps_connection_healthy() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_with_codec_version(&temp_dir, 56).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let statuses = pool
+                .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11])
+                .await
+                .expect("v56 capability fallback must be a healthy pool result");
+            assert!(statuses.is_none());
+
+            pool.list_panes_with_cx(&cx)
+                .await
+                .expect("the old-peer capability probe must leave the connection reusable");
+            let stats = pool.stats_with_cx(&cx).await.expect("pool stats");
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.permanent_failures, 0);
+            assert_eq!(stats.pool.total_acquired, 2);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 

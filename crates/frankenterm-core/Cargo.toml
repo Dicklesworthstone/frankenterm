@@ -30,6 +30,7 @@ emojis.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+metrics.workspace = true
 futures.workspace = true
 finl_unicode.workspace = true
 termwiz.workspace = true
