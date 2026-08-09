@@ -3679,8 +3679,10 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   memory, thread occupancy, or the unresolved output prefix.
 - **Decision:** serialize and annotate the complete line before durable
   ownership, admit at most one record and 1 MiB into a process-wide
-  single-owner coordinator, and duplicate stdout under an exact POSIX flag
-  guard. Unix output uses nonblocking writes, one asupersync writable-reactor
+  single-owner coordinator, associate its event, cursor generation, opaque
+  lease, and terminal result through a one-slot completion channel, and
+  duplicate stdout under an exact POSIX flag guard. Unix output uses
+  nonblocking writes, one asupersync writable-reactor
   registration, a direct `Cx` cancellation waker, and a 20-second total output
   completion bound whose timer is armed lazily only if the descriptor blocks.
   That leaves five seconds for independent settlement
@@ -3694,7 +3696,9 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   compensation also fails. Content-free counters retain queue depth/bytes,
   admissions/saturation, zero-byte releases, partial ambiguity, expiry
   recovery, finalization/stale-token outcomes, descriptor restoration failure,
-  blocked duration, and the zero polling interval of direct cancellation.
+  blocked duration, the conservative last-pending-poll-to-settlement upper
+  bound on cancellation latency, and the zero polling interval of direct
+  cancellation.
   Deterministic source tests cover fragmented/full/zero/partial/flush output,
   real full-socket cancellation and timeout, coordinator item/byte saturation,
   stale-token finalization, prefix retention, and explicit/Drop flag

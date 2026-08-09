@@ -8672,6 +8672,11 @@ mod tests {
             assert_eq!(error.kind(), NonblockingWriteErrorKind::ContextCancelled);
             assert_eq!(error.bytes_written(), 0);
             assert!(
+                error.cancellation_latency_upper_bound_ns()
+                    <= u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+                "the recorded cancellation latency must remain a conservative observed bound"
+            );
+            assert!(
                 elapsed < Duration::from_millis(400),
                 "cancellation waited for descriptor readiness instead of its direct Cx wake: {elapsed:?}"
             );

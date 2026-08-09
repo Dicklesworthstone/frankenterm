@@ -28129,11 +28129,14 @@ impl WatchClaimStdoutWriter {
                 };
                 let bytes_written = error.bytes_written();
                 let blocked_duration_ns = error.blocked_duration_ns();
+                let cancellation_latency_upper_bound_ns =
+                    error.cancellation_latency_upper_bound_ns();
                 let source = restore.err().or_else(|| error.into_source());
                 WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
                     kind,
                     bytes_written,
                     blocked_duration_ns,
+                    cancellation_latency_upper_bound_ns,
                     source,
                 })
             }
@@ -28246,6 +28249,7 @@ where
                 kind: WatchClaimOutputFailureKind::Write,
                 bytes_written: success.bytes_written,
                 blocked_duration_ns: success.blocked_duration_ns,
+                cancellation_latency_upper_bound_ns: 0,
                 source: Some(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "writer reported a flushed byte count different from the admitted line",
@@ -28267,6 +28271,7 @@ where
                 kind: WatchClaimOutputFailureKind::Write,
                 bytes_written: success.bytes_written,
                 blocked_duration_ns: success.blocked_duration_ns,
+                cancellation_latency_upper_bound_ns: 0,
                 source: Some(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "writer reported a flushed byte count different from the admitted line",
@@ -28327,11 +28332,16 @@ where
         }
         WatchClaimOutputAttempt::Failed(failure) if failure.bytes_written == 0 => {
             WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(failure.blocked_duration_ns);
+            WATCH_CLAIM_OUTPUT_COORDINATOR.record_cancellation_latency_upper_bound(
+                failure.cancellation_latency_upper_bound_ns,
+            );
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.zero_byte_failures);
             let cancellation_poll_interval_ns = 0_u64;
             let pipe_closed = failure.is_broken_pipe();
             let descriptor_restore_lost =
                 matches!(failure.kind, WatchClaimOutputFailureKind::DescriptorRestore);
+            let cancellation_latency_upper_bound_ns =
+                failure.cancellation_latency_upper_bound_ns;
             let write_error = failure.into_io_error();
             return match release_watch_claim_bounded(storage, &lease).await {
                 Ok(true) => {
@@ -28353,6 +28363,7 @@ where
                         event_id = queued_event_id,
                         cursor_generation = queued_cursor_generation,
                         lease_expires_at_ms = queued_lease_expiry,
+                        cancellation_latency_upper_bound_ns,
                         cancellation_poll_interval_ns,
                         "watch-events zero-byte output failure lost delivery-lease ownership before release"
                     );
@@ -28390,6 +28401,9 @@ where
         }
         WatchClaimOutputAttempt::Failed(failure) => {
             WATCH_CLAIM_OUTPUT_COORDINATOR.record_blocked_duration(failure.blocked_duration_ns);
+            WATCH_CLAIM_OUTPUT_COORDINATOR.record_cancellation_latency_upper_bound(
+                failure.cancellation_latency_upper_bound_ns,
+            );
             let cancellation_poll_interval_ns = 0_u64;
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.partial_ambiguities);
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries);
@@ -28399,6 +28413,7 @@ where
                 lease_expires_at_ms = queued_lease_expiry,
                 bytes_written = failure.bytes_written,
                 blocked_duration_ns = failure.blocked_duration_ns,
+                cancellation_latency_upper_bound_ns = failure.cancellation_latency_upper_bound_ns,
                 cancellation_poll_interval_ns,
                 failure_kind = ?failure.kind,
                 "watch-events partial output is ambiguous; stream must stop and lease remains for expiry recovery"
@@ -30942,7 +30957,7 @@ mod watch_events_tests {
         let _output_guard = WATCH_CLAIM_OUTPUT_TEST_LOCK
             .lock()
             .expect("serialize global claimed-output coordinator tests");
-        let (_directory, database_path, event_ids) = watch_claim_fixture(12);
+        let (_directory, database_path, event_ids) = watch_claim_fixture(13);
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
             let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
@@ -30956,16 +30971,41 @@ mod watch_events_tests {
             success_record["cursor"] = serde_json::Value::from(0);
             success_record["cursor_epoch"] =
                 serde_json::Value::String(TEST_CURSOR_EPOCH.to_string());
-            let success =
-                deliver_claimed_watch_event(&cx, &storage, success_id, success_record, |line| {
-                    std::future::ready(write_watch_claim_line_synchronously(
-                        &mut success_output,
-                        &line,
-                    ))
-                })
-                .await
-                .expect("deliver claimed event");
+            let success_database_path = database_path.clone();
+            let success = deliver_claimed_watch_event(
+                &cx,
+                &storage,
+                success_id,
+                success_record,
+                |line| {
+                    let attempt =
+                        write_watch_claim_line_synchronously(&mut success_output, &line);
+                    assert!(matches!(attempt, WatchClaimOutputAttempt::Flushed(_)));
+                    let connection = rusqlite::Connection::open(&success_database_path)
+                        .expect("open pre-finalization witness connection");
+                    let handled_at: Option<i64> = connection
+                        .query_row(
+                            "SELECT handled_at FROM events WHERE id = ?1",
+                            rusqlite::params![success_id],
+                            |row| row.get(0),
+                        )
+                        .expect("read pre-finalization handled state");
+                    assert_eq!(
+                        handled_at, None,
+                        "the event may not become handled until after full line and flush acknowledgement"
+                    );
+                    std::future::ready(attempt)
+                },
+            )
+            .await
+            .expect("deliver claimed event");
             assert!(matches!(success, WatchEventClaimDelivery::Delivered { .. }));
+            assert_eq!(success_output.last(), Some(&b'\n'));
+            assert_eq!(
+                success_output.iter().filter(|byte| **byte == b'\n').count(),
+                1,
+                "one claimed event must cross exactly one complete NDJSON line boundary"
+            );
             let emitted: serde_json::Value =
                 serde_json::from_slice(&success_output).expect("parse claimed NDJSON record");
             assert_eq!(emitted["handled"].as_bool(), Some(false));
@@ -31001,6 +31041,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
+                        cancellation_latency_upper_bound_ns: 0,
                         source: Some(std::io::Error::other("injected watch write failure")),
                     }))
                 },
@@ -31034,6 +31075,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
+                        cancellation_latency_upper_bound_ns: 0,
                         source: Some(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "consumer closed before the first byte",
@@ -31057,6 +31099,44 @@ mod watch_events_tests {
                     .release_event_delivery(&reacquired)
                     .await
                     .expect("release reacquired pipe-close lease")
+            );
+
+            let zero_flush_failure_id = event_ids[12];
+            let zero_flush_error = deliver_claimed_watch_event(
+                &cx,
+                &storage,
+                zero_flush_failure_id,
+                claimed_ipc_persisted_event(zero_flush_failure_id),
+                |_line| {
+                    std::future::ready(WatchClaimOutputAttempt::Failed(
+                        WatchClaimOutputFailure {
+                            kind: WatchClaimOutputFailureKind::Flush,
+                            bytes_written: 0,
+                            blocked_duration_ns: 0,
+                            cancellation_latency_upper_bound_ns: 0,
+                            source: Some(std::io::Error::other(
+                                "flush failed before any acknowledged byte",
+                            )),
+                        },
+                    ))
+                },
+            )
+            .await
+            .expect_err("known zero-byte flush failure must propagate after release");
+            assert_eq!(zero_flush_error.kind(), std::io::ErrorKind::Other);
+            let zero_flush_reacquired = storage
+                .reserve_event_delivery(zero_flush_failure_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+                .await
+                .expect("known zero-byte flush failure must release immediately");
+            let zero_flush_reacquired = match zero_flush_reacquired {
+                frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!("zero-byte flush event was not reacquired: {other:?}"),
+            };
+            assert!(
+                storage
+                    .release_event_delivery(&zero_flush_reacquired)
+                    .await
+                    .expect("release zero-byte flush verification lease")
             );
 
             let contended_id = event_ids[3];
@@ -31239,6 +31319,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
+                        cancellation_latency_upper_bound_ns: 0,
                         source: Some(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "consumer closed before the first byte",
@@ -31289,6 +31370,7 @@ mod watch_events_tests {
                         kind: WatchClaimOutputFailureKind::Write,
                         bytes_written: 0,
                         blocked_duration_ns: 0,
+                        cancellation_latency_upper_bound_ns: 0,
                         source: Some(std::io::Error::other(
                             "injected error after writer cancellation",
                         )),
@@ -31328,13 +31410,11 @@ mod watch_events_tests {
                 claimed_ipc_persisted_event(partial_id),
                 |_line| {
                     std::future::ready(WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
-                        kind: WatchClaimOutputFailureKind::Write,
+                        kind: WatchClaimOutputFailureKind::ContextCancelled,
                         bytes_written: 7,
                         blocked_duration_ns: 123,
-                        source: Some(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "consumer closed after a prefix",
-                        )),
+                        cancellation_latency_upper_bound_ns: 42,
+                        source: None,
                     }))
                 },
             )
@@ -31371,6 +31451,7 @@ mod watch_events_tests {
                 partial_before.expiry_recoveries.saturating_add(1)
             );
             assert!(partial_after.max_blocked_duration_ns >= 123);
+            assert!(partial_after.max_cancellation_latency_upper_bound_ns >= 42);
 
             let flush_failure_id = event_ids[10];
             let mut flush_failure_output = FlushErrorWriter {
@@ -31466,6 +31547,10 @@ mod watch_events_tests {
             assert_eq!(
                 saturation_after.cancellation_poll_interval_ns, 0,
                 "Cx cancellation uses a direct waker rather than a polling timer"
+            );
+            assert!(
+                saturation_after.max_cancellation_latency_upper_bound_ns
+                    >= saturation_before.max_cancellation_latency_upper_bound_ns
             );
             let never_leased = storage
                 .reserve_event_delivery(saturated_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
