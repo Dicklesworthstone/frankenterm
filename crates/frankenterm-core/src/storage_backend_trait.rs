@@ -80,6 +80,21 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
+/// Authoritative state of the backend connection's outer transaction boundary.
+///
+/// Savepoints may be nested inside [`BackendTransactionState::Transaction`].
+/// Callers that create a savepoint must compare the state before and after
+/// releasing it: matching states prove that the savepoint did not accidentally
+/// open or close the surrounding transaction, while the successful `RELEASE`
+/// proves removal of the named savepoint itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendTransactionState {
+    /// No transaction is active; the connection is in autocommit mode.
+    Autocommit,
+    /// An explicit transaction or outermost savepoint is active.
+    Transaction,
+}
+
 /// Capability the storage layer needs from its backing engine.
 ///
 /// Each production implementor (rusqlite today, frankensqlite
@@ -117,6 +132,14 @@ pub trait StorageBackend: Send + Sync {
     /// the wired-pass extension will introduce a full
     /// `Row` abstraction.)
     fn query_scalar(&self, sql: &str) -> Result<Option<String>, BackendError>;
+
+    /// Return the connection's outer transaction state without changing it.
+    ///
+    /// This is a correctness witness, not a diagnostic hint. Writer recovery
+    /// uses it to decide whether a connection epoch is safe to reuse after
+    /// transaction or savepoint control. Implementations must fail rather than
+    /// guess when the state cannot be established authoritatively.
+    fn transaction_state(&self) -> Result<BackendTransactionState, BackendError>;
 
     /// Begin a transaction. Returns a guard that commits on
     /// `commit()` or rolls back on `Drop` (default rollback
@@ -778,6 +801,8 @@ struct MockState {
     executed: Vec<String>,
     user_version: u32,
     in_tx: bool,
+    explicit_transaction: bool,
+    savepoint_depth: usize,
     tx_committed: bool,
     /// br-ft-qgj81 substrate-pass: FIFO queue of pre-loaded
     /// responses for `query_row_strings` calls. Each call pops
@@ -846,20 +871,39 @@ impl StorageBackend for MockBackend {
     fn execute(&self, sql: &str) -> Result<usize, BackendError> {
         let mut state = self.inner.lock().unwrap();
         state.executed.push(sql.to_string());
-        match sql.trim().to_ascii_uppercase().as_str() {
+        let normalized = sql.trim().to_ascii_uppercase();
+        match normalized.as_str() {
             "BEGIN" | "BEGIN TRANSACTION" => {
                 state.in_tx = true;
+                state.explicit_transaction = true;
+                state.tx_committed = false;
+            }
+            "BEGIN IMMEDIATE" => {
+                state.in_tx = true;
+                state.explicit_transaction = true;
                 state.tx_committed = false;
             }
             "COMMIT" => {
                 state.tx_committed = state.in_tx;
                 state.in_tx = false;
+                state.explicit_transaction = false;
+                state.savepoint_depth = 0;
             }
             "ROLLBACK" => {
                 state.in_tx = false;
+                state.explicit_transaction = false;
+                state.savepoint_depth = 0;
                 // tx_committed stays false
             }
             _ => {}
+        }
+        if normalized.starts_with("SAVEPOINT ") {
+            state.in_tx = true;
+            state.savepoint_depth = state.savepoint_depth.saturating_add(1);
+            state.tx_committed = false;
+        } else if normalized.starts_with("RELEASE ") {
+            state.savepoint_depth = state.savepoint_depth.saturating_sub(1);
+            state.in_tx = state.explicit_transaction || state.savepoint_depth != 0;
         }
         Ok(0)
     }
@@ -884,6 +928,14 @@ impl StorageBackend for MockBackend {
         // The mock doesn't run real queries; tests that need a
         // specific answer should use a custom backend impl.
         Ok(None)
+    }
+
+    fn transaction_state(&self) -> Result<BackendTransactionState, BackendError> {
+        Ok(if self.inner.lock().unwrap().in_tx {
+            BackendTransactionState::Transaction
+        } else {
+            BackendTransactionState::Autocommit
+        })
     }
 
     fn begin_transaction(&self) -> Result<TransactionGuard<'_>, BackendError> {
@@ -1139,6 +1191,15 @@ impl StorageBackend for RusqliteBackend {
             }
             None => Ok(None),
         }
+    }
+
+    fn transaction_state(&self) -> Result<BackendTransactionState, BackendError> {
+        let conn = self.conn_guard();
+        Ok(if conn.is_autocommit() {
+            BackendTransactionState::Autocommit
+        } else {
+            BackendTransactionState::Transaction
+        })
     }
 
     fn begin_transaction(&self) -> Result<TransactionGuard<'_>, BackendError> {
@@ -1836,13 +1897,64 @@ mod tests {
     #[test]
     fn rusqlite_backend_transaction_commit_persists_inserts() {
         let backend = open_memory();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
         backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
         let tx = backend.begin_transaction().unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Transaction
+        );
         backend.execute("INSERT INTO t VALUES (1)").unwrap();
         backend.execute("INSERT INTO t VALUES (2)").unwrap();
         tx.commit().unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
         let count = backend.query_scalar("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(count.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn transaction_state_witness_tracks_nested_and_outermost_savepoints() {
+        let backend = open_memory();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+
+        backend.execute("BEGIN").unwrap();
+        backend.execute("SAVEPOINT nested_unit").unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Transaction
+        );
+        backend.execute("RELEASE SAVEPOINT nested_unit").unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Transaction,
+            "releasing a nested savepoint must preserve its outer transaction"
+        );
+        backend.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit
+        );
+
+        backend.execute("SAVEPOINT outermost_unit").unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Transaction
+        );
+        backend.execute("RELEASE SAVEPOINT outermost_unit").unwrap();
+        assert_eq!(
+            backend.transaction_state().unwrap(),
+            BackendTransactionState::Autocommit,
+            "releasing an outermost savepoint must restore autocommit"
+        );
     }
 
     #[test]

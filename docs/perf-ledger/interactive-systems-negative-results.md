@@ -3596,6 +3596,38 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Replace the repeated pointer-and-capacity witness only with an equally deterministic allocation-sensitive oracle that turns red on forced growth, covers the full bounded burst envelope, preserves exact contents and order, and separates retained scratch from allocating convenience results.
 
+### IS-N126 — Successful transaction-control SQL does not prove a reusable writer epoch
+
+- **Classification:** transaction-closure false green; authoritative connection
+  state witness retained
+- **Bead:** `ft-g3hrl.2`
+- **Rejected inference:** `ROLLBACK`, `COMMIT`, or `RELEASE SAVEPOINT`
+  returning success is sufficient evidence that the long-lived storage writer
+  may safely dispatch the next queued command on the same backend connection.
+- **Negative evidence:** the prior helper classified a successful control call
+  as closure without independently checking the connection state. A backend
+  can acknowledge control while retaining an unexpected transaction boundary,
+  and a savepoint may run either inside an outer transaction or as the
+  outermost transaction. Continuing after either ambiguity can fold unrelated
+  queued work into a poisoned epoch. Control-only fault tests could not turn
+  red when the SQL call succeeded but the connection state remained wrong.
+- **Decision:** require every storage backend to expose an authoritative,
+  non-mutating outer-transaction state witness. Top-level writer transactions
+  must start and end in autocommit, must become transactional after `BEGIN`,
+  and must verify autocommit after every successful `COMMIT` or `ROLLBACK`.
+  Savepoints capture the surrounding state, require an active transaction
+  after creation, and require the same surrounding state after `RELEASE` or
+  rollback-plus-release. Probe error, panic, typed backend poison, or state
+  mismatch retires the writer epoch; a typed poison permits no further backend
+  call. Deterministic negative controls inject all four verification failures,
+  while a real rusqlite state test covers nested and outermost savepoints. The
+  terminal drain settles each remaining command under its own recovery
+  boundary. Strict-remote execution remains absent while RCH reports every
+  worker unreachable; no product-path, durability, latency, or long-session
+  qualification follows yet.
+- **Primary retry condition:**
+  > Remove the explicit connection-state witness only after another backend-independent oracle proves the exact pre-begin, post-begin, post-commit, post-rollback, nested-savepoint, and outermost-savepoint states and turns red on error, panic, poison, and mismatch without reusing an ambiguous connection.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

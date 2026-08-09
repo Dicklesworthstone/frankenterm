@@ -54,7 +54,8 @@
 use std::path::Path;
 
 use crate::storage_backend_trait::{
-    BackendError, OpenConfig, StorageBackend, StorageBackendFactory, ToSqlValue, TransactionGuard,
+    BackendError, BackendTransactionState, OpenConfig, StorageBackend, StorageBackendFactory,
+    ToSqlValue, TransactionGuard,
 };
 
 /// Stable diagnostic hint for every stubbed operation. Carries
@@ -157,6 +158,10 @@ impl StorageBackend for FrankenSQLiteBackend {
     }
 
     fn query_scalar(&self, _sql: &str) -> Result<Option<String>, BackendError> {
+        Err(BackendError::Other(NOT_WIRED_HINT.to_string()))
+    }
+
+    fn transaction_state(&self) -> Result<BackendTransactionState, BackendError> {
         Err(BackendError::Other(NOT_WIRED_HINT.to_string()))
     }
 

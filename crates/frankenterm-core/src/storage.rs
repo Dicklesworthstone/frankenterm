@@ -80,7 +80,7 @@ use crate::storage_backend_row_helpers::{CellRowReader, RowReader};
 #[cfg(test)]
 use crate::storage_backend_trait::with_test_storage_backend;
 use crate::storage_backend_trait::{
-    BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
+    BackendError, BackendTransactionState, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
 };
 use crate::storage_pane_id_set::{PaneIdSet, PaneIdTempTablePlan};
 use crate::storage_telemetry::StoragePipelineSnapshot;
@@ -10999,14 +10999,6 @@ fn reset_storage_writer_panics_total_for_test() {
     STORAGE_WRITER_PANICS_TOTAL.store(0, AtomicOrdering::Relaxed);
 }
 
-#[cfg(test)]
-fn reset_storage_writer_recovery_counters_for_test() {
-    STORAGE_WRITER_EPOCH_POISONS_TOTAL.store(0, AtomicOrdering::Relaxed);
-    STORAGE_WRITER_RESPONSE_PANICS_TOTAL.store(0, AtomicOrdering::Relaxed);
-    STORAGE_WRITER_WAKER_PANICS_TOTAL.store(0, AtomicOrdering::Relaxed);
-    let _ = take_writer_backend_epoch_poisoned_signal();
-}
-
 fn storage_writer_waker_action_recovering(action: &'static str, operation: impl FnOnce()) {
     if catch_recoverable(
         RecoverablePanicSite::StorageWriter,
@@ -11138,6 +11130,12 @@ enum WriterTransactionControlOutcome {
     Panicked,
 }
 
+enum WriterTransactionStateOutcome {
+    Known(BackendTransactionState),
+    Failed,
+    BackendPoisoned,
+}
+
 fn writer_transaction_control(
     backend: &dyn StorageBackend,
     sql: &'static str,
@@ -11164,9 +11162,80 @@ fn writer_transaction_control(
     }
 }
 
-fn rollback_writer_transaction(backend: &dyn StorageBackend, operation: &'static str) -> bool {
+fn writer_transaction_state(
+    backend: &dyn StorageBackend,
+    operation: &'static str,
+    phase: &'static str,
+) -> WriterTransactionStateOutcome {
+    match catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| backend.transaction_state()),
+    ) {
+        Ok(Ok(state)) => WriterTransactionStateOutcome::Known(state),
+        Ok(Err(BackendError::TxPoisoned)) => WriterTransactionStateOutcome::BackendPoisoned,
+        Ok(Err(_)) => {
+            tracing::error!(
+                operation,
+                phase,
+                error_code = "WA-STORAGE-WRITER-TX-STATE",
+                "storage writer could not verify the backend transaction state"
+            );
+            WriterTransactionStateOutcome::Failed
+        }
+        Err(_) => {
+            saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
+            tracing::error!(
+                operation,
+                phase,
+                writer_panics_total = storage_writer_panics_total(),
+                error_code = "WA-STORAGE-WRITER-PANIC",
+                "storage writer contained a transaction-state verification panic"
+            );
+            WriterTransactionStateOutcome::Failed
+        }
+    }
+}
+
+fn writer_transaction_state_matches(
+    backend: &dyn StorageBackend,
+    expected: BackendTransactionState,
+    operation: &'static str,
+    phase: &'static str,
+) -> WriterTransactionStateOutcome {
+    match writer_transaction_state(backend, operation, phase) {
+        WriterTransactionStateOutcome::Known(actual) if actual == expected => {
+            WriterTransactionStateOutcome::Known(actual)
+        }
+        WriterTransactionStateOutcome::Known(actual) => {
+            tracing::error!(
+                operation,
+                phase,
+                ?expected,
+                ?actual,
+                error_code = "WA-STORAGE-WRITER-TX-STATE-MISMATCH",
+                "storage writer observed an unexpected backend transaction state"
+            );
+            WriterTransactionStateOutcome::Failed
+        }
+        outcome => outcome,
+    }
+}
+
+fn rollback_writer_transaction(
+    backend: &dyn StorageBackend,
+    expected: BackendTransactionState,
+    operation: &'static str,
+) -> bool {
     match writer_transaction_control(backend, "ROLLBACK", operation, "rollback") {
-        WriterTransactionControlOutcome::Succeeded => true,
+        WriterTransactionControlOutcome::Succeeded => matches!(
+            writer_transaction_state_matches(
+                backend,
+                expected,
+                operation,
+                "rollback-closure-verification",
+            ),
+            WriterTransactionStateOutcome::Known(_)
+        ),
         WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => false,
         WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
             false
@@ -11189,16 +11258,75 @@ fn run_writer_transaction<T, F>(
 where
     F: FnOnce() -> Result<T>,
 {
+    if writer_backend_epoch_poisoned_signal_is_set() {
+        return backend_epoch_poisoned_error(operation, "preflight");
+    }
+    match writer_transaction_state_matches(
+        backend,
+        BackendTransactionState::Autocommit,
+        operation,
+        "preflight",
+    ) {
+        WriterTransactionStateOutcome::Known(_) => {}
+        WriterTransactionStateOutcome::Failed | WriterTransactionStateOutcome::BackendPoisoned => {
+            return backend_epoch_poisoned_error(operation, "preflight");
+        }
+    }
+
     match writer_transaction_control(backend, begin_mode.sql(), operation, "begin") {
-        WriterTransactionControlOutcome::Succeeded => {}
+        WriterTransactionControlOutcome::Succeeded => {
+            match writer_transaction_state_matches(
+                backend,
+                BackendTransactionState::Transaction,
+                operation,
+                "begin-verification",
+            ) {
+                WriterTransactionStateOutcome::Known(_) => {}
+                WriterTransactionStateOutcome::Failed => {
+                    let _ = rollback_writer_transaction(
+                        backend,
+                        BackendTransactionState::Autocommit,
+                        operation,
+                    );
+                    return backend_epoch_poisoned_error(operation, "begin-verification");
+                }
+                WriterTransactionStateOutcome::BackendPoisoned => {
+                    return backend_epoch_poisoned_error(operation, "begin-verification");
+                }
+            }
+        }
         WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
             return backend_epoch_poisoned_error(operation, "begin");
         }
         WriterTransactionControlOutcome::Failed(error) => {
-            return Err(storage_backend_error("Begin writer transaction", error).into());
+            return match writer_transaction_state_matches(
+                backend,
+                BackendTransactionState::Autocommit,
+                operation,
+                "begin-failure-verification",
+            ) {
+                WriterTransactionStateOutcome::Known(_) => {
+                    Err(storage_backend_error("Begin writer transaction", error).into())
+                }
+                WriterTransactionStateOutcome::Failed => {
+                    let _ = rollback_writer_transaction(
+                        backend,
+                        BackendTransactionState::Autocommit,
+                        operation,
+                    );
+                    backend_epoch_poisoned_error(operation, "begin-failure-verification")
+                }
+                WriterTransactionStateOutcome::BackendPoisoned => {
+                    backend_epoch_poisoned_error(operation, "begin-failure-verification")
+                }
+            };
         }
         WriterTransactionControlOutcome::Panicked => {
-            let _ = rollback_writer_transaction(backend, operation);
+            let _ = rollback_writer_transaction(
+                backend,
+                BackendTransactionState::Autocommit,
+                operation,
+            );
             return backend_epoch_poisoned_error(operation, "begin");
         }
     }
@@ -11209,13 +11337,35 @@ where
     );
     match mutation_outcome {
         Ok(Ok(value)) => match writer_transaction_control(backend, "COMMIT", operation, "commit") {
-            WriterTransactionControlOutcome::Succeeded => Ok(value),
+            WriterTransactionControlOutcome::Succeeded => match writer_transaction_state_matches(
+                backend,
+                BackendTransactionState::Autocommit,
+                operation,
+                "commit-closure-verification",
+            ) {
+                WriterTransactionStateOutcome::Known(_) => Ok(value),
+                WriterTransactionStateOutcome::Failed => {
+                    let _ = rollback_writer_transaction(
+                        backend,
+                        BackendTransactionState::Autocommit,
+                        operation,
+                    );
+                    backend_epoch_poisoned_error(operation, "commit-closure-verification")
+                }
+                WriterTransactionStateOutcome::BackendPoisoned => {
+                    backend_epoch_poisoned_error(operation, "commit-closure-verification")
+                }
+            },
             WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
                 backend_epoch_poisoned_error(operation, "commit")
             }
             WriterTransactionControlOutcome::Failed(_)
             | WriterTransactionControlOutcome::Panicked => {
-                let _ = rollback_writer_transaction(backend, operation);
+                let _ = rollback_writer_transaction(
+                    backend,
+                    BackendTransactionState::Autocommit,
+                    operation,
+                );
                 backend_epoch_poisoned_error(operation, "commit")
             }
         },
@@ -11227,7 +11377,11 @@ where
                 } else {
                     Err(error)
                 }
-            } else if rollback_writer_transaction(backend, operation) {
+            } else if rollback_writer_transaction(
+                backend,
+                BackendTransactionState::Autocommit,
+                operation,
+            ) {
                 Err(error)
             } else {
                 backend_epoch_poisoned_error(operation, "rollback")
@@ -11241,7 +11395,11 @@ where
                 error_code = "WA-STORAGE-WRITER-PANIC",
                 "storage writer contained a transaction mutation panic"
             );
-            let _ = rollback_writer_transaction(backend, operation);
+            let _ = rollback_writer_transaction(
+                backend,
+                BackendTransactionState::Autocommit,
+                operation,
+            );
             backend_epoch_poisoned_error(operation, "mutation")
         }
     }
@@ -11257,6 +11415,7 @@ struct WriterSavepoint {
 fn restore_writer_savepoint(
     backend: &dyn StorageBackend,
     savepoint: WriterSavepoint,
+    surrounding_state: BackendTransactionState,
     operation: &'static str,
 ) -> bool {
     match writer_transaction_control(backend, savepoint.rollback_sql, operation, "rollback") {
@@ -11270,7 +11429,15 @@ fn restore_writer_savepoint(
         }
     }
     match writer_transaction_control(backend, savepoint.release_sql, operation, "release") {
-        WriterTransactionControlOutcome::Succeeded => true,
+        WriterTransactionControlOutcome::Succeeded => matches!(
+            writer_transaction_state_matches(
+                backend,
+                surrounding_state,
+                operation,
+                "savepoint-restore-closure-verification",
+            ),
+            WriterTransactionStateOutcome::Known(_)
+        ),
         WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => false,
         WriterTransactionControlOutcome::Failed(_) | WriterTransactionControlOutcome::Panicked => {
             false
@@ -11292,16 +11459,43 @@ fn run_writer_savepoint<T, F>(
 where
     F: FnOnce() -> Result<T>,
 {
+    if writer_backend_epoch_poisoned_signal_is_set() {
+        return backend_epoch_poisoned_error(operation, "preflight");
+    }
+    let surrounding_state = match writer_transaction_state(backend, operation, "preflight") {
+        WriterTransactionStateOutcome::Known(state) => state,
+        WriterTransactionStateOutcome::Failed | WriterTransactionStateOutcome::BackendPoisoned => {
+            return backend_epoch_poisoned_error(operation, "preflight");
+        }
+    };
+
     match writer_transaction_control(backend, savepoint.begin_sql, operation, "begin") {
-        WriterTransactionControlOutcome::Succeeded => {}
+        WriterTransactionControlOutcome::Succeeded => {
+            match writer_transaction_state_matches(
+                backend,
+                BackendTransactionState::Transaction,
+                operation,
+                "savepoint-begin-verification",
+            ) {
+                WriterTransactionStateOutcome::Known(_) => {}
+                WriterTransactionStateOutcome::Failed => {
+                    let _ =
+                        restore_writer_savepoint(backend, savepoint, surrounding_state, operation);
+                    return backend_epoch_poisoned_error(operation, "begin-verification");
+                }
+                WriterTransactionStateOutcome::BackendPoisoned => {
+                    return backend_epoch_poisoned_error(operation, "begin-verification");
+                }
+            }
+        }
         WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
             return backend_epoch_poisoned_error(operation, "begin");
         }
-        WriterTransactionControlOutcome::Failed(error) => {
-            return Err(storage_backend_error("Begin writer savepoint", error).into());
+        WriterTransactionControlOutcome::Failed(_) => {
+            return backend_epoch_poisoned_error(operation, "begin");
         }
         WriterTransactionControlOutcome::Panicked => {
-            let _ = restore_writer_savepoint(backend, savepoint, operation);
+            let _ = restore_writer_savepoint(backend, savepoint, surrounding_state, operation);
             return backend_epoch_poisoned_error(operation, "begin");
         }
     }
@@ -11312,13 +11506,27 @@ where
     ) {
         Ok(Ok(value)) => {
             match writer_transaction_control(backend, savepoint.release_sql, operation, "release") {
-                WriterTransactionControlOutcome::Succeeded => Ok(value),
+                WriterTransactionControlOutcome::Succeeded => {
+                    match writer_transaction_state_matches(
+                        backend,
+                        surrounding_state,
+                        operation,
+                        "savepoint-release-closure-verification",
+                    ) {
+                        WriterTransactionStateOutcome::Known(_) => Ok(value),
+                        WriterTransactionStateOutcome::Failed
+                        | WriterTransactionStateOutcome::BackendPoisoned => {
+                            backend_epoch_poisoned_error(operation, "release-closure-verification")
+                        }
+                    }
+                }
                 WriterTransactionControlOutcome::Failed(BackendError::TxPoisoned) => {
                     backend_epoch_poisoned_error(operation, "release")
                 }
                 WriterTransactionControlOutcome::Failed(_)
                 | WriterTransactionControlOutcome::Panicked => {
-                    let _ = restore_writer_savepoint(backend, savepoint, operation);
+                    let _ =
+                        restore_writer_savepoint(backend, savepoint, surrounding_state, operation);
                     backend_epoch_poisoned_error(operation, "release")
                 }
             }
@@ -11331,7 +11539,7 @@ where
                 } else {
                     Err(error)
                 }
-            } else if restore_writer_savepoint(backend, savepoint, operation) {
+            } else if restore_writer_savepoint(backend, savepoint, surrounding_state, operation) {
                 Err(error)
             } else {
                 backend_epoch_poisoned_error(operation, "rollback")
@@ -11345,7 +11553,7 @@ where
                 error_code = "WA-STORAGE-WRITER-PANIC",
                 "storage writer contained a savepoint mutation panic"
             );
-            let _ = restore_writer_savepoint(backend, savepoint, operation);
+            let _ = restore_writer_savepoint(backend, savepoint, surrounding_state, operation);
             backend_epoch_poisoned_error(operation, "mutation")
         }
     }
@@ -11628,7 +11836,7 @@ fn dispatch_write_command_batch(
     while let Some(cmd) = batch.pop_front() {
         if *should_break {
             let failure = WriterFailure::WriterClosed;
-            *should_break |= fail_undispatched_write_command(cmd, &failure);
+            *should_break |= fail_undispatched_write_command_recovering(cmd, &failure);
             if fail_undispatched_write_commands(batch, &failure) {
                 *should_break = true;
             }
@@ -11675,7 +11883,7 @@ fn dispatch_write_command_batch(
             group_commit_events,
         ) {
             *should_break |= interruption.terminate_epoch;
-            *should_break |= fail_undispatched_write_command(cmd, &interruption.failure);
+            *should_break |= fail_undispatched_write_command_recovering(cmd, &interruption.failure);
             if fail_undispatched_write_commands(batch, &interruption.failure) {
                 *should_break = true;
             }
@@ -11703,7 +11911,7 @@ fn dispatch_write_command_batch(
             }
         } else {
             let failure = WriterFailure::WriterClosed;
-            *should_break |= fail_undispatched_write_command(cmd, &failure);
+            *should_break |= fail_undispatched_write_command_recovering(cmd, &failure);
             if fail_undispatched_write_commands(batch, &failure) {
                 *should_break = true;
             }
@@ -11805,7 +12013,8 @@ fn flush_storage_io_pending_commands(
                 // flush before failing the remaining scheduler tail; merely
                 // dropping its oneshot would erase the recovered-panic cause.
                 *should_break |= interruption.terminate_epoch;
-                *should_break |= fail_undispatched_write_command(cmd, &interruption.failure);
+                *should_break |=
+                    fail_undispatched_write_command_recovering(cmd, &interruption.failure);
                 fail_pending_event_gap(
                     std::mem::take(&mut pending_event_gap),
                     &interruption.failure,
@@ -11823,7 +12032,8 @@ fn flush_storage_io_pending_commands(
                 segment_redactors,
             ) {
                 *should_break |= interruption.terminate_epoch;
-                *should_break |= fail_undispatched_write_command(cmd, &interruption.failure);
+                *should_break |=
+                    fail_undispatched_write_command_recovering(cmd, &interruption.failure);
                 fail_pending_append_segments(
                     std::mem::take(&mut pending_append_segments),
                     &interruption.failure,
@@ -12223,7 +12433,7 @@ fn dispatch_event_gap_group_commit_result(
                             "event/gap group commit result kind mismatch".to_string(),
                         )
                         .into()));
-                        drop(capture_hold);
+                        drop_capture_persistence_hold_recovering(capture_hold);
                     }
                     (
                         PendingEventOrGap::Gap {
@@ -12237,7 +12447,7 @@ fn dispatch_event_gap_group_commit_result(
                             "event/gap group commit result kind mismatch".to_string(),
                         )
                         .into()));
-                        drop(capture_hold);
+                        drop_capture_persistence_hold_recovering(capture_hold);
                     }
                 }
             }
@@ -12267,7 +12477,7 @@ fn fail_pending_event_gap(group: Vec<PendingEventOrGap>, failure: &WriterFailure
                 ..
             } => {
                 respond.respond_best_effort(failure.result());
-                drop(capture_hold);
+                drop_capture_persistence_hold_recovering(capture_hold);
             }
             PendingEventOrGap::Gap {
                 capture_hold,
@@ -12275,7 +12485,7 @@ fn fail_pending_event_gap(group: Vec<PendingEventOrGap>, failure: &WriterFailure
                 ..
             } => {
                 respond.respond_best_effort(failure.result());
-                drop(capture_hold);
+                drop_capture_persistence_hold_recovering(capture_hold);
             }
         }
     }
@@ -12453,13 +12663,13 @@ fn fail_pending_append_segments(commands: Vec<PendingAppendSegmentWrite>, failur
             ..
         } = cmd;
         respond.respond_best_effort(failure.result());
-        drop(capture_hold);
+        drop_capture_persistence_hold_recovering(capture_hold);
     }
 }
 
 fn fail_pending_storage_io_commands(commands: HashMap<u64, WriteCommand>, failure: &WriterFailure) {
     for (_, cmd) in commands {
-        fail_undispatched_write_command(cmd, failure);
+        fail_undispatched_write_command_recovering(cmd, failure);
     }
 }
 
@@ -12469,9 +12679,25 @@ fn fail_undispatched_write_commands(
 ) -> bool {
     let mut should_break = false;
     for cmd in commands {
-        should_break |= fail_undispatched_write_command(cmd, failure);
+        should_break |= fail_undispatched_write_command_recovering(cmd, failure);
     }
     should_break
+}
+
+fn drop_capture_persistence_hold_recovering(capture_hold: Option<CapturePersistenceHold>) {
+    if catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| drop(capture_hold)),
+    )
+    .is_err()
+    {
+        saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
+        tracing::error!(
+            writer_panics_total = storage_writer_panics_total(),
+            error_code = "WA-STORAGE-WRITER-CAPTURE-HOLD-DROP-PANIC",
+            "storage writer contained a panic while releasing capture persistence authority"
+        );
+    }
 }
 
 fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -> bool {
@@ -12482,7 +12708,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
             ..
         } => {
             respond_oneshot_best_effort(respond, failure.result());
-            drop(capture_hold);
+            drop_capture_persistence_hold_recovering(capture_hold);
         }
         WriteCommand::RecordGap {
             capture_hold,
@@ -12490,7 +12716,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
             ..
         } => {
             respond_oneshot_best_effort(respond, failure.result());
-            drop(capture_hold);
+            drop_capture_persistence_hold_recovering(capture_hold);
         }
         WriteCommand::RecordEvent {
             capture_hold,
@@ -12498,7 +12724,7 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
             ..
         } => {
             respond_oneshot_best_effort(respond, failure.result());
-            drop(capture_hold);
+            drop_capture_persistence_hold_recovering(capture_hold);
         }
         WriteCommand::ReserveEventDelivery { respond, .. } => {
             respond_oneshot_best_effort(respond, failure.result());
@@ -12630,6 +12856,30 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
     false
 }
 
+fn fail_undispatched_write_command_recovering(cmd: WriteCommand, failure: &WriterFailure) -> bool {
+    let command_was_shutdown = match &cmd {
+        WriteCommand::Shutdown { .. } => true,
+        #[cfg(test)]
+        WriteCommand::ShutdownPanicForTest { .. } => true,
+        _ => false,
+    };
+    match catch_recoverable(
+        RecoverablePanicSite::StorageWriter,
+        std::panic::AssertUnwindSafe(|| fail_undispatched_write_command(cmd, failure)),
+    ) {
+        Ok(should_break) => should_break,
+        Err(_) => {
+            saturating_atomic_u64_add(&STORAGE_WRITER_PANICS_TOTAL, 1);
+            tracing::error!(
+                writer_panics_total = storage_writer_panics_total(),
+                error_code = "WA-STORAGE-WRITER-SETTLEMENT-PANIC",
+                "storage writer contained a panic while settling an undispatched command"
+            );
+            command_was_shutdown
+        }
+    }
+}
+
 fn dispatch_write_command_raw_recovering(
     backend: &dyn StorageBackend,
     cmd: WriteCommand,
@@ -12713,7 +12963,7 @@ fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
             ..
         } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
-            drop(capture_hold);
+            drop_capture_persistence_hold_recovering(capture_hold);
         }
         WriteCommand::RecordGap {
             capture_hold,
@@ -12721,7 +12971,7 @@ fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
             ..
         } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
-            drop(capture_hold);
+            drop_capture_persistence_hold_recovering(capture_hold);
         }
         WriteCommand::RecordEvent {
             capture_hold,
@@ -12729,7 +12979,7 @@ fn respond_storage_io_rejection(cmd: WriteCommand, message: String) {
             ..
         } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
-            drop(capture_hold);
+            drop_capture_persistence_hold_recovering(capture_hold);
         }
         WriteCommand::RecordAuditAction { respond, .. } => {
             respond_oneshot_best_effort(respond, Err(StorageError::Database(message).into()));
@@ -12895,7 +13145,7 @@ fn close_and_drain_writer_queue(
         match rx.try_recv() {
             Ok(command) => {
                 WriteCommandSender::mark_command_dequeued(queued_depth);
-                let _ = fail_undispatched_write_command(command, failure);
+                let _ = fail_undispatched_write_command_recovering(command, failure);
             }
             Err(mpsc::RecvError::Empty) => {
                 if terminal_drain_wakeup.wait_for_terminal_depth_change(
@@ -13154,6 +13404,9 @@ mod writer_epoch_transaction_tests {
         mode: FaultMode,
         target_occurrence: usize,
         matching_calls: AtomicUsize,
+        transaction_state_fault: Option<(FaultMode, usize)>,
+        transaction_state_override: Option<(BackendTransactionState, usize)>,
+        transaction_state_calls: AtomicUsize,
         calls: Mutex<Vec<String>>,
         post_poison_calls: AtomicUsize,
     }
@@ -13166,6 +13419,9 @@ mod writer_epoch_transaction_tests {
                 mode,
                 target_occurrence: 0,
                 matching_calls: AtomicUsize::new(0),
+                transaction_state_fault: None,
+                transaction_state_override: None,
+                transaction_state_calls: AtomicUsize::new(0),
                 calls: Mutex::new(Vec::new()),
                 post_poison_calls: AtomicUsize::new(0),
             }
@@ -13173,6 +13429,20 @@ mod writer_epoch_transaction_tests {
 
         fn with_target_occurrence(mut self, target_occurrence: usize) -> Self {
             self.target_occurrence = target_occurrence;
+            self
+        }
+
+        fn with_transaction_state_fault(mut self, mode: FaultMode, occurrence: usize) -> Self {
+            self.transaction_state_fault = Some((mode, occurrence));
+            self
+        }
+
+        fn with_transaction_state_override(
+            mut self,
+            state: BackendTransactionState,
+            occurrence: usize,
+        ) -> Self {
+            self.transaction_state_override = Some((state, occurrence));
             self
         }
 
@@ -13209,6 +13479,32 @@ mod writer_epoch_transaction_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         }
+
+        fn observe_transaction_state(
+            &self,
+        ) -> std::result::Result<Option<BackendTransactionState>, BackendError> {
+            if writer_backend_epoch_poisoned_signal_is_set() {
+                self.post_poison_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let occurrence = self
+                .transaction_state_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            if let Some((mode, target_occurrence)) = self.transaction_state_fault
+                && occurrence == target_occurrence
+            {
+                return match mode {
+                    FaultMode::Error => Err(BackendError::Query(
+                        "injected finite transaction-state failure".to_string(),
+                    )),
+                    FaultMode::Poison => Err(BackendError::TxPoisoned),
+                    FaultMode::Panic => std::panic::panic_any("INJECTED-TRANSACTION-STATE-PANIC"),
+                };
+            }
+            Ok(self
+                .transaction_state_override
+                .filter(|(_, target)| occurrence == *target)
+                .map(|(state, _)| state))
+        }
     }
 
     impl StorageBackend for FaultBackend {
@@ -13238,6 +13534,14 @@ mod writer_epoch_transaction_tests {
         fn query_scalar(&self, sql: &str) -> std::result::Result<Option<String>, BackendError> {
             self.observe(sql);
             self.inner.query_scalar(sql)
+        }
+
+        fn transaction_state(&self) -> std::result::Result<BackendTransactionState, BackendError> {
+            if let Some(state) = self.observe_transaction_state()? {
+                Ok(state)
+            } else {
+                self.inner.transaction_state()
+            }
         }
 
         fn query_row_strings(
@@ -13285,7 +13589,7 @@ mod writer_epoch_transaction_tests {
     fn writer_transaction_helper_classifies_every_control_and_mutation_outcome() {
         let _guard = writer_panic_counter_test_lock();
         let _writer_authority = WriterDispatchAuthority::enter();
-        reset_storage_writer_recovery_counters_for_test();
+        let _ = take_writer_backend_epoch_poisoned_signal();
 
         for mode in [FaultMode::Error, FaultMode::Panic] {
             let backend = FaultBackend::new("BEGIN IMMEDIATE", mode);
@@ -13481,6 +13785,128 @@ mod writer_epoch_transaction_tests {
         assert!(!take_writer_backend_epoch_poisoned_signal());
     }
 
+    #[test]
+    fn writer_transaction_closure_verification_is_fail_closed() {
+        let _guard = writer_panic_counter_test_lock();
+        let _writer_authority = WriterDispatchAuthority::enter();
+        let _ = take_writer_backend_epoch_poisoned_signal();
+
+        for mode in [FaultMode::Error, FaultMode::Panic, FaultMode::Poison] {
+            let backend =
+                FaultBackend::new("NEVER", FaultMode::Error).with_transaction_state_fault(mode, 0);
+            let result: Result<()> = run_writer_transaction(
+                &backend,
+                WriterTransactionBeginMode::Immediate,
+                "transaction preflight verification fault",
+                || Ok(()),
+            );
+            assert_epoch_poisoned(&result);
+            assert!(
+                backend.calls().is_empty(),
+                "preflight fault must prevent BEGIN"
+            );
+            assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error)
+            .with_transaction_state_override(BackendTransactionState::Transaction, 0);
+        let preflight_mismatch: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Immediate,
+            "transaction preflight state mismatch",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&preflight_mismatch);
+        assert!(backend.calls().is_empty());
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend =
+                FaultBackend::new("NEVER", FaultMode::Error).with_transaction_state_fault(mode, 1);
+            let result: Result<()> = run_writer_transaction(
+                &backend,
+                WriterTransactionBeginMode::Immediate,
+                "transaction begin verification fault",
+                || Ok(()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE", "ROLLBACK"]);
+            assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error)
+            .with_transaction_state_fault(FaultMode::Poison, 1);
+        let begin_verification_poison: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Immediate,
+            "transaction begin verification backend poison",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&begin_verification_poison);
+        assert_eq!(backend.calls(), vec!["BEGIN IMMEDIATE"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic, FaultMode::Poison] {
+            let backend =
+                FaultBackend::new("NEVER", FaultMode::Error).with_transaction_state_fault(mode, 2);
+            let result: Result<()> = run_writer_transaction(
+                &backend,
+                WriterTransactionBeginMode::Deferred,
+                "transaction rollback closure verification fault",
+                || Err(StorageError::Database("force verified rollback".to_string()).into()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(backend.calls(), vec!["BEGIN", "ROLLBACK"]);
+            assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend =
+                FaultBackend::new("NEVER", FaultMode::Error).with_transaction_state_fault(mode, 2);
+            let result: Result<()> = run_writer_transaction(
+                &backend,
+                WriterTransactionBeginMode::Deferred,
+                "transaction commit closure verification fault",
+                || Ok(()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(backend.calls(), vec!["BEGIN", "COMMIT", "ROLLBACK"]);
+            assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error)
+            .with_transaction_state_fault(FaultMode::Poison, 2);
+        let commit_verification_poison: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Deferred,
+            "transaction commit closure verification backend poison",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&commit_verification_poison);
+        assert_eq!(backend.calls(), vec!["BEGIN", "COMMIT"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error)
+            .with_transaction_state_override(BackendTransactionState::Transaction, 2);
+        let commit_closure_mismatch: Result<()> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Deferred,
+            "transaction commit closure mismatch",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&commit_closure_mismatch);
+        assert_eq!(backend.calls(), vec!["BEGIN", "COMMIT", "ROLLBACK"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+    }
+
     fn fts_test_savepoint() -> WriterSavepoint {
         WriterSavepoint {
             begin_sql: "SAVEPOINT test_unit",
@@ -13493,7 +13919,7 @@ mod writer_epoch_transaction_tests {
     fn writer_savepoint_helper_verifies_rollback_and_release_before_reuse() {
         let _guard = writer_panic_counter_test_lock();
         let _writer_authority = WriterDispatchAuthority::enter();
-        reset_storage_writer_recovery_counters_for_test();
+        let _ = take_writer_backend_epoch_poisoned_signal();
 
         for mode in [FaultMode::Error, FaultMode::Panic] {
             let backend = FaultBackend::new("SAVEPOINT test_unit", mode);
@@ -13503,17 +13929,12 @@ mod writer_epoch_transaction_tests {
                 "savepoint begin ambiguity test",
                 || Ok(()),
             );
+            assert_epoch_poisoned(&result);
             match mode {
                 FaultMode::Error => {
-                    assert!(matches!(
-                        result,
-                        Err(crate::Error::Storage(StorageError::Database(_)))
-                    ));
                     assert_eq!(backend.calls(), vec!["SAVEPOINT test_unit"]);
-                    assert!(!take_writer_backend_epoch_poisoned_signal());
                 }
                 FaultMode::Panic => {
-                    assert_epoch_poisoned(&result);
                     assert_eq!(
                         backend.calls(),
                         vec![
@@ -13522,10 +13943,10 @@ mod writer_epoch_transaction_tests {
                             "RELEASE SAVEPOINT test_unit",
                         ]
                     );
-                    assert!(take_writer_backend_epoch_poisoned_signal());
                 }
                 FaultMode::Poison => unreachable!("poison mode is covered separately"),
             }
+            assert!(take_writer_backend_epoch_poisoned_signal());
         }
 
         let backend = FaultBackend::new("SAVEPOINT test_unit", FaultMode::Poison);
@@ -13692,6 +14113,171 @@ mod writer_epoch_transaction_tests {
         assert_eq!(
             backend.calls(),
             vec!["SAVEPOINT test_unit", "RELEASE SAVEPOINT test_unit"]
+        );
+        assert!(!take_writer_backend_epoch_poisoned_signal());
+    }
+
+    #[test]
+    fn writer_savepoint_closure_verification_is_fail_closed() {
+        let _guard = writer_panic_counter_test_lock();
+        let _writer_authority = WriterDispatchAuthority::enter();
+        let _ = take_writer_backend_epoch_poisoned_signal();
+
+        for mode in [FaultMode::Error, FaultMode::Panic, FaultMode::Poison] {
+            let backend =
+                FaultBackend::new("NEVER", FaultMode::Error).with_transaction_state_fault(mode, 0);
+            let result: Result<()> = run_writer_savepoint(
+                &backend,
+                fts_test_savepoint(),
+                "savepoint preflight verification fault",
+                || Ok(()),
+            );
+            assert_epoch_poisoned(&result);
+            assert!(
+                backend.calls().is_empty(),
+                "preflight fault must prevent SAVEPOINT"
+            );
+            assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error)
+            .with_transaction_state_override(BackendTransactionState::Transaction, 2);
+        let release_closure_mismatch: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "savepoint release closure mismatch",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&release_closure_mismatch);
+        assert_eq!(
+            backend.calls(),
+            vec!["SAVEPOINT test_unit", "RELEASE SAVEPOINT test_unit"]
+        );
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic] {
+            let backend =
+                FaultBackend::new("NEVER", FaultMode::Error).with_transaction_state_fault(mode, 1);
+            let result: Result<()> = run_writer_savepoint(
+                &backend,
+                fts_test_savepoint(),
+                "savepoint begin verification fault",
+                || Ok(()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(
+                backend.calls(),
+                vec![
+                    "SAVEPOINT test_unit",
+                    "ROLLBACK TO SAVEPOINT test_unit",
+                    "RELEASE SAVEPOINT test_unit",
+                ]
+            );
+            assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error)
+            .with_transaction_state_fault(FaultMode::Poison, 1);
+        let begin_verification_poison: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "savepoint begin verification backend poison",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&begin_verification_poison);
+        assert_eq!(backend.calls(), vec!["SAVEPOINT test_unit"]);
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error)
+            .with_transaction_state_override(BackendTransactionState::Autocommit, 1);
+        let begin_state_mismatch: Result<()> = run_writer_savepoint(
+            &backend,
+            fts_test_savepoint(),
+            "savepoint begin state mismatch",
+            || Ok(()),
+        );
+        assert_epoch_poisoned(&begin_state_mismatch);
+        assert_eq!(
+            backend.calls(),
+            vec![
+                "SAVEPOINT test_unit",
+                "ROLLBACK TO SAVEPOINT test_unit",
+                "RELEASE SAVEPOINT test_unit",
+            ]
+        );
+        assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+        assert!(take_writer_backend_epoch_poisoned_signal());
+
+        for mode in [FaultMode::Error, FaultMode::Panic, FaultMode::Poison] {
+            let backend =
+                FaultBackend::new("NEVER", FaultMode::Error).with_transaction_state_fault(mode, 2);
+            let result: Result<()> = run_writer_savepoint(
+                &backend,
+                fts_test_savepoint(),
+                "savepoint restore closure verification fault",
+                || Err(StorageError::Database("force savepoint restore".to_string()).into()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(
+                backend.calls(),
+                vec![
+                    "SAVEPOINT test_unit",
+                    "ROLLBACK TO SAVEPOINT test_unit",
+                    "RELEASE SAVEPOINT test_unit",
+                ]
+            );
+            assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        for mode in [FaultMode::Error, FaultMode::Panic, FaultMode::Poison] {
+            let backend =
+                FaultBackend::new("NEVER", FaultMode::Error).with_transaction_state_fault(mode, 2);
+            let result: Result<()> = run_writer_savepoint(
+                &backend,
+                fts_test_savepoint(),
+                "savepoint release closure verification fault",
+                || Ok(()),
+            );
+            assert_epoch_poisoned(&result);
+            assert_eq!(
+                backend.calls(),
+                vec!["SAVEPOINT test_unit", "RELEASE SAVEPOINT test_unit"]
+            );
+            assert_eq!(backend.post_poison_calls.load(AtomicOrdering::Relaxed), 0);
+            assert!(take_writer_backend_epoch_poisoned_signal());
+        }
+
+        let backend = FaultBackend::new("NEVER", FaultMode::Error);
+        let nested: Result<u64> = run_writer_transaction(
+            &backend,
+            WriterTransactionBeginMode::Deferred,
+            "outer transaction around savepoint",
+            || {
+                run_writer_savepoint(
+                    &backend,
+                    fts_test_savepoint(),
+                    "nested savepoint success",
+                    || Ok(29),
+                )
+            },
+        );
+        assert_eq!(
+            nested.expect("nested savepoint should preserve outer state"),
+            29
+        );
+        assert_eq!(
+            backend.calls(),
+            vec![
+                "BEGIN",
+                "SAVEPOINT test_unit",
+                "RELEASE SAVEPOINT test_unit",
+                "COMMIT",
+            ]
         );
         assert!(!take_writer_backend_epoch_poisoned_signal());
     }
@@ -14877,6 +15463,10 @@ mod writer_io_scheduler_tests {
             self.inner.query_scalar(sql)
         }
 
+        fn transaction_state(&self) -> std::result::Result<BackendTransactionState, BackendError> {
+            self.inner.transaction_state()
+        }
+
         fn begin_transaction(
             &self,
         ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
@@ -14980,6 +15570,11 @@ mod writer_io_scheduler_tests {
         fn query_scalar(&self, sql: &str) -> std::result::Result<Option<String>, BackendError> {
             self.note_call("query_scalar");
             self.inner.query_scalar(sql)
+        }
+
+        fn transaction_state(&self) -> std::result::Result<BackendTransactionState, BackendError> {
+            self.note_call("transaction_state");
+            self.inner.transaction_state()
         }
 
         fn begin_transaction(
@@ -15778,6 +16373,10 @@ mod writer_io_scheduler_tests {
 
         fn query_scalar(&self, sql: &str) -> std::result::Result<Option<String>, BackendError> {
             self.inner.query_scalar(sql)
+        }
+
+        fn transaction_state(&self) -> std::result::Result<BackendTransactionState, BackendError> {
+            self.inner.transaction_state()
         }
 
         fn begin_transaction(
