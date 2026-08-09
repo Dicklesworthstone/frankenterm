@@ -27733,8 +27733,7 @@ struct WatchClaimOutputAdmission {
     event_id: i64,
     cursor_generation: String,
     lease: Option<frankenterm_core::storage::EventDeliveryLease>,
-    completion_sender:
-        Option<std::sync::mpsc::SyncSender<WatchClaimOutputCompletion>>,
+    completion_sender: Option<std::sync::mpsc::SyncSender<WatchClaimOutputCompletion>>,
     completion_receiver: std::sync::mpsc::Receiver<WatchClaimOutputCompletion>,
     completion: Option<WatchClaimOutputCompletion>,
     queued_bytes: usize,
@@ -28259,23 +28258,25 @@ where
         WatchClaimOutputAttempt::FlushedRestoreLost { success, source }
             if success.bytes_written != admission.queued_bytes =>
         {
-            saturating_increment_watch_counter(
-                &WATCH_CLAIM_OUTPUT_COORDINATOR.descriptor_restore_failures,
-            );
             tracing::error!(
                 event_id,
+                bytes_written = success.bytes_written,
+                admitted_bytes = admission.queued_bytes,
                 error_kind = ?source.kind(),
                 "watch-events descriptor restoration failed alongside an invalid flush receipt"
             );
             WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
-                kind: WatchClaimOutputFailureKind::Write,
+                // Restoration loss remains the dominant stream-safety
+                // classification. In particular, a forged zero-byte receipt
+                // must not be downgraded to an ordinary write error that lets
+                // the caller emit a follow-up row through an untrusted stdout
+                // descriptor. Non-zero progress is still handled as an
+                // ambiguity below and deliberately retains the lease.
+                kind: WatchClaimOutputFailureKind::DescriptorRestore,
                 bytes_written: success.bytes_written,
                 blocked_duration_ns: success.blocked_duration_ns,
                 cancellation_latency_upper_bound_ns: 0,
-                source: Some(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "writer reported a flushed byte count different from the admitted line",
-                )),
+                source: Some(source),
             })
         }
         attempt => attempt,
@@ -28340,8 +28341,12 @@ where
             let pipe_closed = failure.is_broken_pipe();
             let descriptor_restore_lost =
                 matches!(failure.kind, WatchClaimOutputFailureKind::DescriptorRestore);
-            let cancellation_latency_upper_bound_ns =
-                failure.cancellation_latency_upper_bound_ns;
+            if descriptor_restore_lost {
+                saturating_increment_watch_counter(
+                    &WATCH_CLAIM_OUTPUT_COORDINATOR.descriptor_restore_failures,
+                );
+            }
+            let cancellation_latency_upper_bound_ns = failure.cancellation_latency_upper_bound_ns;
             let write_error = failure.into_io_error();
             return match release_watch_claim_bounded(storage, &lease).await {
                 Ok(true) => {
@@ -28404,6 +28409,11 @@ where
             WATCH_CLAIM_OUTPUT_COORDINATOR.record_cancellation_latency_upper_bound(
                 failure.cancellation_latency_upper_bound_ns,
             );
+            if matches!(failure.kind, WatchClaimOutputFailureKind::DescriptorRestore) {
+                saturating_increment_watch_counter(
+                    &WATCH_CLAIM_OUTPUT_COORDINATOR.descriptor_restore_failures,
+                );
+            }
             let cancellation_poll_interval_ns = 0_u64;
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.partial_ambiguities);
             saturating_increment_watch_counter(&WATCH_CLAIM_OUTPUT_COORDINATOR.expiry_recoveries);
@@ -30957,7 +30967,7 @@ mod watch_events_tests {
         let _output_guard = WATCH_CLAIM_OUTPUT_TEST_LOCK
             .lock()
             .expect("serialize global claimed-output coordinator tests");
-        let (_directory, database_path, event_ids) = watch_claim_fixture(14);
+        let (_directory, database_path, event_ids) = watch_claim_fixture(15);
         run_watch_claim_async(async move {
             let cx = frankenterm_core::cx::for_testing();
             let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
@@ -31108,17 +31118,15 @@ mod watch_events_tests {
                 zero_flush_failure_id,
                 claimed_ipc_persisted_event(zero_flush_failure_id),
                 |_line| {
-                    std::future::ready(WatchClaimOutputAttempt::Failed(
-                        WatchClaimOutputFailure {
-                            kind: WatchClaimOutputFailureKind::Flush,
-                            bytes_written: 0,
-                            blocked_duration_ns: 0,
-                            cancellation_latency_upper_bound_ns: 0,
-                            source: Some(std::io::Error::other(
-                                "flush failed before any acknowledged byte",
-                            )),
-                        },
-                    ))
+                    std::future::ready(WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Flush,
+                        bytes_written: 0,
+                        blocked_duration_ns: 0,
+                        cancellation_latency_upper_bound_ns: 0,
+                        source: Some(std::io::Error::other(
+                            "flush failed before any acknowledged byte",
+                        )),
+                    }))
                 },
             )
             .await
@@ -31137,6 +31145,58 @@ mod watch_events_tests {
                     .release_event_delivery(&zero_flush_reacquired)
                     .await
                     .expect("release zero-byte flush verification lease")
+            );
+
+            let invalid_restore_id = event_ids[14];
+            let invalid_restore_before = watch_claim_output_metrics();
+            let invalid_restore = deliver_claimed_watch_event(
+                &cx,
+                &storage,
+                invalid_restore_id,
+                claimed_ipc_persisted_event(invalid_restore_id),
+                |_line| {
+                    std::future::ready(WatchClaimOutputAttempt::FlushedRestoreLost {
+                        success: WatchClaimOutputSuccess {
+                            flushed_at: std::time::Instant::now(),
+                            bytes_written: 0,
+                            blocked_duration_ns: 7,
+                        },
+                        source: std::io::Error::other(
+                            "injected restoration failure with invalid flush receipt",
+                        ),
+                    })
+                },
+            )
+            .await
+            .expect("descriptor restoration loss is a typed terminal outcome");
+            assert_eq!(
+                invalid_restore,
+                WatchEventClaimDelivery::DescriptorRestoreLost { flushed_at: None },
+                "an impossible zero-byte flush receipt must never downgrade restoration loss to a follow-up-safe error"
+            );
+            assert!(invalid_restore.stops_stream_without_followup_output());
+            let invalid_restore_after = watch_claim_output_metrics();
+            assert_eq!(
+                invalid_restore_after.descriptor_restore_failures,
+                invalid_restore_before
+                    .descriptor_restore_failures
+                    .saturating_add(1)
+            );
+            let invalid_restore_reacquired = storage
+                .reserve_event_delivery(invalid_restore_id, WATCH_EVENTS_CLAIM_LEASE_TTL)
+                .await
+                .expect("zero-byte restoration loss must release immediately");
+            let invalid_restore_reacquired = match invalid_restore_reacquired {
+                frankenterm_core::storage::EventDeliveryReservation::Acquired(lease) => lease,
+                other => panic!(
+                    "zero-byte restoration-loss event was not immediately reacquired: {other:?}"
+                ),
+            };
+            assert!(
+                storage
+                    .release_event_delivery(&invalid_restore_reacquired)
+                    .await
+                    .expect("release restoration-loss verification lease")
             );
 
             let contended_id = event_ids[3];
@@ -31460,18 +31520,16 @@ mod watch_events_tests {
                 partial_write_id,
                 claimed_ipc_persisted_event(partial_write_id),
                 |_line| {
-                    std::future::ready(WatchClaimOutputAttempt::Failed(
-                        WatchClaimOutputFailure {
-                            kind: WatchClaimOutputFailureKind::Write,
-                            bytes_written: 3,
-                            blocked_duration_ns: 0,
-                            cancellation_latency_upper_bound_ns: 0,
-                            source: Some(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "consumer closed after a three-byte prefix",
-                            )),
-                        },
-                    ))
+                    std::future::ready(WatchClaimOutputAttempt::Failed(WatchClaimOutputFailure {
+                        kind: WatchClaimOutputFailureKind::Write,
+                        bytes_written: 3,
+                        blocked_duration_ns: 0,
+                        cancellation_latency_upper_bound_ns: 0,
+                        source: Some(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "consumer closed after a three-byte prefix",
+                        )),
+                    }))
                 },
             )
             .await
@@ -31688,8 +31746,8 @@ mod watch_events_tests {
         const MARKER_ENV: &str = "FT_TEST_WATCH_CLAIM_UNDRAINED_MARKER_ADDR";
 
         if std::env::var_os(CHILD_ENV).is_some() {
-            let marker_address = std::env::var(MARKER_ENV)
-                .expect("child completion marker address");
+            let marker_address =
+                std::env::var(MARKER_ENV).expect("child completion marker address");
             let (_directory, database_path, event_ids) = watch_claim_fixture(1);
             run_watch_claim_async(async move {
                 let cx = frankenterm_core::cx::Cx::current()
@@ -31711,7 +31769,7 @@ mod watch_events_tests {
                         output_started_rx
                             .recv()
                             .expect("wait for isolated output attempt");
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        std::thread::sleep(std::time::Duration::from_millis(10));
                         cancel_cx.cancel_with(
                             frankenterm_core::outcome::CancelKind::Shutdown,
                             Some("cancel isolated undrained claimed output"),

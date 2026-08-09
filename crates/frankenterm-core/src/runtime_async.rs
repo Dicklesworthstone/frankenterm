@@ -6890,13 +6890,17 @@ fn nonblocking_write_blocked_duration_ns(
 /// registration is re-armed before retrying and dropped on every terminal
 /// path. A second write attempt immediately after first registration closes
 /// the register-vs-ready race for the required single-owner writer.
+/// `maximum_output_duration` bounds the complete write-plus-flush interval;
+/// its timer is allocated and armed only after the first `WouldBlock`, while
+/// active fragmented progress checks the same deadline cooperatively.
 ///
 /// # Errors
 ///
 /// Returns [`NonblockingWriteError`] with exact byte progress when the caller
-/// is cancelled, the writer reports zero progress, a write/flush fails, or the
-/// runtime cannot register writable readiness. Callers must treat every error
-/// with non-zero progress as partial or ambiguous delivery.
+/// is cancelled, the output-completion bound expires, the writer reports zero
+/// progress, a write/flush fails, or the runtime cannot register writable
+/// readiness. Callers must treat every error with non-zero progress as partial
+/// or ambiguous delivery.
 #[cfg(unix)]
 pub async fn write_all_nonblocking_with_cx<W>(
     cx: &crate::cx::Cx,
@@ -6940,7 +6944,11 @@ where
     };
 
     if cx.checkpoint().is_err() {
-        return Err(NonblockingWriteError::cancelled(progress(), blocked_duration(), 0));
+        return Err(NonblockingWriteError::cancelled(
+            progress(),
+            blocked_duration(),
+            0,
+        ));
     }
 
     let output = std::pin::pin!(std::future::poll_fn(|task_cx| {
@@ -7058,14 +7066,13 @@ where
                     if !blocked_started.load(std::sync::atomic::Ordering::Relaxed) {
                         use futures::FutureExt as _;
 
-                        let active_context_matches = crate::cx::Cx::current().is_some_and(
-                            |active| {
+                        let active_context_matches =
+                            crate::cx::Cx::current().is_some_and(|active| {
                                 active.region_id() == cx.region_id()
                                     && active.task_id() == cx.task_id()
                                     && active.timer_driver().is_some()
                                     && cx.timer_driver().is_some()
-                            },
-                        );
+                            });
                         if !active_context_matches {
                             return std::task::Poll::Ready(Err(NonblockingWriteError::new(
                                 NonblockingWriteErrorKind::Readiness,
@@ -7168,11 +7175,10 @@ where
         Either::Left((result, _cancellation)) => result,
         Either::Right((_cancelled, output)) => {
             drop(output);
-            let cancellation_latency_upper_bound_ns = cx_timer_now(cx).duration_since(
-                asupersync::Time::from_nanos(
+            let cancellation_latency_upper_bound_ns =
+                cx_timer_now(cx).duration_since(asupersync::Time::from_nanos(
                     last_pending_at_ns.load(std::sync::atomic::Ordering::Relaxed),
-                ),
-            );
+                ));
             Err(NonblockingWriteError::cancelled(
                 progress(),
                 blocked_duration(),
