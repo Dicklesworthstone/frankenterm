@@ -31737,6 +31737,45 @@ mod watch_events_tests {
                 "both explicit completion and Drop must restore the exact original flags"
             );
         }
+
+        // The command-lifetime guard also covers post-finalization control
+        // rows, which intentionally continue to use the established terminal
+        // formatting path. Once the peer stops draining, those synchronous
+        // helpers must observe WouldBlock instead of stranding shutdown after
+        // the event body already filled the pipe.
+        let (descriptor, _peer) =
+            filedescriptor::socketpair().expect("create full control-output socket pair");
+        let observer = filedescriptor::FileDescriptor::dup(&descriptor)
+            .expect("duplicate full control-output observer");
+        let original_raw = nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
+            .expect("read control-output descriptor flags");
+        let original = nix::fcntl::OFlag::from_bits_retain(original_raw);
+        let mut command_guard = WatchClaimNonblockingDescriptor::enable(descriptor)
+            .expect("enable command-lifetime nonblocking output");
+        let fill = [0_u8; 16 * 1024];
+        loop {
+            match std::io::Write::write(&mut command_guard.descriptor, &fill) {
+                Ok(0) => panic!("control-output socket reported zero progress while filling"),
+                Ok(_written) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to fill control-output socket: {error}"),
+            }
+        }
+        let control_error = write_ndjson_line(
+            &mut command_guard.descriptor,
+            &serde_json::json!({"type": "cursor_checkpoint", "cursor": 42}),
+        )
+        .expect_err("a full claimed control-output pipe must fail promptly");
+        assert_eq!(control_error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(command_guard);
+        let restored_raw = nix::fcntl::fcntl(&observer, nix::fcntl::FcntlArg::F_GETFL)
+            .expect("read restored control-output flags");
+        assert_eq!(
+            nix::fcntl::OFlag::from_bits_retain(restored_raw),
+            original,
+            "the command-lifetime backpressure guard must restore exact descriptor flags"
+        );
     }
 
     #[cfg(unix)]
@@ -46990,6 +47029,22 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             );
                             let cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
+                            let stdout = std::io::stdout();
+                            // Claimed delivery has several ordered control rows
+                            // in addition to the event body (cursor checkpoints,
+                            // gaps, heartbeats, and terminal diagnostics). Keep
+                            // the shared stdout open-file description
+                            // nonblocking for the complete claim command so none
+                            // of those follow-up writes can strand cancellation
+                            // after a large event fills the pipe. The nested
+                            // event writer observes O_NONBLOCK as its original
+                            // state, while this outer guard restores the exact
+                            // pre-command flags on every orderly exit. The
+                            // claim=false path never constructs the guard.
+                            #[cfg(unix)]
+                            let _claim_stdout_descriptor_guard = claim
+                                .then(|| WatchClaimNonblockingDescriptor::duplicate_stdout(&stdout))
+                                .transpose()?;
                             if validate_event_cursor_scope_matches(
                                 cursor_scope.as_deref(),
                                 &expected_cursor_scope,
@@ -47082,7 +47137,6 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             let mut current_cursor_epoch = cursor_epoch;
                             let mut last_emit = std::time::Instant::now();
                             let mut last_event_emit: Option<std::time::Instant> = None;
-                            let stdout = std::io::stdout();
                             let mut retention_coverage: Option<EventRetentionCoverage> = None;
 
                             // ft-7h5da.4.1: live IPC transport state. Persisted
