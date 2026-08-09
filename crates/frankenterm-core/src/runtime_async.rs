@@ -408,6 +408,115 @@ impl Drop for ClearContainedWakerOnDrop {
 thread_local! {
     static ASUPERSYNC_HANDLE: std::cell::RefCell<Option<asupersync::runtime::RuntimeHandle>> =
         const { std::cell::RefCell::new(None) };
+    static ASUPERSYNC_SHUTDOWN_TOKEN: std::cell::RefCell<Option<RuntimeShutdownToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct RuntimeShutdownState {
+    requested: std::sync::atomic::AtomicBool,
+    active_leases: std::sync::Mutex<usize>,
+    changed: std::sync::Condvar,
+}
+
+/// Runtime-instance shutdown authority shared with bounded cleanup work.
+///
+/// This token never owns the runtime. It can therefore be retained by a task
+/// or blocking closure without recreating the runtime ownership cycle that the
+/// ambient handle adapters must avoid.
+#[derive(Clone)]
+pub(crate) struct RuntimeShutdownToken {
+    state: std::sync::Arc<RuntimeShutdownState>,
+}
+
+impl RuntimeShutdownToken {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(RuntimeShutdownState {
+                requested: std::sync::atomic::AtomicBool::new(false),
+                active_leases: std::sync::Mutex::new(0),
+                changed: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    /// Acquire one cleanup lease while admission remains open.
+    pub(crate) fn try_acquire(&self) -> Option<RuntimeShutdownLease> {
+        let mut active = self
+            .state
+            .active_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_shutdown_requested() {
+            return None;
+        }
+        *active = active.checked_add(1)?;
+        Some(RuntimeShutdownLease {
+            state: Some(std::sync::Arc::clone(&self.state)),
+        })
+    }
+
+    /// Return whether this runtime has begun its one-way shutdown transition.
+    pub(crate) fn is_shutdown_requested(&self) -> bool {
+        self.state
+            .requested
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn request_shutdown_and_wait(&self, timeout: Duration) -> bool {
+        let started = std::time::Instant::now();
+        let mut active = self
+            .state
+            .active_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.state
+            .requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.state.changed.notify_all();
+
+        while *active > 0 {
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return false;
+            };
+            let (next, wait) = self
+                .state
+                .changed
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active = next;
+            if wait.timed_out() && *active > 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Proof that one admitted cleanup transaction still belongs to a live
+/// runtime shutdown drain.
+pub(crate) struct RuntimeShutdownLease {
+    state: Option<std::sync::Arc<RuntimeShutdownState>>,
+}
+
+impl Drop for RuntimeShutdownLease {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let mut active = state
+            .active_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = *active;
+        *active = active.saturating_sub(1);
+        debug_assert!(previous > 0, "runtime shutdown lease underflow");
+        state.changed.notify_all();
+    }
+}
+
+#[must_use]
+pub(crate) fn current_runtime_shutdown_token() -> Option<RuntimeShutdownToken> {
+    ASUPERSYNC_SHUTDOWN_TOKEN.with(|cell| cell.borrow().clone())
 }
 
 /// Install an asupersync `RuntimeHandle` into thread-local storage for
@@ -429,6 +538,18 @@ pub(crate) struct ScopedRuntimeHandle {
     previous: Option<asupersync::runtime::RuntimeHandle>,
 }
 
+pub(crate) struct ScopedRuntimeShutdownToken {
+    previous: Option<RuntimeShutdownToken>,
+}
+
+impl Drop for ScopedRuntimeShutdownToken {
+    fn drop(&mut self) {
+        let _ = ASUPERSYNC_SHUTDOWN_TOKEN.try_with(|cell| {
+            cell.replace(self.previous.take());
+        });
+    }
+}
+
 impl Drop for ScopedRuntimeHandle {
     fn drop(&mut self) {
         let _ = ASUPERSYNC_HANDLE.try_with(|cell| {
@@ -445,6 +566,14 @@ pub(crate) fn install_runtime_handle_scoped(
     ScopedRuntimeHandle { previous }
 }
 
+#[must_use]
+pub(crate) fn install_runtime_shutdown_token_scoped(
+    token: Option<RuntimeShutdownToken>,
+) -> ScopedRuntimeShutdownToken {
+    let previous = ASUPERSYNC_SHUTDOWN_TOKEN.with(|cell| cell.replace(token));
+    ScopedRuntimeShutdownToken { previous }
+}
+
 /// Return the currently installed asupersync `RuntimeHandle`, if any.
 #[must_use]
 pub fn current_runtime_handle() -> Option<asupersync::runtime::RuntimeHandle> {
@@ -454,6 +583,7 @@ pub fn current_runtime_handle() -> Option<asupersync::runtime::RuntimeHandle> {
 /// Remove the asupersync `RuntimeHandle` from thread-local storage.
 pub fn clear_runtime_handle() {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
+    ASUPERSYNC_SHUTDOWN_TOKEN.with(|cell| cell.replace(None));
 }
 
 /// Project-owned error surface for fallible mutex and rwlock acquisition.
@@ -2814,6 +2944,10 @@ pub mod task {
     /// Visible to the parent module so that `spawn_detached` can also wrap
     /// futures with the correct runtime context.
     pub(super) struct HandleContextFuture<F> {
+        /// Runtime-instance shutdown authority. This is an Arc-backed token,
+        /// not a runtime handle, so retaining it while Pending cannot keep the
+        /// runtime itself alive.
+        pub(super) shutdown_token: Option<super::RuntimeShutdownToken>,
         /// Explicit task capability context to expose through `Cx::current()`
         /// for each poll. Plain `task::spawn` leaves this unset so the
         /// scheduler-owned ambient context remains authoritative.
@@ -2832,6 +2966,8 @@ pub mod task {
             let runtime_handle = asupersync::runtime::Runtime::current_handle()
                 .expect("runtime task polled without scheduler handle");
             let _runtime_handle_guard = super::install_runtime_handle_scoped(runtime_handle);
+            let _runtime_shutdown_guard =
+                super::install_runtime_shutdown_token_scoped(self.shutdown_token.clone());
             // asupersync installs a scheduler-owned Cx while polling a task,
             // but `spawn_with_cx` promises that ambient adapters inside the
             // child observe the explicitly threaded context. Install it only
@@ -2869,6 +3005,7 @@ pub mod task {
         let task_cx = crate::cx::Cx::current();
         let task_cap_mask = task_cx.as_ref().map(crate::cx::effective_cap_mask);
         let wrapped = HandleContextFuture {
+            shutdown_token: super::current_runtime_shutdown_token(),
             task_cx,
             task_cap_mask,
             future: Box::pin(future),
@@ -2906,6 +3043,7 @@ pub mod task {
         let child_cx = cx.clone();
         let child_cap_mask = crate::cx::effective_cap_mask(&child_cx);
         let wrapped = HandleContextFuture {
+            shutdown_token: super::current_runtime_shutdown_token(),
             task_cx: Some(child_cx.clone()),
             task_cap_mask: Some(child_cap_mask),
             future: Box::pin(async move { task(child_cx).await }),
@@ -2949,6 +3087,7 @@ pub mod task {
         let child_cx = cx.clone();
         let child_cap_mask = crate::cx::effective_cap_mask(&child_cx);
         let wrapped = HandleContextFuture {
+            shutdown_token: super::current_runtime_shutdown_token(),
             task_cx: Some(child_cx.clone()),
             task_cap_mask: Some(child_cap_mask),
             future: Box::pin(async move { task(child_cx).await }),
@@ -6142,6 +6281,23 @@ pub trait CompatRuntime {
 /// Runtime wrapper for asupersync.
 pub struct Runtime {
     inner: asupersync::runtime::Runtime,
+    shutdown_token: RuntimeShutdownToken,
+}
+
+const RUNTIME_SHUTDOWN_LEASE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if !self
+            .shutdown_token
+            .request_shutdown_and_wait(RUNTIME_SHUTDOWN_LEASE_DRAIN_TIMEOUT)
+        {
+            tracing::warn!(
+                timeout_ms = RUNTIME_SHUTDOWN_LEASE_DRAIN_TIMEOUT.as_millis(),
+                "runtime shutdown cleanup leases did not settle before the finite drain deadline"
+            );
+        }
+    }
 }
 
 /// Asupersync implementation of the project runtime lifecycle trait.
@@ -6155,6 +6311,8 @@ impl CompatRuntime for Runtime {
         // explicitly. This mirrors tokio's ambient runtime context.
         let handle = self.inner.handle();
         ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
+        ASUPERSYNC_SHUTDOWN_TOKEN
+            .with(|cell| cell.replace(Some(self.shutdown_token.clone())));
         let result = self.inner.block_on(future);
         // Negative-evidence ledger (ft-2worp): intentionally do NOT clear the
         // handle at block_on return. Clearing it here previously produced
@@ -6181,6 +6339,7 @@ impl CompatRuntime for Runtime {
         // root scheduler Cx and a detached child could escape cancellation or
         // regain denied authority.
         let wrapped = task::HandleContextFuture {
+            shutdown_token: Some(self.shutdown_token.clone()),
             task_cx,
             task_cap_mask,
             future: Box::pin(future),
@@ -6268,7 +6427,10 @@ impl RuntimeBuilder {
     pub fn build(self) -> Result<Runtime, String> {
         self.inner
             .build()
-            .map(|inner| Runtime { inner })
+            .map(|inner| Runtime {
+                inner,
+                shutdown_token: RuntimeShutdownToken::new(),
+            })
             .map_err(|err| err.to_string())
     }
 }
