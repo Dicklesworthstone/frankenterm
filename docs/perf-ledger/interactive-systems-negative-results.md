@@ -3741,11 +3741,14 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   subsystem permit, closes admission in one direction at `Runtime::drop`, and
   keeps the scheduler alive for a finite five-second receipt drain. Process
   counters expose shutdown requests, clean drains, and drain timeouts; native
-  counters expose live scans, workers, observers, high-water mark, admissions,
-  completions, cancellation requests, dropped observers, undelivered receipts,
-  saturation, runtime rejection, and worker failure. The concurrency permit
-  belongs to the blocking-work object, so loss of its async supervisor cannot
-  make an already-running scan disappear from admission accounting. Native
+  counters expose live admitted transactions, runtime-owned supervisors,
+  blocking workers, observers, high-water mark, admissions, completions,
+  cancellation requests, dropped observers, undelivered receipts, saturation,
+  runtime rejection, and worker failure. One shared concurrency permit spans
+  the runtime-owned supervisor and its blocking-work object until terminal
+  receipt delivery or confirmed receiver loss. Whichever side drops first
+  therefore cannot free the cap early, and ready-but-unpolled owners cannot
+  accumulate through repeated permit reuse under scheduler unfairness. Native
   scans additionally reject finite root-byte/component, entry-name,
   retained-path, logical-metadata, and syscall charges before the corresponding
   effect; explicit-home root limits run before cloning caller-controlled path
@@ -3754,10 +3757,14 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   explicit caller cancellation, deadline classification, worker panic,
   missing-runtime and saturated admission, shutdown drain, replacement-runtime
   admission, terminal empty/populated checkpoints, every resource ceiling, and
-  the pending timeout/adapter ownership-cycle regression. Source-only policy
-  gates passed at exact SHA `1199fd214c1fc0900d91ee0bdb45eab7bc644f07`, but
-  strict-remote execution remains absent: RCH again refused local fallback on
-  2026-08-09 while every worker was unreachable. No native product-path,
+  the pending timeout/adapter ownership-cycle regression. The fresh-eyes sweep
+  also found and fixed a benchmark all-targets compile defect where the flat
+  spawn comparison still referenced a runtime handle removed during the helper
+  signature migration. Source-only policy gates passed at exact source SHA
+  `15d38e4cbad5ca617f31b7a3445bf32e973c3e1d`, but strict-remote execution
+  remains absent: the exact-SHA focused command exited 103 on 2026-08-09 with
+  `remote required; refusing local fallback (all workers unreachable)`. No
+  local Cargo substitute ran. No native product-path,
   executable shutdown-drain, M4/M5, Threadripper, mux, render, or latency
   qualification follows yet.
 - **Primary retry condition:**
