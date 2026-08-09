@@ -266,6 +266,11 @@ pub(crate) fn capability_mask_test_cases() -> [(asupersync::cx::CapMask, [bool; 
 }
 
 struct HandleContextFuture<F> {
+    /// Only direct, caller-owned futures may retain an explicit strong handle.
+    /// Runtime-owned spawned futures leave this `None` to avoid an ownership
+    /// cycle and acquire the scheduler's current handle per poll instead.
+    explicit_runtime_handle: Option<RuntimeHandle>,
+    runtime_shutdown: Option<crate::runtime_async::RuntimeShutdownToken>,
     task_cx: Cx,
     task_cap_mask: asupersync::cx::CapMask,
     future: Pin<Box<F>>,
@@ -278,9 +283,15 @@ impl<F: Future> Future for HandleContextFuture<F> {
         // Acquire the scheduler's ambient handle only for this poll. Keeping
         // the caller's strong handle inside a runtime-owned pending future
         // would form an ownership cycle and prevent runtime shutdown.
-        let runtime_handle = Runtime::current_handle()
+        let runtime_handle = self
+            .explicit_runtime_handle
+            .clone()
+            .or_else(Runtime::current_handle)
             .expect("runtime task polled without scheduler handle");
         let _runtime_handle_guard = install_runtime_handle_for_poll(runtime_handle);
+        let _runtime_shutdown_guard = crate::runtime_async::install_runtime_shutdown_token_scoped(
+            self.runtime_shutdown.clone(),
+        );
         // `RuntimeHandle::spawn` installs its own scheduler context. The
         // adapter's contract is stronger: ambient Cx-aware helpers inside the
         // child must observe the exact explicitly threaded context. Scope the
@@ -306,6 +317,8 @@ where
 {
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
+        explicit_runtime_handle: None,
+        runtime_shutdown: crate::runtime_async::current_runtime_shutdown_token(),
         task_cx: child_cx.clone(),
         task_cap_mask: effective_cap_mask(&child_cx),
         future: Box::pin(async move { task(child_cx).await }),
@@ -326,6 +339,8 @@ where
 {
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
+        explicit_runtime_handle: None,
+        runtime_shutdown: crate::runtime_async::current_runtime_shutdown_token(),
         task_cx: child_cx.clone(),
         task_cap_mask: effective_cap_mask(&child_cx),
         future: Box::pin(async move { task(child_cx).await }),
@@ -492,7 +507,8 @@ where
 
     let child_cx = cx.clone();
     let wrapped = HandleContextFuture {
-        handle: handle.clone(),
+        explicit_runtime_handle: Some(handle.clone()),
+        runtime_shutdown: crate::runtime_async::current_runtime_shutdown_token(),
         task_cx: child_cx.clone(),
         task_cap_mask: effective_cap_mask(&child_cx),
         future: Box::pin(async move { task(child_cx).await }),
