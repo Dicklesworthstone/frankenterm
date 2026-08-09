@@ -6765,6 +6765,7 @@ pub struct NonblockingWriteError {
     kind: NonblockingWriteErrorKind,
     bytes_written: usize,
     blocked_duration_ns: u64,
+    cancellation_latency_ns: u64,
     source: Option<std::io::Error>,
 }
 
@@ -6780,7 +6781,25 @@ impl NonblockingWriteError {
             kind,
             bytes_written,
             blocked_duration_ns,
+            cancellation_latency_ns: 0,
             source,
+        }
+    }
+
+    fn cancelled(
+        cx: &crate::cx::Cx,
+        bytes_written: usize,
+        blocked_duration_ns: u64,
+    ) -> Self {
+        let cancellation_latency_ns = cx.root_cancel_cause().map_or(0, |reason| {
+            cx_timer_now(cx).duration_since(reason.timestamp)
+        });
+        Self {
+            kind: NonblockingWriteErrorKind::ContextCancelled,
+            bytes_written,
+            blocked_duration_ns,
+            cancellation_latency_ns,
+            source: None,
         }
     }
 
@@ -6800,6 +6819,12 @@ impl NonblockingWriteError {
     #[must_use]
     pub const fn blocked_duration_ns(&self) -> u64 {
         self.blocked_duration_ns
+    }
+
+    /// Time from the structural cancellation request to output settlement.
+    #[must_use]
+    pub const fn cancellation_latency_ns(&self) -> u64 {
+        self.cancellation_latency_ns
     }
 
     /// Return true only when the owning capability context stopped the write.
@@ -6886,16 +6911,31 @@ where
     }
 
     let mut phase = WritePhase::Bytes;
-    let mut bytes_written = 0_usize;
-    let mut blocked_started_at = None;
+    let bytes_written = std::sync::atomic::AtomicUsize::new(0);
+    let blocked_started_at_ns = std::sync::atomic::AtomicU64::new(0);
+    let blocked_started = std::sync::atomic::AtomicBool::new(false);
     let mut readiness: Option<asupersync::runtime::IoRegistration> = None;
+    let mut consecutive_interruptions = 0_u16;
+
+    let progress = || bytes_written.load(std::sync::atomic::Ordering::Relaxed);
+    let blocked_duration = || {
+        if blocked_started.load(std::sync::atomic::Ordering::Acquire) {
+            nonblocking_write_blocked_duration_ns(
+                cx,
+                Some(asupersync::Time::from_nanos(
+                    blocked_started_at_ns.load(std::sync::atomic::Ordering::Relaxed),
+                )),
+            )
+        } else {
+            0
+        }
+    };
 
     if cx.checkpoint().is_err() {
-        return Err(NonblockingWriteError::new(
-            NonblockingWriteErrorKind::ContextCancelled,
-            bytes_written,
-            nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
-            None,
+        return Err(NonblockingWriteError::cancelled(
+            cx,
+            progress(),
+            blocked_duration(),
         ));
     }
 
@@ -6907,8 +6947,8 @@ where
                 Err(source) => {
                     return std::task::Poll::Ready(Err(NonblockingWriteError::new(
                         NonblockingWriteErrorKind::Readiness,
-                        bytes_written,
-                        nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                        progress(),
+                        blocked_duration(),
                         Some(source),
                     )));
                 }
@@ -6919,9 +6959,10 @@ where
         // returning Interrupted or tiny successful fragments.
         for _ in 0..64 {
             let had_readiness = readiness.is_some();
+            let acknowledged = progress();
             let result = match phase {
-                WritePhase::Bytes if bytes_written < bytes.len() => {
-                    writer.write(&bytes[bytes_written..]).map(Some)
+                WritePhase::Bytes if acknowledged < bytes.len() => {
+                    writer.write(&bytes[acknowledged..]).map(Some)
                 }
                 WritePhase::Bytes => {
                     phase = WritePhase::Flush;
@@ -6934,48 +6975,67 @@ where
                 Ok(Some(0)) => {
                     return std::task::Poll::Ready(Err(NonblockingWriteError::new(
                         NonblockingWriteErrorKind::WriteZero,
-                        bytes_written,
-                        nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                        progress(),
+                        blocked_duration(),
                         None,
                     )));
                 }
                 Ok(Some(written)) => {
-                    let remaining = bytes.len().saturating_sub(bytes_written);
+                    let remaining = bytes.len().saturating_sub(progress());
                     if written > remaining {
                         return std::task::Poll::Ready(Err(NonblockingWriteError::new(
                             NonblockingWriteErrorKind::Write,
-                            bytes_written,
-                            nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                            progress(),
+                            blocked_duration(),
                             Some(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 "writer reported progress beyond the supplied buffer",
                             )),
                         )));
                     }
-                    bytes_written += written;
+                    bytes_written.fetch_add(written, std::sync::atomic::Ordering::Relaxed);
+                    consecutive_interruptions = 0;
                     readiness = None;
                 }
                 Ok(None) => {
                     readiness = None;
                     return std::task::Poll::Ready(Ok(NonblockingWriteReceipt {
-                        bytes_written,
-                        blocked_duration_ns: nonblocking_write_blocked_duration_ns(
-                            cx,
-                            blocked_started_at,
-                        ),
+                        bytes_written: progress(),
+                        blocked_duration_ns: blocked_duration(),
                     }));
                 }
-                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {
+                    consecutive_interruptions = consecutive_interruptions.saturating_add(1);
+                    if consecutive_interruptions == 1_024 {
+                        let kind = match phase {
+                            WritePhase::Bytes => NonblockingWriteErrorKind::Write,
+                            WritePhase::Flush => NonblockingWriteErrorKind::Flush,
+                        };
+                        return std::task::Poll::Ready(Err(NonblockingWriteError::new(
+                            kind,
+                            progress(),
+                            blocked_duration(),
+                            Some(source),
+                        )));
+                    }
+                }
                 Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                    blocked_started_at.get_or_insert_with(|| cx_timer_now(cx));
+                    consecutive_interruptions = 0;
+                    if !blocked_started.load(std::sync::atomic::Ordering::Relaxed) {
+                        blocked_started_at_ns.store(
+                            cx_timer_now(cx).as_nanos(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        blocked_started.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     if !had_readiness {
                         let mut registration = match cx.register_io(writer, Interest::WRITABLE) {
                             Ok(registration) => registration,
                             Err(source) => {
                                 return std::task::Poll::Ready(Err(NonblockingWriteError::new(
                                     NonblockingWriteErrorKind::Readiness,
-                                    bytes_written,
-                                    nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                                    progress(),
+                                    blocked_duration(),
                                     Some(source),
                                 )));
                             }
@@ -6986,8 +7046,8 @@ where
                             Err(source) => {
                                 return std::task::Poll::Ready(Err(NonblockingWriteError::new(
                                     NonblockingWriteErrorKind::Readiness,
-                                    bytes_written,
-                                    nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                                    progress(),
+                                    blocked_duration(),
                                     Some(source),
                                 )));
                             }
@@ -7006,8 +7066,8 @@ where
                     };
                     return std::task::Poll::Ready(Err(NonblockingWriteError::new(
                         kind,
-                        bytes_written,
-                        nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
+                        progress(),
+                        blocked_duration(),
                         Some(source),
                     )));
                 }
@@ -7028,11 +7088,10 @@ where
         Either::Left((result, _cancellation)) => result,
         Either::Right((_cancelled, output)) => {
             drop(output);
-            Err(NonblockingWriteError::new(
-                NonblockingWriteErrorKind::ContextCancelled,
-                bytes_written,
-                nonblocking_write_blocked_duration_ns(cx, blocked_started_at),
-                None,
+            Err(NonblockingWriteError::cancelled(
+                cx,
+                progress(),
+                blocked_duration(),
             ))
         }
     }
