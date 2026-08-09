@@ -3735,21 +3735,31 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   observes a typed oneshot terminal receipt; observer Drop or caller-context
   termination requests a private one-way cooperative cancellation without
   cancelling the shared caller `Cx`, while the supervisor retains the blocking
-  join until settlement. Content-free counters expose owners, workers,
-  observers, high-water mark, admissions, completions, cancellation requests,
-  dropped observers, undelivered receipts, saturation, runtime rejection, and
-  worker failure. The concurrency permit belongs to the blocking-work object,
-  so loss of its async supervisor cannot make an already-running scan disappear
-  from admission accounting. Native scans additionally reject finite
-  root-byte/component, entry-name, retained-path, logical-metadata, and syscall
-  charges before the corresponding effect; explicit-home root limits run
-  before cloning caller-controlled path data. Deterministic isolated tests
-  cover ordinary receipt delivery, observer-drop settlement, explicit caller
-  cancellation, runtime rejection, saturation-before-work, pre-runtime root
-  rejection, and each resource ceiling. Strict-remote execution remains absent
-  because RCH refused local fallback while every worker was unreachable; no
-  native product-path, shutdown-drain, M4/M5, Threadripper, mux, render, or
-  latency qualification follows yet.
+  join until settlement. Runtime-owned futures acquire only the scheduler's
+  weak/current handle per poll; no pending adapter retains a strong
+  `RuntimeHandle`. A non-owning runtime shutdown token admits a lease before the
+  subsystem permit, closes admission in one direction at `Runtime::drop`, and
+  keeps the scheduler alive for a finite five-second receipt drain. Process
+  counters expose shutdown requests, clean drains, and drain timeouts; native
+  counters expose live scans, workers, observers, high-water mark, admissions,
+  completions, cancellation requests, dropped observers, undelivered receipts,
+  saturation, runtime rejection, and worker failure. The concurrency permit
+  belongs to the blocking-work object, so loss of its async supervisor cannot
+  make an already-running scan disappear from admission accounting. Native
+  scans additionally reject finite root-byte/component, entry-name,
+  retained-path, logical-metadata, and syscall charges before the corresponding
+  effect; explicit-home root limits run before cloning caller-controlled path
+  data. Deterministic isolated source tests now cover unpolled drop, ordinary
+  receipt delivery, every measured scan checkpoint, observer-drop settlement,
+  explicit caller cancellation, deadline classification, worker panic,
+  missing-runtime and saturated admission, shutdown drain, replacement-runtime
+  admission, terminal empty/populated checkpoints, every resource ceiling, and
+  the pending timeout/adapter ownership-cycle regression. Source-only policy
+  gates passed at exact SHA `1199fd214c1fc0900d91ee0bdb45eab7bc644f07`, but
+  strict-remote execution remains absent: RCH again refused local fallback on
+  2026-08-09 while every worker was unreachable. No native product-path,
+  executable shutdown-drain, M4/M5, Threadripper, mux, render, or latency
+  qualification follows yet.
 - **Primary retry condition:**
   > Replace the runtime-owned supervisor only after another design proves that caller-future drop, caller cancellation, saturation, runtime rejection, and shutdown cannot orphan an admitted blocking join; preserves exactly one typed terminal receipt; bounds live owners, workers, observers, queued work, directory entries, path and metadata bytes, and syscall exposure; and converges under deterministic barriers plus strict-remote exact-source tests.
 
