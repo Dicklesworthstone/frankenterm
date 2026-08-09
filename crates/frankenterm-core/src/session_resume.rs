@@ -1060,11 +1060,45 @@ fn checked_discovery_resource_add(
 fn map_spawn_blocking_error(
     error: &crate::runtime_async::SpawnBlockingWithCxError,
 ) -> SessionResumeError {
-    if error.is_cancelled() {
-        SessionResumeError::Cancelled
-    } else {
-        SessionResumeError::AsyncInfrastructureFailure
+    use crate::runtime_async::SpawnBlockingWithCxError;
+
+    match error {
+        SpawnBlockingWithCxError::CancelledBeforeSpawn { kind }
+        | SpawnBlockingWithCxError::CancelledMidFlight { kind } => {
+            session_resume_cx_termination_from_kind(*kind)
+        }
+        SpawnBlockingWithCxError::RuntimeFailure
+        | SpawnBlockingWithCxError::CancellationWatcherTimerFailure => {
+            SessionResumeError::AsyncInfrastructureFailure
+        }
     }
+}
+
+fn session_resume_cx_termination_from_kind(
+    kind: Option<crate::outcome::CancelKind>,
+) -> SessionResumeError {
+    use crate::outcome::CancelKind;
+
+    match kind {
+        Some(CancelKind::Deadline | CancelKind::Timeout) => SessionResumeError::Timeout,
+        Some(CancelKind::PollQuota | CancelKind::CostBudget) => {
+            SessionResumeError::AsyncInfrastructureFailure
+        }
+        Some(
+            CancelKind::User
+            | CancelKind::FailFast
+            | CancelKind::RaceLost
+            | CancelKind::ParentCancelled
+            | CancelKind::ResourceUnavailable
+            | CancelKind::Shutdown
+            | CancelKind::LinkedExit,
+        )
+        | None => SessionResumeError::Cancelled,
+    }
+}
+
+fn session_resume_cx_termination(cx: &crate::cx::Cx) -> SessionResumeError {
+    session_resume_cx_termination_from_kind(cx.root_cancel_cause().map(|reason| reason.kind))
 }
 
 struct SessionCommandCancellationGuard {
@@ -1570,7 +1604,8 @@ impl SessionResumer {
         args: &[&str],
         apply_working_dir: bool,
     ) -> Result<String, SessionResumeError> {
-        cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)?;
+        cx.checkpoint()
+            .map_err(|_| session_resume_cx_termination(cx))?;
         let timeout = validate_session_resume_timeout_secs(self.config.timeout_secs)?;
         let mut cmd = self.build_casr_command(args, apply_working_dir)?;
         let cancellation = CommandCancellation::new();
@@ -1662,7 +1697,7 @@ impl SessionResumer {
 
         if worker_result.is_err() || watcher_result.is_err() {
             if cancellation_won {
-                return Err(SessionResumeError::Cancelled);
+                return Err(session_resume_cx_termination(cx));
             }
             return Err(SessionResumeError::AsyncInfrastructureFailure);
         }
@@ -1670,7 +1705,7 @@ impl SessionResumer {
             .map_err(|_| SessionResumeError::AsyncInfrastructureFailure)?
             .map_err(|error| Self::map_command_error(&error))?;
         if cancellation_won {
-            return Err(SessionResumeError::Cancelled);
+            return Err(session_resume_cx_termination(cx));
         }
         cancellation_guard.disarm();
 
@@ -1986,6 +2021,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
     resource_budget: &mut NativeDiscoveryResourceBudget,
     mut checkpoint: impl FnMut() -> Result<(), SessionResumeError>,
 ) -> Result<SessionDiscoveryResult, SessionResumeError> {
+    checkpoint()?;
     resource_budget.charge_syscalls(1)?;
     let dir_entries = match directory.entries() {
         Ok(entries) => entries,
@@ -2048,6 +2084,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
             continue;
         };
         resource_budget.charge_candidate_metadata()?;
+        checkpoint()?;
         let file_type = match dir_entry.file_type() {
             Ok(file_type) => file_type,
             Err(_) => {
@@ -2073,6 +2110,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
         }
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
+        checkpoint()?;
         let mut file = match directory.open_with(relative_path, &options) {
             Ok(file) => file,
             Err(_) => {
@@ -2084,6 +2122,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
                 continue;
             }
         };
+        checkpoint()?;
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -2100,6 +2139,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
             continue;
         }
         let mut sqlite_header = [0_u8; 16];
+        checkpoint()?;
         match file.read_exact(&mut sqlite_header) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -2125,6 +2165,7 @@ fn discover_antigravity_conversations_in_open_dir_with_checkpoint(
             .ok()
             .map(cap_std::time::SystemTime::into_std)
             .and_then(system_time_to_epoch_millis);
+        checkpoint()?;
         let resume_plan = antigravity_native_resume_plan(&session_id)?;
         let result_path = conversations_dir.join(relative_path);
         resource_budget.charge_result_path(&result_path)?;
@@ -2268,8 +2309,11 @@ impl NativeDiscoveryCancellation {
     }
 
     fn checkpoint(&self, cx: &crate::cx::Cx) -> Result<(), SessionResumeError> {
-        if self.requested.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+        if self.requested.load(Ordering::Acquire) {
             return Err(SessionResumeError::Cancelled);
+        }
+        if cx.checkpoint().is_err() {
+            return Err(session_resume_cx_termination(cx));
         }
         Ok(())
     }
@@ -2316,7 +2360,7 @@ enum NativeDiscoveryTerminalReceipt {
 }
 
 enum NativeDiscoveryCancellationWait {
-    ContextEnded,
+    ContextEnded(SessionResumeError),
     TimerFailed,
 }
 
@@ -2350,13 +2394,15 @@ async fn wait_for_native_discovery_cancellation(
             .is_err()
         {
             return if cx.checkpoint().is_err() {
-                NativeDiscoveryCancellationWait::ContextEnded
+                NativeDiscoveryCancellationWait::ContextEnded(session_resume_cx_termination(cx))
             } else {
                 NativeDiscoveryCancellationWait::TimerFailed
             };
         }
         if cx.checkpoint().is_err() {
-            return NativeDiscoveryCancellationWait::ContextEnded;
+            return NativeDiscoveryCancellationWait::ContextEnded(session_resume_cx_termination(
+                cx,
+            ));
         }
     }
 }
@@ -2373,7 +2419,8 @@ where
         + Send
         + 'static,
 {
-    cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)?;
+    cx.checkpoint()
+        .map_err(|_| session_resume_cx_termination(cx))?;
     let permit = NativeDiscoveryPermit::try_acquire().ok_or(
         SessionResumeError::DiscoveryAdmissionRejected {
             reason: SessionDiscoveryAdmissionRejection::SubsystemSaturated,
@@ -2459,9 +2506,9 @@ where
             observer.request_cancellation();
             Err(SessionResumeError::AsyncInfrastructureFailure)
         }
-        Either::Right((NativeDiscoveryCancellationWait::ContextEnded, _)) => {
+        Either::Right((NativeDiscoveryCancellationWait::ContextEnded(error), _)) => {
             observer.request_cancellation();
-            Err(SessionResumeError::Cancelled)
+            Err(error)
         }
         Either::Right((NativeDiscoveryCancellationWait::TimerFailed, _)) => {
             observer.request_cancellation();
@@ -2503,7 +2550,8 @@ async fn discover_antigravity_conversations_for_optional_home_with_cx(
     home_dir: Option<PathBuf>,
 ) -> Result<SessionDiscoveryResult, SessionResumeError> {
     let Some(home_dir) = home_dir else {
-        cx.checkpoint().map_err(|_| SessionResumeError::Cancelled)?;
+        cx.checkpoint()
+            .map_err(|_| session_resume_cx_termination(cx))?;
         return Ok(unavailable_native_discovery());
     };
     run_owned_native_discovery_with_cx(cx, move |cancellation, scan_cx| {
@@ -2849,6 +2897,57 @@ mod tests {
     struct ReleaseNativeDiscoveryBarrierOnDrop(Arc<NativeDiscoveryTestBarrier>);
 
     impl Drop for ReleaseNativeDiscoveryBarrierOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    struct NativeDiscoveryCheckpointGate {
+        target: usize,
+        reached: AtomicUsize,
+        released: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl NativeDiscoveryCheckpointGate {
+        fn new(target: usize) -> Self {
+            Self {
+                target,
+                reached: AtomicUsize::new(0),
+                released: std::sync::Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+            }
+        }
+
+        fn checkpoint_in_worker(&self) {
+            let stage = self.reached.fetch_add(1, Ordering::AcqRel) + 1;
+            if stage != self.target {
+                return;
+            }
+            let mut released = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = self
+                    .changed
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        fn release(&self) {
+            *self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct ReleaseNativeDiscoveryCheckpointOnDrop(Arc<NativeDiscoveryCheckpointGate>);
+
+    impl Drop for ReleaseNativeDiscoveryCheckpointOnDrop {
         fn drop(&mut self) {
             self.0.release();
         }
@@ -4419,6 +4518,56 @@ mod tests {
     }
 
     #[test]
+    fn dropping_unpolled_native_discovery_future_admits_no_work() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let work_ran = Arc::new(AtomicBool::new(false));
+        let work_ran_inner = Arc::clone(&work_ran);
+        let cx = crate::cx::for_request();
+        let request = run_owned_native_discovery_with_cx(
+            &cx,
+            move |_cancellation, _scan_cx| {
+                work_ran_inner.store(true, Ordering::Release);
+                Ok(SessionDiscoveryResult::default())
+            },
+        );
+
+        drop(request);
+        assert!(!work_ran.load(Ordering::Acquire));
+        assert_eq!(native_discovery_runtime_metrics(), before);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn native_discovery_worker_panic_is_quarantined_and_settles() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native discovery panic runtime");
+        runtime.block_on(async {
+            let cx = crate::cx::for_request();
+            let error = run_owned_native_discovery_with_cx(&cx, |_cancellation, _scan_cx| {
+                panic!("synthetic native discovery worker panic");
+            })
+            .await
+            .expect_err("worker panic must become a finite infrastructure failure");
+            assert_eq!(error, SessionResumeError::AsyncInfrastructureFailure);
+            wait_for_native_discovery_state(&cx, |snapshot| {
+                snapshot.active_scans == before.active_scans
+                    && snapshot.active_workers == before.active_workers
+                    && snapshot.active_observers == before.active_observers
+            })
+            .await;
+        });
+
+        let after = native_discovery_runtime_metrics();
+        assert_eq!(after.admitted_total, before.admitted_total + 1);
+        assert_eq!(after.completed_total, before.completed_total + 1);
+        assert_eq!(after.worker_failed_total, before.worker_failed_total + 1);
+    }
+
+    #[test]
     fn dropping_native_discovery_observer_cancels_but_owner_settles() {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
@@ -4487,6 +4636,108 @@ mod tests {
         assert_eq!(
             after.undelivered_receipt_total,
             before.undelivered_receipt_total + 1
+        );
+    }
+
+    #[test]
+    fn repeated_observer_abandonment_settles_at_every_scan_checkpoint() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let directory = tempfile::tempdir().expect("native checkpoint fixture");
+        std::fs::write(
+            directory
+                .path()
+                .join("123e4567-e89b-12d3-a456-426614174000.db"),
+            b"SQLite format 3\0",
+        )
+        .expect("write native checkpoint fixture");
+
+        let mut checkpoint_count = 0_usize;
+        let report = discover_antigravity_conversations_in_dir_with_checkpoint(
+            directory.path(),
+            || {
+                checkpoint_count = checkpoint_count.saturating_add(1);
+                Ok(())
+            },
+        )
+        .expect("enumerate native checkpoint fixture");
+        assert_eq!(report.entries.len(), 1);
+        assert!(checkpoint_count > 0);
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native checkpoint runtime");
+        for target in 1..=checkpoint_count {
+            let gate = Arc::new(NativeDiscoveryCheckpointGate::new(target));
+            let _release_on_drop =
+                ReleaseNativeDiscoveryCheckpointOnDrop(Arc::clone(&gate));
+            runtime.block_on(async {
+                let request_cx = crate::cx::for_request();
+                let task_cx = request_cx.clone();
+                let worker_gate = Arc::clone(&gate);
+                let fixture_path = directory.path().to_path_buf();
+                let request = crate::runtime_async::task::spawn_with_cx(
+                    &request_cx,
+                    move |_child_cx| async move {
+                        run_owned_native_discovery_with_cx(
+                            &task_cx,
+                            move |cancellation, scan_cx| {
+                                discover_antigravity_conversations_in_dir_with_checkpoint(
+                                    &fixture_path,
+                                    || {
+                                        worker_gate.checkpoint_in_worker();
+                                        cancellation.checkpoint(&scan_cx)
+                                    },
+                                )
+                            },
+                        )
+                        .await
+                    },
+                );
+
+                wait_for_native_discovery_state(&request_cx, |snapshot| {
+                    gate.reached.load(Ordering::Acquire) >= target
+                        && snapshot.active_scans == before.active_scans + 1
+                        && snapshot.active_workers == before.active_workers + 1
+                        && snapshot.active_observers == before.active_observers + 1
+                })
+                .await;
+                request.abort();
+                assert!(
+                    request.await.is_err(),
+                    "checkpoint {target} observer must acknowledge abort"
+                );
+                gate.release();
+                wait_for_native_discovery_state(&request_cx, |snapshot| {
+                    snapshot.active_scans == before.active_scans
+                        && snapshot.active_workers == before.active_workers
+                        && snapshot.active_observers == before.active_observers
+                })
+                .await;
+            });
+        }
+
+        let checkpoint_count_u64 = u64::try_from(checkpoint_count).expect("finite checkpoints");
+        let after = native_discovery_runtime_metrics();
+        assert_eq!(
+            after.admitted_total,
+            before.admitted_total + checkpoint_count_u64
+        );
+        assert_eq!(
+            after.completed_total,
+            before.completed_total + checkpoint_count_u64
+        );
+        assert_eq!(
+            after.cancel_requested_total,
+            before.cancel_requested_total + checkpoint_count_u64
+        );
+        assert_eq!(
+            after.dropped_observer_total,
+            before.dropped_observer_total + checkpoint_count_u64
+        );
+        assert_eq!(
+            after.undelivered_receipt_total,
+            before.undelivered_receipt_total + checkpoint_count_u64
         );
     }
 
@@ -4563,6 +4814,79 @@ mod tests {
         assert_eq!(
             after.dropped_observer_total, before.dropped_observer_total,
             "explicit context cancellation is not an abandoned observer"
+        );
+        assert_eq!(
+            after.undelivered_receipt_total,
+            before.undelivered_receipt_total + 1
+        );
+    }
+
+    #[test]
+    fn native_discovery_deadline_remains_timeout_and_owner_settles() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let before = native_discovery_runtime_metrics();
+        let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native discovery deadline runtime");
+        let _release_on_drop = ReleaseNativeDiscoveryBarrierOnDrop(Arc::clone(&barrier));
+        runtime.block_on(async {
+            let request_cx = crate::cx::for_request();
+            let task_cx = request_cx.clone();
+            let settlement_cx = crate::cx::for_request();
+            let worker_barrier = Arc::clone(&barrier);
+            let request = crate::runtime_async::task::spawn_with_cx(
+                &request_cx,
+                move |_child_cx| async move {
+                    run_owned_native_discovery_with_cx(
+                        &task_cx,
+                        move |cancellation, scan_cx| {
+                            worker_barrier.wait_in_worker();
+                            cancellation.checkpoint(&scan_cx)?;
+                            Ok(SessionDiscoveryResult::default())
+                        },
+                    )
+                    .await
+                },
+            );
+
+            wait_for_native_discovery_state(&settlement_cx, |snapshot| {
+                barrier.started.load(Ordering::Acquire)
+                    && snapshot.active_scans == before.active_scans + 1
+                    && snapshot.active_workers == before.active_workers + 1
+                    && snapshot.active_observers == before.active_observers + 1
+            })
+            .await;
+            request_cx.cancel_with(
+                crate::outcome::CancelKind::Deadline,
+                Some("expire synthetic native discovery deadline"),
+            );
+            assert_eq!(
+                request
+                    .await
+                    .expect("deadline observer task must return its typed result"),
+                Err(SessionResumeError::Timeout)
+            );
+
+            barrier.release();
+            wait_for_native_discovery_state(&settlement_cx, |snapshot| {
+                snapshot.active_scans == before.active_scans
+                    && snapshot.active_workers == before.active_workers
+                    && snapshot.active_observers == before.active_observers
+            })
+            .await;
+        });
+
+        let after = native_discovery_runtime_metrics();
+        assert_eq!(after.admitted_total, before.admitted_total + 1);
+        assert_eq!(after.completed_total, before.completed_total + 1);
+        assert_eq!(
+            after.cancel_requested_total,
+            before.cancel_requested_total + 1
+        );
+        assert_eq!(
+            after.dropped_observer_total, before.dropped_observer_total,
+            "a deadline is not an abandoned observer"
         );
         assert_eq!(
             after.undelivered_receipt_total,
