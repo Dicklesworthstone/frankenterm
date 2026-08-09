@@ -4494,6 +4494,7 @@ struct ByteAdmissionStats {
     peel_removals: usize,
     backfill_queries: usize,
     backfill_candidate_trials: usize,
+    final_rejection_trials: usize,
     backfill_index_rebuilds: usize,
     backfill_index_entries_peak: usize,
 }
@@ -4602,9 +4603,7 @@ impl DominanceBucket {
             .max(1)
             .checked_next_power_of_two()
             .ok_or_else(encoded_size_overflow)?;
-        let tree_len = tree_base
-            .checked_mul(2)
-            .ok_or_else(encoded_size_overflow)?;
+        let tree_len = tree_base.checked_mul(2).ok_or_else(encoded_size_overflow)?;
         let mut minima = vec![None; tree_len];
         for (position, point) in points.into_iter().enumerate() {
             minima[tree_base + position] =
@@ -4625,9 +4624,7 @@ impl DominanceBucket {
             .keys
             .binary_search(&(point.tab_delta, point.candidate_index))
             .map_err(|_| {
-                PersistenceFailure::corrupt(
-                    "dominance index lost a byte-admission candidate key",
-                )
+                PersistenceFailure::corrupt("dominance index lost a byte-admission candidate key")
             })?;
         let mut node = self.tree_base + position;
         if self.minima[node].take().is_none() {
@@ -4637,18 +4634,13 @@ impl DominanceBucket {
         }
         node /= 2;
         while node != 0 {
-            self.minima[node] =
-                minimum_dominance(self.minima[node * 2], self.minima[node * 2 + 1]);
+            self.minima[node] = minimum_dominance(self.minima[node * 2], self.minima[node * 2 + 1]);
             node /= 2;
         }
         Ok(())
     }
 
-    fn query(
-        &self,
-        maximum_tab_delta: i128,
-        maximum_byte_delta: i128,
-    ) -> Option<DominanceMinimum> {
+    fn query(&self, maximum_tab_delta: i128, maximum_byte_delta: i128) -> Option<DominanceMinimum> {
         let upper = self
             .keys
             .partition_point(|(tab_delta, _)| *tab_delta <= maximum_tab_delta);
@@ -4696,9 +4688,7 @@ impl BackfillDominanceIndex {
             .max(1)
             .checked_next_power_of_two()
             .ok_or_else(encoded_size_overflow)?;
-        let tree_len = tree_base
-            .checked_mul(2)
-            .ok_or_else(encoded_size_overflow)?;
+        let tree_len = tree_base.checked_mul(2).ok_or_else(encoded_size_overflow)?;
         let mut pending_buckets = vec![Vec::new(); tree_len];
         let mut points_by_candidate = vec![None; candidate_count];
         let mut entry_count = 0usize;
@@ -4719,9 +4709,7 @@ impl BackfillDominanceIndex {
             let coordinate = live_overlay_deltas
                 .binary_search(&point.live_overlay_delta)
                 .map_err(|_| {
-                    PersistenceFailure::corrupt(
-                        "dominance index lost a live-overlay coordinate",
-                    )
+                    PersistenceFailure::corrupt("dominance index lost a live-overlay coordinate")
                 })?;
             let mut node = tree_base + coordinate;
             while node != 0 {
@@ -4852,8 +4840,8 @@ fn admission_backfill_slack(
     projection: AdmissionProjection,
     normalized_byte_ceiling: u64,
 ) -> Result<(i128, i128, i128), PersistenceFailure> {
-    let live_overlays = u64::try_from(projection.counts.live_overlays)
-        .map_err(|_| encoded_size_overflow())?;
+    let live_overlays =
+        u64::try_from(projection.counts.live_overlays).map_err(|_| encoded_size_overflow())?;
     let maximum_live_overlays =
         u64::try_from(MAX_LAYOUT_OVERLAYS).map_err(|_| encoded_size_overflow())?;
     let tabs = u64::try_from(projection.counts.tabs).map_err(|_| encoded_size_overflow())?;
@@ -4886,9 +4874,7 @@ fn build_backfill_dominance_index(
         .map(|(index, candidate)| BackfillPoint::for_candidate(projection, index, candidate))
         .collect::<Result<Vec<_>, _>>()?;
     let index = BackfillDominanceIndex::build(points, candidates.len())?;
-    stats.backfill_index_entries_peak = stats
-        .backfill_index_entries_peak
-        .max(index.entry_count);
+    stats.backfill_index_entries_peak = stats.backfill_index_entries_peak.max(index.entry_count);
     Ok(index)
 }
 
@@ -4911,9 +4897,7 @@ fn restore_inclusion_maximal_subset(
         let (live_overlay_slack, tab_slack, byte_slack) =
             admission_backfill_slack(*aggregate, normalized_byte_ceiling)?;
         stats.backfill_queries = stats.backfill_queries.saturating_add(1);
-        let Some(candidate_index) =
-            index.query(live_overlay_slack, tab_slack, byte_slack)
-        else {
+        let Some(candidate_index) = index.query(live_overlay_slack, tab_slack, byte_slack) else {
             break;
         };
         if !pending_backfill[candidate_index] || remaining[candidate_index] {
@@ -4922,8 +4906,7 @@ fn restore_inclusion_maximal_subset(
             ));
         }
 
-        stats.backfill_candidate_trials =
-            stats.backfill_candidate_trials.saturating_add(1);
+        stats.backfill_candidate_trials = stats.backfill_candidate_trials.saturating_add(1);
         let mut projected = *aggregate;
         projected.apply(&candidates[candidate_index])?;
         let violation_mask = admission_violation_mask(base, projected, maximum_bytes, true)?;
@@ -4970,8 +4953,16 @@ fn select_compatible_candidate_subset(
     let mut remaining = vec![false; candidates.len()];
     let mut remaining_count = pending.len();
     for index in pending {
+        let candidate = candidates.get(*index).ok_or_else(|| {
+            PersistenceFailure::corrupt("byte-admission pending candidate was out of bounds")
+        })?;
+        if remaining[*index] {
+            return Err(PersistenceFailure::corrupt(
+                "byte-admission pending candidates contained a duplicate identity",
+            ));
+        }
         remaining[*index] = true;
-        aggregate.apply(&candidates[*index])?;
+        aggregate.apply(candidate)?;
     }
 
     let deltas = candidates
@@ -5107,6 +5098,7 @@ fn select_compatible_candidate_subset(
                     remaining[*index] = false;
                 }
             }
+            stats.peel_removals = stats.peel_removals.saturating_add(remaining_count);
             remaining_count = 0;
             aggregate = base;
             break;
@@ -5241,7 +5233,7 @@ fn enforce_encoded_byte_admission(
         projection,
         rejected,
         accepted_count,
-        stats,
+        mut stats,
     } = select_compatible_candidate_subset(
         base_projection,
         &candidates,
@@ -5254,9 +5246,8 @@ fn enforce_encoded_byte_admission(
             "byte-admission selector lost a candidate lineage",
         ));
     }
-    preflight.byte_admission = stats;
-
     for index in rejected {
+        stats.final_rejection_trials = stats.final_rejection_trials.saturating_add(1);
         let candidate = &candidates[index];
         let mut projected = projection;
         projected.apply(candidate)?;
@@ -5271,6 +5262,7 @@ fn enforce_encoded_byte_admission(
         };
         reject_byte_admission_candidate(candidate, batch, preflight, failure);
     }
+    preflight.byte_admission = stats;
 
     preflight.overlays.new_tombstones = preflight
         .overlays
@@ -5655,6 +5647,8 @@ impl Drop for PersistenceLockTelemetry {
                 .record(as_u64(stats.backfill_queries));
             metrics::histogram!("window_state.byte_admission.backfill_candidate_trials")
                 .record(as_u64(stats.backfill_candidate_trials));
+            metrics::histogram!("window_state.byte_admission.final_rejection_trials")
+                .record(as_u64(stats.final_rejection_trials));
             metrics::histogram!("window_state.byte_admission.backfill_index_rebuilds")
                 .record(as_u64(stats.backfill_index_rebuilds));
             metrics::histogram!("window_state.byte_admission.backfill_index_entries_peak")
@@ -9122,6 +9116,237 @@ mod tests {
                 "candidate {index} remained individually admissible"
             );
         }
+    }
+
+    fn mixed_sign_unlock_point(candidate_index: usize, candidate_count: usize) -> BackfillPoint {
+        let distance = candidate_count
+            .checked_sub(candidate_index)
+            .and_then(|distance| distance.checked_sub(1))
+            .expect("candidate index belongs to the unlock chain");
+        let distance = i128::try_from(distance).expect("test distance fits i128");
+        let (live_overlay_delta, tab_delta) = if distance == 0 {
+            (-1, 0)
+        } else if distance % 2 == 1 {
+            (distance, -(distance + 1))
+        } else {
+            (-(distance + 1), distance)
+        };
+        BackfillPoint {
+            candidate_index,
+            live_overlay_delta,
+            tab_delta,
+            normalized_byte_delta: 0,
+        }
+    }
+
+    #[test]
+    fn dominance_index_replaces_quadratic_mixed_sign_rescans_at_4096() {
+        const CANDIDATES: usize = 4_096;
+        let points = (0..CANDIDATES)
+            .map(|index| mixed_sign_unlock_point(index, CANDIDATES))
+            .collect::<Vec<_>>();
+
+        let legacy_started = Instant::now();
+        let mut legacy_live_slack = 0i128;
+        let mut legacy_tab_slack = 0i128;
+        let mut legacy_trials = 0usize;
+        let mut legacy_rejections_since_progress = 0usize;
+        let mut legacy = std::collections::VecDeque::from_iter(points.iter().copied());
+        while let Some(point) = legacy.pop_front() {
+            legacy_trials = legacy_trials.checked_add(1).expect("trial count fits");
+            if point.live_overlay_delta <= legacy_live_slack && point.tab_delta <= legacy_tab_slack
+            {
+                legacy_live_slack -= point.live_overlay_delta;
+                legacy_tab_slack -= point.tab_delta;
+                legacy_rejections_since_progress = 0;
+            } else {
+                legacy.push_back(point);
+                legacy_rejections_since_progress = legacy_rejections_since_progress
+                    .checked_add(1)
+                    .expect("rejection count fits");
+                assert_ne!(
+                    legacy_rejections_since_progress,
+                    legacy.len(),
+                    "unlock chain must always make deterministic progress"
+                );
+            }
+        }
+        let legacy_elapsed = legacy_started.elapsed();
+
+        let dominance_started = Instant::now();
+        let mut dominance = BackfillDominanceIndex::build(points, CANDIDATES)
+            .expect("build bounded dominance index");
+        let index_entries = dominance.entry_count;
+        let mut dominance_live_slack = 0i128;
+        let mut dominance_tab_slack = 0i128;
+        let mut dominance_queries = 0usize;
+        while dominance_queries != CANDIDATES {
+            let candidate_index = dominance
+                .query(dominance_live_slack, dominance_tab_slack, 0)
+                .expect("one chain candidate is admissible");
+            let point = mixed_sign_unlock_point(candidate_index, CANDIDATES);
+            dominance
+                .remove(candidate_index)
+                .expect("remove selected dominance point once");
+            dominance_live_slack -= point.live_overlay_delta;
+            dominance_tab_slack -= point.tab_delta;
+            dominance_queries += 1;
+        }
+        assert_eq!(dominance.query(i128::MAX, i128::MAX, 0), None);
+        let dominance_elapsed = dominance_started.elapsed();
+
+        let expected_legacy_trials = CANDIDATES
+            .checked_mul(CANDIDATES + 1)
+            .and_then(|trials| trials.checked_div(2))
+            .expect("legacy triangular trial count fits");
+        let tree_levels = usize::try_from(CANDIDATES.next_power_of_two().ilog2())
+            .expect("tree level count fits usize")
+            + 1;
+        assert_eq!(legacy_trials, expected_legacy_trials);
+        assert_eq!(dominance_queries, CANDIDATES);
+        assert!(index_entries <= CANDIDATES * tree_levels);
+        eprintln!(
+            "window_state byte-admission 4096-lineage comparison: legacy_trials={legacy_trials} dominance_queries={dominance_queries} index_entries={index_entries} legacy_elapsed={legacy_elapsed:?} dominance_elapsed={dominance_elapsed:?}"
+        );
+    }
+
+    fn mixed_sign_unlock_candidate(
+        candidate_index: usize,
+        candidate_count: usize,
+    ) -> ByteAdmissionCandidate {
+        let point = mixed_sign_unlock_point(candidate_index, candidate_count);
+        let mut mutations = Vec::new();
+        if point.live_overlay_delta > 0 {
+            for _ in 0..usize::try_from(point.live_overlay_delta)
+                .expect("positive live delta fits usize")
+            {
+                mutations.push(OverlayBudgetMutation {
+                    old_overlay_bytes: None,
+                    new_overlay_bytes: Some(10),
+                    new_tombstone_bytes: None,
+                    old_tab_count: 0,
+                    new_tab_count: 0,
+                    old_is_live: false,
+                    new_is_live: true,
+                    adds_tombstone: false,
+                });
+            }
+        } else {
+            for _ in 0..usize::try_from(-point.live_overlay_delta)
+                .expect("negative live delta magnitude fits usize")
+            {
+                mutations.push(OverlayBudgetMutation {
+                    old_overlay_bytes: Some(10),
+                    new_overlay_bytes: None,
+                    new_tombstone_bytes: Some(10),
+                    old_tab_count: 0,
+                    new_tab_count: 0,
+                    old_is_live: true,
+                    new_is_live: false,
+                    adds_tombstone: true,
+                });
+            }
+        }
+        if point.tab_delta != 0 {
+            let (old_tab_count, new_tab_count) = if point.tab_delta > 0 {
+                (
+                    0,
+                    usize::try_from(point.tab_delta).expect("positive tab delta fits usize"),
+                )
+            } else {
+                (
+                    usize::try_from(-point.tab_delta)
+                        .expect("negative tab delta magnitude fits usize"),
+                    0,
+                )
+            };
+            mutations.push(OverlayBudgetMutation {
+                old_overlay_bytes: Some(10),
+                new_overlay_bytes: Some(10),
+                new_tombstone_bytes: None,
+                old_tab_count,
+                new_tab_count,
+                old_is_live: true,
+                new_is_live: true,
+                adds_tombstone: false,
+            });
+        }
+        ByteAdmissionCandidate {
+            key: ByteAdmissionKey::Overlay(window_id(
+                u64::try_from(candidate_index).expect("candidate index fits u64"),
+            )),
+            admission_rank: if point.live_overlay_delta < 0 { 1 } else { 2 },
+            mutation: ByteBudgetMutation::OverlayComponent {
+                window_ids: vec![window_id(
+                    u64::try_from(candidate_index).expect("candidate index fits u64"),
+                )],
+                mutations,
+            },
+        }
+    }
+
+    #[test]
+    fn exact_backfill_trials_each_adversarial_lineage_once() {
+        const CANDIDATES: usize = 64;
+        let byte_budget = EncodedStateBudget {
+            empty_slot_bytes: 100,
+            window_states: JsonCollectionBudget::default(),
+            domain_bindings: JsonCollectionBudget::default(),
+            overlays: JsonCollectionBudget {
+                item_bytes: u64::try_from(MAX_LAYOUT_OVERLAYS).expect("overlay cap fits u64") * 10,
+                item_count: MAX_LAYOUT_OVERLAYS,
+            },
+            tombstones: JsonCollectionBudget {
+                item_bytes: 10,
+                item_count: 1,
+            },
+        };
+        let base = AdmissionProjection {
+            normalized_bytes: byte_budget,
+            physical_bytes: byte_budget,
+            counts: AdmissionCountBudget {
+                workspaces: 0,
+                bindings: 0,
+                live_overlays: MAX_LAYOUT_OVERLAYS,
+                tombstones: 1,
+                tabs: MAX_TOTAL_OVERLAY_TABS,
+            },
+        };
+        let candidates = (0..CANDIDATES)
+            .map(|index| mixed_sign_unlock_candidate(index, CANDIDATES))
+            .collect::<Vec<_>>();
+        let mut aggregate = base;
+        let mut remaining = vec![false; CANDIDATES];
+        let mut pending_backfill = vec![true; CANDIDATES];
+        let mut remaining_count = 0usize;
+        let mut stats = ByteAdmissionStats {
+            candidate_count: CANDIDATES,
+            ..ByteAdmissionStats::default()
+        };
+
+        restore_inclusion_maximal_subset(
+            base,
+            &candidates,
+            &mut aggregate,
+            &mut remaining,
+            &mut pending_backfill,
+            &mut remaining_count,
+            u64::MAX,
+            &mut stats,
+        )
+        .expect("restore the exact mixed-sign unlock chain");
+
+        assert_eq!(remaining_count, CANDIDATES);
+        assert!(remaining.into_iter().all(|accepted| accepted));
+        assert!(pending_backfill.into_iter().all(|pending| !pending));
+        assert_eq!(stats.backfill_candidate_trials, CANDIDATES);
+        assert_eq!(stats.backfill_queries, CANDIDATES + 1);
+        assert_eq!(stats.backfill_index_rebuilds, 1);
+        assert_eq!(
+            admission_violation_mask(base, aggregate, u64::MAX, true)
+                .expect("classify final aggregate"),
+            0
+        );
     }
 
     #[test]
