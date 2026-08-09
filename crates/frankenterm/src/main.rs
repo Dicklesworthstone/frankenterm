@@ -31681,6 +31681,107 @@ mod watch_events_tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn claimed_output_undrained_pipe_subprocess_is_cancellation_bounded() {
+        const CHILD_ENV: &str = "FT_TEST_WATCH_CLAIM_UNDRAINED_CHILD";
+        const MARKER_ENV: &str = "FT_TEST_WATCH_CLAIM_UNDRAINED_MARKER";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let marker = std::path::PathBuf::from(
+                std::env::var_os(MARKER_ENV).expect("child completion marker path"),
+            );
+            let (_directory, database_path, event_ids) = watch_claim_fixture(1);
+            run_watch_claim_async(async move {
+                let cx = frankenterm_core::cx::Cx::current()
+                    .expect("test subprocess must expose its reactor-capable context");
+                let cancel_cx = cx.clone();
+                let cancellation = std::thread::Builder::new()
+                    .name("watch-claim-undrained-cancel".to_string())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        cancel_cx.cancel_with(
+                            frankenterm_core::outcome::CancelKind::Shutdown,
+                            Some("cancel isolated undrained claimed output"),
+                        );
+                    })
+                    .expect("spawn isolated cancellation requester");
+                let storage = frankenterm_core::storage::StorageHandle::new(&database_path)
+                    .await
+                    .expect("open isolated claimed-output storage");
+                let event_id = event_ids[0];
+                let mut record = claimed_ipc_persisted_event(event_id);
+                record["matched_text"] = serde_json::Value::String("x".repeat(900 * 1024));
+                let stdout = std::io::stdout();
+                let writer = WatchClaimStdoutWriter::new(&stdout)
+                    .expect("prepare isolated nonblocking stdout");
+                let output_cx = cx.clone();
+                let delivery = deliver_claimed_watch_event(
+                    &cx,
+                    &storage,
+                    event_id,
+                    record,
+                    move |line| async move { writer.write_and_flush(&output_cx, line).await },
+                )
+                .await
+                .expect("isolated cancellation must return a typed delivery outcome");
+                assert!(matches!(
+                    delivery,
+                    WatchEventClaimDelivery::OutputAmbiguous {
+                        bytes_written,
+                        ..
+                    } if bytes_written > 0
+                ));
+                cancellation
+                    .join()
+                    .expect("join isolated cancellation requester");
+                storage
+                    .shutdown()
+                    .await
+                    .expect("shutdown isolated claimed-output storage");
+            });
+            std::fs::write(marker, b"settled-before-drain")
+                .expect("publish isolated completion marker");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("create subprocess marker directory");
+        let marker = directory.path().join("claimed-output-settled.marker");
+        let executable = std::env::current_exe().expect("resolve current test executable");
+        let child = std::process::Command::new(executable)
+            .arg("claimed_output_undrained_pipe_subprocess_is_cancellation_bounded")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(MARKER_ENV, &marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn isolated undrained claimed-output test subprocess");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let settled_before_drain = marker.is_file();
+        let output = child
+            .wait_with_output()
+            .expect("drain and join isolated claimed-output subprocess");
+        assert!(
+            settled_before_drain,
+            "the child did not settle while its stdout pipe remained open and undrained; status={:?}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "isolated claimed-output subprocess failed: status={:?}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn finalization_lost_uses_actual_flush_time_for_rate_and_heartbeat_clocks() {
         let flushed_at = std::time::Instant::now()
