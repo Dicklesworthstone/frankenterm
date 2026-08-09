@@ -1,54 +1,52 @@
-# Codec atomic-redeploy constraint
+# Codec version-window and atomic-redeploy constraint
 
 **Bead:** [ft-og9bi](../.beads/issues.jsonl) (track A doc of ft-kuxho)
 **Related:** [ft-kuxho](../.beads/issues.jsonl) parent epic, [`docs/codec-versions.md`](codec-versions.md), [`docs/proposals/ft-kuxho-B-codec-version-min-supported-window.md`](proposals/ft-kuxho-B-codec-version-min-supported-window.md), ft-nyvyl (slow-loris TLS handshake fix, ed413bd2)
 
 ## TL;DR
 
-Today, **every `CODEC_VERSION` bump requires you to take down all mux
-servers and clients, then bring them back up at the new version, with
-no version skew tolerated in between.** This is a deployment
-constraint, not a transient bug — the wire format and the version
-field are both flat scalars and the codec has no negotiation. Until
-ft-kuxho/B's `CODEC_VERSION_MIN_SUPPORTED` window lands, schedule
-codec-bump deploys as maintenance windows and follow the runbook
-below.
+`CODEC_VERSION_MIN_SUPPORTED` is live. Each peer advertises an inclusive
+`min_supported..=codec_vers` window, the handshake rejects disjoint or
+impossible windows, and a successful connection retains the lower peer's
+canonical version as its agreed dialect.
 
-## 1. The failure mode
+- An **additive** change uses a new PDU identity and advances only
+  `CODEC_VERSION`. It is rolling-upgrade safe when both inbound and outbound
+  admission gate that PDU on its minimum dialect. Old peers continue at the
+  previously agreed dialect and never receive the new PDU.
+- A **breaking** positional-schema change advances both `CODEC_VERSION` and
+  `CODEC_VERSION_MIN_SUPPORTED`. Its windows are intentionally disjoint from
+  the old release, so it still requires the maintenance-window runbook below.
 
-Two facts compose into the constraint:
+The current release is codec v57 with a v56 floor. PDU93/94 is additive and
+therefore unavailable, without wire emission, on a negotiated v56 connection.
 
-1. **`CODEC_VERSION` is a single scalar.** `frankenterm/codec/src/lib.rs:650`:
+## 1. The remaining failure mode
 
-   ```rust
-   pub const CODEC_VERSION: usize = 46;
-   ```
-
-   The handshake (`GetCodecVersion` / `GetCodecVersionResponse`, PDUs
-   26/27) returns one number. Existing client code compares with `==`
-   and aborts on mismatch — there is no version window, no
-   negotiation, no fallback path.
-
-2. **varbincode is a positional binary format.** Field offsets are
+The version window prevents a new peer from emitting a new PDU to an old peer;
+it does not make arbitrary schema edits compatible. Varbincode is a positional
+binary format. Field offsets are
    computed by serial position. Adding, removing, reordering, or
    type-changing any field shifts every subsequent field's offset in
    the encoded payload. The known-bad pattern documented in
-   `frankenterm/codec/src/lib.rs:1204-1228` is `skip_serializing_if`
+   `frankenterm/codec/src/lib.rs` is `skip_serializing_if`
    on `Option<T>`: it elides the tag byte for `None`, misaligning the
    decoder for every downstream field.
 
-Combined: a v46 client decoding a v47 PDU sees a different field
-layout for any modified PDU and either:
+An old peer decoding a modified positional schema under an incorrectly shared
+dialect can therefore:
 
-- decodes garbage values and proceeds — silent corruption, very rare
+- decode garbage values and proceed — silent corruption, very rare
   because length prefixes catch most cases;
-- hits a "failed to fill whole buffer" or
+- hit a "failed to fill whole buffer" or
   "tag byte out of range" decode error — the common case;
-- hits a buffer-overrun panic on a defensive `assert!` — the worst case
+- hit a buffer-overrun panic on a defensive `assert!` — the worst case
   when the misalignment lands inside a length-prefixed `Vec`.
 
-There is no graceful fallback. The client either drops the PDU or
-crashes the connection.
+`serde(default)` does not repair canonical old varbincode bytes that end at EOF;
+the newer decoder still asks for the missing field. A changed schema therefore
+needs a new PDU identity, an explicit dual-schema decoder proven against real
+old and new frames, or a simultaneous minimum-version advance.
 
 ## 2. The long-lived TLS mux session caveat
 
@@ -60,43 +58,61 @@ agent panes hold a single connection for the lifetime of a workflow.
 
 This means:
 
-- **Rolling upgrades are not transparent.** Bumping the server to v47
-  while v46 clients are still connected does not migrate those
-  sessions — they continue to speak v46 because the handshake already
-  completed, but every new PDU shape change after the bump corrupts
-  their wire stream.
-- **Connection drops are the *correct* response.** Operators must
-  expect the server upgrade to terminate every active session.
-  Clients reconnect, re-handshake at v47, and resume. There is no
-  graceful-handoff path.
+- **A connection's agreed dialect is immutable.** A v57/v56 pair speaks v56
+  for that connection's lifetime. It cannot begin using a v57-only PDU after a
+  binary elsewhere is upgraded.
+- **Additive rollout is safe, not magical.** Restarting a server still drops
+  its own sockets, but mixed-version peers can reconnect in either order and
+  negotiate the shared dialect. A load-balanced rolling restart need not create
+  a fleet-wide maintenance window for an additive bump.
+- **Breaking rollout remains atomic.** Advancing the minimum makes old/new
+  windows disjoint by design; those peers reject the handshake until they are
+  brought to a common version.
 - **In-flight workflow state survives connection drops** (the
   recorder + checkpoint subsystem is independent of the wire
   protocol), but any client-side cache of pane state, scrollback, or
   pending RPCs is lost.
 
-## 3. Operator runbook for a `CODEC_VERSION` bump
-
-Until ft-kuxho/B's `CODEC_VERSION_MIN_SUPPORTED` window lands, follow
-this sequence for any deploy that includes a `CODEC_VERSION` bump.
+## 3. Operator runbook for a codec bump
 
 ### 3a. Pre-deploy checklist
 
-- [ ] Confirm the bump is in the build by running `git diff main -- frankenterm/codec/src/lib.rs` and verifying the new value.
+- [ ] Classify the change as additive or breaking before deployment.
+- [ ] Confirm the intended `CODEC_VERSION` and
+  `CODEC_VERSION_MIN_SUPPORTED` values in
+  `frankenterm/codec/src/lib.rs`.
 - [ ] Confirm the corresponding row exists in [`docs/codec-versions.md`](codec-versions.md). The CI guard `scripts/check_codec_version_release_notes.sh` (ft-8smkj) blocks merges that miss this, so reaching the deploy stage means it's there — but spot-check it in case of merge artifacts.
-- [ ] Schedule a maintenance window. Communicate the expected blast radius to operators of every workspace that has long-lived agent panes connected to a remote mux.
-- [ ] Pre-position the new client binaries on every workstation that will reconnect. The shorter the gap between server flip and client roll, the shorter the window of unavailability.
+- [ ] For every new PDU identity, confirm the registry declares its exact minimum
+  dialect and producer/serial authority, and retain a negative test proving an
+  older agreed dialect rejects it before serial allocation or wire emission.
+- [ ] For a breaking change, schedule a maintenance window and pre-position the
+  new client binaries on every workstation that will reconnect.
 
-### 3b. Deploy order — server first, then clients
+### 3b. Additive deploy
 
-The strictly-correct order is:
+When only `CODEC_VERSION` advances and the old minimum is retained:
+
+1. Roll servers or clients in either order using the ordinary bounded restart
+   procedure.
+2. Verify mixed-version handshakes agree on the lower canonical version.
+3. Verify the new PDU is admitted only after both peers negotiate its minimum
+   dialect; capability absence must be a healthy, aligned result rather than a
+   transport failure.
+4. Complete the rollout, then verify new/new connections use the new dialect.
+
+### 3c. Breaking deploy — server first, then clients
+
+When both the maximum and minimum advance, use the maintenance window:
 
 1. **Drain new connections to the old servers.** If you run multiple mux servers behind a load balancer, drain them one at a time. If single-server, skip to step 2.
 2. **Stop the old server.** Active sessions terminate; clients receive a connection drop.
-3. **Start the new server at v47.** Verify it accepts handshakes by attaching one v47 client.
-4. **Roll clients to v47.** Each client reconnects, handshakes at v47, and resumes. Until clients are rolled, they are not actually offline — they are crash-looping at handshake (server says 47, client says 46, both abort). That is the expected steady state during the rollout.
-5. **Verify zero v46 clients remain.** Check the mux server's structured logs for `codec_version=46` handshake-reject lines; they should taper to zero within the rollout window.
+3. **Start the new server.** Verify it accepts a same-version handshake.
+4. **Roll clients.** Each client reconnects and resumes. Old clients reject the
+   disjoint handshake until upgraded; that fail-closed state is expected.
+5. **Verify zero old-dialect clients remain.** Check structured handshake logs
+   using the exact old and new version numbers for this release.
 
-### 3c. Cross-deploy coordination
+### 3d. Cross-deploy coordination
 
 - **ft-zoxxq mux server** and **ft-nyvyl client** binaries must both be
   bumped to the same `CODEC_VERSION` in the same release. The
@@ -112,42 +128,34 @@ The strictly-correct order is:
   in-flight workflow to pause on the connection drop and resume on
   reconnect; there is no data loss but there is a visible stall.
 
-### 3d. Rollback
+### 3e. Rollback
 
-If the new build has a regression, roll back by reversing steps 3-5:
-stop the v47 server, start a v46 server, let the v47 clients fail
-their handshake until rolled back. Same pattern, opposite direction.
+For an additive bump, roll components back within the retained compatibility
+window and verify they negotiate the lower dialect. For a breaking bump, reverse
+the breaking-deploy sequence: stop the new server, start the old server, and
+roll clients back until both sides again share a window.
 
-## 4. The future relief valve
+## 4. Window invariants
 
-[ft-kuxho/B](proposals/ft-kuxho-B-codec-version-min-supported-window.md)
-proposes a `CODEC_VERSION_MIN_SUPPORTED` constant that creates a
-backward-compat window: clients at any version
-`CODEC_VERSION_MIN_SUPPORTED <= v <= CODEC_VERSION` can interop. Once
-that lands:
-
-- **Additive bumps** (new PDU variant; new field with `serde(default)`
-  appended at the end of a struct — see ft-e1emx tail-padding
-  conformance harness at `frankenterm/codec/src/lib.rs:3120+`) become
-  rolling-upgrade safe. `CODEC_VERSION` advances; `MIN` does not.
-  Old clients continue to decode the canonical prefix and ignore the
-  trailing extra bytes.
-- **Breaking bumps** still require the runbook above. Removing or
-  reordering fields, changing types, or inserting fields in the
-  middle of a struct all bump `MIN` and force atomic redeploy.
-
-The runbook in §3 should be retained for breaking bumps; the
-"maintenance window" overhead can be skipped for additive bumps once
-the window mechanism is in place. Until then, treat all bumps as
-breaking.
+- A peer must advertise `min_supported <= codec_vers`; impossible windows fail
+  closed.
+- The two inclusive windows must overlap.
+- The agreed dialect is `min(local.codec_vers, remote.codec_vers)` after the
+  overlap check, and remains fixed for the connection generation.
+- Every outbound PDU is checked against that agreed dialect before serial
+  allocation and first write. Every inbound PDU is checked against the same
+  dialect and its producer/role authority.
+- A new PDU identity can be additive. A changed positional schema is not
+  additive merely because a new Rust field has `serde(default)`.
+- `CODEC_VERSION_MIN_SUPPORTED` advances only with a deliberately breaking
+  release and its maintenance-window evidence.
 
 ## 5. Cross-references
 
 - [`docs/codec-versions.md`](codec-versions.md) — the version-history
   release-note file enforced by ft-8smkj.
-- [`docs/proposals/ft-kuxho-B-codec-version-min-supported-window.md`](proposals/ft-kuxho-B-codec-version-min-supported-window.md) — the design for the rolling-upgrade window.
+- [`docs/proposals/ft-kuxho-B-codec-version-min-supported-window.md`](proposals/ft-kuxho-B-codec-version-min-supported-window.md) — the design and proof history for the live rolling-upgrade window.
 - `scripts/check_codec_version_release_notes.sh` — the CI guard that
   prevents silent CODEC_VERSION bumps.
-- `frankenterm/codec/src/lib.rs:650` — the `CODEC_VERSION` constant.
-- `frankenterm/codec/src/lib.rs:1204-1228` — comments documenting the
-  varbincode positional-format hazard.
+- `frankenterm/codec/src/lib.rs` — codec/minimum constants, wire registry,
+  handshake compatibility, and positional-format hazard commentary.
