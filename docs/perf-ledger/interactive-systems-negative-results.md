@@ -3628,6 +3628,38 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Remove the explicit connection-state witness only after another backend-independent oracle proves the exact pre-begin, post-begin, post-commit, post-rollback, nested-savepoint, and outermost-savepoint states and turns red on error, panic, poison, and mismatch without reusing an ambiguous connection.
 
+### IS-N127 — An async blocking-sleep wrapper is not a passive timer
+
+- **Classification:** source-level scheduler and blocking-pool scalability
+  rejection; bounded runtime timer retained
+- **Bead:** `ft-7h5da.4.11`
+- **Rejected inference:** moving `std::thread::sleep` into
+  `spawn_blocking_with_cx` makes Watch/Await pacing, polling, idle, and lease
+  retry delays passive runtime waits with prompt structured cancellation.
+- **Negative evidence:** the former helper divided every logical delay into
+  slices of at most 500 ms and submitted a fresh blocking-pool job for every
+  slice. A 300-second passive delay could therefore submit roughly 600 jobs,
+  multiplied by the number of concurrent followers, while cancellation could
+  not release the currently sleeping worker until its slice returned. Async
+  syntax hid rather than removed the repeated blocking work.
+- **Decision:** route all four production delay classes through one canonical
+  `runtime_async` helper that admits at most one asupersync timer registration
+  per logical delay and races it against the active `Cx` cancellation waker.
+  Admission is capped at 65,536 live registrations, delays above 24 hours and
+  missing/mismatched timer contexts fail closed, and aggregate content-free
+  counters distinguish admission, saturation, duration/context refusal,
+  direct cancellation, deadline/budget/context termination, nonterminal
+  re-polls, shutdown cleanup, completion, and maximum wake latency.
+  Deterministic virtual-time tests cover boundary delays, cancellation races,
+  deadline, poll-quota, cost-budget, and shutdown cleanup, saturation,
+  monotonic clock regression and clock-ceiling saturation,
+  repeated polls, 1/50/200/1,000 registration scale, and 1,000 same-deadline
+  wakes without starvation. Strict-remote execution remains absent while RCH
+  reports every worker unreachable; no product-path, keypress, GUI, M4/M5, or
+  Threadripper performance claim follows from this source repair.
+- **Primary retry condition:**
+  > Replace the bounded one-registration timer only after another Cx-aware design proves prompt cancellation, exact heartbeat/lease/Await boundaries, finite admission and memory, truthful terminal counters, deterministic shutdown and clock behavior, and no per-delay thread or blocking-pool work under strict-remote scale tests.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

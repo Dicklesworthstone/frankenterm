@@ -6302,6 +6302,423 @@ pub async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(),
         .map_err(|err| err.to_string())
 }
 
+/// Maximum number of concurrently admitted interruptible timer registrations.
+///
+/// One entry consists of one asupersync wheel entry plus one inline
+/// cancellation waiter. The hard cap keeps aggregate timer memory finite while
+/// leaving ample headroom above the synthetic 1,000-follower campaign tier.
+pub const INTERRUPTIBLE_TIMER_CAPACITY: usize = 65_536;
+
+/// Largest single delay admitted by the interruptible timer service.
+///
+/// This is deliberately below asupersync 0.3.5's seven-day wheel clamp. A
+/// larger request is refused instead of silently waking early and extending a
+/// lease, cursor deadline, or caller timeout incorrectly.
+pub const INTERRUPTIBLE_TIMER_MAX_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Content-free aggregate counters for the bounded interruptible timer service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptibleTimerMetrics {
+    /// Hard concurrent-registration limit.
+    pub capacity: usize,
+    /// Currently admitted registrations.
+    pub active: usize,
+    /// Successful admissions since process start.
+    pub admissions: u64,
+    /// Calls refused because the hard limit was already active.
+    pub saturations: u64,
+    /// Calls refused because their delay exceeded the exact project bound.
+    pub duration_refusals: u64,
+    /// Calls refused because the supplied `Cx` was not the active timer context.
+    pub context_refusals: u64,
+    /// Admitted timers interrupted by direct context cancellation.
+    pub cancellations: u64,
+    /// Admitted timers ended by a capability deadline.
+    pub deadline_expirations: u64,
+    /// Admitted timers ended by poll-quota or cost-budget exhaustion.
+    pub budget_exhaustions: u64,
+    /// Admitted timers ended by an unattributed context failure.
+    pub context_failures: u64,
+    /// Timer deadlines that woke and reached the completion branch.
+    pub wake_completions: u64,
+    /// Re-polls that observed neither timer readiness nor cancellation.
+    pub stale_wakeups: u64,
+    /// Admitted registrations removed while handling `Shutdown` cancellation.
+    pub shutdown_cleanups: u64,
+    /// Largest observed delay from effective deadline to completion wake.
+    pub max_wake_latency_ns: u64,
+}
+
+struct InterruptibleTimerService {
+    capacity: usize,
+    active: std::sync::atomic::AtomicUsize,
+    admissions: std::sync::atomic::AtomicU64,
+    saturations: std::sync::atomic::AtomicU64,
+    duration_refusals: std::sync::atomic::AtomicU64,
+    context_refusals: std::sync::atomic::AtomicU64,
+    cancellations: std::sync::atomic::AtomicU64,
+    deadline_expirations: std::sync::atomic::AtomicU64,
+    budget_exhaustions: std::sync::atomic::AtomicU64,
+    context_failures: std::sync::atomic::AtomicU64,
+    wake_completions: std::sync::atomic::AtomicU64,
+    stale_wakeups: std::sync::atomic::AtomicU64,
+    shutdown_cleanups: std::sync::atomic::AtomicU64,
+    max_wake_latency_ns: std::sync::atomic::AtomicU64,
+}
+
+impl InterruptibleTimerService {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            active: std::sync::atomic::AtomicUsize::new(0),
+            admissions: std::sync::atomic::AtomicU64::new(0),
+            saturations: std::sync::atomic::AtomicU64::new(0),
+            duration_refusals: std::sync::atomic::AtomicU64::new(0),
+            context_refusals: std::sync::atomic::AtomicU64::new(0),
+            cancellations: std::sync::atomic::AtomicU64::new(0),
+            deadline_expirations: std::sync::atomic::AtomicU64::new(0),
+            budget_exhaustions: std::sync::atomic::AtomicU64::new(0),
+            context_failures: std::sync::atomic::AtomicU64::new(0),
+            wake_completions: std::sync::atomic::AtomicU64::new(0),
+            stale_wakeups: std::sync::atomic::AtomicU64::new(0),
+            shutdown_cleanups: std::sync::atomic::AtomicU64::new(0),
+            max_wake_latency_ns: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn try_admit(&self) -> Result<InterruptibleTimerAdmission<'_>, SleepWithCxError> {
+        let admitted = self.active.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |active| (active < self.capacity).then_some(active + 1),
+        );
+        if admitted.is_err() {
+            saturating_increment_counter(&self.saturations);
+            return Err(SleepWithCxError {
+                kind: SleepWithCxErrorKind::TimerCapacityExhausted,
+            });
+        }
+        saturating_increment_counter(&self.admissions);
+        Ok(InterruptibleTimerAdmission { service: self })
+    }
+
+    fn classify_and_record_context_termination(
+        &self,
+        cx: &crate::cx::Cx,
+        fallback: SleepWithCxErrorKind,
+    ) -> SleepWithCxError {
+        let error = SleepWithCxError::from_cx(cx, fallback);
+        match error.kind() {
+            SleepWithCxErrorKind::ContextCancelled => {
+                saturating_increment_counter(&self.cancellations);
+                if cx
+                    .root_cancel_cause()
+                    .is_some_and(|reason| reason.kind == crate::outcome::CancelKind::Shutdown)
+                {
+                    saturating_increment_counter(&self.shutdown_cleanups);
+                }
+            }
+            SleepWithCxErrorKind::DeadlineExceeded => {
+                saturating_increment_counter(&self.deadline_expirations);
+            }
+            SleepWithCxErrorKind::PollQuotaExhausted
+            | SleepWithCxErrorKind::CostBudgetExhausted => {
+                saturating_increment_counter(&self.budget_exhaustions);
+            }
+            SleepWithCxErrorKind::ContextFailure
+            | SleepWithCxErrorKind::TimerCapacityExhausted
+            | SleepWithCxErrorKind::TimerDurationExceeded
+            | SleepWithCxErrorKind::TimerContextUnavailable => {
+                saturating_increment_counter(&self.context_failures);
+            }
+        }
+        error
+    }
+
+    fn record_duration_refusal(&self) {
+        saturating_increment_counter(&self.duration_refusals);
+    }
+
+    fn record_wake_completion(&self, latency_ns: u64) {
+        saturating_increment_counter(&self.wake_completions);
+        self.max_wake_latency_ns
+            .fetch_max(latency_ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> InterruptibleTimerMetrics {
+        InterruptibleTimerMetrics {
+            capacity: self.capacity,
+            active: self.active.load(std::sync::atomic::Ordering::Acquire),
+            admissions: self.admissions.load(std::sync::atomic::Ordering::Relaxed),
+            saturations: self.saturations.load(std::sync::atomic::Ordering::Relaxed),
+            duration_refusals: self
+                .duration_refusals
+                .load(std::sync::atomic::Ordering::Relaxed),
+            context_refusals: self
+                .context_refusals
+                .load(std::sync::atomic::Ordering::Relaxed),
+            cancellations: self
+                .cancellations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            deadline_expirations: self
+                .deadline_expirations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            budget_exhaustions: self
+                .budget_exhaustions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            context_failures: self
+                .context_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            wake_completions: self
+                .wake_completions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            stale_wakeups: self
+                .stale_wakeups
+                .load(std::sync::atomic::Ordering::Relaxed),
+            shutdown_cleanups: self
+                .shutdown_cleanups
+                .load(std::sync::atomic::Ordering::Relaxed),
+            max_wake_latency_ns: self
+                .max_wake_latency_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+struct InterruptibleTimerAdmission<'a> {
+    service: &'a InterruptibleTimerService,
+}
+
+impl Drop for InterruptibleTimerAdmission<'_> {
+    fn drop(&mut self) {
+        let previous = self
+            .service
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous > 0, "interruptible timer admission underflow");
+    }
+}
+
+static INTERRUPTIBLE_TIMER_SERVICE: InterruptibleTimerService =
+    InterruptibleTimerService::new(INTERRUPTIBLE_TIMER_CAPACITY);
+
+/// Read the bounded timer service's redacted, eventually consistent aggregate
+/// counters.
+#[must_use]
+pub fn interruptible_timer_metrics() -> InterruptibleTimerMetrics {
+    INTERRUPTIBLE_TIMER_SERVICE.snapshot()
+}
+
+/// Finite failure class for [`sleep_with_cx_interruptible`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepWithCxErrorKind {
+    /// The caller explicitly cancelled or shut down the capability context.
+    ContextCancelled,
+    /// The caller's capability deadline or timeout elapsed first.
+    DeadlineExceeded,
+    /// The caller exhausted its cooperative poll quota.
+    PollQuotaExhausted,
+    /// The caller exhausted its cost budget.
+    CostBudgetExhausted,
+    /// The bounded timer service refused a new registration at capacity.
+    TimerCapacityExhausted,
+    /// The requested delay exceeded the exact project timer bound.
+    TimerDurationExceeded,
+    /// The supplied context was not the active timer-capable task context.
+    TimerContextUnavailable,
+    /// The context failed without an attributable structural cause.
+    ContextFailure,
+}
+
+/// Content-free error returned by [`sleep_with_cx_interruptible`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SleepWithCxError {
+    kind: SleepWithCxErrorKind,
+}
+
+impl SleepWithCxError {
+    fn from_cx(cx: &crate::cx::Cx, fallback: SleepWithCxErrorKind) -> Self {
+        use crate::outcome::CancelKind;
+
+        let kind = match cx.root_cancel_cause().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => {
+                SleepWithCxErrorKind::DeadlineExceeded
+            }
+            Some(CancelKind::PollQuota) => SleepWithCxErrorKind::PollQuotaExhausted,
+            Some(CancelKind::CostBudget) => SleepWithCxErrorKind::CostBudgetExhausted,
+            Some(
+                CancelKind::User
+                | CancelKind::FailFast
+                | CancelKind::RaceLost
+                | CancelKind::ParentCancelled
+                | CancelKind::ResourceUnavailable
+                | CancelKind::Shutdown
+                | CancelKind::LinkedExit,
+            ) => SleepWithCxErrorKind::ContextCancelled,
+            None => fallback,
+        };
+        Self { kind }
+    }
+
+    /// Return the finite structural failure class.
+    #[must_use]
+    pub const fn kind(self) -> SleepWithCxErrorKind {
+        self.kind
+    }
+
+    /// Return true only for caller-context cancellation, not budget exhaustion.
+    #[must_use]
+    pub const fn is_cancelled(self) -> bool {
+        matches!(self.kind, SleepWithCxErrorKind::ContextCancelled)
+    }
+}
+
+impl std::fmt::Display for SleepWithCxError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self.kind {
+            SleepWithCxErrorKind::ContextCancelled => "sleep cancelled by capability context",
+            SleepWithCxErrorKind::DeadlineExceeded => "sleep capability deadline exceeded",
+            SleepWithCxErrorKind::PollQuotaExhausted => "sleep capability poll quota exhausted",
+            SleepWithCxErrorKind::CostBudgetExhausted => "sleep capability cost budget exhausted",
+            SleepWithCxErrorKind::TimerCapacityExhausted => {
+                "interruptible timer capacity exhausted"
+            }
+            SleepWithCxErrorKind::TimerDurationExceeded => {
+                "interruptible timer duration exceeds the supported bound"
+            }
+            SleepWithCxErrorKind::TimerContextUnavailable => {
+                "interruptible timer requires the active timer-capable context"
+            }
+            SleepWithCxErrorKind::ContextFailure => "sleep capability context failed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for SleepWithCxError {}
+
+/// Sleep on one asupersync timer-wheel registration and wake promptly when the
+/// supplied caller context is cancelled.
+///
+/// Unlike [`sleep_with_cx`], this helper races the budget-aware timer against a
+/// cancel-aware waiter that registers the current task waker directly with the
+/// explicit `Cx`. Cancellation therefore re-polls this future without a polling
+/// timer, watcher task, or blocking-pool job. The supplied context must be the
+/// active timer-capable task context so the timer, budget, cancellation waker,
+/// and wake-latency clock remain in one domain. The timer is dropped and
+/// deregistered when cancellation wins.
+///
+/// A `Cx` cancellation waker is task-scoped. Concurrent timers must therefore
+/// use their own task-owned contexts rather than driving this helper from
+/// multiple scheduler tasks that share one cloned `Cx`.
+///
+/// # Errors
+///
+/// Returns a finite, content-free [`SleepWithCxError`] for direct cancellation,
+/// capability-budget exhaustion, registration-capacity exhaustion, a delay
+/// above [`INTERRUPTIBLE_TIMER_MAX_DELAY`], or a supplied `Cx` that is not the
+/// active timer-capable task context. Cancellation is checked before validating
+/// or arming the timer and again after the timer wins, closing the
+/// ready-vs-cancel race without exposing a post-cancellation success.
+pub async fn sleep_with_cx_interruptible(
+    cx: &crate::cx::Cx,
+    duration: Duration,
+) -> Result<(), SleepWithCxError> {
+    sleep_with_cx_interruptible_using(cx, duration, &INTERRUPTIBLE_TIMER_SERVICE).await
+}
+
+async fn sleep_with_cx_interruptible_using(
+    cx: &crate::cx::Cx,
+    duration: Duration,
+    service: &InterruptibleTimerService,
+) -> Result<(), SleepWithCxError> {
+    if cx.checkpoint().is_err() {
+        return Err(SleepWithCxError::from_cx(
+            cx,
+            SleepWithCxErrorKind::ContextFailure,
+        ));
+    }
+    if duration.is_zero() {
+        return cx
+            .checkpoint()
+            .map_err(|_error| SleepWithCxError::from_cx(cx, SleepWithCxErrorKind::ContextFailure));
+    }
+    if duration > INTERRUPTIBLE_TIMER_MAX_DELAY {
+        service.record_duration_refusal();
+        return Err(SleepWithCxError {
+            kind: SleepWithCxErrorKind::TimerDurationExceeded,
+        });
+    }
+
+    let active_context_matches = crate::cx::Cx::current().is_some_and(|active| {
+        active.region_id() == cx.region_id()
+            && active.task_id() == cx.task_id()
+            && active.timer_driver().is_some()
+            && cx.timer_driver().is_some()
+    });
+    if !active_context_matches {
+        saturating_increment_counter(&service.context_refusals);
+        return Err(SleepWithCxError {
+            kind: SleepWithCxErrorKind::TimerContextUnavailable,
+        });
+    }
+
+    let _admission = service.try_admit()?;
+
+    use futures::future::{Either, select};
+
+    let timer_started_at = cx_timer_now(cx);
+    let requested_deadline = timer_started_at + duration;
+    let effective_deadline = cx.budget().deadline.map_or(requested_deadline, |deadline| {
+        deadline.min(requested_deadline)
+    });
+    let timer = std::pin::pin!(asupersync::time::budget_sleep(
+        cx,
+        duration,
+        timer_started_at,
+    ));
+    // An uninitialized OnceCell is a zero-payload cancellation signal here:
+    // `wait` registers directly with the explicit Cx and can only resolve via
+    // cancellation because this private cell is never initialized.
+    let cancellation_signal = asupersync::sync::OnceCell::<()>::new();
+    let cancellation_wait = std::pin::pin!(cancellation_signal.wait(cx));
+    let mut cancellation_poll_count = 0_u64;
+    let cancellation = std::pin::pin!(std::future::poll_fn(|task_cx| {
+        let poll = cancellation_wait.as_mut().poll(task_cx);
+        if poll.is_pending() {
+            if cancellation_poll_count > 0 {
+                saturating_increment_counter(&service.stale_wakeups);
+            }
+            cancellation_poll_count = cancellation_poll_count.saturating_add(1);
+        }
+        poll
+    }));
+
+    match select(timer, cancellation).await {
+        Either::Left((Ok(()), _)) => {
+            service.record_wake_completion(cx_timer_now(cx).duration_since(effective_deadline));
+            cx.checkpoint().map_err(|_error| {
+                service.classify_and_record_context_termination(
+                    cx,
+                    SleepWithCxErrorKind::ContextFailure,
+                )
+            })
+        }
+        Either::Left((Err(_elapsed), _)) => {
+            // budget_sleep's sole error is an elapsed capability deadline.
+            // Checkpoint once to latch the structural cancel cause when this
+            // sleep was the first observer of deadline exhaustion.
+            let _ = cx.checkpoint();
+            Err(service.classify_and_record_context_termination(
+                cx,
+                SleepWithCxErrorKind::DeadlineExceeded,
+            ))
+        }
+        Either::Right((_wait_result, _)) => Err(service
+            .classify_and_record_context_termination(cx, SleepWithCxErrorKind::ContextFailure)),
+    }
+}
+
 /// Pause without inheriting the ambient capability budget.
 ///
 /// Reserved for trusted terminal-settlement loops that must retain ownership
@@ -7504,6 +7921,882 @@ mod tests {
         assert!(
             woke.load(std::sync::atomic::Ordering::SeqCst),
             "sleep task should complete under LabRuntime"
+        );
+        assert!(report.oracle_report.all_passed());
+        assert!(report.invariant_violations.is_empty());
+    }
+
+    fn interruptible_sleep_kind_code(kind: SleepWithCxErrorKind) -> u8 {
+        match kind {
+            SleepWithCxErrorKind::ContextCancelled => 1,
+            SleepWithCxErrorKind::DeadlineExceeded => 2,
+            SleepWithCxErrorKind::PollQuotaExhausted => 3,
+            SleepWithCxErrorKind::CostBudgetExhausted => 4,
+            SleepWithCxErrorKind::TimerCapacityExhausted => 5,
+            SleepWithCxErrorKind::TimerDurationExceeded => 6,
+            SleepWithCxErrorKind::TimerContextUnavailable => 7,
+            SleepWithCxErrorKind::ContextFailure => 8,
+        }
+    }
+
+    #[test]
+    fn interruptible_sleep_source_uses_one_timer_and_no_worker_or_polling_loop() {
+        let source = include_str!("runtime_async.rs");
+        let helper_start = source
+            .find("async fn sleep_with_cx_interruptible_using(")
+            .expect("interruptible timer helper source");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("\n}\n\n/// Pause without inheriting the ambient capability budget.")
+            .expect("interruptible timer helper boundary");
+        let helper = &helper_tail[..helper_end];
+
+        assert_eq!(
+            helper
+                .match_indices("asupersync::time::budget_sleep(")
+                .count(),
+            1,
+            "one logical delay must construct exactly one timer future"
+        );
+        assert_eq!(helper.match_indices("service.try_admit()?").count(), 1);
+        assert!(helper.contains("OnceCell::<()>::new()"));
+        assert!(!helper.contains("spawn_blocking"));
+        assert!(!helper.contains("std::thread"));
+        assert!(!helper.contains("loop {"));
+    }
+
+    #[test]
+    fn interruptible_sleep_rejects_precancel_without_arming_a_timer() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel interruptible sleep"),
+            );
+
+            let error = sleep_with_cx_interruptible(&cx, Duration::from_secs(60))
+                .await
+                .expect_err("pre-cancelled sleep must not arm or wait");
+            assert_eq!(error.kind(), SleepWithCxErrorKind::ContextCancelled);
+            assert!(error.is_cancelled());
+        });
+    }
+
+    #[test]
+    fn interruptible_sleep_timer_service_fails_closed_at_capacity_and_cleans_shutdown() {
+        let service = std::sync::Arc::new(InterruptibleTimerService::new(2));
+        let contexts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let saturated = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x7A11_5A70)
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+
+        for _ in 0..3 {
+            let service_task = std::sync::Arc::clone(&service);
+            let contexts_task = std::sync::Arc::clone(&contexts);
+            let saturated_task = std::sync::Arc::clone(&saturated);
+            let cancelled_task = std::sync::Arc::clone(&cancelled);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = crate::cx::Cx::current()
+                        .expect("LabRuntime task must expose its owning context");
+                    contexts_task
+                        .lock()
+                        .expect("record saturation context")
+                        .push(cx.clone());
+                    let error = sleep_with_cx_interruptible_using(
+                        &cx,
+                        Duration::from_secs(60),
+                        &service_task,
+                    )
+                    .await
+                    .expect_err("capacity test never advances the timer deadline");
+                    match error.kind() {
+                        SleepWithCxErrorKind::TimerCapacityExhausted => {
+                            saturated_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        SleepWithCxErrorKind::ContextCancelled => {
+                            cancelled_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        other => panic!("unexpected capacity-test outcome: {other:?}"),
+                    }
+                })
+                .expect("spawn bounded timer saturation task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+        }
+
+        runtime.run_until_idle();
+        let saturated_metrics = service.snapshot();
+        assert_eq!(saturated_metrics.capacity, 2);
+        assert_eq!(saturated_metrics.active, 2);
+        assert_eq!(saturated_metrics.admissions, 2);
+        assert_eq!(saturated_metrics.saturations, 1);
+        assert_eq!(saturated.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(runtime.pending_timer_count(), 2);
+
+        for cx in contexts.lock().expect("cancel saturation contexts").iter() {
+            cx.cancel_with(
+                crate::outcome::CancelKind::Shutdown,
+                Some("bounded timer saturation shutdown"),
+            );
+        }
+        runtime.run_until_idle();
+
+        let cleaned_metrics = service.snapshot();
+        assert_eq!(
+            cleaned_metrics,
+            InterruptibleTimerMetrics {
+                capacity: 2,
+                active: 0,
+                admissions: 2,
+                saturations: 1,
+                duration_refusals: 0,
+                context_refusals: 0,
+                cancellations: 2,
+                deadline_expirations: 0,
+                budget_exhaustions: 0,
+                context_failures: 0,
+                wake_completions: 0,
+                stale_wakeups: 0,
+                shutdown_cleanups: 2,
+                max_wake_latency_ns: 0,
+            }
+        );
+        assert_eq!(cancelled.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(runtime.pending_timer_count(), 0);
+    }
+
+    #[test]
+    fn interruptible_sleep_rejects_a_nonactive_or_timerless_context_before_admission() {
+        run_async_test(async {
+            let explicit = crate::cx::for_testing();
+            let service = InterruptibleTimerService::new(1);
+            let error =
+                sleep_with_cx_interruptible_using(&explicit, Duration::from_millis(1), &service)
+                    .await
+                    .expect_err(
+                        "timerless context must not fall through to a different timer domain",
+                    );
+            assert_eq!(error.kind(), SleepWithCxErrorKind::TimerContextUnavailable);
+            assert_eq!(service.snapshot().context_refusals, 1);
+            assert_eq!(service.snapshot().admissions, 0);
+            assert_eq!(service.snapshot().active, 0);
+        });
+    }
+
+    #[test]
+    fn interruptible_sleep_handles_zero_subslice_and_exact_long_delays() {
+        let cases = [
+            Duration::ZERO,
+            Duration::from_millis(501),
+            INTERRUPTIBLE_TIMER_MAX_DELAY,
+        ];
+
+        for (case_index, duration) in cases.into_iter().enumerate() {
+            let service = std::sync::Arc::new(InterruptibleTimerService::new(1));
+            let service_task = std::sync::Arc::clone(&service);
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_task = std::sync::Arc::clone(&completed);
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(
+                    0x7A11_0000 + u64::try_from(case_index).expect("case index fits u64"),
+                )
+                .with_auto_advance()
+                .worker_count(2)
+                .max_steps(20_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = crate::cx::Cx::current()
+                        .expect("LabRuntime task must expose its owning context");
+                    sleep_with_cx_interruptible_using(&cx, duration, &service_task)
+                        .await
+                        .expect("infinite-budget interruptible sleep must complete");
+                    completed_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .expect("spawn interruptible timer-boundary task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            let oracle_report = runtime.run_until_quiescent_with_report();
+
+            assert!(
+                completed.load(std::sync::atomic::Ordering::SeqCst),
+                "duration case {duration:?} did not complete"
+            );
+            assert_eq!(
+                runtime.pending_timer_count(),
+                0,
+                "duration case {duration:?} leaked its timer registration"
+            );
+            assert!(
+                report.auto_advances >= u64::from(!duration.is_zero()),
+                "non-zero duration case {duration:?} must advance virtual time"
+            );
+            let metrics = service.snapshot();
+            assert_eq!(metrics.active, 0);
+            assert_eq!(metrics.saturations, 0);
+            assert_eq!(metrics.duration_refusals, 0);
+            assert_eq!(metrics.context_refusals, 0);
+            assert_eq!(metrics.cancellations, 0);
+            assert_eq!(metrics.deadline_expirations, 0);
+            assert_eq!(metrics.budget_exhaustions, 0);
+            assert_eq!(metrics.context_failures, 0);
+            assert_eq!(metrics.stale_wakeups, 0);
+            assert_eq!(metrics.shutdown_cleanups, 0);
+            assert_eq!(metrics.admissions, u64::from(!duration.is_zero()));
+            assert_eq!(metrics.wake_completions, u64::from(!duration.is_zero()));
+            assert_eq!(metrics.max_wake_latency_ns, 0);
+            if !duration.is_zero() {
+                let duration_ns = u64::try_from(duration.as_nanos())
+                    .expect("admitted timer duration fits the Time domain");
+                assert!(
+                    runtime.now() >= asupersync::Time::from_nanos(duration_ns),
+                    "duration case {duration:?} woke before its exact deadline"
+                );
+            }
+            assert!(oracle_report.oracle_report.all_passed());
+            assert!(oracle_report.invariant_violations.is_empty());
+        }
+    }
+
+    #[test]
+    fn interruptible_sleep_refuses_clock_extreme_instead_of_waking_early() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let service = InterruptibleTimerService::new(1);
+            let error = sleep_with_cx_interruptible_using(&cx, Duration::MAX, &service)
+                .await
+                .expect_err("out-of-range timer must fail before registration");
+            assert_eq!(error.kind(), SleepWithCxErrorKind::TimerDurationExceeded);
+            assert!(!error.is_cancelled());
+            assert_eq!(
+                service.snapshot(),
+                InterruptibleTimerMetrics {
+                    capacity: 1,
+                    active: 0,
+                    admissions: 0,
+                    saturations: 0,
+                    duration_refusals: 1,
+                    context_refusals: 0,
+                    cancellations: 0,
+                    deadline_expirations: 0,
+                    budget_exhaustions: 0,
+                    context_failures: 0,
+                    wake_completions: 0,
+                    stale_wakeups: 0,
+                    shutdown_cleanups: 0,
+                    max_wake_latency_ns: 0,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn interruptible_sleep_saturates_near_the_clock_ceiling_without_early_wake() {
+        let service = std::sync::Arc::new(InterruptibleTimerService::new(1));
+        let service_task = std::sync::Arc::clone(&service);
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_task = std::sync::Arc::clone(&completed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x7A11_CE11)
+                .with_auto_advance()
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        let start = asupersync::Time::from_nanos(u64::MAX - 1_000_000);
+        runtime.advance_time_to(start);
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must expose its owning context");
+                sleep_with_cx_interruptible_using(&cx, Duration::from_secs(1), &service_task)
+                    .await
+                    .expect("clock-ceiling saturation must retain one exact timer");
+                completed_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("spawn clock-ceiling interruptible sleep");
+        runtime.scheduler.lock().schedule(task_id, 0);
+
+        runtime.run_until_idle();
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(runtime.pending_timer_count(), 1);
+
+        let virtual_report = runtime.run_with_auto_advance();
+        let oracle_report = runtime.run_until_quiescent_with_report();
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(runtime.now(), asupersync::Time::MAX);
+        assert_eq!(runtime.pending_timer_count(), 0);
+        assert!(virtual_report.auto_advances >= 1);
+        assert_eq!(service.snapshot().wake_completions, 1);
+        assert_eq!(service.snapshot().max_wake_latency_ns, 0);
+        assert!(oracle_report.oracle_report.all_passed());
+        assert!(oracle_report.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn interruptible_sleep_classifies_capability_deadline_exactly() {
+        let service = std::sync::Arc::new(InterruptibleTimerService::new(1));
+        let service_task = std::sync::Arc::clone(&service);
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let observed_task = std::sync::Arc::clone(&observed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x7A11_D1E0)
+                .with_auto_advance()
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let budget = asupersync::Budget::new().with_deadline(asupersync::Time::from_millis(5));
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, budget, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must expose its owning context");
+                let error =
+                    sleep_with_cx_interruptible_using(&cx, Duration::from_secs(60), &service_task)
+                        .await
+                        .expect_err("capability deadline must interrupt the longer sleep");
+                observed_task.store(
+                    interruptible_sleep_kind_code(error.kind()),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            })
+            .expect("spawn deadline-bound interruptible sleep");
+        runtime.scheduler.lock().schedule(task_id, 0);
+
+        let report = runtime.run_with_auto_advance();
+        let oracle_report = runtime.run_until_quiescent_with_report();
+
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            interruptible_sleep_kind_code(SleepWithCxErrorKind::DeadlineExceeded)
+        );
+        assert_eq!(runtime.pending_timer_count(), 0);
+        assert!(report.auto_advances >= 1);
+        let metrics = service.snapshot();
+        assert_eq!(metrics.active, 0);
+        assert_eq!(metrics.admissions, 1);
+        assert_eq!(metrics.deadline_expirations, 1);
+        assert_eq!(metrics.cancellations, 0);
+        assert_eq!(metrics.budget_exhaustions, 0);
+        assert_eq!(metrics.context_failures, 0);
+        assert!(oracle_report.oracle_report.all_passed());
+        assert!(oracle_report.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn interruptible_sleep_classifies_midflight_poll_quota_exhaustion_exactly() {
+        let service = std::sync::Arc::new(InterruptibleTimerService::new(1));
+        let service_task = std::sync::Arc::clone(&service);
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let observed_task = std::sync::Arc::clone(&observed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x7A11_B0D6)
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        // LabRuntime consumes one poll credit immediately before every task
+        // poll. The first credit arms the timer; the second reschedule below
+        // exhausts the quota and wakes the cancellation side of the race.
+        let budget = asupersync::Budget::new().with_poll_quota(2);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, budget, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must expose its owning context");
+                let error =
+                    sleep_with_cx_interruptible_using(&cx, Duration::from_secs(60), &service_task)
+                        .await
+                        .expect_err("the second scheduler poll must exhaust the capability quota");
+                observed_task.store(
+                    interruptible_sleep_kind_code(error.kind()),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            })
+            .expect("spawn poll-quota-bound interruptible sleep");
+        runtime.scheduler.lock().schedule(task_id, 0);
+
+        runtime.run_until_idle();
+        assert_eq!(runtime.pending_timer_count(), 1);
+        assert_eq!(service.snapshot().active, 1);
+
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.run_until_idle();
+
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            interruptible_sleep_kind_code(SleepWithCxErrorKind::PollQuotaExhausted)
+        );
+        assert_eq!(runtime.pending_timer_count(), 0);
+        assert_eq!(
+            service.snapshot(),
+            InterruptibleTimerMetrics {
+                capacity: 1,
+                active: 0,
+                admissions: 1,
+                saturations: 0,
+                duration_refusals: 0,
+                context_refusals: 0,
+                cancellations: 0,
+                deadline_expirations: 0,
+                budget_exhaustions: 1,
+                context_failures: 0,
+                wake_completions: 0,
+                stale_wakeups: 0,
+                shutdown_cleanups: 0,
+                max_wake_latency_ns: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn interruptible_sleep_classifies_admitted_cost_budget_cancellation_exactly() {
+        let service = std::sync::Arc::new(InterruptibleTimerService::new(1));
+        let service_task = std::sync::Arc::clone(&service);
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let observed_task = std::sync::Arc::clone(&observed);
+        let task_cx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let task_cx_writer = std::sync::Arc::clone(&task_cx);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x7A11_C057)
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must expose its owning context");
+                *task_cx_writer
+                    .lock()
+                    .expect("publish cost-budget task context") = Some(cx.clone());
+                let error =
+                    sleep_with_cx_interruptible_using(&cx, Duration::from_secs(60), &service_task)
+                        .await
+                        .expect_err("cost-budget cancellation must interrupt an admitted timer");
+                observed_task.store(
+                    interruptible_sleep_kind_code(error.kind()),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            })
+            .expect("spawn cost-budget-bound interruptible sleep");
+        runtime.scheduler.lock().schedule(task_id, 0);
+
+        runtime.run_until_idle();
+        assert_eq!(runtime.pending_timer_count(), 1);
+        assert_eq!(service.snapshot().active, 1);
+
+        task_cx
+            .lock()
+            .expect("read cost-budget task context")
+            .as_ref()
+            .expect("cost-budget task published its context")
+            .cancel_with(
+                crate::outcome::CancelKind::CostBudget,
+                Some("synthetic admitted cost-budget exhaustion"),
+            );
+        runtime.run_until_idle();
+
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            interruptible_sleep_kind_code(SleepWithCxErrorKind::CostBudgetExhausted)
+        );
+        assert_eq!(runtime.pending_timer_count(), 0);
+        assert_eq!(
+            service.snapshot(),
+            InterruptibleTimerMetrics {
+                capacity: 1,
+                active: 0,
+                admissions: 1,
+                saturations: 0,
+                duration_refusals: 0,
+                context_refusals: 0,
+                cancellations: 0,
+                deadline_expirations: 0,
+                budget_exhaustions: 1,
+                context_failures: 0,
+                wake_completions: 0,
+                stale_wakeups: 0,
+                shutdown_cleanups: 0,
+                max_wake_latency_ns: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn interruptible_sleep_cancel_wins_at_the_ready_timer_boundary() {
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let observed_task = std::sync::Arc::clone(&observed);
+        let task_cx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let task_cx_writer = std::sync::Arc::clone(&task_cx);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x7A11_CA11)
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must expose its owning context");
+                *task_cx_writer.lock().expect("publish timer task context") = Some(cx.clone());
+                let result = sleep_with_cx_interruptible(&cx, Duration::from_millis(5)).await;
+                let code = result.map_or_else(
+                    |error| interruptible_sleep_kind_code(error.kind()),
+                    |()| u8::MAX,
+                );
+                observed_task.store(code, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("spawn cancel-vs-ready interruptible sleep");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.run_until_idle();
+        assert_eq!(runtime.pending_timer_count(), 1);
+
+        runtime.advance_time(5_000_000);
+        task_cx
+            .lock()
+            .expect("read timer task context")
+            .as_ref()
+            .expect("timer task published its context")
+            .cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel exactly at timer deadline"),
+            );
+        runtime.run_until_idle();
+
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            interruptible_sleep_kind_code(SleepWithCxErrorKind::ContextCancelled),
+            "post-timer checkpoint must make cancellation win the ready race"
+        );
+        assert_eq!(runtime.pending_timer_count(), 0);
+    }
+
+    #[test]
+    fn interruptible_sleep_ignores_backward_clock_jump_and_keeps_exact_deadline() {
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_task = std::sync::Arc::clone(&completed);
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x7A11_C10C)
+                .worker_count(2)
+                .max_steps(20_000),
+        );
+        runtime.advance_time(1_000_000_000);
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::Cx::current()
+                    .expect("LabRuntime task must expose its owning context");
+                sleep_with_cx_interruptible(&cx, Duration::from_secs(1))
+                    .await
+                    .expect("backward clock attempt must not fail the timer");
+                completed_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("spawn backward-clock interruptible sleep");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.run_until_idle();
+        assert_eq!(runtime.pending_timer_count(), 1);
+
+        runtime.advance_time_to(asupersync::Time::from_millis(500));
+        assert_eq!(runtime.now(), asupersync::Time::from_secs(1));
+        assert_eq!(runtime.pending_timer_count(), 1);
+
+        let virtual_report = runtime.run_with_auto_advance();
+        let oracle_report = runtime.run_until_quiescent_with_report();
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(runtime.now() >= asupersync::Time::from_secs(2));
+        assert_eq!(runtime.pending_timer_count(), 0);
+        assert!(virtual_report.auto_advances >= 1);
+        assert!(oracle_report.oracle_report.all_passed());
+        assert!(oracle_report.invariant_violations.is_empty());
+    }
+
+    #[test]
+    fn interruptible_sleep_scales_one_registration_per_follower_without_rearming() {
+        for &follower_count in &[1_usize, 50, 200, 1_000] {
+            let follower_count_u64 =
+                u64::try_from(follower_count).expect("follower count fits u64");
+            let service = std::sync::Arc::new(InterruptibleTimerService::new(follower_count));
+            let contexts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let settled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(0x7A11_5000 + follower_count_u64)
+                    .worker_count(4)
+                    .trace_capacity(follower_count.saturating_mul(32).saturating_add(1_024))
+                    .max_steps(200_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let mut task_ids = Vec::with_capacity(follower_count);
+
+            for _ in 0..follower_count {
+                let service_task = std::sync::Arc::clone(&service);
+                let contexts_task = std::sync::Arc::clone(&contexts);
+                let settled_task = std::sync::Arc::clone(&settled);
+                let (task_id, _handle) = runtime
+                    .state
+                    .create_task(region, asupersync::Budget::INFINITE, async move {
+                        let cx = crate::cx::Cx::current()
+                            .expect("LabRuntime task must expose its owning context");
+                        contexts_task
+                            .lock()
+                            .expect("record follower context")
+                            .push(cx.clone());
+                        let error = sleep_with_cx_interruptible_using(
+                            &cx,
+                            Duration::from_secs(24 * 60 * 60),
+                            &service_task,
+                        )
+                        .await
+                        .expect_err("shutdown must cancel every synthetic follower");
+                        assert_eq!(error.kind(), SleepWithCxErrorKind::ContextCancelled);
+                        settled_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .expect("spawn synthetic interruptible follower");
+                runtime.scheduler.lock().schedule(task_id, 0);
+                task_ids.push(task_id);
+            }
+
+            let initial_scheduler_steps = runtime.run_until_idle();
+            assert_eq!(
+                contexts.lock().expect("read follower contexts").len(),
+                follower_count
+            );
+            assert_eq!(
+                runtime.pending_timer_count(),
+                follower_count,
+                "each follower must own exactly one timer registration"
+            );
+            let armed_metrics = service.snapshot();
+            assert_eq!(armed_metrics.capacity, follower_count);
+            assert_eq!(armed_metrics.active, follower_count);
+            assert_eq!(armed_metrics.admissions, follower_count_u64);
+            assert_eq!(armed_metrics.saturations, 0);
+            assert_eq!(armed_metrics.duration_refusals, 0);
+            assert_eq!(armed_metrics.context_refusals, 0);
+            assert_eq!(armed_metrics.cancellations, 0);
+            assert_eq!(armed_metrics.deadline_expirations, 0);
+            assert_eq!(armed_metrics.budget_exhaustions, 0);
+            assert_eq!(armed_metrics.context_failures, 0);
+            assert_eq!(armed_metrics.wake_completions, 0);
+            assert_eq!(armed_metrics.stale_wakeups, 0);
+            assert_eq!(armed_metrics.shutdown_cleanups, 0);
+            assert_eq!(armed_metrics.max_wake_latency_ns, 0);
+            assert!(
+                initial_scheduler_steps >= follower_count_u64,
+                "initial scheduler counter must poll every follower at least once"
+            );
+
+            let mut repeated_poll_steps = 0_u64;
+            for _ in 0..3 {
+                for &task_id in &task_ids {
+                    runtime.scheduler.lock().schedule(task_id, 0);
+                }
+                repeated_poll_steps = repeated_poll_steps.saturating_add(runtime.run_until_idle());
+                assert_eq!(
+                    runtime.pending_timer_count(),
+                    follower_count,
+                    "repeated polling must update neither timer count nor registration multiplicity"
+                );
+            }
+            let repoll_metrics = service.snapshot();
+            assert_eq!(repoll_metrics.admissions, follower_count_u64);
+            assert_eq!(repoll_metrics.active, follower_count);
+            assert_eq!(repoll_metrics.saturations, 0);
+            assert_eq!(repoll_metrics.duration_refusals, 0);
+            assert_eq!(repoll_metrics.context_refusals, 0);
+            assert_eq!(repoll_metrics.cancellations, 0);
+            assert_eq!(repoll_metrics.deadline_expirations, 0);
+            assert_eq!(repoll_metrics.budget_exhaustions, 0);
+            assert_eq!(repoll_metrics.context_failures, 0);
+            assert_eq!(repoll_metrics.wake_completions, 0);
+            assert_eq!(
+                repoll_metrics.stale_wakeups,
+                follower_count_u64.saturating_mul(3),
+                "each injected nonterminal re-poll must be counted without rearming"
+            );
+            assert_eq!(repoll_metrics.shutdown_cleanups, 0);
+            assert_eq!(repoll_metrics.max_wake_latency_ns, 0);
+            assert!(
+                repeated_poll_steps >= follower_count_u64.saturating_mul(3),
+                "scheduler-step counter must record every injected re-poll"
+            );
+
+            for cx in contexts.lock().expect("cancel follower contexts").iter() {
+                cx.cancel_with(
+                    crate::outcome::CancelKind::Shutdown,
+                    Some("synthetic follower shutdown"),
+                );
+            }
+            let shutdown_scheduler_steps = runtime.run_until_idle();
+
+            assert_eq!(
+                settled.load(std::sync::atomic::Ordering::SeqCst),
+                follower_count,
+                "every cancelled follower must settle"
+            );
+            assert_eq!(
+                runtime.pending_timer_count(),
+                0,
+                "shutdown must deregister every losing timer"
+            );
+            let cleaned_metrics = service.snapshot();
+            assert_eq!(cleaned_metrics.active, 0);
+            assert_eq!(cleaned_metrics.admissions, follower_count_u64);
+            assert_eq!(cleaned_metrics.saturations, 0);
+            assert_eq!(cleaned_metrics.duration_refusals, 0);
+            assert_eq!(cleaned_metrics.context_refusals, 0);
+            assert_eq!(cleaned_metrics.cancellations, follower_count_u64);
+            assert_eq!(cleaned_metrics.shutdown_cleanups, follower_count_u64);
+            assert_eq!(cleaned_metrics.wake_completions, 0);
+            assert_eq!(cleaned_metrics.deadline_expirations, 0);
+            assert_eq!(cleaned_metrics.budget_exhaustions, 0);
+            assert_eq!(cleaned_metrics.context_failures, 0);
+            assert_eq!(
+                cleaned_metrics.stale_wakeups,
+                follower_count_u64.saturating_mul(3)
+            );
+            assert_eq!(cleaned_metrics.max_wake_latency_ns, 0);
+            assert!(
+                shutdown_scheduler_steps >= follower_count_u64,
+                "shutdown wake counter must schedule every admitted follower"
+            );
+
+            let trace = runtime.trace().snapshot();
+            let timer_scheduled = trace
+                .iter()
+                .filter(|event| event.kind == asupersync::trace::TraceEventKind::TimerScheduled)
+                .count();
+            let timer_cancelled = trace
+                .iter()
+                .filter(|event| event.kind == asupersync::trace::TraceEventKind::TimerCancelled)
+                .count();
+            let wake_events = trace
+                .iter()
+                .filter(|event| event.kind == asupersync::trace::TraceEventKind::Wake)
+                .count();
+            assert_eq!(timer_scheduled, follower_count);
+            assert_eq!(timer_cancelled, follower_count);
+            assert!(
+                wake_events >= follower_count,
+                "trace wake counter must include every shutdown cancellation"
+            );
+            let report = runtime.run_until_quiescent_with_report();
+            assert!(report.oracle_report.all_passed());
+            assert!(report.invariant_violations.is_empty());
+        }
+    }
+
+    #[test]
+    fn interruptible_sleep_wakes_one_thousand_same_deadline_followers_without_starvation() {
+        const FOLLOWER_COUNT: usize = 1_000;
+        const FOLLOWER_COUNT_U64: u64 = 1_000;
+        let service = std::sync::Arc::new(InterruptibleTimerService::new(FOLLOWER_COUNT));
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(0x7A11_FA17)
+                .worker_count(4)
+                .trace_capacity(FOLLOWER_COUNT * 24)
+                .max_steps(200_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+
+        for _ in 0..FOLLOWER_COUNT {
+            let service_task = std::sync::Arc::clone(&service);
+            let completed_task = std::sync::Arc::clone(&completed);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = crate::cx::Cx::current()
+                        .expect("LabRuntime task must expose its owning context");
+                    sleep_with_cx_interruptible_using(&cx, Duration::from_millis(1), &service_task)
+                        .await
+                        .expect("same-deadline follower must wake normally");
+                    completed_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .expect("spawn same-deadline interruptible follower");
+            runtime.scheduler.lock().schedule(task_id, 0);
+        }
+
+        let admission_steps = runtime.run_until_idle();
+        assert!(admission_steps >= FOLLOWER_COUNT_U64);
+        assert_eq!(runtime.pending_timer_count(), FOLLOWER_COUNT);
+        assert_eq!(service.snapshot().active, FOLLOWER_COUNT);
+
+        runtime.advance_time(1_000_000);
+        let wake_steps = runtime.run_until_idle();
+        let report = runtime.run_until_quiescent_with_report();
+        assert!(wake_steps >= FOLLOWER_COUNT_U64);
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            FOLLOWER_COUNT
+        );
+        assert_eq!(runtime.pending_timer_count(), 0);
+        let metrics = service.snapshot();
+        assert_eq!(metrics.active, 0);
+        assert_eq!(metrics.admissions, FOLLOWER_COUNT_U64);
+        assert_eq!(metrics.saturations, 0);
+        assert_eq!(metrics.duration_refusals, 0);
+        assert_eq!(metrics.context_refusals, 0);
+        assert_eq!(metrics.wake_completions, FOLLOWER_COUNT_U64);
+        assert_eq!(metrics.cancellations, 0);
+        assert_eq!(metrics.deadline_expirations, 0);
+        assert_eq!(metrics.budget_exhaustions, 0);
+        assert_eq!(metrics.context_failures, 0);
+        assert_eq!(metrics.stale_wakeups, 0);
+        assert_eq!(metrics.shutdown_cleanups, 0);
+        assert_eq!(metrics.max_wake_latency_ns, 0);
+        let trace = runtime.trace().snapshot();
+        let timer_scheduled = trace
+            .iter()
+            .filter(|event| event.kind == asupersync::trace::TraceEventKind::TimerScheduled)
+            .count();
+        let timer_fired = trace
+            .iter()
+            .filter(|event| event.kind == asupersync::trace::TraceEventKind::TimerFired)
+            .count();
+        let wake_events = trace
+            .iter()
+            .filter(|event| event.kind == asupersync::trace::TraceEventKind::Wake)
+            .count();
+        assert_eq!(timer_scheduled, FOLLOWER_COUNT);
+        assert_eq!(timer_fired, FOLLOWER_COUNT);
+        assert!(
+            wake_events >= FOLLOWER_COUNT,
+            "trace wake counter must include every same-deadline timer wake"
         );
         assert!(report.oracle_report.all_passed());
         assert!(report.invariant_violations.is_empty());

@@ -27101,7 +27101,7 @@ const WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT: std::time::Duration =
 const WATCH_EVENTS_BATCH_LIMIT_MAX: usize = 1_000;
 const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=1000";
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
-const WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL: std::time::Duration =
+const WATCH_EVENTS_IPC_CANCELLATION_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(500);
 
 fn watch_events_unhandled_only(unhandled: bool, claim: bool) -> bool {
@@ -27279,7 +27279,7 @@ fn watch_durable_poll_remaining(
 
 #[cfg(unix)]
 fn watch_ipc_read_timeout(remaining: std::time::Duration) -> std::time::Duration {
-    remaining.min(WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL)
+    remaining.min(WATCH_EVENTS_IPC_CANCELLATION_CHECK_INTERVAL)
 }
 
 #[cfg(unix)]
@@ -27419,65 +27419,36 @@ async fn pace_watch_event(
     }
 }
 
-fn watch_delay_remaining_at(
-    started_at: std::time::Instant,
-    delay: std::time::Duration,
-    now: std::time::Instant,
-) -> std::time::Duration {
-    delay.saturating_sub(now.saturating_duration_since(started_at))
-}
-
-/// Implementation seam for deterministic cancellation tests. Production uses
-/// `std::thread::sleep`; tests may inject a blocking sleeper that cancels its Cx
-/// after the worker has actually started.
-async fn sleep_watch_delay_with_cx_using<F>(
-    cx: &frankenterm_core::cx::Cx,
-    delay: std::time::Duration,
-    operation: &str,
-    blocking_sleep: F,
-) -> std::io::Result<()>
-where
-    F: Fn(std::time::Duration) + Clone + Send + 'static,
-{
-    let started_at = std::time::Instant::now();
-    loop {
-        watch_checkpoint(cx, operation)?;
-        let remaining = watch_delay_remaining_at(started_at, delay, std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let slice = remaining.min(WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL);
-        let blocking_sleep = blocking_sleep.clone();
-        frankenterm_core::runtime_async::spawn_blocking_with_cx(cx, move || {
-            blocking_sleep(slice);
-        })
-        .await
-        .map_err(|error| {
-            if error.is_cancelled() {
-                std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    format!("watch-events {operation} cancelled: {error}"),
-                )
-            } else {
-                std::io::Error::other(format!(
-                    "watch-events {operation} blocking delay failed: {error}"
-                ))
-            }
-        })?;
-    }
-    watch_checkpoint(cx, operation)
-}
-
-/// Sleep without relying on a timer-capable runtime, while still bounding how
-/// long structured cancellation can remain unobserved. Each slice uses the
-/// Cx-aware blocking race, and the next slice is computed from total elapsed
-/// time so executor/scheduling overhead cannot accumulate into oversleep.
+/// Sleep on the runtime's bounded timer wheel. The canonical helper uses one
+/// registration for the full delay and relies on the runtime-owned `Cx` waker
+/// for prompt cancellation; it never occupies the blocking pool.
 async fn sleep_watch_delay_with_cx(
     cx: &frankenterm_core::cx::Cx,
     delay: std::time::Duration,
     operation: &str,
 ) -> std::io::Result<()> {
-    sleep_watch_delay_with_cx_using(cx, delay, operation, std::thread::sleep).await
+    watch_checkpoint(cx, operation)?;
+    frankenterm_core::runtime_async::sleep_with_cx_interruptible(cx, delay)
+        .await
+        .map_err(|error| {
+            use frankenterm_core::runtime_async::SleepWithCxErrorKind;
+
+            let kind = match error.kind() {
+                SleepWithCxErrorKind::TimerCapacityExhausted => std::io::ErrorKind::WouldBlock,
+                SleepWithCxErrorKind::TimerDurationExceeded => std::io::ErrorKind::InvalidInput,
+                SleepWithCxErrorKind::TimerContextUnavailable => std::io::ErrorKind::Unsupported,
+                SleepWithCxErrorKind::DeadlineExceeded => std::io::ErrorKind::TimedOut,
+                SleepWithCxErrorKind::ContextCancelled
+                | SleepWithCxErrorKind::PollQuotaExhausted
+                | SleepWithCxErrorKind::CostBudgetExhausted => std::io::ErrorKind::Interrupted,
+                SleepWithCxErrorKind::ContextFailure => std::io::ErrorKind::Other,
+            };
+            std::io::Error::new(
+                kind,
+                format!("watch-events {operation} delay failed: {error}"),
+            )
+        })?;
+    watch_checkpoint(cx, operation)
 }
 
 fn watch_claim_retry_delay(
@@ -27499,6 +27470,14 @@ fn watch_delay_bounded_by_heartbeat(
         return wait;
     }
     wait.min(heartbeat.saturating_sub(elapsed_since_emit))
+}
+
+fn await_poll_delay(
+    poll: std::time::Duration,
+    timeout: Option<std::time::Duration>,
+    elapsed: std::time::Duration,
+) -> std::time::Duration {
+    timeout.map_or(poll, |timeout| poll.min(timeout.saturating_sub(elapsed)))
 }
 
 fn annotate_watch_event_claim_delivery(
@@ -29640,7 +29619,7 @@ mod watch_events_tests {
 
         assert_eq!(
             watch_ipc_read_timeout(huge),
-            WATCH_EVENTS_CANCELLATION_CHECK_INTERVAL,
+            WATCH_EVENTS_IPC_CANCELLATION_CHECK_INTERVAL,
             "one stalled read may never inherit an effectively unbounded poll interval"
         );
         assert!(
@@ -29654,6 +29633,16 @@ mod watch_events_tests {
         );
 
         run_watch_claim_async(async move {
+            let healthy = frankenterm_core::cx::for_testing();
+            let oversized_error = sleep_watch_delay_with_cx(&healthy, huge, "test delay")
+                .await
+                .expect_err("an oversized delay must fail before timer registration");
+            assert_eq!(
+                oversized_error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "a permanently unsupported duration must not masquerade as transient capacity"
+            );
+
             let cx = frankenterm_core::cx::for_testing();
             cx.cancel_with(
                 frankenterm_core::outcome::CancelKind::User,
@@ -29679,7 +29668,7 @@ mod watch_events_tests {
 
             let sleep_error = sleep_watch_delay_with_cx(&cx, huge, "test delay")
                 .await
-                .expect_err("pre-cancelled delay must not spawn a huge blocking sleep");
+                .expect_err("pre-cancelled delay must not arm a huge timer");
             assert_eq!(sleep_error.kind(), std::io::ErrorKind::Interrupted);
         });
     }
@@ -29789,85 +29778,72 @@ mod watch_events_tests {
     }
 
     #[test]
-    fn elapsed_delay_recomputation_does_not_accumulate_executor_oversleep() {
-        let started_at = std::time::Instant::now();
-        let delay = std::time::Duration::from_millis(1_500);
-        assert_eq!(
-            watch_delay_remaining_at(
-                started_at,
-                delay,
-                started_at + std::time::Duration::from_millis(700),
-            ),
-            std::time::Duration::from_millis(800),
-            "a 500 ms slice plus 200 ms executor delay must consume the full 700 ms"
-        );
-        assert_eq!(
-            watch_delay_remaining_at(
-                started_at,
-                delay,
-                started_at + std::time::Duration::from_millis(1_700),
-            ),
-            std::time::Duration::ZERO,
-            "elapsed time beyond the target must saturate without an extra slice"
-        );
+    fn watch_delay_uses_one_canonical_timer_path_and_no_blocking_pool() {
+        let source = include_str!("main.rs");
+        let helper_start = source
+            .find("async fn sleep_watch_delay_with_cx(")
+            .expect("watch delay helper source");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("\n}\n\nfn watch_claim_retry_delay(")
+            .expect("watch delay helper boundary");
+        let helper = &helper_tail[..helper_end];
+
+        assert!(helper.contains("sleep_with_cx_interruptible(cx, delay)"));
+        assert!(!helper.contains("spawn_blocking"));
+        assert!(!helper.contains("thread::sleep"));
+        assert!(!helper.contains("loop {"));
+        let operations = [
+            ["pac", "ing"].concat(),
+            ["lease retry", " delay"].concat(),
+            ["idle poll", " delay"].concat(),
+            ["await poll", " delay"].concat(),
+        ];
+        for operation in operations {
+            let needle = format!("\"{operation}\"");
+            let mut matches = source.match_indices(&needle);
+            let (position, _) = matches
+                .next()
+                .unwrap_or_else(|| panic!("missing production {operation} delay call"));
+            assert!(
+                matches.next().is_none(),
+                "production delay label {operation} must remain unique"
+            );
+            let line_start = source[..position].rfind('\n').map_or(0, |index| index + 1);
+            let line_end = source[position..]
+                .find('\n')
+                .map_or(source.len(), |index| position + index);
+            assert!(
+                source[line_start..line_end].contains("sleep_watch_delay_with_cx"),
+                "production {operation} delay must call the canonical helper"
+            );
+        }
     }
 
     #[test]
-    fn blocking_delay_observes_cancellation_after_the_worker_starts() {
+    fn runtime_owned_watch_delay_observes_midflight_cancellation() {
         run_watch_claim_async(async move {
-            let cx = frankenterm_core::cx::for_testing();
+            let cx = frankenterm_core::cx::Cx::current()
+                .expect("test runtime must install the owning capability context");
             let cancel_cx = cx.clone();
-            // (release worker, worker finished)
-            let gate = std::sync::Arc::new((
-                std::sync::Mutex::new((false, false)),
-                std::sync::Condvar::new(),
-            ));
-            let worker_gate = std::sync::Arc::clone(&gate);
-            let sleeper = move |_slice: std::time::Duration| {
+            let cancel_task = frankenterm_core::runtime_async::task::spawn(async move {
                 cancel_cx.cancel_with(
                     frankenterm_core::outcome::CancelKind::User,
-                    Some("blocking delay cancelled from worker"),
+                    Some("cancel runtime-owned watch delay"),
                 );
-                let (lock, wake) = &*worker_gate;
-                let state = lock.lock().expect("lock blocking-delay test gate");
-                let (mut state, timeout) = wake
-                    .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| !state.0)
-                    .expect("wait for blocking-delay test release");
-                // The timeout is a test-failure escape hatch, not a success
-                // path: the assertion below requires the await to return while
-                // this worker is still blocked.
-                if timeout.timed_out() && !state.0 {
-                    state.1 = true;
-                    wake.notify_all();
-                    return;
-                }
-                state.1 = true;
-                wake.notify_all();
-            };
+            });
 
-            let error = sleep_watch_delay_with_cx_using(
+            let error = sleep_watch_delay_with_cx(
                 &cx,
                 std::time::Duration::from_secs(60),
                 "mid-flight cancellation test",
-                sleeper,
             )
             .await
-            .expect_err("Cx-aware blocking race must return before its worker finishes");
+            .expect_err("runtime-owned cancellation must interrupt the pending timer");
             assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
-
-            let (lock, wake) = &*gate;
-            let mut state = lock.lock().expect("lock blocking-delay release gate");
-            assert!(
-                !state.1,
-                "helper waited for the blocking worker instead of observing cancellation"
-            );
-            state.0 = true;
-            wake.notify_all();
-            while !state.1 {
-                state = wake
-                    .wait(state)
-                    .expect("wait for abandoned blocking slice to finish");
-            }
+            cancel_task
+                .await
+                .expect("mid-flight cancellation task must settle");
         });
     }
 
@@ -30806,6 +30782,36 @@ mod watch_events_tests {
                 std::time::Duration::from_secs(60),
             ),
             poll
+        );
+    }
+
+    #[test]
+    fn await_poll_delay_never_crosses_the_exact_timeout_boundary() {
+        let poll = std::time::Duration::from_millis(500);
+        let timeout = std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            await_poll_delay(poll, None, std::time::Duration::from_secs(60)),
+            poll,
+            "an unbounded await keeps its configured poll cadence"
+        );
+        assert_eq!(
+            await_poll_delay(poll, Some(timeout), std::time::Duration::from_millis(250),),
+            poll
+        );
+        assert_eq!(
+            await_poll_delay(poll, Some(timeout), std::time::Duration::from_millis(750),),
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(
+            await_poll_delay(poll, Some(timeout), timeout),
+            std::time::Duration::ZERO,
+            "the exact timeout boundary must not arm another poll"
+        );
+        assert_eq!(
+            await_poll_delay(poll, Some(timeout), std::time::Duration::from_secs(2),),
+            std::time::Duration::ZERO,
+            "late observations must saturate without underflow"
         );
     }
 
@@ -46678,8 +46684,8 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 )? {
                                     break 'follow;
                                 }
-                                // See above: blocking-pool delay (async timer
-                                // sleep hangs without a timer-capable cx).
+                                // One runtime timer registration; cancellation
+                                // wakes the owning Cx without a polling slice.
                                 let wait = watch_delay_bounded_by_heartbeat(
                                     poll,
                                     heartbeat_interval_ms,
@@ -47136,9 +47142,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                 if batch_len >= 500 {
                                     continue;
                                 }
-                                let wait = timeout.map_or(poll, |timeout| {
-                                    poll.min(timeout.saturating_sub(started.elapsed()))
-                                });
+                                let wait = await_poll_delay(poll, timeout, started.elapsed());
                                 sleep_watch_delay_with_cx(&cx, wait, "await poll delay").await?;
                             };
 
