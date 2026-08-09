@@ -192,9 +192,10 @@ pub const MAX_SESSION_RESUME_TIMEOUT_SECS: u64 = 30 * 60;
 /// Maximum number of filesystem entries examined per native scan and sessions
 /// admitted from all discovery sources combined.
 pub const MAX_SESSION_DISCOVERY_ENTRIES: usize = 10_000;
-/// Maximum number of native Antigravity scans that may own blocking work at
-/// once. Admission is fail-fast rather than queued, so caller-future drop can
-/// never accumulate an unbounded backlog behind the blocking pool.
+/// Maximum number of native Antigravity discovery transactions admitted at
+/// once. Each permit spans queued/running blocking work and terminal receipt
+/// settlement. Admission is fail-fast, so caller-future drop and scheduler
+/// unfairness cannot accumulate an unbounded owner or blocking-pool backlog.
 pub const MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS: usize = 4;
 /// Maximum byte length of one caller-selected native-discovery root.
 pub const MAX_NATIVE_DISCOVERY_HOME_PATH_BYTES: usize = 32 * 1024;
