@@ -884,6 +884,15 @@ pub struct FleetScrollbackTelemetrySnapshot {
     pub telemetry_blind: bool,
     /// Whether only a strict subset of pane status reads succeeded.
     pub telemetry_partial: bool,
+    /// Number of sampled panes whose mux-owned tiered scrollback is enabled.
+    #[serde(default)]
+    pub tiering_enabled_panes: usize,
+    /// Smallest configured hot-tier line budget in the sampled population.
+    #[serde(default)]
+    pub configured_hot_lines_min: Option<usize>,
+    /// Largest configured hot-tier line budget in the sampled population.
+    #[serde(default)]
+    pub configured_hot_lines_max: Option<usize>,
     /// Sum of mux-owned cumulative hot-to-warm line spill counters.
     pub warm_spill_lines_total: u64,
     /// Sum of mux-owned cumulative hot-to-warm byte spill counters.
@@ -12409,6 +12418,9 @@ mod tests {
                 sampled_pane_ids: (1..=10).collect(),
                 telemetry_blind: false,
                 telemetry_partial: false,
+                tiering_enabled_panes: 10,
+                configured_hot_lines_min: Some(1_000),
+                configured_hot_lines_max: Some(1_000),
                 warm_spill_lines_total: 55,
                 warm_spill_bytes_total: 4_096,
             }),

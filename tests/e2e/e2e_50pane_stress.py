@@ -35,6 +35,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import shutil
 import signal
@@ -53,10 +54,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = REPO_ROOT / "tests" / "e2e" / "output"
 SKIP_EXIT_CODE = 77
 REPORT_CONTRACT_ID = "ft.e2e_50pane_stress"
-REPORT_SCHEMA_VERSION = 3
-VERIFIER_VERSION = "ft.e2e_50pane_stress.verifier.v2"
-AUTHORIZATION_RECEIPT_SCHEMA_VERSION = 1
-AUTHORIZATION_SCOPE = "ft-d0ez0.5.native-isolated-50-pane.v1"
+REPORT_SCHEMA_VERSION = 4
+VERIFIER_VERSION = "ft.e2e_50pane_stress.verifier.v3"
+AUTHORIZATION_RECEIPT_SCHEMA_VERSION = 2
+AUTHORIZATION_SCOPE = "ft-d0ez0.5.native-isolated-50-pane.v2"
 FULL_DURATION_SECS = 300.0
 DEFAULT_DURATION_SECS = FULL_DURATION_SECS
 DEFAULT_TIMEOUT_SECS = 30.0
@@ -84,11 +85,20 @@ OUTPUT_RATE_MINIMUM_FRACTION = 0.85
 OUTPUT_PAYLOAD_BYTES_PER_LINE = 448
 FLEET_SCROLLBACK_PER_PANE_BUDGET_BYTES = 512 * 1024
 FLEET_SCROLLBACK_HIGH_RATIO = 0.8
+MUX_SCROLLBACK_HOT_LINES = 1_000
 DETECTION_PROBE_PHASE_FRACTION = 0.8
 DETECTION_PROBE_PHASE_TOLERANCE_SECS = 15.0
 ROBOT_BENCHMARK_PHASE_FRACTION = 0.9
 ROBOT_BENCHMARK_PHASE_TOLERANCE_SECS = 15.0
 AUTHORITATIVE_BUILD_PROFILES = {"release-interactive", "release-perf"}
+AUTHORITATIVE_BINARY_RESOLUTION_PREFIXES = {
+    "cargo_target_dir",
+    "env_ft_binary",
+    "repo_target",
+}
+BINARY_VERSION_PATTERN = re.compile(
+    r"\Aft [^\s]+ \((?P<git_sha>[0-9a-f]{40})(?P<dirty>\+dirty)?\)\Z"
+)
 DETECTION_PATTERN_TEXT = (
     "Warning: You have less than 25% of your 8h limit remaining. "
     "Usage: 24% of your 8h limit remaining."
@@ -501,6 +511,70 @@ def is_lower_hex(value: Any, length: int) -> bool:
     )
 
 
+def parse_binary_version_identity(value: Any) -> tuple[str, bool] | None:
+    """Return the embedded exact Git SHA and dirty bit from `ft --version`."""
+    if not isinstance(value, str):
+        return None
+    match = BINARY_VERSION_PATTERN.fullmatch(value.strip())
+    if match is None:
+        return None
+    return match.group("git_sha"), match.group("dirty") is not None
+
+
+def authoritative_profile_from_resolution_source(value: Any) -> str | None:
+    """Infer a build profile only from a recognized Cargo target directory."""
+    if not isinstance(value, str):
+        return None
+    prefix, separator, profile = value.partition(":")
+    if (
+        separator
+        and prefix in AUTHORITATIVE_BINARY_RESOLUTION_PREFIXES
+        and profile in AUTHORITATIVE_BUILD_PROFILES
+    ):
+        return profile
+    return None
+
+
+def binary_path_matches_profile(value: Any, profile: str | None) -> bool:
+    if not isinstance(value, str) or profile is None:
+        return False
+    path = Path(value)
+    return path.is_absolute() and path.name == "ft" and path.parent.name == profile
+
+
+def absolute_path_is_within(value: Any, root: Any) -> bool:
+    if not isinstance(value, str) or not isinstance(root, str):
+        return False
+    path = Path(value)
+    root_path = Path(root)
+    if (
+        not path.is_absolute()
+        or not root_path.is_absolute()
+        or ".." in path.parts
+        or ".." in root_path.parts
+        or path == root_path
+    ):
+        return False
+    try:
+        path.relative_to(root_path)
+    except ValueError:
+        return False
+    return True
+
+
+def hardware_fingerprint_payload(hardware: dict[str, Any]) -> dict[str, Any]:
+    """Select the normalized hardware fields covered by the retained digest."""
+    return {
+        "system": hardware.get("system"),
+        "machine": hardware.get("machine"),
+        "release": hardware.get("release"),
+        "cpu_model": hardware.get("cpu_model"),
+        "logical_cpu_count": hardware.get("logical_cpu_count"),
+        "physical_memory_bytes": hardware.get("physical_memory_bytes"),
+        "target_class": hardware.get("target_class"),
+    }
+
+
 def minimum_output_lines_for_pane(pane_index: int, requested_duration: float) -> int:
     high_phase_start = requested_duration * HIGH_OUTPUT_PHASE_FRACTION
     expected_lines = NORMAL_LINES_PER_SECOND_PER_PANE * requested_duration
@@ -675,6 +749,7 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         "output_payload_bytes_per_line": OUTPUT_PAYLOAD_BYTES_PER_LINE,
         "fleet_scrollback_per_pane_budget_bytes": FLEET_SCROLLBACK_PER_PANE_BUDGET_BYTES,
         "fleet_scrollback_high_ratio": FLEET_SCROLLBACK_HIGH_RATIO,
+        "mux_scrollback_hot_lines": MUX_SCROLLBACK_HOT_LINES,
         "detection_probe_phase_fraction": DETECTION_PROBE_PHASE_FRACTION,
         "detection_probe_phase_tolerance_secs": DETECTION_PROBE_PHASE_TOLERANCE_SECS,
         "robot_benchmark_phase_fraction": ROBOT_BENCHMARK_PHASE_FRACTION,
@@ -691,6 +766,14 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         actual=thresholds,
     )
 
+    provenance = report.get("provenance") if isinstance(report.get("provenance"), dict) else {}
+    source = provenance.get("source") if isinstance(provenance.get("source"), dict) else {}
+    binary = provenance.get("binary") if isinstance(provenance.get("binary"), dict) else {}
+    config = provenance.get("config") if isinstance(provenance.get("config"), dict) else {}
+    hardware = provenance.get("hardware") if isinstance(provenance.get("hardware"), dict) else {}
+    receipt_workload = (
+        report.get("workload") if isinstance(report.get("workload"), dict) else {}
+    )
     authority = report.get("authority") if isinstance(report.get("authority"), dict) else {}
     transport = authority.get("transport")
     evidence_state = authority.get("evidence_state")
@@ -701,6 +784,7 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
     )
     workspace = report.get("workspace") if isinstance(report.get("workspace"), dict) else {}
     target_workspace = authority.get("target_workspace")
+    authorization_receipt_ref = authority.get("authorization_receipt_ref")
     receipt_shape_ok = (
         authorization_receipt.get("schema_version") == AUTHORIZATION_RECEIPT_SCHEMA_VERSION
         and authorization_receipt.get("scope") == AUTHORIZATION_SCOPE
@@ -713,6 +797,14 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         and authorization_receipt.get("target_workspace") == target_workspace
         and target_workspace == workspace.get("root")
         and authorization_receipt.get("operator_session_untouched") is True
+        and authorization_receipt.get("source_git_sha") == source.get("git_sha")
+        and authorization_receipt.get("binary_sha256") == binary.get("sha256")
+        and authorization_receipt.get("config_sha256") == config.get("sha256")
+        and authorization_receipt.get("hardware_fingerprint_sha256")
+        == hardware.get("hardware_fingerprint_sha256")
+        and authorization_receipt.get("requested_sustained_duration_secs")
+        == receipt_workload.get("requested_sustained_duration_secs")
+        and authorization_receipt.get("required_panes") == NUM_PANES
     )
     receipt_digest_ok = (
         receipt_shape_ok
@@ -730,8 +822,9 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         authority_ready = (
             authority.get("isolated_workspace") is True
             and authority.get("operator_session_untouched") is True
-            and isinstance(authority.get("authorization_receipt_ref"), str)
-            and 0 < len(authority.get("authorization_receipt_ref")) <= 4096
+            and isinstance(authorization_receipt_ref, str)
+            and 0 < len(authorization_receipt_ref) <= 4096
+            and absolute_path_is_within(authorization_receipt_ref, target_workspace)
             and receipt_digest_ok
         )
         authority_outcome = "pass" if authority_ready else "skipped_not_proven"
@@ -747,19 +840,29 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         reason_code=authority_reason,
         expected=(
             "measured native_isolated_mux run in an isolated workspace with an explicit "
-            "authorization receipt and no operator-session interaction"
+            "candidate/workload-bound authorization receipt and no operator-session interaction"
         ),
         actual=authority,
     )
 
-    provenance = report.get("provenance") if isinstance(report.get("provenance"), dict) else {}
-    source = provenance.get("source") if isinstance(provenance.get("source"), dict) else {}
-    binary = provenance.get("binary") if isinstance(provenance.get("binary"), dict) else {}
-    config = provenance.get("config") if isinstance(provenance.get("config"), dict) else {}
-    hardware = provenance.get("hardware") if isinstance(provenance.get("hardware"), dict) else {}
     config_content = config.get("content")
     config_content_bytes = (
         config_content.encode("utf-8") if isinstance(config_content, str) else b""
+    )
+    binary_version_identity = parse_binary_version_identity(binary.get("version"))
+    binary_git_sha = (
+        binary_version_identity[0] if binary_version_identity is not None else None
+    )
+    binary_git_dirty = (
+        binary_version_identity[1] if binary_version_identity is not None else None
+    )
+    source_git_sha = source.get("git_sha")
+    inferred_build_profile = authoritative_profile_from_resolution_source(
+        binary.get("resolution_source")
+    )
+    hardware_fingerprint = hardware.get("hardware_fingerprint_sha256")
+    expected_hardware_fingerprint = canonical_json_sha256(
+        hardware_fingerprint_payload(hardware)
     )
     provenance_missing = [
         field
@@ -767,15 +870,29 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
             "source.git_sha": is_lower_hex(source.get("git_sha"), 40),
             "source.git_tree_sha": is_lower_hex(source.get("git_tree_sha"), 40),
             "source.tracked_tree_clean": source.get("tracked_tree_clean") is True,
-            "binary.path": isinstance(binary.get("path"), str) and bool(binary.get("path")),
+            "binary.path": isinstance(binary.get("path"), str)
+            and 0 < len(binary.get("path")) <= 4096,
             "binary.sha256": is_lower_hex(binary.get("sha256"), 64),
             "binary.size_bytes": isinstance(binary.get("size_bytes"), int)
             and not isinstance(binary.get("size_bytes"), bool)
             and binary.get("size_bytes", 0) > 0,
-            "binary.version": isinstance(binary.get("version"), str) and bool(binary.get("version")),
-            "binary.build_profile": binary.get("build_profile")
-            in AUTHORITATIVE_BUILD_PROFILES,
-            "config.path": isinstance(config.get("path"), str) and bool(config.get("path")),
+            "binary.version_identity": binary_version_identity is not None,
+            "binary.source_git_sha_match": is_lower_hex(source_git_sha, 40)
+            and source_git_sha == binary_git_sha,
+            "binary.source_git_clean": binary_git_dirty is False,
+            "binary.build_profile_resolution": inferred_build_profile is not None
+            and binary.get("build_profile") == inferred_build_profile,
+            "binary.path_profile_layout": binary_path_matches_profile(
+                binary.get("path"), inferred_build_profile
+            ),
+            "binary.path_isolated_workspace": absolute_path_is_within(
+                binary.get("path"), target_workspace
+            ),
+            "config.path": isinstance(config.get("path"), str)
+            and 0 < len(config.get("path")) <= 4096,
+            "config.path_isolated_workspace": absolute_path_is_within(
+                config.get("path"), target_workspace
+            ),
             "config.sha256": is_lower_hex(config.get("sha256"), 64),
             "config.size_bytes": isinstance(config.get("size_bytes"), int)
             and not isinstance(config.get("size_bytes"), bool)
@@ -785,14 +902,28 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
             and hashlib.sha256(config_content_bytes).hexdigest() == config.get("sha256"),
             "config.content_size": bool(config_content_bytes)
             and len(config_content_bytes) == config.get("size_bytes"),
-            "hardware.system": isinstance(hardware.get("system"), str) and bool(hardware.get("system")),
-            "hardware.machine": isinstance(hardware.get("machine"), str) and bool(hardware.get("machine")),
-            "hardware.release": isinstance(hardware.get("release"), str) and bool(hardware.get("release")),
+            "hardware.system": isinstance(hardware.get("system"), str)
+            and 0 < len(hardware.get("system")) <= 256,
+            "hardware.machine": isinstance(hardware.get("machine"), str)
+            and 0 < len(hardware.get("machine")) <= 256,
+            "hardware.release": isinstance(hardware.get("release"), str)
+            and 0 < len(hardware.get("release")) <= 256,
             "hardware.target_class": isinstance(hardware.get("target_class"), str)
-            and bool(hardware.get("target_class")),
+            and 0 < len(hardware.get("target_class")) <= 256,
+            "hardware.cpu_model": isinstance(hardware.get("cpu_model"), str)
+            and 0 < len(hardware.get("cpu_model")) <= 512,
             "hardware.logical_cpu_count": isinstance(hardware.get("logical_cpu_count"), int)
             and not isinstance(hardware.get("logical_cpu_count"), bool)
             and hardware.get("logical_cpu_count", 0) > 0,
+            "hardware.physical_memory_bytes": isinstance(
+                hardware.get("physical_memory_bytes"), int
+            )
+            and not isinstance(hardware.get("physical_memory_bytes"), bool)
+            and hardware.get("physical_memory_bytes", 0) > 0,
+            "hardware.hardware_fingerprint_sha256": is_lower_hex(
+                hardware_fingerprint, 64
+            )
+            and hardware_fingerprint == expected_hardware_fingerprint,
         }.items()
         if not present
     ]
@@ -805,8 +936,9 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
             "provenance.complete" if not provenance_missing else "provenance.missing_or_dirty"
         ),
         expected=(
-            "clean exact source; release-interactive/release-perf binary identity; "
-            "frozen embedded config with matching digest; and target hardware identity"
+            "clean exact source; clean source-matched binary from a recognized "
+            "release-interactive/release-perf target layout; frozen embedded config "
+            "with matching digest; and digest-bound target hardware identity"
         ),
         actual={"missing_or_invalid": provenance_missing, "provenance": provenance},
     )
@@ -1257,6 +1389,9 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
             "sampled_pane_ids",
             "telemetry_blind",
             "telemetry_partial",
+            "tiering_enabled_panes",
+            "configured_hot_lines_min",
+            "configured_hot_lines_max",
             "warm_spill_lines_total",
             "warm_spill_bytes_total",
         ),
@@ -1279,6 +1414,9 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
             source_timestamp = sample["source_snapshot_timestamp_ms"]
             observed_ids = sample["observed_pane_ids"]
             sampled_ids = sample["sampled_pane_ids"]
+            tiering_enabled_panes = sample["tiering_enabled_panes"]
+            configured_hot_lines_min = sample["configured_hot_lines_min"]
+            configured_hot_lines_max = sample["configured_hot_lines_max"]
             if (
                 sample["source"]
                 != "runtime_health_snapshot.fleet_scrollback_telemetry"
@@ -1294,6 +1432,11 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
                 or sampled_ids != expected_pane_ids
                 or sample["telemetry_blind"] is not False
                 or sample["telemetry_partial"] is not False
+                or not isinstance(tiering_enabled_panes, int)
+                or isinstance(tiering_enabled_panes, bool)
+                or tiering_enabled_panes != NUM_PANES
+                or configured_hot_lines_min != MUX_SCROLLBACK_HOT_LINES
+                or configured_hot_lines_max != MUX_SCROLLBACK_HOT_LINES
                 or not isinstance(lines, int)
                 or isinstance(lines, bool)
                 or lines < 0
@@ -1332,8 +1475,9 @@ def verify_stress_report(report: dict[str, Any]) -> dict[str, Any]:
         reason_code=scrollback_reason,
         expected=(
             "complete measured mux coverage for the exact spawned pane identities, "
-            "with nondecreasing warm-spill line/byte totals and a line-total "
-            "increase across distinct runtime snapshots"
+            f"all tiering enabled at exactly {MUX_SCROLLBACK_HOT_LINES} hot lines, "
+            "nondecreasing warm-spill line/byte totals, and a line-total increase "
+            "across distinct runtime snapshots"
         ),
         actual=scrollback_samples,
     )
@@ -1697,8 +1841,11 @@ def resolve_ft_binary() -> BinaryChoice:
     if env_binary:
         env_path = Path(env_binary).expanduser()
         if env_path.is_file() and os.access(env_path, os.X_OK):
-            record(str(env_path), "env:FT_BINARY", True)
-            return BinaryChoice(str(env_path), "env:FT_BINARY", candidates)
+            resolved_env_path = env_path.resolve()
+            env_profile = resolved_env_path.parent.name
+            resolution_source = f"env_ft_binary:{env_profile}"
+            record(str(resolved_env_path), resolution_source, True)
+            return BinaryChoice(str(resolved_env_path), resolution_source, candidates)
         record(str(env_path), "env:FT_BINARY", False, "not executable")
 
     cargo_roots: list[tuple[Path, str]] = []
@@ -2074,16 +2221,7 @@ def collect_source_provenance() -> dict[str, Any]:
 def collect_binary_provenance(binary_path: str, resolution_source: str | None) -> dict[str, Any]:
     resolved = Path(binary_path).resolve()
     version = run([str(resolved), "--version"], cwd=REPO_ROOT, check=False, timeout=10.0)
-    build_profile = os.environ.get("FT_BUILD_PROFILE", "")
-    if resolution_source:
-        candidate_profile = resolution_source.rsplit(":", maxsplit=1)[-1]
-        if candidate_profile in {
-            "release-interactive",
-            "release-perf",
-            "release",
-            "debug",
-        }:
-            build_profile = candidate_profile
+    build_profile = authoritative_profile_from_resolution_source(resolution_source) or ""
     return {
         "path": str(resolved),
         "sha256": sha256_file(resolved),
@@ -2093,6 +2231,53 @@ def collect_binary_provenance(binary_path: str, resolution_source: str | None) -
         "resolution_source": resolution_source,
         "version_command": version.as_dict(),
     }
+
+
+def collect_cpu_model() -> str:
+    if platform.system() == "Darwin":
+        result = run(
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+            cwd=REPO_ROOT,
+            check=False,
+            timeout=5.0,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()[:512]
+    if platform.system() == "Linux":
+        try:
+            with Path("/proc/cpuinfo").open("r", encoding="utf-8", errors="replace") as cpuinfo:
+                for line in cpuinfo.read(1024 * 1024).splitlines():
+                    key, separator, value = line.partition(":")
+                    if separator and key.strip() in {"model name", "Hardware"} and value.strip():
+                        return value.strip()[:512]
+        except OSError:
+            pass
+    return platform.processor().strip()[:512]
+
+
+def collect_physical_memory_bytes() -> int | None:
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        physical_pages = os.sysconf("SC_PHYS_PAGES")
+        memory_bytes = page_size * physical_pages
+        if memory_bytes > 0:
+            return memory_bytes
+    except (OSError, TypeError, ValueError):
+        pass
+    if platform.system() == "Darwin":
+        result = run(
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+            cwd=REPO_ROOT,
+            check=False,
+            timeout=5.0,
+        )
+        try:
+            memory_bytes = int(result.stdout.strip()) if result.returncode == 0 else 0
+        except ValueError:
+            memory_bytes = 0
+        if memory_bytes > 0:
+            return memory_bytes
+    return None
 
 
 def collect_config_provenance(config_path: Path) -> dict[str, Any]:
@@ -2107,13 +2292,19 @@ def collect_config_provenance(config_path: Path) -> dict[str, Any]:
 
 
 def collect_hardware_provenance() -> dict[str, Any]:
-    return {
+    hardware = {
         "system": platform.system(),
         "machine": platform.machine(),
         "release": platform.release(),
+        "cpu_model": collect_cpu_model(),
         "logical_cpu_count": os.cpu_count(),
-        "target_class": os.environ.get("FT_E2E_TARGET_CLASS", ""),
+        "physical_memory_bytes": collect_physical_memory_bytes(),
+        "target_class": os.environ.get("FT_E2E_TARGET_CLASS", "")[:256],
     }
+    hardware["hardware_fingerprint_sha256"] = canonical_json_sha256(
+        hardware_fingerprint_payload(hardware)
+    )
+    return hardware
 
 
 def next_sample_timestamp(previous_timestamp_ms: int | None) -> int:
@@ -2241,6 +2432,9 @@ def collect_scrollback_sample(
         "sampled_pane_ids": telemetry.get("sampled_pane_ids"),
         "telemetry_blind": telemetry.get("telemetry_blind"),
         "telemetry_partial": telemetry.get("telemetry_partial"),
+        "tiering_enabled_panes": telemetry.get("tiering_enabled_panes"),
+        "configured_hot_lines_min": telemetry.get("configured_hot_lines_min"),
+        "configured_hot_lines_max": telemetry.get("configured_hot_lines_max"),
         "warm_spill_lines_total": telemetry.get("warm_spill_lines_total"),
         "warm_spill_bytes_total": telemetry.get("warm_spill_bytes_total"),
     }
@@ -2354,6 +2548,18 @@ def verifier_fixture_report() -> dict[str, Any]:
     observed_output_bytes = sum(
         sample["observed_bytes"] for sample in pane_output_deltas
     )
+    hardware = {
+        "system": "VerifierOS",
+        "machine": "verifier64",
+        "release": "1",
+        "cpu_model": "Verifier CPU 128-core",
+        "logical_cpu_count": 128,
+        "physical_memory_bytes": 256 * 1024 * 1024 * 1024,
+        "target_class": "verifier-self-test",
+    }
+    hardware["hardware_fingerprint_sha256"] = canonical_json_sha256(
+        hardware_fingerprint_payload(hardware)
+    )
     receipt = {
         "schema_version": AUTHORIZATION_RECEIPT_SCHEMA_VERSION,
         "scope": AUTHORIZATION_SCOPE,
@@ -2362,6 +2568,12 @@ def verifier_fixture_report() -> dict[str, Any]:
         "authorized_by": "verifier-self-test",
         "target_workspace": "/isolated/verifier-self-test",
         "operator_session_untouched": True,
+        "source_git_sha": "a" * 40,
+        "binary_sha256": "c" * 64,
+        "config_sha256": hashlib.sha256(CONFIG_TEMPLATE.encode("utf-8")).hexdigest(),
+        "hardware_fingerprint_sha256": hardware["hardware_fingerprint_sha256"],
+        "requested_sustained_duration_secs": FULL_DURATION_SECS,
+        "required_panes": NUM_PANES,
     }
     return {
         "contract_id": REPORT_CONTRACT_ID,
@@ -2386,6 +2598,7 @@ def verifier_fixture_report() -> dict[str, Any]:
             "output_payload_bytes_per_line": OUTPUT_PAYLOAD_BYTES_PER_LINE,
             "fleet_scrollback_per_pane_budget_bytes": FLEET_SCROLLBACK_PER_PANE_BUDGET_BYTES,
             "fleet_scrollback_high_ratio": FLEET_SCROLLBACK_HIGH_RATIO,
+            "mux_scrollback_hot_lines": MUX_SCROLLBACK_HOT_LINES,
             "detection_probe_phase_fraction": DETECTION_PROBE_PHASE_FRACTION,
             "detection_probe_phase_tolerance_secs": DETECTION_PROBE_PHASE_TOLERANCE_SECS,
             "robot_benchmark_phase_fraction": ROBOT_BENCHMARK_PHASE_FRACTION,
@@ -2398,7 +2611,9 @@ def verifier_fixture_report() -> dict[str, Any]:
             "isolated_workspace": True,
             "operator_session_untouched": True,
             "target_workspace": "/isolated/verifier-self-test",
-            "authorization_receipt_ref": "self-test:inline",
+            "authorization_receipt_ref": (
+                "/isolated/verifier-self-test/authorization-receipt.json"
+            ),
             "authorization_receipt": receipt,
             "authorization_receipt_sha256": canonical_json_sha256(receipt),
         },
@@ -2410,25 +2625,20 @@ def verifier_fixture_report() -> dict[str, Any]:
                 "tracked_tree_clean": True,
             },
             "binary": {
-                "path": "/isolated/ft",
+                "path": "/isolated/verifier-self-test/target/release-perf/ft",
                 "sha256": "c" * 64,
                 "size_bytes": 1,
-                "version": "ft verifier-self-test",
+                "version": f"ft 0.1.0 ({'a' * 40})",
                 "build_profile": "release-perf",
+                "resolution_source": "cargo_target_dir:release-perf",
             },
             "config": {
-                "path": "/isolated/ft.toml",
+                "path": "/isolated/verifier-self-test/ft.toml",
                 "sha256": hashlib.sha256(CONFIG_TEMPLATE.encode("utf-8")).hexdigest(),
                 "size_bytes": len(CONFIG_TEMPLATE.encode("utf-8")),
                 "content": CONFIG_TEMPLATE,
             },
-            "hardware": {
-                "system": "VerifierOS",
-                "machine": "verifier64",
-                "release": "1",
-                "logical_cpu_count": 128,
-                "target_class": "verifier-self-test",
-            },
+            "hardware": hardware,
         },
         "workload": {
             "requested_sustained_duration_secs": FULL_DURATION_SECS,
@@ -2506,6 +2716,9 @@ def verifier_fixture_report() -> dict[str, Any]:
                     "sampled_pane_ids": list(range(1, NUM_PANES + 1)),
                     "telemetry_blind": False,
                     "telemetry_partial": False,
+                    "tiering_enabled_panes": NUM_PANES,
+                    "configured_hot_lines_min": MUX_SCROLLBACK_HOT_LINES,
+                    "configured_hot_lines_max": MUX_SCROLLBACK_HOT_LINES,
                     "warm_spill_lines_total": 0,
                     "warm_spill_bytes_total": 0,
                 },
@@ -2521,6 +2734,9 @@ def verifier_fixture_report() -> dict[str, Any]:
                     "sampled_pane_ids": list(range(1, NUM_PANES + 1)),
                     "telemetry_blind": False,
                     "telemetry_partial": False,
+                    "tiering_enabled_panes": NUM_PANES,
+                    "configured_hot_lines_min": MUX_SCROLLBACK_HOT_LINES,
+                    "configured_hot_lines_max": MUX_SCROLLBACK_HOT_LINES,
                     "warm_spill_lines_total": 100,
                     "warm_spill_bytes_total": 8_192,
                 },
@@ -2601,6 +2817,10 @@ def run_verifier_self_tests() -> None:
     assert result["status"] == "passed", result
     assert result["authoritative"] is True
     assert result["ignored_precomputed_check_count"] == 1
+    assert not absolute_path_is_within(
+        "/isolated/verifier-self-test/../operator-live/receipt.json",
+        "/isolated/verifier-self-test",
+    )
 
     fixture = clone_json(baseline)
     fixture["authority"]["transport"] = "fixture_wezterm_cli"
@@ -2677,6 +2897,18 @@ def run_verifier_self_tests() -> None:
     ] = 0
     assert verify_stress_report(spill_without_transition)["status"] == "failed"
 
+    disabled_tiering = clone_json(baseline)
+    disabled_tiering["evidence"]["scrollback_samples"][1][
+        "tiering_enabled_panes"
+    ] = NUM_PANES - 1
+    assert verify_stress_report(disabled_tiering)["status"] == "skipped_not_proven"
+
+    drifted_hot_tier = clone_json(baseline)
+    drifted_hot_tier["evidence"]["scrollback_samples"][1][
+        "configured_hot_lines_max"
+    ] = MUX_SCROLLBACK_HOT_LINES + 1
+    assert verify_stress_report(drifted_hot_tier)["status"] == "skipped_not_proven"
+
     stale_scrollback_snapshot = clone_json(baseline)
     stale_scrollback_snapshot["evidence"]["scrollback_samples"][1][
         "source_snapshot_timestamp_ms"
@@ -2706,6 +2938,16 @@ def run_verifier_self_tests() -> None:
     forged_receipt = clone_json(baseline)
     forged_receipt["authority"]["authorization_receipt"]["authorized_by"] = "mutated"
     assert verify_stress_report(forged_receipt)["status"] == "skipped_not_proven"
+
+    external_receipt_ref = clone_json(baseline)
+    external_receipt_ref["authority"]["authorization_receipt_ref"] = (
+        "/operator/live/authorization-receipt.json"
+    )
+    assert verify_stress_report(external_receipt_ref)["status"] == "skipped_not_proven"
+
+    replayed_receipt = clone_json(baseline)
+    replayed_receipt["provenance"]["binary"]["sha256"] = "d" * 64
+    assert verify_stress_report(replayed_receipt)["status"] == "skipped_not_proven"
 
     drifted_budget = clone_json(baseline)
     drifted_budget["thresholds"]["fleet_scrollback_per_pane_budget_bytes"] += 1
@@ -2781,6 +3023,61 @@ def run_verifier_self_tests() -> None:
     debug_binary = clone_json(baseline)
     debug_binary["provenance"]["binary"]["build_profile"] = "debug"
     assert verify_stress_report(debug_binary)["status"] == "skipped_not_proven"
+
+    source_binary_mismatch = clone_json(baseline)
+    source_binary_mismatch["provenance"]["binary"]["version"] = (
+        f"ft 0.1.0 ({'d' * 40})"
+    )
+    assert (
+        verify_stress_report(source_binary_mismatch)["status"]
+        == "skipped_not_proven"
+    )
+
+    dirty_binary = clone_json(baseline)
+    dirty_binary["provenance"]["binary"]["version"] = f"ft 0.1.0 ({'a' * 40}+dirty)"
+    assert verify_stress_report(dirty_binary)["status"] == "skipped_not_proven"
+
+    caller_labeled_profile = clone_json(baseline)
+    caller_labeled_profile["provenance"]["binary"]["resolution_source"] = "env:FT_BINARY"
+    assert (
+        verify_stress_report(caller_labeled_profile)["status"]
+        == "skipped_not_proven"
+    )
+
+    wrong_profile_path = clone_json(baseline)
+    wrong_profile_path["provenance"]["binary"]["path"] = (
+        "/isolated/verifier-self-test/target/debug/ft"
+    )
+    assert verify_stress_report(wrong_profile_path)["status"] == "skipped_not_proven"
+
+    external_binary_path = clone_json(baseline)
+    external_binary_path["provenance"]["binary"]["path"] = (
+        "/operator/live/target/release-perf/ft"
+    )
+    assert (
+        verify_stress_report(external_binary_path)["status"]
+        == "skipped_not_proven"
+    )
+
+    external_config_path = clone_json(baseline)
+    external_config_path["provenance"]["config"]["path"] = "/operator/live/ft.toml"
+    assert (
+        verify_stress_report(external_config_path)["status"]
+        == "skipped_not_proven"
+    )
+
+    mismatched_profile_source = clone_json(baseline)
+    mismatched_profile_source["provenance"]["binary"][
+        "resolution_source"
+    ] = "cargo_target_dir:release-interactive"
+    assert (
+        verify_stress_report(mismatched_profile_source)["status"]
+        == "skipped_not_proven"
+    )
+
+    tampered_hardware = clone_json(baseline)
+    tampered_hardware["provenance"]["hardware"]["target_class"] = "forged-target"
+    assert verify_stress_report(tampered_hardware)["status"] == "skipped_not_proven"
 
     false_green = {
         "schema_version": "ft.e2e_50pane_stress.v1",
@@ -2928,6 +3225,7 @@ def main() -> int:
             "output_payload_bytes_per_line": OUTPUT_PAYLOAD_BYTES_PER_LINE,
             "fleet_scrollback_per_pane_budget_bytes": FLEET_SCROLLBACK_PER_PANE_BUDGET_BYTES,
             "fleet_scrollback_high_ratio": FLEET_SCROLLBACK_HIGH_RATIO,
+            "mux_scrollback_hot_lines": MUX_SCROLLBACK_HOT_LINES,
             "detection_probe_phase_fraction": DETECTION_PROBE_PHASE_FRACTION,
             "detection_probe_phase_tolerance_secs": DETECTION_PROBE_PHASE_TOLERANCE_SECS,
             "robot_benchmark_phase_fraction": ROBOT_BENCHMARK_PHASE_FRACTION,

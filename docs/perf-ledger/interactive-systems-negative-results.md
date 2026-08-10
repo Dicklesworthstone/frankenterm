@@ -3455,14 +3455,38 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   publication. The 50-pane verifier instead required an invented transition
   field that had no production producer, and its runnable collector never
   populated any scrollback samples. A synthetic verifier fixture could pass
-  while no native report could establish the same claim.
+  while no native report could establish the same claim. The schema-v3 proof
+  boundary also accepted an abbreviated nine-hex source identity, trusted a
+  caller-supplied build-profile label, treated an arbitrary hardware-class
+  string as hardware provenance, and bound its authorization receipt only to
+  the run/workspace rather than the exact binary, configuration, hardware,
+  workload, and duration. Reproducible builds also forcibly suppressed the
+  embedded tracked-tree dirty marker. Finally, the spill gate did not prove
+  that all 50 panes actually had tiering enabled with the frozen 1,000-line
+  hot-tier limit. Each omission permitted a report to pass while exercising a
+  different candidate or scrollback configuration than the one named by the
+  claim.
 - **Decision:** preserve the mux-owned warm-spill counters through the runtime
   summary, publish bounded complete/partial/blind fleet coverage in each
   source-timestamped health snapshot, and require a nondecreasing line/byte
   series with a line-total increase across two distinct producer snapshots.
-  Fixture transport and stale/replayed snapshots remain
-  `skipped_not_proven`; no native performance claim exists until the isolated
-  full-duration run is retained.
+  Schema v4 now requires the binary's full clean 40-hex Git identity to equal
+  the source identity, preserves a fail-closed tracked-tree dirty marker even
+  with `SOURCE_DATE_EPOCH`, infers the release profile from the binary layout,
+  requires the candidate and frozen configuration to reside inside the
+  authorized workspace, fingerprints the concrete hardware facts, binds the
+  authorization receipt to the exact candidate/configuration/hardware/workload
+  tuple, and requires all 50 observed panes to report tiering enabled with an
+  exact 1,000-line configured hot tier. Pure offline negative controls run in
+  CI without launching the product. Strict-remote job
+  `j-29969150772248675` ran the final-source scrollback-health filter on
+  `ovh-a`: 2 passed, 0 failed, with RCH explicitly reporting remote execution
+  and exit 0. Fixture transport and stale/replayed snapshots remain
+  `skipped_not_proven`. The harness still has no private native execution path,
+  and neither the receipt nor the offline report is a cryptographic trust root;
+  no native performance, 300-second stability, RSS, Apple M4/M5, or
+  Threadripper claim exists until an authorized isolated full-duration run and
+  its raw samples are retained.
 - **Primary retry condition:**
   > Replace the mux-owned spill counters only after another bounded production surface proves the same fixed-population hot-to-warm transition with complete pane coverage, distinct producer identity, and no self-declared transition boolean or synthetic-only field.
 

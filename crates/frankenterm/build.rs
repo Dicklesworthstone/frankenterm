@@ -2,8 +2,8 @@
 // and enabled features as compile-time environment variables for `ft --version`.
 //
 // Reproducibility: honors SOURCE_DATE_EPOCH (https://reproducible-builds.org/specs/source-date-epoch/).
-// When set, FT_BUILD_TS is derived from that epoch and FT_GIT_DIRTY is forced empty so the same
-// commit produces bit-identical binaries regardless of wall clock or working-tree state.
+// When set, FT_BUILD_TS is derived from that epoch. Tracked source changes still set
+// FT_GIT_DIRTY so reproducibility metadata cannot suppress candidate-integrity evidence.
 
 use std::process::Command;
 
@@ -17,7 +17,7 @@ fn main() {
 
     // Git commit hash
     let git_hash = Command::new("git")
-        .args(["rev-parse", "--short=9", "HEAD"])
+        .args(["rev-parse", "--verify", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -25,19 +25,13 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=FT_GIT_HASH={git_hash}");
 
-    // Git dirty flag: skip the working-tree check under SOURCE_DATE_EPOCH so a reproducible
-    // build from a fresh checkout cannot be forced "dirty" by an unrelated untracked file.
-    let git_dirty = if source_date_epoch.is_some() {
-        false
-    } else {
-        Command::new("git")
-            .args(["status", "--porcelain"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false)
-    };
+    // Git dirty flag: tracked changes invalidate candidate identity even under
+    // SOURCE_DATE_EPOCH. Untracked artifacts are excluded so they cannot perturb
+    // reproducible metadata. If Git cannot establish cleanliness, fail closed.
+    let git_dirty = Command::new("git")
+        .args(["diff-index", "--quiet", "HEAD", "--"])
+        .status()
+        .map_or(true, |status| !status.success());
     if git_dirty {
         println!("cargo:rustc-env=FT_GIT_DIRTY=+dirty");
     } else {

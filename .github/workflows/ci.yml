@@ -142,6 +142,13 @@ jobs:
       - name: RuntimeProof coverage ratchet (ft-3kv6e)
         run: python3 scripts/check_runtime_proof_coverage.py
 
+      # ft-d0ez0.5 — pure/offline verifier coverage only. This does not launch
+      # ft, a GUI, a mux server, or any session. The scheduled CI invocation
+      # keeps false-green stress-report mutations covered nightly while native
+      # performance evidence remains an explicitly authorized retained run.
+      - name: 50-pane stress verifier fail-closed self-test (ft-d0ez0.5)
+        run: python3 tests/e2e/e2e_50pane_stress.py --self-test-verifier
+
       # ft-tf6g3.29 — mechanized Lean model of the RuntimeProof private
       # supertrait seal. Elan reads lean-toolchain and installs the exact
       # Lean release used by the proof checker.

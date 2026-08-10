@@ -443,6 +443,9 @@
             "sampled_pane_ids",
             "telemetry_blind",
             "telemetry_partial",
+            "tiering_enabled_panes",
+            "configured_hot_lines_min",
+            "configured_hot_lines_max",
             "warm_spill_lines_total",
             "warm_spill_bytes_total"
           ],
@@ -461,6 +464,15 @@
             },
             "telemetry_blind": { "type": "boolean" },
             "telemetry_partial": { "type": "boolean" },
+            "tiering_enabled_panes": { "type": "integer", "minimum": 0 },
+            "configured_hot_lines_min": {
+              "type": ["integer", "null"],
+              "minimum": 0
+            },
+            "configured_hot_lines_max": {
+              "type": ["integer", "null"],
+              "minimum": 0
+            },
             "warm_spill_lines_total": { "type": "integer", "minimum": 0 },
             "warm_spill_bytes_total": { "type": "integer", "minimum": 0 }
           },

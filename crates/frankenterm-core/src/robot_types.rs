@@ -7611,6 +7611,9 @@ mod tests {
             sampled_pane_ids: (1..=42).collect(),
             telemetry_blind: false,
             telemetry_partial: false,
+            tiering_enabled_panes: 42,
+            configured_hot_lines_min: Some(1_000),
+            configured_hot_lines_max: Some(1_000),
             warm_spill_lines_total: 12,
             warm_spill_bytes_total: 1_024,
         });

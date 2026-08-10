@@ -9288,22 +9288,35 @@ impl PaneTieredScrollbackFetch {
         let mut observed_pane_ids = observed_pane_ids.to_vec();
         observed_pane_ids.sort_unstable();
         observed_pane_ids.dedup();
-        let sampled_pane_ids: Vec<u64> = observed_pane_ids
-            .iter()
-            .copied()
-            .filter(|pane_id| self.summaries.contains_key(pane_id))
-            .collect();
         let pane_count = observed_pane_ids.len();
+        let mut sampled_pane_ids = Vec::with_capacity(pane_count.min(self.summaries.len()));
+        let mut tiering_enabled_panes = 0_usize;
+        let mut configured_hot_lines_min: Option<usize> = None;
+        let mut configured_hot_lines_max: Option<usize> = None;
+        let mut warm_spill_lines_total = 0_u64;
+        let mut warm_spill_bytes_total = 0_u64;
+        for pane_id in &observed_pane_ids {
+            let Some(summary) = self.summaries.get(pane_id) else {
+                continue;
+            };
+            sampled_pane_ids.push(*pane_id);
+            tiering_enabled_panes += usize::from(summary.tiering_enabled);
+            configured_hot_lines_min = Some(
+                configured_hot_lines_min.map_or(summary.configured_hot_lines, |minimum| {
+                    minimum.min(summary.configured_hot_lines)
+                }),
+            );
+            configured_hot_lines_max = Some(
+                configured_hot_lines_max.map_or(summary.configured_hot_lines, |maximum| {
+                    maximum.max(summary.configured_hot_lines)
+                }),
+            );
+            warm_spill_lines_total =
+                warm_spill_lines_total.saturating_add(summary.warm_spill_lines_total);
+            warm_spill_bytes_total =
+                warm_spill_bytes_total.saturating_add(summary.warm_spill_bytes_total);
+        }
         let sampled_pane_count = sampled_pane_ids.len();
-        let (warm_spill_lines_total, warm_spill_bytes_total) = sampled_pane_ids
-            .iter()
-            .filter_map(|pane_id| self.summaries.get(pane_id))
-            .fold((0_u64, 0_u64), |(lines, bytes), summary| {
-                (
-                    lines.saturating_add(summary.warm_spill_lines_total),
-                    bytes.saturating_add(summary.warm_spill_bytes_total),
-                )
-            });
         FleetScrollbackTelemetrySnapshot {
             observed_panes: pane_count,
             sampled_panes: sampled_pane_count,
@@ -9311,6 +9324,9 @@ impl PaneTieredScrollbackFetch {
             sampled_pane_ids,
             telemetry_blind: pane_count > 0 && sampled_pane_count == 0,
             telemetry_partial: pane_count > sampled_pane_count && sampled_pane_count > 0,
+            tiering_enabled_panes,
+            configured_hot_lines_min,
+            configured_hot_lines_max,
             warm_spill_lines_total,
             warm_spill_bytes_total,
         }
@@ -15879,6 +15895,8 @@ mod tests {
         fetch.summaries.insert(
             11,
             PaneTieredScrollbackSummary {
+                tiering_enabled: true,
+                configured_hot_lines: 1_000,
                 warm_spill_lines_total: u64::MAX,
                 warm_spill_bytes_total: 4_096,
                 ..Default::default()
@@ -15887,6 +15905,8 @@ mod tests {
         fetch.summaries.insert(
             12,
             PaneTieredScrollbackSummary {
+                tiering_enabled: false,
+                configured_hot_lines: 2_000,
                 warm_spill_lines_total: 1,
                 warm_spill_bytes_total: u64::MAX,
                 ..Default::default()
@@ -15900,6 +15920,9 @@ mod tests {
         assert_eq!(snapshot.sampled_pane_ids, vec![11, 12]);
         assert!(!snapshot.telemetry_blind);
         assert!(!snapshot.telemetry_partial);
+        assert_eq!(snapshot.tiering_enabled_panes, 1);
+        assert_eq!(snapshot.configured_hot_lines_min, Some(1_000));
+        assert_eq!(snapshot.configured_hot_lines_max, Some(2_000));
         assert_eq!(snapshot.warm_spill_lines_total, u64::MAX);
         assert_eq!(snapshot.warm_spill_bytes_total, u64::MAX);
     }
@@ -15920,6 +15943,9 @@ mod tests {
         assert_eq!(snapshot.observed_pane_ids, vec![11]);
         assert!(snapshot.sampled_pane_ids.is_empty());
         assert!(snapshot.telemetry_blind);
+        assert_eq!(snapshot.tiering_enabled_panes, 0);
+        assert_eq!(snapshot.configured_hot_lines_min, None);
+        assert_eq!(snapshot.configured_hot_lines_max, None);
         assert_eq!(snapshot.warm_spill_lines_total, 0);
         assert_eq!(snapshot.warm_spill_bytes_total, 0);
     }

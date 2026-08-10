@@ -100,7 +100,7 @@ mod build_meta {
     pub const FEATURES: &str = env!("FT_FEATURES");
     pub const ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
-    /// Short version line: `0.1.0 (abc123def)`
+    /// Short version line with the exact source commit: `0.1.0 (<40-hex-sha>)`.
     pub fn short_version() -> String {
         format!("{} ({}{})", frankenterm_core::VERSION, GIT_HASH, GIT_DIRTY)
     }
