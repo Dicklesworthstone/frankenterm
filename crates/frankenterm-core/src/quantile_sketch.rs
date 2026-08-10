@@ -219,7 +219,7 @@ impl TDigest {
                     } else {
                         0.5
                     };
-                    return self.min + t * (c.mean - self.min);
+                    return t.mul_add(c.mean - self.min, self.min);
                 }
                 // Interpolate between previous centroid mean and this one
                 let prev = &self.centroids[i - 1];
@@ -232,7 +232,7 @@ impl TDigest {
                 } else {
                     0.5
                 };
-                return prev.mean + t * gap;
+                return t.mul_add(gap, prev.mean);
             }
 
             cumulative += c.weight;
@@ -246,7 +246,7 @@ impl TDigest {
                     } else {
                         0.5
                     };
-                    return c.mean + t * (self.max - c.mean);
+                    return t.mul_add(self.max - c.mean, c.mean);
                 }
                 let next = &self.centroids[i + 1];
                 let gap = next.mean - c.mean;
@@ -258,7 +258,7 @@ impl TDigest {
                 } else {
                     0.5
                 };
-                return c.mean + t * gap;
+                return t.mul_add(gap, c.mean);
             }
         }
 
@@ -309,7 +309,7 @@ impl TDigest {
                 };
                 let prev_contrib = prev.weight / 2.0;
                 let curr_contrib = c.weight / 2.0;
-                return (cumulative - prev_contrib + t * (prev_contrib + curr_contrib)) / total;
+                return t.mul_add(prev_contrib + curr_contrib, cumulative - prev_contrib) / total;
             }
 
             cumulative += c.weight;

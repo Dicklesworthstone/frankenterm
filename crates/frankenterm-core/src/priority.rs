@@ -232,7 +232,7 @@ impl OutputRateTracker {
         if elapsed_secs > 1e-9 {
             let instant_rate = line_count as f64 / elapsed_secs;
             let alpha = 1.0 - decay;
-            self.ewma_lps += alpha * instant_rate;
+            self.ewma_lps = alpha.mul_add(instant_rate, self.ewma_lps);
         }
 
         self.last_sample = now;

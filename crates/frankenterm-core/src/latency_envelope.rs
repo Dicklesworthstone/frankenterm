@@ -497,9 +497,12 @@ pub fn adversarial_arrival_replay(
         for sustained_idx in 1..=sustained_events {
             let sustained_work = sustained_idx as f64 * unit_work;
             let capture_at_ms = sustained_work / arrival_rate;
-            let delay_ms = (service.latency() + burst / service.rate()
-                - sustained_work * (1.0 / arrival_rate - 1.0 / service.rate()))
-            .max(service.latency());
+            let delay_ms = sustained_work
+                .mul_add(
+                    -(1.0 / arrival_rate - 1.0 / service.rate()),
+                    service.latency() + burst / service.rate(),
+                )
+                .max(service.latency());
             max_delay_ms = max_delay_ms.max(delay_ms);
             let sample = sample_with_delay(capture_at_ms, delay_ms)?;
             let _ = monitor.observe(sample);

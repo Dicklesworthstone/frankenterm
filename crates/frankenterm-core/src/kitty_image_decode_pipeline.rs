@@ -216,12 +216,7 @@ impl DecodeBudget {
     /// short-circuit on any operation.
     #[must_use]
     pub fn with_repaired_invariants(mut self) -> Self {
-        if self.total_max_ms == 0 {
-            self.total_max_ms = 1;
-        }
-        if self.total_max_ms > 5_000 {
-            self.total_max_ms = 5_000;
-        }
+        self.total_max_ms = self.total_max_ms.clamp(1, 5_000);
         if self.per_stage_max_ms == 0 {
             self.per_stage_max_ms = 1;
         }

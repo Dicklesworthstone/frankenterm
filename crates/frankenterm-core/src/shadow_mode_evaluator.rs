@@ -967,8 +967,10 @@ fn compute_diff(
     } else {
         1.0
     };
-    let fidelity_score =
-        (dispatch_rate * 0.5 + agent_match_rate * 0.3 + unexpected_penalty * 0.2).clamp(0.0, 1.0);
+    let weighted_dispatch_and_agent = agent_match_rate.mul_add(0.3, dispatch_rate * 0.5);
+    let fidelity_score = unexpected_penalty
+        .mul_add(0.2, weighted_dispatch_and_agent)
+        .clamp(0.0, 1.0);
 
     ShadowModeDiff {
         cycle_id,

@@ -166,7 +166,7 @@ impl Distribution {
 
 /// Linear-interpolation quantile on an already-sorted sample.
 fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
-    debug_assert!(!sorted.is_empty());
+    debug_assert_ne!(sorted.len(), 0);
     debug_assert!((0.0..=1.0).contains(&q));
     let n = sorted.len();
     if n == 1 {
@@ -361,7 +361,7 @@ fn normal_cdf(x: f64) -> f64 {
         .mul_add(t, 0.319_381_530)
         * t;
     let density = (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
-    let y = 1.0 - polynomial * density;
+    let y = polynomial.mul_add(-density, 1.0);
     let erf_approx = 2.0_f64.mul_add(y, -1.0);
     erf_approx.mul_add(sign, 1.0) * 0.5
 }

@@ -527,7 +527,7 @@ pub fn generate_sine(freq_hz: f64, amplitude: f64, noise_level: f64, n: usize) -
             let t = i as f64 / sr;
             amplitude.mul_add(
                 (2.0 * PI * freq_hz * t).sin(),
-                (xorshift64(&mut rng) * 2.0 - 1.0) * noise_level,
+                xorshift64(&mut rng).mul_add(2.0, -1.0) * noise_level,
             )
         })
         .collect()
@@ -536,7 +536,9 @@ pub fn generate_sine(freq_hz: f64, amplitude: f64, noise_level: f64, n: usize) -
 /// Generate white noise with a given seed.
 pub fn generate_white_noise(seed: u64, n: usize) -> Vec<f64> {
     let mut state = seed.wrapping_add(1);
-    (0..n).map(|_| xorshift64(&mut state) * 2.0 - 1.0).collect()
+    (0..n)
+        .map(|_| xorshift64(&mut state).mul_add(2.0, -1.0))
+        .collect()
 }
 
 /// Generate white noise scaled by amplitude.

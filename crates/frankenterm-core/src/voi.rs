@@ -375,7 +375,9 @@ impl VoiScheduler {
         for belief in self.beliefs.values_mut() {
             if belief.last_drift_ms < now_ms {
                 let dt_secs = (now_ms - belief.last_drift_ms) as f64 / 1000.0;
-                let new_entropy = (belief.cached_entropy + dt_secs * drift_rate).min(max_entropy);
+                let new_entropy = dt_secs
+                    .mul_add(drift_rate, belief.cached_entropy)
+                    .min(max_entropy);
                 belief.cached_entropy = new_entropy;
                 belief.last_drift_ms = now_ms;
             }
@@ -387,7 +389,8 @@ impl VoiScheduler {
         let belief = self.beliefs.get(&pane_id)?;
 
         let dt_secs = (now_ms.saturating_sub(belief.last_drift_ms)) as f64 / 1000.0;
-        let current_h = (belief.cached_entropy + dt_secs * self.config.entropy_drift_rate)
+        let current_h = dt_secs
+            .mul_add(self.config.entropy_drift_rate, belief.cached_entropy)
             .min(self.config.max_entropy);
 
         // Expected post-observation entropy: optimistic estimate.
@@ -422,7 +425,8 @@ impl VoiScheduler {
 
         for (&pane_id, belief) in &self.beliefs {
             let dt_secs = (now_ms.saturating_sub(belief.last_drift_ms)) as f64 / 1000.0;
-            let current_h = (belief.cached_entropy + dt_secs * self.config.entropy_drift_rate)
+            let current_h = dt_secs
+                .mul_add(self.config.entropy_drift_rate, belief.cached_entropy)
                 .min(self.config.max_entropy);
             total_entropy += current_h;
 

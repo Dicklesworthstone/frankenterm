@@ -100,12 +100,7 @@ impl RetryPolicyConfig {
         if self.base_backoff_ms == 0 {
             self.base_backoff_ms = 1;
         }
-        if self.max_backoff_ms == 0 {
-            self.max_backoff_ms = 1;
-        }
-        if self.max_backoff_ms > 3_600_000 {
-            self.max_backoff_ms = 3_600_000;
-        }
+        self.max_backoff_ms = self.max_backoff_ms.clamp(1, 3_600_000);
         if self.base_backoff_ms > self.max_backoff_ms {
             self.base_backoff_ms = self.max_backoff_ms;
         }

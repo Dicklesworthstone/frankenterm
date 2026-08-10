@@ -496,7 +496,7 @@ impl ChaosScaleHarness {
             let base_utilization = if has_context_exhaustion {
                 // Under context exhaustion, spread from 0.60 to 0.95.
                 // Ensures some panes land in Red (>=0.75) and Black (>=0.90).
-                0.60 + pane_fraction * 0.35
+                pane_fraction.mul_add(0.35, 0.60)
             } else {
                 // Normal distribution: 0% to 45% utilization.
                 pane_fraction * 0.45

@@ -69,8 +69,8 @@ impl SemanticCompressionMode {
         let repeated = repeated_line_ratio.clamp(0.0, 1.0);
         match self {
             Self::Disabled => 1.0,
-            Self::Conservative => (1.0 - repeated * 0.35).max(0.55),
-            Self::Aggressive => (1.0 - repeated * 0.62).max(0.24),
+            Self::Conservative => repeated.mul_add(-0.35, 1.0).max(0.55),
+            Self::Aggressive => repeated.mul_add(-0.62, 1.0).max(0.24),
         }
     }
 

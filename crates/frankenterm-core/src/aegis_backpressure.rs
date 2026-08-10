@@ -186,7 +186,7 @@ impl GaussianPosterior {
         let prior_precision = 1.0 / self.variance;
         let obs_precision = 1.0 / obs_var;
         let new_precision = prior_precision + obs_precision;
-        self.mean = (prior_precision * self.mean + obs_precision * observation) / new_precision;
+        self.mean = obs_precision.mul_add(observation, prior_precision * self.mean) / new_precision;
         self.variance = 1.0 / new_precision;
         self.n_observations = self.n_observations.saturating_add(1);
     }
@@ -214,13 +214,13 @@ impl GaussianPosterior {
         // For Gaussian: mean + z_{1-δ/2} * σ
         // Using Φ⁻¹ approximation for common values
         let z = quantile_normal(1.0 - delta / 2.0);
-        self.mean + z * self.std_dev()
+        z.mul_add(self.std_dev(), self.mean)
     }
 
     /// Lower confidence bound.
     pub fn lower_bound(&self, delta: f64) -> f64 {
         let z = quantile_normal(1.0 - delta / 2.0);
-        self.mean - z * self.std_dev()
+        z.mul_add(-self.std_dev(), self.mean)
     }
 }
 
@@ -238,15 +238,15 @@ fn quantile_normal(p: f64) -> f64 {
     } else {
         (-2.0 * (1.0 - p).ln()).sqrt()
     };
-    let c0 = 2.515_517;
-    let c1 = 0.802_853;
-    let c2 = 0.010_328;
-    let d1 = 1.432_788;
-    let d2 = 0.189_269;
-    let d3 = 0.001_308;
+    let c0: f64 = 2.515_517;
+    let c1: f64 = 0.802_853;
+    let c2: f64 = 0.010_328;
+    let d1: f64 = 1.432_788;
+    let d2: f64 = 0.189_269;
+    let d3: f64 = 0.001_308;
     let val = t
-        - (c2 * t).mul_add(t, c0 + c1 * t)
-            / (d3 * t * t).mul_add(t, (d2 * t).mul_add(t, 1.0 + d1 * t));
+        - (c2 * t).mul_add(t, c1.mul_add(t, c0))
+            / (d3 * t * t).mul_add(t, (d2 * t).mul_add(t, d1.mul_add(t, 1.0)));
     if p < 0.5 { -val } else { val }
 }
 
@@ -286,7 +286,7 @@ fn external_cause_probability(evidence: &ExternalCauseEvidence) -> f64 {
 
     // System load > 2.0 suggests system-level contention
     let load_signal = (evidence.system_load / 4.0).min(1.0);
-    score += load_signal * 0.3;
+    score = load_signal.mul_add(0.3, score);
     weight_sum += 0.3;
 
     // Other panes also slow → correlated external cause
