@@ -2539,9 +2539,9 @@ where
 
     let cancellation_wait_signal = cancellation.clone();
     let mut observer = NativeDiscoveryObserverGuard::new(cancellation);
-    let receipt_cx = crate::cx::for_request();
+    let terminal_wait_cx = crate::cx::for_request();
     let receipt = std::pin::pin!(crate::runtime_async::oneshot_recv_with_cx(
-        &receipt_cx,
+        &terminal_wait_cx,
         receipt_rx
     ));
     let cancellation_wait = std::pin::pin!(wait_for_native_discovery_cancellation(
