@@ -877,10 +877,9 @@ impl std::fmt::Display for SessionResumeError {
                 f,
                 "native session discovery exceeded the {resource} budget (observed={observed}, limit={limit})"
             ),
-            Self::DiscoveryAdmissionRejected { reason } => write!(
-                f,
-                "native session discovery admission rejected ({reason})"
-            ),
+            Self::DiscoveryAdmissionRejected { reason } => {
+                write!(f, "native session discovery admission rejected ({reason})")
+            }
             Self::DiscoveryIncomplete { source, reason } => write!(
                 f,
                 "session discovery incomplete (source={source}, reason={reason})"
@@ -2500,9 +2499,8 @@ where
     // Cx plus a private drop-cancellation signal. Runtime shutdown still owns
     // and drains this task through the region that accepted it.
     let owner_cx = native_discovery_owner_cx(cx);
-    let owner = crate::runtime_async::task::try_spawn_with_cx(
-        &owner_cx,
-        move |_owner_cx| async move {
+    let owner =
+        crate::runtime_async::task::try_spawn_with_cx(&owner_cx, move |_owner_cx| async move {
             let _owner_guard = owner_guard;
             let worker_cancellation = owner_cancellation.clone();
             let worker_scan_cx = scan_cx.clone();
@@ -2538,8 +2536,7 @@ where
             // scheduler. Release only after the one terminal receipt has been
             // delivered or conclusively found undeliverable.
             drop(shutdown_lease);
-        },
-    );
+        });
     let owner = match owner {
         Ok(owner) => owner,
         Err(error) => {
@@ -4588,8 +4585,7 @@ mod tests {
     fn native_discovery_owner_is_cancel_independent_without_capability_escalation() {
         for (mask, expected) in crate::cx::capability_mask_test_cases() {
             let caller_cx = {
-                let _caller_context =
-                    crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
+                let _caller_context = crate::cx::Cx::set_current(Some(crate::cx::for_testing()));
                 let _caller_capability_ceiling = crate::cx::Cx::push_restriction(mask);
                 crate::cx::Cx::current().expect("restricted caller context")
             };
@@ -4651,13 +4647,10 @@ mod tests {
         let work_ran = Arc::new(AtomicBool::new(false));
         let work_ran_inner = Arc::clone(&work_ran);
         let cx = crate::cx::for_request();
-        let request = run_owned_native_discovery_with_cx(
-            &cx,
-            move |_cancellation, _scan_cx| {
-                work_ran_inner.store(true, Ordering::Release);
-                Ok(SessionDiscoveryResult::default())
-            },
-        );
+        let request = run_owned_native_discovery_with_cx(&cx, move |_cancellation, _scan_cx| {
+            work_ran_inner.store(true, Ordering::Release);
+            Ok(SessionDiscoveryResult::default())
+        });
 
         drop(request);
         assert!(!work_ran.load(Ordering::Acquire));
@@ -4715,19 +4708,16 @@ mod tests {
             let request = crate::runtime_async::task::spawn_with_cx(
                 &request_cx,
                 move |_child_cx| async move {
-                    run_owned_native_discovery_with_cx(
-                        &task_cx,
-                        move |_cancellation, _scan_cx| {
-                            worker_barrier.wait_in_worker();
-                            // Model work that crosses its indivisible blocking
-                            // boundary just before observer cancellation and
-                            // therefore still returns a successful payload. The
-                            // owner must settle and drop that payload after the
-                            // receiver has deterministically disappeared.
-                            worker_settled_inner.store(true, Ordering::Release);
-                            Ok(SessionDiscoveryResult::default())
-                        },
-                    )
+                    run_owned_native_discovery_with_cx(&task_cx, move |_cancellation, _scan_cx| {
+                        worker_barrier.wait_in_worker();
+                        // Model work that crosses its indivisible blocking
+                        // boundary just before observer cancellation and
+                        // therefore still returns a successful payload. The
+                        // owner must settle and drop that payload after the
+                        // receiver has deterministically disappeared.
+                        worker_settled_inner.store(true, Ordering::Release);
+                        Ok(SessionDiscoveryResult::default())
+                    })
                     .await
                 },
             );
@@ -4786,14 +4776,12 @@ mod tests {
         .expect("write native checkpoint fixture");
 
         let mut checkpoint_count = 0_usize;
-        let report = discover_antigravity_conversations_in_dir_with_checkpoint(
-            directory.path(),
-            || {
+        let report =
+            discover_antigravity_conversations_in_dir_with_checkpoint(directory.path(), || {
                 checkpoint_count = checkpoint_count.saturating_add(1);
                 Ok(())
-            },
-        )
-        .expect("enumerate native checkpoint fixture");
+            })
+            .expect("enumerate native checkpoint fixture");
         assert_eq!(report.entries.len(), 1);
         assert!(checkpoint_count > 0);
 
@@ -4802,8 +4790,7 @@ mod tests {
             .expect("native checkpoint runtime");
         for target in 1..=checkpoint_count {
             let gate = Arc::new(NativeDiscoveryCheckpointGate::new(target));
-            let _release_on_drop =
-                ReleaseNativeDiscoveryCheckpointOnDrop(Arc::clone(&gate));
+            let _release_on_drop = ReleaseNativeDiscoveryCheckpointOnDrop(Arc::clone(&gate));
             runtime.block_on(async {
                 let request_cx = crate::cx::for_request();
                 let task_cx = request_cx.clone();
@@ -4897,16 +4884,13 @@ mod tests {
             let request = crate::runtime_async::task::spawn_with_cx(
                 &request_cx,
                 move |_child_cx| async move {
-                    run_owned_native_discovery_with_cx(
-                        &task_cx,
-                        move |cancellation, scan_cx| {
-                            worker_barrier.wait_in_worker();
-                            let result = cancellation.checkpoint(&scan_cx);
-                            worker_settled_inner.store(true, Ordering::Release);
-                            result?;
-                            Ok(SessionDiscoveryResult::default())
-                        },
-                    )
+                    run_owned_native_discovery_with_cx(&task_cx, move |cancellation, scan_cx| {
+                        worker_barrier.wait_in_worker();
+                        let result = cancellation.checkpoint(&scan_cx);
+                        worker_settled_inner.store(true, Ordering::Release);
+                        result?;
+                        Ok(SessionDiscoveryResult::default())
+                    })
                     .await
                 },
             );
@@ -4976,14 +4960,11 @@ mod tests {
             let request = crate::runtime_async::task::spawn_with_cx(
                 &request_cx,
                 move |_child_cx| async move {
-                    run_owned_native_discovery_with_cx(
-                        &task_cx,
-                        move |cancellation, scan_cx| {
-                            worker_barrier.wait_in_worker();
-                            cancellation.checkpoint(&scan_cx)?;
-                            Ok(SessionDiscoveryResult::default())
-                        },
-                    )
+                    run_owned_native_discovery_with_cx(&task_cx, move |cancellation, scan_cx| {
+                        worker_barrier.wait_in_worker();
+                        cancellation.checkpoint(&scan_cx)?;
+                        Ok(SessionDiscoveryResult::default())
+                    })
                     .await
                 },
             );
@@ -5048,18 +5029,16 @@ mod tests {
             .expect("native discovery shutdown runtime");
         runtime.spawn_detached(async move {
             let request_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            let _ = run_owned_native_discovery_with_cx(
-                &request_cx,
-                move |cancellation, scan_cx| {
+            let _ =
+                run_owned_native_discovery_with_cx(&request_cx, move |cancellation, scan_cx| {
                     cancellation_tx
                         .send(cancellation.clone())
                         .expect("publish native shutdown cancellation token");
                     worker_barrier.wait_in_worker();
                     cancellation.checkpoint(&scan_cx)?;
                     Ok(SessionDiscoveryResult::default())
-                },
-            )
-            .await;
+                })
+                .await;
         });
 
         let cancellation = cancellation_rx
@@ -5105,12 +5084,12 @@ mod tests {
             .expect("replacement native discovery runtime");
         replacement.block_on(async {
             let replacement_cx = crate::cx::for_request();
-            let report = run_owned_native_discovery_with_cx(
-                &replacement_cx,
-                |_cancellation, _scan_cx| Ok(SessionDiscoveryResult::default()),
-            )
-            .await
-            .expect("replacement runtime must admit an independent native scan");
+            let report =
+                run_owned_native_discovery_with_cx(&replacement_cx, |_cancellation, _scan_cx| {
+                    Ok(SessionDiscoveryResult::default())
+                })
+                .await
+                .expect("replacement runtime must admit an independent native scan");
             assert!(report.entries.is_empty());
             wait_for_native_discovery_state(&replacement_cx, |snapshot| {
                 snapshot.active_scans == before.active_scans
@@ -5142,8 +5121,14 @@ mod tests {
     fn native_discovery_without_runtime_rejects_before_subsystem_admission() {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
-        assert_eq!(before.active_scans, 0, "lifecycle tests must start quiescent");
-        assert_eq!(before.active_owners, 0, "lifecycle tests must start quiescent");
+        assert_eq!(
+            before.active_scans, 0,
+            "lifecycle tests must start quiescent"
+        );
+        assert_eq!(
+            before.active_owners, 0,
+            "lifecycle tests must start quiescent"
+        );
         let work_ran = Arc::new(AtomicBool::new(false));
         let work_ran_inner = Arc::clone(&work_ran);
 
@@ -5170,8 +5155,7 @@ mod tests {
             assert_eq!(
                 error,
                 SessionResumeError::DiscoveryAdmissionRejected {
-                    reason:
-                        SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown,
+                    reason: SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown,
                 }
             );
         })
@@ -5198,8 +5182,14 @@ mod tests {
     fn native_discovery_saturation_rejects_without_running_work() {
         let _test_lock = native_discovery_lifecycle_test_lock();
         let before = native_discovery_runtime_metrics();
-        assert_eq!(before.active_scans, 0, "lifecycle tests must start quiescent");
-        assert_eq!(before.active_owners, 0, "lifecycle tests must start quiescent");
+        assert_eq!(
+            before.active_scans, 0,
+            "lifecycle tests must start quiescent"
+        );
+        assert_eq!(
+            before.active_owners, 0,
+            "lifecycle tests must start quiescent"
+        );
         let barrier = Arc::new(NativeDiscoveryTestBarrier::default());
         let started = Arc::new(AtomicUsize::new(0));
         let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
@@ -5241,15 +5231,13 @@ mod tests {
 
             let rejected_work_ran = Arc::new(AtomicBool::new(false));
             let rejected_work_ran_inner = Arc::clone(&rejected_work_ran);
-            let error = run_owned_native_discovery_with_cx(
-                &wait_cx,
-                move |_cancellation, _scan_cx| {
+            let error =
+                run_owned_native_discovery_with_cx(&wait_cx, move |_cancellation, _scan_cx| {
                     rejected_work_ran_inner.store(true, Ordering::Release);
                     Ok(SessionDiscoveryResult::default())
-                },
-            )
-            .await
-            .expect_err("the fifth concurrent scan must fail before owner admission");
+                })
+                .await
+                .expect_err("the fifth concurrent scan must fail before owner admission");
             assert_eq!(
                 error,
                 SessionResumeError::DiscoveryAdmissionRejected {
@@ -5290,14 +5278,12 @@ mod tests {
     fn native_scan_observes_cancellation_after_empty_enumeration() {
         let directory = tempfile::tempdir().expect("empty native scan directory");
         let mut terminal_checkpoint = 0_usize;
-        let report = discover_antigravity_conversations_in_dir_with_checkpoint(
-            directory.path(),
-            || {
+        let report =
+            discover_antigravity_conversations_in_dir_with_checkpoint(directory.path(), || {
                 terminal_checkpoint = terminal_checkpoint.saturating_add(1);
                 Ok(())
-            },
-        )
-        .expect("measure empty native scan checkpoints");
+            })
+            .expect("measure empty native scan checkpoints");
         assert!(report.entries.is_empty());
         assert!(terminal_checkpoint >= 3);
 
@@ -5326,14 +5312,12 @@ mod tests {
         )
         .expect("write native SQLite fixture");
         let mut terminal_checkpoint = 0_usize;
-        let report = discover_antigravity_conversations_in_dir_with_checkpoint(
-            directory.path(),
-            || {
+        let report =
+            discover_antigravity_conversations_in_dir_with_checkpoint(directory.path(), || {
                 terminal_checkpoint = terminal_checkpoint.saturating_add(1);
                 Ok(())
-            },
-        )
-        .expect("measure populated native scan checkpoints");
+            })
+            .expect("measure populated native scan checkpoints");
         assert_eq!(report.entries.len(), 1);
         assert!(terminal_checkpoint > 3);
 

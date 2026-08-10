@@ -23,12 +23,12 @@ use codec::{
     AdjustPaneSize, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode,
     CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
-    GetPaneTieredScrollbackStatusesV1, GetPaneTieredScrollbackStatusesV1Response,
-    GetSemanticZones, GetSemanticZonesResponse, InputSerial, ListPanes, ListPanesResponse,
-    MoveFloatingPane, Pdu, PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize,
-    SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse,
-    SpawnV2, SplitPane, StreamingPduBuffer, SwapToLayout, ToggleFloatingPane,
-    TopologyCapabilities, UnitResponse, UpdatePaneConstraints, WriteToPane,
+    GetPaneTieredScrollbackStatusesV1, GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones,
+    GetSemanticZonesResponse, InputSerial, ListPanes, ListPanesResponse, MoveFloatingPane, Pdu,
+    PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize, SelectStackPane,
+    SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane,
+    StreamingPduBuffer, SwapToLayout, ToggleFloatingPane, TopologyCapabilities, UnitResponse,
+    UpdatePaneConstraints, WriteToPane,
 };
 use config as wezterm_config;
 use frankenterm_term::TerminalSize;
@@ -1960,12 +1960,10 @@ impl DirectMuxClient {
     }
 
     /// Check whether the negotiated peer dialect admits the additive batch PDU.
-    pub(crate) fn supports_tiered_scrollback_status_batch(
-        &self,
-    ) -> Result<bool, DirectMuxError> {
-        let probe = Pdu::GetPaneTieredScrollbackStatusesV1(
-            GetPaneTieredScrollbackStatusesV1 { pane_ids: vec![0] },
-        );
+    pub(crate) fn supports_tiered_scrollback_status_batch(&self) -> Result<bool, DirectMuxError> {
+        let probe = Pdu::GetPaneTieredScrollbackStatusesV1(GetPaneTieredScrollbackStatusesV1 {
+            pane_ids: vec![0],
+        });
         match self.authorize_outbound_pdu(&probe) {
             Ok(()) => Ok(true),
             Err(error) if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") => {
@@ -5127,8 +5125,8 @@ mod tests {
         read_buf: &mut StreamingPduBuffer,
     ) -> DecodedPdu {
         loop {
-            if let Some(decoded) = codec::Pdu::stream_decode(read_buf)
-                .expect("decode synthetic mux request")
+            if let Some(decoded) =
+                codec::Pdu::stream_decode(read_buf).expect("decode synthetic mux request")
             {
                 return decoded;
             }
@@ -13181,12 +13179,10 @@ mod tests {
             });
 
             let cx = crate::cx::for_testing();
-            let mut client = DirectMuxClient::connect_with_cx(
-                &cx,
-                direct_mux_client_config(socket_path),
-            )
-            .await
-            .expect("connect bulk tiered-scrollback client");
+            let mut client =
+                DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(socket_path))
+                    .await
+                    .expect("connect bulk tiered-scrollback client");
             let response = client
                 .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11, 19])
                 .await
@@ -13213,22 +13209,16 @@ mod tests {
                     "a rejected bulk request reached the wire"
                 );
                 assert_eq!(decoded.serial, 3, "pre-write rejection consumed a serial");
-                write_response_pdu(
-                    &mut stream,
-                    &empty_list_panes_response(),
-                    decoded.serial,
-                )
-                .await
-                .expect("write negative-control response");
+                write_response_pdu(&mut stream, &empty_list_panes_response(), decoded.serial)
+                    .await
+                    .expect("write negative-control response");
             });
 
             let cx = crate::cx::for_testing();
-            let mut client = DirectMuxClient::connect_with_cx(
-                &cx,
-                direct_mux_client_config(socket_path),
-            )
-            .await
-            .expect("connect v56 peer");
+            let mut client =
+                DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(socket_path))
+                    .await
+                    .expect("connect v56 peer");
             let old_peer = client
                 .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11])
                 .await
@@ -13296,17 +13286,18 @@ mod tests {
             });
 
             let cx = crate::cx::for_testing();
-            let mut client = DirectMuxClient::connect_with_cx(
-                &cx,
-                direct_mux_client_config(socket_path),
-            )
-            .await
-            .expect("connect reordered-response client");
+            let mut client =
+                DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(socket_path))
+                    .await
+                    .expect("connect reordered-response client");
             let error = client
                 .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11])
                 .await
                 .expect_err("reordered response must fail contract validation");
-            assert!(matches!(error, DirectMuxError::AlignedUnexpectedResponse { .. }));
+            assert!(matches!(
+                error,
+                DirectMuxError::AlignedUnexpectedResponse { .. }
+            ));
             assert!(client.is_connection_poisoned());
             server.await.expect("server task");
         });

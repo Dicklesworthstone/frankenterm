@@ -102,10 +102,10 @@ use crate::vendored::subscribe_pane_output_with_inherited_cx;
 use crate::vendored::{DirectMuxClient, DirectMuxClientConfig, PaneDelta, SubscriptionConfig};
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
-    MuxSemanticSnapshot, MuxSemanticZoneKind, PaneInfo, PaneTextSource,
-    PANE_TIERED_SCROLLBACK_BULK_MAX_PANES, PaneTieredScrollbackBatchEntry,
-    PaneTieredScrollbackBatchOutcome, PaneTieredScrollbackSummary, WeztermHandle,
-    WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
+    MuxSemanticSnapshot, MuxSemanticZoneKind, PANE_TIERED_SCROLLBACK_BULK_MAX_PANES, PaneInfo,
+    PaneTextSource, PaneTieredScrollbackBatchEntry, PaneTieredScrollbackBatchOutcome,
+    PaneTieredScrollbackSummary, WeztermHandle, WeztermHandleSource, WeztermInterface,
+    wezterm_handle_with_timeout,
 };
 
 fn runtime_cx_error(operation: &'static str, cx: &crate::cx::Cx, fallback: &'static str) -> Error {
@@ -9371,12 +9371,8 @@ fn finish_pane_tiered_scrollback_fetch(
         .record(as_histogram_count(fetch.bulk_batches_attempted));
     metrics::histogram!("frankenterm.runtime.tiered_scrollback_bulk_chunks_completed")
         .record(as_histogram_count(fetch.bulk_chunks_completed));
-    metrics::histogram!(
-        "frankenterm.runtime.tiered_scrollback_legacy_fallback_requests_admitted"
-    )
-    .record(as_histogram_count(
-        fetch.legacy_fallback_requests_admitted,
-    ));
+    metrics::histogram!("frankenterm.runtime.tiered_scrollback_legacy_fallback_requests_admitted")
+        .record(as_histogram_count(fetch.legacy_fallback_requests_admitted));
     if fetch.legacy_fallback_batches > 0 {
         metrics::counter!("frankenterm.runtime.tiered_scrollback_fallback_cycles").increment(1);
     }
@@ -9441,12 +9437,9 @@ async fn collect_pane_tiered_scrollback_summaries(
                         && entries
                             .iter()
                             .zip(pane_chunk)
-                            .all(|(entry, requested_pane_id)| {
-                                entry.pane_id == *requested_pane_id
-                            });
+                            .all(|(entry, requested_pane_id)| entry.pane_id == *requested_pane_id);
                     if response_is_exact {
-                        fetch.bulk_chunks_completed =
-                            fetch.bulk_chunks_completed.saturating_add(1);
+                        fetch.bulk_chunks_completed = fetch.bulk_chunks_completed.saturating_add(1);
                         for entry in entries {
                             record_pane_tiered_scrollback_bulk_entry(&mut fetch, entry);
                         }
@@ -9522,9 +9515,8 @@ async fn collect_pane_tiered_scrollback_summaries(
             .by_ref()
             .take(PANE_TIERED_SCROLLBACK_FETCH_CONCURRENCY)
         {
-            fetch.legacy_fallback_requests_admitted = fetch
-                .legacy_fallback_requests_admitted
-                .saturating_add(1);
+            fetch.legacy_fallback_requests_admitted =
+                fetch.legacy_fallback_requests_admitted.saturating_add(1);
             pending.push(probe(pane_id));
         }
         while let Some((pane_id, result)) = pending.next().await {
@@ -9542,9 +9534,8 @@ async fn collect_pane_tiered_scrollback_summaries(
                 return finish_pane_tiered_scrollback_fetch(fetch, started_at);
             }
             if let Some(next_pane_id) = remaining.next() {
-                fetch.legacy_fallback_requests_admitted = fetch
-                    .legacy_fallback_requests_admitted
-                    .saturating_add(1);
+                fetch.legacy_fallback_requests_admitted =
+                    fetch.legacy_fallback_requests_admitted.saturating_add(1);
                 pending.push(probe(next_pane_id));
             }
         }

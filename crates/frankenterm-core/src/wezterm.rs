@@ -908,8 +908,7 @@ pub(crate) fn validate_pane_tiered_scrollback_bulk_request(pane_ids: &[u64]) -> 
 
 #[cfg(all(feature = "vendored", unix))]
 const _: () = assert!(
-    PANE_TIERED_SCROLLBACK_BULK_MAX_PANES
-        == codec::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES
+    PANE_TIERED_SCROLLBACK_BULK_MAX_PANES == codec::MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES
 );
 
 #[cfg(all(feature = "vendored", unix))]
@@ -1937,26 +1936,28 @@ impl WeztermClient {
                     .entries
                     .into_iter()
                     .zip(pane_ids.iter().copied())
-                    .map(|(entry, requested_pane_id)| PaneTieredScrollbackBatchEntry {
-                        pane_id: requested_pane_id,
-                        outcome: match entry.outcome {
-                            codec::PaneTieredScrollbackStatusOutcomeV1::Available(status) => {
-                                PaneTieredScrollbackBatchOutcome::Available(status.into())
-                            }
-                            codec::PaneTieredScrollbackStatusOutcomeV1::Unavailable => {
-                                PaneTieredScrollbackBatchOutcome::Unavailable
-                            }
-                            codec::PaneTieredScrollbackStatusOutcomeV1::Missing => {
-                                PaneTieredScrollbackBatchOutcome::Missing
-                            }
-                            codec::PaneTieredScrollbackStatusOutcomeV1::Closed => {
-                                PaneTieredScrollbackBatchOutcome::Closed
-                            }
-                            codec::PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked => {
-                                PaneTieredScrollbackBatchOutcome::CallbackPanicked
-                            }
+                    .map(
+                        |(entry, requested_pane_id)| PaneTieredScrollbackBatchEntry {
+                            pane_id: requested_pane_id,
+                            outcome: match entry.outcome {
+                                codec::PaneTieredScrollbackStatusOutcomeV1::Available(status) => {
+                                    PaneTieredScrollbackBatchOutcome::Available(status.into())
+                                }
+                                codec::PaneTieredScrollbackStatusOutcomeV1::Unavailable => {
+                                    PaneTieredScrollbackBatchOutcome::Unavailable
+                                }
+                                codec::PaneTieredScrollbackStatusOutcomeV1::Missing => {
+                                    PaneTieredScrollbackBatchOutcome::Missing
+                                }
+                                codec::PaneTieredScrollbackStatusOutcomeV1::Closed => {
+                                    PaneTieredScrollbackBatchOutcome::Closed
+                                }
+                                codec::PaneTieredScrollbackStatusOutcomeV1::CallbackPanicked => {
+                                    PaneTieredScrollbackBatchOutcome::CallbackPanicked
+                                }
+                            },
                         },
-                    })
+                    )
                     .collect();
                 self.mux_circuit_record_success();
                 Ok(Some(entries))
@@ -1969,9 +1970,7 @@ impl WeztermClient {
                 self.mux_circuit_record_success();
                 Ok(None)
             }
-            Err(error)
-                if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") =>
-            {
+            Err(error) if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") => {
                 self.mux_circuit_record_success();
                 Ok(None)
             }
@@ -9190,7 +9189,8 @@ impl MockWezterm {
             .tiered_scrollback_bulk_outcomes
             .lock()
             .unwrap_or_else(record_poison_and_recover) = outcomes;
-        self.tiered_scrollback_bulk_calls.store(0, Ordering::Relaxed);
+        self.tiered_scrollback_bulk_calls
+            .store(0, Ordering::Relaxed);
         self.tiered_scrollback_legacy_calls
             .store(0, Ordering::Relaxed);
         self.tiered_scrollback_cancel_after_bulk_calls
@@ -10071,8 +10071,8 @@ impl WeztermInterface for MockWezterm {
             mock_checkpoint(cx, "mock tiered scrollback bulk summary")?;
             #[cfg(test)]
             {
-                let call_number = saturating_increment_u64(&self.tiered_scrollback_bulk_calls)
-                    .saturating_add(1);
+                let call_number =
+                    saturating_increment_u64(&self.tiered_scrollback_bulk_calls).saturating_add(1);
                 if self
                     .tiered_scrollback_cancel_after_bulk_calls
                     .load(Ordering::Relaxed)
@@ -10093,9 +10093,10 @@ impl WeztermInterface for MockWezterm {
                         .copied()
                         .map(|pane_id| PaneTieredScrollbackBatchEntry {
                             pane_id,
-                            outcome: outcomes.get(&pane_id).copied().unwrap_or(
-                                PaneTieredScrollbackBatchOutcome::Missing,
-                            ),
+                            outcome: outcomes
+                                .get(&pane_id)
+                                .copied()
+                                .unwrap_or(PaneTieredScrollbackBatchOutcome::Missing),
                         })
                         .collect();
                     return Ok(Some(entries));

@@ -11,17 +11,16 @@ use codec::{
     GetLinesResponse, GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges,
     GetPaneRenderChangesResponse, GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse,
     GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones, GetSemanticZonesResponse,
-    GetTlsCredsResponse, InputSerial, KillPane,
-    ListPanes, ListPanesCoherent, ListPanesCoherentOutcome, ListPanesCoherentResponse,
-    ListPanesResponse, ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse,
-    LivenessResponse, MoveFloatingPane, MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert,
-    PaneTieredScrollbackStatusEntryV1, PaneTieredScrollbackStatusOutcomeV1, Pdu, Ping, Pong,
-    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
-    SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
-    SetActiveWorkspace, SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
-    SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
-    TabTitleChanged, ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
-    UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
+    GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesCoherent,
+    ListPanesCoherentOutcome, ListPanesCoherentResponse, ListPanesResponse, ListPanesTabStackEntry,
+    ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse, MoveFloatingPane,
+    MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert, PaneTieredScrollbackStatusEntryV1,
+    PaneTieredScrollbackStatusOutcomeV1, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace,
+    Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown,
+    SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId, SetFloatingPaneZ,
+    SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed, SetWindowWorkspace, SpawnResponse,
+    SpawnV2, SplitPane, SwapToLayout, TabTitleChanged, ToggleFloatingPane, TopologyCapabilities,
+    TopologyStreamId, UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::client::ClientId;
@@ -3650,9 +3649,7 @@ fn sample_tiered_scrollback_status(
             let Some(registration) = registration else {
                 return PaneTieredScrollbackStatusOutcomeV1::Missing;
             };
-            match registration
-                .try_with_current(|current| current.get_tiered_scrollback_status())
-            {
+            match registration.try_with_current(|current| current.get_tiered_scrollback_status()) {
                 Some(Some(status)) => PaneTieredScrollbackStatusOutcomeV1::Available(status.into()),
                 Some(None) => PaneTieredScrollbackStatusOutcomeV1::Unavailable,
                 None => PaneTieredScrollbackStatusOutcomeV1::Closed,
@@ -4673,9 +4670,7 @@ impl SessionHandler {
                             )
                             .record(queue_delay.as_secs_f64() * 1_000.0);
                             metrics::histogram!("mux.server.tiered_scrollback_batch_panes")
-                                .record(
-                                    u32::try_from(request.pane_ids.len()).unwrap_or(u32::MAX),
-                                );
+                                .record(u32::try_from(request.pane_ids.len()).unwrap_or(u32::MAX));
 
                             let snapshot_started_at = Instant::now();
                             let session = authority.acquire()?;
@@ -4686,26 +4681,22 @@ impl SessionHandler {
                             let registrations = request
                                 .pane_ids
                                 .into_iter()
-                                .map(|pane_id| {
-                                    (pane_id, session.capture_current_pane(pane_id))
-                                })
+                                .map(|pane_id| (pane_id, session.capture_current_pane(pane_id)))
                                 .collect::<Vec<_>>();
                             let entries = registrations
                                 .into_iter()
-                                .map(|(pane_id, registration)| {
-                                    PaneTieredScrollbackStatusEntryV1 {
+                                .map(
+                                    |(pane_id, registration)| PaneTieredScrollbackStatusEntryV1 {
                                         pane_id,
                                         outcome: sample_tiered_scrollback_status(
                                             pane_id,
                                             registration,
                                         ),
-                                    }
-                                })
+                                    },
+                                )
                                 .collect::<Vec<_>>();
-                            metrics::histogram!(
-                                "mux.server.tiered_scrollback_batch_snapshot_ms"
-                            )
-                            .record(snapshot_started_at.elapsed().as_secs_f64() * 1_000.0);
+                            metrics::histogram!("mux.server.tiered_scrollback_batch_snapshot_ms")
+                                .record(snapshot_started_at.elapsed().as_secs_f64() * 1_000.0);
                             record_tiered_scrollback_batch_outcomes(&entries);
                             let response = GetPaneTieredScrollbackStatusesV1Response { entries };
                             response.validate()?;
@@ -6482,7 +6473,8 @@ mod tests {
         let unavailable = Arc::new(FakePane::new_with_id(8, None));
         let available_dyn: Arc<dyn Pane> = available;
         let unavailable_dyn: Arc<dyn Pane> = unavailable;
-        mux.add_pane(&available_dyn).expect("register available pane");
+        mux.add_pane(&available_dyn)
+            .expect("register available pane");
         mux.add_pane(&unavailable_dyn)
             .expect("register unavailable pane");
         let (sender, captured) = capturing_sender();
@@ -6492,16 +6484,13 @@ mod tests {
 
         handler.process_one(DecodedPdu {
             serial: 401,
-            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(
-                codec::GetPaneTieredScrollbackStatusesV1 {
-                    pane_ids: vec![7, 8, 9],
-                },
-            ),
+            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(codec::GetPaneTieredScrollbackStatusesV1 {
+                pane_ids: vec![7, 8, 9],
+            }),
         });
         tick_until_response(&executor, &captured, 1);
 
-        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) =
-            take_response(&captured).pdu
+        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) = take_response(&captured).pdu
         else {
             panic!("expected bulk tiered-scrollback status response");
         };
@@ -6539,19 +6528,16 @@ mod tests {
         let executor = SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _mux_guard = ScopedMux::install(&mux);
-        let panicking: Arc<dyn Pane> = Arc::new(
-            FakePane::new_with_tiered_scrollback_status_probe(
-                17,
-                Some(sample_tiered_scrollback_status(17)),
-                Arc::new(|| panic!("synthetic tiered-scrollback callback failure")),
-            ),
-        );
+        let panicking: Arc<dyn Pane> = Arc::new(FakePane::new_with_tiered_scrollback_status_probe(
+            17,
+            Some(sample_tiered_scrollback_status(17)),
+            Arc::new(|| panic!("synthetic tiered-scrollback callback failure")),
+        ));
         let healthy: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(
             18,
             Some(sample_tiered_scrollback_status(18)),
         ));
-        mux.add_pane(&panicking)
-            .expect("register panicking pane");
+        mux.add_pane(&panicking).expect("register panicking pane");
         mux.add_pane(&healthy).expect("register healthy pane");
         let (sender, captured) = capturing_sender();
         let mut handler =
@@ -6559,16 +6545,13 @@ mod tests {
 
         handler.process_one(DecodedPdu {
             serial: 402,
-            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(
-                codec::GetPaneTieredScrollbackStatusesV1 {
-                    pane_ids: vec![17, 18],
-                },
-            ),
+            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(codec::GetPaneTieredScrollbackStatusesV1 {
+                pane_ids: vec![17, 18],
+            }),
         });
         tick_until_response(&executor, &captured, 1);
 
-        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) =
-            take_response(&captured).pdu
+        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) = take_response(&captured).pdu
         else {
             panic!("expected panic-contained bulk status response");
         };
@@ -6600,21 +6583,19 @@ mod tests {
         let _mux_guard = ScopedMux::install(&mux);
         let later_registration = Arc::new(Mutex::new(None::<PaneRegistrationHandle>));
         let later_registration_for_callback = Arc::clone(&later_registration);
-        let first: Arc<dyn Pane> = Arc::new(
-            FakePane::new_with_tiered_scrollback_status_probe(
-                27,
-                Some(sample_tiered_scrollback_status(27)),
-                Arc::new(move || {
-                    if let Some(registration) = later_registration_for_callback
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .as_ref()
-                    {
-                        let _ = registration.retire_if_current();
-                    }
-                }),
-            ),
-        );
+        let first: Arc<dyn Pane> = Arc::new(FakePane::new_with_tiered_scrollback_status_probe(
+            27,
+            Some(sample_tiered_scrollback_status(27)),
+            Arc::new(move || {
+                if let Some(registration) = later_registration_for_callback
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                {
+                    let _ = registration.retire_if_current();
+                }
+            }),
+        ));
         let later: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(
             28,
             Some(sample_tiered_scrollback_status(28)),
@@ -6633,16 +6614,13 @@ mod tests {
 
         handler.process_one(DecodedPdu {
             serial: 403,
-            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(
-                codec::GetPaneTieredScrollbackStatusesV1 {
-                    pane_ids: vec![27, 28, 29],
-                },
-            ),
+            pdu: Pdu::GetPaneTieredScrollbackStatusesV1(codec::GetPaneTieredScrollbackStatusesV1 {
+                pane_ids: vec![27, 28, 29],
+            }),
         });
         tick_until_response(&executor, &captured, 1);
 
-        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) =
-            take_response(&captured).pdu
+        let Pdu::GetPaneTieredScrollbackStatusesV1Response(response) = take_response(&captured).pdu
         else {
             panic!("expected frozen-membership bulk status response");
         };

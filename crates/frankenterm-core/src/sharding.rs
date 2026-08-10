@@ -2453,10 +2453,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 ));
             }
 
-            let mut by_shard = std::collections::BTreeMap::<
-                ShardId,
-                Vec<(usize, u64, u64)>,
-            >::new();
+            let mut by_shard = std::collections::BTreeMap::<ShardId, Vec<(usize, u64, u64)>>::new();
             for (request_index, global_pane_id) in pane_ids.iter().copied().enumerate() {
                 let route = self.route_for_global_pane_id_with_cx(cx, global_pane_id)?;
                 by_shard.entry(route.shard_id).or_default().push((
@@ -2472,8 +2469,7 @@ impl WeztermInterface for ShardedWeztermClient {
             // and mux-queue delay. Completion order is projected back through
             // the frozen request indices below.
             let mut shard_jobs = by_shard.into_iter();
-            let start_shard_request =
-                |(shard_id, routed): (ShardId, Vec<(usize, u64, u64)>)| {
+            let start_shard_request = |(shard_id, routed): (ShardId, Vec<(usize, u64, u64)>)| {
                 let backend = self.backend_for_id(shard_id)?.handle.clone();
                 let local_pane_ids = routed
                     .iter()
@@ -2483,10 +2479,8 @@ impl WeztermInterface for ShardedWeztermClient {
                     let result = match catch_recoverable(
                         RecoverablePanicSite::ClientCallback,
                         std::panic::AssertUnwindSafe(|| {
-                            backend.pane_tiered_scrollback_summaries_bulk_with_cx(
-                                cx,
-                                &local_pane_ids,
-                            )
+                            backend
+                                .pane_tiered_scrollback_summaries_bulk_with_cx(cx, &local_pane_ids)
                         }),
                     ) {
                         Ok(future) => match catch_recoverable_future(
@@ -5242,10 +5236,7 @@ mod tests {
                     7,
                     crate::wezterm::PaneTieredScrollbackBatchOutcome::Unavailable,
                 ),
-                (
-                    9,
-                    crate::wezterm::PaneTieredScrollbackBatchOutcome::Missing,
-                ),
+                (9, crate::wezterm::PaneTieredScrollbackBatchOutcome::Missing),
             ])));
             let client = ShardedWeztermClient::new(
                 vec![
@@ -5261,10 +5252,7 @@ mod tests {
             let cx = crate::cx::for_testing();
 
             let entries = client
-                .pane_tiered_scrollback_summaries_bulk_with_cx(
-                    &cx,
-                    &[pane_1_7, pane_0_3, pane_1_9],
-                )
+                .pane_tiered_scrollback_summaries_bulk_with_cx(&cx, &[pane_1_7, pane_0_3, pane_1_9])
                 .await
                 .expect("bounded sharded health fanout must succeed")
                 .expect("both shard backends advertise bulk health");
@@ -5332,13 +5320,11 @@ mod tests {
                 .sum::<u64>();
             assert_eq!(
                 admitted,
-                u64::try_from(PANE_TIERED_SCROLLBACK_SHARD_FANOUT)
-                    .expect("shard fanout fits u64"),
+                u64::try_from(PANE_TIERED_SCROLLBACK_SHARD_FANOUT).expect("shard fanout fits u64"),
                 "only the frozen initial shard window may be admitted",
             );
             assert_eq!(
-                mocks[PANE_TIERED_SCROLLBACK_SHARD_FANOUT]
-                    .tiered_scrollback_call_counts_for_test(),
+                mocks[PANE_TIERED_SCROLLBACK_SHARD_FANOUT].tiered_scrollback_call_counts_for_test(),
                 (0, 0),
                 "a not-yet-started shard must not be admitted after capability absence",
             );
@@ -5387,8 +5373,7 @@ mod tests {
                 "cancellation must retain its typed runtime classification: {error:?}",
             );
             assert_eq!(
-                mocks[PANE_TIERED_SCROLLBACK_SHARD_FANOUT]
-                    .tiered_scrollback_call_counts_for_test(),
+                mocks[PANE_TIERED_SCROLLBACK_SHARD_FANOUT].tiered_scrollback_call_counts_for_test(),
                 (0, 0),
                 "a shard beyond the active window must not start after cancellation",
             );

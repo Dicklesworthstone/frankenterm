@@ -204,7 +204,9 @@ pub fn read_local_wezterm_version() -> Option<WeztermVersion> {
         .arg("--version")
         .stdout_limit(LOCAL_WEZTERM_VERSION_MAX_STDOUT_BYTES)
         .stderr_limit(LOCAL_WEZTERM_VERSION_MAX_STDERR_BYTES);
-    let output = command.output_blocking(LOCAL_WEZTERM_VERSION_TIMEOUT).ok()?;
+    let output = command
+        .output_blocking(LOCAL_WEZTERM_VERSION_TIMEOUT)
+        .ok()?;
     if !output.status.success() {
         return None;
     }

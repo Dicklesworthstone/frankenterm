@@ -6349,8 +6349,7 @@ impl CompatRuntime for Runtime {
         // explicitly. This mirrors tokio's ambient runtime context.
         let handle = self.inner.handle();
         ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
-        ASUPERSYNC_SHUTDOWN_TOKEN
-            .with(|cell| cell.replace(Some(self.shutdown_token.clone())));
+        ASUPERSYNC_SHUTDOWN_TOKEN.with(|cell| cell.replace(Some(self.shutdown_token.clone())));
         let result = self.inner.block_on(future);
         // Negative-evidence ledger (ft-2worp): intentionally do NOT clear the
         // handle at block_on return. Clearing it here previously produced
@@ -7402,10 +7401,9 @@ where
     }
     // The losing output future's pinned borrow ends with the `if let`
     // temporary above, before these captured progress cells are inspected.
-    let cancellation_latency_upper_bound_ns =
-        cx_timer_now(cx).duration_since(asupersync::Time::from_nanos(
-            last_pending_at_ns.load(std::sync::atomic::Ordering::Relaxed),
-        ));
+    let cancellation_latency_upper_bound_ns = cx_timer_now(cx).duration_since(
+        asupersync::Time::from_nanos(last_pending_at_ns.load(std::sync::atomic::Ordering::Relaxed)),
+    );
     Err(NonblockingWriteError::cancelled(
         progress(),
         blocked_duration(),
@@ -8507,8 +8505,7 @@ mod tests {
 
         impl Drop for PendingTaskDropProbe {
             fn drop(&mut self) {
-                self.0
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.0.store(true, std::sync::atomic::Ordering::Release);
             }
         }
 

@@ -18292,16 +18292,14 @@ mod test {
 
     #[test]
     fn tiered_scrollback_status_batch_rejects_empty_duplicate_and_oversized_inputs() {
-        let empty = Pdu::GetPaneTieredScrollbackStatusesV1(
-            GetPaneTieredScrollbackStatusesV1 { pane_ids: Vec::new() },
-        );
+        let empty = Pdu::GetPaneTieredScrollbackStatusesV1(GetPaneTieredScrollbackStatusesV1 {
+            pane_ids: Vec::new(),
+        });
         assert!(empty.encode_frame(702).is_err());
 
-        let duplicate = Pdu::GetPaneTieredScrollbackStatusesV1(
-            GetPaneTieredScrollbackStatusesV1 {
-                pane_ids: vec![7, 7],
-            },
-        );
+        let duplicate = Pdu::GetPaneTieredScrollbackStatusesV1(GetPaneTieredScrollbackStatusesV1 {
+            pane_ids: vec![7, 7],
+        });
         assert!(duplicate.encode_frame(703).is_err());
 
         let duplicate_response = Pdu::GetPaneTieredScrollbackStatusesV1Response(
@@ -18320,11 +18318,9 @@ mod test {
         );
         assert!(duplicate_response.encode_frame(704).is_err());
 
-        let oversized = Pdu::GetPaneTieredScrollbackStatusesV1(
-            GetPaneTieredScrollbackStatusesV1 {
-                pane_ids: (0..=MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES).collect(),
-            },
-        );
+        let oversized = Pdu::GetPaneTieredScrollbackStatusesV1(GetPaneTieredScrollbackStatusesV1 {
+            pane_ids: (0..=MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES).collect(),
+        });
         assert!(oversized.encode_frame(705).is_err());
 
         let (oversized_payload, compressed) = serialize_with_mode(
@@ -18355,9 +18351,10 @@ mod test {
             outcome: PaneTieredScrollbackStatusOutcomeV1::Unavailable,
         };
         let (oversized_response_payload, compressed) = serialize_with_mode(
-            &(
-                vec![hostile_entry; MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES + 1],
-            ),
+            &(vec![
+                hostile_entry;
+                MAX_TIERED_SCROLLBACK_STATUS_BATCH_PANES + 1
+            ],),
             CompressionMode::Never,
         )
         .expect("hostile unbounded response tuple must serialize");
@@ -18579,8 +18576,7 @@ mod test {
             77, 80, 81, 85, 86, 88, 91, 93,
         ];
         const SERVER_REPLIES: &[u64] = &[
-            0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92,
-            94,
+            0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,

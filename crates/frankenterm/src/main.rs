@@ -79230,9 +79230,7 @@ fn wezterm_cli_version_diagnostic(
 fn vendored_compatibility_diagnostic(
     selection: &frankenterm_core::wezterm::BackendSelection,
 ) -> DiagnosticCheck {
-    use frankenterm_core::vendored::{
-        VendoredCompatibilityReport, VendoredCompatibilityStatus,
-    };
+    use frankenterm_core::vendored::{VendoredCompatibilityReport, VendoredCompatibilityStatus};
     use frankenterm_core::wezterm::BackendKind;
 
     if selection.kind == BackendKind::Vendored {
@@ -79255,10 +79253,7 @@ fn vendored_compatibility_diagnostic(
     };
 
     if !report.vendored_enabled {
-        return DiagnosticCheck::ok_with_detail(
-            "WezTerm vendored",
-            "vendored feature not enabled",
-        );
+        return DiagnosticCheck::ok_with_detail("WezTerm vendored", "vendored feature not enabled");
     }
 
     let detail = bounded_terminal_diagnostic(&report.message, 256, 1_024);
@@ -106155,9 +106150,7 @@ A  docs/new-proof.md\n";
 
             // Overall JSON envelope
             let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
-            let has_warnings = checks
-                .iter()
-                .any(|c| c.status == DiagnosticStatus::Warning);
+            let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
             let overall = if has_errors {
                 "error"
             } else if has_warnings {
@@ -106207,10 +106200,8 @@ A  docs/new-proof.md\n";
             assert_eq!(names_1, names_2, "check names must be deterministic");
 
             // Same statuses
-            let statuses_1: Vec<&str> =
-                checks_1.iter().map(|c| c.status.as_str()).collect();
-            let statuses_2: Vec<&str> =
-                checks_2.iter().map(|c| c.status.as_str()).collect();
+            let statuses_1: Vec<&str> = checks_1.iter().map(|c| c.status.as_str()).collect();
+            let statuses_2: Vec<&str> = checks_2.iter().map(|c| c.status.as_str()).collect();
             assert_eq!(
                 statuses_1, statuses_2,
                 "check statuses must be deterministic"

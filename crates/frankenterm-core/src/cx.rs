@@ -282,8 +282,8 @@ impl<F: Future> Future for HandleContextFuture<F> {
         // wrapper can be nested inside another runtime-owned future, so even an
         // apparently caller-owned strong handle stored here could form an
         // ownership cycle and prevent runtime shutdown.
-        let runtime_handle = Runtime::current_handle()
-            .expect("runtime task polled without scheduler handle");
+        let runtime_handle =
+            Runtime::current_handle().expect("runtime task polled without scheduler handle");
         let _runtime_handle_guard = install_runtime_handle_for_poll(runtime_handle);
         let _runtime_shutdown_guard = crate::runtime_async::install_runtime_shutdown_token_scoped(
             self.runtime_shutdown.clone(),
@@ -370,15 +370,11 @@ where
 
     let limit = max_concurrency.max(1);
 
-    iter(
-        tasks
-            .into_iter()
-            .map(|task| {
-                let handle = Runtime::current_handle()
-                    .expect("bounded Cx task spawned without scheduler handle");
-                spawn_with_cx(&handle, cx, task)
-            }),
-    )
+    iter(tasks.into_iter().map(|task| {
+        let handle =
+            Runtime::current_handle().expect("bounded Cx task spawned without scheduler handle");
+        spawn_with_cx(&handle, cx, task)
+    }))
     .buffered(limit)
     .collect::<Vec<_>>()
     .await
@@ -998,8 +994,7 @@ mod tests {
             })
             .collect();
 
-        let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
+        let results = runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
         assert_eq!(results, vec![0, 1, 2, 3, 4]);
     }
 
@@ -1028,8 +1023,8 @@ mod tests {
             })
             .collect();
 
-        let results = runtime
-            .block_on(async { spawn_bounded_with_cx(&cx, tasks.len(), tasks).await });
+        let results =
+            runtime.block_on(async { spawn_bounded_with_cx(&cx, tasks.len(), tasks).await });
         assert_eq!(results, vec![0, 1, 2, 3]);
     }
 
@@ -1060,8 +1055,7 @@ mod tests {
             })
             .collect();
 
-        let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&cx, 1, tasks).await });
+        let results = runtime.block_on(async { spawn_bounded_with_cx(&cx, 1, tasks).await });
         assert_eq!(results.len(), 3);
         assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
@@ -1095,8 +1089,7 @@ mod tests {
             })
             .collect();
 
-        let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
+        let results = runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
         assert_eq!(results, vec![0, 1, 2, 3]);
         assert_eq!(
             completed.load(Ordering::SeqCst),
@@ -1137,8 +1130,7 @@ mod tests {
             })
             .collect();
 
-        let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
+        let results = runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
 
         assert_eq!(results, vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(
@@ -1185,8 +1177,7 @@ mod tests {
             })
             .collect();
 
-        let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&cx, 0, tasks).await });
+        let results = runtime.block_on(async { spawn_bounded_with_cx(&cx, 0, tasks).await });
 
         assert_eq!(results, vec![0, 1, 2, 3]);
         assert_eq!(
@@ -1224,8 +1215,7 @@ mod tests {
             })
             .collect();
 
-        let results =
-            runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
+        let results = runtime.block_on(async { spawn_bounded_with_cx(&cx, 2, tasks).await });
         assert_eq!(results, vec![10, 11, 12, 13]);
     }
 
@@ -1260,14 +1250,10 @@ mod tests {
         let dropped_by_child = std::sync::Arc::clone(&dropped);
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(
-                &cx,
-                Duration::from_millis(1),
-                move |_cx| async move {
-                    let _drop_flag = DropFlag(dropped_by_child);
-                    std::future::pending::<&'static str>().await
-                },
-            )
+            spawn_with_timeout(&cx, Duration::from_millis(1), move |_cx| async move {
+                let _drop_flag = DropFlag(dropped_by_child);
+                std::future::pending::<&'static str>().await
+            })
             .await
         });
         let error = result.expect_err("direct child must time out");
@@ -1332,14 +1318,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let result = runtime.block_on(async {
-            spawn_with_timeout(
-                &cx,
-                Duration::from_secs(30),
-                move |_cx| async move {
-                    polls_by_child.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    std::future::pending::<()>().await;
-                },
-            )
+            spawn_with_timeout(&cx, Duration::from_secs(30), move |_cx| async move {
+                polls_by_child.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            })
             .await
         });
         let elapsed = started.elapsed();
@@ -1402,25 +1384,21 @@ mod tests {
         let (completed_tx, completed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
         runtime.block_on(async {
-            let result = spawn_with_timeout(
-                &cx,
-                Duration::from_millis(1),
-                move |_cx| async move {
-                    let _drop_flag = DropFlag(direct_dropped_by_child);
-                    // Deliberately discard the nested JoinHandle. This is the
-                    // unsupported structured-ownership case documented on the
-                    // helper: timeout drops this direct future, not the already
-                    // scheduled descendant.
-                    drop(crate::runtime_async::task::spawn(async move {
-                        crate::runtime_async::oneshot_recv(release_rx)
-                            .await
-                            .expect("detached nested release sender");
-                        nested_completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
-                        let _ = completed_tx.send(());
-                    }));
-                    std::future::pending::<()>().await;
-                },
-            )
+            let result = spawn_with_timeout(&cx, Duration::from_millis(1), move |_cx| async move {
+                let _drop_flag = DropFlag(direct_dropped_by_child);
+                // Deliberately discard the nested JoinHandle. This is the
+                // unsupported structured-ownership case documented on the
+                // helper: timeout drops this direct future, not the already
+                // scheduled descendant.
+                drop(crate::runtime_async::task::spawn(async move {
+                    crate::runtime_async::oneshot_recv(release_rx)
+                        .await
+                        .expect("detached nested release sender");
+                    nested_completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = completed_tx.send(());
+                }));
+                std::future::pending::<()>().await;
+            })
             .await;
 
             assert!(matches!(
@@ -1473,39 +1451,32 @@ mod tests {
         let cx = for_testing();
 
         let result = runtime.block_on(async {
-            spawn_with_timeout(&cx, Duration::from_secs(1), move |nested_cx| {
-                async move {
-                    let tasks: Vec<
-                        Box<
+            spawn_with_timeout(&cx, Duration::from_secs(1), move |nested_cx| async move {
+                let tasks: Vec<
+                    Box<
+                        dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>>
+                            + Send,
+                    >,
+                > = [(0_u32, 10_u64), (1, 0), (2, 5)]
+                    .into_iter()
+                    .map(|(value, delay_ms)| {
+                        let closure: Box<
                             dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>>
                                 + Send,
-                        >,
-                    > = [(0_u32, 10_u64), (1, 0), (2, 5)]
-                        .into_iter()
-                        .map(|(value, delay_ms)| {
-                            let closure: Box<
-                                dyn FnOnce(
-                                        Cx,
-                                    )
-                                        -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>>
-                                    + Send,
-                            > = Box::new(move |_cx| {
-                                Box::pin(async move {
-                                    if delay_ms > 0 {
-                                        crate::runtime_async::sleep(Duration::from_millis(
-                                            delay_ms,
-                                        ))
+                        > = Box::new(move |_cx| {
+                            Box::pin(async move {
+                                if delay_ms > 0 {
+                                    crate::runtime_async::sleep(Duration::from_millis(delay_ms))
                                         .await;
-                                    }
-                                    value
-                                })
-                            });
-                            closure
-                        })
-                        .collect();
+                                }
+                                value
+                            })
+                        });
+                        closure
+                    })
+                    .collect();
 
-                    spawn_bounded_with_cx(&nested_cx, 2, tasks).await
-                }
+                spawn_bounded_with_cx(&nested_cx, 2, tasks).await
             })
             .await
         });
