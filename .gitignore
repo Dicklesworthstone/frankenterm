@@ -284,3 +284,18 @@ ubs_*.txt
 
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/
+
+# === multi-repo ephemeral patterns 2026-08-10 ===
+# Local agent product-convergence planning dumps at repo root (not source)
+/ft-interactive-swarm-*
+# Eidetic Engine local runtime memory
+.ee/
+# Cloudflare Wrangler CLI local state
+.wrangler/
+# br fsqlite-ns VFS sidecars
+.beads/beads.db-fsqlite-ns-*
+# git-repo-janitor skill scratch workspace
+.repo_janitor_workspace/
+# Skill-loop progress scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
