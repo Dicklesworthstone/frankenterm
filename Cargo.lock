@@ -3472,6 +3472,7 @@ dependencies = [
  "frankenterm-core-replay",
  "frankenterm-sigpipe",
  "hex",
+ "memchr",
  "mux",
  "nix 0.31.3",
  "openssl-sys",
