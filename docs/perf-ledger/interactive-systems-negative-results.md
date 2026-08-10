@@ -3776,7 +3776,7 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   missing target-hardware evidence
 - **Bead:** `ft-interactive-systems-performance-4tenz.29`
 - **Baseline revision:** `b20f16ae715a2ca179f38fca95de177ce6864076`
-- **Candidate revision:** `8d140f80d7213b48acba99aa516466be81ba6634`
+- **Candidate revision:** `e6bd46f58e864a08129b3e4f946d8bc11b2aaeb1`
 - **Target identity:** strict-remote `ovh-a`, `vmi1149989`, `vmi1156319`,
   `vmi1152480`, `vmi1264463`, and `vmi1293453` Linux compile/test workers
   for source proof only; no M4/M5 macOS,
@@ -3805,7 +3805,14 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   under `j-29969150772248618`; the broader workspace/all-targets locked check
   passed under `j-29969150772248635`, and the current-source mux/core/`ft`
   library-and-binary locked check passed under `j-29969150772248649`.
-  Committed-baseline format proof remains a separate gate at this checkpoint
+  The exact-baseline format gate on `29cae821b92ef3a905262e3dcbd5c7c0fc59fe5c`
+  ran the one named test under `j-29969150772248656` and failed with 0 passed,
+  1 failed, and 0 filtered after identifying canonical rustfmt drift in 12
+  campaign-touched files. The official formatter was then used locally only
+  as a mechanical source editor, producing formatting-only commit
+  `e6bd46f58e864a08129b3e4f946d8bc11b2aaeb1`; this is not compile, test, or
+  format proof. Exact committed-baseline format proof remains a separate gate
+  at this checkpoint
 - **Samples/statistics:** none; no runtime A/B, sample distribution,
   confidence interval, or coefficient of variation was collected
 - **Equivalence:** executed codec, server, and core tests cover exact-bound wire
