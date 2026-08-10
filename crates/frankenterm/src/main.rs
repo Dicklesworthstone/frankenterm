@@ -27817,8 +27817,10 @@ impl WatchClaimOutputAdmission {
                     completion
                 }
             },
-            Err(std::sync::mpsc::TrySendError::Full(completion))
-            | Err(std::sync::mpsc::TrySendError::Disconnected(completion)) => {
+            Err(
+                std::sync::mpsc::TrySendError::Full(completion)
+                | std::sync::mpsc::TrySendError::Disconnected(completion),
+            ) => {
                 tracing::error!(
                     event_id = self.event_id,
                     "watch-events output completion channel rejected its sole bounded result"
