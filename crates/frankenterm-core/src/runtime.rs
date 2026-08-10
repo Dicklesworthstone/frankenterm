@@ -9364,16 +9364,19 @@ fn finish_pane_tiered_scrollback_fetch(
     fetch: PaneTieredScrollbackFetch,
     started_at: Instant,
 ) -> PaneTieredScrollbackFetch {
+    let as_histogram_count = |value| u32::try_from(value).unwrap_or(u32::MAX);
     metrics::histogram!("frankenterm.runtime.tiered_scrollback_cycle_ms")
         .record(started_at.elapsed().as_secs_f64() * 1_000.0);
     metrics::histogram!("frankenterm.runtime.tiered_scrollback_bulk_batches_attempted")
-        .record(fetch.bulk_batches_attempted as f64);
+        .record(as_histogram_count(fetch.bulk_batches_attempted));
     metrics::histogram!("frankenterm.runtime.tiered_scrollback_bulk_chunks_completed")
-        .record(fetch.bulk_chunks_completed as f64);
+        .record(as_histogram_count(fetch.bulk_chunks_completed));
     metrics::histogram!(
         "frankenterm.runtime.tiered_scrollback_legacy_fallback_requests_admitted"
     )
-    .record(fetch.legacy_fallback_requests_admitted as f64);
+    .record(as_histogram_count(
+        fetch.legacy_fallback_requests_admitted,
+    ));
     if fetch.legacy_fallback_batches > 0 {
         metrics::counter!("frankenterm.runtime.tiered_scrollback_fallback_cycles").increment(1);
     }

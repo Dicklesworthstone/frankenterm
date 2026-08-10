@@ -4673,7 +4673,9 @@ impl SessionHandler {
                             )
                             .record(queue_delay.as_secs_f64() * 1_000.0);
                             metrics::histogram!("mux.server.tiered_scrollback_batch_panes")
-                                .record(request.pane_ids.len() as f64);
+                                .record(
+                                    u32::try_from(request.pane_ids.len()).unwrap_or(u32::MAX),
+                                );
 
                             let snapshot_started_at = Instant::now();
                             let session = authority.acquire()?;
