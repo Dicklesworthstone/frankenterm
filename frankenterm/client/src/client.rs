@@ -6445,6 +6445,14 @@ fn unix_stream_connect_with_timeout(
     }
 }
 
+// `async_trait` keeps this trait object-safe by generating boxed `Future`
+// returns. Those futures are already intrinsically must-use, and the macro's
+// own annotation therefore triggers `double_must_use` under newer Clippy.
+// Scope the compatibility allowance to this one macro-generated trait surface.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait duplicates the intrinsic must-use contract of its generated boxed future"
+)]
 #[async_trait]
 pub trait AsyncReadAndWrite: Unpin + AsyncRead + AsyncWrite + std::fmt::Debug + Send {
     async fn wait_for_readable(&self) -> anyhow::Result<()>;
