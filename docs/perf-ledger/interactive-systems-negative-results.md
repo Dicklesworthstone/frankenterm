@@ -3776,38 +3776,43 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   missing target-hardware evidence
 - **Bead:** `ft-interactive-systems-performance-4tenz.29`
 - **Baseline revision:** `b20f16ae715a2ca179f38fca95de177ce6864076`
-- **Candidate revision:** `df2e495c458c355a70636cb49c94fa778722550c`
-- **Target identity:** strict-remote `ovh-a`, `vmi1149989`, and `vmi1227854`
-  Linux compile/test workers for source proof only; no M4/M5 macOS,
+- **Candidate revision:** `8d140f80d7213b48acba99aa516466be81ba6634`
+- **Target identity:** strict-remote `ovh-a`, `vmi1149989`, `vmi1156319`,
+  `vmi1152480`, `vmi1264463`, and `vmi1293453` Linux compile/test workers
+  for source proof only; no M4/M5 macOS,
   64-core/128-thread `trj` Threadripper, display, LAN, thermal, or
   production-session identity was measured
 - **Workload identity:** deterministic codec, mux-client, mux-server, shard,
   runtime, panic, cancellation, old-peer, 200-pane, and 513-pane structural
   fixtures; no retained real 20/50/200-pane workload run
-- **Focused command/artifact:** exact-source strict-remote
-  `cargo test -p codec -p frankenterm-core -p frankenterm-mux-server-impl tiered_scrollback -- --nocapture`
-  under RCH job `j-29969059034431491` failed before tests ran because the
-  `ovh-a` worker exhausted its filesystem while the package-level command was
-  linking unrelated `frankenterm-core` integration-test binaries (`No space
-  left on device`). A narrowed three-package `--lib` retry under job
-  `j-29969059034431494` also reached no tests: `vmi1149989` killed the
-  monolithic `frankenterm-core` lib-test rustc with `SIGKILL` after 31 minutes.
-  Split exact-source jobs then proved the bounded codec schema under
-  `j-29969150772248581` (6 passed, 260 filtered out) and server snapshot/panic
-  containment under `j-29969150772248583` (5 passed, 402 filtered out).
-  Runtime, sharding, direct-client, and pool unit execution remains blocked by
-  the core test-binary resource ceiling; no local substitute ran
-- **Broad command/artifact:** real-remote package all-targets `cargo check -p
-  codec -p frankenterm-core -p frankenterm-mux-server-impl --all-targets`
-  passed under RCH job `j-29969059034431490`; final exact-source workspace
-  check, Clippy, and format proof remain separate gates
+- **Focused command/artifact:** strict-remote split suites proved the bounded
+  codec schema under `j-29969150772248619` (6 passed), server snapshot and
+  panic containment under `j-29969150772248620` (3 passed), and runtime,
+  sharding, direct-client, pool, cancellation, partial completion, old-peer
+  fallback, and 200-pane collapse under `j-29969150772248621` (14 passed).
+  The repaired doctor database/lock fixtures passed their five-test narrowed
+  retry under `j-29969150772248638`. Exact committed-SHA mux Clippy passed on
+  `vmi1149989` under `j-29969150772248652` with a clean-overlay receipt pinned
+  to the candidate SHA. Exact committed-SHA `ft` binary Clippy also passed on
+  `vmi1293453` under `j-29969150772248653` with the same pinned source
+  identity. Earlier broad Clippy exposed one unnested completion error pattern
+  and an invalid `#[expect]` around `async_trait` expansion; both were fixed
+  before those exact gates. The isolated bounded local-version
+  admission test under `j-29969150772248632` reached no result before RCH's
+  one-hour `RCH-E104` SSH ceiling, so it is not counted and no local substitute
+  ran
+- **Broad command/artifact:** real-remote package all-targets check passed
+  under `j-29969150772248618`; the broader workspace/all-targets locked check
+  passed under `j-29969150772248635`, and the current-source mux/core/`ft`
+  library-and-binary locked check passed under `j-29969150772248649`.
+  Committed-baseline format proof remains a separate gate at this checkpoint
 - **Samples/statistics:** none; no runtime A/B, sample distribution,
   confidence interval, or coefficient of variation was collected
-- **Equivalence:** executed codec and server tests cover exact-bound wire order,
-  malformed request rejection, typed missing/closed/unavailable/panic siblings,
-  frozen membership, and callback-panic containment. Reviewed but remotely
-  unexecuted core tests cover global order, response cardinality, cancellation,
-  partial completion, and old-peer fallback. Byte/state replay plus visual,
+- **Equivalence:** executed codec, server, and core tests cover exact-bound wire
+  order, malformed request rejection, typed missing/closed/unavailable/panic
+  siblings, frozen membership, callback-panic containment, global order,
+  response cardinality, cancellation, partial completion, old-peer fallback,
+  and bounded 200-pane request collapse. Byte/state replay plus visual,
   cursor, IME, accessibility, resize, and zoom equivalence remain unproved
 - **Measured result:** none. The source now uses codec-v57 `PDU93`/`PDU94` with
   at most 256 unique nonempty pane IDs, 4 KiB request and 32 KiB response codec
