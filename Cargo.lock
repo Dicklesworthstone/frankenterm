@@ -3473,6 +3473,7 @@ dependencies = [
  "frankenterm-sigpipe",
  "hex",
  "mux",
+ "nix 0.31.3",
  "openssl-sys",
  "predicates",
  "rusqlite",
