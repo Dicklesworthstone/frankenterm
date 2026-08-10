@@ -364,9 +364,9 @@ fn text_from_semantic_zone_lines(logical_lines: &[LogicalLine], zone: &SemanticZ
 // `async_trait` keeps this trait object-safe by generating boxed `Future`
 // returns. The macro's own `#[must_use]` annotation duplicates the future's
 // intrinsic must-use contract under newer Clippy, so scope the compatibility
-// expectation to this one macro-generated trait surface and fail loudly when
-// the macro/compiler combination no longer needs it.
-#[expect(
+// allowance to this one macro-generated trait surface; placing `#[expect]`
+// outside the macro expansion is itself unfulfillable.
+#[allow(
     clippy::double_must_use,
     reason = "async_trait duplicates the intrinsic must-use contract of its generated boxed future"
 )]

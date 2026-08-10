@@ -116,9 +116,9 @@ impl Drop for PreparedSplitPane {
 // trait object-safe. Those futures are already `#[must_use]`; the macro also
 // annotates each generated trait method, which newer Clippy diagnoses as
 // `double_must_use` even though there is no source-level attribute to remove.
-// Keep this as an expectation so a future `async_trait`/Clippy combination
-// that removes the synthetic duplication makes the workaround fail loudly.
-#[expect(
+// Scope the compatibility allowance to this one macro-generated trait surface;
+// placing `#[expect]` outside the macro expansion is itself unfulfillable.
+#[allow(
     clippy::double_must_use,
     reason = "async_trait duplicates the intrinsic must-use contract of its generated boxed futures"
 )]
