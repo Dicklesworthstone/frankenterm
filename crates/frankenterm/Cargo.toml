@@ -132,5 +132,6 @@ jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+memchr.workspace = true
 predicates = "3.1.4"
 tempfile = "3.27.0"

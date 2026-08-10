@@ -31053,7 +31053,7 @@ mod watch_events_tests {
             assert!(matches!(success, WatchEventClaimDelivery::Delivered { .. }));
             assert_eq!(success_output.last(), Some(&b'\n'));
             assert_eq!(
-                success_output.iter().filter(|byte| **byte == b'\n').count(),
+                memchr::memchr_iter(b'\n', &success_output).count(),
                 1,
                 "one claimed event must cross exactly one complete NDJSON line boundary"
             );
