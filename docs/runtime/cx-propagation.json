@@ -9,8 +9,8 @@
         "recorder_migration.rs"
       ],
       "total": 17,
-      "uncovered": 1,
-      "wrapper_exempt": 6
+      "uncovered": 0,
+      "wrapper_exempt": 7
     },
     "connectors": {
       "covered": 0,
@@ -41,8 +41,8 @@
       "wrapper_exempt": 5
     },
     "other": {
-      "covered": 395,
-      "exempt_file": 43,
+      "covered": 466,
+      "exempt_file": 48,
       "files": [
         "alerts.rs",
         "approval.rs",
@@ -72,7 +72,6 @@
         "replay.rs",
         "reports.rs",
         "restore_layout.rs",
-        "restore_process.rs",
         "restore_scrollback.rs",
         "retry.rs",
         "robot_sdk_contracts.rs",
@@ -83,6 +82,8 @@
         "secrets.rs",
         "session_correlation.rs",
         "session_restore.rs",
+        "session_resume.rs",
+        "session_resume_with_handoff.rs",
         "session_retention.rs",
         "sharding.rs",
         "simulation.rs",
@@ -104,9 +105,9 @@
         "web_framework.rs",
         "wezterm.rs"
       ],
-      "total": 824,
-      "uncovered": 19,
-      "wrapper_exempt": 367
+      "total": 914,
+      "uncovered": 0,
+      "wrapper_exempt": 397
     },
     "tx": {
       "covered": 0,
@@ -129,7 +130,7 @@
       "wrapper_exempt": 5
     },
     "workflow": {
-      "covered": 36,
+      "covered": 35,
       "exempt_file": 0,
       "files": [
         "workflows/account_steps.rs",
@@ -142,12 +143,12 @@
         "workflows/runner.rs",
         "workflows/wait_execution.rs"
       ],
-      "total": 64,
-      "uncovered": 2,
-      "wrapper_exempt": 26
+      "total": 59,
+      "uncovered": 0,
+      "wrapper_exempt": 24
     }
   },
-  "generated_at": "2026-08-03T17:17:53Z",
+  "generated_at": "2026-08-10T10:21:19Z",
   "labruntime_coverage": {
     "by_bucket": {
       "capture": {
@@ -171,7 +172,7 @@
         "files_with_calls": 0
       },
       "other": {
-        "call_sites": 28,
+        "call_sites": 30,
         "files": [
           "cpu_pressure.rs",
           "native_events.rs",
@@ -179,9 +180,11 @@
           "telemetry.rs",
           "test_fixtures/lab_runtime.rs",
           "tests/lab_runtime_macro_smoke.rs",
-          "tests/proptest_lab_runtime_fixture.rs"
+          "tests/proptest_lab_runtime_fixture.rs",
+          "tests/restore_process_labruntime.rs",
+          "tests/restore_scrollback_labruntime.rs"
         ],
-        "files_with_calls": 7
+        "files_with_calls": 9
       },
       "tx": {
         "call_sites": 0,
@@ -199,16 +202,16 @@
         "files_with_calls": 0
       }
     },
-    "files_with_calls": 7,
+    "files_with_calls": 9,
     "tested_files_intersect_covered": 4,
-    "total_call_sites": 28
+    "total_call_sites": 30
   },
   "schema_version": 2,
   "totals": {
-    "covered_sites": 453,
-    "exempt_file_sites": 43,
-    "total_sites": 927,
-    "uncovered_sites": 22,
-    "wrapper_exempt_sites": 409
+    "covered_sites": 523,
+    "exempt_file_sites": 48,
+    "total_sites": 1012,
+    "uncovered_sites": 0,
+    "wrapper_exempt_sites": 438
   }
 }
