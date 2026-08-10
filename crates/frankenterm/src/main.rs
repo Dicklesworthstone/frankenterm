@@ -95532,6 +95532,20 @@ log_level = "debug"
             v.contains('(') && v.contains(')'),
             "short version should contain commit hash in parens: {v}"
         );
+        assert!(
+            build_meta::GIT_HASH == "unknown"
+                || (build_meta::GIT_HASH.len() == 40
+                    && build_meta::GIT_HASH
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())),
+            "Git identity must be the fail-closed unknown sentinel or exact lowercase 40-hex: {}",
+            build_meta::GIT_HASH
+        );
+        assert!(
+            matches!(build_meta::GIT_DIRTY, "" | "+dirty"),
+            "unsupported Git dirty marker: {}",
+            build_meta::GIT_DIRTY
+        );
     }
 
     #[test]
