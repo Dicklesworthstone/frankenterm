@@ -1652,7 +1652,7 @@ The umbrella epic closes only when all of the following are true:
 The campaign is successful when these user-level properties are durable and
 explainable—not when a proxy benchmark alone reports an attractive number.
 
-## 19. Current reality checkpoint (2026-08-07)
+## 19. Current reality checkpoint (2026-08-10)
 
 This campaign is **PARTIAL and not release-qualified**. The repository now has
 substantial bounded protocol, persistence, rendering, telemetry, and test
@@ -1681,13 +1681,17 @@ substrate, but the user-level result promised above has not yet been proved:
   pane becomes a typed sibling result rather than aborting the batch. The wire
   result carries ten bounded health fields rather than render payloads, with a
   4 KiB request ceiling and a 32 KiB response ceiling. Sharded domains admit at
-  most sixteen shard requests concurrently, restore global request order, stop
-  admitting new work on cancellation or terminal error, and drain already
-  admitted work. Old peers are capability-fenced before the new PDU is written
-  and retain a healthy pooled connection while the runtime uses a separately
-  bounded legacy fallback. Content-free counters distinguish logical bulk
-  requests, admitted batches, server wire requests, queue/snapshot duration,
-  response size, partial outcomes, cancellation, and fallback. These are
+  most sixteen shard requests concurrently and restore global request order.
+  Capability absence and terminal non-cancellation errors stop new admission
+  and drain already admitted siblings. Cancellation stops new admission and
+  drops the remaining Cx-bound sibling futures; their owned mux clients are not
+  returned to the pool, so an uncertain in-flight transport cannot be reused.
+  Old peers are capability-fenced before the new PDU is written and retain a
+  healthy pooled connection while the runtime uses a separately bounded legacy
+  fallback. Dedicated content-free counters distinguish logical
+  bulk requests, admitted batches, server wire requests, queue/snapshot
+  duration, partial outcomes, cancellation, and fallback; the codec's existing
+  PDU-labeled size histogram records encoded PDU93/PDU94 sizes. These are
   structural work-, memory-, fairness-, and failure-containment properties.
   They do not establish a wall-time, interactive-latency, rendering, visual,
   M4/M5, or Threadripper improvement without retained same-source target runs.

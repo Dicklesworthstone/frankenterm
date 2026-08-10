@@ -49,7 +49,7 @@
 | Auditing the claims | [Trust & Attestation](#trust--attestation) → [Threat Model](#deep-dive-threat-model) → [Formal Methods](#deep-dive-formal-methods-in-this-repo) |
 | Reading the algorithms | [Algorithm & Data Structure Catalog](#algorithm--data-structure-catalog) → [Pattern Engine](#deep-dive-pattern-engine-architecture) → [Cx Cancellation Model](#deep-dive-the-cx-cancellation-model) |
 
-**A swarm-native terminal platform designed to observe, control, and audit large fleets of concurrent AI coding agents.** The retained 200-pane figures are synthetic benchmark-lane results, not a qualified native or target-class operating envelope. <!--count:workspace_members-->77<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->531<!--/count--> core-library modules, <!--count:core_loc-->1089341<!--/count-->+ lines of Rust, <!--count:test_count-->57556<!--/count-->+ test annotations across <!--count:core_rust_test_files-->984<!--/count--> integration test files.
+**A swarm-native terminal platform designed to observe, control, and audit large fleets of concurrent AI coding agents.** The retained 200-pane figures are synthetic benchmark-lane results, not a qualified native or target-class operating envelope. <!--count:workspace_members-->80<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->536<!--/count--> core-library modules, <!--count:core_loc-->1259639<!--/count-->+ lines of Rust, <!--count:test_count-->60530<!--/count-->+ test annotations across <!--count:core_rust_test_files-->1042<!--/count--> integration test files.
 
 _Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe. Developer checks use the live worktree by default; release snapshots use `--source=head` so unrelated dirty files cannot alter the attested counts._
 
@@ -60,7 +60,7 @@ _Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See
 cargo install --profile release-interactive --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
 ```
 
-`ft --version` works immediately after install. `ft doctor` / `ft doctor --json` run immediately. Pane/session operations that talk to the live mux require WezTerm CLI in `PATH` and a reachable mux/GUI for `wezterm cli list`.
+`ft --version` works immediately after install. `ft doctor` / `ft doctor --json` run immediately. Pane/session operations require a reachable FrankenTerm/WezTerm-fork mux endpoint. Native vendored builds prefer the direct pooled mux protocol; the external `wezterm` CLI is a compatibility fallback, not a universal prerequisite.
 
 </div>
 
@@ -99,7 +99,7 @@ ft --version       # smoke test — should print version + git commit
 ft doctor          # environment check — exits non-zero on missing prerequisites
 ```
 
-`ft` talks to a live mux through the WezTerm interop boundary, so `wezterm` must be in `PATH`. `ft doctor` will tell you if it isn't. If you need from-source builds or optional features (`mcp`, `web`, `distributed`, `semantic-search`, `ftui`), see [Installation](#installation) below.
+`ft` talks to a live FrankenTerm/WezTerm-fork mux. Native vendored builds can use the direct pooled mux protocol; compatibility configurations may instead require the external `wezterm` CLI in `PATH`. `ft doctor` reports the available backend prerequisites. If you need from-source builds or optional features (`mcp`, `web`, `distributed`, `semantic-search`, `ftui`), see [Installation](#installation) below.
 
 ### 2 · See the fleet (1 minute, no daemon yet)
 
@@ -457,7 +457,7 @@ Terminology used throughout this document and the codebase. Reading these once s
 
 ## Safety Guarantees
 
-- **Observe vs act split**: `ft watch` is read-only; mutating actions must pass the Policy Engine.
+- **Observe vs act split**: the default `ft watch` loop does not send pane input, but it does own local persistence effects such as schema migration, capture writes, and retention pruning. Input and `--auto-handle` workflow actions remain separately policy-gated and auditable.
 - **No silent gaps**: capture gaps are recorded explicitly and surfaced in events/diagnostics.
 - **Policy-gated sending**: `ft send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
 - **Policy-gated reads**: `get-text`/`search` surfaces enforce policy checks and return redacted text payloads.
@@ -534,7 +534,7 @@ The `ft attestation` family is a thin Rust wrapper over [`scripts/attestation-ve
 | Event-driven automation | Built-in workflows + policy gate | Not native | Not native | Not native |
 | Machine API for agents | Robot Mode + MCP + TOON | None | None | None |
 | Operating-envelope safety | Native fail-closed contract | None | None | None |
-| Cross-session state + recovery | Built-in snapshots + sessions | Partial / manual | Session-centric, not swarm-centric | Minimal |
+| Cross-session capture + inspection | Built-in snapshots + sessions; automated restore/restart execution is unavailable | Partial / manual | Session-centric, not swarm-centric | Minimal |
 | Agent-safe control plane | 14-subsystem policy diagnostics surface | Not native | Not native | Not native |
 | Transactional multi-pane ops | Prepare/commit/compensate + idempotency ledger | None | None | None |
 | Full-text search over output | FTS5 + Tantivy + hybrid modes | None | None | None |
@@ -759,7 +759,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin f
 Post-install expectations:
 - `ft --version` succeeds immediately
 - `ft doctor` / `ft doctor --json` emit diagnostics immediately
-- On a clean host, doctor reports backend-prerequisite errors until WezTerm is available (`wezterm --version` and `wezterm cli list --format json` must succeed)
+- On a clean host, doctor reports the available mux-backend prerequisites. A compatibility-CLI setup requires `wezterm --version` and `wezterm cli list --format json`; a native vendored setup may use a reachable direct mux endpoint instead.
 - `.ft`, logs, and the SQLite database are created on first daemon/watch startup
 
 ### From source
@@ -1472,11 +1472,11 @@ Operator-tunable runtime constants live under `[tuning]` sections such as `[tuni
 ### Workspace Structure
 
 ```
-frankenterm/                              # 77 workspace members (auto-stamped)
+frankenterm/                              # <!--count:workspace_members-->80<!--/count--> workspace members (auto-stamped)
 ├── Cargo.toml
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft)
-│   ├── frankenterm-core/                 # Core library — 509 top-level modules, ~1.01M LOC
+│   ├── frankenterm-core/                 # Core library — <!--count:core_top_level_modules-->536<!--/count--> top-level modules, <!--count:core_loc-->1259639<!--/count--> LOC
 │   │   ├── src/
 │   │   │   ├── runtime.rs                # Observation runtime orchestration
 │   │   │   ├── runtime_async.rs          # Canonical asupersync wrapper API surface
@@ -1497,8 +1497,8 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   │   │   ├── incident_bundle.rs        # Live incident-bundle collectors
 │   │   │   ├── mission_objective_plan.rs # Capacity-aware objective planner
 │   │   │   └── …                         # 500+ additional modules
-│   │   ├── tests/                        # 952 Rust test files, 55k+ test annotations
-│   │   └── benches/                      # 111 Criterion benchmarks
+│   │   ├── tests/                        # <!--count:core_rust_test_files-->1042<!--/count--> Rust test files, <!--count:test_count-->60530<!--/count-->+ test annotations
+│   │   └── benches/                      # <!--count:criterion_bench_files-->119<!--/count--> Criterion bench files
 │   │
 │   ├── frankenterm-core-ars/             # ARS (Adaptive/Autonomous Reflex System)
 │   ├── frankenterm-core-tantivy/         # Lexical search stack
@@ -1536,9 +1536,9 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   ├── deps-freetype/  deps-harfbuzz/  deps-fontconfig/
 │   ├── env-bootstrap/  tabout/  gui-subcommands/  toast-notification/  open-url/
 │   └── lua-api-crates/{termwiz-funcs,mux-lua,url-funcs}/
-├── fuzz/                                 # 48 fuzz targets
-├── docs/                                 # <!--count:doc_markdown_files-->464<!--/count--> Markdown documentation files
-├── tests/e2e/                            # 276 shell E2E scripts
+├── fuzz/                                 # <!--count:fuzz_targets-->51<!--/count--> fuzz targets
+├── docs/                                 # <!--count:doc_markdown_files-->496<!--/count--> Markdown documentation files
+├── tests/e2e/                            # <!--count:e2e_scripts-->284<!--/count--> shell E2E scripts
 └── fixtures/                             # Test fixtures (including operating-envelope goldens)
 ```
 
@@ -3981,7 +3981,7 @@ The wire protocol's safety review and diff-fuzz coverage are tracked in [`docs/s
 
 ## Performance Benchmarks
 
-Benchmarks live under `crates/frankenterm-core/benches/` (<!--count:criterion_bench_files-->112<!--/count--> Criterion bench files) and use human-readable budgets with machine-readable artifacts. In the shared agent checkout, proof and closeout benchmark runs must go through RCH:
+Benchmarks live under `crates/frankenterm-core/benches/` (<!--count:criterion_bench_files-->119<!--/count--> Criterion bench files) and use human-readable budgets with machine-readable artifacts. In the shared agent checkout, proof and closeout benchmark runs must go through RCH:
 
 ```bash
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-compile \
@@ -4047,11 +4047,11 @@ The project maintains extensive test coverage:
 
 | Category | Count | Purpose |
 |---|---|---|
-| Test annotations | <!--count:test_count-->57556<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
-| Core Rust test files | <!--count:core_rust_test_files-->984<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
-| E2E shell scripts | <!--count:e2e_scripts-->276<!--/count--> | Full-pipeline validation |
-| Criterion bench files | <!--count:criterion_bench_files-->112<!--/count--> | Performance regression detection |
-| Fuzz targets | <!--count:fuzz_targets-->54<!--/count--> | Security / robustness |
+| Test annotations | <!--count:test_count-->60530<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
+| Core Rust test files | <!--count:core_rust_test_files-->1042<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
+| E2E shell scripts | <!--count:e2e_scripts-->284<!--/count--> | Full-pipeline validation |
+| Criterion bench files | <!--count:criterion_bench_files-->119<!--/count--> | Performance regression detection |
+| Fuzz targets | <!--count:fuzz_targets-->51<!--/count--> | Security / robustness |
 
 ```bash
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test \
@@ -4319,6 +4319,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*<!--count:workspace_members-->77<!--/count--> workspace crates. <!--count:core_top_level_modules-->531<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1089341<!--/count-->+ lines. <!--count:test_count-->57556<!--/count-->+ tests. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
+*<!--count:workspace_members-->80<!--/count--> workspace crates. <!--count:core_top_level_modules-->536<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1259639<!--/count-->+ lines. <!--count:test_count-->60530<!--/count-->+ test annotations. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>

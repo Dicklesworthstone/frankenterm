@@ -2644,7 +2644,7 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Rejected inference:** sharded route maps, bounded lease scans, batched parser
   policy, ordered durable drains, and reduced hot-loop allocation necessarily
   establish improved keypress, resize, zoom, or long-session responsiveness on
-  recent Apple silicon and the 128-core Threadripper host.
+  recent Apple silicon and the 64-core/128-thread `trj` Threadripper host.
 - **Negative evidence:** these changes have static and focused remote
   correctness evidence only. The ordered-window path remains capability-fenced,
   durable tab-order restoration remains incomplete, and the retained
@@ -3778,9 +3778,9 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Baseline revision:** `b20f16ae715a2ca179f38fca95de177ce6864076`
 - **Candidate revision:** `df2e495c458c355a70636cb49c94fa778722550c`
 - **Target identity:** strict-remote `ovh-a`, `vmi1149989`, and `vmi1227854`
-  Linux compile/test workers for source proof only; no M4/M5 macOS, 128-core
-  Threadripper, display, LAN, thermal, or production-session identity was
-  measured
+  Linux compile/test workers for source proof only; no M4/M5 macOS,
+  64-core/128-thread `trj` Threadripper, display, LAN, thermal, or
+  production-session identity was measured
 - **Workload identity:** deterministic codec, mux-client, mux-server, shard,
   runtime, panic, cancellation, old-peer, 200-pane, and 513-pane structural
   fixtures; no retained real 20/50/200-pane workload run
@@ -3827,7 +3827,7 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   and old-peer circuit remove avoidable work and ambiguity. Performance
   promotion is explicitly withheld.
 - **Primary retry condition:**
-  > Promote the bulk health path as a performance improvement only after retained same-source 20/50/200-pane runs on the intended M4/M5 Mac and 128-core Threadripper/LAN target record request count, health wall time, mux queue wait, interactive latency tails, resource envelopes, deterministic state equivalence, and resize/zoom visual equivalence while all exact-source release gates pass.
+  > Promote the bulk health path as a performance improvement only after retained same-source 20/50/200-pane runs on the intended M4/M5 Mac and 64-core/128-thread `trj` Threadripper/LAN target record request count, health wall time, mux queue wait, interactive latency tails, resource envelopes, deterministic state equivalence, and resize/zoom visual equivalence while all exact-source release gates pass.
 
 ## Open hypothesis register
 
