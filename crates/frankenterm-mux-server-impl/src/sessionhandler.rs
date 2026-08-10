@@ -4678,6 +4678,9 @@ impl SessionHandler {
                             // invoking any pane callback. A callback for an earlier pane can
                             // therefore retire a later registration, but cannot change a pane
                             // that existed at turn admission from `Closed` into `Missing`.
+                            // The intermediate collection is semantically required: fusing the
+                            // iterators would interleave registration capture with callbacks.
+                            #[allow(clippy::needless_collect)]
                             let registrations = request
                                 .pane_ids
                                 .into_iter()
