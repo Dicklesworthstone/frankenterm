@@ -522,6 +522,15 @@ impl RuntimeShutdownToken {
         }
         true
     }
+
+    /// Begin the one-way shutdown transition without waiting beyond the
+    /// current instant. This seam exists only so sibling-module tests can prove
+    /// that subsystem admission rejects a live-but-shutting-down runtime before
+    /// any work is admitted.
+    #[cfg(test)]
+    pub(crate) fn request_shutdown_for_test(&self) -> bool {
+        self.request_shutdown_and_wait(Duration::ZERO)
+    }
 }
 
 /// Proof that one admitted cleanup transaction still belongs to a live

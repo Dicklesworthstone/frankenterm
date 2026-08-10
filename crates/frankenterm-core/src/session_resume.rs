@@ -887,8 +887,8 @@ impl std::fmt::Display for SessionResumeError {
             Self::AsyncInfrastructureFailure => {
                 f.write_str("session-resume async infrastructure failed")
             }
-            Self::Timeout => write!(f, "casr operation timed out"),
-            Self::Cancelled => write!(f, "casr operation cancelled"),
+            Self::Timeout => write!(f, "session-resume operation timed out"),
+            Self::Cancelled => write!(f, "session-resume operation cancelled"),
             Self::CaptureIncomplete {
                 stdout_open,
                 stderr_open,
@@ -3044,6 +3044,14 @@ mod tests {
         }
     }
 
+    struct ClearRuntimeContextOnDrop;
+
+    impl Drop for ClearRuntimeContextOnDrop {
+        fn drop(&mut self) {
+            crate::runtime_async::clear_runtime_handle();
+        }
+    }
+
     fn native_discovery_lifecycle_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -5172,6 +5180,104 @@ mod tests {
             after.admitted_total, before.admitted_total,
             "missing application-runtime authority must reject before subsystem admission"
         );
+        assert_eq!(
+            after.runtime_rejected_total,
+            before.runtime_rejected_total + 1
+        );
+    }
+
+    #[test]
+    fn native_discovery_shutting_down_runtime_rejects_before_subsystem_admission() {
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let _clear_runtime_on_drop = ClearRuntimeContextOnDrop;
+        let before = native_discovery_runtime_metrics();
+        let work_ran = Arc::new(AtomicBool::new(false));
+        let work_ran_inner = Arc::clone(&work_ran);
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native discovery shutting-down runtime");
+
+        runtime.block_on(async {
+            let shutdown = crate::runtime_async::current_runtime_shutdown_token()
+                .expect("runtime block_on must install shutdown authority");
+            assert!(
+                shutdown.request_shutdown_for_test(),
+                "a runtime with no cleanup leases must enter shutdown immediately"
+            );
+
+            let cx = crate::cx::for_request();
+            let error = run_owned_native_discovery_with_cx(&cx, move |_cancellation, _scan_cx| {
+                work_ran_inner.store(true, Ordering::Release);
+                Ok(SessionDiscoveryResult::default())
+            })
+            .await
+            .expect_err("shutting-down authority must reject before work admission");
+            assert_eq!(
+                error,
+                SessionResumeError::DiscoveryAdmissionRejected {
+                    reason: SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown,
+                }
+            );
+        });
+        drop(runtime);
+
+        let after = native_discovery_runtime_metrics();
+        assert!(!work_ran.load(Ordering::Acquire));
+        assert_eq!(after.active_scans, before.active_scans);
+        assert_eq!(after.active_owners, before.active_owners);
+        assert_eq!(after.active_workers, before.active_workers);
+        assert_eq!(after.active_observers, before.active_observers);
+        assert_eq!(after.admitted_total, before.admitted_total);
+        assert_eq!(
+            after.runtime_rejected_total,
+            before.runtime_rejected_total + 1
+        );
+    }
+
+    #[test]
+    fn native_discovery_stale_runtime_authority_rejects_before_subsystem_admission() {
+        use std::future::Future as _;
+
+        let _test_lock = native_discovery_lifecycle_test_lock();
+        let _clear_runtime_on_drop = ClearRuntimeContextOnDrop;
+        crate::runtime_async::clear_runtime_handle();
+        let before = native_discovery_runtime_metrics();
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native discovery stale-authority runtime");
+        runtime.block_on(async {});
+        drop(runtime);
+
+        let work_ran = Arc::new(AtomicBool::new(false));
+        let work_ran_inner = Arc::clone(&work_ran);
+        let cx = crate::cx::for_request();
+        let mut request = Box::pin(run_owned_native_discovery_with_cx(
+            &cx,
+            move |_cancellation, _scan_cx| {
+                work_ran_inner.store(true, Ordering::Release);
+                Ok(SessionDiscoveryResult::default())
+            },
+        ));
+        let waker = futures::task::noop_waker();
+        let mut poll_cx = std::task::Context::from_waker(&waker);
+        let error = match request.as_mut().poll(&mut poll_cx) {
+            std::task::Poll::Ready(Err(error)) => error,
+            other => panic!("stale runtime authority must reject before suspending: {other:?}"),
+        };
+
+        assert_eq!(
+            error,
+            SessionResumeError::DiscoveryAdmissionRejected {
+                reason: SessionDiscoveryAdmissionRejection::RuntimeUnavailableOrShuttingDown,
+            }
+        );
+        let after = native_discovery_runtime_metrics();
+        assert!(!work_ran.load(Ordering::Acquire));
+        assert_eq!(after.active_scans, before.active_scans);
+        assert_eq!(after.active_owners, before.active_owners);
+        assert_eq!(after.active_workers, before.active_workers);
+        assert_eq!(after.active_observers, before.active_observers);
+        assert_eq!(after.admitted_total, before.admitted_total);
         assert_eq!(
             after.runtime_rejected_total,
             before.runtime_rejected_total + 1

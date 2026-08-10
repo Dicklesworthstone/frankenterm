@@ -3784,13 +3784,17 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   the pending timeout/adapter ownership-cycle regression. The fresh-eyes sweep
   also found and fixed a benchmark all-targets compile defect where the flat
   spawn comparison still referenced a runtime handle removed during the helper
-  signature migration. Source-only policy gates passed at exact source SHA
-  `15d38e4cbad5ca617f31b7a3445bf32e973c3e1d`, but strict-remote execution
-  remains absent: the exact-SHA focused command exited 103 on 2026-08-09 with
-  `remote required; refusing local fallback (all workers unreachable)`. No
-  local Cargo substitute ran. No native product-path,
-  executable shutdown-drain, M4/M5, Threadripper, mux, render, or latency
-  qualification follows yet.
+  signature migration. A second fresh-eyes sweep added direct pre-effect tests
+  for both live-but-shutting-down and stale runtime authority, and corrected
+  native-discovery timeout/cancellation displays that still mislabeled the
+  operation as CASR. On 2026-08-10 the patched overlay ran remotely on `ovh-a`:
+  the focused `native_discovery` lane executed 16 tests with 16 passed, 0
+  failed, and 30,939 filtered out, including the intentional worker-panic
+  quarantine control. Exact-committed-source focused, workspace-check, Clippy,
+  and formatting results remain separate closeout evidence rather than an
+  inference from that overlay run. No local Cargo substitute ran. No native
+  product-path, M4/M5, Threadripper, mux, render, or latency qualification
+  follows yet.
 - **Primary retry condition:**
   > Replace the runtime-owned supervisor only after another design proves that caller-future drop, caller cancellation, saturation, runtime rejection, and shutdown cannot orphan an admitted blocking join; preserves exactly one typed terminal receipt; bounds live owners, workers, observers, queued work, directory entries, path and metadata bytes, and syscall exposure; and converges under deterministic barriers plus strict-remote exact-source tests.
 

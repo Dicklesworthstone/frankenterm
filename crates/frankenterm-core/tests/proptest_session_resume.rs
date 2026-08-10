@@ -438,7 +438,16 @@ fn antigravity_e2e_fixture_merges_casr_and_native_sessions_without_cross_listing
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(ProptestConfig {
+        cases: 100,
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::Direct(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/proptest-regressions/session_resume.txt"
+            )),
+        )),
+        ..ProptestConfig::default()
+    })]
 
     // 1. AgentProvider slug roundtrip for all known variants
     #[test]
@@ -624,10 +633,17 @@ proptest! {
     #[test]
     fn error_cancelled_has_stable_structural_display(_content in "[QWXZ]{32,64}") {
         let display = SessionResumeError::Cancelled.to_string();
-        prop_assert_eq!(display, "casr operation cancelled");
+        prop_assert_eq!(display, "session-resume operation cancelled");
     }
 
-    // 16b. Incomplete capture exposes only bounded structural detail.
+    // 16b. Timeout is shared by native and CASR-backed operations.
+    #[test]
+    fn error_timeout_has_stable_structural_display(_content in "[QWXZ]{32,64}") {
+        let display = SessionResumeError::Timeout.to_string();
+        prop_assert_eq!(display, "session-resume operation timed out");
+    }
+
+    // 16c. Incomplete capture exposes only bounded structural detail.
     #[test]
     fn error_capture_incomplete_has_structural_display(
         stdout_open in any::<bool>(),
@@ -648,7 +664,7 @@ proptest! {
         );
     }
 
-    // 16c. Failed cleanup preserves only structural process state.
+    // 16d. Failed cleanup preserves only structural process state.
     #[test]
     fn error_cleanup_incomplete_has_structural_display(
         trigger in arb_cleanup_trigger(),
