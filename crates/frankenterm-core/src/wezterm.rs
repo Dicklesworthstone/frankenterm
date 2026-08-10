@@ -1221,7 +1221,7 @@ pub fn set_wezterm_cli_override(path: Option<String>) {
 }
 
 /// Resolve the wezterm binary path, respecting `FT_WEZTERM_CLI` env var.
-fn wezterm_binary() -> String {
+pub(crate) fn wezterm_binary() -> String {
     if let Some(path) = wezterm_cli_override_slot()
         .lock()
         .unwrap_or_else(record_poison_and_recover)

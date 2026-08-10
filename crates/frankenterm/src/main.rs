@@ -27130,6 +27130,7 @@ const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=10
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
 const WATCH_EVENTS_IPC_CANCELLATION_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(500);
+#[cfg(test)]
 const WATCH_CLAIM_OUTPUT_MAX_QUEUED_RECORDS: usize = 1;
 const WATCH_CLAIM_OUTPUT_MAX_QUEUED_BYTES: usize = 1024 * 1024;
 
@@ -27587,11 +27588,21 @@ fn watch_claim_cursor_generation(record: &serde_json::Value) -> std::io::Result<
 }
 
 fn saturating_increment_watch_counter(counter: &std::sync::atomic::AtomicU64) {
-    let _ = counter.fetch_update(
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-        |value| Some(value.saturating_add(1)),
-    );
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            return;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -27936,6 +27947,7 @@ enum WatchClaimOutputAttempt {
     Failed(WatchClaimOutputFailure),
 }
 
+#[cfg(any(test, not(unix)))]
 fn write_watch_claim_line_synchronously<W: std::io::Write>(
     writer: &mut W,
     line: &[u8],
@@ -28308,6 +28320,7 @@ where
         attempt => attempt,
     };
     let (queued_event_id, queued_cursor_generation, queued_lease_expiry) = admission.trace_fields();
+    let queued_cursor_generation = queued_cursor_generation.to_owned();
     let success = match attempt {
         WatchClaimOutputAttempt::Flushed(success) => success,
         WatchClaimOutputAttempt::FlushedRestoreLost { success, source } => {
@@ -55624,11 +55637,14 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
                 #[cfg(feature = "vendored")]
                 {
-                    let local_version = frankenterm_core::vendored::read_local_wezterm_version();
-                    let compat =
-                        frankenterm_core::vendored::compatibility_report(local_version.as_ref());
-                    payload["vendored_compatibility"] =
-                        serde_json::to_value(&compat).unwrap_or(serde_json::Value::Null);
+                    // `wezterm_handle_from_config` already performed the
+                    // finite compatibility probe while selecting this exact
+                    // backend. Reuse that report rather than launching an
+                    // immediately duplicated `wezterm --version` subprocess.
+                    payload["vendored_compatibility"] = wezterm
+                        .backend_selection()
+                        .and_then(|selection| selection.compatibility.clone())
+                        .unwrap_or(serde_json::Value::Null);
                 }
                 match watcher_status {
                     Ok(Some(status)) => {
@@ -60704,7 +60720,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
                 return Ok(());
             }
-            let checks = run_diagnostics(&permission_warnings, &config, &layout);
+            let checks = run_diagnostics(cx, &permission_warnings, &config, &layout).await;
             let mut all_checks: Vec<DiagnosticCheck> = checks;
             let session_report = if layout.db_path.exists() {
                 let cx = frankenterm_core::cx::Cx::current()
@@ -76497,6 +76513,9 @@ struct RemoteCommandOutput {
     duration_ms: u128,
 }
 
+const REMOTE_SETUP_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const REMOTE_SETUP_MAX_STDERR_BYTES: usize = 8 * 1024 * 1024;
+
 struct RemoteSetupOptions<'a> {
     apply: bool,
     dry_run: bool,
@@ -76513,37 +76532,34 @@ fn run_remote_command(
     command: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<RemoteCommandOutput> {
-    use std::process::{Command, Stdio};
-    use std::thread::sleep;
+    use std::process::Command;
 
     let start = std::time::Instant::now();
-    let mut child = Command::new("ssh")
-        .arg("-o")
+    let mut ssh = Command::new("ssh");
+    ssh.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg(format!("ConnectTimeout={}", timeout.as_secs()))
         .arg(host)
-        .arg(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    loop {
-        if let Some(_status) = child.try_wait()? {
-            break;
-        }
-        if start.elapsed() > timeout {
-            let _ = child.kill();
-            anyhow::bail!("timeout after {}s", timeout.as_secs());
-        }
-        sleep(std::time::Duration::from_millis(100));
+        .arg(command);
+    let output = run_cmd_with_timeout(
+        &mut ssh,
+        timeout,
+        REMOTE_SETUP_MAX_STDOUT_BYTES,
+        REMOTE_SETUP_MAX_STDERR_BYTES,
+    )?;
+    if output.stdout.overflowed || output.stderr.overflowed {
+        anyhow::bail!(
+            "remote command output exceeded the {} byte stdout or {} byte stderr safety limit",
+            REMOTE_SETUP_MAX_STDOUT_BYTES,
+            REMOTE_SETUP_MAX_STDERR_BYTES
+        );
     }
 
-    let output = child.wait_with_output()?;
     Ok(RemoteCommandOutput {
         status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        stdout: String::from_utf8_lossy(&output.stdout.bytes).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr.bytes).to_string(),
         duration_ms: start.elapsed().as_millis(),
     })
 }
@@ -76697,28 +76713,38 @@ where
             options.verbose,
             false,
         )?;
-        let remote_version = version_output.stdout.trim().to_string();
-        if !remote_version.is_empty() {
-            println!("  Remote version: {remote_version}");
+        let remote_version = version_output.stdout.trim();
+        if !remote_version.is_empty()
+            && remote_version.len() <= WEZTERM_VERSION_MAX_STDOUT_BYTES
+            && !remote_version.chars().any(char::is_control)
+        {
+            println!(
+                "  Remote version: {}",
+                bounded_terminal_diagnostic(remote_version, 128, 256)
+            );
             // Compare with local version to warn about mismatches
-            if let Ok(local_out) = std::process::Command::new(wezterm_binary())
-                .arg("--version")
-                .output()
+            let mut local_version_command = std::process::Command::new(wezterm_binary());
+            local_version_command.arg("--version");
+            if let Ok(local_out) = run_cmd_with_timeout(
+                &mut local_version_command,
+                timeout,
+                WEZTERM_VERSION_MAX_STDOUT_BYTES,
+                DIAGNOSTIC_COMMAND_MAX_STDERR_BYTES,
+            ) && local_out.status.success()
+                && !local_out.stderr.overflowed
+                && let Ok(local_version) = admit_single_line_output(&local_out.stdout)
             {
-                let local_version = String::from_utf8_lossy(&local_out.stdout)
-                    .trim()
-                    .to_string();
-                if !local_version.is_empty() {
-                    if local_version != remote_version {
-                        println!(
-                            "  ⚠ Version mismatch: local={local_version}, remote={remote_version}"
-                        );
-                        println!("    WezTerm multiplexing works best with matching versions.");
-                    } else {
-                        println!("  ✓ Local and remote versions match");
-                    }
+                if local_version != remote_version {
+                    println!(
+                        "  ⚠ Version mismatch: local={local_version}, remote={remote_version}"
+                    );
+                    println!("    WezTerm multiplexing works best with matching versions.");
+                } else {
+                    println!("  ✓ Local and remote versions match");
                 }
             }
+        } else if !remote_version.is_empty() {
+            println!("  ⚠ Remote WezTerm version output was not a safe bounded line");
         }
     }
 
@@ -79082,8 +79108,185 @@ impl WeztermListProbeFailure {
     }
 }
 
+fn mux_backend_diagnostic(
+    selection: &frankenterm_core::wezterm::BackendSelection,
+) -> DiagnosticCheck {
+    DiagnosticCheck::ok_with_detail(
+        "mux backend",
+        bounded_terminal_diagnostic(
+            &format!("{} ({})", selection.kind, selection.reason),
+            256,
+            1_024,
+        ),
+    )
+}
+
+const fn wezterm_cli_probe_required(kind: frankenterm_core::wezterm::BackendKind) -> bool {
+    matches!(kind, frankenterm_core::wezterm::BackendKind::Cli)
+}
+
+#[cfg(feature = "vendored")]
+fn backend_compatibility_local_version(
+    selection: &frankenterm_core::wezterm::BackendSelection,
+) -> Option<String> {
+    selection
+        .compatibility
+        .clone()
+        .and_then(|value| {
+            serde_json::from_value::<frankenterm_core::vendored::VendoredCompatibilityReport>(value)
+                .ok()
+        })
+        .and_then(|report| report.local_version)
+}
+
+#[cfg(not(feature = "vendored"))]
+fn backend_compatibility_local_version(
+    _selection: &frankenterm_core::wezterm::BackendSelection,
+) -> Option<String> {
+    None
+}
+
+fn wezterm_cli_version_diagnostic(
+    selection: &frankenterm_core::wezterm::BackendSelection,
+    timeout: std::time::Duration,
+) -> DiagnosticCheck {
+    // Vendored-aware selection already ran the exact same finite version
+    // probe. A successfully admitted line is authoritative for this client
+    // construction; only an absent/failed report needs a diagnostic retry.
+    if let Some(version) = backend_compatibility_local_version(selection) {
+        return DiagnosticCheck::ok_with_detail(
+            "WezTerm CLI",
+            bounded_terminal_diagnostic(&version, 128, 256),
+        );
+    }
+
+    match run_cmd_with_timeout(
+        std::process::Command::new(wezterm_binary()).arg("--version"),
+        timeout,
+        WEZTERM_VERSION_MAX_STDOUT_BYTES,
+        DIAGNOSTIC_COMMAND_MAX_STDERR_BYTES,
+    ) {
+        Ok(output) if output.stdout.overflowed => DiagnosticCheck::error(
+            "WezTerm CLI",
+            SingleLineOutputAdmissionError::Oversized.wezterm_diagnostic_detail(),
+            "Ensure the active backend bridge returns a valid bounded version",
+        ),
+        Ok(output) if output.stderr.overflowed => DiagnosticCheck::error(
+            "WezTerm CLI",
+            WEZTERM_VERSION_STDERR_OVERSIZED_DETAIL,
+            "Ensure the active backend bridge returns bounded diagnostics",
+        ),
+        Ok(output) if output.status.success() => match admit_single_line_output(&output.stdout) {
+            Ok(version) => DiagnosticCheck::ok_with_detail(
+                "WezTerm CLI",
+                bounded_terminal_diagnostic(version, 128, 256),
+            ),
+            Err(error) => DiagnosticCheck::error(
+                "WezTerm CLI",
+                error.wezterm_diagnostic_detail(),
+                "Ensure the active backend bridge returns a valid bounded version",
+            ),
+        },
+        Ok(output) => {
+            tracing::debug!(
+                exit_code = ?output.status.code(),
+                stderr_overflowed = output.stderr.overflowed,
+                retained_stderr_bytes = output.stderr.bytes.len(),
+                "WezTerm version probe returned a non-success status"
+            );
+            DiagnosticCheck::error(
+                "WezTerm CLI",
+                "wezterm command failed",
+                "Ensure the selected CLI backend is installed and in PATH",
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => DiagnosticCheck::error(
+            "WezTerm CLI",
+            "wezterm --version timed out",
+            "The selected CLI backend is unresponsive",
+        ),
+        Err(error) => {
+            tracing::debug!(
+                error_kind = ?error.kind(),
+                "WezTerm version probe could not be completed"
+            );
+            let detail = if error.kind() == std::io::ErrorKind::NotFound {
+                "wezterm not found"
+            } else {
+                "wezterm version probe could not be completed"
+            };
+            DiagnosticCheck::error(
+                "WezTerm CLI",
+                detail,
+                "Install the selected WezTerm CLI backend or configure a compatible direct mux socket",
+            )
+        }
+    }
+}
+
+#[cfg(feature = "vendored")]
+fn vendored_compatibility_diagnostic(
+    selection: &frankenterm_core::wezterm::BackendSelection,
+) -> DiagnosticCheck {
+    use frankenterm_core::vendored::{
+        VendoredCompatibilityReport, VendoredCompatibilityStatus,
+    };
+    use frankenterm_core::wezterm::BackendKind;
+
+    if selection.kind == BackendKind::Vendored {
+        return DiagnosticCheck::ok_with_detail(
+            "WezTerm vendored",
+            bounded_terminal_diagnostic(&selection.reason, 256, 1_024),
+        );
+    }
+
+    let Some(report) = selection
+        .compatibility
+        .clone()
+        .and_then(|value| serde_json::from_value::<VendoredCompatibilityReport>(value).ok())
+    else {
+        return DiagnosticCheck::warning(
+            "WezTerm vendored",
+            "compatibility metadata unavailable; CLI backend selected",
+            "Continue with the CLI backend or rebuild FrankenTerm with complete vendored metadata",
+        );
+    };
+
+    if !report.vendored_enabled {
+        return DiagnosticCheck::ok_with_detail(
+            "WezTerm vendored",
+            "vendored feature not enabled",
+        );
+    }
+
+    let detail = bounded_terminal_diagnostic(&report.message, 256, 1_024);
+    match report.status {
+        VendoredCompatibilityStatus::Matched => {
+            DiagnosticCheck::ok_with_detail("WezTerm vendored", detail)
+        }
+        VendoredCompatibilityStatus::Compatible | VendoredCompatibilityStatus::Incompatible => {
+            let recommendation = report
+                .recommendation
+                .as_deref()
+                .map(|value| bounded_terminal_diagnostic(value, 256, 1_024))
+                .unwrap_or_else(|| {
+                    "Continue with the CLI backend or repair vendored compatibility".to_string()
+                });
+            DiagnosticCheck::warning("WezTerm vendored", detail, recommendation)
+        }
+    }
+}
+
+#[cfg(not(feature = "vendored"))]
+fn vendored_compatibility_diagnostic(
+    _selection: &frankenterm_core::wezterm::BackendSelection,
+) -> DiagnosticCheck {
+    DiagnosticCheck::ok_with_detail("WezTerm vendored", "vendored feature not enabled")
+}
+
 /// Run all diagnostic checks and return results
-fn run_diagnostics(
+async fn run_diagnostics(
+    cx: &frankenterm_core::cx::Cx,
     permission_warnings: &[frankenterm_core::config::PermissionWarning],
     config: &frankenterm_core::config::Config,
     layout: &frankenterm_core::config::WorkspaceLayout,
@@ -79323,146 +79526,30 @@ fn run_diagnostics(
             .map(diagnostic_check_from_runtime_health),
     );
 
-    // Check 2: WezTerm CLI available
+    // Select the same mux backend used by production clients. This selection
+    // is finite: the local-version compatibility probe is timeout- and
+    // output-bounded in frankenterm-core.
     let wezterm_timeout = std::time::Duration::from_secs(5);
-    #[cfg(feature = "vendored")]
-    let mut local_wezterm_version: Option<frankenterm_core::vendored::WeztermVersion> = None;
-    match run_cmd_with_timeout(
-        std::process::Command::new(wezterm_binary()).arg("--version"),
-        wezterm_timeout,
-        WEZTERM_VERSION_MAX_STDOUT_BYTES,
-        DIAGNOSTIC_COMMAND_MAX_STDERR_BYTES,
-    ) {
-        Ok(output) if output.stdout.overflowed => {
-            checks.push(DiagnosticCheck::error(
-                "WezTerm CLI",
-                SingleLineOutputAdmissionError::Oversized.wezterm_diagnostic_detail(),
-                "Ensure the active backend bridge returns a valid bounded version",
-            ));
-        }
-        Ok(output) if output.stderr.overflowed => {
-            checks.push(DiagnosticCheck::error(
-                "WezTerm CLI",
-                WEZTERM_VERSION_STDERR_OVERSIZED_DETAIL,
-                "Ensure the active backend bridge returns bounded diagnostics",
-            ));
-        }
-        Ok(output) if output.status.success() => {
-            match admit_single_line_output(&output.stdout) {
-                Ok(version) => {
-                    checks.push(DiagnosticCheck::ok_with_detail(
-                        "WezTerm CLI",
-                        bounded_terminal_diagnostic(version, 128, 256),
-                    ));
-                    #[cfg(feature = "vendored")]
-                    {
-                        // `version` has passed the finite, UTF-8, non-empty,
-                        // control-free admission gate above. Parse that raw
-                        // admitted value so compatibility matching is not
-                        // distorted by display redaction or truncation.
-                        local_wezterm_version =
-                            Some(frankenterm_core::vendored::WeztermVersion::parse(version));
-                    }
-                }
-                Err(error) => {
-                    checks.push(DiagnosticCheck::error(
-                        "WezTerm CLI",
-                        error.wezterm_diagnostic_detail(),
-                        "Ensure the active backend bridge returns a valid bounded version",
-                    ));
-                }
-            }
-        }
-        Ok(output) => {
-            tracing::debug!(
-                exit_code = ?output.status.code(),
-                stderr_overflowed = output.stderr.overflowed,
-                retained_stderr_bytes = output.stderr.bytes.len(),
-                "WezTerm version probe returned a non-success status"
-            );
-            checks.push(DiagnosticCheck::error(
-                "WezTerm CLI",
-                "wezterm command failed",
-                "Ensure the active backend bridge (current: WezTerm) is installed and in PATH",
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            checks.push(DiagnosticCheck::error(
-                "WezTerm CLI",
-                "wezterm --version timed out",
-                "Backend bridge may be unresponsive; try restarting WezTerm",
-            ));
-        }
-        Err(error) => {
-            tracing::debug!(
-                error_kind = ?error.kind(),
-                "WezTerm version probe could not be completed"
-            );
-            let detail = if error.kind() == std::io::ErrorKind::NotFound {
-                "wezterm not found"
-            } else {
-                "wezterm version probe could not be completed"
-            };
-            checks.push(DiagnosticCheck::error(
-                "WezTerm CLI",
-                detail,
-                "Install WezTerm from https://wezfurlong.org/wezterm/",
-            ));
-        }
-    }
+    let mux_client = frankenterm_core::wezterm::build_unified_client(config);
+    let backend_selection = mux_client.selection().clone();
+    checks.push(mux_backend_diagnostic(&backend_selection));
 
-    // Check 2b: Vendored compatibility (only meaningful when vendored feature is enabled)
-    #[cfg(feature = "vendored")]
-    {
-        let compat =
-            frankenterm_core::vendored::compatibility_report(local_wezterm_version.as_ref());
-        if !compat.vendored_enabled {
-            checks.push(DiagnosticCheck::ok_with_detail(
-                "WezTerm vendored",
-                "vendored feature not enabled",
-            ));
-        } else {
-            match compat.status {
-                frankenterm_core::vendored::VendoredCompatibilityStatus::Matched => {
-                    checks.push(DiagnosticCheck::ok_with_detail(
-                        "WezTerm vendored",
-                        bounded_terminal_diagnostic(&compat.message, 256, 1_024),
-                    ));
-                }
-                frankenterm_core::vendored::VendoredCompatibilityStatus::Compatible => {
-                    let recommendation = compat
-                        .recommendation
-                        .as_deref()
-                        .map(|value| bounded_terminal_diagnostic(value, 256, 1_024))
-                        .unwrap_or_else(|| "Review vendored compatibility".to_string());
-                    checks.push(DiagnosticCheck::warning(
-                        "WezTerm vendored",
-                        bounded_terminal_diagnostic(&compat.message, 256, 1_024),
-                        recommendation,
-                    ));
-                }
-                frankenterm_core::vendored::VendoredCompatibilityStatus::Incompatible => {
-                    let recommendation = compat
-                        .recommendation
-                        .as_deref()
-                        .map(|value| bounded_terminal_diagnostic(value, 256, 1_024))
-                        .unwrap_or_else(|| "Update WezTerm or rebuild ft".to_string());
-                    checks.push(DiagnosticCheck::error(
-                        "WezTerm vendored",
-                        bounded_terminal_diagnostic(&compat.message, 256, 1_024),
-                        recommendation,
-                    ));
-                }
-            }
-        }
-    }
-    #[cfg(not(feature = "vendored"))]
-    {
+    // The external CLI is mandatory only for the CLI backend. A selected
+    // vendored client must not fail doctor merely because its optional
+    // fallback is absent, and it must not pay for a redundant second version
+    // subprocess after backend selection's bounded compatibility probe.
+    if wezterm_cli_probe_required(backend_selection.kind) {
+        checks.push(wezterm_cli_version_diagnostic(
+            &backend_selection,
+            wezterm_timeout,
+        ));
+    } else {
         checks.push(DiagnosticCheck::ok_with_detail(
-            "WezTerm vendored",
-            "vendored feature not enabled",
+            "WezTerm CLI",
+            "not used for the pane probe; vendored client selected",
         ));
     }
+    checks.push(vendored_compatibility_diagnostic(&backend_selection));
 
     // Check 3: WezTerm scrollback configuration
     match check_wezterm_scrollback() {
@@ -79515,74 +79602,110 @@ fn run_diagnostics(
         }
     }
 
-    // Check 5: WezTerm running and responding
-    match run_cmd_with_timeout(
-        &mut wezterm_cli_list_command(),
-        wezterm_timeout,
-        WEZTERM_LIST_MAX_STDOUT_BYTES,
-        DIAGNOSTIC_COMMAND_MAX_STDERR_BYTES,
-    ) {
-        Ok(output) if output.stdout.overflowed => {
-            checks.push(DiagnosticCheck::error(
-                "WezTerm connection",
-                WeztermListProbeFailure::Oversized.diagnostic_detail(),
-                "Reduce active pane count or inspect the backend bridge response",
-            ));
-        }
-        Ok(output) if output.stderr.overflowed => {
-            checks.push(DiagnosticCheck::error(
-                "WezTerm connection",
-                WeztermListProbeFailure::StderrOversized.diagnostic_detail(),
-                "Inspect the backend bridge without exposing raw diagnostic output",
-            ));
-        }
-        Ok(output) if output.status.success() => {
-            match serde_json::from_slice::<Vec<serde::de::IgnoredAny>>(&output.stdout.bytes) {
-                Ok(panes) => {
-                    checks.push(DiagnosticCheck::ok_with_detail(
+    // Check 5: the selected mux backend is running and responding. Preserve
+    // the bounded/no-auto-start CLI probe for CLI mode; vendored mode exercises
+    // the same MuxInterface used by the runtime under an explicit outer
+    // deadline. An explicitly configured socket never falls back; an implicit
+    // socket retains the runtime's eligible transport-failure CLI failover.
+    if wezterm_cli_probe_required(backend_selection.kind) {
+        match run_cmd_with_timeout(
+            &mut wezterm_cli_list_command(),
+            wezterm_timeout,
+            WEZTERM_LIST_MAX_STDOUT_BYTES,
+            DIAGNOSTIC_COMMAND_MAX_STDERR_BYTES,
+        ) {
+            Ok(output) if output.stdout.overflowed => {
+                checks.push(DiagnosticCheck::error(
+                    "WezTerm connection",
+                    WeztermListProbeFailure::Oversized.diagnostic_detail(),
+                    "Reduce active pane count or inspect the backend bridge response",
+                ));
+            }
+            Ok(output) if output.stderr.overflowed => {
+                checks.push(DiagnosticCheck::error(
+                    "WezTerm connection",
+                    WeztermListProbeFailure::StderrOversized.diagnostic_detail(),
+                    "Inspect the backend bridge without exposing raw diagnostic output",
+                ));
+            }
+            Ok(output) if output.status.success() => {
+                match serde_json::from_slice::<Vec<serde::de::IgnoredAny>>(&output.stdout.bytes) {
+                    Ok(panes) => checks.push(DiagnosticCheck::ok_with_detail(
                         "WezTerm connection",
-                        format!("{} pane(s) detected", panes.len()),
-                    ));
-                }
-                Err(_) => {
-                    checks.push(DiagnosticCheck::warning(
+                        format!("{} pane(s) detected via CLI", panes.len()),
+                    )),
+                    Err(_) => checks.push(DiagnosticCheck::warning(
                         "WezTerm connection",
                         "Could not parse pane list",
                         "Check backend bridge version compatibility (WezTerm)",
-                    ));
+                    )),
                 }
             }
+            Ok(output) => {
+                tracing::debug!(
+                    exit_code = ?output.status.code(),
+                    stderr_overflowed = output.stderr.overflowed,
+                    retained_stderr_bytes = output.stderr.bytes.len(),
+                    "WezTerm connection probe returned a non-success status"
+                );
+                checks.push(DiagnosticCheck::error(
+                    "WezTerm connection",
+                    WeztermListProbeFailure::NonSuccess.diagnostic_detail(),
+                    "Ensure the selected WezTerm CLI mux is running",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                checks.push(DiagnosticCheck::error(
+                    "WezTerm connection",
+                    "wezterm cli list timed out",
+                    "The selected CLI mux did not answer the bounded pane probe",
+                ));
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error_kind = ?error.kind(),
+                    "WezTerm connection probe could not be completed"
+                );
+                checks.push(DiagnosticCheck::error(
+                    "WezTerm connection",
+                    WeztermListProbeFailure::from_io_error(&error).diagnostic_detail(),
+                    "Ensure the selected WezTerm CLI backend is installed and running",
+                ));
+            }
         }
-        Ok(output) => {
-            tracing::debug!(
-                exit_code = ?output.status.code(),
-                stderr_overflowed = output.stderr.overflowed,
-                retained_stderr_bytes = output.stderr.bytes.len(),
-                "WezTerm connection probe returned a non-success status"
-            );
-            checks.push(DiagnosticCheck::error(
+    } else if cx.checkpoint().is_err() {
+        checks.push(DiagnosticCheck::error(
+            "WezTerm connection",
+            "direct mux pane probe cancelled before execution",
+            "Retry doctor with a live request capability",
+        ));
+    } else {
+        let probe = frankenterm_core::runtime_async::timeout_with_cx(
+            cx,
+            wezterm_timeout,
+            frankenterm_core::wezterm::MuxInterface::list_panes_with_cx(&mux_client, cx),
+        )
+        .await;
+        match probe {
+            Ok(Ok(panes)) => checks.push(DiagnosticCheck::ok_with_detail(
                 "WezTerm connection",
-                WeztermListProbeFailure::NonSuccess.diagnostic_detail(),
-                "Ensure the active backend bridge (current: WezTerm GUI/mux) is running",
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            checks.push(DiagnosticCheck::error(
+                format!("{} pane(s) detected via vendored client", panes.len()),
+            )),
+            Ok(Err(_)) => checks.push(DiagnosticCheck::error(
                 "WezTerm connection",
-                "wezterm cli list timed out",
-                "Backend mux may not be running; start the WezTerm bridge",
-            ));
-        }
-        Err(e) => {
-            tracing::debug!(
-                error_kind = ?e.kind(),
-                "WezTerm connection probe could not be completed"
-            );
-            checks.push(DiagnosticCheck::error(
+                "direct mux pane probe failed",
+                "Check the configured mux socket and backend compatibility",
+            )),
+            Err(_) if cx.checkpoint().is_err() => checks.push(DiagnosticCheck::error(
                 "WezTerm connection",
-                WeztermListProbeFailure::from_io_error(&e).diagnostic_detail(),
-                "Ensure the active backend bridge (current: WezTerm) is installed and running",
-            ));
+                "direct mux pane probe cancelled",
+                "Retry doctor with a live request capability",
+            )),
+            Err(_) => checks.push(DiagnosticCheck::error(
+                "WezTerm connection",
+                "direct mux pane probe timed out",
+                "Check the configured mux socket and mux responsiveness",
+            )),
         }
     }
 
@@ -104833,6 +104956,108 @@ A  docs/new-proof.md\n";
         }
     }
 
+    #[test]
+    fn doctor_only_requires_external_cli_for_cli_backend() {
+        use frankenterm_core::wezterm::BackendKind;
+
+        assert!(wezterm_cli_probe_required(BackendKind::Cli));
+        assert!(!wezterm_cli_probe_required(BackendKind::Vendored));
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn doctor_treats_selected_direct_mux_as_healthy_without_cli_fallback() {
+        use frankenterm_core::wezterm::{BackendKind, BackendSelection};
+
+        let selection = BackendSelection {
+            kind: BackendKind::Vendored,
+            reason: "vendored backend selected: explicit socket override".to_string(),
+            compatibility: None,
+        };
+        let backend = mux_backend_diagnostic(&selection);
+        assert_eq!(backend.status, DiagnosticStatus::Ok);
+        assert!(backend.detail.as_deref().unwrap().contains("vendored"));
+
+        let compatibility = vendored_compatibility_diagnostic(&selection);
+        assert_eq!(compatibility.status, DiagnosticStatus::Ok);
+        assert!(
+            compatibility
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("explicit socket override")
+        );
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn doctor_reports_unavailable_direct_mux_as_cli_degradation_not_failure() {
+        use frankenterm_core::vendored::{
+            VendoredCompatibilityReport, VendoredCompatibilityStatus,
+        };
+        use frankenterm_core::wezterm::{BackendKind, BackendSelection};
+
+        let report = VendoredCompatibilityReport {
+            status: VendoredCompatibilityStatus::Incompatible,
+            vendored_enabled: true,
+            allow_vendored: false,
+            local_version: None,
+            local_commit: None,
+            vendored_commit: Some("abcdef12".to_string()),
+            vendored_version: None,
+            message: "local WezTerm version unavailable".to_string(),
+            recommendation: Some("use the selected CLI backend".to_string()),
+        };
+        let selection = BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "vendored backend disallowed".to_string(),
+            compatibility: Some(serde_json::to_value(report).expect("serialize report")),
+        };
+
+        let compatibility = vendored_compatibility_diagnostic(&selection);
+        assert_eq!(compatibility.status, DiagnosticStatus::Warning);
+        assert!(
+            compatibility
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("version unavailable")
+        );
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn doctor_reuses_backend_selection_version_probe_for_cli_diagnostic() {
+        use frankenterm_core::vendored::{
+            VendoredCompatibilityReport, VendoredCompatibilityStatus,
+        };
+        use frankenterm_core::wezterm::{BackendKind, BackendSelection};
+
+        let report = VendoredCompatibilityReport {
+            status: VendoredCompatibilityStatus::Matched,
+            vendored_enabled: true,
+            allow_vendored: true,
+            local_version: Some("wezterm 20260810-abcdef12".to_string()),
+            local_commit: Some("abcdef12".to_string()),
+            vendored_commit: Some("abcdef12".to_string()),
+            vendored_version: None,
+            message: "local and vendored commits match".to_string(),
+            recommendation: None,
+        };
+        let selection = BackendSelection {
+            kind: BackendKind::Cli,
+            reason: "mux socket not discovered; falling back to CLI".to_string(),
+            compatibility: Some(serde_json::to_value(report).expect("serialize report")),
+        };
+
+        let diagnostic = wezterm_cli_version_diagnostic(&selection, std::time::Duration::ZERO);
+        assert_eq!(diagnostic.status, DiagnosticStatus::Ok);
+        assert_eq!(
+            diagnostic.detail.as_deref(),
+            Some("wezterm 20260810-abcdef12")
+        );
+    }
+
     #[cfg(feature = "browser")]
     #[test]
     fn diagnostic_playwright_probe_reuses_exact_auth_capability_and_safe_details() {
@@ -105646,6 +105871,30 @@ A  docs/new-proof.md\n";
         }
     }
 
+    fn create_doctor_database_fixture(layout: &frankenterm_core::config::WorkspaceLayout) {
+        std::fs::create_dir_all(&layout.ft_dir).expect("create doctor fixture directory");
+        let connection =
+            rusqlite::Connection::open(&layout.db_path).expect("create doctor fixture database");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                frankenterm_core::storage::SCHEMA_VERSION,
+            )
+            .expect("stamp doctor fixture schema version");
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("enable WAL for doctor fixture");
+    }
+
+    async fn run_test_diagnostics(
+        config: &frankenterm_core::config::Config,
+        layout: &frankenterm_core::config::WorkspaceLayout,
+    ) -> Vec<DiagnosticCheck> {
+        let cx = frankenterm_core::cx::for_request();
+        run_diagnostics(&cx, &[], config, layout).await
+    }
+
     #[test]
     fn doctor_fixture_healthy_workspace() {
         run_async_test(async {
@@ -105653,14 +105902,13 @@ A  docs/new-proof.md\n";
             let layout = make_test_layout(&temp);
             std::fs::create_dir_all(&layout.logs_dir).unwrap();
 
-            // Create a valid SQLite DB with correct schema version
-            let storage = StorageHandle::new(&layout.db_path.to_string_lossy())
-                .await
-                .unwrap();
-            let _ = storage.shutdown().await;
+            // Doctor validates metadata only. Build the minimal truthful DB
+            // fixture directly so this test cannot fail because an unrelated
+            // full migration failpoint or background storage worker is active.
+            create_doctor_database_fixture(&layout);
             let config = frankenterm_core::config::Config::default();
 
-            let checks = run_diagnostics(&[], &config, &layout);
+            let checks = run_test_diagnostics(&config, &layout).await;
 
             // Should have multiple checks
             assert!(
@@ -105762,17 +106010,14 @@ A  docs/new-proof.md\n";
             let layout = make_test_layout(&temp);
             std::fs::create_dir_all(&layout.logs_dir).unwrap();
 
-            let storage = StorageHandle::new(&layout.db_path.to_string_lossy())
-                .await
-                .unwrap();
-            let _ = storage.shutdown().await;
+            create_doctor_database_fixture(&layout);
 
             let mut config = frankenterm_core::config::Config::default();
             config.tuning.web.default_host = "0.0.0.0".to_string();
             config.tuning.web.default_port = 9911;
             config.tuning.workflows.max_steps = 12;
 
-            let checks = run_diagnostics(&[], &config, &layout);
+            let checks = run_test_diagnostics(&config, &layout).await;
             let tuning_check = checks
                 .iter()
                 .find(|c| c.name == "tuning")
@@ -105800,157 +106045,177 @@ A  docs/new-proof.md\n";
 
     #[test]
     fn doctor_fixture_missing_ft_dir() {
-        let temp = unique_temp_dir("doctor_no_wa");
-        let layout = make_test_layout(&temp);
-        let config = frankenterm_core::config::Config::default();
+        run_async_test(async {
+            let temp = unique_temp_dir("doctor_no_wa");
+            let layout = make_test_layout(&temp);
+            let config = frankenterm_core::config::Config::default();
 
-        let checks = run_diagnostics(&[], &config, &layout);
+            let checks = run_test_diagnostics(&config, &layout).await;
 
-        let ft_dir_check = checks.iter().find(|c| c.name == ".ft directory").unwrap();
-        assert_eq!(ft_dir_check.status, DiagnosticStatus::Warning);
-        assert!(
-            ft_dir_check
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("does not exist")
-        );
+            let ft_dir_check = checks.iter().find(|c| c.name == ".ft directory").unwrap();
+            assert_eq!(ft_dir_check.status, DiagnosticStatus::Warning);
+            assert!(
+                ft_dir_check
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("does not exist")
+            );
 
-        let db_check = checks.iter().find(|c| c.name == "database").unwrap();
-        assert_eq!(db_check.status, DiagnosticStatus::Warning);
+            let db_check = checks.iter().find(|c| c.name == "database").unwrap();
+            assert_eq!(db_check.status, DiagnosticStatus::Warning);
 
-        let _ = std::fs::remove_dir_all(&temp);
+            let _ = std::fs::remove_dir_all(&temp);
+        });
     }
 
     #[test]
-    fn doctor_fixture_stale_lock_file() {
-        let temp = unique_temp_dir("doctor_stale_lock");
-        let layout = make_test_layout(&temp);
-        std::fs::create_dir_all(&layout.ft_dir).unwrap();
+    fn doctor_fixture_held_lock_with_invalid_metadata_is_warning() {
+        run_async_test(async {
+            let temp = unique_temp_dir("doctor_stale_lock");
+            let layout = make_test_layout(&temp);
+            std::fs::create_dir_all(&layout.ft_dir).unwrap();
 
-        // Write a lock file with a PID that definitely doesn't exist
-        std::fs::write(&layout.lock_path, "999999999").unwrap();
+            // A free lock file is truthfully reported as free regardless of
+            // stale bytes. Hold the actual lock and corrupt only its identity
+            // sidecar to exercise the warning path deterministically.
+            let held = frankenterm_core::lock::WatcherLock::acquire(&layout.lock_path)
+                .expect("hold doctor fixture lock");
+            std::fs::write(held.meta_path(), b"invalid lock identity")
+                .expect("invalidate doctor fixture lock metadata");
 
-        let config = frankenterm_core::config::Config::default();
+            let config = frankenterm_core::config::Config::default();
 
-        let checks = run_diagnostics(&[], &config, &layout);
+            let checks = run_test_diagnostics(&config, &layout).await;
 
-        let daemon_check = checks.iter().find(|c| c.name == "daemon status").unwrap();
-        assert_eq!(daemon_check.status, DiagnosticStatus::Warning);
-        let detail = daemon_check.detail.as_deref().unwrap();
-        assert!(
-            detail.contains("stale") || detail.contains("not running"),
-            "stale lock should be detected, got: {detail}"
-        );
+            let daemon_check = checks.iter().find(|c| c.name == "daemon status").unwrap();
+            assert_eq!(daemon_check.status, DiagnosticStatus::Warning);
+            let detail = daemon_check.detail.as_deref().unwrap();
+            assert!(
+                detail.contains("held") && detail.contains("identity metadata"),
+                "held lock with invalid identity should be explicit, got: {detail}"
+            );
 
-        let _ = std::fs::remove_dir_all(&temp);
+            drop(held);
+            let _ = std::fs::remove_dir_all(&temp);
+        });
     }
 
     #[test]
     fn doctor_fixture_feature_flags() {
-        let temp = unique_temp_dir("doctor_features");
-        let layout = make_test_layout(&temp);
-        std::fs::create_dir_all(&layout.ft_dir).unwrap();
+        run_async_test(async {
+            let temp = unique_temp_dir("doctor_features");
+            let layout = make_test_layout(&temp);
+            std::fs::create_dir_all(&layout.ft_dir).unwrap();
 
-        let config = frankenterm_core::config::Config::default();
+            let config = frankenterm_core::config::Config::default();
 
-        let checks = run_diagnostics(&[], &config, &layout);
+            let checks = run_test_diagnostics(&config, &layout).await;
 
-        let features_check = checks.iter().find(|c| c.name == "features").unwrap();
-        assert_eq!(features_check.status, DiagnosticStatus::Ok);
-        // Features detail should be a string (either feature list or "default")
-        let detail = features_check.detail.as_deref().unwrap();
-        assert!(!detail.is_empty());
-        // Should not contain secrets
-        assert!(!detail.contains("sk-"));
-        assert!(!detail.contains("Bearer"));
+            let features_check = checks.iter().find(|c| c.name == "features").unwrap();
+            assert_eq!(features_check.status, DiagnosticStatus::Ok);
+            // Features detail should be a string (either feature list or "default")
+            let detail = features_check.detail.as_deref().unwrap();
+            assert!(!detail.is_empty());
+            // Should not contain secrets
+            assert!(!detail.contains("sk-"));
+            assert!(!detail.contains("Bearer"));
 
-        let _ = std::fs::remove_dir_all(&temp);
+            let _ = std::fs::remove_dir_all(&temp);
+        });
     }
 
     #[test]
     fn doctor_json_output_all_checks_have_valid_status() {
-        let temp = unique_temp_dir("doctor_valid_status");
-        let layout = make_test_layout(&temp);
-        std::fs::create_dir_all(&layout.ft_dir).unwrap();
+        run_async_test(async {
+            let temp = unique_temp_dir("doctor_valid_status");
+            let layout = make_test_layout(&temp);
+            std::fs::create_dir_all(&layout.ft_dir).unwrap();
 
-        let config = frankenterm_core::config::Config::default();
+            let config = frankenterm_core::config::Config::default();
 
-        let checks = run_diagnostics(&[], &config, &layout);
+            let checks = run_test_diagnostics(&config, &layout).await;
 
-        // Verify every check can be serialized to valid JSON
-        for check in &checks {
-            let json = check.to_json_value();
-            let status = json["status"].as_str().unwrap();
-            assert!(
-                ["ok", "warning", "error"].contains(&status),
-                "check '{}' has invalid status: '{}'",
-                check.name,
-                status
-            );
-            // Name is always present and non-empty
-            let name = json["name"].as_str().unwrap();
-            assert!(!name.is_empty(), "check name must not be empty");
-        }
+            // Verify every check can be serialized to valid JSON
+            for check in &checks {
+                let json = check.to_json_value();
+                let status = json["status"].as_str().unwrap();
+                assert!(
+                    ["ok", "warning", "error"].contains(&status),
+                    "check '{}' has invalid status: '{}'",
+                    check.name,
+                    status
+                );
+                // Name is always present and non-empty
+                let name = json["name"].as_str().unwrap();
+                assert!(!name.is_empty(), "check name must not be empty");
+            }
 
-        // Overall JSON envelope
-        let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
-        let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
-        let overall = if has_errors {
-            "error"
-        } else if has_warnings {
-            "warning"
-        } else {
-            "ok"
-        };
+            // Overall JSON envelope
+            let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
+            let has_warnings = checks
+                .iter()
+                .any(|c| c.status == DiagnosticStatus::Warning);
+            let overall = if has_errors {
+                "error"
+            } else if has_warnings {
+                "warning"
+            } else {
+                "ok"
+            };
 
-        let envelope = serde_json::json!({
-            "ok": !has_errors,
-            "status": overall,
-            "version": frankenterm_core::VERSION,
-            "checks": checks.iter().map(|c| c.to_json_value()).collect::<Vec<_>>(),
+            let envelope = serde_json::json!({
+                "ok": !has_errors,
+                "status": overall,
+                "version": frankenterm_core::VERSION,
+                "checks": checks.iter().map(|c| c.to_json_value()).collect::<Vec<_>>(),
+            });
+
+            // Envelope has required fields
+            assert!(envelope.get("ok").is_some());
+            assert!(envelope.get("status").is_some());
+            assert!(envelope.get("version").is_some());
+            assert!(envelope.get("checks").is_some());
+
+            // Full JSON roundtrip
+            let json_str = serde_json::to_string_pretty(&envelope).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+            assert_eq!(parsed["ok"], envelope["ok"]);
+            assert_eq!(parsed["status"], envelope["status"]);
+
+            let _ = std::fs::remove_dir_all(&temp);
         });
-
-        // Envelope has required fields
-        assert!(envelope.get("ok").is_some());
-        assert!(envelope.get("status").is_some());
-        assert!(envelope.get("version").is_some());
-        assert!(envelope.get("checks").is_some());
-
-        // Full JSON roundtrip
-        let json_str = serde_json::to_string_pretty(&envelope).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed["ok"], envelope["ok"]);
-        assert_eq!(parsed["status"], envelope["status"]);
-
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
     fn doctor_check_names_are_deterministic() {
-        let temp = unique_temp_dir("doctor_deterministic");
-        let layout = make_test_layout(&temp);
-        std::fs::create_dir_all(&layout.ft_dir).unwrap();
+        run_async_test(async {
+            let temp = unique_temp_dir("doctor_deterministic");
+            let layout = make_test_layout(&temp);
+            std::fs::create_dir_all(&layout.ft_dir).unwrap();
 
-        let config = frankenterm_core::config::Config::default();
+            let config = frankenterm_core::config::Config::default();
 
-        let checks_1 = run_diagnostics(&[], &config, &layout);
-        let checks_2 = run_diagnostics(&[], &config, &layout);
+            let checks_1 = run_test_diagnostics(&config, &layout).await;
+            let checks_2 = run_test_diagnostics(&config, &layout).await;
 
-        // Same names in same order
-        let names_1: Vec<&str> = checks_1.iter().map(|c| c.name.as_str()).collect();
-        let names_2: Vec<&str> = checks_2.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names_1, names_2, "check names must be deterministic");
+            // Same names in same order
+            let names_1: Vec<&str> = checks_1.iter().map(|c| c.name.as_str()).collect();
+            let names_2: Vec<&str> = checks_2.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names_1, names_2, "check names must be deterministic");
 
-        // Same statuses
-        let statuses_1: Vec<&str> = checks_1.iter().map(|c| c.status.as_str()).collect();
-        let statuses_2: Vec<&str> = checks_2.iter().map(|c| c.status.as_str()).collect();
-        assert_eq!(
-            statuses_1, statuses_2,
-            "check statuses must be deterministic"
-        );
+            // Same statuses
+            let statuses_1: Vec<&str> =
+                checks_1.iter().map(|c| c.status.as_str()).collect();
+            let statuses_2: Vec<&str> =
+                checks_2.iter().map(|c| c.status.as_str()).collect();
+            assert_eq!(
+                statuses_1, statuses_2,
+                "check statuses must be deterministic"
+            );
 
-        let _ = std::fs::remove_dir_all(&temp);
+            let _ = std::fs::remove_dir_all(&temp);
+        });
     }
 
     #[test]

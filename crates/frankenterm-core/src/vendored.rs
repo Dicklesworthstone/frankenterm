@@ -6,7 +6,10 @@
 //! - Compatibility classification (matched/compatible/incompatible)
 
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+
+const LOCAL_WEZTERM_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LOCAL_WEZTERM_VERSION_MAX_STDOUT_BYTES: usize = 512;
+const LOCAL_WEZTERM_VERSION_MAX_STDERR_BYTES: usize = 16 * 1024;
 
 #[cfg(all(feature = "vendored", unix))]
 mod mux_client;
@@ -187,17 +190,33 @@ pub fn vendored_metadata() -> VendoredWeztermMetadata {
     }
 }
 
-/// Attempt to read the local WezTerm version via `wezterm --version`.
+/// Attempt to read the local WezTerm version via a finite `wezterm --version`
+/// probe.
+///
+/// Backend selection runs on interactive paths, so this probe must never wait
+/// indefinitely or retain unbounded child output. Any timeout, cleanup
+/// failure, oversized output, invalid UTF-8, non-success status, or malformed
+/// multi-line/control-bearing response conservatively means that no compatible
+/// local version was established.
 pub fn read_local_wezterm_version() -> Option<WeztermVersion> {
-    let output = Command::new("wezterm").arg("--version").output().ok()?;
+    let mut command = crate::runtime_async::process::Command::new(crate::wezterm::wezterm_binary());
+    command
+        .arg("--version")
+        .stdout_limit(LOCAL_WEZTERM_VERSION_MAX_STDOUT_BYTES)
+        .stderr_limit(LOCAL_WEZTERM_VERSION_MAX_STDERR_BYTES);
+    let output = command.output_blocking(LOCAL_WEZTERM_VERSION_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if version.is_empty() {
+    admit_local_wezterm_version(&output.stdout)
+}
+
+fn admit_local_wezterm_version(stdout: &[u8]) -> Option<WeztermVersion> {
+    let version = std::str::from_utf8(stdout).ok()?.trim();
+    if version.is_empty() || version.chars().any(char::is_control) {
         return None;
     }
-    Some(WeztermVersion::parse(&version))
+    Some(WeztermVersion::parse(version))
 }
 
 /// Compute vendored compatibility classification from local version output.
@@ -557,6 +576,16 @@ mod tests {
         assert!(v.commit.is_none());
         let v = WeztermVersion::parse("");
         assert!(v.commit.is_none());
+    }
+
+    #[test]
+    fn local_version_probe_admission_is_strict_and_single_line() {
+        let version = admit_local_wezterm_version(b"wezterm 20240203-110809-5046fc22\n")
+            .expect("valid bounded version");
+        assert_eq!(version.commit.as_deref(), Some("5046fc22"));
+        assert!(admit_local_wezterm_version(b"").is_none());
+        assert!(admit_local_wezterm_version(b"wezterm\nforged").is_none());
+        assert!(admit_local_wezterm_version(&[0xff]).is_none());
     }
 
     #[test]

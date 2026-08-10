@@ -239,9 +239,21 @@ static NATIVE_DISCOVERY_RUNTIME_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static NATIVE_DISCOVERY_WORKER_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn saturating_increment(counter: &AtomicU64) {
-    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(1))
-    });
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            return;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Process-local ownership and settlement telemetry for native discovery.
@@ -1051,7 +1063,7 @@ fn checked_discovery_resource_add(
     additional: usize,
     limit: usize,
 ) -> Result<usize, SessionResumeError> {
-    let observed = current.checked_add(additional).unwrap_or(usize::MAX);
+    let observed = current.saturating_add(additional);
     if observed > limit {
         return Err(SessionResumeError::DiscoveryResourceLimitExceeded {
             resource,
@@ -2254,15 +2266,20 @@ struct NativeDiscoveryPermit;
 
 impl NativeDiscoveryPermit {
     fn try_acquire() -> Option<Self> {
-        let previous = NATIVE_DISCOVERY_ACTIVE_SCANS
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS).then_some(active + 1)
-            });
-        let active = match previous {
-            Ok(previous) => previous + 1,
-            Err(_) => {
+        let mut previous = NATIVE_DISCOVERY_ACTIVE_SCANS.load(Ordering::Acquire);
+        let active = loop {
+            if previous >= MAX_CONCURRENT_NATIVE_DISCOVERY_SCANS {
                 saturating_increment(&NATIVE_DISCOVERY_SATURATED_TOTAL);
                 return None;
+            }
+            match NATIVE_DISCOVERY_ACTIVE_SCANS.compare_exchange_weak(
+                previous,
+                previous + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break previous + 1,
+                Err(observed) => previous = observed,
             }
         };
 

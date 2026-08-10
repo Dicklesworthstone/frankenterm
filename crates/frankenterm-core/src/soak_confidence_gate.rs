@@ -1008,7 +1008,7 @@ pub fn validate_soak_workload_plan(plan: &SoakWorkloadPlan) -> Result<(), SoakWo
         || !SOAK_WORKLOAD_REQUIRED_PANE_COUNTS.contains(&plan.pane_count)
         || plan.window_count == 0
         || plan.tab_count < plan.window_count
-        || !plan.tab_count.is_multiple_of(plan.window_count)
+        || plan.tab_count % plan.window_count != 0
         || plan.tab_count > plan.pane_count
         || plan.interactive_pane_count == 0
         || plan.interactive_pane_count > plan.pane_count
@@ -1404,7 +1404,7 @@ fn validate_soak_scale(
 ) -> Result<(), SoakWorkloadCorpusError> {
     if scale.window_count == 0
         || scale.tab_count < scale.window_count
-        || !scale.tab_count.is_multiple_of(scale.window_count)
+        || scale.tab_count % scale.window_count != 0
         || scale.tab_count > scale.pane_count
         || scale.interactive_pane_count == 0
         || scale.interactive_pane_count > scale.pane_count
@@ -3081,10 +3081,7 @@ impl ConfidenceGate {
             slo_conforming: verdict.decision != ConfidenceDecision::NotConfident,
             error_rate: results.aggregate_error_rate(),
             p95_latency_ms: results.maximum_p95_latency_ms(),
-            incident_count: match u32::try_from(results.cells_failed()) {
-                Ok(count) => count,
-                Err(_) => u32::MAX,
-            },
+            incident_count: u32::try_from(results.cells_failed()).unwrap_or(u32::MAX),
             rollback_triggered: false,
             notes: format!(
                 "Soak verdict: {:?}. {}/{} cells passed.",

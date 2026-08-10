@@ -112,6 +112,16 @@ impl Drop for PreparedSplitPane {
     }
 }
 
+// `async_trait` must synthesize boxed `Future` return values to keep this
+// trait object-safe. Those futures are already `#[must_use]`; the macro also
+// annotates each generated trait method, which newer Clippy diagnoses as
+// `double_must_use` even though there is no source-level attribute to remove.
+// Keep this as an expectation so a future `async_trait`/Clippy combination
+// that removes the synthetic duplication makes the workaround fail loudly.
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait duplicates the intrinsic must-use contract of its generated boxed futures"
+)]
 #[async_trait(?Send)]
 pub trait Domain: Downcast + Send + Sync {
     /// Spawn a new command within this domain on the exact originating mux.

@@ -6591,16 +6591,23 @@ impl InterruptibleTimerService {
     }
 
     fn try_admit(&self) -> Result<InterruptibleTimerAdmission<'_>, SleepWithCxError> {
-        let admitted = self.active.try_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |active| (active < self.capacity).then_some(active + 1),
-        );
-        if admitted.is_err() {
-            saturating_increment_counter(&self.saturations);
-            return Err(SleepWithCxError {
-                kind: SleepWithCxErrorKind::TimerCapacityExhausted,
-            });
+        let mut active = self.active.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if active >= self.capacity {
+                saturating_increment_counter(&self.saturations);
+                return Err(SleepWithCxError {
+                    kind: SleepWithCxErrorKind::TimerCapacityExhausted,
+                });
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => active = observed,
+            }
         }
         saturating_increment_counter(&self.admissions);
         Ok(InterruptibleTimerAdmission { service: self })
@@ -7390,21 +7397,20 @@ where
     // cancellation race and remains a truthful downstream acknowledgement.
     let cancellation_signal = asupersync::sync::OnceCell::<()>::new();
     let cancellation = std::pin::pin!(cancellation_signal.wait(cx));
-    match select(output, cancellation).await {
-        Either::Left((result, _cancellation)) => result,
-        Either::Right((_cancelled, output)) => {
-            drop(output);
-            let cancellation_latency_upper_bound_ns =
-                cx_timer_now(cx).duration_since(asupersync::Time::from_nanos(
-                    last_pending_at_ns.load(std::sync::atomic::Ordering::Relaxed),
-                ));
-            Err(NonblockingWriteError::cancelled(
-                progress(),
-                blocked_duration(),
-                cancellation_latency_upper_bound_ns,
-            ))
-        }
+    if let Either::Left((result, _cancellation)) = select(output, cancellation).await {
+        return result;
     }
+    // The losing output future's pinned borrow ends with the `if let`
+    // temporary above, before these captured progress cells are inspected.
+    let cancellation_latency_upper_bound_ns =
+        cx_timer_now(cx).duration_since(asupersync::Time::from_nanos(
+            last_pending_at_ns.load(std::sync::atomic::Ordering::Relaxed),
+        ));
+    Err(NonblockingWriteError::cancelled(
+        progress(),
+        blocked_duration(),
+        cancellation_latency_upper_bound_ns,
+    ))
 }
 
 /// Pause without inheriting the ambient capability budget.

@@ -361,6 +361,15 @@ fn text_from_semantic_zone_lines(logical_lines: &[LogicalLine], zone: &SemanticZ
 }
 
 /// A Pane represents a view on a terminal
+// `async_trait` keeps this trait object-safe by generating boxed `Future`
+// returns. The macro's own `#[must_use]` annotation duplicates the future's
+// intrinsic must-use contract under newer Clippy, so scope the compatibility
+// expectation to this one macro-generated trait surface and fail loudly when
+// the macro/compiler combination no longer needs it.
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait duplicates the intrinsic must-use contract of its generated boxed future"
+)]
 #[async_trait(?Send)]
 pub trait Pane: Downcast + Send + Sync {
     fn pane_id(&self) -> PaneId;
