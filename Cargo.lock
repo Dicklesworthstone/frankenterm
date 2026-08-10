@@ -3688,6 +3688,7 @@ dependencies = [
  "lfucache",
  "loom",
  "memchr",
+ "metrics",
  "mux",
  "nix 0.31.3",
  "proptest",
