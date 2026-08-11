@@ -89,8 +89,10 @@
 /// Bumped 40 -> 41 to fence unclean session ownership to a host boot and
 /// process incarnation, persist capture heartbeats, and record explicit
 /// recovery-retention acknowledgement without conflating live sessions with
-/// stale crash candidates.
-pub const SCHEMA_VERSION: i32 = 41;
+/// stale crash candidates. Bumped 41 -> 42 so databases created by the first
+/// v41 implementation migrate to the same all-or-none owner-tuple enforcement
+/// as fresh databases instead of silently retaining weaker trigger authority.
+pub const SCHEMA_VERSION: i32 = 42;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with

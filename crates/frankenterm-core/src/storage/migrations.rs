@@ -2136,6 +2136,17 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // possible again, so this authority migration is forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 42,
+        description: "Enforce owner-lifecycle tuple parity on upgraded session databases",
+        // Applied by `ensure_session_owner_lifecycle_schema`, which replaces
+        // the first v41 mux-session triggers with canonical bodies that enforce
+        // the same owner tuple as a fresh v42 table.
+        up_sql: "",
+        // Weakening upgraded databases back to the first v41 trigger authority
+        // would reintroduce partial owner tuples, so this is forward-only.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -5545,8 +5556,8 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // protects never-reused IDs and restore-attempt settlement evidence; v39
     // protects the transactional bounded scrollback projection; v40 protects
     // exact retained-session byte authority; v41 protects live-owner fencing
-    // from stale recovery cleanup. V41 is therefore the current downgrade
-    // floor.
+    // from stale recovery cleanup; v42 makes the owner tuple invariant
+    // migration-safe. V42 is therefore the current downgrade floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
@@ -5663,6 +5674,10 @@ fn apply_migration_mutation(
                     ensure_session_owner_lifecycle_schema(conn)?;
                     apply_raw_up_sql = false;
                 }
+                42 => {
+                    ensure_session_owner_lifecycle_schema(conn)?;
+                    apply_raw_up_sql = false;
+                }
                 _ => {}
             }
             if apply_raw_up_sql && !migration.up_sql.is_empty() {
@@ -5685,6 +5700,11 @@ fn apply_migration_mutation(
                 validate_session_owner_lifecycle_schema(conn)?;
                 validate_session_retained_size_schema(conn)?;
                 ensure_no_foreign_key_violations(conn, "migration v41")?;
+            }
+            if migration.version == 42 {
+                validate_session_owner_lifecycle_schema(conn)?;
+                validate_session_retained_size_schema(conn)?;
+                ensure_no_foreign_key_violations(conn, "migration v42")?;
             }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;
@@ -8512,8 +8532,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_scrollback_size_and_owner_authority_v36_through_v41_are_forward_only() {
-        for version in [36, 37, 38, 39, 40, 41] {
+    fn checkpoint_scrollback_size_and_owner_authority_v36_through_v42_are_forward_only() {
+        for version in [36, 37, 38, 39, 40, 41, 42] {
             let migration = MIGRATIONS
                 .iter()
                 .find(|migration| migration.version == version)
@@ -8534,6 +8554,8 @@ mod tests {
         assert!(build_migration_plan(40, 35).is_err());
         assert!(build_migration_plan(41, 40).is_err());
         assert!(build_migration_plan(41, 35).is_err());
+        assert!(build_migration_plan(42, 41).is_err());
+        assert!(build_migration_plan(42, 35).is_err());
     }
 
     #[test]
@@ -9570,6 +9592,53 @@ mod tests {
                 [],
             )
             .expect_err("canonical v41 trigger must reject a partial owner tuple");
+        assert!(partial_owner.to_string().contains("invalid session owner lifecycle tuple"));
+    }
+
+    #[test]
+    fn v42_reinstalls_migration_safe_owner_tuple_authority() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, shutdown_clean, topology_json, ft_version,
+                 host_id, owner_pid, owner_process_start, owner_heartbeat_at
+             ) VALUES ('owned-v42', 1, 0, '{}', '0.42.0',
+                       '{\"version\":3,\"hostname\":\"trj\",\"boot_id\":\"boot-a\"}',
+                       42, 900, 1)",
+            [],
+        )
+        .expect("insert owner-fenced session");
+
+        // Model a database written by the first v41 implementation: its schema
+        // version is current for that binary, but its mux update trigger lacks
+        // the strengthened owner-tuple guard installed by v42.
+        conn.execute_batch("DROP TRIGGER mux_sessions_retained_size_au;")
+            .expect("remove strengthened trigger from historical fixture");
+        conn.execute("DELETE FROM schema_version WHERE version = 42", [])
+            .expect("rewind migration audit fixture");
+        set_user_version(&conn, 41).expect("rewind version fixture");
+
+        let step = build_migration_plan(41, 42)
+            .expect("build v42 plan")
+            .steps
+            .into_iter()
+            .next()
+            .expect("v42 step");
+        apply_migration_step(&conn, &step).expect("apply owner-tuple parity migration");
+
+        assert_eq!(get_user_version(&conn).unwrap(), 42);
+        validate_session_owner_lifecycle_schema(&conn).unwrap();
+        validate_session_retained_size_schema(&conn).unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("isolate trigger enforcement from the fresh-table CHECK");
+        let partial_owner = conn
+            .execute(
+                "UPDATE mux_sessions SET owner_heartbeat_at = NULL
+                 WHERE session_id = 'owned-v42'",
+                [],
+            )
+            .expect_err("v42 trigger must reject a partial owner tuple");
         assert!(partial_owner.to_string().contains("invalid session owner lifecycle tuple"));
     }
 
