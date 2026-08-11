@@ -2147,6 +2147,20 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // would reintroduce partial owner tuples, so this is forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 43,
+        description: "Permit legacy orphan cleanup without weakening live retained-size authority",
+        // Applied by `ensure_orphan_cleanup_retained_size_schema`, which
+        // replaces the v42 pane-delete trigger. The corrected guard requires
+        // a live parent session before demanding its retained-size summary;
+        // a checkpoint already orphaned from mux_sessions has no live byte
+        // authority to update and must remain collectible.
+        up_sql: "",
+        // Reinstalling the v42 trigger would permanently block collection of
+        // pane children under legacy orphan checkpoints, so this correction is
+        // forward-only.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2224,6 +2238,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         validate_clean_checkpoint_receipt_schema(conn)?;
         validate_checkpoint_identity_v38_schema(conn)?;
         validate_pane_scrollback_summary_schema(conn)?;
+        validate_session_owner_lifecycle_schema(conn)?;
         validate_session_retained_size_schema(conn)?;
         check_ft_version_compatibility(conn)?;
         // The overwhelmingly common reopen path is read-only and must not
@@ -2369,19 +2384,19 @@ fn validate_pane_scrollback_summary_schema(conn: &Connection) -> Result<()> {
         ),
         (
             "pane_scrollback_summary_bi",
-            "scrollback summary requires a persisted pane",
+            "RAISE(ABORT, 'scrollback summary requires a persisted pane')",
         ),
         (
             "pane_scrollback_summary_bd",
-            "live pane scrollback summary is permanent",
+            "RAISE(ABORT, 'live pane scrollback summary is permanent')",
         ),
         (
             "pane_scrollback_summary_pane_id_bu",
-            "scrollback summary pane identity is immutable",
+            "RAISE(ABORT, 'scrollback summary pane identity is immutable')",
         ),
         (
             "output_segments_scrollback_summary_bi",
-            "invalid output segment metadata or missing scrollback summary",
+            "RAISE(ABORT, 'invalid output segment metadata or missing scrollback summary')",
         ),
         (
             "output_segments_scrollback_summary_ai",
@@ -2389,7 +2404,7 @@ fn validate_pane_scrollback_summary_schema(conn: &Connection) -> Result<()> {
         ),
         (
             "output_segments_scrollback_summary_bd",
-            "missing scrollback summary during output retention",
+            "RAISE(ABORT, 'missing scrollback summary during output retention')",
         ),
         (
             "output_segments_scrollback_summary_ad",
@@ -2397,7 +2412,7 @@ fn validate_pane_scrollback_summary_schema(conn: &Connection) -> Result<()> {
         ),
         (
             "output_segments_scrollback_metadata_bu",
-            "output segment scrollback metadata is immutable",
+            "RAISE(ABORT, 'output segment scrollback metadata is immutable')",
         ),
     ] {
         let trigger_sql = load_schema_object_sql(conn, "trigger", trigger)?.ok_or_else(|| {
@@ -2456,8 +2471,51 @@ fn validate_pane_scrollback_summary_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+const MUX_SESSIONS_SCHEMA_BEGIN: &str = "-- FT_MUX_SESSIONS_SCHEMA_BEGIN";
+const MUX_SESSIONS_SCHEMA_END: &str = "-- FT_MUX_SESSIONS_SCHEMA_END";
 const SESSION_RETAINED_SIZE_V40_BEGIN: &str = "-- FT_SESSION_RETAINED_SIZE_V40_BEGIN";
 const SESSION_RETAINED_SIZE_V40_END: &str = "-- FT_SESSION_RETAINED_SIZE_V40_END";
+
+/// Return the single canonical `mux_sessions` table DDL section.
+///
+/// Test fixtures use this section so lifecycle-column additions cannot leave
+/// their table shape behind the production schema while still compiling.
+///
+/// # Errors
+///
+/// Returns a corruption error if the embedded workspace schema does not contain
+/// exactly one ordered begin/end marker pair.
+pub fn mux_sessions_schema_sql() -> Result<&'static str> {
+    if SCHEMA_SQL.match_indices(MUX_SESSIONS_SCHEMA_BEGIN).count() != 1
+        || SCHEMA_SQL.match_indices(MUX_SESSIONS_SCHEMA_END).count() != 1
+    {
+        return Err(StorageError::Corruption {
+            details: "SCHEMA_SQL must contain exactly one mux_sessions marker pair".to_string(),
+        }
+        .into());
+    }
+    let start = SCHEMA_SQL
+        .find(MUX_SESSIONS_SCHEMA_BEGIN)
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL is missing the mux_sessions begin marker".to_string(),
+        })?
+        .checked_add(MUX_SESSIONS_SCHEMA_BEGIN.len())
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL mux_sessions marker offset overflow".to_string(),
+        })?;
+    let end = SCHEMA_SQL
+        .find(MUX_SESSIONS_SCHEMA_END)
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL is missing the mux_sessions end marker".to_string(),
+        })?;
+    if start >= end {
+        return Err(StorageError::Corruption {
+            details: "SCHEMA_SQL mux_sessions markers are reversed or empty".to_string(),
+        }
+        .into());
+    }
+    Ok(&SCHEMA_SQL[start..end])
+}
 
 /// Return the single canonical schema-v40 retained-size DDL section.
 ///
@@ -2554,6 +2612,13 @@ fn ensure_session_retained_size_schema(conn: &Connection) -> Result<()> {
     validate_session_retained_size_schema(conn)
 }
 
+const SESSION_RECOVERY_LIFECYCLE_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_mux_sessions_recovery_lifecycle
+     ON mux_sessions(
+         shutdown_clean, recovery_acknowledged_at,
+         last_checkpoint_at DESC, session_id
+     );";
+
 fn ensure_session_owner_lifecycle_columns(conn: &Connection) -> Result<()> {
     for (column, definition) in [
         (
@@ -2584,60 +2649,60 @@ fn ensure_session_owner_lifecycle_columns(conn: &Connection) -> Result<()> {
             })?;
         }
     }
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_mux_sessions_recovery_lifecycle
-         ON mux_sessions(
-             shutdown_clean, recovery_acknowledged_at,
-             last_checkpoint_at DESC, session_id
-         );",
-    )
-    .map_err(|error| {
-        StorageError::MigrationFailed(format!(
-            "session owner-lifecycle index installation failed: {error}"
-        ))
-    })?;
+    ensure_exact_index(
+        conn,
+        "idx_mux_sessions_recovery_lifecycle",
+        "DROP INDEX IF EXISTS idx_mux_sessions_recovery_lifecycle;",
+        SESSION_RECOVERY_LIFECYCLE_INDEX_SQL,
+        "session owner lifecycle",
+    )?;
     Ok(())
 }
 
 fn validate_session_owner_lifecycle_schema(conn: &Connection) -> Result<()> {
-    for column in [
-        "owner_pid",
-        "owner_process_start",
-        "owner_heartbeat_at",
-        "recovery_acknowledged_at",
+    for (column, check_definition) in [
+        (
+            "owner_pid",
+            "owner_pid INTEGER CHECK(owner_pid IS NULL OR owner_pid > 0)",
+        ),
+        (
+            "owner_process_start",
+            "owner_process_start INTEGER CHECK(owner_process_start IS NULL OR owner_process_start > 0)",
+        ),
+        (
+            "owner_heartbeat_at",
+            "owner_heartbeat_at INTEGER CHECK(owner_heartbeat_at IS NULL OR owner_heartbeat_at >= 0)",
+        ),
+        (
+            "recovery_acknowledged_at",
+            "recovery_acknowledged_at INTEGER CHECK(recovery_acknowledged_at IS NULL OR recovery_acknowledged_at >= 0)",
+        ),
     ] {
-        if !table_has_column(conn, "mux_sessions", column)? {
-            return Err(StorageError::Corruption {
-                details: format!(
-                    "schema v41 mux_sessions is missing owner-lifecycle column {column}"
-                ),
-            }
-            .into());
-        }
+        require_exact_column_contract(
+            conn,
+            "mux_sessions",
+            &SqliteColumnContract {
+                name: column.to_string(),
+                declared_type: "INTEGER".to_string(),
+                not_null: false,
+                default_value: None,
+                primary_key: false,
+            },
+            "session owner lifecycle",
+        )?;
+        require_table_sql_fragment(
+            conn,
+            "mux_sessions",
+            check_definition,
+            "session owner lifecycle",
+        )?;
     }
-    let index_present: bool = conn
-        .query_row(
-            "SELECT EXISTS(
-             SELECT 1 FROM sqlite_schema
-             WHERE type = 'index'
-               AND name = 'idx_mux_sessions_recovery_lifecycle'
-               AND tbl_name = 'mux_sessions'
-         )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| {
-            StorageError::MigrationFailed(format!(
-                "session owner-lifecycle index validation failed: {error}"
-            ))
-        })?;
-    if !index_present {
-        return Err(StorageError::Corruption {
-            details: "schema v41 is missing the session recovery-lifecycle index".to_string(),
-        }
-        .into());
-    }
-    Ok(())
+    validate_exact_index(
+        conn,
+        "idx_mux_sessions_recovery_lifecycle",
+        SESSION_RECOVERY_LIFECYCLE_INDEX_SQL,
+        "session owner lifecycle",
+    )
 }
 
 fn ensure_session_owner_lifecycle_schema(conn: &Connection) -> Result<()> {
@@ -2677,11 +2742,19 @@ fn ensure_session_owner_lifecycle_schema(conn: &Connection) -> Result<()> {
     validate_session_retained_size_schema(conn)
 }
 
-/// Validate the O(sessions) retained-byte authority without walking checkpoint
-/// or pane history. Full row-by-row recomputation is deliberately owned by the
-/// infrequent cleanup transaction, where a mismatch fails closed before any
-/// retention deletion.
-fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
+fn ensure_orphan_cleanup_retained_size_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TRIGGER IF EXISTS mux_pane_state_retained_size_ad;")
+        .map_err(|error| {
+            StorageError::MigrationFailed(format!(
+                "session orphan-cleanup retained-size refresh setup failed: {error}"
+            ))
+        })?;
+    ensure_session_retained_size_schema(conn)
+}
+
+/// Validate the exact retained-size schema objects without walking persisted
+/// session, checkpoint, pane, or lifecycle rows.
+fn validate_session_retained_size_schema_objects(conn: &Connection) -> Result<()> {
     for (object_type, declaration_kind, object_name) in [
         ("view", "VIEW", "session_retained_size_recomputed"),
         ("table", "TABLE", "session_retained_size"),
@@ -2804,15 +2877,15 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
     for (trigger, required_action) in [
         (
             "session_retained_size_bi",
-            "session retained-size row requires a persisted session",
+            "RAISE(ABORT, 'session retained-size row requires a persisted session')",
         ),
         (
             "session_retained_size_bd",
-            "live session retained-size authority is permanent",
+            "RAISE(ABORT, 'live session retained-size authority is permanent')",
         ),
         (
             "session_retained_size_session_id_bu",
-            "session retained-size identity is immutable",
+            "RAISE(ABORT, 'session retained-size identity is immutable')",
         ),
         (
             "mux_sessions_retained_size_ai",
@@ -2829,7 +2902,7 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
         ),
         (
             "session_checkpoints_retained_size_au",
-            "checkpoint retained-size identity is immutable",
+            "RAISE(ABORT, 'checkpoint retained-size identity is immutable')",
         ),
         (
             "session_checkpoints_retained_size_bd",
@@ -2841,7 +2914,7 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
         ),
         (
             "mux_pane_state_retained_size_au",
-            "pane-state retained-size identity is immutable",
+            "RAISE(ABORT, 'pane-state retained-size identity is immutable')",
         ),
         (
             "mux_pane_state_retained_size_ad",
@@ -2853,7 +2926,7 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
         ),
         (
             "restore_attempt_lifecycle_retained_size_au",
-            "restore-lifecycle retained-size identity is immutable",
+            "RAISE(ABORT, 'restore-lifecycle retained-size identity is immutable')",
         ),
         (
             "restore_attempt_lifecycle_retained_size_ad",
@@ -2875,6 +2948,97 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Validate the constant-size schema objects that authorize direct session
+/// cleanup mutations. This deliberately avoids walking session rows; the
+/// canonical trigger bodies themselves fail closed if a live summary is
+/// missing, while full retained-byte decisions call the row validator below.
+pub(crate) fn validate_session_retained_size_mutation_schema(conn: &Connection) -> Result<()> {
+    validate_session_retained_size_schema_objects(conn)?;
+    validate_session_authority_trigger_catalog(conn)
+}
+
+/// Require exactly the 15 audited triggers that protect retained-size authority:
+/// 12 source-maintenance triggers plus the summary table's three self-guards.
+/// Exact body validation is owned by `validate_session_retained_size_schema_objects`;
+/// this catalog check additionally rejects aliases, extras, and TEMP triggers.
+fn validate_session_authority_trigger_catalog(conn: &Connection) -> Result<()> {
+    let (unaudited_count, canonical_count, temp_count): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM sqlite_schema
+                  WHERE type = 'trigger'
+                    AND tbl_name COLLATE NOCASE
+                        IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
+                            'restore_attempt_lifecycle', 'session_retained_size')
+                    AND name COLLATE NOCASE NOT IN (
+                        'session_retained_size_bi',
+                        'session_retained_size_bd',
+                        'session_retained_size_session_id_bu',
+                        'mux_sessions_retained_size_ai',
+                        'mux_sessions_retained_size_au',
+                        'mux_sessions_retained_size_ad',
+                        'session_checkpoints_retained_size_ai',
+                        'session_checkpoints_retained_size_au',
+                        'session_checkpoints_retained_size_bd',
+                        'mux_pane_state_retained_size_ai',
+                        'mux_pane_state_retained_size_au',
+                        'mux_pane_state_retained_size_ad',
+                        'restore_attempt_lifecycle_retained_size_ai',
+                        'restore_attempt_lifecycle_retained_size_au',
+                        'restore_attempt_lifecycle_retained_size_ad'
+                    )),
+                 (SELECT COUNT(*) FROM sqlite_schema
+                  WHERE type = 'trigger'
+                    AND tbl_name COLLATE NOCASE
+                        IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
+                            'restore_attempt_lifecycle', 'session_retained_size')
+                    AND name COLLATE NOCASE IN (
+                        'session_retained_size_bi',
+                        'session_retained_size_bd',
+                        'session_retained_size_session_id_bu',
+                        'mux_sessions_retained_size_ai',
+                        'mux_sessions_retained_size_au',
+                        'mux_sessions_retained_size_ad',
+                        'session_checkpoints_retained_size_ai',
+                        'session_checkpoints_retained_size_au',
+                        'session_checkpoints_retained_size_bd',
+                        'mux_pane_state_retained_size_ai',
+                        'mux_pane_state_retained_size_au',
+                        'mux_pane_state_retained_size_ad',
+                        'restore_attempt_lifecycle_retained_size_ai',
+                        'restore_attempt_lifecycle_retained_size_au',
+                        'restore_attempt_lifecycle_retained_size_ad'
+                    )),
+                 (SELECT COUNT(*) FROM sqlite_temp_schema
+                  WHERE type = 'trigger'
+                    AND tbl_name COLLATE NOCASE
+                        IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
+                            'restore_attempt_lifecycle', 'session_retained_size'))",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if unaudited_count == 0 && canonical_count == 15 && temp_count == 0 {
+        return Ok(());
+    }
+    Err(StorageError::Corruption {
+        details: format!(
+            "session retained-size authority requires 15 canonical triggers and no extras: canonical={canonical_count} unaudited={unaudited_count} temp={temp_count}"
+        ),
+    }
+    .into())
+}
+
+/// Validate the O(sessions) retained-byte authority without walking checkpoint
+/// or pane history. Full row-by-row recomputation is deliberately owned by the
+/// infrequent cleanup transaction, where a mismatch fails closed before any
+/// retention deletion.
+pub(crate) fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
+    validate_session_retained_size_schema_objects(conn)?;
+    validate_session_authority_trigger_catalog(conn)?;
     let missing_summary: Option<String> = conn
         .query_row(
             "SELECT s.session_id
@@ -2955,6 +3119,34 @@ struct SqliteColumnDescriptor {
     primary_key: bool,
 }
 
+/// The semantic contract of one SQLite column, excluding its physical ordinal.
+///
+/// SQLite's `ALTER TABLE ... ADD COLUMN` necessarily appends a migrated column,
+/// while the same column may appear earlier in the current fresh-create DDL.
+/// Ordinals are therefore authoritative only for tables that a migration
+/// canonically rebuilds; they are not part of a column's general type/null/default
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqliteColumnContract {
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    default_value: Option<String>,
+    primary_key: bool,
+}
+
+impl From<&SqliteColumnDescriptor> for SqliteColumnContract {
+    fn from(descriptor: &SqliteColumnDescriptor) -> Self {
+        Self {
+            name: descriptor.name.clone(),
+            declared_type: descriptor.declared_type.clone(),
+            not_null: descriptor.not_null,
+            default_value: descriptor.default_value.clone(),
+            primary_key: descriptor.primary_key,
+        }
+    }
+}
+
 fn load_column_descriptor(
     conn: &Connection,
     table: &str,
@@ -3015,6 +3207,27 @@ fn require_exact_column_descriptor(
     Err(StorageError::Corruption {
         details: format!(
             "{context}: non-canonical {table}.{} descriptor: expected {expected:?}, found {actual:?}",
+            expected.name
+        ),
+    }
+    .into())
+}
+
+fn require_exact_column_contract(
+    conn: &Connection,
+    table: &str,
+    expected: &SqliteColumnContract,
+    context: &str,
+) -> Result<()> {
+    let actual = load_column_descriptor(conn, table, &expected.name)?;
+    let actual_contract = actual.as_ref().map(SqliteColumnContract::from);
+    if actual_contract.as_ref() == Some(expected) {
+        return Ok(());
+    }
+
+    Err(StorageError::Corruption {
+        details: format!(
+            "{context}: non-canonical {table}.{} contract: expected {expected:?}, found {actual:?}",
             expected.name
         ),
     }
@@ -3103,6 +3316,24 @@ fn compact_schema_sql(sql: &str) -> String {
                 }
             }
             None => match character {
+                '-' if characters.peek() == Some(&'-') => {
+                    characters.next();
+                    for comment_character in characters.by_ref() {
+                        if comment_character == '\n' {
+                            break;
+                        }
+                    }
+                }
+                '/' if characters.peek() == Some(&'*') => {
+                    characters.next();
+                    let mut previous = '\0';
+                    for comment_character in characters.by_ref() {
+                        if previous == '*' && comment_character == '/' {
+                            break;
+                        }
+                        previous = comment_character;
+                    }
+                }
                 '\'' => {
                     compact.push(character);
                     quote = Some(Quote::Single);
@@ -3563,11 +3794,10 @@ fn ensure_checkpoint_snapshot_authority_schema(conn: &Connection) -> Result<()> 
 /// authorized a legacy boolean, so legacy clean rows fail safe to unclean
 /// rather than minting a new receipt identity after the fact.
 fn validate_clean_checkpoint_receipt_column_and_foreign_key(conn: &Connection) -> Result<()> {
-    require_exact_column_descriptor(
+    require_exact_column_contract(
         conn,
         "mux_sessions",
-        &SqliteColumnDescriptor {
-            cid: 8,
+        &SqliteColumnContract {
             name: "clean_checkpoint_id".to_string(),
             declared_type: "INTEGER".to_string(),
             not_null: false,
@@ -4113,12 +4343,15 @@ fn validate_checkpoint_identity_v38_schema(conn: &Connection) -> Result<()> {
         }
         .into());
     }
-    validate_restore_attempt_lifecycle_v38_schema(conn)?;
-    ensure_no_checkpoint_authority_triggers(conn, "checkpoint identity v38")
+    validate_restore_attempt_lifecycle_v38_schema(conn)
 }
 
 fn ensure_checkpoint_identity_v38_schema(conn: &Connection) -> Result<()> {
     if checkpoint_v38_table_has_identity_surface(conn)? {
+        // This helper runs only while applying migration v38. Later canonical
+        // retained-size triggers are valid on a current database, but no
+        // trigger may observe or alter the v38 table-rebuild cutover itself.
+        ensure_no_checkpoint_authority_triggers(conn, "migration v38")?;
         return validate_checkpoint_identity_v38_schema(conn);
     }
 
@@ -5291,10 +5524,15 @@ fn run_owned_migration_transaction(
             transaction,
             StorageError::MigrationFailed(format!("{context}: migration mutation panicked")).into(),
         ),
-        Ok(Err(_error)) => rollback_migration_transaction(
-            transaction,
-            StorageError::MigrationFailed(format!("{context}: migration mutation failed")).into(),
-        ),
+        Ok(Err(_error)) => {
+            #[cfg(test)]
+            eprintln!("{context}: inner migration mutation error: {_error}");
+            rollback_migration_transaction(
+                transaction,
+                StorageError::MigrationFailed(format!("{context}: migration mutation failed"))
+                    .into(),
+            )
+        }
         Ok(Ok(())) => {
             let commit_failed = take_migration_commit_fault()
                 || !matches!(
@@ -5557,7 +5795,9 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // protects the transactional bounded scrollback projection; v40 protects
     // exact retained-session byte authority; v41 protects live-owner fencing
     // from stale recovery cleanup; v42 makes the owner tuple invariant
-    // migration-safe. V42 is therefore the current downgrade floor.
+    // migration-safe; v43 keeps legacy orphan cleanup executable without
+    // weakening retained-size authority for live sessions. V43 is therefore
+    // the current downgrade floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
@@ -5678,6 +5918,10 @@ fn apply_migration_mutation(
                     ensure_session_owner_lifecycle_schema(conn)?;
                     apply_raw_up_sql = false;
                 }
+                43 => {
+                    ensure_orphan_cleanup_retained_size_schema(conn)?;
+                    apply_raw_up_sql = false;
+                }
                 _ => {}
             }
             if apply_raw_up_sql && !migration.up_sql.is_empty() {
@@ -5705,6 +5949,10 @@ fn apply_migration_mutation(
                 validate_session_owner_lifecycle_schema(conn)?;
                 validate_session_retained_size_schema(conn)?;
                 ensure_no_foreign_key_violations(conn, "migration v42")?;
+            }
+            if migration.version == 43 {
+                validate_session_owner_lifecycle_schema(conn)?;
+                validate_session_retained_size_schema(conn)?;
             }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;
@@ -6266,6 +6514,48 @@ mod tests {
             "createindex\"Index Name\"on[Table Name](`Column Name`)",
             "quoted identifier spelling must remain fail-closed while surrounding SQL is normalized"
         );
+        assert_eq!(
+            compact_schema_sql(
+                "CREATE TABLE example(value TEXT, -- SQLite's retained note\n\
+                 CHECK(value = 'kept'));",
+            ),
+            compact_schema_sql("CREATE TABLE example(value TEXT, CHECK(value = 'kept'))"),
+            "apostrophes inside line comments must not enter string-literal mode"
+        );
+        assert_eq!(
+            compact_schema_sql(
+                "CREATE TABLE example(value TEXT /* SQLite's retained note */, CHECK(value = 'kept'));",
+            ),
+            compact_schema_sql("CREATE TABLE example(value TEXT, CHECK(value = 'kept'))"),
+            "apostrophes inside block comments must not enter string-literal mode"
+        );
+        assert!(
+            compact_schema_sql(
+                "CREATE INDEX idx_comment_literal ON example(value) WHERE value = '-- /* kept */';",
+            )
+            .ends_with("wherevalue='-- /* kept */'"),
+            "comment markers inside string literals must remain semantic content"
+        );
+    }
+
+    #[test]
+    fn canonical_mux_sessions_fixture_schema_matches_head_table_contract() {
+        let conn = Connection::open_in_memory().expect("open mux_sessions schema fixture");
+        let canonical = mux_sessions_schema_sql().expect("extract canonical mux_sessions schema");
+        conn.execute_batch(canonical)
+            .expect("install canonical mux_sessions schema");
+        let stored: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'mux_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read installed mux_sessions schema");
+        assert_eq!(
+            compact_schema_sql(canonical),
+            compact_schema_sql(&stored),
+            "fixture extraction must preserve the exact production table contract"
+        );
     }
 
     #[test]
@@ -6292,7 +6582,7 @@ mod tests {
         initialize_schema(&conn).expect("v0 migration sequence installs current schema");
         validate_session_retained_size_schema(&conn)
             .expect("v40 must be installed after all legacy session columns exist");
-        assert_eq!(get_user_version(&conn).unwrap(), 40);
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     fn create_v35_checkpoint_fixture(conn: &Connection) {
@@ -7508,9 +7798,8 @@ mod tests {
             );
         }
 
-        let up = build_migration_plan(32, SCHEMA_VERSION)
-            .expect("build v32 -> current-head upgrade plan");
-        apply_migration_plan(&upgraded, &up).expect("upgrade fixture to current head");
+        let up = build_migration_plan(32, 33).expect("build v32 -> v33 upgrade plan");
+        apply_migration_plan(&upgraded, &up).expect("upgrade fixture to v33");
         ensure_event_delivery_lease_schema(&upgraded)
             .expect("guarded v33 must be idempotent after upgrade");
 
@@ -7520,7 +7809,7 @@ mod tests {
         );
         assert_eq!(
             get_user_version(&upgraded).expect("upgraded user_version"),
-            SCHEMA_VERSION
+            33
         );
         assert_eq!(
             events_table_info(&upgraded),
@@ -7709,7 +7998,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_authority_v36_to_v38_fresh_and_upgrade_shapes_are_identical() {
+    fn checkpoint_authority_v36_to_v38_fresh_and_upgrade_contracts_are_identical() {
         let fresh = Connection::open_in_memory().expect("open fresh current fixture");
         initialize_schema(&fresh).expect("initialize fresh current schema");
 
@@ -7727,10 +8016,26 @@ mod tests {
             table_descriptors(&fresh, "session_checkpoints"),
             "fresh and upgraded checkpoint column descriptors/order must be exact"
         );
+        let upgraded_session_contracts = table_descriptors(&upgraded, "mux_sessions")
+            .iter()
+            .map(SqliteColumnContract::from)
+            .collect::<Vec<_>>();
+        let fresh_v38_session_contracts = table_descriptors(&fresh, "mux_sessions")
+            .iter()
+            .filter(|descriptor| {
+                ![
+                    "owner_pid",
+                    "owner_process_start",
+                    "owner_heartbeat_at",
+                    "recovery_acknowledged_at",
+                ]
+                .contains(&descriptor.name.as_str())
+            })
+            .map(SqliteColumnContract::from)
+            .collect::<Vec<_>>();
         assert_eq!(
-            table_descriptors(&upgraded, "mux_sessions"),
-            table_descriptors(&fresh, "mux_sessions"),
-            "fresh and upgraded session column descriptors/order must be exact"
+            upgraded_session_contracts, fresh_v38_session_contracts,
+            "fresh and upgraded v38 session column contracts must be exact; later ALTER TABLE additions may have different physical ordinals"
         );
         for index_name in [
             "idx_checkpoints_session_role_latest",
@@ -7804,7 +8109,11 @@ mod tests {
             .expect("seed role column without its canonical CHECK");
         let error = ensure_checkpoint_snapshot_authority_schema(&missing_check)
             .expect_err("a role column without its CHECK must fail closed");
-        assert!(error.to_string().contains("canonical constraint"));
+        assert!(
+            error
+                .to_string()
+                .contains("canonical checkpoint-role constraint")
+        );
 
         let malformed_clean_column =
             Connection::open_in_memory().expect("open malformed clean-column fixture");
@@ -7915,6 +8224,47 @@ mod tests {
             ),
             compact_schema_sql(CLEAN_CHECKPOINT_INDEX_SQL)
         );
+    }
+
+    #[test]
+    fn clean_checkpoint_contract_accepts_fresh_and_migrated_ordinals() {
+        let migrated = Connection::open_in_memory().expect("open migrated fixture");
+        create_v37_checkpoint_fixture(&migrated);
+        let migrated_descriptor =
+            load_column_descriptor(&migrated, "mux_sessions", "clean_checkpoint_id")
+                .expect("load migrated clean-checkpoint descriptor")
+                .expect("migrated clean-checkpoint column");
+        assert_eq!(migrated_descriptor.cid, 8);
+        validate_clean_checkpoint_receipt_column_and_foreign_key(&migrated)
+            .expect("migrated ordinal must retain the clean-checkpoint contract");
+
+        let fresh = Connection::open_in_memory().expect("open fresh fixture");
+        fresh
+            .execute_batch(SCHEMA_SQL)
+            .expect("create current fresh schema");
+        let fresh_descriptor =
+            load_column_descriptor(&fresh, "mux_sessions", "clean_checkpoint_id")
+                .expect("load fresh clean-checkpoint descriptor")
+                .expect("fresh clean-checkpoint column");
+        assert_eq!(fresh_descriptor.cid, 12);
+        validate_clean_checkpoint_receipt_column_and_foreign_key(&fresh)
+            .expect("fresh ordinal must retain the same clean-checkpoint contract");
+
+        let drifted = Connection::open_in_memory().expect("open descriptor-drift fixture");
+        drifted
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE session_checkpoints(id INTEGER PRIMARY KEY);
+                 CREATE TABLE mux_sessions(
+                     clean_checkpoint_id TEXT
+                         REFERENCES session_checkpoints(id) ON DELETE SET NULL
+                 );",
+            )
+            .expect("create descriptor-drift fixture");
+        let error = validate_clean_checkpoint_receipt_column_and_foreign_key(&drifted)
+            .expect_err("a non-integer clean-checkpoint column must fail closed");
+        assert!(error.to_string().contains("clean_checkpoint_id"));
+        assert!(error.to_string().contains("non-canonical"));
     }
 
     #[test]
@@ -8532,8 +8882,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_scrollback_size_and_owner_authority_v36_through_v42_are_forward_only() {
-        for version in [36, 37, 38, 39, 40, 41, 42] {
+    fn checkpoint_scrollback_size_and_owner_authority_v36_through_v43_are_forward_only() {
+        for version in [36, 37, 38, 39, 40, 41, 42, 43] {
             let migration = MIGRATIONS
                 .iter()
                 .find(|migration| migration.version == version)
@@ -8556,6 +8906,8 @@ mod tests {
         assert!(build_migration_plan(41, 35).is_err());
         assert!(build_migration_plan(42, 41).is_err());
         assert!(build_migration_plan(42, 35).is_err());
+        assert!(build_migration_plan(43, 42).is_err());
+        assert!(build_migration_plan(43, 35).is_err());
     }
 
     #[test]
@@ -9592,7 +9944,11 @@ mod tests {
                 [],
             )
             .expect_err("canonical v41 trigger must reject a partial owner tuple");
-        assert!(partial_owner.to_string().contains("invalid session owner lifecycle tuple"));
+        assert!(
+            partial_owner
+                .to_string()
+                .contains("invalid session owner lifecycle tuple")
+        );
     }
 
     #[test]
@@ -9604,7 +9960,7 @@ mod tests {
                  session_id, created_at, shutdown_clean, topology_json, ft_version,
                  host_id, owner_pid, owner_process_start, owner_heartbeat_at
              ) VALUES ('owned-v42', 1, 0, '{}', '0.42.0',
-                       '{\"version\":3,\"hostname\":\"trj\",\"boot_id\":\"boot-a\"}',
+                       '{\"version\":5,\"hostname\":\"trj\",\"machine_fence\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"boot_id\":\"11111111-1111-4111-8111-111111111111\",\"process_domain_id\":\"pid:[1]\"}',
                        42, 900, 1)",
             [],
         )
@@ -9639,7 +9995,160 @@ mod tests {
                 [],
             )
             .expect_err("v42 trigger must reject a partial owner tuple");
-        assert!(partial_owner.to_string().contains("invalid session owner lifecycle tuple"));
+        assert!(
+            partial_owner
+                .to_string()
+                .contains("invalid session owner lifecycle tuple")
+        );
+    }
+
+    #[test]
+    fn v43_reinstalls_orphan_collectible_pane_delete_authority() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize current schema");
+
+        // Seed the shape a legacy cleanup must be able to repair: the session
+        // row is already absent, while its checkpoint and pane child remain.
+        // The insert triggers are temporarily removed because their correct
+        // live-write contract must reject precisely this corrupt historical
+        // shape.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER session_checkpoints_retained_size_ai;
+             DROP TRIGGER mux_pane_state_retained_size_ai;
+             INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes
+             ) VALUES (
+                 'orphan-v43', 1, 'periodic', '0123456789abcdef', 1, 0
+             );
+             INSERT INTO mux_pane_state (
+                 checkpoint_id, pane_id, terminal_state_json
+             ) VALUES (last_insert_rowid(), 7, '{}');
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("seed legacy orphan checkpoint and pane");
+        conn.execute_batch(SCHEMA_SQL)
+            .expect("restore canonical insert-trigger authority");
+
+        // Model the v42 delete guard: it demanded a retained-size summary for
+        // every extant checkpoint, including one whose parent session had
+        // already disappeared.
+        conn.execute_batch(
+            "DROP TRIGGER mux_pane_state_retained_size_ad;
+             CREATE TRIGGER mux_pane_state_retained_size_ad
+             AFTER DELETE ON mux_pane_state BEGIN
+                 SELECT CASE WHEN EXISTS (
+                     SELECT 1 FROM session_checkpoints
+                     WHERE id = old.checkpoint_id
+                 ) AND NOT EXISTS (
+                     SELECT 1
+                     FROM session_checkpoints c
+                     INNER JOIN session_retained_size z
+                         ON z.session_id = c.session_id
+                     WHERE c.id = old.checkpoint_id
+                 ) THEN RAISE(
+                     ABORT,
+                     'missing session retained-size authority during pane-state delete'
+                 ) END;
+             END;",
+        )
+        .expect("install historical v42 pane-delete guard");
+        let pane_state_id: i64 = conn
+            .query_row(
+                "SELECT id FROM mux_pane_state WHERE pane_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphan pane id");
+        let blocked = conn
+            .execute("DELETE FROM mux_pane_state WHERE id = ?1", [pane_state_id])
+            .expect_err("v42 guard must demonstrate the orphan-cleanup defect");
+        assert!(
+            blocked
+                .to_string()
+                .contains("missing session retained-size authority")
+        );
+
+        conn.execute("DELETE FROM schema_version WHERE version = 43", [])
+            .expect("rewind migration audit fixture");
+        set_user_version(&conn, 42).expect("rewind version fixture");
+        let step = build_migration_plan(42, 43)
+            .expect("build v43 plan")
+            .steps
+            .into_iter()
+            .next()
+            .expect("v43 step");
+        apply_migration_step(&conn, &step).expect("apply orphan-cleanup authority migration");
+
+        assert_eq!(get_user_version(&conn).unwrap(), 43);
+        validate_session_retained_size_schema(&conn).unwrap();
+        assert_eq!(
+            conn.execute("DELETE FROM mux_pane_state WHERE id = ?1", [pane_state_id])
+                .expect("v43 guard must admit a pane beneath an orphan checkpoint"),
+            1
+        );
+        assert_eq!(
+            conn.execute(
+                "DELETE FROM session_checkpoints WHERE session_id = 'orphan-v43'",
+                [],
+            )
+            .expect("collect orphan checkpoint after its pane"),
+            1
+        );
+    }
+
+    #[test]
+    fn owner_lifecycle_validation_rejects_non_integer_column_contract() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE mux_sessions (
+                 session_id TEXT,
+                 shutdown_clean INTEGER,
+                 last_checkpoint_at INTEGER,
+                 owner_pid TEXT CHECK(owner_pid IS NULL OR owner_pid > 0),
+                 owner_process_start INTEGER
+                     CHECK(owner_process_start IS NULL OR owner_process_start > 0),
+                 owner_heartbeat_at INTEGER
+                     CHECK(owner_heartbeat_at IS NULL OR owner_heartbeat_at >= 0),
+                 recovery_acknowledged_at INTEGER
+                     CHECK(recovery_acknowledged_at IS NULL OR recovery_acknowledged_at >= 0)
+             );
+             CREATE INDEX idx_mux_sessions_recovery_lifecycle
+                 ON mux_sessions(
+                     shutdown_clean, recovery_acknowledged_at,
+                     last_checkpoint_at DESC, session_id
+                 );",
+        )
+        .expect("create drifted owner-lifecycle fixture");
+
+        let error = validate_session_owner_lifecycle_schema(&conn)
+            .expect_err("a TEXT owner PID must not satisfy lifecycle authority");
+        assert!(
+            error.to_string().contains("owner_pid") && error.to_string().contains("non-canonical"),
+            "column-contract drift must be explicit: {error}"
+        );
+    }
+
+    #[test]
+    fn current_schema_reopen_rejects_recovery_lifecycle_index_drift() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch(
+            "DROP INDEX idx_mux_sessions_recovery_lifecycle;
+             CREATE INDEX idx_mux_sessions_recovery_lifecycle
+                 ON mux_sessions(session_id);",
+        )
+        .expect("inject same-name recovery-lifecycle index drift");
+
+        let error = initialize_schema(&conn)
+            .expect_err("a current schema must reject a non-canonical recovery index");
+        assert!(
+            error
+                .to_string()
+                .contains("idx_mux_sessions_recovery_lifecycle"),
+            "drifted recovery index identity must be explicit: {error}"
+        );
     }
 
     #[test]

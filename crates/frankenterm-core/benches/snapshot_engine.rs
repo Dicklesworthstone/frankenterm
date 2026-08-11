@@ -101,8 +101,25 @@ fn setup_db() -> (String, Connection) {
              window_metadata_json TEXT,
              ft_version TEXT NOT NULL,
              host_id TEXT,
+             owner_pid INTEGER,
+             owner_process_start INTEGER,
+             owner_heartbeat_at INTEGER,
+             recovery_acknowledged_at INTEGER,
              clean_checkpoint_id INTEGER
-                 REFERENCES session_checkpoints(id) ON DELETE SET NULL
+                 REFERENCES session_checkpoints(id) ON DELETE SET NULL,
+             CHECK(owner_pid IS NULL OR owner_pid > 0),
+             CHECK(owner_process_start IS NULL OR owner_process_start > 0),
+             CHECK(owner_heartbeat_at IS NULL OR owner_heartbeat_at >= 0),
+             CHECK(recovery_acknowledged_at IS NULL OR recovery_acknowledged_at >= 0),
+             CHECK(
+                 (owner_pid IS NULL
+                     AND owner_process_start IS NULL
+                     AND owner_heartbeat_at IS NULL)
+                 OR (owner_pid IS NOT NULL
+                     AND owner_process_start IS NOT NULL
+                     AND owner_heartbeat_at IS NOT NULL
+                     AND host_id IS NOT NULL)
+             )
          );
 
          CREATE TABLE session_checkpoints (

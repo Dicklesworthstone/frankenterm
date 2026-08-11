@@ -3685,6 +3685,7 @@ dependencies = [
  "futures",
  "half",
  "hex",
+ "hostname",
  "insta",
  "jsonschema",
  "lfucache",
@@ -3693,6 +3694,7 @@ dependencies = [
  "metrics",
  "mux",
  "nix 0.31.3",
+ "procinfo",
  "proptest",
  "rand 0.10.1",
  "ratatui",
@@ -8640,10 +8642,12 @@ name = "procinfo"
 version = "0.1.0"
 dependencies = [
  "frankenterm-dynamic",
+ "hex",
  "libc",
  "log",
  "luahelper",
  "ntapi",
+ "sha2 0.11.0",
  "winapi",
 ]
 

@@ -92,7 +92,9 @@
 /// stale crash candidates. Bumped 41 -> 42 so databases created by the first
 /// v41 implementation migrate to the same all-or-none owner-tuple enforcement
 /// as fresh databases instead of silently retaining weaker trigger authority.
-pub const SCHEMA_VERSION: i32 = 42;
+/// Bumped 42 -> 43 so pane children beneath legacy orphan checkpoints remain
+/// collectible without weakening retained-size authority for live sessions.
+pub const SCHEMA_VERSION: i32 = 43;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -1059,6 +1061,7 @@ CREATE INDEX IF NOT EXISTS idx_pane_bookmarks_pane_id ON pane_bookmarks(pane_id)
 CREATE INDEX IF NOT EXISTS idx_pane_bookmarks_alias ON pane_bookmarks(alias);
 
 -- Mux sessions: top-level session tracking (one per watcher invocation)
+-- FT_MUX_SESSIONS_SCHEMA_BEGIN
 CREATE TABLE IF NOT EXISTS mux_sessions (
     session_id TEXT PRIMARY KEY,           -- UUID v7 for time-ordering
     created_at INTEGER NOT NULL,           -- epoch ms
@@ -1067,7 +1070,7 @@ CREATE TABLE IF NOT EXISTS mux_sessions (
     topology_json TEXT NOT NULL,           -- serialized tab/split tree
     window_metadata_json TEXT,             -- window size, title, position
     ft_version TEXT NOT NULL,              -- binary version at creation
-    host_id TEXT,                          -- hostname + boot_id for multi-host disambiguation
+    host_id TEXT,                          -- versioned app-scoped machine fence + hostname + boot + process domain
     owner_pid INTEGER CHECK(owner_pid IS NULL OR owner_pid > 0),
     owner_process_start INTEGER CHECK(owner_process_start IS NULL OR owner_process_start > 0),
     owner_heartbeat_at INTEGER CHECK(owner_heartbeat_at IS NULL OR owner_heartbeat_at >= 0),
@@ -1085,6 +1088,7 @@ CREATE TABLE IF NOT EXISTS mux_sessions (
             AND host_id IS NOT NULL)
     )
 );
+-- FT_MUX_SESSIONS_SCHEMA_END
 
 -- Session checkpoints: individual checkpoint snapshots (many per session)
 CREATE TABLE IF NOT EXISTS session_checkpoints (
@@ -1764,7 +1768,10 @@ END;
 CREATE TRIGGER IF NOT EXISTS mux_pane_state_retained_size_ad
 AFTER DELETE ON mux_pane_state BEGIN
     SELECT CASE WHEN EXISTS (
-        SELECT 1 FROM session_checkpoints WHERE id = old.checkpoint_id
+        SELECT 1
+        FROM session_checkpoints c
+        INNER JOIN mux_sessions s ON s.session_id = c.session_id
+        WHERE c.id = old.checkpoint_id
     ) AND NOT EXISTS (
         SELECT 1
         FROM session_checkpoints c

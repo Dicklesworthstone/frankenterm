@@ -74276,6 +74276,9 @@ async fn handle_session_command(
             println!("{}", "-".repeat(40));
             println!("Sessions:        {} total", report.total_sessions);
             println!("  Unclean:       {}", report.unclean_sessions);
+            println!("    Live owner:  {}", report.live_sessions);
+            println!("    Dead owner:  {}", report.recovery_candidate_sessions);
+            println!("    Unknown:     {}", report.unknown_owner_sessions);
             println!("Checkpoints:     {}", report.total_checkpoints);
             println!(
                 "Pane-state estimates: {}",
@@ -77746,8 +77749,11 @@ fn build_session_recovery_guidance(
         return OperatorGuidance {
             status: "recovery_required".to_string(),
             summary: format!(
-                "{} unclean session(s) require inspection before you trust pane state; this guidance is inspection-only because restore execution is unavailable.",
-                report.unclean_sessions
+                "{} unclean session(s) require inspection before you trust pane state: {} live owner(s), {} proven-dead recovery candidate(s), and {} session(s) with unknown ownership. Live and unknown owners remain protected; this guidance is inspection-only because restore execution is unavailable.",
+                report.unclean_sessions,
+                report.live_sessions,
+                report.recovery_candidate_sessions,
+                report.unknown_owner_sessions,
             ),
             next_steps,
         };
@@ -78059,6 +78065,9 @@ mod operator_guidance_tests {
         let report = SessionDoctorReport {
             total_sessions: 3,
             unclean_sessions: 2,
+            live_sessions: 1,
+            recovery_candidate_sessions: 1,
+            unknown_owner_sessions: 0,
             total_checkpoints: 4,
             orphaned_pane_states: 0,
             orphaned_checkpoints: 0,
@@ -78073,6 +78082,12 @@ mod operator_guidance_tests {
         let guidance = build_session_recovery_guidance(&report);
         assert_eq!(guidance.status, "recovery_required");
         assert!(guidance.summary.contains("inspection-only"));
+        assert!(guidance.summary.contains("1 live owner"));
+        assert!(
+            guidance
+                .summary
+                .contains("1 proven-dead recovery candidate")
+        );
         assert!(
             guidance
                 .summary
@@ -78133,6 +78148,9 @@ mod operator_guidance_tests {
         let report = SessionDoctorReport {
             total_sessions: 2,
             unclean_sessions: 1,
+            live_sessions: 0,
+            recovery_candidate_sessions: 0,
+            unknown_owner_sessions: 1,
             total_checkpoints: 7,
             orphaned_pane_states: 0,
             orphaned_checkpoints: 1,
@@ -78211,6 +78229,9 @@ mod operator_guidance_tests {
         let orphaned_checkpoint = SessionDoctorReport {
             total_sessions: 1,
             unclean_sessions: 0,
+            live_sessions: 0,
+            recovery_candidate_sessions: 0,
+            unknown_owner_sessions: 0,
             total_checkpoints: 1,
             orphaned_pane_states: 0,
             orphaned_checkpoints: 1,
@@ -78258,6 +78279,9 @@ mod operator_guidance_tests {
         let report = SessionDoctorReport {
             total_sessions: 0,
             unclean_sessions: 0,
+            live_sessions: 0,
+            recovery_candidate_sessions: 0,
+            unknown_owner_sessions: 0,
             total_checkpoints: 0,
             orphaned_pane_states: 0,
             orphaned_checkpoints: 0,
@@ -78280,6 +78304,9 @@ mod operator_guidance_tests {
         let report = SessionDoctorReport {
             total_sessions: 2,
             unclean_sessions: 1,
+            live_sessions: 0,
+            recovery_candidate_sessions: 1,
+            unknown_owner_sessions: 0,
             total_checkpoints: 2,
             orphaned_pane_states: 0,
             orphaned_checkpoints: 0,
@@ -81950,6 +81977,9 @@ mod tests {
         let report = frankenterm_core::session_restore::SessionDoctorReport {
             total_sessions: 2,
             unclean_sessions: 1,
+            live_sessions: 0,
+            recovery_candidate_sessions: 0,
+            unknown_owner_sessions: 1,
             total_checkpoints: 3,
             orphaned_pane_states: 4,
             orphaned_checkpoints: 5,
@@ -81972,6 +82002,9 @@ mod tests {
             Some("reconciliation_required")
         );
         assert_eq!(payload["pane_state_estimate_bytes"].as_u64(), Some(5_120));
+        assert_eq!(payload["live_sessions"].as_u64(), Some(0));
+        assert_eq!(payload["recovery_candidate_sessions"].as_u64(), Some(0));
+        assert_eq!(payload["unknown_owner_sessions"].as_u64(), Some(1));
         assert_eq!(payload["orphaned_checkpoints"].as_u64(), Some(5));
         assert_eq!(payload["invalid_resolved_restore_chains"].as_u64(), Some(6));
         assert!(payload.get("total_data_bytes").is_none());
@@ -105829,7 +105862,13 @@ A  docs/new-proof.md\n";
             DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
             DiagnosticCheck::ok_with_detail("workspace root", "<workspace>"),
             DiagnosticCheck::ok_with_detail(".ft directory", "exists"),
-            DiagnosticCheck::ok_with_detail("database", "schema v42, wal mode"),
+            DiagnosticCheck::ok_with_detail(
+                "database",
+                format!(
+                    "schema v{}, wal mode",
+                    frankenterm_core::storage::SCHEMA_VERSION
+                ),
+            ),
             DiagnosticCheck::ok_with_detail("daemon status", "not running"),
             DiagnosticCheck::ok_with_detail("logs directory", "exists"),
         ];
@@ -105846,7 +105885,13 @@ A  docs/new-proof.md\n";
                 "binary not found in PATH",
                 "Install WezTerm or add it to PATH; see https://wezfurlong.org/wezterm/",
             ),
-            DiagnosticCheck::ok_with_detail("database", "schema v42, wal mode"),
+            DiagnosticCheck::ok_with_detail(
+                "database",
+                format!(
+                    "schema v{}, wal mode",
+                    frankenterm_core::storage::SCHEMA_VERSION
+                ),
+            ),
         ];
         doctor_assert_matches_golden("wezterm_unreachable", &checks);
     }
@@ -105858,8 +105903,11 @@ A  docs/new-proof.md\n";
             DiagnosticCheck::ok_with_detail("workspace root", "<workspace>"),
             DiagnosticCheck::error(
                 "database",
-                "schema mismatch (found v0, expected v42)",
-                "Rebuild database: rm .ft/ft.db && ft watch",
+                format!(
+                    "schema mismatch (found v0, expected v{})",
+                    frankenterm_core::storage::SCHEMA_VERSION
+                ),
+                "Preserve .ft/ft.db, run ft session doctor, and recover from a verified backup or migration receipt",
             ),
         ];
         doctor_assert_matches_golden("database_corrupt", &checks);
@@ -105872,9 +105920,15 @@ A  docs/new-proof.md\n";
             DiagnosticCheck::warning(
                 "daemon status",
                 "stale lock file detected",
-                "Remove .ft/ft.lock and run ft watch",
+                "Verify that no daemon owns .ft/ft.lock, then follow the documented stale-lock recovery procedure",
             ),
-            DiagnosticCheck::ok_with_detail("database", "schema v42, wal mode"),
+            DiagnosticCheck::ok_with_detail(
+                "database",
+                format!(
+                    "schema v{}, wal mode",
+                    frankenterm_core::storage::SCHEMA_VERSION
+                ),
+            ),
         ];
         doctor_assert_matches_golden("daemon_not_running", &checks);
     }
@@ -105887,9 +105941,15 @@ A  docs/new-proof.md\n";
             DiagnosticCheck::warning(
                 "disk space",
                 "97% used (450 GB available of 1.8 TB)",
-                "Free space: cargo clean; rm -rf /tmp/ft-*-target",
+                "Inspect build-artifact usage and remove only verified disposable target directories",
             ),
-            DiagnosticCheck::ok_with_detail("database", "schema v42, wal mode"),
+            DiagnosticCheck::ok_with_detail(
+                "database",
+                format!(
+                    "schema v{}, wal mode",
+                    frankenterm_core::storage::SCHEMA_VERSION
+                ),
+            ),
         ];
         doctor_assert_matches_golden("disk_pressure", &checks);
     }

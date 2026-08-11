@@ -19,12 +19,33 @@ impl From<&str> for LocalProcessStatus {
     }
 }
 
+fn normalized_machine_id(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.len() != 32
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || value.bytes().all(|byte| byte == b'0')
+    {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
 impl LocalProcessInfo {
     fn observe_stat_start_time(pid: libc::pid_t) -> ProcessStartTimeObservation {
         let data = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(data) => data,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ProcessStartTimeObservation::Absent;
+                // ENOENT is ambiguous under procfs `hidepid`: another user's
+                // live process can be deliberately invisible. A signal value
+                // of zero performs an existence/permission check without
+                // delivering a signal; only ESRCH proves absence.
+                let result = unsafe { libc::kill(pid, 0) };
+                if result == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return ProcessStartTimeObservation::Absent;
+                }
+                return ProcessStartTimeObservation::Unknown;
             }
             Err(_) => return ProcessStartTimeObservation::Unknown,
         };
@@ -53,7 +74,13 @@ impl LocalProcessInfo {
     }
 
     pub fn observe_process_start_time(pid: u32) -> ProcessStartTimeObservation {
-        Self::observe_stat_start_time(pid as libc::pid_t)
+        if pid == 0 {
+            return ProcessStartTimeObservation::Unknown;
+        }
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return ProcessStartTimeObservation::Unknown;
+        };
+        Self::observe_stat_start_time(pid)
     }
 
     /// Linux exposes a kernel-generated UUID that is constant for one boot.
@@ -63,18 +90,49 @@ impl LocalProcessInfo {
         (!value.is_empty()).then(|| value.to_string())
     }
 
+    /// Hash the installation-stable Linux machine ID into an application-
+    /// scoped fence. The raw `/etc/machine-id` value is confidential and is
+    /// never returned or persisted.
+    pub fn host_machine_fence() -> Option<String> {
+        use std::io::Read;
+
+        let file = std::fs::File::open("/etc/machine-id").ok()?;
+        let mut raw = String::new();
+        file.take(
+            u64::try_from(MAX_RAW_MACHINE_ID_BYTES)
+                .ok()?
+                .saturating_add(1),
+        )
+        .read_to_string(&mut raw)
+        .ok()?;
+        if raw.len() > MAX_RAW_MACHINE_ID_BYTES {
+            return None;
+        }
+        let normalized = normalized_machine_id(&raw)?;
+        app_scoped_machine_fence(normalized.as_bytes())
+    }
+
     pub fn current_working_dir(pid: u32) -> Option<PathBuf> {
+        if pid == 0 {
+            return None;
+        }
         std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()
     }
 
     pub fn executable_path(pid: u32) -> Option<PathBuf> {
+        if pid == 0 {
+            return None;
+        }
         std::fs::read_link(format!("/proc/{}/exe", pid)).ok()
     }
 
     pub fn with_root_pid(pid: u32) -> Option<Self> {
         use libc::pid_t;
 
-        let pid = pid as pid_t;
+        if pid == 0 {
+            return None;
+        }
+        let pid = pid_t::try_from(pid).ok()?;
 
         fn all_pids() -> Vec<pid_t> {
             let mut pids = vec![];
@@ -145,14 +203,22 @@ impl LocalProcessInfo {
 
         let procs: Vec<_> = all_pids().into_iter().filter_map(info_for_pid).collect();
 
-        fn build_proc(info: &LinuxStat, procs: &[LinuxStat]) -> LocalProcessInfo {
+        fn build_proc(
+            info: &LinuxStat,
+            procs: &[LinuxStat],
+            ancestry: &mut HashSet<pid_t>,
+        ) -> LocalProcessInfo {
+            let inserted = ancestry.insert(info.pid);
+            debug_assert!(inserted);
             let mut children = HashMap::new();
 
             for kid in procs {
-                if kid.ppid == info.pid {
-                    children.insert(kid.pid as u32, build_proc(kid, procs));
+                if kid.ppid == info.pid && !ancestry.contains(&kid.pid) {
+                    children.insert(kid.pid as u32, build_proc(kid, procs, ancestry));
                 }
             }
+            let removed = ancestry.remove(&info.pid);
+            debug_assert!(removed);
 
             let executable = exe_for_pid(info.pid);
             let name = info.name.clone();
@@ -172,9 +238,31 @@ impl LocalProcessInfo {
         }
 
         if let Some(info) = procs.iter().find(|info| info.pid == pid) {
-            Some(build_proc(info, &procs))
+            Some(build_proc(info, &procs, &mut HashSet::new()))
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod machine_identity_tests {
+    use super::*;
+
+    #[test]
+    fn linux_machine_id_normalization_is_strict() {
+        assert_eq!(
+            normalized_machine_id("0123456789ABCDEF0123456789ABCDEF\n").as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        for invalid in [
+            "",
+            "uninitialized",
+            "00000000000000000000000000000000",
+            "0123456789abcdef",
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            assert_eq!(normalized_machine_id(invalid), None, "accepted {invalid:?}");
         }
     }
 }

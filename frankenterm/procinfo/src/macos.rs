@@ -33,11 +33,21 @@ impl LocalProcessInfo {
     }
 
     pub fn observe_process_start_time(pid: u32) -> ProcessStartTimeObservation {
+        if pid == 0 {
+            return ProcessStartTimeObservation::Unknown;
+        }
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            return ProcessStartTimeObservation::Unknown;
+        };
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let wanted_size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // `proc_pidinfo` reports failure through the thread-local errno slot.
+        // Clear it immediately before the syscall so a stale ESRCH from an
+        // unrelated operation can never pronounce this owner absent.
+        unsafe { *libc::__error() = 0 };
         let read = unsafe {
             libc::proc_pidinfo(
-                pid as libc::c_int,
+                pid,
                 libc::PROC_PIDTBSDINFO,
                 0,
                 &mut info as *mut _ as *mut _,
@@ -50,9 +60,7 @@ impl LocalProcessInfo {
                 ProcessStartTimeObservation::Running,
             );
         }
-        if read == 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        {
+        if read == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             ProcessStartTimeObservation::Absent
         } else {
             ProcessStartTimeObservation::Unknown
@@ -77,17 +85,43 @@ impl LocalProcessInfo {
             return None;
         }
         let bytes = &value[..size];
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
         let boot_id = std::str::from_utf8(&bytes[..end]).ok()?.trim();
         (!boot_id.is_empty()).then(|| boot_id.to_string())
     }
 
+    /// Hash the machine UUID into an application-scoped persistent fence.
+    /// `gethostuuid(2)` may wait for the platform identity provider, so keep
+    /// the read bounded; timeout or an invalid sentinel fails closed.
+    pub fn host_machine_fence() -> Option<String> {
+        let mut raw = [0_u8; 16];
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 100_000_000,
+        };
+        let result = unsafe { libc::gethostuuid(raw.as_mut_ptr(), &timeout) };
+        if result != 0
+            || raw.iter().all(|byte| *byte == 0)
+            || raw.iter().all(|byte| *byte == u8::MAX)
+        {
+            return None;
+        }
+        app_scoped_machine_fence(&raw)
+    }
+
     pub fn current_working_dir(pid: u32) -> Option<PathBuf> {
+        if pid == 0 {
+            return None;
+        }
+        let pid = libc::pid_t::try_from(pid).ok()?;
         let mut pathinfo: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&pathinfo) as libc::c_int;
         let ret = unsafe {
             libc::proc_pidinfo(
-                pid as _,
+                pid,
                 libc::PROC_PIDVNODEPATHINFO,
                 0,
                 &mut pathinfo as *mut _ as *mut _,
@@ -114,10 +148,14 @@ impl LocalProcessInfo {
     }
 
     pub fn executable_path(pid: u32) -> Option<PathBuf> {
+        if pid == 0 {
+            return None;
+        }
+        let pid = libc::pid_t::try_from(pid).ok()?;
         let mut buffer: Vec<u8> = Vec::with_capacity(libc::PROC_PIDPATHINFO_MAXSIZE as _);
         let x = unsafe {
             libc::proc_pidpath(
-                pid as _,
+                pid,
                 buffer.as_mut_ptr() as *mut _,
                 libc::PROC_PIDPATHINFO_MAXSIZE as _,
             )
@@ -131,6 +169,13 @@ impl LocalProcessInfo {
     }
 
     pub fn with_root_pid(pid: u32) -> Option<Self> {
+        if pid == 0 {
+            return None;
+        }
+        if libc::pid_t::try_from(pid).is_err() {
+            return None;
+        }
+
         /// Enumerate all current process identifiers
         fn all_pids() -> Vec<libc::pid_t> {
             let num_pids = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
@@ -228,14 +273,22 @@ impl LocalProcessInfo {
 
         let procs: Vec<_> = all_pids().into_iter().filter_map(info_for_pid).collect();
 
-        fn build_proc(info: &libc::proc_bsdinfo, procs: &[libc::proc_bsdinfo]) -> LocalProcessInfo {
+        fn build_proc(
+            info: &libc::proc_bsdinfo,
+            procs: &[libc::proc_bsdinfo],
+            ancestry: &mut HashSet<u32>,
+        ) -> LocalProcessInfo {
+            let inserted = ancestry.insert(info.pbi_pid);
+            debug_assert!(inserted);
             let mut children = HashMap::new();
 
             for kid in procs {
-                if kid.pbi_ppid == info.pbi_pid {
-                    children.insert(kid.pbi_pid, build_proc(kid, procs));
+                if kid.pbi_ppid == info.pbi_pid && !ancestry.contains(&kid.pbi_pid) {
+                    children.insert(kid.pbi_pid, build_proc(kid, procs, ancestry));
                 }
             }
+            let removed = ancestry.remove(&info.pbi_pid);
+            debug_assert!(removed);
 
             let (executable, argv) = exe_and_args_for_pid_sysctl(info.pbi_pid as _)
                 .unwrap_or_else(|| (exe_for_pid(info.pbi_pid as _), vec![]));
@@ -257,7 +310,7 @@ impl LocalProcessInfo {
         }
 
         if let Some(info) = procs.iter().find(|info| info.pbi_pid == pid) {
-            Some(build_proc(info, &procs))
+            Some(build_proc(info, &procs, &mut HashSet::new()))
         } else {
             None
         }

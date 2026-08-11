@@ -10,19 +10,23 @@ default = ["lua"]
 lua = ["dep:luahelper", "dep:frankenterm-dynamic"]
 
 [dependencies]
+frankenterm-dynamic = { workspace = true, optional = true, features = ["std"] }
+hex = { workspace = true, features = ["std"] }
 libc.workspace = true
 log.workspace = true
-luahelper = { workspace=true, optional = true }
-frankenterm-dynamic = { workspace=true, optional = true, features=["std"]}
+luahelper = { workspace = true, optional = true }
+sha2.workspace = true
 
 [target."cfg(windows)".dependencies]
 ntapi.workspace = true
-winapi = { workspace=true, features = [
+winapi = { workspace = true, features = [
     "handleapi",
     "memoryapi",
     "psapi",
     "processthreadsapi",
     "shellapi",
+    "sysinfoapi",
     "tlhelp32",
+    "winbase",
+    "winerror",
 ]}
-

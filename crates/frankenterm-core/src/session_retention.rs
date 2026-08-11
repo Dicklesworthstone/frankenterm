@@ -28,19 +28,26 @@ use crate::checkpoint_witness::{
 use crate::config::SessionRetentionConfig;
 
 // Version 2 introduced a microsecond-resolution macOS process-start token.
-// Version 3 replaces the wall-clock-derived macOS boot timestamp with the
-// kernel boot-session UUID, which cannot drift after a clock correction. Older
-// identities remain unknown rather than crossing either stronger fence.
-const SESSION_HOST_IDENTITY_VERSION: u8 = 3;
+// Version 3 replaced the wall-clock-derived macOS boot timestamp with the
+// kernel boot-session UUID. Version 4 also fences Linux PID namespaces so a
+// same-boot container cannot pronounce another namespace's owner dead.
+// Version 5 adds an application-scoped persistent machine fence so two hosts
+// with the same hostname cannot mistake different boot IDs for a local reboot.
+// Older identities remain unknown rather than crossing any stronger fence.
+const SESSION_HOST_IDENTITY_VERSION: u8 = 5;
 const MAX_HOSTNAME_BYTES: usize = 255;
-const MAX_BOOT_ID_BYTES: usize = 512;
+const MACHINE_FENCE_BYTES: usize = 64;
+const BOOT_ID_BYTES: usize = 36;
+const MAX_PROCESS_DOMAIN_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionHostIdentity {
     version: u8,
     hostname: String,
+    machine_fence: String,
     boot_id: String,
+    process_domain_id: String,
 }
 
 /// Stable ownership fence recorded on every session created by current code.
@@ -89,11 +96,13 @@ impl SessionOwnerClassifier {
         host_id: Option<&str>,
         owner_pid: Option<i64>,
         owner_process_start: Option<i64>,
+        owner_heartbeat_at: Option<i64>,
     ) -> UncleanSessionOwnerState {
         classify_unclean_session_owner_with_observer(
             host_id,
             owner_pid,
             owner_process_start,
+            owner_heartbeat_at,
             &self.observer,
         )
     }
@@ -125,16 +134,69 @@ fn bounded_identity_component(raw: String, max_bytes: usize) -> Option<String> {
     Some(value.to_string())
 }
 
+fn is_canonical_machine_fence(value: &str) -> bool {
+    value.len() == MACHINE_FENCE_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn normalized_boot_id(raw: String) -> Option<String> {
+    let value = raw.as_bytes();
+    if value.len() != BOOT_ID_BYTES
+        || value.iter().enumerate().any(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte != b'-'
+            } else {
+                !byte.is_ascii_hexdigit()
+            }
+        })
+        || value
+            .iter()
+            .filter(|byte| **byte != b'-')
+            .all(|byte| *byte == b'0')
+        || value
+            .iter()
+            .filter(|byte| **byte != b'-')
+            .all(|byte| byte.eq_ignore_ascii_case(&b'f'))
+    {
+        return None;
+    }
+    Some(raw.to_ascii_lowercase())
+}
+
 fn current_session_host_identity() -> Option<SessionHostIdentity> {
     let hostname = hostname::get().ok()?.into_string().ok()?;
     let hostname = bounded_identity_component(hostname, MAX_HOSTNAME_BYTES)?;
+    let machine_fence = procinfo::LocalProcessInfo::host_machine_fence()?;
+    if !is_canonical_machine_fence(&machine_fence) {
+        return None;
+    }
     let boot_id = procinfo::LocalProcessInfo::host_boot_id()?;
-    let boot_id = bounded_identity_component(boot_id, MAX_BOOT_ID_BYTES)?;
+    let boot_id = normalized_boot_id(boot_id)?;
+    let process_domain_id = current_process_domain_id()?;
+    let process_domain_id =
+        bounded_identity_component(process_domain_id, MAX_PROCESS_DOMAIN_ID_BYTES)?;
     Some(SessionHostIdentity {
         version: SESSION_HOST_IDENTITY_VERSION,
         hostname,
+        machine_fence,
         boot_id,
+        process_domain_id,
     })
+}
+
+fn current_process_domain_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(std::env::consts::OS.to_string())
+    }
 }
 
 /// Capture the current process incarnation once for a snapshot-engine lifetime.
@@ -157,15 +219,17 @@ fn parse_session_host_identity(host_id: &str) -> Option<SessionHostIdentity> {
     if host_id.is_empty() || host_id.len() > MAX_SESSION_HOST_ID_BYTES {
         return None;
     }
-    let identity: SessionHostIdentity = serde_json::from_str(host_id).ok()?;
+    let mut identity: SessionHostIdentity = serde_json::from_str(host_id).ok()?;
     if identity.version != SESSION_HOST_IDENTITY_VERSION
         || identity.hostname.trim().is_empty()
         || identity.hostname.len() > MAX_HOSTNAME_BYTES
-        || identity.boot_id.trim().is_empty()
-        || identity.boot_id.len() > MAX_BOOT_ID_BYTES
+        || !is_canonical_machine_fence(&identity.machine_fence)
+        || identity.process_domain_id.trim().is_empty()
+        || identity.process_domain_id.len() > MAX_PROCESS_DOMAIN_ID_BYTES
     {
         return None;
     }
+    identity.boot_id = normalized_boot_id(identity.boot_id)?;
     Some(identity)
 }
 
@@ -173,10 +237,11 @@ fn classify_unclean_session_owner_with_observer(
     host_id: Option<&str>,
     owner_pid: Option<i64>,
     owner_process_start: Option<i64>,
+    owner_heartbeat_at: Option<i64>,
     observer: &impl SessionOwnerObserver,
 ) -> UncleanSessionOwnerState {
-    let (Some(host_id), Some(owner_pid), Some(owner_process_start)) =
-        (host_id, owner_pid, owner_process_start)
+    let (Some(host_id), Some(owner_pid), Some(owner_process_start), Some(owner_heartbeat_at)) =
+        (host_id, owner_pid, owner_process_start, owner_heartbeat_at)
     else {
         return UncleanSessionOwnerState::Unknown;
     };
@@ -186,6 +251,9 @@ fn classify_unclean_session_owner_with_observer(
     let Ok(owner_process_start) = u64::try_from(owner_process_start) else {
         return UncleanSessionOwnerState::Unknown;
     };
+    if owner_heartbeat_at < 0 {
+        return UncleanSessionOwnerState::Unknown;
+    }
     if owner_pid == 0 || owner_process_start == 0 {
         return UncleanSessionOwnerState::Unknown;
     }
@@ -195,11 +263,18 @@ fn classify_unclean_session_owner_with_observer(
     let Some(current_host) = observer.current_host() else {
         return UncleanSessionOwnerState::Unknown;
     };
-    if stored_host.hostname != current_host.hostname {
+    // The v5 machine fence is the persistent host authority. Hostnames are
+    // retained for diagnostics, but they are mutable configuration and may
+    // change during one boot; treating a rename as a foreign host would strand
+    // every earlier crash candidate in the fail-closed `Unknown` state.
+    if stored_host.machine_fence != current_host.machine_fence {
         return UncleanSessionOwnerState::Unknown;
     }
     if stored_host.boot_id != current_host.boot_id {
         return UncleanSessionOwnerState::RecoveryCandidate;
+    }
+    if stored_host.process_domain_id != current_host.process_domain_id {
+        return UncleanSessionOwnerState::Unknown;
     }
     match observer.observe_process_start(owner_pid) {
         procinfo::ProcessStartTimeObservation::Running(observed_start)
@@ -311,10 +386,23 @@ pub fn cleanup_sessions(
     config: &SessionRetentionConfig,
 ) -> Result<CleanupResult, rusqlite::Error> {
     let mut result = CleanupResult::default();
+    // Host, boot, and process-domain identity cannot legitimately change
+    // within one cleanup invocation. Resolve that platform state once for all
+    // enabled policy phases; PID start observations remain fresh at each
+    // candidate classification.
+    let owner_observer =
+        (config.max_age_days > 0 || config.max_closed_sessions > 0 || config.max_total_size_mb > 0)
+            .then(SystemSessionOwnerObserver::new);
 
     // 1. Delete sessions older than max_age_days
     if config.max_age_days > 0 {
-        result.deleted_by_age = delete_sessions_by_age(conn, config.max_age_days)?;
+        result.deleted_by_age = delete_sessions_by_age_with_observer(
+            conn,
+            config.max_age_days,
+            owner_observer
+                .as_ref()
+                .ok_or_else(|| recovery_authority_error("age retention has no owner observer"))?,
+        )?;
         if result.deleted_by_age > 0 {
             info!(
                 deleted = result.deleted_by_age,
@@ -326,7 +414,13 @@ pub fn cleanup_sessions(
 
     // 2. Delete excess closed sessions
     if config.max_closed_sessions > 0 {
-        result.deleted_by_count = delete_excess_closed_sessions(conn, config.max_closed_sessions)?;
+        result.deleted_by_count = delete_excess_closed_sessions_with_observer(
+            conn,
+            config.max_closed_sessions,
+            owner_observer
+                .as_ref()
+                .ok_or_else(|| recovery_authority_error("count retention has no owner observer"))?,
+        )?;
         if result.deleted_by_count > 0 {
             info!(
                 deleted = result.deleted_by_count,
@@ -338,7 +432,13 @@ pub fn cleanup_sessions(
 
     // 3. Delete by size budget
     if config.max_total_size_mb > 0 {
-        let size_outcome = delete_sessions_by_size(conn, config.max_total_size_mb)?;
+        let size_outcome = delete_sessions_by_size_with_observer(
+            conn,
+            config.max_total_size_mb,
+            owner_observer
+                .as_ref()
+                .ok_or_else(|| recovery_authority_error("size retention has no owner observer"))?,
+        )?;
         result.deleted_by_size = size_outcome.deleted;
         result.size_measured_bytes = size_outcome.measured_bytes;
         result.size_deleted_bytes = size_outcome.deleted_bytes;
@@ -412,6 +512,7 @@ struct SessionRetentionAuthority {
     host_id: Option<String>,
     owner_pid: Option<i64>,
     owner_process_start: Option<i64>,
+    owner_heartbeat_at: Option<i64>,
     recovery_acknowledged_at: Option<i64>,
 }
 
@@ -435,7 +536,8 @@ fn newest_usable_recovery_session(
                     THEN session.host_id
                 END,
                 session.owner_pid,
-                session.owner_process_start
+                session.owner_process_start,
+                session.owner_heartbeat_at
          FROM mux_sessions AS session
          WHERE session.shutdown_clean = 0
            AND session.recovery_acknowledged_at IS NULL
@@ -460,11 +562,12 @@ fn newest_usable_recovery_session(
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         },
     )?;
     for row in rows {
-        let (session_id, host_id, owner_pid, owner_process_start) = row?;
+        let (session_id, host_id, owner_pid, owner_process_start, owner_heartbeat_at) = row?;
         if has_unresolved_restore_intent(conn, &session_id)? {
             continue;
         }
@@ -472,6 +575,7 @@ fn newest_usable_recovery_session(
             host_id.as_deref(),
             owner_pid,
             owner_process_start,
+            owner_heartbeat_at,
             observer,
         ) != UncleanSessionOwnerState::RecoveryCandidate
         {
@@ -494,6 +598,7 @@ fn session_is_deletion_eligible(
         candidate.host_id.as_deref(),
         candidate.owner_pid,
         candidate.owner_process_start,
+        candidate.owner_heartbeat_at,
         observer,
     );
     if owner_state == UncleanSessionOwnerState::Live
@@ -517,6 +622,12 @@ fn session_is_deletion_eligible(
         return Ok(false);
     }
     if owner_state != UncleanSessionOwnerState::RecoveryCandidate {
+        return Ok(false);
+    }
+    if candidate
+        .recovery_acknowledged_at
+        .is_some_and(|acknowledged_at| acknowledged_at < 0)
+    {
         return Ok(false);
     }
     if candidate.recovery_acknowledged_at.is_some() {
@@ -555,7 +666,8 @@ fn set_recovery_acknowledgement_with_observer(
                         THEN host_id
                     END,
                     owner_pid,
-                    owner_process_start
+                    owner_process_start,
+                    owner_heartbeat_at
              FROM mux_sessions
              WHERE session_id = ?1",
             rusqlite::params![
@@ -568,11 +680,13 @@ fn set_recovery_acknowledgement_with_observer(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((shutdown_clean, host_id, owner_pid, owner_process_start)) = row else {
+    let Some((shutdown_clean, host_id, owner_pid, owner_process_start, owner_heartbeat_at)) = row
+    else {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     };
     if shutdown_clean != 0 {
@@ -584,6 +698,7 @@ fn set_recovery_acknowledgement_with_observer(
         host_id.as_deref(),
         owner_pid,
         owner_process_start,
+        owner_heartbeat_at,
         observer,
     );
     if acknowledged_at.is_some() && owner_state != UncleanSessionOwnerState::RecoveryCandidate {
@@ -711,11 +826,11 @@ pub(crate) fn has_unresolved_restore_intent(
 /// persistent allowlist: migration validation pins their bodies, and cleanup
 /// depends on them to keep byte deletion receipts exact.
 ///
-/// The complete 12-trigger source-table set is required, not merely allowed:
-/// snapshot DML receipts rely on exactly one summary mutation per source-row
-/// mutation. SQLite identifiers are case-insensitive while both schema catalogs
-/// preserve the spelling used by `CREATE TRIGGER`, so all comparisons use
-/// `NOCASE`.
+/// The complete 15-trigger set is required, not merely allowed: 12 source
+/// maintenance triggers ensure exactly one summary mutation per source-row
+/// mutation, while three summary self-guards prevent direct authority drift.
+/// SQLite identifiers are case-insensitive while both schema catalogs preserve
+/// the spelling used by `CREATE TRIGGER`, so comparisons use `NOCASE`.
 ///
 /// # Errors
 ///
@@ -725,63 +840,13 @@ pub(crate) fn has_unresolved_restore_intent(
 pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
     conn: &Connection,
 ) -> Result<(), rusqlite::Error> {
-    let (unaudited_count, canonical_count, temp_count): (i64, i64, i64) = conn.query_row(
-        "SELECT
-             (SELECT COUNT(*) FROM sqlite_schema
-             WHERE type = 'trigger'
-                AND tbl_name COLLATE NOCASE
-                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
-                        'restore_attempt_lifecycle')
-                AND name COLLATE NOCASE NOT IN (
-                    'mux_sessions_retained_size_ai',
-                    'mux_sessions_retained_size_au',
-                    'mux_sessions_retained_size_ad',
-                    'session_checkpoints_retained_size_ai',
-                    'session_checkpoints_retained_size_au',
-                    'session_checkpoints_retained_size_bd',
-                    'mux_pane_state_retained_size_ai',
-                    'mux_pane_state_retained_size_au',
-                    'mux_pane_state_retained_size_ad',
-                    'restore_attempt_lifecycle_retained_size_ai',
-                    'restore_attempt_lifecycle_retained_size_au',
-                    'restore_attempt_lifecycle_retained_size_ad'
-                )),
-             (SELECT COUNT(*) FROM sqlite_schema
-              WHERE type = 'trigger'
-                AND tbl_name COLLATE NOCASE
-                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
-                        'restore_attempt_lifecycle')
-                AND name COLLATE NOCASE IN (
-                    'mux_sessions_retained_size_ai',
-                    'mux_sessions_retained_size_au',
-                    'mux_sessions_retained_size_ad',
-                    'session_checkpoints_retained_size_ai',
-                    'session_checkpoints_retained_size_au',
-                    'session_checkpoints_retained_size_bd',
-                    'mux_pane_state_retained_size_ai',
-                    'mux_pane_state_retained_size_au',
-                    'mux_pane_state_retained_size_ad',
-                    'restore_attempt_lifecycle_retained_size_ai',
-                    'restore_attempt_lifecycle_retained_size_au',
-                    'restore_attempt_lifecycle_retained_size_ad'
-                )),
-             (SELECT COUNT(*) FROM sqlite_temp_schema
-              WHERE type = 'trigger'
-                AND tbl_name COLLATE NOCASE
-                    IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
-                        'restore_attempt_lifecycle'))",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    if unaudited_count == 0 && canonical_count == 12 && temp_count == 0 {
-        Ok(())
-    } else {
-        Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            std::io::Error::other(
-                "session authority mutation requires the exact canonical retained-size trigger set",
-            ),
-        )))
-    }
+    crate::storage::migrations::validate_session_retained_size_mutation_schema(conn).map_err(
+        |error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                "session authority mutation requires the exact canonical retained-size schema: {error}"
+            ))))
+        },
+    )
 }
 
 /// Delete eligible closed or proven-dead recovery sessions older than
@@ -790,6 +855,7 @@ pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
 /// Exact live owners override every age policy. Unclean sessions are eligible
 /// only after owner-death fencing, and the newest usable recovery point remains
 /// protected unless an explicit acknowledgement authorized its deletion.
+#[cfg(test)]
 fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize, rusqlite::Error> {
     let observer = SystemSessionOwnerObserver::new();
     delete_sessions_by_age_with_observer(conn, max_age_days, &observer)
@@ -820,6 +886,7 @@ fn delete_sessions_by_age_with_observer(
                     END,
                     owner_pid,
                     owner_process_start,
+                    owner_heartbeat_at,
                     recovery_acknowledged_at
              FROM mux_sessions
              WHERE MAX(
@@ -850,7 +917,8 @@ fn delete_sessions_by_age_with_observer(
                     host_id: row.get(3)?,
                     owner_pid: row.get(4)?,
                     owner_process_start: row.get(5)?,
-                    recovery_acknowledged_at: row.get(6)?,
+                    owner_heartbeat_at: row.get(6)?,
+                    recovery_acknowledged_at: row.get(7)?,
                 })
             },
         )?
@@ -880,6 +948,7 @@ fn delete_sessions_by_age_with_observer(
 }
 
 /// Delete excess closed sessions, keeping the most recent `max_count`.
+#[cfg(test)]
 fn delete_excess_closed_sessions(
     conn: &Connection,
     max_count: usize,
@@ -908,6 +977,7 @@ fn delete_excess_closed_sessions_with_observer(
                     END,
                     owner_pid,
                     owner_process_start,
+                    owner_heartbeat_at,
                     recovery_acknowledged_at
              FROM mux_sessions
              WHERE typeof(session_id) = 'text'
@@ -937,7 +1007,8 @@ fn delete_excess_closed_sessions_with_observer(
                     host_id: row.get(3)?,
                     owner_pid: row.get(4)?,
                     owner_process_start: row.get(5)?,
-                    recovery_acknowledged_at: row.get(6)?,
+                    owner_heartbeat_at: row.get(6)?,
+                    recovery_acknowledged_at: row.get(7)?,
                 })
             },
         )?
@@ -1113,6 +1184,7 @@ fn validate_session_retained_size_authority(conn: &Connection) -> Result<(), rus
 /// bytes are under budget. Every stored field is charged once by schema-v40
 /// `session_retained_size`; SQLite page, index, freelist, and WAL bytes remain
 /// outside this explicitly logical budget.
+#[cfg(test)]
 fn delete_sessions_by_size(
     conn: &Connection,
     max_total_mb: u64,
@@ -1189,6 +1261,7 @@ fn delete_sessions_by_size_with_observer(
                     END,
                     s.owner_pid,
                     s.owner_process_start,
+                    s.owner_heartbeat_at,
                     s.recovery_acknowledged_at
              FROM mux_sessions s
              INNER JOIN session_retained_size z ON z.session_id = s.session_id
@@ -1226,7 +1299,8 @@ fn delete_sessions_by_size_with_observer(
                             host_id: row.get(4)?,
                             owner_pid: row.get(5)?,
                             owner_process_start: row.get(6)?,
-                            recovery_acknowledged_at: row.get(7)?,
+                            owner_heartbeat_at: row.get(7)?,
+                            recovery_acknowledged_at: row.get(8)?,
                         },
                         session_bytes,
                     ))
@@ -1522,6 +1596,11 @@ mod tests {
 
     use super::*;
 
+    const TEST_MACHINE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEST_MACHINE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const TEST_BOOT_A: &str = "11111111-1111-4111-8111-111111111111";
+    const TEST_BOOT_B: &str = "22222222-2222-4222-8222-222222222222";
+
     struct FakeOwnerObserver {
         current_host: Option<SessionHostIdentity>,
         processes: BTreeMap<u32, procinfo::ProcessStartTimeObservation>,
@@ -1540,16 +1619,49 @@ mod tests {
         }
     }
 
-    fn test_host(hostname: &str, boot_id: &str) -> SessionHostIdentity {
+    fn test_host_on_machine(
+        hostname: &str,
+        machine_fence: &str,
+        boot_id: &str,
+    ) -> SessionHostIdentity {
+        let boot_id = match boot_id {
+            "boot-a" => TEST_BOOT_A,
+            "boot-b" => TEST_BOOT_B,
+            value => value,
+        };
         SessionHostIdentity {
             version: SESSION_HOST_IDENTITY_VERSION,
             hostname: hostname.to_string(),
+            machine_fence: machine_fence.to_string(),
             boot_id: boot_id.to_string(),
+            process_domain_id: "test-process-domain".to_string(),
         }
+    }
+
+    fn test_host(hostname: &str, boot_id: &str) -> SessionHostIdentity {
+        test_host_on_machine(hostname, TEST_MACHINE_A, boot_id)
     }
 
     fn encoded_test_host(hostname: &str, boot_id: &str) -> String {
         serde_json::to_string(&test_host(hostname, boot_id)).unwrap()
+    }
+
+    #[test]
+    fn boot_identity_normalization_is_uuid_shaped_and_whitespace_strict() {
+        assert_eq!(
+            normalized_boot_id(TEST_BOOT_A.to_ascii_uppercase()).as_deref(),
+            Some(TEST_BOOT_A)
+        );
+        for invalid in [
+            "",
+            " boot-a",
+            "11111111-1111-4111-8111-111111111111 ",
+            "111111111111-4111-8111-111111111111",
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ] {
+            assert_eq!(normalized_boot_id(invalid.to_string()), None);
+        }
     }
 
     #[test]
@@ -1568,6 +1680,7 @@ mod tests {
                 Some(&host_id),
                 Some(41),
                 Some(900),
+                Some(1),
                 &observer,
             ),
             UncleanSessionOwnerState::Live
@@ -1577,6 +1690,7 @@ mod tests {
                 Some(&host_id),
                 Some(42),
                 Some(900),
+                Some(1),
                 &observer,
             ),
             UncleanSessionOwnerState::RecoveryCandidate,
@@ -1587,6 +1701,7 @@ mod tests {
                 Some(&host_id),
                 Some(42),
                 Some(901),
+                Some(1),
                 &observer,
             ),
             UncleanSessionOwnerState::Live,
@@ -1602,13 +1717,14 @@ mod tests {
                 Some(&host_id),
                 Some(41),
                 Some(900),
+                Some(1),
                 &rebooted,
             ),
             UncleanSessionOwnerState::RecoveryCandidate
         );
 
-        let foreign = FakeOwnerObserver {
-            current_host: Some(test_host("mac-studio", "boot-a")),
+        let same_name_other_machine = FakeOwnerObserver {
+            current_host: Some(test_host_on_machine("trj", TEST_MACHINE_B, "boot-b")),
             processes: BTreeMap::new(),
         };
         assert_eq!(
@@ -1616,10 +1732,46 @@ mod tests {
                 Some(&host_id),
                 Some(41),
                 Some(900),
-                &foreign,
+                Some(1),
+                &same_name_other_machine,
             ),
             UncleanSessionOwnerState::Unknown,
-            "a different hostname can still own a shared database"
+            "a boot mismatch proves a reboot only after the persistent machine fence matches"
+        );
+
+        let renamed_same_machine = FakeOwnerObserver {
+            current_host: Some(test_host("mac-studio", "boot-a")),
+            processes: BTreeMap::from([(41, procinfo::ProcessStartTimeObservation::Running(900))]),
+        };
+        assert_eq!(
+            classify_unclean_session_owner_with_observer(
+                Some(&host_id),
+                Some(41),
+                Some(900),
+                Some(1),
+                &renamed_same_machine,
+            ),
+            UncleanSessionOwnerState::Live,
+            "a hostname rename must not invalidate the stable machine and process fences"
+        );
+
+        let other_process_domain = FakeOwnerObserver {
+            current_host: Some(SessionHostIdentity {
+                process_domain_id: "other-process-domain".to_string(),
+                ..test_host("trj", "boot-a")
+            }),
+            processes: BTreeMap::new(),
+        };
+        assert_eq!(
+            classify_unclean_session_owner_with_observer(
+                Some(&host_id),
+                Some(41),
+                Some(900),
+                Some(1),
+                &other_process_domain,
+            ),
+            UncleanSessionOwnerState::Unknown,
+            "same-boot PID namespace mismatch cannot prove another namespace's owner dead"
         );
     }
 
@@ -1630,17 +1782,28 @@ mod tests {
             processes: BTreeMap::from([(41, procinfo::ProcessStartTimeObservation::Unknown)]),
         };
         let valid_host = encoded_test_host("trj", "boot-a");
-        for (host_id, pid, process_start) in [
-            (None, Some(41), Some(900)),
-            (Some("not-json"), Some(41), Some(900)),
-            (Some(""), None, None),
-            (Some(valid_host.as_str()), Some(41), Some(900)),
+        let legacy_host = r#"{"version":4,"hostname":"trj","boot_id":"boot-a","process_domain_id":"test-process-domain"}"#;
+        let short_machine_fence = r#"{"version":5,"hostname":"trj","machine_fence":"abcd","boot_id":"boot-a","process_domain_id":"test-process-domain"}"#;
+        let whitespace_boot = format!(
+            r#"{{"version":5,"hostname":"trj","machine_fence":"{TEST_MACHINE_A}","boot_id":" {TEST_BOOT_A}","process_domain_id":"test-process-domain"}}"#
+        );
+        for (host_id, pid, process_start, heartbeat_at) in [
+            (None, Some(41), Some(900), Some(1)),
+            (Some("not-json"), Some(41), Some(900), Some(1)),
+            (Some(legacy_host), Some(41), Some(900), Some(1)),
+            (Some(short_machine_fence), Some(41), Some(900), Some(1)),
+            (Some(whitespace_boot.as_str()), Some(41), Some(900), Some(1)),
+            (Some(""), None, None, None),
+            (Some(valid_host.as_str()), Some(41), Some(900), None),
+            (Some(valid_host.as_str()), Some(41), Some(900), Some(-1)),
+            (Some(valid_host.as_str()), Some(41), Some(900), Some(1)),
         ] {
             assert_eq!(
                 classify_unclean_session_owner_with_observer(
                     host_id,
                     pid,
                     process_start,
+                    heartbeat_at,
                     &observer,
                 ),
                 UncleanSessionOwnerState::Unknown
@@ -1819,14 +1982,24 @@ mod tests {
     }
 
     fn insert_session(conn: &Connection, id: &str, created_at: i64, shutdown_clean: bool) {
+        insert_session_with_topology(conn, id, created_at, shutdown_clean, "{}");
+    }
+
+    fn insert_session_with_topology(
+        conn: &Connection,
+        id: &str,
+        created_at: i64,
+        shutdown_clean: bool,
+        topology_json: &str,
+    ) {
         conn.execute(
             "INSERT INTO mux_sessions (session_id, created_at, shutdown_clean, topology_json, ft_version)
-             VALUES (?1, ?2, ?3, '{}', '0.1.0')",
-            rusqlite::params![id, created_at, shutdown_clean as i64],
+             VALUES (?1, ?2, ?3, ?4, '0.1.0')",
+            rusqlite::params![id, created_at, shutdown_clean as i64, topology_json],
         )
         .unwrap();
         if shutdown_clean {
-            insert_v2_clean_receipt(conn, id, created_at);
+            insert_v2_clean_shutdown_snapshot(conn, id, created_at);
         }
     }
 
@@ -1846,7 +2019,8 @@ mod tests {
                  FROM mux_sessions
                  WHERE session_id = ?1
              )
-               AND checkpoint_role = 'restore_receipt'
+               AND checkpoint_type = 'shutdown'
+               AND checkpoint_role = 'snapshot'
                AND total_bytes = 0",
             [session_id],
         )
@@ -1876,7 +2050,7 @@ mod tests {
         )
         .unwrap();
         if shutdown_clean {
-            insert_v2_clean_receipt(conn, session_id, checkpoint_at);
+            insert_v2_clean_shutdown_snapshot(conn, session_id, checkpoint_at);
         }
         checkpoint_id
     }
@@ -1891,31 +2065,41 @@ mod tests {
         .unwrap();
     }
 
-    fn insert_v2_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64) -> i64 {
-        let metadata_json = r#"{"old_to_new":{}}"#;
+    fn insert_v2_clean_shutdown_snapshot(
+        conn: &Connection,
+        session_id: &str,
+        checkpoint_at: i64,
+    ) -> i64 {
+        let topology_json: String = conn
+            .query_row(
+                "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .expect("load clean shutdown topology");
         conn.execute(
             "INSERT INTO session_checkpoints
              (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
               total_bytes, metadata_json, checkpoint_role, topology_json)
-             VALUES (?1, ?2, 'startup', 'pending:rst2', 0, 0, ?3,
-                     'restore_receipt', NULL)",
-            rusqlite::params![session_id, checkpoint_at, metadata_json],
+             VALUES (?1, ?2, 'shutdown', 'pending:snp2', 0, 0, NULL,
+                     'snapshot', ?3)",
+            rusqlite::params![session_id, checkpoint_at, &topology_json],
         )
         .unwrap();
         let checkpoint_id = conn.last_insert_rowid();
         let state_hash = crate::checkpoint_witness::checkpoint_witness(
-            crate::checkpoint_witness::CHECKPOINT_ROLE_RESTORE_RECEIPT,
+            crate::checkpoint_witness::CHECKPOINT_ROLE_SNAPSHOT,
             session_id,
             checkpoint_id,
             checkpoint_at,
-            "startup",
+            "shutdown",
             0,
             0,
-            Some(metadata_json),
             None,
+            Some(&topology_json),
             &[],
         )
-        .expect("compute v2 clean receipt witness");
+        .expect("compute v2 clean shutdown witness");
         conn.execute(
             "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
             rusqlite::params![state_hash, checkpoint_id],
@@ -2043,6 +2227,7 @@ mod tests {
             host_id: Some(host_id.clone()),
             owner_pid: Some(41),
             owner_process_start: Some(900),
+            owner_heartbeat_at: Some(i64::MAX),
             recovery_acknowledged_at: None,
         };
         let live = FakeOwnerObserver {
@@ -2063,6 +2248,20 @@ mod tests {
         assert!(!session_is_deletion_eligible(&conn, &candidate, None, &dead).unwrap());
         set_recovery_acknowledgement_with_observer(&conn, "owned-active", Some(1_000), &dead)
             .unwrap();
+        let negative_acknowledgement = SessionRetentionAuthority {
+            session_id: candidate.session_id.clone(),
+            shutdown_clean: candidate.shutdown_clean,
+            clean_checkpoint_id: candidate.clean_checkpoint_id,
+            host_id: candidate.host_id.clone(),
+            owner_pid: candidate.owner_pid,
+            owner_process_start: candidate.owner_process_start,
+            owner_heartbeat_at: candidate.owner_heartbeat_at,
+            recovery_acknowledged_at: Some(-1),
+        };
+        assert!(
+            !session_is_deletion_eligible(&conn, &negative_acknowledgement, None, &dead).unwrap(),
+            "corrupt negative acknowledgement metadata must never authorize deletion"
+        );
         let acknowledged = SessionRetentionAuthority {
             recovery_acknowledged_at: Some(1_000),
             ..candidate
@@ -2078,6 +2277,104 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_ack, None);
+    }
+
+    #[test]
+    fn malformed_owner_lifecycle_timestamps_never_authorize_cleanup_or_acknowledgement() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+
+        for (index, session_id) in ["negative-lifecycle", "missing-heartbeat"]
+            .into_iter()
+            .enumerate()
+        {
+            let timestamp = 1 + i64::try_from(index).unwrap();
+            insert_session(&conn, session_id, timestamp, false);
+            set_unclean_owner(
+                &conn,
+                session_id,
+                &host_id,
+                71 + i64::try_from(index).unwrap(),
+                1_071 + i64::try_from(index).unwrap(),
+                timestamp,
+            );
+            insert_v2_recovery_snapshot(
+                &conn,
+                session_id,
+                timestamp,
+                71 + u64::try_from(index).unwrap(),
+                71 + u64::try_from(index).unwrap(),
+            );
+        }
+
+        // Seed historical corruption without weakening the behavior under
+        // test. SQLite's `ignore_check_constraints` pragma does not bypass the
+        // canonical retained-size UPDATE trigger, so suspend that one trigger,
+        // keep its byte summary exact by hand, and reinstall/validate the
+        // canonical trigger set before invoking any retention authority.
+        conn.execute_batch(
+            "DROP TRIGGER mux_sessions_retained_size_au;
+             PRAGMA ignore_check_constraints = ON;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET owner_heartbeat_at = -1,
+                 recovery_acknowledged_at = -1
+             WHERE session_id = 'negative-lifecycle'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET owner_heartbeat_at = NULL,
+                 recovery_acknowledged_at = 1
+             WHERE session_id = 'missing-heartbeat'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE session_retained_size
+                 SET session_row_bytes = session_row_bytes + 8
+                 WHERE session_id = 'negative-lifecycle'",
+                [],
+            )
+            .unwrap(),
+            1,
+            "the newly non-NULL acknowledgement contributes one SQLite integer"
+        );
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+        conn.execute_batch(crate::storage::migrations::session_retained_size_schema_sql().unwrap())
+            .expect("restore canonical retained-size trigger authority");
+        crate::storage::migrations::validate_session_retained_size_schema(&conn)
+            .expect("corrupt lifecycle values retain exact byte authority");
+
+        for session_id in ["negative-lifecycle", "missing-heartbeat"] {
+            assert!(
+                set_recovery_acknowledgement_with_observer(&conn, session_id, Some(10), &dead,)
+                    .is_err(),
+                "malformed owner heartbeat for {session_id} must reject acknowledgement"
+            );
+        }
+        assert_eq!(
+            delete_sessions_by_age_with_observer(&conn, 0, &dead).unwrap(),
+            0
+        );
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
+            0
+        );
+        assert!(
+            delete_sessions_by_size_with_observer(&conn, 0, &dead).is_err(),
+            "exact-size cleanup must reject malformed lifecycle accounting authority"
+        );
+        assert_eq!(count_sessions(&conn), 2);
     }
 
     #[test]
@@ -2300,6 +2597,10 @@ mod tests {
     }
 
     fn count_checkpoints(conn: &Connection) -> i64 {
+        // Count every persisted snapshot, including the verified zero-pane
+        // shutdown snapshot that gives a test fixture destructive clean-state
+        // authority. Payload-only assertions must account for that authority
+        // snapshot.
         conn.query_row(
             "SELECT COUNT(*) FROM session_checkpoints
              WHERE checkpoint_role = 'snapshot'",
@@ -2375,19 +2676,19 @@ mod tests {
     }
 
     #[test]
-    fn age_cleanup_never_deletes_session_with_corrupt_v2_clean_receipt() {
+    fn age_cleanup_never_deletes_session_with_corrupt_v2_clean_snapshot() {
         let conn = make_test_db();
         let old =
             i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer") - 90 * 86_400_000;
         insert_session(&conn, "corrupt-v2-clean", old, false);
-        let receipt_id = insert_v2_clean_receipt(&conn, "corrupt-v2-clean", old);
+        let snapshot_id = insert_v2_clean_shutdown_snapshot(&conn, "corrupt-v2-clean", old);
         conn.execute(
             "UPDATE session_checkpoints
              SET metadata_json = '{\"old_to_new\":{\"1\":9}}'
              WHERE id = ?1",
-            [receipt_id],
+            [snapshot_id],
         )
-        .expect("tamper clean receipt without recomputing witness");
+        .expect("tamper clean snapshot without recomputing witness");
 
         assert_eq!(delete_sessions_by_age(&conn, 30).unwrap(), 0);
         assert_eq!(count_sessions(&conn), 1);
@@ -2424,7 +2725,7 @@ mod tests {
         )
         .expect("bind authoritative unresolved lifecycle");
 
-        // The later snapshot and clean receipt make the ordinary clean-session
+        // The later snapshot and clean authority make the ordinary clean-session
         // authority valid again, but cannot resolve the older external-effect
         // intent merely by displacing it from the latest-row position.
         insert_checkpoint(&conn, "unresolved-restore", old + 2, 2 * 1_024 * 1_024);
@@ -2553,7 +2854,7 @@ mod tests {
             rusqlite::params![intent_id, intent_id + 100, old],
         )
         .expect("seed cross-session lifecycle corruption");
-        insert_v2_clean_receipt(&conn, "missing-lifecycle", old + 3);
+        insert_v2_clean_shutdown_snapshot(&conn, "missing-lifecycle", old + 3);
 
         assert!(
             has_unresolved_restore_intent(&conn, "missing-lifecycle")
@@ -2660,19 +2961,13 @@ mod tests {
     }
 
     #[test]
-    fn count_cleanup_orders_by_authoritative_checkpoint_recency() {
+    fn count_cleanup_orders_by_checkpoint_recency_over_session_creation() {
         let conn = make_test_db();
         let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
         let old = now - 90 * 86_400_000;
         insert_session(&conn, "recent-by-created", now - 10_000, true);
         insert_session(&conn, "recent-by-checkpoint", old, true);
         insert_checkpoint(&conn, "recent-by-checkpoint", now - 1_000, 1_024);
-        conn.execute(
-            "UPDATE mux_sessions SET last_checkpoint_at = -1 WHERE session_id = ?1",
-            ["recent-by-checkpoint"],
-        )
-        .unwrap();
-
         let deleted = delete_excess_closed_sessions(&conn, 1).unwrap();
         assert_eq!(deleted, 1);
         let retained: String = conn
@@ -2780,7 +3075,7 @@ mod tests {
             .expect_err("trigger authority drift must fail before eviction");
         assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
         assert_eq!(count_sessions(&conn), 1);
-        assert_eq!(count_checkpoints(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 2);
     }
 
     #[test]
@@ -2963,7 +3258,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(state_hash, "hash");
+        assert_eq!(state_hash, "0123456789abcdef");
 
         insert_session(&conn, "pane-update-guard", now + 2, false);
         let pane_checkpoint_id = insert_checkpoint(&conn, "pane-update-guard", now + 2, 0);
@@ -3049,31 +3344,20 @@ mod tests {
     }
 
     #[test]
-    fn size_cleanup_evicts_by_authoritative_checkpoint_recency() {
+    fn size_cleanup_evicts_by_checkpoint_recency_over_session_creation() {
         let conn = make_test_db();
         let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
         let old = now - 90 * 86_400_000;
         insert_session(&conn, "genuinely-old", old, true);
         insert_checkpoint(&conn, "genuinely-old", old, 700 * 1_024);
-        insert_session(&conn, "recent-checkpoint-stale-cache", old - 1, true);
-        insert_checkpoint(
-            &conn,
-            "recent-checkpoint-stale-cache",
-            now - 1_000,
-            700 * 1_024,
-        );
-        conn.execute(
-            "UPDATE mux_sessions SET last_checkpoint_at = ?1 WHERE session_id = ?2",
-            rusqlite::params![old - 2, "recent-checkpoint-stale-cache"],
-        )
-        .unwrap();
-
+        insert_session(&conn, "recent-by-checkpoint", old - 1, true);
+        insert_checkpoint(&conn, "recent-by-checkpoint", now - 1_000, 700 * 1_024);
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
         assert_eq!(outcome.deleted, 1);
         let retained: String = conn
             .query_row("SELECT session_id FROM mux_sessions", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(retained, "recent-checkpoint-stale-cache");
+        assert_eq!(retained, "recent-by-checkpoint");
     }
 
     #[test]
@@ -3119,7 +3403,7 @@ mod tests {
         delete_sessions_by_size(&conn, 1)
             .expect_err("the second candidate must abort the size-cleanup transaction");
         assert_eq!(count_sessions(&conn), 3);
-        assert_eq!(count_checkpoints(&conn), 3);
+        assert_eq!(count_checkpoints(&conn), 6);
     }
 
     #[test]
@@ -3145,7 +3429,7 @@ mod tests {
             .expect_err("an unaudited ignore trigger must fail before any deletion");
         assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
         assert_eq!(count_sessions(&conn), 2);
-        assert_eq!(count_checkpoints(&conn), 2);
+        assert_eq!(count_checkpoints(&conn), 4);
     }
 
     #[test]
@@ -3166,7 +3450,7 @@ mod tests {
         delete_sessions_by_size(&conn, 1)
             .expect_err("TEMP triggers on authoritative tables must fail closed");
         assert_eq!(count_sessions(&conn), 1);
-        assert_eq!(count_checkpoints(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 2);
     }
 
     #[test]
@@ -3199,6 +3483,43 @@ mod tests {
         .unwrap();
         delete_sessions_by_size(&conn, 1)
             .expect_err("identifier casing must not bypass the TEMP trigger guard");
+        assert_eq!(count_sessions(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 2);
+    }
+
+    #[test]
+    fn retention_rejects_same_name_trigger_body_drift_before_deletion() {
+        let conn = make_test_db();
+        let old = i64::try_from(epoch_ms()).unwrap() - 90 * 86_400_000;
+        insert_session(&conn, "same-name-drift", old, true);
+        conn.execute_batch(
+            "DROP TRIGGER mux_sessions_retained_size_ad;
+             CREATE TRIGGER mux_sessions_retained_size_ad
+             AFTER DELETE ON mux_sessions BEGIN SELECT 1; END;",
+        )
+        .expect("replace canonical delete trigger with a same-name no-op");
+
+        let error = delete_sessions_by_age(&conn, 30)
+            .expect_err("same-name trigger drift must fail before age deletion");
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
+        assert_eq!(count_sessions(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 1);
+    }
+
+    #[test]
+    fn retention_rejects_extra_summary_table_trigger_before_deletion() {
+        let conn = make_test_db();
+        let old = i64::try_from(epoch_ms()).unwrap() - 90 * 86_400_000;
+        insert_session(&conn, "summary-trigger-drift", old, true);
+        conn.execute_batch(
+            "CREATE TRIGGER unaudited_summary_trigger
+             AFTER UPDATE ON session_retained_size BEGIN SELECT 1; END;",
+        )
+        .expect("install unaudited retained-size summary trigger");
+
+        let error = delete_sessions_by_age(&conn, 30)
+            .expect_err("a summary-table trigger must fail before age deletion");
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
         assert_eq!(count_sessions(&conn), 1);
         assert_eq!(count_checkpoints(&conn), 1);
     }
@@ -3313,14 +3634,14 @@ mod tests {
         assert!(outcome.measured_bytes > 0);
         assert_eq!(outcome.ineligible_shortfall_bytes, 0);
         assert_eq!(count_sessions(&conn), 1);
-        assert_eq!(count_checkpoints(&conn), 2);
+        assert_eq!(count_checkpoints(&conn), 3);
 
         let orphaned = cleanup_orphaned_data(&conn).unwrap();
         assert_eq!(orphaned.orphaned_restore_lifecycle_rows, 0);
         assert_eq!(orphaned.orphaned_checkpoints, 1);
         assert_eq!(orphaned.orphaned_pane_states, 0);
         assert_eq!(count_sessions(&conn), 1);
-        assert_eq!(count_checkpoints(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 2);
     }
 
     // ---- Cascade delete ----
@@ -3336,7 +3657,7 @@ mod tests {
         insert_pane_state(&conn, cp_id, 1);
         insert_pane_state(&conn, cp_id, 2);
 
-        assert_eq!(count_checkpoints(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 2);
         assert_eq!(count_pane_states(&conn), 2);
 
         delete_sessions_by_age(&conn, 30).unwrap();
@@ -3368,11 +3689,11 @@ mod tests {
             .unwrap();
         });
 
-        assert_eq!(count_checkpoints(&conn), 2);
+        assert_eq!(count_checkpoints(&conn), 3);
 
         let orphaned = cleanup_orphaned_data(&conn).unwrap();
         assert_eq!(orphaned.orphaned_checkpoints, 1);
-        assert_eq!(count_checkpoints(&conn), 1);
+        assert_eq!(count_checkpoints(&conn), 2);
     }
 
     #[test]
@@ -3792,13 +4113,7 @@ mod tests {
         // witness. Full VACUUM would drive this count back to zero.
         let payload = "x".repeat(32 * 1024);
         for i in 0..12 {
-            conn.execute(
-                "INSERT INTO mux_sessions
-                 (session_id, created_at, shutdown_clean, topology_json, ft_version)
-                 VALUES (?1, ?2, 1, ?3, '0.1.0')",
-                rusqlite::params![format!("old-{i}"), old, &payload],
-            )
-            .unwrap();
+            insert_session_with_topology(&conn, &format!("old-{i}"), old, true, &payload);
         }
 
         let config = SessionRetentionConfig {
@@ -4015,7 +4330,7 @@ mod tests {
         insert_pane_state(&conn, cp3, 4);
         insert_pane_state(&conn, cp3, 5);
 
-        assert_eq!(count_checkpoints(&conn), 3);
+        assert_eq!(count_checkpoints(&conn), 4);
         assert_eq!(count_pane_states(&conn), 5);
 
         delete_sessions_by_age(&conn, 30).unwrap();
@@ -4051,14 +4366,15 @@ mod tests {
         );
     }
 
-    // ── Size cleanup: sessions with only clean-receipt checkpoints ──
+    // ── Size cleanup: sessions with only clean-authority snapshots ──
 
     #[test]
-    fn size_cleanup_with_only_session_and_clean_receipt_payloads() {
+    fn size_cleanup_with_only_session_and_clean_snapshot_payloads() {
         let conn = make_test_db();
         let now = epoch_ms() as i64;
 
-        // Session rows and clean receipts are charged even without a snapshot.
+        // Session rows and their zero-pane clean snapshots are charged even
+        // without captured pane payloads.
         for i in 0..5 {
             insert_session(&conn, &format!("nochk-{i}"), now + i * 1000, true);
         }

@@ -10,6 +10,26 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+const MAX_RAW_MACHINE_ID_BYTES: usize = 4 * 1024;
+
+/// Derive a content-free, application-scoped fence from a platform machine ID.
+///
+/// Platform identifiers can be confidential and must never cross this crate's
+/// API in raw form. The fixed domain separator prevents the digest from being
+/// correlated with an unscoped hash emitted by unrelated software.
+fn app_scoped_machine_fence(raw: &[u8]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    if raw.is_empty() || raw.len() > MAX_RAW_MACHINE_ID_BYTES {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"frankenterm/procinfo/host-machine-id/v1\0");
+    digest.update(u64::try_from(raw.len()).ok()?.to_le_bytes());
+    digest.update(raw);
+    Some(hex::encode(digest.finalize()))
+}
+
 #[cfg(feature = "lua")]
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
 
@@ -136,11 +156,29 @@ impl LocalProcessInfo {
     pub fn host_boot_id() -> Option<String> {
         None
     }
+
+    /// Return an application-scoped persistent machine fence when supported.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    pub fn host_machine_fence() -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep platform-only fields represented in every synthetic process while
+    /// letting the test bodies focus on the portable process-tree contract.
+    macro_rules! test_process_info {
+        ($($fields:tt)*) => {
+            LocalProcessInfo {
+                $($fields)*
+                #[cfg(windows)]
+                console: 0,
+            }
+        };
+    }
 
     // ── LocalProcessStatus ────────────────────────────────────
 
@@ -182,6 +220,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn machine_identity_digest_is_scoped_deterministic_and_bounded() {
+        let first = app_scoped_machine_fence(b"machine-a").expect("derive machine fence");
+        let second = app_scoped_machine_fence(b"machine-a").expect("derive machine fence again");
+        let other = app_scoped_machine_fence(b"machine-b").expect("derive other machine fence");
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_eq!(first.len(), 64);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert_eq!(app_scoped_machine_fence(b""), None);
+        assert_eq!(
+            app_scoped_machine_fence(&vec![0; MAX_RAW_MACHINE_ID_BYTES + 1]),
+            None
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn oversized_unsigned_pid_is_never_reinterpreted_as_a_native_process_group() {
+        assert_eq!(
+            LocalProcessInfo::observe_process_start_time(u32::MAX),
+            ProcessStartTimeObservation::Unknown
+        );
+        assert!(LocalProcessInfo::with_root_pid(u32::MAX).is_none());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(LocalProcessInfo::current_working_dir(u32::MAX).is_none());
+            assert!(LocalProcessInfo::executable_path(u32::MAX).is_none());
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn zero_pid_is_never_treated_as_a_process_identity_or_tree_root() {
+        assert_eq!(
+            LocalProcessInfo::observe_process_start_time(0),
+            ProcessStartTimeObservation::Unknown
+        );
+        assert!(LocalProcessInfo::process_start_time(0).is_none());
+        assert!(LocalProcessInfo::current_working_dir(0).is_none());
+        assert!(LocalProcessInfo::executable_path(0).is_none());
+        assert!(LocalProcessInfo::with_root_pid(0).is_none());
+    }
+
     // ── LocalProcessInfo construction ─────────────────────────
 
     fn make_proc(
@@ -189,7 +273,7 @@ mod tests {
         exe: &str,
         children: HashMap<u32, LocalProcessInfo>,
     ) -> LocalProcessInfo {
-        LocalProcessInfo {
+        test_process_info! {
             pid: 1,
             ppid: 0,
             name: name.to_string(),
@@ -229,7 +313,7 @@ mod tests {
 
     #[test]
     fn flatten_with_children() {
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "vim".to_string(),
@@ -251,7 +335,7 @@ mod tests {
 
     #[test]
     fn flatten_deduplicates_same_exe_name() {
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "bash2".to_string(),
@@ -273,7 +357,7 @@ mod tests {
 
     #[test]
     fn flatten_empty_executable_skipped() {
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 1,
             ppid: 0,
             name: "kernel".to_string(),
@@ -334,7 +418,7 @@ mod tests {
 
     #[test]
     fn flatten_deeply_nested_children() {
-        let grandchild = LocalProcessInfo {
+        let grandchild = test_process_info! {
             pid: 3,
             ppid: 2,
             name: "grep".to_string(),
@@ -347,7 +431,7 @@ mod tests {
         };
         let mut gc_children = HashMap::new();
         gc_children.insert(3, grandchild);
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "find".to_string(),
@@ -370,7 +454,7 @@ mod tests {
 
     #[test]
     fn flatten_mixed_valid_and_empty_executables() {
-        let child_with_exe = LocalProcessInfo {
+        let child_with_exe = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "cat".to_string(),
@@ -381,7 +465,7 @@ mod tests {
             start_time: 0,
             children: HashMap::new(),
         };
-        let child_without_exe = LocalProcessInfo {
+        let child_without_exe = test_process_info! {
             pid: 3,
             ppid: 1,
             name: "kernel_worker".to_string(),
@@ -408,7 +492,7 @@ mod tests {
         for i in 0..10 {
             children.insert(
                 i + 2,
-                LocalProcessInfo {
+                test_process_info! {
                     pid: i + 2,
                     ppid: 1,
                     name: format!("worker{}", i),
@@ -429,7 +513,7 @@ mod tests {
     #[test]
     fn flatten_exe_only_filename_component() {
         // Exe paths with same filename but different directories
-        let child1 = LocalProcessInfo {
+        let child1 = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "app".to_string(),
@@ -440,7 +524,7 @@ mod tests {
             start_time: 0,
             children: HashMap::new(),
         };
-        let child2 = LocalProcessInfo {
+        let child2 = test_process_info! {
             pid: 3,
             ppid: 1,
             name: "app".to_string(),
@@ -466,7 +550,7 @@ mod tests {
 
     #[test]
     fn process_info_fields_accessible() {
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 42,
             ppid: 1,
             name: "myproc".to_string(),
@@ -488,7 +572,7 @@ mod tests {
 
     #[test]
     fn process_info_clone_preserves_all_fields() {
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "child".to_string(),
@@ -501,7 +585,7 @@ mod tests {
         };
         let mut children = HashMap::new();
         children.insert(2, child);
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 1,
             ppid: 0,
             name: "parent".to_string(),
@@ -622,7 +706,7 @@ mod tests {
 
     #[test]
     fn flatten_all_empty_exes_returns_empty() {
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "child".to_string(),
@@ -635,7 +719,7 @@ mod tests {
         };
         let mut children = HashMap::new();
         children.insert(2, child);
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 1,
             ppid: 0,
             name: "parent".to_string(),
@@ -652,7 +736,7 @@ mod tests {
 
     #[test]
     fn flatten_root_only_exe_with_empty_children() {
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "kworker".to_string(),
@@ -673,7 +757,7 @@ mod tests {
 
     #[test]
     fn flatten_four_levels_deep() {
-        let level4 = LocalProcessInfo {
+        let level4 = test_process_info! {
             pid: 5,
             ppid: 4,
             name: "d".to_string(),
@@ -686,7 +770,7 @@ mod tests {
         };
         let mut c3 = HashMap::new();
         c3.insert(5, level4);
-        let level3 = LocalProcessInfo {
+        let level3 = test_process_info! {
             pid: 4,
             ppid: 3,
             name: "c".to_string(),
@@ -699,7 +783,7 @@ mod tests {
         };
         let mut c2 = HashMap::new();
         c2.insert(4, level3);
-        let level2 = LocalProcessInfo {
+        let level2 = test_process_info! {
             pid: 3,
             ppid: 2,
             name: "b".to_string(),
@@ -724,7 +808,7 @@ mod tests {
 
     #[test]
     fn process_info_with_argv() {
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 10,
             ppid: 1,
             name: "cargo".to_string(),
@@ -771,7 +855,7 @@ mod tests {
         for i in 10..15u32 {
             children.insert(
                 i,
-                LocalProcessInfo {
+                test_process_info! {
                     pid: i,
                     ppid: 1,
                     name: format!("child{}", i),
@@ -844,7 +928,7 @@ mod tests {
 
     #[test]
     fn flatten_single_child_no_grandchildren() {
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "ls".to_string(),
@@ -870,7 +954,7 @@ mod tests {
         for (id, name) in [(2u32, "cat"), (3, "grep"), (4, "sed")] {
             children.insert(
                 id,
-                LocalProcessInfo {
+                test_process_info! {
                     pid: id,
                     ppid: 1,
                     name: name.to_string(),
@@ -965,12 +1049,15 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn with_root_pid_status_is_run() {
+    fn with_root_pid_status_is_live_and_known() {
         let pid = std::process::id();
         let info = LocalProcessInfo::with_root_pid(pid).unwrap();
         assert!(
-            matches!(info.status, LocalProcessStatus::Run),
-            "current process should be running, got {:?}",
+            !matches!(
+                info.status,
+                LocalProcessStatus::Zombie | LocalProcessStatus::Dead | LocalProcessStatus::Unknown
+            ),
+            "current process must have a live, recognized status, got {:?}",
             info.status
         );
     }
@@ -979,7 +1066,7 @@ mod tests {
 
     #[test]
     fn flatten_parent_no_exe_children_have_exes() {
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "worker".to_string(),
@@ -992,7 +1079,7 @@ mod tests {
         };
         let mut children = HashMap::new();
         children.insert(2, child);
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 1,
             ppid: 0,
             name: "kthread".to_string(),
@@ -1010,7 +1097,7 @@ mod tests {
 
     #[test]
     fn flatten_branching_two_subtrees() {
-        let gc1 = LocalProcessInfo {
+        let gc1 = test_process_info! {
             pid: 4,
             ppid: 2,
             name: "gc1".to_string(),
@@ -1021,7 +1108,7 @@ mod tests {
             start_time: 0,
             children: HashMap::new(),
         };
-        let gc2 = LocalProcessInfo {
+        let gc2 = test_process_info! {
             pid: 5,
             ppid: 3,
             name: "gc2".to_string(),
@@ -1036,7 +1123,7 @@ mod tests {
         c1_kids.insert(4, gc1);
         let mut c2_kids = HashMap::new();
         c2_kids.insert(5, gc2);
-        let child1 = LocalProcessInfo {
+        let child1 = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "c1".to_string(),
@@ -1047,7 +1134,7 @@ mod tests {
             start_time: 0,
             children: c1_kids,
         };
-        let child2 = LocalProcessInfo {
+        let child2 = test_process_info! {
             pid: 3,
             ppid: 1,
             name: "c2".to_string(),
@@ -1071,7 +1158,7 @@ mod tests {
 
     #[test]
     fn process_info_clone_deep_nested() {
-        let grandchild = LocalProcessInfo {
+        let grandchild = test_process_info! {
             pid: 3,
             ppid: 2,
             name: "gc".to_string(),
@@ -1084,7 +1171,7 @@ mod tests {
         };
         let mut gc_map = HashMap::new();
         gc_map.insert(3, grandchild);
-        let child = LocalProcessInfo {
+        let child = test_process_info! {
             pid: 2,
             ppid: 1,
             name: "child".to_string(),
@@ -1109,7 +1196,7 @@ mod tests {
 
     #[test]
     fn process_info_large_pid_values() {
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: u32::MAX,
             ppid: u32::MAX - 1,
             name: "big".to_string(),
@@ -1128,7 +1215,7 @@ mod tests {
     #[test]
     fn flatten_exe_just_filename_no_directory() {
         // An executable path with no directory component
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 1,
             ppid: 0,
             name: "bare".to_string(),
@@ -1146,7 +1233,7 @@ mod tests {
 
     #[test]
     fn process_info_debug_contains_executable() {
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 1,
             ppid: 0,
             name: "test".to_string(),
@@ -1200,7 +1287,7 @@ mod tests {
         for i in 2..12u32 {
             children.insert(
                 i,
-                LocalProcessInfo {
+                test_process_info! {
                     pid: i,
                     ppid: 1,
                     name: format!("worker{i}"),
@@ -1223,7 +1310,7 @@ mod tests {
 
     #[test]
     fn process_info_argv_with_empty_strings() {
-        let proc = LocalProcessInfo {
+        let proc = test_process_info! {
             pid: 1,
             ppid: 0,
             name: "test".to_string(),

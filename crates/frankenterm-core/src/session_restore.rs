@@ -1640,7 +1640,8 @@ fn find_unclean_sessions_with_owner_policy_from_conn(
                 session.shutdown_clean,
                 session.clean_checkpoint_id,
                 session.owner_pid,
-                session.owner_process_start
+                session.owner_process_start,
+                session.owner_heartbeat_at
          FROM mux_sessions AS session
          ORDER BY COALESCE((
                       SELECT MAX(causal.id)
@@ -1670,6 +1671,7 @@ fn find_unclean_sessions_with_owner_policy_from_conn(
                 row.get::<_, Option<i64>>(8)?,
                 row.get::<_, Option<i64>>(9)?,
                 row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
             ))
         },
     )?;
@@ -1689,6 +1691,7 @@ fn find_unclean_sessions_with_owner_policy_from_conn(
             clean_checkpoint_id,
             owner_pid,
             owner_process_start,
+            owner_heartbeat_at,
         ) = row?;
         let session_id = decode_required_bounded_text(session_id, "mux_sessions.session_id")?;
         let ft_version = decode_required_bounded_text(ft_version, "mux_sessions.ft_version")?;
@@ -1697,8 +1700,12 @@ fn find_unclean_sessions_with_owner_policy_from_conn(
         if assess_clean_authority(conn, &session_id, shutdown_clean, clean_checkpoint_id)? {
             continue;
         }
-        let owner_state =
-            owner_classifier.classify(host_id.as_deref(), owner_pid, owner_process_start);
+        let owner_state = owner_classifier.classify(
+            host_id.as_deref(),
+            owner_pid,
+            owner_process_start,
+            owner_heartbeat_at,
+        );
         if owner_state == crate::session_retention::UncleanSessionOwnerState::Live
             || (require_proven_dead_owner
                 && owner_state
@@ -4369,6 +4376,16 @@ fn finalize_restore_for_test(
     pane_id_map: &HashMap<u64, u64>,
     mark_clean: bool,
 ) -> Result<i64, RestoreError> {
+    fn recover_retry_safe_test_error(error: RestoreAuthorityDbError) -> RestoreError {
+        match error {
+            RestoreAuthorityDbError::RetrySafe { source } => source,
+            RestoreAuthorityDbError::IndeterminateCommit { .. }
+            | RestoreAuthorityDbError::IndeterminateRollback { .. } => RestoreError::Bookkeeping(
+                "test restore authority transaction became indeterminate".to_string(),
+            ),
+        }
+    }
+
     let needs_verified_snapshot_source =
         load_latest_checkpoint(db_path, session_id)?.is_none_or(|checkpoint| {
             checkpoint.checkpoint_role != CheckpointRole::Snapshot
@@ -4558,18 +4575,14 @@ fn finalize_restore_for_test(
         state_hash: source_checkpoint.state_hash,
         pane_count: source_checkpoint.pane_count,
     };
-    let intent =
-        persist_restore_intent_unclean(db_path, session_id, &source).map_err(|_error| {
-            RestoreError::Bookkeeping("test restore intent did not settle".to_string())
-        })?;
+    let intent = persist_restore_intent_unclean(db_path, session_id, &source)
+        .map_err(recover_retry_safe_test_error)?;
     let mut evidence = complete_test_restore_outcome_evidence(pane_id_map.len());
     evidence.intent = intent;
     evidence.source = source;
     let receipt =
         persist_restore_receipt_settled(db_path, session_id, pane_id_map, &evidence, mark_clean)
-            .map_err(|_error| {
-                RestoreError::Bookkeeping("test restore outcome did not settle".to_string())
-            })?;
+            .map_err(recover_retry_safe_test_error)?;
     Ok(receipt.checkpoint_id)
 }
 
@@ -5105,7 +5118,8 @@ fn session_doctor_from_conn(conn: &Connection) -> Result<SessionDoctorReport, Re
                     THEN host_id
                 END,
                 owner_pid,
-                owner_process_start
+                owner_process_start,
+                owner_heartbeat_at
          FROM mux_sessions",
     )?;
     let shutdown_rows = shutdown_stmt.query_map(
@@ -5121,6 +5135,7 @@ fn session_doctor_from_conn(conn: &Connection) -> Result<SessionDoctorReport, Re
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         },
     )?;
@@ -5137,11 +5152,17 @@ fn session_doctor_from_conn(conn: &Connection) -> Result<SessionDoctorReport, Re
             host_id,
             owner_pid,
             owner_process_start,
+            owner_heartbeat_at,
         ) = row?;
         let session_id = decode_required_bounded_text(session_id, "mux_sessions.session_id")?;
         if !assess_clean_authority(conn, &session_id, shutdown_clean, clean_checkpoint_id)? {
             unclean_sessions = unclean_sessions.saturating_add(1);
-            match owner_classifier.classify(host_id.as_deref(), owner_pid, owner_process_start) {
+            match owner_classifier.classify(
+                host_id.as_deref(),
+                owner_pid,
+                owner_process_start,
+                owner_heartbeat_at,
+            ) {
                 crate::session_retention::UncleanSessionOwnerState::Live => {
                     live_sessions = live_sessions.saturating_add(1);
                 }
@@ -7216,7 +7237,12 @@ mod tests {
                 .expect("bind older resolved restore authority");
         let newer_outcome =
             finalize_restore_for_test(&db_path, "sess-multiple-resolved", &mapping, true)
-                .expect("bind newer resolved restore authority");
+                .unwrap_or_else(|error| match error {
+                    RestoreError::Bookkeeping(detail) => {
+                        panic!("newer resolved restore bookkeeping failed: {detail}")
+                    }
+                    other => panic!("bind newer resolved restore authority: {other:?}"),
+                });
         assert!(older_outcome < newer_outcome);
 
         conn.execute_batch("PRAGMA foreign_keys = OFF;")
@@ -7307,10 +7333,15 @@ mod tests {
         let cp_id = finalize_restore_for_test(&db_path, "sess-map-tamper", &mapping, true)
             .expect("finalize restore");
 
-        // Swap in a different old_to_new without touching state_hash.
+        // Change only the pane mapping while preserving the otherwise valid
+        // outcome evidence, and leave the witnessed state_hash untouched.
         conn.execute(
             "UPDATE session_checkpoints
-             SET metadata_json = '{\"old_to_new\":{\"1\":999}}'
+             SET metadata_json = json_set(
+                 metadata_json,
+                 '$.old_to_new.\"1\"',
+                 999
+             )
              WHERE id = ?1",
             [cp_id],
         )
@@ -7759,21 +7790,10 @@ mod tests {
             .unwrap();
 
         // Create schema tables
+        conn.execute_batch(crate::storage::migrations::mux_sessions_schema_sql().unwrap())
+            .expect("restore fixture must install the canonical mux_sessions schema");
         conn.execute_batch(
-            "CREATE TABLE mux_sessions (
-                session_id TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL,
-                last_checkpoint_at INTEGER,
-                shutdown_clean INTEGER NOT NULL DEFAULT 0,
-                topology_json TEXT NOT NULL,
-                window_metadata_json TEXT,
-                ft_version TEXT NOT NULL,
-                host_id TEXT,
-                clean_checkpoint_id INTEGER
-                    REFERENCES session_checkpoints(id) ON DELETE SET NULL
-            );
-
-            CREATE TABLE session_checkpoints (
+            "CREATE TABLE session_checkpoints (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL
                     REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
@@ -7861,8 +7881,52 @@ mod tests {
             CREATE INDEX idx_output_segments_pane_seq ON output_segments(pane_id, seq);",
         )
         .unwrap();
+        conn.execute_batch(crate::storage::migrations::session_retained_size_schema_sql().unwrap())
+            .expect("restore fixture must install the canonical retained-size authority");
 
         (db_path, conn, dir)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum LegacyOrphanInsertSurface {
+        Checkpoint,
+        PaneState,
+        RestoreLifecycle,
+    }
+
+    fn seed_legacy_orphans<T>(
+        conn: &Connection,
+        surfaces: &[LegacyOrphanInsertSurface],
+        seed: impl FnOnce(&Connection) -> T,
+    ) -> T {
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")
+            .expect("disable foreign keys for historical-corruption fixture");
+        for surface in surfaces {
+            let drop_trigger_sql = match surface {
+                LegacyOrphanInsertSurface::Checkpoint => {
+                    "DROP TRIGGER session_checkpoints_retained_size_ai;"
+                }
+                LegacyOrphanInsertSurface::PaneState => {
+                    "DROP TRIGGER mux_pane_state_retained_size_ai;"
+                }
+                LegacyOrphanInsertSurface::RestoreLifecycle => {
+                    "DROP TRIGGER restore_attempt_lifecycle_retained_size_ai;"
+                }
+            };
+            conn.execute_batch(drop_trigger_sql)
+                .expect("suspend retained-size insert trigger for legacy fixture");
+        }
+        let output = seed(conn);
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("restore foreign-key enforcement after legacy fixture");
+        conn.execute_batch(
+            crate::storage::migrations::session_retained_size_schema_sql()
+                .expect("canonical retained-size DDL must be extractable"),
+        )
+        .expect("restore canonical retained-size triggers after legacy fixture");
+        crate::storage::migrations::validate_session_retained_size_schema(conn)
+            .expect("legacy fixture must restore exact retained-size authority");
+        output
     }
 
     fn insert_session(conn: &Connection, session_id: &str, shutdown_clean: bool) {
@@ -7877,12 +7941,8 @@ mod tests {
             insert_clean_receipt(conn, session_id, 1000);
         } else if let Some(owner) = crate::session_retention::current_session_owner_identity() {
             let mut host: serde_json::Value = serde_json::from_str(&owner.host_id).unwrap();
-            let boot_id = host
-                .get_mut("boot_id")
-                .and_then(serde_json::Value::as_str)
-                .map(|boot_id| format!("{boot_id}-prior-test-boot"))
-                .unwrap();
-            host["boot_id"] = serde_json::Value::String(boot_id);
+            host["boot_id"] =
+                serde_json::Value::String("33333333-3333-4333-8333-333333333333".to_string());
             let prior_boot_host_id = serde_json::to_string(&host).unwrap();
             conn.execute(
                 "UPDATE mux_sessions
@@ -11052,6 +11112,9 @@ mod tests {
         let report = session_doctor(&db_path).unwrap();
         assert_eq!(report.total_sessions, 1);
         assert_eq!(report.unclean_sessions, 0);
+        assert_eq!(report.live_sessions, 0);
+        assert_eq!(report.recovery_candidate_sessions, 0);
+        assert_eq!(report.unknown_owner_sessions, 0);
         assert_eq!(report.total_checkpoints, 2);
         assert_eq!(report.orphaned_checkpoints, 0);
         assert_eq!(report.orphaned_pane_states, 0);
@@ -11152,26 +11215,36 @@ mod tests {
         let report = session_doctor(&db_path).unwrap();
         assert_eq!(report.total_sessions, 3);
         assert_eq!(report.unclean_sessions, 2);
+        assert_eq!(report.live_sessions, 0);
+        assert_eq!(
+            report.live_sessions
+                + report.recovery_candidate_sessions
+                + report.unknown_owner_sessions,
+            report.unclean_sessions,
+            "owner-lifecycle buckets must exactly partition every unclean session"
+        );
     }
 
     #[test]
     fn session_doctor_detects_orphans() {
         let (db_path, conn, _dir) = setup_test_db();
-        insert_session(&conn, "sess-o", true);
+        insert_session(&conn, "sess-o", false);
         let orphaned_checkpoint = insert_checkpoint(&conn, "sess-o", 1_000, 1);
         insert_pane_state(&conn, orphaned_checkpoint, 1, None, None);
 
-        // Simulate a historical database written by a connection that did not
-        // enable foreign-key enforcement.
-        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        conn.execute("DELETE FROM mux_sessions WHERE session_id = 'sess-o'", [])
+        // Simulate a historical database admitted before both foreign-key and
+        // retained-size insert guards were universal. Restore and validate the
+        // canonical trigger set before exercising the production doctor.
+        seed_legacy_orphans(&conn, &[LegacyOrphanInsertSurface::PaneState], |conn| {
+            conn.execute("DELETE FROM mux_sessions WHERE session_id = 'sess-o'", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
+                     VALUES (999, 0, '{}')",
+                [],
+            )
             .unwrap();
-        conn.execute(
-            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
-             VALUES (999, 0, '{}')",
-            [],
-        )
-        .unwrap();
+        });
 
         let report = session_doctor(&db_path).unwrap();
         assert_eq!(report.total_sessions, 0);
@@ -11241,30 +11314,39 @@ mod tests {
     fn delete_session_reports_cleanup_for_orphaned_checkpoint_rows() {
         let (db_path, conn, _dir) = setup_test_db();
 
-        // Simulate a historical writer that admitted parentless rows before
-        // every connection enabled foreign-key enforcement.
-        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO session_checkpoints
-             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                "sess-orphan",
-                1000i64,
-                "periodic",
-                "0123456789abcdef",
-                1i64,
-                64i64
+        // Simulate parentless rows from a historical writer, then reinstall
+        // the canonical guards before calling the production deletion path.
+        let checkpoint_id = seed_legacy_orphans(
+            &conn,
+            &[
+                LegacyOrphanInsertSurface::Checkpoint,
+                LegacyOrphanInsertSurface::PaneState,
             ],
-        )
-        .unwrap();
-        let checkpoint_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
-             VALUES (?1, ?2, ?3)",
-            params![checkpoint_id, 7i64, "{}"],
-        )
-        .unwrap();
+            |conn| {
+                conn.execute(
+                    "INSERT INTO session_checkpoints
+                     (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        "sess-orphan",
+                        1000i64,
+                        "periodic",
+                        "0123456789abcdef",
+                        1i64,
+                        64i64
+                    ],
+                )
+                .unwrap();
+                let checkpoint_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
+                     VALUES (?1, ?2, ?3)",
+                    params![checkpoint_id, 7i64, "{}"],
+                )
+                .unwrap();
+                checkpoint_id
+            },
+        );
 
         let deleted = delete_session(&db_path, "sess-orphan").unwrap();
         assert!(
@@ -11294,15 +11376,20 @@ mod tests {
     #[test]
     fn delete_session_reports_cleanup_for_lifecycle_only_rows() {
         let (db_path, conn, _dir) = setup_test_db();
-        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        conn.execute(
-            "INSERT INTO restore_attempt_lifecycle (
-                 intent_checkpoint_id, session_id, source_checkpoint_id,
-                 outcome_checkpoint_id, status, created_at, resolved_at
-             ) VALUES (999, 'sess-lifecycle-only', 998, NULL, 'intent', 1000, NULL)",
-            [],
-        )
-        .unwrap();
+        seed_legacy_orphans(
+            &conn,
+            &[LegacyOrphanInsertSurface::RestoreLifecycle],
+            |conn| {
+                conn.execute(
+                    "INSERT INTO restore_attempt_lifecycle (
+                         intent_checkpoint_id, session_id, source_checkpoint_id,
+                         outcome_checkpoint_id, status, created_at, resolved_at
+                     ) VALUES (999, 'sess-lifecycle-only', 998, NULL, 'intent', 1000, NULL)",
+                    [],
+                )
+                .unwrap();
+            },
+        );
 
         assert!(delete_session(&db_path, "sess-lifecycle-only").unwrap());
         let lifecycle_count: i64 = conn

@@ -48,22 +48,11 @@ fn setup_test_db() -> (tempfile::TempDir, String, Connection) {
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .unwrap();
+    conn.execute_batch(frankenterm_core::storage::migrations::mux_sessions_schema_sql().unwrap())
+        .expect("property fixture must install the canonical mux_sessions schema");
 
     conn.execute_batch(
-        "CREATE TABLE mux_sessions (
-            session_id TEXT PRIMARY KEY,
-            created_at INTEGER NOT NULL,
-            last_checkpoint_at INTEGER,
-            shutdown_clean INTEGER NOT NULL DEFAULT 0,
-            topology_json TEXT NOT NULL,
-            window_metadata_json TEXT,
-            ft_version TEXT NOT NULL,
-            host_id TEXT,
-            clean_checkpoint_id INTEGER
-                REFERENCES session_checkpoints(id) ON DELETE SET NULL
-        );
-
-        CREATE TABLE session_checkpoints (
+        "CREATE TABLE session_checkpoints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
             checkpoint_at INTEGER NOT NULL,
@@ -617,23 +606,34 @@ fn arb_session_doctor_report() -> impl Strategy<Value = SessionDoctorReport> {
                 invalid_resolved_restore_chains,
                 total_data_bytes,
             )| {
-                // unclean_sessions must be <= total_sessions
+                // Unclean sessions must be bounded by the total, and the
+                // three owner-lifecycle buckets must form an exact partition.
                 let max_unclean = total_sessions;
-                (0..=max_unclean).prop_map(move |unclean_sessions| SessionDoctorReport {
-                    total_sessions,
-                    unclean_sessions,
-                    live_sessions: 0,
-                    recovery_candidate_sessions: 0,
-                    unknown_owner_sessions: unclean_sessions,
-                    total_checkpoints,
-                    orphaned_checkpoints,
-                    orphaned_pane_states,
-                    unresolved_restore_attempts: 0,
-                    invalid_resolved_restore_chains,
-                    outcome_complete_restore_attempts: 0,
-                    reconciliation_required_restore_attempts: 0,
-                    orphaned_restore_intents: 0,
-                    total_data_bytes,
+                (0..=max_unclean).prop_flat_map(move |unclean_sessions| {
+                    (0..=unclean_sessions).prop_flat_map(move |live_sessions| {
+                        (0..=unclean_sessions - live_sessions).prop_map(
+                            move |recovery_candidate_sessions| {
+                                let unknown_owner_sessions =
+                                    unclean_sessions - live_sessions - recovery_candidate_sessions;
+                                SessionDoctorReport {
+                                    total_sessions,
+                                    unclean_sessions,
+                                    live_sessions,
+                                    recovery_candidate_sessions,
+                                    unknown_owner_sessions,
+                                    total_checkpoints,
+                                    orphaned_checkpoints,
+                                    orphaned_pane_states,
+                                    unresolved_restore_attempts: 0,
+                                    invalid_resolved_restore_chains,
+                                    outcome_complete_restore_attempts: 0,
+                                    reconciliation_required_restore_attempts: 0,
+                                    orphaned_restore_intents: 0,
+                                    total_data_bytes,
+                                }
+                            },
+                        )
+                    })
                 })
             },
         )
@@ -892,6 +892,9 @@ proptest! {
         let expected = serde_json::json!({
             "total_sessions": report.total_sessions,
             "unclean_sessions": report.unclean_sessions,
+            "live_sessions": report.live_sessions,
+            "recovery_candidate_sessions": report.recovery_candidate_sessions,
+            "unknown_owner_sessions": report.unknown_owner_sessions,
             "total_checkpoints": report.total_checkpoints,
             "orphaned_checkpoints": report.orphaned_checkpoints,
             "orphaned_pane_states": report.orphaned_pane_states,

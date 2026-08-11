@@ -1483,7 +1483,7 @@ frankenterm/                              # <!--count:workspace_members-->80<!--
 │   │   │   ├── ingest.rs                 # Pane discovery + delta extraction
 │   │   │   ├── patterns.rs               # Pattern detection engine
 │   │   │   ├── events.rs                 # Event bus and detection fanout
-│   │   │   ├── storage/                  # SQLite + FTS5 (currently schema v38)
+│   │   │   ├── storage/                  # SQLite + FTS5 (currently schema v43)
 │   │   │   ├── policy.rs                 # Safety / access control
 │   │   │   ├── redactor.rs               # Secret redaction (T1/T2/T3 tiers)
 │   │   │   ├── plan.rs                   # Mission + Tx types
@@ -2457,7 +2457,7 @@ capacity guarantees.
 
 ### Current schema version
 
-The current version is **v38**. The authoritative source is
+The current version is **v43**. The authoritative source is
 [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs);
 documentation must follow that constant rather than becoming an independent
 version authority.
@@ -3813,7 +3813,7 @@ This section catalogues the non-obvious design decisions the project has made, t
 - **SQLite is bundled** (no system dep), runs in-process (no IPC overhead), and supports FTS5 + WAL out of the box.
 - **Single-writer integrity** is a deliberate constraint: only one watcher writes, and multiple readers are fine.
 - **Backup is the SQLite online backup API**: consistent snapshots without stop-the-world.
-- **Future-proof**: schema migrations are versioned (`SCHEMA_VERSION = 38` at HEAD; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
+- **Future-proof**: schema migrations are versioned (`SCHEMA_VERSION = 43` at HEAD; the live authority is [`storage/schema_ddl.rs::SCHEMA_VERSION`](crates/frankenterm-core/src/storage/schema_ddl.rs)); rollbacks are tracked in `forensic_migration` + `rollback_execution`.
 - **Trade-off accepted**: at fleet-of-thousands scale, write throughput would become a bottleneck. We're not there.
 
 ### Why asupersync, not tokio?

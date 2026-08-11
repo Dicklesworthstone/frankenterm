@@ -527,7 +527,7 @@ impl RuntimeShutdownToken {
     /// current instant. This seam exists only so sibling-module tests can prove
     /// that subsystem admission rejects a live-but-shutting-down runtime before
     /// any work is admitted.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "session-resume"))]
     pub(crate) fn request_shutdown_for_test(&self) -> bool {
         self.request_shutdown_and_wait(Duration::ZERO)
     }

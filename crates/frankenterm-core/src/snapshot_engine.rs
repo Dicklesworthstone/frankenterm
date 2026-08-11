@@ -9167,20 +9167,10 @@ mod tests {
 
         // Create schema tables
         let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute_batch(crate::storage::migrations::mux_sessions_schema_sql().unwrap())
+            .expect("snapshot fixture must install the canonical mux_sessions schema");
         conn.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS mux_sessions (
-                session_id TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL,
-                last_checkpoint_at INTEGER,
-                shutdown_clean INTEGER NOT NULL DEFAULT 0,
-                topology_json TEXT NOT NULL,
-                window_metadata_json TEXT,
-                ft_version TEXT NOT NULL,
-                host_id TEXT,
-                clean_checkpoint_id INTEGER
-                    REFERENCES session_checkpoints(id) ON DELETE SET NULL
-            );
             CREATE TABLE IF NOT EXISTS session_checkpoints (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
@@ -9734,7 +9724,7 @@ mod tests {
             db_path.as_str(),
             "owner-unavailable",
             100,
-            "manual",
+            SnapshotTrigger::Manual.as_db_str(),
             &prepared,
             Some(&new_session),
             None,
@@ -9744,7 +9734,7 @@ mod tests {
             db_path.as_str(),
             "owner-unavailable",
             101,
-            "manual",
+            SnapshotTrigger::Manual.as_db_str(),
             &prepared,
             None,
             None,
@@ -11035,7 +11025,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_delete_exact_identity_defeats_rowid_reuse() {
+    fn checkpoint_delete_exact_identity_defeats_explicit_primary_key_reuse() {
         run_async_test(async {
             let (_tmp, db_path) = setup_test_db();
             create_session_sync(
@@ -11065,20 +11055,28 @@ mod tests {
             let conn = Connection::open(db_path.as_str()).unwrap();
             conn.execute("DELETE FROM session_checkpoints WHERE id = ?1", [reused_id])
                 .unwrap();
-            drop(conn);
-            let replacement_id = insert_checkpoint_fixture(
-                db_path.as_str(),
-                "sess-rowid-reuse",
-                1_000,
-                CHECKPOINT_ROLE_SNAPSHOT,
-                "0000000000000008",
-                Some(r#"{"version":"replacement"}"#),
-                11,
-            );
+            let inserted = conn
+                .execute(
+                    "INSERT INTO session_checkpoints
+                     (id, session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+                      total_bytes, metadata_json, checkpoint_role, topology_json)
+                     VALUES (?1, ?2, ?3, 'event', ?4, 0, ?5, NULL, ?6, ?7)",
+                    rusqlite::params![
+                        reused_id,
+                        "sess-rowid-reuse",
+                        1_000,
+                        "0000000000000008",
+                        11,
+                        CHECKPOINT_ROLE_SNAPSHOT,
+                        r#"{"version":"replacement"}"#,
+                    ],
+                )
+                .unwrap();
             assert_eq!(
-                replacement_id, reused_id,
-                "SQLite should reuse the max ROWID"
+                inserted, 1,
+                "the fixture must explicitly reuse the deleted primary key"
             );
+            drop(conn);
 
             let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
             let deleted = engine
@@ -11090,7 +11088,7 @@ mod tests {
                 .unwrap()
                 .query_row(
                     "SELECT state_hash FROM session_checkpoints WHERE id = ?1",
-                    [replacement_id],
+                    [reused_id],
                     |row| row.get(0),
                 )
                 .unwrap();

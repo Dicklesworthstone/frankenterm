@@ -8,11 +8,11 @@
     {
       "detail": "stale lock file detected",
       "name": "daemon status",
-      "recommendation": "Remove .ft/ft.lock and run ft watch",
+      "recommendation": "Verify that no daemon owns .ft/ft.lock, then follow the documented stale-lock recovery procedure",
       "status": "warning"
     },
     {
-      "detail": "schema v42, wal mode",
+      "detail": "schema v43, wal mode",
       "name": "database",
       "status": "ok"
     }

@@ -1,5 +1,8 @@
 #![cfg(windows)]
 use super::*;
+use ntapi::ntexapi::{
+    NtQuerySystemInformation, SystemBootEnvironmentInformation, SYSTEM_BOOT_ENVIRONMENT_INFORMATION,
+};
 use ntapi::ntpebteb::PEB;
 use ntapi::ntpsapi::{
     NtQueryInformationProcess, ProcessBasicInformation, ProcessWow64Information,
@@ -13,15 +16,70 @@ use std::os::windows::ffi::OsStringExt;
 use winapi::shared::minwindef::{DWORD, FILETIME, LPVOID, MAX_PATH};
 use winapi::shared::ntdef::{FALSE, NT_SUCCESS};
 use winapi::shared::winerror::ERROR_INVALID_PARAMETER;
-use winapi::um::handleapi::CloseHandle;
+use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
 use winapi::um::memoryapi::ReadProcessMemory;
 use winapi::um::processthreadsapi::{
     GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
 };
 use winapi::um::shellapi::CommandLineToArgvW;
+use winapi::um::sysinfoapi::GetSystemFirmwareTable;
 use winapi::um::tlhelp32::*;
 use winapi::um::winbase::{LocalFree, QueryFullProcessImageNameW};
-use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use winapi::um::winnt::{
+    HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+};
+
+const RAW_SMBIOS_HEADER_BYTES: usize = 8;
+const MAX_FIRMWARE_TABLE_BYTES: usize = 4 * 1024 * 1024;
+
+fn smbios_system_uuid(raw: &[u8]) -> Option<[u8; 16]> {
+    let table_len = usize::try_from(u32::from_le_bytes(
+        raw.get(4..RAW_SMBIOS_HEADER_BYTES)?.try_into().ok()?,
+    ))
+    .ok()?;
+    let table =
+        raw.get(RAW_SMBIOS_HEADER_BYTES..RAW_SMBIOS_HEADER_BYTES.checked_add(table_len)?)?;
+    let mut offset = 0_usize;
+
+    while offset.checked_add(4)? <= table.len() {
+        let structure_type = table[offset];
+        let structure_len = usize::from(table[offset + 1]);
+        if structure_len < 4 || offset.checked_add(structure_len)? > table.len() {
+            return None;
+        }
+        let system_uuid = if structure_type == 1 && structure_len >= 24 {
+            let uuid: [u8; 16] = table.get(offset + 8..offset + 24)?.try_into().ok()?;
+            if uuid.iter().all(|byte| *byte == 0) || uuid.iter().all(|byte| *byte == u8::MAX) {
+                return None;
+            }
+            Some(uuid)
+        } else {
+            None
+        };
+        if structure_type == 127 {
+            return None;
+        }
+
+        let mut next = offset + structure_len;
+        let mut found_terminator = false;
+        while next.checked_add(1)? < table.len() {
+            if table[next] == 0 && table[next + 1] == 0 {
+                next += 2;
+                found_terminator = true;
+                break;
+            }
+            next += 1;
+        }
+        if !found_terminator {
+            return None;
+        }
+        if system_uuid.is_some() {
+            return system_uuid;
+        }
+        offset = next;
+    }
+    None
+}
 
 /// Manages a Toolhelp32 snapshot handle
 struct Snapshot(HANDLE);
@@ -29,7 +87,7 @@ struct Snapshot(HANDLE);
 impl Snapshot {
     pub fn new() -> Option<Self> {
         let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if handle.is_null() {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             None
         } else {
             Some(Self(handle))
@@ -121,6 +179,19 @@ impl ProcHandle {
             return None;
         }
         Some(Self { pid, proc: handle })
+    }
+
+    /// Open only the authority needed by `GetProcessTimes`, preserving the
+    /// exact `OpenProcess` error before logging or any other Win32 call can
+    /// overwrite the thread-local last-error slot.
+    fn for_start_time(pid: u32) -> Result<Self, Option<i32>> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE as _, pid) };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error().raw_os_error();
+            log::trace!("ProcHandle::for_start_time({pid}): OpenProcess failed with {error:?}");
+            return Err(error);
+        }
+        Ok(Self { pid, proc: handle })
     }
 
     /// Returns the executable image for the process
@@ -355,6 +426,9 @@ impl LocalProcessInfo {
     }
 
     pub fn observe_process_start_time(pid: u32) -> ProcessStartTimeObservation {
+        if pid == 0 {
+            return ProcessStartTimeObservation::Unknown;
+        }
         if pid == unsafe { GetCurrentProcessId() } {
             const fn empty() -> FILETIME {
                 FILETIME {
@@ -383,14 +457,15 @@ impl LocalProcessInfo {
                 ProcessStartTimeObservation::Unknown
             };
         }
-        let Some(handle) = ProcHandle::new(pid) else {
-            return if std::io::Error::last_os_error().raw_os_error()
-                == i32::try_from(ERROR_INVALID_PARAMETER).ok()
-            {
-                ProcessStartTimeObservation::Absent
-            } else {
-                ProcessStartTimeObservation::Unknown
-            };
+        let handle = match ProcHandle::for_start_time(pid) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return if error == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
+                    ProcessStartTimeObservation::Absent
+                } else {
+                    ProcessStartTimeObservation::Unknown
+                };
+            }
         };
         match handle.start_time() {
             Some(start_time) => ProcessStartTimeObservation::Running(start_time),
@@ -398,13 +473,74 @@ impl LocalProcessInfo {
         }
     }
 
-    /// A stable Windows boot identifier is not exposed by this crate yet.
-    /// Returning `None` makes ownership classification fail closed.
+    /// Read the kernel boot GUID for the current Windows boot environment.
     pub fn host_boot_id() -> Option<String> {
-        None
+        let mut info = MaybeUninit::<SYSTEM_BOOT_ENVIRONMENT_INFORMATION>::zeroed();
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SystemBootEnvironmentInformation,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<SYSTEM_BOOT_ENVIRONMENT_INFORMATION>() as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if !NT_SUCCESS(status) {
+            return None;
+        }
+        let boot = unsafe { info.assume_init() }.BootIdentifier;
+        if boot.Data1 == 0
+            && boot.Data2 == 0
+            && boot.Data3 == 0
+            && boot.Data4.iter().all(|byte| *byte == 0)
+        {
+            return None;
+        }
+        Some(format!(
+            "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            boot.Data1,
+            boot.Data2,
+            boot.Data3,
+            boot.Data4[0],
+            boot.Data4[1],
+            boot.Data4[2],
+            boot.Data4[3],
+            boot.Data4[4],
+            boot.Data4[5],
+            boot.Data4[6],
+            boot.Data4[7],
+        ))
+    }
+
+    /// Hash the SMBIOS Type-1 system UUID into an application-scoped
+    /// persistent fence. Both firmware reads and the table size are bounded;
+    /// malformed, absent, or sentinel UUIDs fail closed.
+    pub fn host_machine_fence() -> Option<String> {
+        let provider = u32::from_be_bytes(*b"RSMB");
+        let required = unsafe { GetSystemFirmwareTable(provider, 0, std::ptr::null_mut(), 0) };
+        let required = usize::try_from(required).ok()?;
+        if required < RAW_SMBIOS_HEADER_BYTES || required > MAX_FIRMWARE_TABLE_BYTES {
+            return None;
+        }
+        let mut raw = vec![0_u8; required];
+        let written = unsafe {
+            GetSystemFirmwareTable(
+                provider,
+                0,
+                raw.as_mut_ptr().cast(),
+                u32::try_from(raw.len()).ok()?,
+            )
+        };
+        if usize::try_from(written).ok()? != raw.len() {
+            return None;
+        }
+        let uuid = smbios_system_uuid(&raw)?;
+        app_scoped_machine_fence(&uuid)
     }
 
     pub fn current_working_dir(pid: u32) -> Option<PathBuf> {
+        if pid == 0 {
+            return None;
+        }
         log::trace!("current_working_dir({})", pid);
         let proc = ProcHandle::new(pid)?;
         let params = proc.get_params()?;
@@ -412,24 +548,40 @@ impl LocalProcessInfo {
     }
 
     pub fn executable_path(pid: u32) -> Option<PathBuf> {
+        if pid == 0 {
+            return None;
+        }
         log::trace!("executable_path({})", pid);
         let proc = ProcHandle::new(pid)?;
         proc.executable()
     }
 
     pub fn with_root_pid(pid: u32) -> Option<Self> {
+        if pid == 0 {
+            return None;
+        }
         log::trace!("LocalProcessInfo::with_root_pid({}), getting snapshot", pid);
         let procs = Snapshot::entries();
         log::trace!("Got snapshot");
 
-        fn build_proc(info: &PROCESSENTRY32W, procs: &[PROCESSENTRY32W]) -> LocalProcessInfo {
+        fn build_proc(
+            info: &PROCESSENTRY32W,
+            procs: &[PROCESSENTRY32W],
+            ancestry: &mut HashSet<u32>,
+        ) -> LocalProcessInfo {
+            let inserted = ancestry.insert(info.th32ProcessID);
+            debug_assert!(inserted);
             let mut children = HashMap::new();
 
             for kid in procs {
-                if kid.th32ParentProcessID == info.th32ProcessID {
-                    children.insert(kid.th32ProcessID, build_proc(kid, procs));
+                if kid.th32ParentProcessID == info.th32ProcessID
+                    && !ancestry.contains(&kid.th32ProcessID)
+                {
+                    children.insert(kid.th32ProcessID, build_proc(kid, procs, ancestry));
                 }
             }
+            let removed = ancestry.remove(&info.th32ProcessID);
+            debug_assert!(removed);
 
             let mut executable = None;
             let mut start_time = 0;
@@ -472,9 +624,42 @@ impl LocalProcessInfo {
         }
 
         if let Some(info) = procs.iter().find(|info| info.th32ProcessID == pid) {
-            Some(build_proc(info, &procs))
+            Some(build_proc(info, &procs, &mut HashSet::new()))
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod machine_identity_tests {
+    use super::*;
+
+    fn firmware_table_with_uuid(uuid: [u8; 16]) -> Vec<u8> {
+        let mut table = vec![1, 25, 0, 0, 1, 2, 3, 4];
+        table.extend_from_slice(&uuid);
+        table.push(0);
+        table.extend_from_slice(&[0, 0]);
+        table.extend_from_slice(&[127, 4, 0, 0, 0, 0]);
+
+        let mut raw = vec![0, 3, 7, 0];
+        raw.extend_from_slice(&u32::try_from(table.len()).unwrap().to_le_bytes());
+        raw.extend_from_slice(&table);
+        raw
+    }
+
+    #[test]
+    fn smbios_machine_uuid_parser_is_bounded_and_rejects_sentinels() {
+        let uuid = [0x5a; 16];
+        assert_eq!(
+            smbios_system_uuid(&firmware_table_with_uuid(uuid)),
+            Some(uuid)
+        );
+        assert_eq!(smbios_system_uuid(&firmware_table_with_uuid([0; 16])), None);
+        assert_eq!(
+            smbios_system_uuid(&firmware_table_with_uuid([u8::MAX; 16])),
+            None
+        );
+        assert_eq!(smbios_system_uuid(&[0; RAW_SMBIOS_HEADER_BYTES]), None);
     }
 }

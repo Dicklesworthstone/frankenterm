@@ -13,11 +13,11 @@
     {
       "detail": "97% used (450 GB available of 1.8 TB)",
       "name": "disk space",
-      "recommendation": "Free space: cargo clean; rm -rf /tmp/ft-*-target",
+      "recommendation": "Inspect build-artifact usage and remove only verified disposable target directories",
       "status": "warning"
     },
     {
-      "detail": "schema v42, wal mode",
+      "detail": "schema v43, wal mode",
       "name": "database",
       "status": "ok"
     }

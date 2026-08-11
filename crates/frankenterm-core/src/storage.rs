@@ -518,7 +518,7 @@ const FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT_ENV: &str = "FT_MOONSHOT_SKIP_STAR
 /// (no-regression) behavior on the clean-start and over-threshold paths and
 /// durability proven by the `round8_wal_recovery` oracle. The env var is now an
 /// **opt-OUT**: set `FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT=0` to restore the
-/// legacy always-checkpoint behavior. Honors the `FT_MOONSHOT_ALL` master switch.
+/// legacy always-checkpoint behavior. Honors the global `FT_MOONSHOT_ALL` switch.
 fn skip_startup_wal_checkpoint_enabled() -> bool {
     if std::env::var("FT_MOONSHOT_ALL")
         .ok()
@@ -1314,6 +1314,7 @@ enum WriteCommand {
         prepared: PreparedMuxSession,
         ft_version: String,
         host_id: Option<String>,
+        owner_identity: Option<crate::session_retention::SessionOwnerIdentity>,
         respond: oneshot::Sender<Result<()>>,
     },
     /// Insert a session checkpoint with per-pane state
@@ -1321,17 +1322,20 @@ enum WriteCommand {
         session_id: String,
         checkpoint_type: String,
         prepared: PreparedSessionCheckpoint,
+        owner_identity: Option<crate::session_retention::SessionOwnerIdentity>,
         respond: oneshot::Sender<Result<SessionCheckpointReceipt>>,
     },
     /// Prune old checkpoints beyond retention limit
     PruneSessionCheckpoints {
         session_id: String,
         retention: usize,
+        owner_identity: Option<crate::session_retention::SessionOwnerIdentity>,
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Mark a session as cleanly shut down
     MarkSessionShutdownClean {
         receipt: SessionCheckpointReceipt,
+        owner_identity: Option<crate::session_retention::SessionOwnerIdentity>,
         respond: oneshot::Sender<Result<()>>,
     },
     /// Test-only command that panics inside the writer dispatch path.
@@ -1614,7 +1618,7 @@ const WRITER_BLOCKING_RECV_PARK_MS: u64 = 25;
 
 /// Read a boolean moonshot/tuning env flag using the shared truthy vocabulary.
 ///
-/// Honors the `FT_MOONSHOT_ALL` master switch (round-5 "everything-on" test
+/// Honors the global `FT_MOONSHOT_ALL` switch (round-5 "everything-on" test
 /// builds): when `FT_MOONSHOT_ALL` is truthy, every `FT_MOONSHOT_*` gate routed
 /// through this helper enables at once. Default-off / revert-safe.
 fn storage_env_flag_enabled(name: &str) -> bool {
@@ -2941,6 +2945,10 @@ pub struct StorageHandle {
     write_tx: WriteCommandSender,
     /// Database path for read connections
     db_path: Arc<String>,
+    /// Stable host-boot and process-incarnation fence shared by every clone.
+    /// Missing platform authority keeps session mutations on the explicit
+    /// unowned/fail-closed branch rather than fabricating a partial tuple.
+    session_owner_identity: Option<crate::session_retention::SessionOwnerIdentity>,
     /// Backend provider that owns writer creation and read-backend lending.
     backend_provider: Arc<dyn StorageBackendProvider>,
     /// Configured idle read-pool capacity for this handle's default provider.
@@ -3590,6 +3598,7 @@ impl StorageHandle {
         let handle = Self {
             write_tx,
             db_path: Arc::new(db_path.to_string()),
+            session_owner_identity: crate::session_retention::current_session_owner_identity(),
             backend_provider,
             read_pool_size: config.read_pool_size.max(1),
             mmap_mirror_dir: mmap_runtime.map(|runtime| Arc::new(runtime.base_dir)),
@@ -7416,6 +7425,7 @@ impl StorageHandle {
                     prepared,
                     ft_version,
                     host_id,
+                    owner_identity: self.session_owner_identity.clone(),
                     respond: tx,
                 },
             )
@@ -7478,6 +7488,7 @@ impl StorageHandle {
                     session_id,
                     checkpoint_type,
                     prepared,
+                    owner_identity: self.session_owner_identity.clone(),
                     respond: tx,
                 },
             )
@@ -7514,6 +7525,7 @@ impl StorageHandle {
                 WriteCommand::PruneSessionCheckpoints {
                     session_id,
                     retention,
+                    owner_identity: self.session_owner_identity.clone(),
                     respond: tx,
                 },
             )
@@ -7546,6 +7558,7 @@ impl StorageHandle {
                 cx,
                 WriteCommand::MarkSessionShutdownClean {
                     receipt,
+                    owner_identity: self.session_owner_identity.clone(),
                     respond: tx,
                 },
             )
@@ -18010,6 +18023,7 @@ fn dispatch_write_command_raw(
             prepared,
             ft_version,
             host_id,
+            owner_identity,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
@@ -18022,6 +18036,7 @@ fn dispatch_write_command_raw(
                 &prepared,
                 &ft_version,
                 host_id.as_deref(),
+                owner_identity.as_ref(),
             );
             respond_oneshot_best_effort(respond, result);
         }
@@ -18029,6 +18044,7 @@ fn dispatch_write_command_raw(
             session_id,
             checkpoint_type,
             prepared,
+            owner_identity,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
@@ -18040,27 +18056,39 @@ fn dispatch_write_command_raw(
                 &session_id,
                 &checkpoint_type,
                 &prepared,
+                owner_identity.as_ref(),
             );
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSessionCheckpoints {
             session_id,
             retention,
+            owner_identity,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // prune_session_checkpoints direct-rusqlite path.
-            let result = prune_session_checkpoints_backend(backend, &session_id, retention);
+            let result = prune_session_checkpoints_backend(
+                backend,
+                &session_id,
+                retention,
+                owner_identity.as_ref(),
+            );
             respond_oneshot_best_effort(respond, result);
         }
-        WriteCommand::MarkSessionShutdownClean { receipt, respond } => {
+        WriteCommand::MarkSessionShutdownClean {
+            receipt,
+            owner_identity,
+            respond,
+        } => {
             let respond = WriterResultResponder::new(respond);
             // br-ft-l1jgo: routes through the writer backend trait surface.
             // Replaces the legacy
             // mark_session_shutdown_clean direct-rusqlite path.
-            let result = mark_session_shutdown_clean_backend(backend, &receipt);
+            let result =
+                mark_session_shutdown_clean_backend(backend, &receipt, owner_identity.as_ref());
             respond_oneshot_best_effort(respond, result);
         }
         #[cfg(test)]
@@ -22563,32 +22591,86 @@ fn insert_mux_session_backend(
     prepared: &PreparedMuxSession,
     ft_version: &str,
     host_id: Option<&str>,
+    owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
 ) -> Result<()> {
+    let now = now_ms();
+    let effective_host_id = owner_identity
+        .map(|identity| identity.host_id.as_str())
+        .or(host_id);
     validate_mux_session_admission(
         session_id,
         prepared.topology_json.len(),
         ft_version,
-        host_id,
+        effective_host_id,
     )
     .map_err(session_persistence_admission_error)?;
-    let now = now_ms();
-    let host_id_value = match host_id {
+    let host_id_value = match effective_host_id {
         Some(s) => ToSqlValue::Text(s),
         None => ToSqlValue::Null,
     };
     execute_typed(
         backend,
-        "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, host_id)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO mux_sessions (
+             session_id, created_at, topology_json, ft_version, host_id,
+             owner_pid, owner_process_start, owner_heartbeat_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         &[
             ToSqlValue::Text(session_id),
             ToSqlValue::Integer(now),
             ToSqlValue::Text(prepared.topology_json.as_str()),
             ToSqlValue::Text(ft_version),
             host_id_value,
+            ToSqlValue::optional_i64(owner_identity.map(|identity| identity.pid)),
+            ToSqlValue::optional_i64(owner_identity.map(|identity| identity.process_start)),
+            ToSqlValue::optional_i64(owner_identity.map(|_| now)),
         ],
     )
     .map_err(|err| storage_backend_error("Failed to insert mux session", err))?;
+    Ok(())
+}
+
+/// Require the exact owner incarnation captured by this storage handle before
+/// mutating an existing mux session. The all-NULL branch is intentional: when
+/// platform identity is unavailable, creation and later mutation must agree on
+/// that explicit unowned state instead of silently claiming a legacy row.
+fn require_mux_session_owner_backend(
+    backend: &dyn StorageBackend,
+    session_id: &str,
+    owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
+) -> Result<()> {
+    let owner_host_id = owner_identity.map(|identity| identity.host_id.as_str());
+    let owner_pid = owner_identity.map(|identity| identity.pid);
+    let owner_process_start = owner_identity.map(|identity| identity.process_start);
+    let matched = backend
+        .query_row_typed(
+            "SELECT session_id
+             FROM mux_sessions
+             WHERE session_id = ?1
+               AND (
+                   (?2 IS NULL
+                       AND owner_pid IS NULL
+                       AND owner_process_start IS NULL
+                       AND owner_heartbeat_at IS NULL)
+                   OR (host_id = ?2
+                       AND owner_pid = ?3
+                       AND owner_process_start = ?4
+                       AND owner_heartbeat_at IS NOT NULL)
+               )",
+            &[
+                ToSqlValue::Text(session_id),
+                ToSqlValue::optional_text(owner_host_id),
+                ToSqlValue::optional_i64(owner_pid),
+                ToSqlValue::optional_i64(owner_process_start),
+            ],
+        )
+        .map_err(|error| storage_backend_error("Failed to verify mux session owner", error))?;
+    if matched.is_none() {
+        return Err(StorageError::Database(
+            "Mux session mutation rejected because its owner incarnation does not match"
+                .to_string(),
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -23014,6 +23096,7 @@ fn insert_session_checkpoint_backend(
     session_id: &str,
     checkpoint_type: &str,
     prepared: &PreparedSessionCheckpoint,
+    owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
 ) -> Result<SessionCheckpointReceipt> {
     validate_checkpoint_identity_admission(session_id, checkpoint_type)
         .map_err(session_persistence_admission_error)?;
@@ -23024,6 +23107,7 @@ fn insert_session_checkpoint_backend(
         WriterTransactionBeginMode::Immediate,
         "insert session checkpoint",
         || -> Result<SessionCheckpointReceipt> {
+            require_mux_session_owner_backend(backend, session_id, owner_identity)?;
             let row = backend
                 .query_row_typed(
                     "INSERT INTO session_checkpoints
@@ -23125,13 +23209,33 @@ fn insert_session_checkpoint_backend(
                  SET last_checkpoint_at = ?1,
                      topology_json = ?2,
                      shutdown_clean = 0,
-                     clean_checkpoint_id = NULL
+                     clean_checkpoint_id = NULL,
+                     owner_heartbeat_at = ?7,
+                     recovery_acknowledged_at = NULL
                  WHERE session_id = ?3
+                   AND (
+                       (?4 IS NULL
+                           AND owner_pid IS NULL
+                           AND owner_process_start IS NULL
+                           AND owner_heartbeat_at IS NULL)
+                       OR (host_id = ?4
+                           AND owner_pid = ?5
+                           AND owner_process_start = ?6
+                           AND owner_heartbeat_at IS NOT NULL)
+                   )
                  RETURNING session_id",
                     &[
                         ToSqlValue::Integer(now),
                         ToSqlValue::Text(prepared.topology_json.as_str()),
                         ToSqlValue::Text(session_id),
+                        ToSqlValue::optional_text(
+                            owner_identity.map(|identity| identity.host_id.as_str()),
+                        ),
+                        ToSqlValue::optional_i64(owner_identity.map(|identity| identity.pid)),
+                        ToSqlValue::optional_i64(
+                            owner_identity.map(|identity| identity.process_start),
+                        ),
+                        ToSqlValue::optional_i64(owner_identity.map(|_| now)),
                     ],
                 )
                 .map_err(|err| {
@@ -23174,14 +23278,17 @@ fn prune_session_checkpoints_backend(
     backend: &dyn StorageBackend,
     session_id: &str,
     retention: usize,
+    owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
 ) -> Result<usize> {
     let keep_count = i64::try_from(retention).unwrap_or(i64::MAX);
+    let heartbeat_at = now_ms();
 
     run_writer_transaction(
         backend,
         WriterTransactionBeginMode::Immediate,
         "prune session checkpoints",
         || -> Result<usize> {
+            require_mux_session_owner_backend(backend, session_id, owner_identity)?;
             execute_typed(
                 backend,
                 "DELETE FROM session_checkpoints
@@ -23278,10 +23385,14 @@ fn prune_session_checkpoints_backend(
                           )
                          THEN clean_checkpoint_id
                          ELSE NULL
-                     END
+                     END,
+                     owner_heartbeat_at = ?2
                  WHERE session_id = ?1
                  RETURNING session_id",
-                    &[ToSqlValue::Text(session_id)],
+                    &[
+                        ToSqlValue::Text(session_id),
+                        ToSqlValue::optional_i64(owner_identity.map(|_| heartbeat_at)),
+                    ],
                 )
                 .map_err(|err| {
                     storage_backend_error("Failed to reconcile pruned mux session", err)
@@ -23333,6 +23444,7 @@ fn current_session_checkpoint_witness_matches_backend(
                    FROM mux_sessions AS session
                    WHERE session.session_id = ?2
                      AND session.last_checkpoint_at = ?3
+                     AND session.topology_json = checkpoint.topology_json
                )
                AND NOT EXISTS (
                    SELECT 1
@@ -23502,12 +23614,15 @@ fn current_session_checkpoint_witness_matches_backend(
 fn mark_session_shutdown_clean_backend(
     backend: &dyn StorageBackend,
     receipt: &SessionCheckpointReceipt,
+    owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
 ) -> Result<()> {
+    let heartbeat_at = now_ms();
     run_writer_transaction(
         backend,
         WriterTransactionBeginMode::Immediate,
         "mark session shutdown clean",
         || {
+            require_mux_session_owner_backend(backend, &receipt.session_id, owner_identity)?;
             if !current_session_checkpoint_witness_matches_backend(backend, receipt)? {
                 return Err(StorageError::Database(format!(
                     "Checkpoint {} is not an intact latest durable receipt for session {}",
@@ -23519,9 +23634,26 @@ fn mark_session_shutdown_clean_backend(
                 .query_row_typed(
                     "UPDATE mux_sessions
          SET shutdown_clean = 1,
-             clean_checkpoint_id = ?2
+             clean_checkpoint_id = ?2,
+             owner_heartbeat_at = ?8
          WHERE session_id = ?1
            AND last_checkpoint_at = ?3
+           AND topology_json = (
+               SELECT checkpoint.topology_json
+               FROM session_checkpoints AS checkpoint
+               WHERE checkpoint.id = ?2
+                 AND checkpoint.session_id = ?1
+           )
+           AND (
+               (?5 IS NULL
+                   AND owner_pid IS NULL
+                   AND owner_process_start IS NULL
+                   AND owner_heartbeat_at IS NULL)
+               OR (host_id = ?5
+                   AND owner_pid = ?6
+                   AND owner_process_start = ?7
+                   AND owner_heartbeat_at IS NOT NULL)
+           )
            AND EXISTS (
                SELECT 1
                FROM session_checkpoints AS checkpoint
@@ -23544,6 +23676,14 @@ fn mark_session_shutdown_clean_backend(
                         ToSqlValue::Integer(receipt.checkpoint_id),
                         ToSqlValue::Integer(receipt.checkpoint_at),
                         ToSqlValue::Text(receipt.state_hash.as_str()),
+                        ToSqlValue::optional_text(
+                            owner_identity.map(|identity| identity.host_id.as_str()),
+                        ),
+                        ToSqlValue::optional_i64(owner_identity.map(|identity| identity.pid)),
+                        ToSqlValue::optional_i64(
+                            owner_identity.map(|identity| identity.process_start),
+                        ),
+                        ToSqlValue::optional_i64(owner_identity.map(|_| heartbeat_at)),
                     ],
                 )
                 .map_err(|err| {
@@ -38029,7 +38169,7 @@ fn clean_snapshot_binding_requires_all_restore_lifecycles_to_be_resolved() {
     };
 
     let blocked = with_test_storage_backend(&mut conn, |backend| {
-        mark_session_shutdown_clean_backend(backend, &receipt)
+        mark_session_shutdown_clean_backend(backend, &receipt, None)
     });
     assert!(
         blocked.is_err(),
@@ -38053,7 +38193,7 @@ fn clean_snapshot_binding_requires_all_restore_lifecycles_to_be_resolved() {
     )
     .expect("record explicit lifecycle resolution");
     with_test_storage_backend(&mut conn, |backend| {
-        mark_session_shutdown_clean_backend(backend, &receipt)
+        mark_session_shutdown_clean_backend(backend, &receipt, None)
     })
     .expect("resolved lifecycle permits exact snapshot clean binding");
     assert_eq!(
@@ -38064,6 +38204,262 @@ fn clean_snapshot_binding_requires_all_restore_lifecycles_to_be_resolved() {
         )
         .expect("read resolved clean state"),
         1
+    );
+}
+
+#[test]
+fn writer_session_mutations_require_the_exact_owner_incarnation() {
+    let mut conn = rusqlite::Connection::open_in_memory().expect("open owner-CAS fixture");
+    initialize_schema(&conn).expect("initialize owner-CAS fixture");
+    let topology =
+        "{\"captured_at\":0,\"schema_version\":1,\"windows\":[],\"workspace_id\":null}";
+    let owner_a = crate::session_retention::SessionOwnerIdentity {
+        host_id: r#"{"version":5,"hostname":"test-host","machine_fence":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","boot_id":"11111111-1111-4111-8111-111111111111","process_domain_id":"test-domain"}"#.to_string(),
+        pid: 4_101,
+        process_start: 9_001,
+    };
+    let owner_b = crate::session_retention::SessionOwnerIdentity {
+        host_id: r#"{"version":5,"hostname":"test-host","machine_fence":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","boot_id":"22222222-2222-4222-8222-222222222222","process_domain_id":"test-domain"}"#.to_string(),
+        pid: 4_102,
+        process_start: 9_002,
+    };
+    let mux = PreparedMuxSession {
+        topology_json: topology.to_string(),
+    };
+    let ignored_legacy_host = "h".repeat(MAX_SESSION_HOST_ID_BYTES + 1);
+    with_test_storage_backend(&mut conn, |backend| {
+        insert_mux_session_backend(
+            backend,
+            "owned-writer-session",
+            &mux,
+            "test",
+            Some(&ignored_legacy_host),
+            Some(&owner_a),
+        )
+    })
+    .expect("persisted owner authority supersedes the ignored legacy host");
+    let checkpoint = PreparedSessionCheckpoint {
+        topology_json: topology.to_string(),
+        metadata_json: None,
+        panes: Vec::new(),
+        pane_count: 0,
+        total_bytes: 0,
+    };
+
+    let competing_checkpoint = with_test_storage_backend(&mut conn, |backend| {
+        insert_session_checkpoint_backend(
+            backend,
+            "owned-writer-session",
+            "periodic",
+            &checkpoint,
+            Some(&owner_b),
+        )
+    });
+    assert!(competing_checkpoint.is_err());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count rolled-back competing checkpoint"),
+        0
+    );
+
+    let receipt = with_test_storage_backend(&mut conn, |backend| {
+        insert_session_checkpoint_backend(
+            backend,
+            "owned-writer-session",
+            "periodic",
+            &checkpoint,
+            Some(&owner_a),
+        )
+    })
+    .expect("exact owner inserts checkpoint");
+    let competing_prune = with_test_storage_backend(&mut conn, |backend| {
+        prune_session_checkpoints_backend(
+            backend,
+            "owned-writer-session",
+            0,
+            Some(&owner_b),
+        )
+    });
+    assert!(competing_prune.is_err());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count checkpoint after rejected competing prune"),
+        1
+    );
+
+    let competing_close = with_test_storage_backend(&mut conn, |backend| {
+        mark_session_shutdown_clean_backend(backend, &receipt, Some(&owner_b))
+    });
+    assert!(competing_close.is_err());
+    let divergent_topology =
+        "{\"captured_at\":1,\"schema_version\":1,\"windows\":[],\"workspace_id\":null}";
+    conn.execute(
+        "UPDATE mux_sessions SET topology_json = ?1
+         WHERE session_id = 'owned-writer-session'",
+        [divergent_topology],
+    )
+    .expect("diverge mutable session topology from its exact checkpoint");
+    let divergent_close = with_test_storage_backend(&mut conn, |backend| {
+        mark_session_shutdown_clean_backend(backend, &receipt, Some(&owner_a))
+    });
+    assert!(
+        divergent_close.is_err(),
+        "a valid checkpoint cannot authorize clean state for different session topology"
+    );
+    conn.execute(
+        "UPDATE mux_sessions SET topology_json = ?1
+         WHERE session_id = 'owned-writer-session'",
+        [topology],
+    )
+    .expect("restore exact session topology");
+    with_test_storage_backend(&mut conn, |backend| {
+        mark_session_shutdown_clean_backend(backend, &receipt, Some(&owner_a))
+    })
+    .expect("exact owner marks clean shutdown");
+    let (shutdown_clean, stored_host, stored_pid, stored_start): (i64, String, i64, i64) = conn
+        .query_row(
+            "SELECT shutdown_clean, host_id, owner_pid, owner_process_start
+             FROM mux_sessions WHERE session_id = 'owned-writer-session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .expect("load owner-fenced writer session");
+    assert_eq!(shutdown_clean, 1);
+    assert_eq!(stored_host.as_str(), owner_a.host_id.as_str());
+    assert_eq!(stored_pid, owner_a.pid);
+    assert_eq!(stored_start, owner_a.process_start);
+}
+
+#[test]
+fn writer_session_owner_contract_never_claims_an_unowned_session() {
+    let mut conn = rusqlite::Connection::open_in_memory().expect("open unowned-CAS fixture");
+    initialize_schema(&conn).expect("initialize unowned-CAS fixture");
+    let topology =
+        "{\"captured_at\":0,\"schema_version\":1,\"windows\":[],\"workspace_id\":null}";
+    let mux = PreparedMuxSession {
+        topology_json: topology.to_string(),
+    };
+    with_test_storage_backend(&mut conn, |backend| {
+        insert_mux_session_backend(
+            backend,
+            "unowned-writer-session",
+            &mux,
+            "test",
+            Some("legacy-host"),
+            None,
+        )
+    })
+    .expect("insert explicitly unowned writer session");
+    let owner = crate::session_retention::SessionOwnerIdentity {
+        host_id: r#"{"version":5,"hostname":"test-host","machine_fence":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","boot_id":"11111111-1111-4111-8111-111111111111","process_domain_id":"test-domain"}"#.to_string(),
+        pid: 4_101,
+        process_start: 9_001,
+    };
+    let checkpoint = PreparedSessionCheckpoint {
+        topology_json: topology.to_string(),
+        metadata_json: None,
+        panes: Vec::new(),
+        pane_count: 0,
+        total_bytes: 0,
+    };
+    let claim = with_test_storage_backend(&mut conn, |backend| {
+        insert_session_checkpoint_backend(
+            backend,
+            "unowned-writer-session",
+            "periodic",
+            &checkpoint,
+            Some(&owner),
+        )
+    });
+    assert!(claim.is_err());
+    assert!(
+        conn.query_row(
+            "SELECT owner_pid IS NULL AND owner_process_start IS NULL
+                    AND owner_heartbeat_at IS NULL
+             FROM mux_sessions WHERE session_id = 'unowned-writer-session'",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("inspect unowned tuple")
+    );
+}
+
+#[test]
+fn writer_session_mutations_reject_a_partial_owner_tuple() {
+    let mut conn = rusqlite::Connection::open_in_memory().expect("open corrupt-owner fixture");
+    initialize_schema(&conn).expect("initialize corrupt-owner fixture");
+    let topology =
+        "{\"captured_at\":0,\"schema_version\":1,\"windows\":[],\"workspace_id\":null}";
+    let owner = crate::session_retention::SessionOwnerIdentity {
+        host_id: r#"{"version":5,"hostname":"test-host","machine_fence":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","boot_id":"11111111-1111-4111-8111-111111111111","process_domain_id":"test-domain"}"#.to_string(),
+        pid: 4_101,
+        process_start: 9_001,
+    };
+    let mux = PreparedMuxSession {
+        topology_json: topology.to_string(),
+    };
+    with_test_storage_backend(&mut conn, |backend| {
+        insert_mux_session_backend(
+            backend,
+            "partial-owner-writer-session",
+            &mux,
+            "test",
+            None,
+            Some(&owner),
+        )
+    })
+    .expect("insert complete owner tuple");
+
+    // Construct a legacy/corrupt partial tuple by suspending both layers that
+    // now reject it. Reinstall the exact canonical mutation trigger before the
+    // production writer path is exercised.
+    conn.execute_batch(
+        "PRAGMA ignore_check_constraints=ON;
+         DROP TRIGGER mux_sessions_retained_size_au;
+         UPDATE mux_sessions
+         SET owner_heartbeat_at = NULL
+         WHERE session_id = 'partial-owner-writer-session';
+         PRAGMA ignore_check_constraints=OFF;",
+    )
+    .expect("construct partial owner tuple");
+    conn.execute_batch(
+        crate::storage::migrations::session_retained_size_schema_sql()
+            .expect("canonical retained-size DDL must be extractable"),
+    )
+    .expect("restore canonical session update trigger");
+    crate::storage::migrations::validate_session_retained_size_mutation_schema(&conn)
+        .expect("restore exact retained-size mutation schema");
+
+    let checkpoint = PreparedSessionCheckpoint {
+        topology_json: topology.to_string(),
+        metadata_json: None,
+        panes: Vec::new(),
+        pane_count: 0,
+        total_bytes: 0,
+    };
+    let mutation = with_test_storage_backend(&mut conn, |backend| {
+        insert_session_checkpoint_backend(
+            backend,
+            "partial-owner-writer-session",
+            "periodic",
+            &checkpoint,
+            Some(&owner),
+        )
+    });
+    assert!(
+        mutation.is_err(),
+        "writer must not heal or claim a corrupt partial owner tuple"
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count checkpoints after rejected partial-owner mutation"),
+        0
     );
 }
 

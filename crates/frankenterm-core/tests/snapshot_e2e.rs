@@ -348,23 +348,12 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
     let tmp = tempfile::NamedTempFile::new().expect("create temp db");
     let db_path = Arc::new(tmp.path().to_string_lossy().to_string());
     let conn = Connection::open(db_path.as_str()).expect("open temp db");
+    conn.execute_batch(frankenterm_core::storage::migrations::mux_sessions_schema_sql().unwrap())
+        .expect("snapshot E2E fixture must install the canonical mux_sessions schema");
     conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
         PRAGMA journal_mode = WAL;
-
-        CREATE TABLE IF NOT EXISTS mux_sessions (
-            session_id TEXT PRIMARY KEY,
-            created_at INTEGER NOT NULL,
-            last_checkpoint_at INTEGER,
-            shutdown_clean INTEGER NOT NULL DEFAULT 0,
-            topology_json TEXT NOT NULL,
-            window_metadata_json TEXT,
-            ft_version TEXT NOT NULL,
-            host_id TEXT,
-            clean_checkpoint_id INTEGER
-                REFERENCES session_checkpoints(id) ON DELETE SET NULL
-        );
 
         CREATE TABLE IF NOT EXISTS session_checkpoints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
