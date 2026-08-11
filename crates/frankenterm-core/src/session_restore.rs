@@ -4386,11 +4386,27 @@ fn finalize_restore_for_test(
         }
     }
 
-    let needs_verified_snapshot_source =
-        load_latest_checkpoint(db_path, session_id)?.is_none_or(|checkpoint| {
-            checkpoint.checkpoint_role != CheckpointRole::Snapshot
-                || checkpoint.verification != CheckpointVerification::VerifiedV2
-        });
+    let latest_snapshot = load_latest_checkpoint(db_path, session_id)?;
+    let latest_checkpoint_id = with_query_snapshot(db_path, |conn| {
+        conn.query_row(
+            "SELECT id
+             FROM session_checkpoints
+             WHERE session_id = ?1
+             ORDER BY id DESC
+             LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(RestoreError::from)
+    })?;
+    let needs_verified_snapshot_source = latest_snapshot.as_ref().is_none_or(|checkpoint| {
+        checkpoint.checkpoint_role != CheckpointRole::Snapshot
+            || checkpoint.verification != CheckpointVerification::VerifiedV2
+    }) || latest_snapshot
+        .as_ref()
+        .map(|checkpoint| checkpoint.checkpoint_id)
+        != latest_checkpoint_id;
     if needs_verified_snapshot_source {
         let mut conn = open_conn(db_path)?;
         let session_exists = conn
