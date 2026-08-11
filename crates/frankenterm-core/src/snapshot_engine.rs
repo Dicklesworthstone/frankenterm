@@ -1113,10 +1113,12 @@ fn due_intelligent_scheduler_retry(
 
 /// Per-scheduler automatic session-cleanup cadence state.
 ///
-/// `last_authoritative_success` advances only after a typed successful cleanup
-/// receipt. `retry_deferred_at` rate-limits admission contention and failures
-/// that are explicitly safe to retry. Indeterminate outcomes are governed by
-/// the engine-owned sticky reconciliation latch instead of this schedule.
+/// `last_authoritative_success` advances only after a typed cleanup receipt
+/// confirms that every enabled recovery-usability reconciliation phase was
+/// complete. `retry_deferred_at` rate-limits bounded reconciliation progress,
+/// admission contention, and failures that are explicitly safe to retry.
+/// Indeterminate outcomes are governed by the engine-owned sticky
+/// reconciliation latch instead of this schedule.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SessionCleanupSchedule {
     last_authoritative_success: Option<Instant>,
