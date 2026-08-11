@@ -1441,11 +1441,14 @@ SEE ALSO:
         command: SnapshotCommands,
     },
 
-    /// Session persistence commands (list, show, delete, doctor)
+    /// Session persistence and crash-recovery lifecycle commands
     #[command(after_help = r#"EXAMPLES:
     ft session list                   Show saved sessions
     ft session show <session_id>      Detailed session view
     ft session delete <id>            Delete a session
+    ft session acknowledge-recovery <id> --force
+                                      Allow cleanup of proven-dead recovery data
+    ft session preserve-recovery <id> Keep recovery data protected
     ft session doctor                 Health check on session data
 
 SEE ALSO:
@@ -6672,6 +6675,30 @@ enum SessionCommands {
         /// Skip confirmation
         #[arg(long)]
         force: bool,
+    },
+
+    /// Authorize retention to reclaim one proven-dead recovery session
+    AcknowledgeRecovery {
+        /// Proven-dead session ID whose recovery data may be reclaimed
+        session_id: String,
+
+        /// Confirm the recovery-data loss authorization
+        #[arg(long)]
+        force: bool,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Clear a prior retention acknowledgement and preserve recovery data
+    PreserveRecovery {
+        /// Session ID whose recovery data must remain protected
+        session_id: String,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
     },
 
     /// Health check on session persistence data
@@ -73762,6 +73789,35 @@ async fn handle_snapshot_command(
 // Session command handler
 // =============================================================================
 
+async fn set_session_recovery_acknowledgement_with_cx(
+    cx: &frankenterm_core::cx::Cx,
+    db_path: &str,
+    session_id: &str,
+    acknowledged_at: Option<u64>,
+) -> anyhow::Result<()> {
+    let db_path = db_path.to_string();
+    let session_id = session_id.to_string();
+    frankenterm_core::runtime_async::spawn_blocking_with_cx(cx, move || {
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|_| anyhow::anyhow!("session recovery database open failed"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("session recovery database preparation failed"))?;
+        match acknowledged_at {
+            Some(timestamp) => frankenterm_core::session_retention::acknowledge_recovery_session(
+                &conn,
+                &session_id,
+                timestamp,
+            ),
+            None => {
+                frankenterm_core::session_retention::preserve_recovery_session(&conn, &session_id)
+            }
+        }
+        .map_err(|_| anyhow::anyhow!("session recovery lifecycle action was rejected"))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("session recovery lifecycle action did not settle"))?
+}
+
 async fn handle_session_command(
     command: SessionCommands,
     layout: &frankenterm_core::config::WorkspaceLayout,
@@ -74104,6 +74160,79 @@ async fn handle_session_command(
             } else {
                 eprintln!("Session {display_session_id} not found.");
                 std::process::exit(1);
+            }
+        }
+
+        SessionCommands::AcknowledgeRecovery {
+            session_id,
+            force,
+            format,
+        } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
+            if !force {
+                emit_snapshot_session_error(
+                    output_format,
+                    "recovery_acknowledgement_requires_force",
+                    "Acknowledging recovery cleanup requires --force because retained recovery data may be deleted.",
+                )?;
+                std::process::exit(1);
+            }
+            let acknowledged_at = u64::try_from(now_epoch_ms()).map_err(|_| {
+                anyhow::anyhow!("system clock cannot represent recovery action time")
+            })?;
+            if let Err(error) = set_session_recovery_acknowledgement_with_cx(
+                &cx,
+                &db_path,
+                &session_id,
+                Some(acknowledged_at),
+            )
+            .await
+            {
+                trace_bounded_cli_internal_error("session recovery acknowledgement", &error);
+                emit_snapshot_session_error(
+                    output_format,
+                    "recovery_acknowledgement_rejected",
+                    "Recovery cleanup acknowledgement was rejected; the session must be unclean and its owner must be proven dead.",
+                )?;
+                std::process::exit(1);
+            }
+            let payload = serde_json::json!({
+                "ok": true,
+                "action": "acknowledge_recovery_cleanup",
+                "session_id": session_id,
+                "acknowledged_at": acknowledged_at,
+            });
+            if !print_snapshot_session_structured_output(&payload, output_format)? {
+                println!(
+                    "Recovery cleanup acknowledged for session {}.",
+                    redact_single_line_for_output(&session_id)
+                );
+            }
+        }
+
+        SessionCommands::PreserveRecovery { session_id, format } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
+            if let Err(error) =
+                set_session_recovery_acknowledgement_with_cx(&cx, &db_path, &session_id, None).await
+            {
+                trace_bounded_cli_internal_error("session recovery preservation", &error);
+                emit_snapshot_session_error(
+                    output_format,
+                    "recovery_preservation_rejected",
+                    "Recovery preservation was rejected; verify that the unclean session exists.",
+                )?;
+                std::process::exit(1);
+            }
+            let payload = serde_json::json!({
+                "ok": true,
+                "action": "preserve_recovery",
+                "session_id": session_id,
+            });
+            if !print_snapshot_session_structured_output(&payload, output_format)? {
+                println!(
+                    "Recovery data preserved for session {}.",
+                    redact_single_line_for_output(&session_id)
+                );
             }
         }
 
