@@ -16,6 +16,11 @@
 /// transaction commit and is outside that physical-behavior guarantee.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CleanupResult {
+    /// Recovery-usability reconciliation made bounded durable progress but did
+    /// not yet reach an authoritative protected-point decision for every
+    /// enabled retention phase. The caller must schedule a prompt retry rather
+    /// than treating this receipt as the start of the normal cleanup interval.
+    pub recovery_reconciliation_pending: bool,
     /// Sessions deleted by age policy.
     pub deleted_by_age: usize,
     /// Sessions deleted by count limit.
@@ -50,7 +55,8 @@ impl CleanupResult {
     /// Whether any cleanup was performed.
     #[must_use]
     pub fn any_work_done(&self) -> bool {
-        self.total_sessions_deleted() > 0
+        self.recovery_reconciliation_pending
+            || self.total_sessions_deleted() > 0
             || self.orphaned_restore_lifecycle_rows > 0
             || self.orphaned_checkpoints > 0
             || self.orphaned_pane_states > 0
@@ -78,6 +84,17 @@ mod tests {
     fn orphaned_restore_lifecycle_rows_are_reported_as_work() {
         let result = CleanupResult {
             orphaned_restore_lifecycle_rows: 1,
+            ..CleanupResult::default()
+        };
+
+        assert_eq!(result.total_sessions_deleted(), 0);
+        assert!(result.any_work_done());
+    }
+
+    #[test]
+    fn pending_recovery_reconciliation_is_reported_as_work() {
+        let result = CleanupResult {
+            recovery_reconciliation_pending: true,
             ..CleanupResult::default()
         };
 

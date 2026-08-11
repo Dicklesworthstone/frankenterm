@@ -3998,9 +3998,17 @@ impl SnapshotEngine {
             .await
         {
             Ok(result) => {
-                schedule.record_authoritative_success(Instant::now());
                 let total = result.total_sessions_deleted();
-                if result.size_ineligible_shortfall_bytes > 0 {
+                if result.recovery_reconciliation_pending {
+                    schedule.defer_retry(Instant::now());
+                    tracing::debug!(
+                        sessions_deleted = total,
+                        retry_delay_seconds = SESSION_CLEANUP_RETRY_DELAY.as_secs(),
+                        interval_hours,
+                        "Session retention recovery reconciliation made bounded progress; retry deferred"
+                    );
+                } else if result.size_ineligible_shortfall_bytes > 0 {
+                    schedule.record_authoritative_success(Instant::now());
                     tracing::warn!(
                         sessions_deleted = total,
                         size_measured_bytes = result.size_measured_bytes,
@@ -4011,6 +4019,7 @@ impl SnapshotEngine {
                         "Session retention cleanup completed above its size budget because no more sessions were eligible"
                     );
                 } else if result.any_work_done() {
+                    schedule.record_authoritative_success(Instant::now());
                     tracing::info!(
                         sessions_deleted = total,
                         orphaned_restore_lifecycle_rows = result.orphaned_restore_lifecycle_rows,
@@ -4026,6 +4035,7 @@ impl SnapshotEngine {
                         "Session retention cleanup completed"
                     );
                 } else {
+                    schedule.record_authoritative_success(Instant::now());
                     tracing::debug!(
                         size_measured_bytes = result.size_measured_bytes,
                         size_deleted_bytes = result.size_deleted_bytes,
@@ -8979,6 +8989,50 @@ mod tests {
                 Some(first_success),
                 "interval=0 must not run again after authoritative startup success"
             );
+        });
+    }
+
+    #[test]
+    fn session_cleanup_pending_reconciliation_defers_interval_zero_success() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let conn = Connection::open(db_path.as_str()).expect("open cleanup fixture");
+            for index in 0..5_i64 {
+                conn.execute(
+                    "INSERT INTO mux_sessions (
+                         session_id, created_at, shutdown_clean,
+                         topology_json, ft_version
+                     ) VALUES (?1, ?2, 0, '{}', '0.1.0')",
+                    rusqlite::params![format!("pending-active-{index}"), index + 1],
+                )
+                .expect("insert pending recovery-authority fixture");
+            }
+            drop(conn);
+
+            let mut config = SnapshotConfig::default();
+            config.session_retention.cleanup_interval_hours = 0;
+            let engine = SnapshotEngine::new(db_path, config);
+            let mut schedule = SessionCleanupSchedule::default();
+            let cx = crate::cx::for_testing();
+
+            engine.maybe_run_session_cleanup(&cx, &mut schedule).await;
+
+            assert!(
+                schedule.last_authoritative_success.is_none(),
+                "bounded reconciliation is not a completed startup cleanup"
+            );
+            assert!(
+                schedule.retry_deferred_at.is_some(),
+                "bounded reconciliation must schedule a prompt continuation"
+            );
+
+            schedule.retry_deferred_at = None;
+            engine.maybe_run_session_cleanup(&cx, &mut schedule).await;
+            assert!(
+                schedule.last_authoritative_success.is_some(),
+                "the prompt continuation must finish interval-zero startup cleanup"
+            );
+            assert!(schedule.retry_deferred_at.is_none());
         });
     }
 

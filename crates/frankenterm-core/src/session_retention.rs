@@ -308,6 +308,28 @@ struct SizeCleanupOutcome {
     ineligible_shortfall_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetentionPhaseOutcome<T> {
+    value: T,
+    recovery_reconciliation_pending: bool,
+}
+
+impl<T> RetentionPhaseOutcome<T> {
+    const fn ready(value: T) -> Self {
+        Self {
+            value,
+            recovery_reconciliation_pending: false,
+        }
+    }
+
+    const fn pending(value: T) -> Self {
+        Self {
+            value,
+            recovery_reconciliation_pending: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct OrphanCleanupOutcome {
     orphaned_restore_lifecycle_rows: usize,
@@ -397,13 +419,16 @@ pub fn cleanup_sessions(
 
     // 1. Delete sessions older than max_age_days
     if config.max_age_days > 0 {
-        result.deleted_by_age = delete_sessions_by_age_with_observer(
+        let phase = delete_sessions_by_age_phase_with_observer(
             conn,
             config.max_age_days,
             owner_observer
                 .as_ref()
                 .ok_or_else(|| recovery_authority_error("age retention has no owner observer"))?,
         )?;
+        result.deleted_by_age = phase.value;
+        result.recovery_reconciliation_pending |=
+            phase.recovery_reconciliation_pending;
         if result.deleted_by_age > 0 {
             info!(
                 deleted = result.deleted_by_age,
@@ -415,13 +440,16 @@ pub fn cleanup_sessions(
 
     // 2. Delete excess closed sessions
     if config.max_closed_sessions > 0 {
-        result.deleted_by_count = delete_excess_closed_sessions_with_observer(
+        let phase = delete_excess_closed_sessions_phase_with_observer(
             conn,
             config.max_closed_sessions,
             owner_observer
                 .as_ref()
                 .ok_or_else(|| recovery_authority_error("count retention has no owner observer"))?,
         )?;
+        result.deleted_by_count = phase.value;
+        result.recovery_reconciliation_pending |=
+            phase.recovery_reconciliation_pending;
         if result.deleted_by_count > 0 {
             info!(
                 deleted = result.deleted_by_count,
@@ -433,13 +461,16 @@ pub fn cleanup_sessions(
 
     // 3. Delete by size budget
     if config.max_total_size_mb > 0 {
-        let size_outcome = delete_sessions_by_size_with_observer(
+        let phase = delete_sessions_by_size_phase_with_observer(
             conn,
             config.max_total_size_mb,
             owner_observer
                 .as_ref()
                 .ok_or_else(|| recovery_authority_error("size retention has no owner observer"))?,
         )?;
+        let size_outcome = phase.value;
+        result.recovery_reconciliation_pending |=
+            phase.recovery_reconciliation_pending;
         result.deleted_by_size = size_outcome.deleted;
         result.size_measured_bytes = size_outcome.measured_bytes;
         result.size_deleted_bytes = size_outcome.deleted_bytes;
@@ -1299,6 +1330,16 @@ fn delete_sessions_by_age_with_observer(
     max_age_days: u64,
     observer: &impl SessionOwnerObserver,
 ) -> Result<usize, rusqlite::Error> {
+    Ok(
+        delete_sessions_by_age_phase_with_observer(conn, max_age_days, observer)?.value,
+    )
+}
+
+fn delete_sessions_by_age_phase_with_observer(
+    conn: &Connection,
+    max_age_days: u64,
+    observer: &impl SessionOwnerObserver,
+) -> Result<RetentionPhaseOutcome<usize>, rusqlite::Error> {
     let cutoff_ms = epoch_ms().saturating_sub(max_age_days.saturating_mul(86_400_000));
     // An unrepresentable future cutoff must fail without deleting anything;
     // clamping to i64::MAX would make nearly every closed session eligible.
@@ -1310,7 +1351,7 @@ fn delete_sessions_by_age_with_observer(
         ProtectedRecoverySelection::Ready(session_id) => session_id,
         ProtectedRecoverySelection::Pending => {
             tx.commit()?;
-            return Ok(0);
+            return Ok(RetentionPhaseOutcome::pending(0));
         }
     };
     let candidates: Vec<SessionRetentionAuthority> = {
@@ -1383,7 +1424,7 @@ fn delete_sessions_by_age_with_observer(
         deleted = deleted.saturating_add(1);
     }
     tx.commit()?;
-    Ok(deleted)
+    Ok(RetentionPhaseOutcome::ready(deleted))
 }
 
 /// Delete excess closed sessions, keeping the most recent `max_count`.
@@ -1401,13 +1442,23 @@ fn delete_excess_closed_sessions_with_observer(
     max_count: usize,
     observer: &impl SessionOwnerObserver,
 ) -> Result<usize, rusqlite::Error> {
+    Ok(
+        delete_excess_closed_sessions_phase_with_observer(conn, max_count, observer)?.value,
+    )
+}
+
+fn delete_excess_closed_sessions_phase_with_observer(
+    conn: &Connection,
+    max_count: usize,
+    observer: &impl SessionOwnerObserver,
+) -> Result<RetentionPhaseOutcome<usize>, rusqlite::Error> {
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
     let protected_recovery_session = match newest_usable_recovery_session(&tx, observer)? {
         ProtectedRecoverySelection::Ready(session_id) => session_id,
         ProtectedRecoverySelection::Pending => {
             tx.commit()?;
-            return Ok(0);
+            return Ok(RetentionPhaseOutcome::pending(0));
         }
     };
     let candidates: Vec<SessionRetentionAuthority> = {
@@ -1484,7 +1535,7 @@ fn delete_excess_closed_sessions_with_observer(
         deleted = deleted.saturating_add(1);
     }
     tx.commit()?;
-    Ok(deleted)
+    Ok(RetentionPhaseOutcome::ready(deleted))
 }
 
 fn retained_size_contract_error(message: &'static str) -> rusqlite::Error {
@@ -1643,6 +1694,16 @@ fn delete_sessions_by_size_with_observer(
     max_total_mb: u64,
     observer: &impl SessionOwnerObserver,
 ) -> Result<SizeCleanupOutcome, rusqlite::Error> {
+    Ok(
+        delete_sessions_by_size_phase_with_observer(conn, max_total_mb, observer)?.value,
+    )
+}
+
+fn delete_sessions_by_size_phase_with_observer(
+    conn: &Connection,
+    max_total_mb: u64,
+    observer: &impl SessionOwnerObserver,
+) -> Result<RetentionPhaseOutcome<SizeCleanupOutcome>, rusqlite::Error> {
     let max_bytes = max_total_mb
         .checked_mul(1_024)
         .and_then(|bytes| bytes.checked_mul(1_024))
@@ -1661,7 +1722,9 @@ fn delete_sessions_by_size_with_observer(
         ProtectedRecoverySelection::Ready(session_id) => session_id,
         ProtectedRecoverySelection::Pending => {
             tx.commit()?;
-            return Ok(SizeCleanupOutcome::default());
+            return Ok(RetentionPhaseOutcome::pending(
+                SizeCleanupOutcome::default(),
+            ));
         }
     };
     validate_session_retained_size_authority(&tx)?;
@@ -1683,11 +1746,13 @@ fn delete_sessions_by_size_with_observer(
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, total_bytes))?;
 
     if total_bytes <= max_bytes {
-        return Ok(SizeCleanupOutcome {
+        let outcome = SizeCleanupOutcome {
             measured_bytes: total_bytes,
             retained_bytes: total_bytes,
             ..SizeCleanupOutcome::default()
-        });
+        };
+        tx.commit()?;
+        return Ok(RetentionPhaseOutcome::ready(outcome));
     }
 
     let to_free = total_bytes.checked_sub(max_bytes).ok_or_else(|| {
@@ -1824,13 +1889,13 @@ fn delete_sessions_by_size_with_observer(
             "Committed bounded session set for size budget"
         );
     }
-    Ok(SizeCleanupOutcome {
+    Ok(RetentionPhaseOutcome::ready(SizeCleanupOutcome {
         deleted,
         measured_bytes: total_bytes,
         deleted_bytes: freed,
         retained_bytes,
         ineligible_shortfall_bytes: retained_bytes.saturating_sub(max_bytes),
-    })
+    }))
 }
 
 /// Clean orphaned data that lost its parent reference.
@@ -2431,6 +2496,15 @@ mod tests {
             }
         }
         panic!("recovery selection did not converge within {max_steps} bounded steps");
+    }
+
+    fn settle_test_recovery_selection(conn: &Connection) {
+        let observer = SystemSessionOwnerObserver::new();
+        assert_eq!(
+            drive_recovery_selection(conn, &observer, 64),
+            None,
+            "closed-session fixture must settle without advertising a crash recovery point"
+        );
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -4111,6 +4185,11 @@ mod tests {
         let old =
             i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer") - 90 * 86_400_000;
         let oversized_session_id = "s".repeat(MAX_CHECKPOINT_SESSION_ID_BYTES + 1);
+        conn.execute_batch(
+            "DROP TRIGGER mux_sessions_recovery_usability_ai;
+             PRAGMA ignore_check_constraints = ON;",
+        )
+            .expect("enable historical-corruption fixture insertion");
         conn.execute(
             "INSERT INTO mux_sessions (
                  session_id, created_at, last_checkpoint_at, shutdown_clean,
@@ -4128,6 +4207,10 @@ mod tests {
             rusqlite::params![oversized_session_id, old],
         )
         .expect("insert oversized session checkpoint fixture");
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .expect("restore canonical CHECK enforcement");
+        conn.execute_batch(crate::storage::SCHEMA_SQL)
+            .expect("restore canonical recovery-usability trigger authority");
 
         assert_eq!(delete_sessions_by_age(&conn, 30).unwrap(), 0);
         assert_eq!(delete_excess_closed_sessions(&conn, 0).unwrap(), 0);
@@ -4387,6 +4470,7 @@ mod tests {
         for i in 0..5 {
             insert_session(&conn, &format!("sess-{i}"), now + i * 1000, true);
         }
+        settle_test_recovery_selection(&conn);
 
         let deleted = delete_excess_closed_sessions(&conn, 3).unwrap();
         assert_eq!(deleted, 2);
@@ -5354,6 +5438,36 @@ mod tests {
         assert_eq!(result.total_sessions_deleted(), 0);
     }
 
+    #[test]
+    fn cleanup_receipt_requires_prompt_retry_after_bounded_reconciliation() {
+        let conn = make_test_db();
+        let now = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer");
+        for index in 0..5 {
+            insert_session(
+                &conn,
+                &format!("pending-active-{index}"),
+                now + i64::from(index),
+                false,
+            );
+        }
+        let config = SessionRetentionConfig {
+            max_age_days: 30,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 0,
+        };
+
+        let first = cleanup_sessions(&conn, &config).expect("bounded reconciliation step");
+        assert!(first.recovery_reconciliation_pending);
+        assert!(first.any_work_done());
+        assert_eq!(first.total_sessions_deleted(), 0);
+
+        let second = cleanup_sessions(&conn, &config).expect("reconciled cleanup step");
+        assert!(!second.recovery_reconciliation_pending);
+        assert_eq!(second.total_sessions_deleted(), 0);
+        assert_eq!(count_sessions(&conn), 5);
+    }
+
     // ---- Config defaults ----
 
     #[test]
@@ -5382,6 +5496,7 @@ mod tests {
     #[test]
     fn cleanup_result_empty() {
         let result = CleanupResult::default();
+        assert!(!result.recovery_reconciliation_pending);
         assert_eq!(result.total_sessions_deleted(), 0);
         assert!(!result.any_work_done());
     }
@@ -5576,6 +5691,7 @@ mod tests {
         for i in 0..12 {
             insert_session_with_topology(&conn, &format!("old-{i}"), old, true, &payload);
         }
+        settle_test_recovery_selection(&conn);
 
         let config = SessionRetentionConfig {
             max_age_days: 30,
@@ -5668,6 +5784,7 @@ mod tests {
             // give each 600KB of checkpoint data → total 3000KB > 2MB budget for last 2
             insert_checkpoint(&conn, &id, now + i * 1000, 600 * 1024);
         }
+        settle_test_recovery_selection(&conn);
 
         let config = SessionRetentionConfig {
             max_age_days: 30,
@@ -5697,6 +5814,7 @@ mod tests {
             insert_session(&conn, &id, now + i * 1000, true);
             insert_checkpoint(&conn, &id, now + i * 1000, 400 * 1024);
         }
+        settle_test_recovery_selection(&conn);
 
         // Budget: 1 MiB = 1024 KiB. Total is 1600 KiB, so freeing 576 KiB
         // deterministically deletes the two oldest 400 KiB sessions.
@@ -5722,6 +5840,7 @@ mod tests {
         for i in 0..4 {
             insert_session(&conn, &format!("closed-{i}"), now + (i + 3) * 1000, true);
         }
+        settle_test_recovery_selection(&conn);
 
         let deleted = delete_excess_closed_sessions(&conn, 2).unwrap();
         assert_eq!(deleted, 2);
@@ -5839,6 +5958,7 @@ mod tests {
         for i in 0..5 {
             insert_session(&conn, &format!("nochk-{i}"), now + i * 1000, true);
         }
+        settle_test_recovery_selection(&conn);
 
         let outcome = delete_sessions_by_size(&conn, 1).unwrap();
         assert_eq!(outcome.deleted, 0);

@@ -361,6 +361,7 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
                 orphan_cp,
                 orphan_ps,
             )| CleanupResult {
+                recovery_reconciliation_pending: false,
                 deleted_by_age: age,
                 deleted_by_count: count,
                 deleted_by_size: size,
