@@ -2102,6 +2102,9 @@ pub struct SnapshotEngine {
     config: SnapshotConfig,
     /// Current session ID (set on first capture).
     session_id: RwLock<Option<String>>,
+    /// Stable host-boot and process-incarnation fence captured once. Missing
+    /// platform authority leaves sessions fail-closed as legacy/unknown.
+    owner_identity: Option<crate::session_retention::SessionOwnerIdentity>,
     /// Stable semantic-state SHA-256 digest used for periodic deduplication.
     last_dedup_hash: RwLock<Option<LastDedupCheckpoint>>,
     /// Atomic combined capture/shutdown lifecycle. One CAS both admits an
@@ -2149,6 +2152,7 @@ impl SnapshotEngine {
             db_path,
             config,
             session_id: RwLock::new(None),
+            owner_identity: crate::session_retention::current_session_owner_identity(),
             last_dedup_hash: RwLock::new(None),
             capture_lifecycle: AtomicU8::new(CAPTURE_LIFECYCLE_OPEN_IDLE),
             scheduler_in_progress: AtomicBool::new(false),
@@ -2867,8 +2871,12 @@ impl SnapshotEngine {
         let session_id = session_id_guard.clone().unwrap_or_else(generate_session_id);
         let new_session = creates_session.then(|| NewSessionMetadata {
             ft_version: crate::VERSION.to_string(),
-            host_id: current_host_id(),
+            host_id: self
+                .owner_identity
+                .as_ref()
+                .map(|identity| identity.host_id.clone()),
         });
+        let owner_identity = self.owner_identity.clone();
 
         // 6. Acquire the final in-memory publication guard before the durable
         // write. Post-handoff cancellation is indeterminate, never an ordinary
@@ -2898,6 +2906,7 @@ impl SnapshotEngine {
                         &checkpoint_type,
                         &prepared,
                         new_session.as_ref(),
+                        owner_identity.as_ref(),
                     )
                 },
             )
@@ -4280,6 +4289,7 @@ impl SnapshotEngine {
         let checkpoint_id = checkpoint.checkpoint_id;
         let checkpoint_at = checkpoint.checkpoint_at;
         let state_hash = checkpoint.state_hash.clone();
+        let owner_identity = self.owner_identity.clone();
         self.spawn_blocking_authority_with_cx(
             cx,
             SnapshotAuthorityOperation::ShutdownMark,
@@ -4290,6 +4300,7 @@ impl SnapshotEngine {
                     checkpoint_id,
                     checkpoint_at,
                     &state_hash,
+                    owner_identity.as_ref(),
                 )
             },
         )
@@ -5810,9 +5821,7 @@ fn bounded_host_id(raw: Option<String>) -> Option<String> {
 }
 
 fn current_host_id() -> Option<String> {
-    ["HOSTNAME", "HOST"]
-        .into_iter()
-        .find_map(|name| bounded_host_id(std::env::var(name).ok()))
+    crate::session_retention::current_session_owner_identity().map(|identity| identity.host_id)
 }
 
 /// Creation-only fields inserted alongside a first checkpoint. Keeping this
@@ -5889,6 +5898,7 @@ fn mark_shutdown_authoritatively_sync(
     checkpoint_id: i64,
     checkpoint_at: u64,
     state_hash: &str,
+    owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
 ) -> std::result::Result<(), SnapshotAuthorityDbError> {
     let identity = SnapshotCheckpointIdentity {
         checkpoint_id,
@@ -5931,8 +5941,23 @@ fn mark_shutdown_authoritatively_sync(
                    WHERE latest.session_id = ?1
                    ORDER BY latest.id DESC
                    LIMIT 1
+               )
+               AND (
+                   (?5 IS NULL AND session.owner_pid IS NULL
+                       AND session.owner_process_start IS NULL)
+                   OR (session.host_id = ?5
+                       AND session.owner_pid = ?6
+                       AND session.owner_process_start = ?7)
                )",
-            rusqlite::params![session_id, checkpoint_at, checkpoint_id, state_hash],
+            rusqlite::params![
+                session_id,
+                checkpoint_at,
+                checkpoint_id,
+                state_hash,
+                owner_identity.map(|identity| identity.host_id.as_str()),
+                owner_identity.map(|identity| identity.pid),
+                owner_identity.map(|identity| identity.process_start),
+            ],
         )?;
         require_exactly_one_changed_row(updated)
     })
@@ -5952,6 +5977,7 @@ fn mark_shutdown_sync(
         checkpoint_id,
         checkpoint_at,
         state_hash,
+        None,
     )
     .map_err(SnapshotAuthorityDbError::into_primary_source)
 }
@@ -5967,6 +5993,7 @@ fn save_checkpoint_authoritatively_sync(
     checkpoint_type: &str,
     prepared: &PreparedSnapshotPersistence,
     new_session: Option<&NewSessionMetadata>,
+    owner_identity: Option<&crate::session_retention::SessionOwnerIdentity>,
 ) -> std::result::Result<CheckpointCommitReceipt, SnapshotAuthorityDbError> {
     let now_ms = u64_to_sqlite_integer(now_ms)?;
     let conn = open_conn(db_path)?;
@@ -5979,14 +6006,17 @@ fn save_checkpoint_authoritatively_sync(
         if let Some(metadata) = new_session {
             let inserted_session = tx.execute(
                 "INSERT INTO mux_sessions
-                 (session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id)
-                 VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
+                 (session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id,
+                  owner_pid, owner_process_start, owner_heartbeat_at)
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?2)",
                 rusqlite::params![
                     session_id,
                     now_ms,
                     prepared.topology_json.as_str(),
                     metadata.ft_version.as_str(),
                     metadata.host_id.as_deref(),
+                    owner_identity.map(|identity| identity.pid),
+                    owner_identity.map(|identity| identity.process_start),
                 ],
             )?;
             require_exactly_one_changed_row(inserted_session)?;
@@ -6061,9 +6091,25 @@ fn save_checkpoint_authoritatively_sync(
                  SET last_checkpoint_at = ?1,
                      topology_json = ?2,
                      shutdown_clean = 0,
-                     clean_checkpoint_id = NULL
-                 WHERE session_id = ?3",
-                rusqlite::params![now_ms, prepared.topology_json.as_str(), session_id],
+                     clean_checkpoint_id = NULL,
+                     owner_heartbeat_at = ?1,
+                     recovery_acknowledged_at = NULL
+                 WHERE session_id = ?3
+                   AND (
+                       (?4 IS NULL AND owner_pid IS NULL
+                           AND owner_process_start IS NULL)
+                       OR (host_id = ?4
+                           AND owner_pid = ?5
+                           AND owner_process_start = ?6)
+                   )",
+                rusqlite::params![
+                    now_ms,
+                    prepared.topology_json.as_str(),
+                    session_id,
+                    owner_identity.map(|identity| identity.host_id.as_str()),
+                    owner_identity.map(|identity| identity.pid),
+                    owner_identity.map(|identity| identity.process_start),
+                ],
             )?;
             require_exactly_one_changed_row(updated_session)?;
         }
@@ -6117,6 +6163,7 @@ fn save_checkpoint_sync(
         checkpoint_type,
         prepared,
         new_session,
+        None,
     )
     .map_err(SnapshotAuthorityDbError::into_primary_source)
 }
@@ -9606,6 +9653,61 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_heartbeat_and_shutdown_remain_bound_to_owner_incarnation() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let owner = engine
+                .owner_identity
+                .clone()
+                .expect("supported test worker must expose host/process ownership authority");
+            let panes = vec![make_test_pane(1, 24, 80)];
+            let first = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .unwrap();
+            let second = engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .unwrap();
+
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let stored: (String, i64, i64, i64, Option<i64>) = conn
+                .query_row(
+                    "SELECT host_id, owner_pid, owner_process_start,
+                            owner_heartbeat_at, recovery_acknowledged_at
+                     FROM mux_sessions WHERE session_id = ?1",
+                    [&second.session_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(stored.0, owner.host_id);
+            assert_eq!(stored.1, owner.pid);
+            assert_eq!(stored.2, owner.process_start);
+            assert_eq!(stored.3, i64::try_from(second.checkpoint_at).unwrap());
+            assert_eq!(stored.4, None);
+
+            engine.close_after_checkpoint(&second).await.unwrap();
+            let shutdown_clean: i64 = conn
+                .query_row(
+                    "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                    [&first.session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(shutdown_clean, 1);
+        });
+    }
+
+    #[test]
     fn metadata_admission_precedes_auxiliary_database_reads() {
         run_async_test(async {
             // Deliberately leave this SQLite file without snapshot, event, or
@@ -12300,6 +12402,7 @@ mod tests {
             db_path,
             config: intelligent_config(5.0),
             session_id: RwLock::new(None),
+            owner_identity: None,
             last_dedup_hash: RwLock::new(None),
             capture_lifecycle: AtomicU8::new(CAPTURE_LIFECYCLE_OPEN_IDLE),
             scheduler_in_progress: AtomicBool::new(false),

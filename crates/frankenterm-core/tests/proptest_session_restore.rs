@@ -622,6 +622,9 @@ fn arb_session_doctor_report() -> impl Strategy<Value = SessionDoctorReport> {
                 (0..=max_unclean).prop_map(move |unclean_sessions| SessionDoctorReport {
                     total_sessions,
                     unclean_sessions,
+                    live_sessions: 0,
+                    recovery_candidate_sessions: 0,
+                    unknown_owner_sessions: unclean_sessions,
                     total_checkpoints,
                     orphaned_checkpoints,
                     orphaned_pane_states,

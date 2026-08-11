@@ -17,6 +17,56 @@ impl From<u32> for LocalProcessStatus {
 }
 
 impl LocalProcessInfo {
+    /// Read one process-incarnation token without enumerating the process tree.
+    pub fn process_start_time(pid: u32) -> Option<u64> {
+        match Self::observe_process_start_time(pid) {
+            ProcessStartTimeObservation::Running(start_time) => Some(start_time),
+            ProcessStartTimeObservation::Absent | ProcessStartTimeObservation::Unknown => None,
+        }
+    }
+
+    pub fn observe_process_start_time(pid: u32) -> ProcessStartTimeObservation {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let wanted_size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut _,
+                wanted_size,
+            )
+        };
+        if read == wanted_size && info.pbi_start_tvsec > 0 {
+            return ProcessStartTimeObservation::Running(info.pbi_start_tvsec);
+        }
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            ProcessStartTimeObservation::Absent
+        } else {
+            ProcessStartTimeObservation::Unknown
+        }
+    }
+
+    /// Derive a stable macOS boot identity from the kernel boot timestamp.
+    pub fn host_boot_id() -> Option<String> {
+        let mut boot_time: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::timeval>();
+        let name = b"kern.boottime\0";
+        let result = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr().cast(),
+                &mut boot_time as *mut _ as *mut _,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || size != std::mem::size_of::<libc::timeval>() || boot_time.tv_sec <= 0 {
+            return None;
+        }
+        Some(format!("{}:{}", boot_time.tv_sec, boot_time.tv_usec))
+    }
+
     pub fn current_working_dir(pid: u32) -> Option<PathBuf> {
         let mut pathinfo: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&pathinfo) as libc::c_int;

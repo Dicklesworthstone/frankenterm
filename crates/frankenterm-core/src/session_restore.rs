@@ -1625,7 +1625,9 @@ fn find_unclean_sessions_from_conn(
                 END,
                 session.host_id IS NOT NULL,
                 session.shutdown_clean,
-                session.clean_checkpoint_id
+                session.clean_checkpoint_id,
+                session.owner_pid,
+                session.owner_process_start
          FROM mux_sessions AS session
          ORDER BY COALESCE((
                       SELECT MAX(causal.id)
@@ -1653,11 +1655,14 @@ fn find_unclean_sessions_from_conn(
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
             ))
         },
     )?;
 
     let mut candidates = Vec::new();
+    let owner_classifier = crate::session_retention::SessionOwnerClassifier::new();
     for row in rows {
         let (
             session_id,
@@ -1669,12 +1674,19 @@ fn find_unclean_sessions_from_conn(
             host_id_present,
             shutdown_clean,
             clean_checkpoint_id,
+            owner_pid,
+            owner_process_start,
         ) = row?;
         let session_id = decode_required_bounded_text(session_id, "mux_sessions.session_id")?;
         let ft_version = decode_required_bounded_text(ft_version, "mux_sessions.ft_version")?;
         let host_id =
             decode_optional_bounded_text(host_id, host_id_present, "mux_sessions.host_id")?;
         if assess_clean_authority(conn, &session_id, shutdown_clean, clean_checkpoint_id)? {
+            continue;
+        }
+        if owner_classifier.classify(host_id.as_deref(), owner_pid, owner_process_start)
+            == crate::session_retention::UncleanSessionOwnerState::Live
+        {
             continue;
         }
         candidates.push(SessionCandidate {
@@ -1917,6 +1929,44 @@ fn restore_candidate_checkpoint_from_conn(
         checkpoint_at,
         verification,
     }))
+}
+
+/// Return whether the latest snapshot for one session is a bounded, non-empty,
+/// fully verified recovery point. Retention uses the same loader as restore so
+/// it never preserves a descriptor that the actual recovery path would reject.
+pub(crate) fn session_has_usable_recovery_point_from_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<bool, RestoreError> {
+    validate_session_selector(session_id)?;
+    let checkpoint_id = conn
+        .query_row(
+            "SELECT id
+             FROM session_checkpoints
+             WHERE session_id = ?1
+               AND checkpoint_role = 'snapshot'
+             ORDER BY id DESC
+             LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(checkpoint_id) = checkpoint_id else {
+        return Ok(false);
+    };
+    let Some(descriptor) = restore_candidate_checkpoint_from_conn(conn, checkpoint_id)? else {
+        return Ok(false);
+    };
+    if descriptor.verification != CheckpointVerification::VerifiedV2 {
+        return Ok(false);
+    }
+    let Some(checkpoint) = load_checkpoint_by_id_from_conn(conn, checkpoint_id)? else {
+        return Ok(false);
+    };
+    Ok(
+        checkpoint.verification == CheckpointVerification::VerifiedV2
+            && !checkpoint.pane_states.is_empty(),
+    )
 }
 
 /// Load a specific checkpoint by row ID, including pane states.
@@ -4970,6 +5020,9 @@ fn show_session_page_from_conn(
 pub struct SessionDoctorReport {
     pub total_sessions: usize,
     pub unclean_sessions: usize,
+    pub live_sessions: usize,
+    pub recovery_candidate_sessions: usize,
+    pub unknown_owner_sessions: usize,
     pub total_checkpoints: usize,
     pub orphaned_checkpoints: usize,
     pub orphaned_pane_states: usize,
@@ -4997,25 +5050,60 @@ fn session_doctor_from_conn(conn: &Connection) -> Result<SessionDoctorReport, Re
                     THEN session_id
                 END,
                 shutdown_clean,
-                clean_checkpoint_id
+                clean_checkpoint_id,
+                CASE
+                    WHEN typeof(host_id) = 'text'
+                     AND length(CAST(host_id AS BLOB)) <= ?2
+                    THEN host_id
+                END,
+                owner_pid,
+                owner_process_start
          FROM mux_sessions",
     )?;
     let shutdown_rows = shutdown_stmt.query_map(
-        [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
+        rusqlite::params![
+            i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+            i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+        ],
         |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         },
     )?;
     let mut unclean_sessions = 0usize;
+    let mut live_sessions = 0usize;
+    let mut recovery_candidate_sessions = 0usize;
+    let mut unknown_owner_sessions = 0usize;
+    let owner_classifier = crate::session_retention::SessionOwnerClassifier::new();
     for row in shutdown_rows {
-        let (session_id, shutdown_clean, clean_checkpoint_id) = row?;
+        let (
+            session_id,
+            shutdown_clean,
+            clean_checkpoint_id,
+            host_id,
+            owner_pid,
+            owner_process_start,
+        ) = row?;
         let session_id = decode_required_bounded_text(session_id, "mux_sessions.session_id")?;
         if !assess_clean_authority(conn, &session_id, shutdown_clean, clean_checkpoint_id)? {
             unclean_sessions = unclean_sessions.saturating_add(1);
+            match owner_classifier.classify(host_id.as_deref(), owner_pid, owner_process_start) {
+                crate::session_retention::UncleanSessionOwnerState::Live => {
+                    live_sessions = live_sessions.saturating_add(1);
+                }
+                crate::session_retention::UncleanSessionOwnerState::RecoveryCandidate => {
+                    recovery_candidate_sessions = recovery_candidate_sessions.saturating_add(1);
+                }
+                crate::session_retention::UncleanSessionOwnerState::Unknown => {
+                    unknown_owner_sessions = unknown_owner_sessions.saturating_add(1);
+                }
+            }
         }
     }
     let invalid_resolved_restore_chains = count_invalid_resolved_restore_chains_from_conn(conn)?;
@@ -5131,6 +5219,9 @@ fn session_doctor_from_conn(conn: &Connection) -> Result<SessionDoctorReport, Re
     Ok(SessionDoctorReport {
         total_sessions: decode_usize(total_sessions, "mux_sessions.count")?,
         unclean_sessions,
+        live_sessions,
+        recovery_candidate_sessions,
+        unknown_owner_sessions,
         total_checkpoints: decode_usize(total_checkpoints, "session_checkpoints.count")?,
         orphaned_checkpoints: decode_usize(
             orphaned_checkpoints,
@@ -11618,6 +11709,9 @@ mod tests {
   "session_doctor": {
     "total_sessions": 2,
     "unclean_sessions": 1,
+    "live_sessions": 0,
+    "recovery_candidate_sessions": 0,
+    "unknown_owner_sessions": 1,
     "total_checkpoints": 3,
     "orphaned_checkpoints": 0,
     "orphaned_pane_states": 0,
@@ -11676,6 +11770,9 @@ mod tests {
         let report = SessionDoctorReport {
             total_sessions: 3,
             unclean_sessions: 1,
+            live_sessions: 0,
+            recovery_candidate_sessions: 1,
+            unknown_owner_sessions: 0,
             total_checkpoints: 10,
             orphaned_checkpoints: 1,
             orphaned_pane_states: 2,
@@ -11689,6 +11786,7 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["total_sessions"], 3);
         assert_eq!(json["unclean_sessions"], 1);
+        assert_eq!(json["recovery_candidate_sessions"], 1);
         assert_eq!(json["orphaned_checkpoints"], 1);
         assert_eq!(json["orphaned_pane_states"], 2);
         assert_eq!(json["unresolved_restore_attempts"], 1);
@@ -11700,6 +11798,9 @@ mod tests {
         let report = SessionDoctorReport {
             total_sessions: 1,
             unclean_sessions: 0,
+            live_sessions: 0,
+            recovery_candidate_sessions: 0,
+            unknown_owner_sessions: 0,
             total_checkpoints: 5,
             orphaned_checkpoints: 0,
             orphaned_pane_states: 0,

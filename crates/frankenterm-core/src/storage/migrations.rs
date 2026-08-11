@@ -2125,6 +2125,17 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 41,
+        description: "Fence live session owners from stale crash-recovery candidates",
+        // Applied by `ensure_session_owner_lifecycle_schema`, which also
+        // refreshes the v40 retained-size objects so the four new persisted
+        // INTEGER fields are charged exactly once.
+        up_sql: "",
+        // Removing the ownership fence would make live-session deletion
+        // possible again, so this authority migration is forward-only.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2529,6 +2540,123 @@ fn ensure_session_retained_size_schema(conn: &Connection) -> Result<()> {
             "session retained-size schema installation failed: {error}"
         ))
     })?;
+    validate_session_retained_size_schema(conn)
+}
+
+fn ensure_session_owner_lifecycle_columns(conn: &Connection) -> Result<()> {
+    for (column, definition) in [
+        (
+            "owner_pid",
+            "INTEGER CHECK(owner_pid IS NULL OR owner_pid > 0)",
+        ),
+        (
+            "owner_process_start",
+            "INTEGER CHECK(owner_process_start IS NULL OR owner_process_start > 0)",
+        ),
+        (
+            "owner_heartbeat_at",
+            "INTEGER CHECK(owner_heartbeat_at IS NULL OR owner_heartbeat_at >= 0)",
+        ),
+        (
+            "recovery_acknowledged_at",
+            "INTEGER CHECK(recovery_acknowledged_at IS NULL OR recovery_acknowledged_at >= 0)",
+        ),
+    ] {
+        if !table_has_column(conn, "mux_sessions", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE mux_sessions ADD COLUMN {column} {definition};"
+            ))
+            .map_err(|error| {
+                StorageError::MigrationFailed(format!(
+                    "session owner-lifecycle column {column} installation failed: {error}"
+                ))
+            })?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mux_sessions_recovery_lifecycle
+         ON mux_sessions(
+             shutdown_clean, recovery_acknowledged_at,
+             last_checkpoint_at DESC, session_id
+         );",
+    )
+    .map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "session owner-lifecycle index installation failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn validate_session_owner_lifecycle_schema(conn: &Connection) -> Result<()> {
+    for column in [
+        "owner_pid",
+        "owner_process_start",
+        "owner_heartbeat_at",
+        "recovery_acknowledged_at",
+    ] {
+        if !table_has_column(conn, "mux_sessions", column)? {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v41 mux_sessions is missing owner-lifecycle column {column}"
+                ),
+            }
+            .into());
+        }
+    }
+    let index_present: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema
+             WHERE type = 'index'
+               AND name = 'idx_mux_sessions_recovery_lifecycle'
+               AND tbl_name = 'mux_sessions'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !index_present {
+        return Err(StorageError::Corruption {
+            details: "schema v41 is missing the session recovery-lifecycle index".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn ensure_session_owner_lifecycle_schema(conn: &Connection) -> Result<()> {
+    ensure_session_owner_lifecycle_columns(conn)?;
+
+    // A v40 database already has definitions whose session-row formula does
+    // not know about v41 fields. Reinstall only the dependent objects from the
+    // single canonical marked schema section; every other retained-size object
+    // remains untouched.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS mux_sessions_retained_size_ai;
+         DROP TRIGGER IF EXISTS mux_sessions_retained_size_au;
+         DROP TRIGGER IF EXISTS mux_sessions_retained_size_ad;
+         DROP VIEW IF EXISTS session_retained_size_recomputed;",
+    )
+    .map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "session owner-lifecycle retained-size refresh setup failed: {error}"
+        ))
+    })?;
+    ensure_session_retained_size_schema(conn)?;
+    conn.execute(
+        "UPDATE session_retained_size
+         SET session_row_bytes = (
+             SELECT recomputed.session_row_bytes
+             FROM session_retained_size_recomputed AS recomputed
+             WHERE recomputed.session_id = session_retained_size.session_id
+         )",
+        [],
+    )
+    .map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "session owner-lifecycle retained-size refresh failed: {error}"
+        ))
+    })?;
+    validate_session_owner_lifecycle_schema(conn)?;
     validate_session_retained_size_schema(conn)
 }
 
@@ -5406,8 +5534,9 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // authority; v37 protects exact clean-checkpoint receipt identity; v38
     // protects never-reused IDs and restore-attempt settlement evidence; v39
     // protects the transactional bounded scrollback projection; v40 protects
-    // exact retained-session byte authority. V40 is
-    // therefore the current downgrade floor.
+    // exact retained-session byte authority; v41 protects live-owner fencing
+    // from stale recovery cleanup. V41 is therefore the current downgrade
+    // floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
@@ -5513,7 +5642,15 @@ fn apply_migration_mutation(
                     apply_raw_up_sql = false;
                 }
                 40 => {
+                    // The current canonical retained-size formula includes the
+                    // additive v41 fields. Installing those columns first also
+                    // keeps direct upgrades from pre-v40 schemas coherent.
+                    ensure_session_owner_lifecycle_columns(conn)?;
                     ensure_session_retained_size_schema(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                41 => {
+                    ensure_session_owner_lifecycle_schema(conn)?;
                     apply_raw_up_sql = false;
                 }
                 _ => {}
@@ -5533,6 +5670,11 @@ fn apply_migration_mutation(
             if migration.version == 40 {
                 validate_session_retained_size_schema(conn)?;
                 ensure_no_foreign_key_violations(conn, "migration v40")?;
+            }
+            if migration.version == 41 {
+                validate_session_owner_lifecycle_schema(conn)?;
+                validate_session_retained_size_schema(conn)?;
+                ensure_no_foreign_key_violations(conn, "migration v41")?;
             }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;
@@ -8360,8 +8502,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_scrollback_and_size_authority_v36_through_v40_are_forward_only() {
-        for version in [36, 37, 38, 39, 40] {
+    fn checkpoint_scrollback_size_and_owner_authority_v36_through_v41_are_forward_only() {
+        for version in [36, 37, 38, 39, 40, 41] {
             let migration = MIGRATIONS
                 .iter()
                 .find(|migration| migration.version == version)
@@ -8380,6 +8522,8 @@ mod tests {
         assert!(build_migration_plan(39, 35).is_err());
         assert!(build_migration_plan(40, 39).is_err());
         assert!(build_migration_plan(40, 35).is_err());
+        assert!(build_migration_plan(41, 40).is_err());
+        assert!(build_migration_plan(41, 35).is_err());
     }
 
     #[test]
@@ -9347,6 +9491,61 @@ mod tests {
             error.to_string().contains("mux_sessions_retained_size_ai"),
             "drifted trigger identity must be explicit: {error}"
         );
+    }
+
+    #[test]
+    fn v41_refreshes_pre_owner_retained_size_authority_atomically() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, shutdown_clean, topology_json, ft_version,
+                 host_id, owner_pid, owner_process_start, owner_heartbeat_at
+             ) VALUES ('owned-v41', 1, 0, '{}', '0.41.0',
+                       '{\"version\":1,\"hostname\":\"trj\",\"boot_id\":\"boot-a\"}',
+                       41, 900, 1)",
+            [],
+        )
+        .expect("insert owner-fenced session");
+        let expected: i64 = conn
+            .query_row(
+                "SELECT session_row_bytes FROM session_retained_size_recomputed
+                 WHERE session_id = 'owned-v41'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE session_retained_size
+             SET session_row_bytes = session_row_bytes - 32
+             WHERE session_id = 'owned-v41'",
+            [],
+        )
+        .expect("simulate v40 formula that did not charge four owner fields");
+        conn.execute("DELETE FROM schema_version WHERE version = 41", [])
+            .expect("rewind migration audit fixture");
+        set_user_version(&conn, 40).expect("rewind version fixture");
+
+        let step = build_migration_plan(40, 41)
+            .expect("build v41 plan")
+            .steps
+            .into_iter()
+            .next()
+            .expect("v41 step");
+        apply_migration_step(&conn, &step).expect("apply owner-lifecycle migration");
+
+        assert_eq!(get_user_version(&conn).unwrap(), 41);
+        let stored: i64 = conn
+            .query_row(
+                "SELECT session_row_bytes FROM session_retained_size
+                 WHERE session_id = 'owned-v41'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, expected);
+        validate_session_owner_lifecycle_schema(&conn).unwrap();
+        validate_session_retained_size_schema(&conn).unwrap();
     }
 
     #[test]

@@ -90,6 +90,8 @@ hex = "0.4"
 
 # Database
 rusqlite.workspace = true
+hostname.workspace = true
+procinfo = { path = "../../frankenterm/procinfo", default-features = false }
 
 # Config
 toml.workspace = true

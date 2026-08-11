@@ -12,9 +12,12 @@ use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStringExt;
 use winapi::shared::minwindef::{DWORD, FILETIME, LPVOID, MAX_PATH};
 use winapi::shared::ntdef::{FALSE, NT_SUCCESS};
+use winapi::shared::winerror::ERROR_INVALID_PARAMETER;
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::memoryapi::ReadProcessMemory;
-use winapi::um::processthreadsapi::{GetCurrentProcessId, GetProcessTimes, OpenProcess};
+use winapi::um::processthreadsapi::{
+    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
+};
 use winapi::um::shellapi::CommandLineToArgvW;
 use winapi::um::tlhelp32::*;
 use winapi::um::winbase::{LocalFree, QueryFullProcessImageNameW};
@@ -343,6 +346,64 @@ impl Drop for ProcHandle {
 }
 
 impl LocalProcessInfo {
+    /// Read one process-incarnation token without enumerating the process tree.
+    pub fn process_start_time(pid: u32) -> Option<u64> {
+        match Self::observe_process_start_time(pid) {
+            ProcessStartTimeObservation::Running(start_time) => Some(start_time),
+            ProcessStartTimeObservation::Absent | ProcessStartTimeObservation::Unknown => None,
+        }
+    }
+
+    pub fn observe_process_start_time(pid: u32) -> ProcessStartTimeObservation {
+        if pid == unsafe { GetCurrentProcessId() } {
+            const fn empty() -> FILETIME {
+                FILETIME {
+                    dwLowDateTime: 0,
+                    dwHighDateTime: 0,
+                }
+            }
+            let mut start = empty();
+            let mut exit = empty();
+            let mut kernel = empty();
+            let mut user = empty();
+            let ok = unsafe {
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut start,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            };
+            return if ok != 0 {
+                ProcessStartTimeObservation::Running(
+                    (start.dwHighDateTime as u64) << 32 | start.dwLowDateTime as u64,
+                )
+            } else {
+                ProcessStartTimeObservation::Unknown
+            };
+        }
+        let Some(handle) = ProcHandle::new(pid) else {
+            return if std::io::Error::last_os_error().raw_os_error()
+                == i32::try_from(ERROR_INVALID_PARAMETER).ok()
+            {
+                ProcessStartTimeObservation::Absent
+            } else {
+                ProcessStartTimeObservation::Unknown
+            };
+        };
+        match handle.start_time() {
+            Some(start_time) => ProcessStartTimeObservation::Running(start_time),
+            None => ProcessStartTimeObservation::Unknown,
+        }
+    }
+
+    /// A stable Windows boot identifier is not exposed by this crate yet.
+    /// Returning `None` makes ownership classification fail closed.
+    pub fn host_boot_id() -> Option<String> {
+        None
+    }
+
     pub fn current_working_dir(pid: u32) -> Option<PathBuf> {
         log::trace!("current_working_dir({})", pid);
         let proc = ProcHandle::new(pid)?;

@@ -18,11 +18,206 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::checkpoint_witness::{MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES};
+use crate::checkpoint_witness::{
+    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES, MAX_SESSION_HOST_ID_BYTES,
+};
 use crate::config::SessionRetentionConfig;
+
+const SESSION_HOST_IDENTITY_VERSION: u8 = 1;
+const MAX_HOSTNAME_BYTES: usize = 255;
+const MAX_BOOT_ID_BYTES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionHostIdentity {
+    version: u8,
+    hostname: String,
+    boot_id: String,
+}
+
+/// Stable ownership fence recorded on every session created by current code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionOwnerIdentity {
+    pub(crate) host_id: String,
+    pub(crate) pid: i64,
+    pub(crate) process_start: i64,
+}
+
+/// Liveness classification for an unclean session owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UncleanSessionOwnerState {
+    /// The exact host boot, PID, and process-start token are still present.
+    Live,
+    /// The same host has authoritatively proven that the owner incarnation ended.
+    RecoveryCandidate,
+    /// Legacy, foreign-host, malformed, or unobservable ownership; fail closed.
+    Unknown,
+}
+
+trait SessionOwnerObserver {
+    fn current_host(&self) -> Option<&SessionHostIdentity>;
+    fn observe_process_start(&self, pid: u32) -> procinfo::ProcessStartTimeObservation;
+}
+
+struct SystemSessionOwnerObserver {
+    current_host: Option<SessionHostIdentity>,
+}
+
+/// Reusable system observer so a restore/doctor scan resolves host boot
+/// identity once instead of repeating platform syscalls for every session.
+pub(crate) struct SessionOwnerClassifier {
+    observer: SystemSessionOwnerObserver,
+}
+
+impl SessionOwnerClassifier {
+    pub(crate) fn new() -> Self {
+        Self {
+            observer: SystemSessionOwnerObserver::new(),
+        }
+    }
+
+    pub(crate) fn classify(
+        &self,
+        host_id: Option<&str>,
+        owner_pid: Option<i64>,
+        owner_process_start: Option<i64>,
+    ) -> UncleanSessionOwnerState {
+        classify_unclean_session_owner_with_observer(
+            host_id,
+            owner_pid,
+            owner_process_start,
+            &self.observer,
+        )
+    }
+}
+
+impl SystemSessionOwnerObserver {
+    fn new() -> Self {
+        Self {
+            current_host: current_session_host_identity(),
+        }
+    }
+}
+
+impl SessionOwnerObserver for SystemSessionOwnerObserver {
+    fn current_host(&self) -> Option<&SessionHostIdentity> {
+        self.current_host.as_ref()
+    }
+
+    fn observe_process_start(&self, pid: u32) -> procinfo::ProcessStartTimeObservation {
+        procinfo::LocalProcessInfo::observe_process_start_time(pid)
+    }
+}
+
+fn bounded_identity_component(raw: String, max_bytes: usize) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() || value.len() > max_bytes {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn current_session_host_identity() -> Option<SessionHostIdentity> {
+    let hostname = hostname::get().ok()?.into_string().ok()?;
+    let hostname = bounded_identity_component(hostname, MAX_HOSTNAME_BYTES)?;
+    let boot_id = procinfo::LocalProcessInfo::host_boot_id()?;
+    let boot_id = bounded_identity_component(boot_id, MAX_BOOT_ID_BYTES)?;
+    Some(SessionHostIdentity {
+        version: SESSION_HOST_IDENTITY_VERSION,
+        hostname,
+        boot_id,
+    })
+}
+
+/// Capture the current process incarnation once for a snapshot-engine lifetime.
+pub(crate) fn current_session_owner_identity() -> Option<SessionOwnerIdentity> {
+    let host = current_session_host_identity()?;
+    let host_id = serde_json::to_string(&host).ok()?;
+    if host_id.len() > MAX_SESSION_HOST_ID_BYTES {
+        return None;
+    }
+    let pid = std::process::id();
+    let process_start = procinfo::LocalProcessInfo::process_start_time(pid)?;
+    Some(SessionOwnerIdentity {
+        host_id,
+        pid: i64::from(pid),
+        process_start: i64::try_from(process_start).ok()?,
+    })
+}
+
+fn parse_session_host_identity(host_id: &str) -> Option<SessionHostIdentity> {
+    if host_id.is_empty() || host_id.len() > MAX_SESSION_HOST_ID_BYTES {
+        return None;
+    }
+    let identity: SessionHostIdentity = serde_json::from_str(host_id).ok()?;
+    if identity.version != SESSION_HOST_IDENTITY_VERSION
+        || identity.hostname.trim().is_empty()
+        || identity.hostname.len() > MAX_HOSTNAME_BYTES
+        || identity.boot_id.trim().is_empty()
+        || identity.boot_id.len() > MAX_BOOT_ID_BYTES
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+fn classify_unclean_session_owner_with_observer(
+    host_id: Option<&str>,
+    owner_pid: Option<i64>,
+    owner_process_start: Option<i64>,
+    observer: &impl SessionOwnerObserver,
+) -> UncleanSessionOwnerState {
+    let (Some(host_id), Some(owner_pid), Some(owner_process_start)) =
+        (host_id, owner_pid, owner_process_start)
+    else {
+        return UncleanSessionOwnerState::Unknown;
+    };
+    let Ok(owner_pid) = u32::try_from(owner_pid) else {
+        return UncleanSessionOwnerState::Unknown;
+    };
+    let Ok(owner_process_start) = u64::try_from(owner_process_start) else {
+        return UncleanSessionOwnerState::Unknown;
+    };
+    if owner_pid == 0 || owner_process_start == 0 {
+        return UncleanSessionOwnerState::Unknown;
+    }
+    let Some(stored_host) = parse_session_host_identity(host_id) else {
+        return UncleanSessionOwnerState::Unknown;
+    };
+    let Some(current_host) = observer.current_host() else {
+        return UncleanSessionOwnerState::Unknown;
+    };
+    if stored_host.hostname != current_host.hostname {
+        return UncleanSessionOwnerState::Unknown;
+    }
+    if stored_host.boot_id != current_host.boot_id {
+        return UncleanSessionOwnerState::RecoveryCandidate;
+    }
+    match observer.observe_process_start(owner_pid) {
+        procinfo::ProcessStartTimeObservation::Running(observed_start)
+            if observed_start == owner_process_start =>
+        {
+            UncleanSessionOwnerState::Live
+        }
+        procinfo::ProcessStartTimeObservation::Running(_)
+        | procinfo::ProcessStartTimeObservation::Absent => {
+            UncleanSessionOwnerState::RecoveryCandidate
+        }
+        procinfo::ProcessStartTimeObservation::Unknown => UncleanSessionOwnerState::Unknown,
+    }
+}
+
+pub(crate) fn classify_unclean_session_owner(
+    host_id: Option<&str>,
+    owner_pid: Option<i64>,
+    owner_process_start: Option<i64>,
+) -> UncleanSessionOwnerState {
+    SessionOwnerClassifier::new().classify(host_id, owner_pid, owner_process_start)
+}
 
 // [ft-xcsm0 / ft-8nqx0 Phase 4] CleanupResult lifted to the audit-types
 // leaf crate so the cleanup summary contract can be reviewed
@@ -213,6 +408,229 @@ fn begin_retention_transaction(conn: &Connection) -> rusqlite::Result<Transactio
     Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
 }
 
+#[derive(Debug)]
+struct SessionRetentionAuthority {
+    session_id: String,
+    shutdown_clean: i64,
+    clean_checkpoint_id: Option<i64>,
+    host_id: Option<String>,
+    owner_pid: Option<i64>,
+    owner_process_start: Option<i64>,
+    recovery_acknowledged_at: Option<i64>,
+}
+
+fn session_has_usable_recovery_point(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    crate::session_restore::session_has_usable_recovery_point_from_conn(conn, session_id)
+        .map_err(clean_authority_error)
+}
+
+fn newest_usable_recovery_session(
+    conn: &Connection,
+    observer: &impl SessionOwnerObserver,
+) -> Result<Option<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT session.session_id,
+                CASE
+                    WHEN typeof(session.host_id) = 'text'
+                     AND length(CAST(session.host_id AS BLOB)) <= ?1
+                    THEN session.host_id
+                END,
+                session.owner_pid,
+                session.owner_process_start
+         FROM mux_sessions AS session
+         WHERE session.shutdown_clean = 0
+           AND session.recovery_acknowledged_at IS NULL
+           AND typeof(session.session_id) = 'text'
+           AND length(CAST(session.session_id AS BLOB)) BETWEEN 1 AND ?2
+         ORDER BY COALESCE((
+                      SELECT MAX(checkpoint.id)
+                      FROM session_checkpoints AS checkpoint
+                      WHERE checkpoint.session_id = session.session_id
+                        AND checkpoint.checkpoint_role = 'snapshot'
+                  ), -1) DESC,
+                  session.session_id ASC",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+            i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        },
+    )?;
+    for row in rows {
+        let (session_id, host_id, owner_pid, owner_process_start) = row?;
+        if has_unresolved_restore_intent(conn, &session_id)? {
+            continue;
+        }
+        if classify_unclean_session_owner_with_observer(
+            host_id.as_deref(),
+            owner_pid,
+            owner_process_start,
+            observer,
+        ) != UncleanSessionOwnerState::RecoveryCandidate
+        {
+            continue;
+        }
+        if session_has_usable_recovery_point(conn, &session_id)? {
+            return Ok(Some(session_id));
+        }
+    }
+    Ok(None)
+}
+
+fn session_is_deletion_eligible(
+    conn: &Connection,
+    candidate: &SessionRetentionAuthority,
+    protected_recovery_session: Option<&str>,
+    observer: &impl SessionOwnerObserver,
+) -> Result<bool, rusqlite::Error> {
+    let owner_state = classify_unclean_session_owner_with_observer(
+        candidate.host_id.as_deref(),
+        candidate.owner_pid,
+        candidate.owner_process_start,
+        observer,
+    );
+    if owner_state == UncleanSessionOwnerState::Live
+        || has_unresolved_restore_intent(conn, &candidate.session_id)?
+    {
+        return Ok(false);
+    }
+    if crate::session_restore::assess_clean_authority(
+        conn,
+        &candidate.session_id,
+        candidate.shutdown_clean,
+        candidate.clean_checkpoint_id,
+    )
+    .map_err(clean_authority_error)?
+    {
+        return Ok(true);
+    }
+    if owner_state != UncleanSessionOwnerState::RecoveryCandidate {
+        return Ok(false);
+    }
+    if candidate.recovery_acknowledged_at.is_some() {
+        return Ok(true);
+    }
+    if protected_recovery_session == Some(candidate.session_id.as_str()) {
+        return Ok(false);
+    }
+    session_has_usable_recovery_point(conn, &candidate.session_id)
+}
+
+fn recovery_authority_error(message: &'static str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(message)))
+}
+
+fn set_recovery_acknowledgement_with_observer(
+    conn: &Connection,
+    session_id: &str,
+    acknowledged_at: Option<u64>,
+    observer: &impl SessionOwnerObserver,
+) -> Result<(), rusqlite::Error> {
+    if session_id.is_empty() || session_id.len() > MAX_CHECKPOINT_SESSION_ID_BYTES {
+        return Err(recovery_authority_error(
+            "session recovery acknowledgement rejected an invalid selector",
+        ));
+    }
+    let acknowledged_at = acknowledged_at.map(u64_to_sqlite_integer).transpose()?;
+    let tx = begin_retention_transaction(conn)?;
+    ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
+    let row = tx
+        .query_row(
+            "SELECT shutdown_clean,
+                    CASE
+                        WHEN typeof(host_id) = 'text'
+                         AND length(CAST(host_id AS BLOB)) <= ?2
+                        THEN host_id
+                    END,
+                    owner_pid,
+                    owner_process_start
+             FROM mux_sessions
+             WHERE session_id = ?1",
+            rusqlite::params![
+                session_id,
+                i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((shutdown_clean, host_id, owner_pid, owner_process_start)) = row else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    if shutdown_clean != 0 {
+        return Err(recovery_authority_error(
+            "session recovery acknowledgement requires an unclean session",
+        ));
+    }
+    let owner_state = classify_unclean_session_owner_with_observer(
+        host_id.as_deref(),
+        owner_pid,
+        owner_process_start,
+        observer,
+    );
+    if acknowledged_at.is_some() && owner_state != UncleanSessionOwnerState::RecoveryCandidate {
+        return Err(recovery_authority_error(
+            "session recovery acknowledgement requires a proven-dead owner",
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE mux_sessions
+         SET recovery_acknowledged_at = ?2
+         WHERE session_id = ?1 AND shutdown_clean = 0",
+        rusqlite::params![session_id, acknowledged_at],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::StatementChangedRows(changed));
+    }
+    tx.commit()
+}
+
+/// Authorize retention cleanup of one proven-dead recovery candidate.
+///
+/// Live, foreign-host, legacy, and otherwise unobservable owners are rejected.
+pub fn acknowledge_recovery_session(
+    conn: &Connection,
+    session_id: &str,
+    acknowledged_at: u64,
+) -> Result<(), rusqlite::Error> {
+    set_recovery_acknowledgement_with_observer(
+        conn,
+        session_id,
+        Some(acknowledged_at),
+        &SystemSessionOwnerObserver::new(),
+    )
+}
+
+/// Clear an earlier recovery-cleanup acknowledgement, preserving the session.
+pub fn preserve_recovery_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(), rusqlite::Error> {
+    set_recovery_acknowledgement_with_observer(
+        conn,
+        session_id,
+        None,
+        &SystemSessionOwnerObserver::new(),
+    )
+}
+
 /// Return whether a session has any restore attempt that lacks an explicit
 /// durable `resolved` lifecycle state. The metadata branch preserves fail-safe
 /// behavior for v37-era intent rows written under the overloaded
@@ -365,12 +783,12 @@ pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
     }
 }
 
-/// Delete closed sessions older than `max_age_days`.
+/// Delete eligible closed or proven-dead recovery sessions older than
+/// `max_age_days`.
 ///
-/// Active sessions (`shutdown_clean = 0`) are preserved. Closed-session age is
-/// measured from its latest checkpoint when present, so a long-running session
-/// is not deleted immediately after a recent clean shutdown merely because it
-/// was originally created before the age cutoff.
+/// Exact live owners override every age policy. Unclean sessions are eligible
+/// only after owner-death fencing, and the newest usable recovery point remains
+/// protected unless an explicit acknowledgement authorized its deletion.
 fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize, rusqlite::Error> {
     let cutoff_ms = epoch_ms().saturating_sub(max_age_days.saturating_mul(86_400_000));
     // An unrepresentable future cutoff must fail without deleting anything;
@@ -379,9 +797,21 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
 
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
-    let candidates: Vec<(String, i64, Option<i64>)> = {
+    let observer = SystemSessionOwnerObserver::new();
+    let protected_recovery_session = newest_usable_recovery_session(&tx, &observer)?;
+    let candidates: Vec<SessionRetentionAuthority> = {
         let mut stmt = tx.prepare(
-            "SELECT session_id, shutdown_clean, clean_checkpoint_id
+            "SELECT session_id,
+                    shutdown_clean,
+                    clean_checkpoint_id,
+                    CASE
+                        WHEN typeof(host_id) = 'text'
+                         AND length(CAST(host_id AS BLOB)) <= ?3
+                        THEN host_id
+                    END,
+                    owner_pid,
+                    owner_process_start,
+                    recovery_acknowledged_at
              FROM mux_sessions
              WHERE MAX(
                        created_at,
@@ -393,7 +823,6 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
                            created_at
                        )
                    ) < ?1
-               AND shutdown_clean = 1
                AND typeof(session_id) = 'text'
                AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?2
              ORDER BY session_id ASC",
@@ -402,29 +831,35 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
             rusqlite::params![
                 cutoff_ms,
                 i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
             ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok(SessionRetentionAuthority {
+                    session_id: row.get(0)?,
+                    shutdown_clean: row.get(1)?,
+                    clean_checkpoint_id: row.get(2)?,
+                    host_id: row.get(3)?,
+                    owner_pid: row.get(4)?,
+                    owner_process_start: row.get(5)?,
+                    recovery_acknowledged_at: row.get(6)?,
+                })
+            },
         )?
         .collect::<Result<_, _>>()?
     };
     let mut deleted = 0usize;
-    for (session_id, shutdown_clean, clean_checkpoint_id) in candidates {
-        if has_unresolved_restore_intent(&tx, &session_id)? {
-            continue;
-        }
-        if !crate::session_restore::assess_clean_authority(
+    for candidate in candidates {
+        if !session_is_deletion_eligible(
             &tx,
-            &session_id,
-            shutdown_clean,
-            clean_checkpoint_id,
-        )
-        .map_err(clean_authority_error)?
-        {
+            &candidate,
+            protected_recovery_session.as_deref(),
+            &observer,
+        )? {
             continue;
         }
         let affected = tx.execute(
             "DELETE FROM mux_sessions WHERE session_id = ?1",
-            [&session_id],
+            [&candidate.session_id],
         )?;
         if affected != 1 {
             return Err(rusqlite::Error::StatementChangedRows(affected));
@@ -442,12 +877,23 @@ fn delete_excess_closed_sessions(
 ) -> Result<usize, rusqlite::Error> {
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
-    let candidates: Vec<(String, i64, Option<i64>)> = {
+    let observer = SystemSessionOwnerObserver::new();
+    let protected_recovery_session = newest_usable_recovery_session(&tx, &observer)?;
+    let candidates: Vec<SessionRetentionAuthority> = {
         let mut stmt = tx.prepare(
-            "SELECT session_id, shutdown_clean, clean_checkpoint_id
+            "SELECT session_id,
+                    shutdown_clean,
+                    clean_checkpoint_id,
+                    CASE
+                        WHEN typeof(host_id) = 'text'
+                         AND length(CAST(host_id AS BLOB)) <= ?2
+                        THEN host_id
+                    END,
+                    owner_pid,
+                    owner_process_start,
+                    recovery_acknowledged_at
              FROM mux_sessions
-             WHERE shutdown_clean = 1
-               AND typeof(session_id) = 'text'
+             WHERE typeof(session_id) = 'text'
                AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?1
              ORDER BY MAX(
                           created_at,
@@ -462,25 +908,33 @@ fn delete_excess_closed_sessions(
                       session_id DESC",
         )?;
         stmt.query_map(
-            [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            rusqlite::params![
+                i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+                i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                Ok(SessionRetentionAuthority {
+                    session_id: row.get(0)?,
+                    shutdown_clean: row.get(1)?,
+                    clean_checkpoint_id: row.get(2)?,
+                    host_id: row.get(3)?,
+                    owner_pid: row.get(4)?,
+                    owner_process_start: row.get(5)?,
+                    recovery_acknowledged_at: row.get(6)?,
+                })
+            },
         )?
         .collect::<Result<_, _>>()?
     };
     let mut retained = 0usize;
     let mut deleted = 0usize;
-    for (session_id, shutdown_clean, clean_checkpoint_id) in candidates {
-        if has_unresolved_restore_intent(&tx, &session_id)? {
-            continue;
-        }
-        if !crate::session_restore::assess_clean_authority(
+    for candidate in candidates {
+        if !session_is_deletion_eligible(
             &tx,
-            &session_id,
-            shutdown_clean,
-            clean_checkpoint_id,
-        )
-        .map_err(clean_authority_error)?
-        {
+            &candidate,
+            protected_recovery_session.as_deref(),
+            &observer,
+        )? {
             continue;
         }
         if retained < max_count {
@@ -489,7 +943,7 @@ fn delete_excess_closed_sessions(
         }
         let affected = tx.execute(
             "DELETE FROM mux_sessions WHERE session_id = ?1",
-            [&session_id],
+            [&candidate.session_id],
         )?;
         if affected != 1 {
             return Err(rusqlite::Error::StatementChangedRows(affected));
@@ -522,7 +976,29 @@ fn validate_session_retained_size_authority(conn: &Connection) -> Result<(), rus
                 OR (s.window_metadata_json IS NOT NULL AND
                     typeof(s.window_metadata_json) != 'text')
                 OR typeof(s.ft_version) != 'text'
-                OR (s.host_id IS NOT NULL AND typeof(s.host_id) != 'text')
+                OR (s.host_id IS NOT NULL AND (
+                    typeof(s.host_id) != 'text'
+                    OR length(CAST(s.host_id AS BLOB)) > ?2))
+                OR (s.owner_pid IS NOT NULL AND
+                    (typeof(s.owner_pid) != 'integer' OR s.owner_pid <= 0))
+                OR (s.owner_process_start IS NOT NULL AND
+                    (typeof(s.owner_process_start) != 'integer'
+                     OR s.owner_process_start <= 0))
+                OR (s.owner_heartbeat_at IS NOT NULL AND
+                    (typeof(s.owner_heartbeat_at) != 'integer'
+                     OR s.owner_heartbeat_at < 0))
+                OR (s.recovery_acknowledged_at IS NOT NULL AND
+                    (typeof(s.recovery_acknowledged_at) != 'integer'
+                     OR s.recovery_acknowledged_at < 0))
+                OR NOT (
+                    (s.owner_pid IS NULL
+                     AND s.owner_process_start IS NULL
+                     AND s.owner_heartbeat_at IS NULL)
+                    OR (s.owner_pid IS NOT NULL
+                        AND s.owner_process_start IS NOT NULL
+                        AND s.owner_heartbeat_at IS NOT NULL
+                        AND s.host_id IS NOT NULL)
+                )
                 OR (s.clean_checkpoint_id IS NOT NULL AND
                     (typeof(s.clean_checkpoint_id) != 'integer' OR s.clean_checkpoint_id <= 0))
              UNION ALL
@@ -573,7 +1049,10 @@ fn validate_session_retained_size_authority(conn: &Connection) -> Result<(), rus
                 OR (r.resolved_at IS NOT NULL AND
                     (typeof(r.resolved_at) != 'integer' OR r.resolved_at < r.created_at))
          )",
-        [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
+        rusqlite::params![
+            i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+            i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+        ],
         |row| row.get(0),
     )?;
     if invalid_row {
@@ -636,6 +1115,8 @@ fn delete_sessions_by_size(
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
     validate_session_retained_size_authority(&tx)?;
+    let observer = SystemSessionOwnerObserver::new();
+    let protected_recovery_session = newest_usable_recovery_session(&tx, &observer)?;
 
     // The generated retained_bytes column is checked non-negative and each
     // summary row belongs to exactly one live mux session. SUM overflow is a
@@ -670,16 +1151,23 @@ fn delete_sessions_by_size(
     // Get closed sessions ordered oldest first. Session-level payload bytes are
     // read once from the summary row; no join can multiply topology or other
     // session fields by checkpoint/pane cardinality.
-    let candidate_rows: Vec<(String, u64, i64, Option<i64>)> = {
+    let candidate_rows: Vec<(SessionRetentionAuthority, u64)> = {
         let mut stmt = tx.prepare(
             "SELECT s.session_id,
                     z.retained_bytes,
                     s.shutdown_clean,
-                    s.clean_checkpoint_id
+                    s.clean_checkpoint_id,
+                    CASE
+                        WHEN typeof(s.host_id) = 'text'
+                         AND length(CAST(s.host_id AS BLOB)) <= ?2
+                        THEN s.host_id
+                    END,
+                    s.owner_pid,
+                    s.owner_process_start,
+                    s.recovery_acknowledged_at
              FROM mux_sessions s
              INNER JOIN session_retained_size z ON z.session_id = s.session_id
-             WHERE s.shutdown_clean = 1
-               AND typeof(s.session_id) = 'text'
+             WHERE typeof(s.session_id) = 'text'
                AND length(CAST(s.session_id AS BLOB)) BETWEEN 1 AND ?1
                AND z.retained_bytes > 0
              ORDER BY MAX(
@@ -697,13 +1185,26 @@ fn delete_sessions_by_size(
 
         let sessions = stmt
             .query_map(
-                [i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX)],
+                rusqlite::params![
+                    i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+                    i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+                ],
                 |row| {
-                    let session_id = row.get(0)?;
                     let session_bytes: i64 = row.get(1)?;
                     let session_bytes = u64::try_from(session_bytes)
                         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, session_bytes))?;
-                    Ok((session_id, session_bytes, row.get(2)?, row.get(3)?))
+                    Ok((
+                        SessionRetentionAuthority {
+                            session_id: row.get(0)?,
+                            shutdown_clean: row.get(2)?,
+                            clean_checkpoint_id: row.get(3)?,
+                            host_id: row.get(4)?,
+                            owner_pid: row.get(5)?,
+                            owner_process_start: row.get(6)?,
+                            recovery_acknowledged_at: row.get(7)?,
+                        },
+                        session_bytes,
+                    ))
                 },
             )?
             .collect::<Result<_, _>>()?;
@@ -711,19 +1212,14 @@ fn delete_sessions_by_size(
     };
 
     let mut sessions = Vec::with_capacity(candidate_rows.len());
-    for (session_id, session_bytes, shutdown_clean, clean_checkpoint_id) in candidate_rows {
-        if has_unresolved_restore_intent(&tx, &session_id)? {
-            continue;
-        }
-        if crate::session_restore::assess_clean_authority(
+    for (candidate, session_bytes) in candidate_rows {
+        if session_is_deletion_eligible(
             &tx,
-            &session_id,
-            shutdown_clean,
-            clean_checkpoint_id,
-        )
-        .map_err(clean_authority_error)?
-        {
-            sessions.push((session_id, session_bytes));
+            &candidate,
+            protected_recovery_session.as_deref(),
+            &observer,
+        )? {
+            sessions.push((candidate.session_id, session_bytes));
         }
     }
 
@@ -997,7 +1493,135 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    struct FakeOwnerObserver {
+        current_host: Option<SessionHostIdentity>,
+        processes: BTreeMap<u32, procinfo::ProcessStartTimeObservation>,
+    }
+
+    impl SessionOwnerObserver for FakeOwnerObserver {
+        fn current_host(&self) -> Option<&SessionHostIdentity> {
+            self.current_host.as_ref()
+        }
+
+        fn observe_process_start(&self, pid: u32) -> procinfo::ProcessStartTimeObservation {
+            self.processes
+                .get(&pid)
+                .copied()
+                .unwrap_or(procinfo::ProcessStartTimeObservation::Absent)
+        }
+    }
+
+    fn test_host(hostname: &str, boot_id: &str) -> SessionHostIdentity {
+        SessionHostIdentity {
+            version: SESSION_HOST_IDENTITY_VERSION,
+            hostname: hostname.to_string(),
+            boot_id: boot_id.to_string(),
+        }
+    }
+
+    fn encoded_test_host(hostname: &str, boot_id: &str) -> String {
+        serde_json::to_string(&test_host(hostname, boot_id)).unwrap()
+    }
+
+    #[test]
+    fn owner_classification_fences_pid_reuse_reboot_and_foreign_hosts() {
+        let host_id = encoded_test_host("trj", "boot-a");
+        let observer = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::from([
+                (41, procinfo::ProcessStartTimeObservation::Running(900)),
+                (42, procinfo::ProcessStartTimeObservation::Running(901)),
+            ]),
+        };
+
+        assert_eq!(
+            classify_unclean_session_owner_with_observer(
+                Some(&host_id),
+                Some(41),
+                Some(900),
+                &observer,
+            ),
+            UncleanSessionOwnerState::Live
+        );
+        assert_eq!(
+            classify_unclean_session_owner_with_observer(
+                Some(&host_id),
+                Some(42),
+                Some(900),
+                &observer,
+            ),
+            UncleanSessionOwnerState::RecoveryCandidate,
+            "a reused PID with a different start token is not the owner"
+        );
+        assert_eq!(
+            classify_unclean_session_owner_with_observer(
+                Some(&host_id),
+                Some(42),
+                Some(901),
+                &observer,
+            ),
+            UncleanSessionOwnerState::Live,
+            "concurrent engines remain fenced to their own PID/start pair"
+        );
+
+        let rebooted = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-b")),
+            processes: BTreeMap::new(),
+        };
+        assert_eq!(
+            classify_unclean_session_owner_with_observer(
+                Some(&host_id),
+                Some(41),
+                Some(900),
+                &rebooted,
+            ),
+            UncleanSessionOwnerState::RecoveryCandidate
+        );
+
+        let foreign = FakeOwnerObserver {
+            current_host: Some(test_host("mac-studio", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        assert_eq!(
+            classify_unclean_session_owner_with_observer(
+                Some(&host_id),
+                Some(41),
+                Some(900),
+                &foreign,
+            ),
+            UncleanSessionOwnerState::Unknown,
+            "a different hostname can still own a shared database"
+        );
+    }
+
+    #[test]
+    fn malformed_incomplete_and_unobservable_owners_fail_closed() {
+        let observer = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::from([(41, procinfo::ProcessStartTimeObservation::Unknown)]),
+        };
+        let valid_host = encoded_test_host("trj", "boot-a");
+        for (host_id, pid, process_start) in [
+            (None, Some(41), Some(900)),
+            (Some("not-json"), Some(41), Some(900)),
+            (Some(""), None, None),
+            (Some(valid_host.as_str()), Some(41), Some(900)),
+        ] {
+            assert_eq!(
+                classify_unclean_session_owner_with_observer(
+                    host_id,
+                    pid,
+                    process_start,
+                    &observer,
+                ),
+                UncleanSessionOwnerState::Unknown
+            );
+        }
+    }
 
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove that the
     /// Cx-first `cleanup_sessions_async_cx` path respects the caller's
@@ -1282,6 +1906,65 @@ mod tests {
         )
         .unwrap();
         checkpoint_id
+    }
+
+    #[test]
+    fn live_owner_overrides_retention_and_ack_requires_proven_death() {
+        let conn = make_test_db();
+        insert_session(&conn, "owned-active", 1, false);
+        let host_id = encoded_test_host("trj", "boot-a");
+        conn.execute(
+            "UPDATE mux_sessions
+             SET host_id = ?2,
+                 owner_pid = 41,
+                 owner_process_start = 900,
+                 owner_heartbeat_at = 9223372036854775807
+             WHERE session_id = ?1",
+            rusqlite::params!["owned-active", host_id],
+        )
+        .unwrap();
+        let candidate = SessionRetentionAuthority {
+            session_id: "owned-active".to_string(),
+            shutdown_clean: 0,
+            clean_checkpoint_id: None,
+            host_id: Some(host_id.clone()),
+            owner_pid: Some(41),
+            owner_process_start: Some(900),
+            recovery_acknowledged_at: None,
+        };
+        let live = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::from([(41, procinfo::ProcessStartTimeObservation::Running(900))]),
+        };
+        assert!(!session_is_deletion_eligible(&conn, &candidate, None, &live).unwrap());
+        assert!(
+            set_recovery_acknowledgement_with_observer(&conn, "owned-active", Some(1_000), &live,)
+                .is_err(),
+            "heartbeat wall-clock skew and an extreme acknowledgement timestamp cannot override liveness"
+        );
+
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::from([(41, procinfo::ProcessStartTimeObservation::Absent)]),
+        };
+        assert!(!session_is_deletion_eligible(&conn, &candidate, None, &dead).unwrap());
+        set_recovery_acknowledgement_with_observer(&conn, "owned-active", Some(1_000), &dead)
+            .unwrap();
+        let acknowledged = SessionRetentionAuthority {
+            recovery_acknowledged_at: Some(1_000),
+            ..candidate
+        };
+        assert!(session_is_deletion_eligible(&conn, &acknowledged, None, &dead).unwrap());
+        set_recovery_acknowledgement_with_observer(&conn, "owned-active", None, &dead).unwrap();
+        let stored_ack: Option<i64> = conn
+            .query_row(
+                "SELECT recovery_acknowledged_at
+                 FROM mux_sessions WHERE session_id = 'owned-active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_ack, None);
     }
 
     fn count_sessions(conn: &Connection) -> i64 {

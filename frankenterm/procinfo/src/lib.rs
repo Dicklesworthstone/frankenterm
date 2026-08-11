@@ -34,6 +34,17 @@ pub enum LocalProcessStatus {
     Unknown,
 }
 
+/// Result of observing one exact PID's process-incarnation token.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ProcessStartTimeObservation {
+    /// The PID exists and its platform start token was read.
+    Running(u64),
+    /// The operating system authoritatively reported that the PID is absent.
+    Absent,
+    /// Existence or the start token could not be observed safely.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "lua", derive(FromDynamic, ToDynamic))]
 pub struct LocalProcessInfo {
@@ -103,6 +114,26 @@ impl LocalProcessInfo {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     pub fn executable_path(_pid: u32) -> Option<PathBuf> {
+        None
+    }
+
+    /// Return the platform process-incarnation token for one exact PID.
+    ///
+    /// The units are platform-specific but stable for the lifetime of the
+    /// process. Callers must compare tokens only on the same host boot.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    pub fn process_start_time(_pid: u32) -> Option<u64> {
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    pub fn observe_process_start_time(_pid: u32) -> ProcessStartTimeObservation {
+        ProcessStartTimeObservation::Unknown
+    }
+
+    /// Return a stable identifier for the current host boot when supported.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    pub fn host_boot_id() -> Option<String> {
         None
     }
 }

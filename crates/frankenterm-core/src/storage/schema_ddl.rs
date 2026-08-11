@@ -86,7 +86,11 @@
 /// O(sessions) at decision time. `session_retained_size` charges every stored
 /// session/checkpoint/pane/lifecycle field exactly once under a documented
 /// logical-byte contract and is maintained by the owning row mutations.
-pub const SCHEMA_VERSION: i32 = 40;
+/// Bumped 40 -> 41 to fence unclean session ownership to a host boot and
+/// process incarnation, persist capture heartbeats, and record explicit
+/// recovery-retention acknowledgement without conflating live sessions with
+/// stale crash candidates.
+pub const SCHEMA_VERSION: i32 = 41;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -1062,8 +1066,21 @@ CREATE TABLE IF NOT EXISTS mux_sessions (
     window_metadata_json TEXT,             -- window size, title, position
     ft_version TEXT NOT NULL,              -- binary version at creation
     host_id TEXT,                          -- hostname + boot_id for multi-host disambiguation
-    clean_checkpoint_id INTEGER REFERENCES session_checkpoints(id) ON DELETE SET NULL
+    owner_pid INTEGER CHECK(owner_pid IS NULL OR owner_pid > 0),
+    owner_process_start INTEGER CHECK(owner_process_start IS NULL OR owner_process_start > 0),
+    owner_heartbeat_at INTEGER CHECK(owner_heartbeat_at IS NULL OR owner_heartbeat_at >= 0),
+    recovery_acknowledged_at INTEGER
+        CHECK(recovery_acknowledged_at IS NULL OR recovery_acknowledged_at >= 0),
+    clean_checkpoint_id INTEGER REFERENCES session_checkpoints(id) ON DELETE SET NULL,
                                             -- exact receipt authorizing shutdown_clean = 1
+    CHECK(
+        (owner_pid IS NULL
+            AND owner_process_start IS NULL
+            AND owner_heartbeat_at IS NULL)
+        OR (owner_pid IS NOT NULL
+            AND owner_process_start IS NOT NULL
+            AND owner_heartbeat_at IS NOT NULL)
+    )
 );
 
 -- Session checkpoints: individual checkpoint snapshots (many per session)
@@ -1099,6 +1116,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_restore_intent_outcome
     WHERE restore_intent_checkpoint_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_mux_sessions_clean_checkpoint
     ON mux_sessions(clean_checkpoint_id);
+CREATE INDEX IF NOT EXISTS idx_mux_sessions_recovery_lifecycle
+    ON mux_sessions(
+        shutdown_clean, recovery_acknowledged_at,
+        last_checkpoint_at DESC, session_id
+    );
 
 -- Restore-attempt lifecycle: authoritative settlement state independent of
 -- whichever checkpoint happens to be latest after an interrupted attempt.
@@ -1181,6 +1203,10 @@ SELECT
         + COALESCE(length(CAST(s.window_metadata_json AS BLOB)), 0)
         + length(CAST(s.ft_version AS BLOB))
         + COALESCE(length(CAST(s.host_id AS BLOB)), 0)
+        + CASE WHEN s.owner_pid IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN s.owner_process_start IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN s.owner_heartbeat_at IS NULL THEN 0 ELSE 8 END
+        + CASE WHEN s.recovery_acknowledged_at IS NULL THEN 0 ELSE 8 END
         + CASE WHEN s.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
         AS session_row_bytes,
     COALESCE((
@@ -1293,6 +1319,10 @@ AFTER INSERT ON mux_sessions BEGIN
             + COALESCE(length(CAST(new.window_metadata_json AS BLOB)), 0)
             + length(CAST(new.ft_version AS BLOB))
             + COALESCE(length(CAST(new.host_id AS BLOB)), 0)
+            + CASE WHEN new.owner_pid IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.owner_process_start IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.owner_heartbeat_at IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.recovery_acknowledged_at IS NULL THEN 0 ELSE 8 END
             + CASE WHEN new.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
     );
 END;
@@ -1314,6 +1344,10 @@ AFTER UPDATE ON mux_sessions BEGIN
             + COALESCE(length(CAST(old.window_metadata_json AS BLOB)), 0)
             + length(CAST(old.ft_version AS BLOB))
             + COALESCE(length(CAST(old.host_id AS BLOB)), 0)
+            + CASE WHEN old.owner_pid IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN old.owner_process_start IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN old.owner_heartbeat_at IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN old.recovery_acknowledged_at IS NULL THEN 0 ELSE 8 END
             + CASE WHEN old.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
     ) THEN RAISE(ABORT, 'session retained-size authority drift during session update') END
     FROM session_retained_size WHERE session_id = old.session_id;
@@ -1326,6 +1360,10 @@ AFTER UPDATE ON mux_sessions BEGIN
             + COALESCE(length(CAST(new.window_metadata_json AS BLOB)), 0)
             + length(CAST(new.ft_version AS BLOB))
             + COALESCE(length(CAST(new.host_id AS BLOB)), 0)
+            + CASE WHEN new.owner_pid IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.owner_process_start IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.owner_heartbeat_at IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.recovery_acknowledged_at IS NULL THEN 0 ELSE 8 END
             + CASE WHEN new.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
     ) > session_row_bytes AND retained_bytes > 9223372036854775807 - ((
         length(CAST(new.session_id AS BLOB))
@@ -1336,6 +1374,10 @@ AFTER UPDATE ON mux_sessions BEGIN
             + COALESCE(length(CAST(new.window_metadata_json AS BLOB)), 0)
             + length(CAST(new.ft_version AS BLOB))
             + COALESCE(length(CAST(new.host_id AS BLOB)), 0)
+            + CASE WHEN new.owner_pid IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.owner_process_start IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.owner_heartbeat_at IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.recovery_acknowledged_at IS NULL THEN 0 ELSE 8 END
             + CASE WHEN new.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
     ) - session_row_bytes)
     THEN RAISE(ABORT, 'session retained-size overflow during session update') END
@@ -1350,6 +1392,10 @@ AFTER UPDATE ON mux_sessions BEGIN
             + COALESCE(length(CAST(new.window_metadata_json AS BLOB)), 0)
             + length(CAST(new.ft_version AS BLOB))
             + COALESCE(length(CAST(new.host_id AS BLOB)), 0)
+            + CASE WHEN new.owner_pid IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.owner_process_start IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.owner_heartbeat_at IS NULL THEN 0 ELSE 8 END
+            + CASE WHEN new.recovery_acknowledged_at IS NULL THEN 0 ELSE 8 END
             + CASE WHEN new.clean_checkpoint_id IS NULL THEN 0 ELSE 8 END
     WHERE session_id = old.session_id;
 END;
