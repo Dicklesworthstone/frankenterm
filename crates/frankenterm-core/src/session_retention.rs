@@ -27,7 +27,10 @@ use crate::checkpoint_witness::{
 };
 use crate::config::SessionRetentionConfig;
 
-const SESSION_HOST_IDENTITY_VERSION: u8 = 1;
+// Version 2 records a microsecond-resolution process-start token on macOS.
+// Version 1 identities must remain unknown rather than comparing their
+// second-resolution token against the stronger incarnation fence.
+const SESSION_HOST_IDENTITY_VERSION: u8 = 2;
 const MAX_HOSTNAME_BYTES: usize = 255;
 const MAX_BOOT_ID_BYTES: usize = 512;
 
@@ -787,6 +790,15 @@ pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
 /// only after owner-death fencing, and the newest usable recovery point remains
 /// protected unless an explicit acknowledgement authorized its deletion.
 fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize, rusqlite::Error> {
+    let observer = SystemSessionOwnerObserver::new();
+    delete_sessions_by_age_with_observer(conn, max_age_days, &observer)
+}
+
+fn delete_sessions_by_age_with_observer(
+    conn: &Connection,
+    max_age_days: u64,
+    observer: &impl SessionOwnerObserver,
+) -> Result<usize, rusqlite::Error> {
     let cutoff_ms = epoch_ms().saturating_sub(max_age_days.saturating_mul(86_400_000));
     // An unrepresentable future cutoff must fail without deleting anything;
     // clamping to i64::MAX would make nearly every closed session eligible.
@@ -794,8 +806,7 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
 
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
-    let observer = SystemSessionOwnerObserver::new();
-    let protected_recovery_session = newest_usable_recovery_session(&tx, &observer)?;
+    let protected_recovery_session = newest_usable_recovery_session(&tx, observer)?;
     let candidates: Vec<SessionRetentionAuthority> = {
         let mut stmt = tx.prepare(
             "SELECT session_id,
@@ -850,7 +861,7 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
             &tx,
             &candidate,
             protected_recovery_session.as_deref(),
-            &observer,
+            observer,
         )? {
             continue;
         }
@@ -872,10 +883,18 @@ fn delete_excess_closed_sessions(
     conn: &Connection,
     max_count: usize,
 ) -> Result<usize, rusqlite::Error> {
+    let observer = SystemSessionOwnerObserver::new();
+    delete_excess_closed_sessions_with_observer(conn, max_count, &observer)
+}
+
+fn delete_excess_closed_sessions_with_observer(
+    conn: &Connection,
+    max_count: usize,
+    observer: &impl SessionOwnerObserver,
+) -> Result<usize, rusqlite::Error> {
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
-    let observer = SystemSessionOwnerObserver::new();
-    let protected_recovery_session = newest_usable_recovery_session(&tx, &observer)?;
+    let protected_recovery_session = newest_usable_recovery_session(&tx, observer)?;
     let candidates: Vec<SessionRetentionAuthority> = {
         let mut stmt = tx.prepare(
             "SELECT session_id,
@@ -930,7 +949,7 @@ fn delete_excess_closed_sessions(
             &tx,
             &candidate,
             protected_recovery_session.as_deref(),
-            &observer,
+            observer,
         )? {
             continue;
         }
@@ -1097,6 +1116,15 @@ fn delete_sessions_by_size(
     conn: &Connection,
     max_total_mb: u64,
 ) -> Result<SizeCleanupOutcome, rusqlite::Error> {
+    let observer = SystemSessionOwnerObserver::new();
+    delete_sessions_by_size_with_observer(conn, max_total_mb, &observer)
+}
+
+fn delete_sessions_by_size_with_observer(
+    conn: &Connection,
+    max_total_mb: u64,
+    observer: &impl SessionOwnerObserver,
+) -> Result<SizeCleanupOutcome, rusqlite::Error> {
     let max_bytes = max_total_mb
         .checked_mul(1_024)
         .and_then(|bytes| bytes.checked_mul(1_024))
@@ -1112,8 +1140,7 @@ fn delete_sessions_by_size(
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
     validate_session_retained_size_authority(&tx)?;
-    let observer = SystemSessionOwnerObserver::new();
-    let protected_recovery_session = newest_usable_recovery_session(&tx, &observer)?;
+    let protected_recovery_session = newest_usable_recovery_session(&tx, observer)?;
 
     // The generated retained_bytes column is checked non-negative and each
     // summary row belongs to exactly one live mux session. SUM overflow is a
@@ -1214,7 +1241,7 @@ fn delete_sessions_by_size(
             &tx,
             &candidate,
             protected_recovery_session.as_deref(),
-            &observer,
+            observer,
         )? {
             sessions.push((candidate.session_id, session_bytes));
         }
@@ -1905,6 +1932,94 @@ mod tests {
         checkpoint_id
     }
 
+    fn set_unclean_owner(
+        conn: &Connection,
+        session_id: &str,
+        host_id: &str,
+        owner_pid: i64,
+        process_start: i64,
+        heartbeat_at: i64,
+    ) {
+        conn.execute(
+            "UPDATE mux_sessions
+             SET host_id = ?2,
+                 owner_pid = ?3,
+                 owner_process_start = ?4,
+                 owner_heartbeat_at = ?5
+             WHERE session_id = ?1",
+            rusqlite::params![session_id, host_id, owner_pid, process_start, heartbeat_at],
+        )
+        .unwrap();
+    }
+
+    fn insert_v2_recovery_snapshot(
+        conn: &Connection,
+        session_id: &str,
+        checkpoint_at: i64,
+        topology_pane_id: u64,
+        persisted_pane_id: u64,
+    ) -> i64 {
+        let topology_json = format!(
+            r#"{{"schema_version":1,"captured_at":{checkpoint_at},"windows":[{{"window_id":1,"tabs":[{{"tab_id":1,"pane_tree":{{"type":"Leaf","pane_id":{topology_pane_id},"rows":24,"cols":80,"is_active":true}},"active_pane_id":{topology_pane_id}}}],"active_tab_index":0}}]}}"#
+        );
+        let terminal_state_json = r#"{"rows":24,"cols":80,"cursor_row":0,"cursor_col":0,"is_alt_screen":false,"title":"recovery"}"#;
+        let pane = crate::checkpoint_witness::PersistedPaneState {
+            pane_id: i64::try_from(persisted_pane_id).unwrap(),
+            cwd: None,
+            command: None,
+            env_json: None,
+            terminal_state_json: terminal_state_json.to_string(),
+            agent_metadata_json: None,
+            scrollback_checkpoint_seq: None,
+            last_output_at: None,
+        };
+        let total_bytes = i64::try_from(terminal_state_json.len()).unwrap();
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
+              total_bytes, checkpoint_role, topology_json)
+             VALUES (?1, ?2, 'periodic', 'pending:snp2', 1, ?3,
+                     'snapshot', ?4)",
+            rusqlite::params![session_id, checkpoint_at, total_bytes, topology_json],
+        )
+        .unwrap();
+        let checkpoint_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mux_pane_state
+             (checkpoint_id, pane_id, terminal_state_json)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![checkpoint_id, pane.pane_id, terminal_state_json],
+        )
+        .unwrap();
+        let state_hash = crate::checkpoint_witness::checkpoint_witness(
+            crate::checkpoint_witness::CHECKPOINT_ROLE_SNAPSHOT,
+            session_id,
+            checkpoint_id,
+            checkpoint_at,
+            "periodic",
+            1,
+            total_bytes,
+            None,
+            Some(&topology_json),
+            &[pane],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
+            rusqlite::params![state_hash, checkpoint_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET last_checkpoint_at = ?2,
+                 topology_json = ?3
+             WHERE session_id = ?1",
+            rusqlite::params![session_id, checkpoint_at, topology_json],
+        )
+        .unwrap();
+        checkpoint_id
+    }
+
     #[test]
     fn live_owner_overrides_retention_and_ack_requires_proven_death() {
         let conn = make_test_db();
@@ -1962,6 +2077,220 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_ack, None);
+    }
+
+    #[test]
+    fn repeated_abrupt_crashes_are_bounded_to_the_newest_usable_recovery_point() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+
+        for (index, session_id) in ["crash-old", "crash-middle", "crash-new"]
+            .into_iter()
+            .enumerate()
+        {
+            let timestamp = 100 + i64::try_from(index).unwrap();
+            insert_session(&conn, session_id, timestamp, false);
+            set_unclean_owner(
+                &conn,
+                session_id,
+                &host_id,
+                40 + i64::try_from(index).unwrap(),
+                900 + i64::try_from(index).unwrap(),
+                timestamp,
+            );
+            insert_v2_recovery_snapshot(
+                &conn,
+                session_id,
+                timestamp,
+                1 + u64::try_from(index).unwrap(),
+                1 + u64::try_from(index).unwrap(),
+            );
+        }
+
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
+            2
+        );
+        assert_eq!(count_sessions(&conn), 1);
+        assert!(
+            crate::session_restore::session_has_usable_recovery_point_from_conn(&conn, "crash-new")
+                .unwrap()
+        );
+
+        insert_session(&conn, "crash-newer", 200, false);
+        set_unclean_owner(&conn, "crash-newer", &host_id, 44, 904, 200);
+        insert_v2_recovery_snapshot(&conn, "crash-newer", 200, 4, 4);
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
+            1,
+            "the previously protected crash must become reclaimable once a newer usable recovery exists"
+        );
+        assert_eq!(count_sessions(&conn), 1);
+        let survivor: String = conn
+            .query_row("SELECT session_id FROM mux_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(survivor, "crash-newer");
+    }
+
+    #[test]
+    fn corrupt_empty_and_topology_mismatched_recovery_points_fail_closed() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+
+        insert_session(&conn, "empty-crash", 1, false);
+        set_unclean_owner(&conn, "empty-crash", &host_id, 41, 901, 1);
+
+        insert_session(&conn, "mismatched-crash", 2, false);
+        set_unclean_owner(&conn, "mismatched-crash", &host_id, 42, 902, 2);
+        insert_v2_recovery_snapshot(&conn, "mismatched-crash", 2, 20, 21);
+
+        insert_session(&conn, "corrupt-crash", 3, false);
+        set_unclean_owner(&conn, "corrupt-crash", &host_id, 43, 903, 3);
+        let corrupt_checkpoint = insert_v2_recovery_snapshot(&conn, "corrupt-crash", 3, 30, 30);
+        conn.execute(
+            "UPDATE session_checkpoints SET state_hash = 'snp2:corrupt' WHERE id = ?1",
+            [corrupt_checkpoint],
+        )
+        .unwrap();
+
+        for session_id in ["empty-crash", "mismatched-crash", "corrupt-crash"] {
+            assert!(
+                !crate::session_restore::session_has_usable_recovery_point_from_conn(
+                    &conn, session_id
+                )
+                .unwrap(),
+                "{session_id} must not be represented as a usable recovery authority"
+            );
+        }
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
+            0,
+            "ambiguous or unusable recovery state must require explicit acknowledgement"
+        );
+        assert_eq!(count_sessions(&conn), 3);
+    }
+
+    #[test]
+    fn recovery_retention_and_acknowledgement_survive_database_restart() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
+        for (session_id, timestamp, pid) in [("restart-old", 10, 51), ("restart-new", 20, 52)] {
+            insert_session(&conn, session_id, timestamp, false);
+            set_unclean_owner(&conn, session_id, &host_id, pid, 1_000 + pid, timestamp);
+            insert_v2_recovery_snapshot(
+                &conn,
+                session_id,
+                timestamp,
+                u64::try_from(pid).unwrap(),
+                u64::try_from(pid).unwrap(),
+            );
+        }
+        drop(conn);
+
+        let reopened = Connection::open(&path).unwrap();
+        reopened.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&reopened, 0, &dead).unwrap(),
+            1
+        );
+        set_recovery_acknowledgement_with_observer(&reopened, "restart-new", Some(30), &dead)
+            .unwrap();
+        drop(reopened);
+
+        let restarted = Connection::open(&path).unwrap();
+        restarted
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        let acknowledgement: Option<i64> = restarted
+            .query_row(
+                "SELECT recovery_acknowledged_at FROM mux_sessions
+                 WHERE session_id = 'restart-new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acknowledgement, Some(30));
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&restarted, 0, &dead).unwrap(),
+            1
+        );
+        assert_eq!(count_sessions(&restarted), 0);
+    }
+
+    #[test]
+    fn exact_size_pressure_counts_owner_lifecycle_and_acknowledged_recovery_bytes() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        insert_session(&conn, "sized-crash", 1, false);
+        let baseline: i64 = conn
+            .query_row(
+                "SELECT retained_bytes FROM session_retained_size
+                 WHERE session_id = 'sized-crash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        set_unclean_owner(&conn, "sized-crash", &host_id, 61, 1_061, 1);
+        set_recovery_acknowledgement_with_observer(&conn, "sized-crash", Some(2), &dead).unwrap();
+        let with_lifecycle: i64 = conn
+            .query_row(
+                "SELECT retained_bytes FROM session_retained_size
+                 WHERE session_id = 'sized-crash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            with_lifecycle - baseline,
+            i64::try_from(host_id.len()).unwrap() + 32,
+            "host identity plus owner PID/start/heartbeat and acknowledgement must each be charged exactly once"
+        );
+
+        let budget = 1_024_i64 * 1_024;
+        let padding = usize::try_from(budget - with_lifecycle).unwrap();
+        conn.execute(
+            "UPDATE mux_sessions SET topology_json = topology_json || ?2
+             WHERE session_id = ?1",
+            rusqlite::params!["sized-crash", "x".repeat(padding)],
+        )
+        .unwrap();
+        let at_budget = delete_sessions_by_size_with_observer(&conn, 1, &dead).unwrap();
+        assert_eq!(at_budget.measured_bytes, u64::try_from(budget).unwrap());
+        assert_eq!(at_budget.deleted, 0);
+
+        conn.execute(
+            "UPDATE mux_sessions SET topology_json = topology_json || 'x'
+             WHERE session_id = 'sized-crash'",
+            [],
+        )
+        .unwrap();
+        let over_budget = delete_sessions_by_size_with_observer(&conn, 1, &dead).unwrap();
+        assert_eq!(
+            over_budget.measured_bytes,
+            u64::try_from(budget + 1).unwrap()
+        );
+        assert_eq!(over_budget.deleted, 1);
+        assert_eq!(over_budget.retained_bytes, 0);
     }
 
     fn count_sessions(conn: &Connection) -> i64 {

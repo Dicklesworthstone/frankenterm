@@ -4783,6 +4783,7 @@ const SNAPSHOT_ENV_VALUE_INPUT_BYTES: usize = 4 * 1024;
 const SNAPSHOT_METADATA_MAX_DEPTH: usize = 64;
 const SNAPSHOT_METADATA_MAX_NODES: usize = 65_536;
 // Keep this in lockstep with the restore reader's host-id admission boundary.
+#[cfg(test)]
 const SNAPSHOT_HOST_ID_INPUT_BYTES: usize = 1024;
 const FOREGROUND_PROCESS_NAME_FIELD: &str = "foreground_process_name";
 
@@ -5811,6 +5812,7 @@ fn exact_snapshot_checkpoint_exists_sync(
     Ok(verified)
 }
 
+#[cfg(test)]
 fn bounded_host_id(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     let trimmed = raw.trim();
@@ -5820,6 +5822,7 @@ fn bounded_host_id(raw: Option<String>) -> Option<String> {
     Some(bounded_utf8(trimmed, SNAPSHOT_HOST_ID_INPUT_BYTES).0)
 }
 
+#[cfg(test)]
 fn current_host_id() -> Option<String> {
     bounded_host_id(
         crate::session_retention::current_session_owner_identity().map(|identity| identity.host_id),

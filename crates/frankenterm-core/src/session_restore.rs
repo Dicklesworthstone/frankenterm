@@ -1938,7 +1938,9 @@ pub(crate) fn session_has_usable_recovery_point_from_conn(
     conn: &Connection,
     session_id: &str,
 ) -> Result<bool, RestoreError> {
-    validate_session_selector(session_id)?;
+    if validate_session_selector(session_id).is_err() {
+        return Ok(false);
+    }
     let checkpoint_id = conn
         .query_row(
             "SELECT id
@@ -1954,19 +1956,48 @@ pub(crate) fn session_has_usable_recovery_point_from_conn(
     let Some(checkpoint_id) = checkpoint_id else {
         return Ok(false);
     };
-    let Some(descriptor) = restore_candidate_checkpoint_from_conn(conn, checkpoint_id)? else {
-        return Ok(false);
+    let descriptor = match restore_candidate_checkpoint_from_conn(conn, checkpoint_id) {
+        Ok(Some(descriptor)) => descriptor,
+        Ok(None) => return Ok(false),
+        Err(RestoreError::Database(message)) => return Err(RestoreError::Database(message)),
+        Err(_) => return Ok(false),
     };
     if descriptor.verification != CheckpointVerification::VerifiedV2 {
         return Ok(false);
     }
-    let Some(checkpoint) = load_checkpoint_by_id_from_conn(conn, checkpoint_id)? else {
+    let checkpoint = match load_checkpoint_by_id_from_conn(conn, checkpoint_id) {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => return Ok(false),
+        Err(RestoreError::Database(message)) => return Err(RestoreError::Database(message)),
+        Err(_) => return Ok(false),
+    };
+    if checkpoint.verification != CheckpointVerification::VerifiedV2
+        || checkpoint.pane_states.is_empty()
+    {
+        return Ok(false);
+    }
+    let Some(topology_json) = checkpoint.topology_json.as_deref() else {
         return Ok(false);
     };
-    Ok(
-        checkpoint.verification == CheckpointVerification::VerifiedV2
-            && !checkpoint.pane_states.is_empty(),
+    let Ok(topology) = TopologySnapshot::from_json(topology_json) else {
+        return Ok(false);
+    };
+    let pane_ids = checkpoint
+        .pane_states
+        .iter()
+        .map(|pane| pane.pane_id)
+        .collect::<Vec<_>>();
+    if validate_restore_topology(
+        checkpoint.checkpoint_id,
+        checkpoint.pane_count,
+        &pane_ids,
+        &topology,
     )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Load a specific checkpoint by row ID, including pane states.
