@@ -2,3 +2,6 @@
 # builds for some clap parser unit tests. 16MB is sufficient for those cases.
 [env]
 RUST_MIN_STACK = "16777216"
+
+[build]
+rustflags = ["-Z", "threads=4"]
