@@ -114,12 +114,7 @@ impl LocalProcessInfo {
                 name: name.to_string(),
                 status: fields.first()?.to_string(),
                 ppid: fields.get(1)?.parse().ok()?,
-                starttime: match LocalProcessInfo::observe_stat_start_time(pid) {
-                    ProcessStartTimeObservation::Running(start_time) => start_time,
-                    ProcessStartTimeObservation::Absent | ProcessStartTimeObservation::Unknown => {
-                        return None
-                    }
-                },
+                starttime: fields.get(19)?.parse().ok()?,
             })
         }
 

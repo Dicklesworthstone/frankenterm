@@ -211,14 +211,6 @@ fn classify_unclean_session_owner_with_observer(
     }
 }
 
-pub(crate) fn classify_unclean_session_owner(
-    host_id: Option<&str>,
-    owner_pid: Option<i64>,
-    owner_process_start: Option<i64>,
-) -> UncleanSessionOwnerState {
-    SessionOwnerClassifier::new().classify(host_id, owner_pid, owner_process_start)
-}
-
 // [ft-xcsm0 / ft-8nqx0 Phase 4] CleanupResult lifted to the audit-types
 // leaf crate so the cleanup summary contract can be reviewed
 // independently from the operational SQL pipeline below. Re-exported
@@ -505,15 +497,20 @@ fn session_is_deletion_eligible(
     {
         return Ok(false);
     }
-    if crate::session_restore::assess_clean_authority(
+    let clean_authority = crate::session_restore::assess_clean_authority(
         conn,
         &candidate.session_id,
         candidate.shutdown_clean,
         candidate.clean_checkpoint_id,
     )
-    .map_err(clean_authority_error)?
-    {
+    .map_err(clean_authority_error)?;
+    if clean_authority {
         return Ok(true);
+    }
+    if candidate.shutdown_clean != 0 {
+        // A claimed-clean row whose exact receipt does not verify is corrupt
+        // authority, not an ordinary crash candidate.
+        return Ok(false);
     }
     if owner_state != UncleanSessionOwnerState::RecoveryCandidate {
         return Ok(false);

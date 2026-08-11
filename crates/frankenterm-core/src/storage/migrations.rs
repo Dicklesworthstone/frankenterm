@@ -2604,16 +2604,22 @@ fn validate_session_owner_lifecycle_schema(conn: &Connection) -> Result<()> {
             .into());
         }
     }
-    let index_present: bool = conn.query_row(
-        "SELECT EXISTS(
+    let index_present: bool = conn
+        .query_row(
+            "SELECT EXISTS(
              SELECT 1 FROM sqlite_schema
              WHERE type = 'index'
                AND name = 'idx_mux_sessions_recovery_lifecycle'
                AND tbl_name = 'mux_sessions'
          )",
-        [],
-        |row| row.get(0),
-    )?;
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            StorageError::MigrationFailed(format!(
+                "session owner-lifecycle index validation failed: {error}"
+            ))
+        })?;
     if !index_present {
         return Err(StorageError::Corruption {
             details: "schema v41 is missing the session recovery-lifecycle index".to_string(),
@@ -2719,6 +2725,10 @@ fn validate_session_retained_size_schema(conn: &Connection) -> Result<()> {
     let compact_view_sql = compact_schema_sql(&view_sql);
     for required in [
         "length(CAST(s.session_id AS BLOB))",
+        "CASE WHEN s.owner_pid IS NULL THEN 0 ELSE 8 END",
+        "CASE WHEN s.owner_process_start IS NULL THEN 0 ELSE 8 END",
+        "CASE WHEN s.owner_heartbeat_at IS NULL THEN 0 ELSE 8 END",
+        "CASE WHEN s.recovery_acknowledged_at IS NULL THEN 0 ELSE 8 END",
         "FROM session_checkpoints c WHERE c.session_id = s.session_id",
         "FROM mux_pane_state p INNER JOIN session_checkpoints c ON c.id = p.checkpoint_id",
         "FROM restore_attempt_lifecycle r WHERE r.session_id = s.session_id",

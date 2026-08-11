@@ -5821,7 +5821,9 @@ fn bounded_host_id(raw: Option<String>) -> Option<String> {
 }
 
 fn current_host_id() -> Option<String> {
-    crate::session_retention::current_session_owner_identity().map(|identity| identity.host_id)
+    bounded_host_id(
+        crate::session_retention::current_session_owner_identity().map(|identity| identity.host_id),
+    )
 }
 
 /// Creation-only fields inserted alongside a first checkpoint. Keeping this
