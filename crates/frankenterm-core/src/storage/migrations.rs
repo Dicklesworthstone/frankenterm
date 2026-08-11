@@ -2161,6 +2161,17 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 44,
+        description: "Bound and durably reconcile recovery-point selection",
+        // Applied from the canonical marked SCHEMA_SQL section so fresh and
+        // upgraded databases share one exact authority definition.
+        up_sql: "",
+        // Removing transactional invalidation would make a cached usability
+        // result survive newer checkpoint/pane/lifecycle state. Keep this
+        // destructive-cleanup authority forward-only.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -2240,6 +2251,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         validate_pane_scrollback_summary_schema(conn)?;
         validate_session_owner_lifecycle_schema(conn)?;
         validate_session_retained_size_schema(conn)?;
+        validate_session_recovery_usability_schema(conn)?;
         check_ft_version_compatibility(conn)?;
         // The overwhelmingly common reopen path is read-only and must not
         // acquire SQLite's singleton writer lock. If the optimistic probe
@@ -2475,6 +2487,9 @@ const MUX_SESSIONS_SCHEMA_BEGIN: &str = "-- FT_MUX_SESSIONS_SCHEMA_BEGIN";
 const MUX_SESSIONS_SCHEMA_END: &str = "-- FT_MUX_SESSIONS_SCHEMA_END";
 const SESSION_RETAINED_SIZE_V40_BEGIN: &str = "-- FT_SESSION_RETAINED_SIZE_V40_BEGIN";
 const SESSION_RETAINED_SIZE_V40_END: &str = "-- FT_SESSION_RETAINED_SIZE_V40_END";
+const SESSION_RECOVERY_USABILITY_V44_BEGIN: &str =
+    "-- FT_SESSION_RECOVERY_USABILITY_V44_BEGIN";
+const SESSION_RECOVERY_USABILITY_V44_END: &str = "-- FT_SESSION_RECOVERY_USABILITY_V44_END";
 
 /// Return the single canonical `mux_sessions` table DDL section.
 ///
@@ -2563,6 +2578,223 @@ pub fn session_retained_size_schema_sql() -> Result<&'static str> {
         .into());
     }
     Ok(&SCHEMA_SQL[start..end])
+}
+
+/// Return the canonical schema-v44 recovery-usability DDL section.
+///
+/// The marker cardinality checks make fresh initialization, migration, and
+/// exact-body validation consume one definition.
+///
+/// # Errors
+///
+/// Returns a corruption error if the embedded workspace schema does not contain
+/// exactly one ordered begin/end marker pair.
+pub fn session_recovery_usability_schema_sql() -> Result<&'static str> {
+    if SCHEMA_SQL
+        .match_indices(SESSION_RECOVERY_USABILITY_V44_BEGIN)
+        .count()
+        != 1
+        || SCHEMA_SQL
+            .match_indices(SESSION_RECOVERY_USABILITY_V44_END)
+            .count()
+            != 1
+    {
+        return Err(StorageError::Corruption {
+            details: "SCHEMA_SQL must contain exactly one v44 recovery-usability marker pair"
+                .to_string(),
+        }
+        .into());
+    }
+    let start = SCHEMA_SQL
+        .find(SESSION_RECOVERY_USABILITY_V44_BEGIN)
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL is missing the v44 recovery-usability begin marker".to_string(),
+        })?
+        .checked_add(SESSION_RECOVERY_USABILITY_V44_BEGIN.len())
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL v44 recovery-usability marker offset overflow".to_string(),
+        })?;
+    let end = SCHEMA_SQL
+        .find(SESSION_RECOVERY_USABILITY_V44_END)
+        .ok_or_else(|| StorageError::Corruption {
+            details: "SCHEMA_SQL is missing the v44 recovery-usability end marker".to_string(),
+        })?;
+    if start >= end {
+        return Err(StorageError::Corruption {
+            details: "SCHEMA_SQL v44 recovery-usability markers are reversed or empty".to_string(),
+        }
+        .into());
+    }
+    Ok(&SCHEMA_SQL[start..end])
+}
+
+fn canonical_session_recovery_usability_object_sql(
+    declaration_kind: &'static str,
+    object_name: &'static str,
+) -> Result<&'static str> {
+    let schema_sql = session_recovery_usability_schema_sql()?;
+    let declaration = format!("CREATE {declaration_kind} IF NOT EXISTS {object_name}");
+    let mut matches = schema_sql.match_indices(&declaration);
+    let Some((start, _)) = matches.next() else {
+        return Err(StorageError::Corruption {
+            details: format!("SCHEMA_SQL v44 is missing canonical object {object_name}"),
+        }
+        .into());
+    };
+    if matches.next().is_some() {
+        return Err(StorageError::Corruption {
+            details: format!(
+                "SCHEMA_SQL v44 declares canonical object {object_name} more than once"
+            ),
+        }
+        .into());
+    }
+
+    let tail = &schema_sql[start..];
+    let terminator = if declaration_kind == "TRIGGER" {
+        "\nEND;"
+    } else {
+        ";"
+    };
+    let end = tail
+        .find(terminator)
+        .and_then(|offset| offset.checked_add(terminator.len()))
+        .ok_or_else(|| StorageError::Corruption {
+            details: format!("SCHEMA_SQL v44 canonical object {object_name} is unterminated"),
+        })?;
+    Ok(&tail[..end])
+}
+
+fn validate_session_recovery_usability_schema_objects(conn: &Connection) -> Result<()> {
+    for (object_type, declaration_kind, object_name) in [
+        ("table", "TABLE", "session_recovery_usability"),
+        ("index", "INDEX", "idx_session_recovery_usability_state"),
+        ("index", "INDEX", "idx_session_recovery_usability_dirty"),
+        ("table", "TABLE", "session_recovery_selection"),
+        ("trigger", "TRIGGER", "mux_sessions_recovery_usability_ai"),
+        ("trigger", "TRIGGER", "mux_sessions_recovery_usability_bu"),
+        ("trigger", "TRIGGER", "mux_sessions_recovery_usability_bd"),
+        (
+            "trigger",
+            "TRIGGER",
+            "session_checkpoints_recovery_usability_ai",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "session_checkpoints_recovery_usability_au",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "session_checkpoints_recovery_usability_bd",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "mux_pane_state_recovery_usability_ai",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "mux_pane_state_recovery_usability_au",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "mux_pane_state_recovery_usability_bd",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "restore_attempt_lifecycle_recovery_usability_ai",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "restore_attempt_lifecycle_recovery_usability_au",
+        ),
+        (
+            "trigger",
+            "TRIGGER",
+            "restore_attempt_lifecycle_recovery_usability_bd",
+        ),
+    ] {
+        let actual = load_schema_object_sql(conn, object_type, object_name)?.ok_or_else(|| {
+            StorageError::Corruption {
+                details: format!("schema v44 is missing required {object_type} {object_name}"),
+            }
+        })?;
+        let canonical =
+            canonical_session_recovery_usability_object_sql(declaration_kind, object_name)?;
+        if compact_schema_sql(&actual) != compact_schema_sql(canonical) {
+            return Err(StorageError::Corruption {
+                details: format!(
+                    "schema v44 {object_type} {object_name} differs from its canonical definition"
+                ),
+            }
+            .into());
+        }
+    }
+
+    let singleton_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_recovery_selection WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    if singleton_count != 1 {
+        return Err(StorageError::Corruption {
+            details: "schema v44 requires exactly one recovery-selection singleton".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_session_recovery_usability_schema(conn: &Connection) -> Result<()> {
+    // Current-schema reopen must not scan an authority row per historical
+    // session. Migration v44 performs the one-time foreign-key proof; exact
+    // DDL plus the audited delete trigger preserve that relation afterward.
+    // Selection also fails closed if a directly corrupted authority row ever
+    // names a missing session.
+    validate_session_recovery_usability_schema_objects(conn)
+}
+
+fn ensure_session_recovery_usability_schema(conn: &Connection) -> Result<()> {
+    let sql = session_recovery_usability_schema_sql()?;
+    conn.execute_batch(sql).map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "session recovery-usability schema installation failed: {error}"
+        ))
+    })?;
+    // The canonical fresh schema starts complete because every later session
+    // insert has an audited authority trigger. An upgrade may already contain
+    // arbitrarily many sessions that predate those triggers, so reset only the
+    // migration-time population cursor and let cleanup backfill incrementally.
+    let has_existing_sessions: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM mux_sessions LIMIT 1)", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| StorageError::Database(error.to_string()))?;
+    conn.execute(
+        "UPDATE session_recovery_selection
+         SET population_after_rowid = NULL,
+             population_complete = ?1,
+             scan_generation = 0,
+             scan_after_checkpoint_id = NULL,
+             scan_after_session_id = NULL,
+             protected_session_id = NULL,
+             protected_checkpoint_id = NULL,
+             scan_complete = 0
+         WHERE singleton = 1",
+        [!has_existing_sessions],
+    )
+    .map_err(|error| StorageError::MigrationFailed(format!(
+        "session recovery-usability population reset failed: {error}"
+    )))?;
+    validate_session_recovery_usability_schema(conn)
 }
 
 fn canonical_session_retained_size_object_sql(
@@ -2957,14 +3189,35 @@ fn validate_session_retained_size_schema_objects(conn: &Connection) -> Result<()
 /// missing, while full retained-byte decisions call the row validator below.
 pub(crate) fn validate_session_retained_size_mutation_schema(conn: &Connection) -> Result<()> {
     validate_session_retained_size_schema_objects(conn)?;
+    let usability_exists = table_exists(conn, "session_recovery_usability")?;
+    let selection_exists = table_exists(conn, "session_recovery_selection")?;
+    if usability_exists != selection_exists {
+        return Err(StorageError::Corruption {
+            details: "recovery-usability authority tables are only partially installed".to_string(),
+        }
+        .into());
+    }
+    if usability_exists {
+        validate_session_recovery_usability_schema_objects(conn)?;
+    }
     validate_session_authority_trigger_catalog(conn)
 }
 
-/// Require exactly the 15 audited triggers that protect retained-size authority:
-/// 12 source-maintenance triggers plus the summary table's three self-guards.
-/// Exact body validation is owned by `validate_session_retained_size_schema_objects`;
-/// this catalog check additionally rejects aliases, extras, and TEMP triggers.
+/// Require the exact audited trigger set for the installed authority version.
+/// V40-v43 have 15 retained-size triggers. V44 adds 12 recovery-usability
+/// invalidators over the same source tables. Exact body validation is owned by
+/// the object validators; this catalog check rejects aliases, extras, partial
+/// installs, and TEMP triggers.
 fn validate_session_authority_trigger_catalog(conn: &Connection) -> Result<()> {
+    let usability_exists = table_exists(conn, "session_recovery_usability")?;
+    let selection_exists = table_exists(conn, "session_recovery_selection")?;
+    if usability_exists != selection_exists {
+        return Err(StorageError::Corruption {
+            details: "recovery-usability authority tables are only partially installed".to_string(),
+        }
+        .into());
+    }
+    let expected_count = if usability_exists { 27_i64 } else { 15_i64 };
     let (unaudited_count, canonical_count, temp_count): (i64, i64, i64) = conn
         .query_row(
             "SELECT
@@ -2972,7 +3225,8 @@ fn validate_session_authority_trigger_catalog(conn: &Connection) -> Result<()> {
                   WHERE type = 'trigger'
                     AND tbl_name COLLATE NOCASE
                         IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
-                            'restore_attempt_lifecycle', 'session_retained_size')
+                            'restore_attempt_lifecycle', 'session_retained_size',
+                            'session_recovery_usability', 'session_recovery_selection')
                     AND name COLLATE NOCASE NOT IN (
                         'session_retained_size_bi',
                         'session_retained_size_bd',
@@ -2988,13 +3242,26 @@ fn validate_session_authority_trigger_catalog(conn: &Connection) -> Result<()> {
                         'mux_pane_state_retained_size_ad',
                         'restore_attempt_lifecycle_retained_size_ai',
                         'restore_attempt_lifecycle_retained_size_au',
-                        'restore_attempt_lifecycle_retained_size_ad'
+                        'restore_attempt_lifecycle_retained_size_ad',
+                        'mux_sessions_recovery_usability_ai',
+                        'mux_sessions_recovery_usability_bu',
+                        'mux_sessions_recovery_usability_bd',
+                        'session_checkpoints_recovery_usability_ai',
+                        'session_checkpoints_recovery_usability_au',
+                        'session_checkpoints_recovery_usability_bd',
+                        'mux_pane_state_recovery_usability_ai',
+                        'mux_pane_state_recovery_usability_au',
+                        'mux_pane_state_recovery_usability_bd',
+                        'restore_attempt_lifecycle_recovery_usability_ai',
+                        'restore_attempt_lifecycle_recovery_usability_au',
+                        'restore_attempt_lifecycle_recovery_usability_bd'
                     )),
                  (SELECT COUNT(*) FROM sqlite_schema
                   WHERE type = 'trigger'
                     AND tbl_name COLLATE NOCASE
                         IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
-                            'restore_attempt_lifecycle', 'session_retained_size')
+                            'restore_attempt_lifecycle', 'session_retained_size',
+                            'session_recovery_usability', 'session_recovery_selection')
                     AND name COLLATE NOCASE IN (
                         'session_retained_size_bi',
                         'session_retained_size_bd',
@@ -3010,23 +3277,36 @@ fn validate_session_authority_trigger_catalog(conn: &Connection) -> Result<()> {
                         'mux_pane_state_retained_size_ad',
                         'restore_attempt_lifecycle_retained_size_ai',
                         'restore_attempt_lifecycle_retained_size_au',
-                        'restore_attempt_lifecycle_retained_size_ad'
+                        'restore_attempt_lifecycle_retained_size_ad',
+                        'mux_sessions_recovery_usability_ai',
+                        'mux_sessions_recovery_usability_bu',
+                        'mux_sessions_recovery_usability_bd',
+                        'session_checkpoints_recovery_usability_ai',
+                        'session_checkpoints_recovery_usability_au',
+                        'session_checkpoints_recovery_usability_bd',
+                        'mux_pane_state_recovery_usability_ai',
+                        'mux_pane_state_recovery_usability_au',
+                        'mux_pane_state_recovery_usability_bd',
+                        'restore_attempt_lifecycle_recovery_usability_ai',
+                        'restore_attempt_lifecycle_recovery_usability_au',
+                        'restore_attempt_lifecycle_recovery_usability_bd'
                     )),
                  (SELECT COUNT(*) FROM sqlite_temp_schema
                   WHERE type = 'trigger'
                     AND tbl_name COLLATE NOCASE
                         IN ('mux_sessions', 'session_checkpoints', 'mux_pane_state',
-                            'restore_attempt_lifecycle', 'session_retained_size'))",
+                            'restore_attempt_lifecycle', 'session_retained_size',
+                            'session_recovery_usability', 'session_recovery_selection'))",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| StorageError::Database(error.to_string()))?;
-    if unaudited_count == 0 && canonical_count == 15 && temp_count == 0 {
+    if unaudited_count == 0 && canonical_count == expected_count && temp_count == 0 {
         return Ok(());
     }
     Err(StorageError::Corruption {
         details: format!(
-            "session retained-size authority requires 15 canonical triggers and no extras: canonical={canonical_count} unaudited={unaudited_count} temp={temp_count}"
+            "session authority requires {expected_count} canonical triggers and no extras: canonical={canonical_count} unaudited={unaudited_count} temp={temp_count}"
         ),
     }
     .into())
@@ -5796,8 +6076,9 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
     // exact retained-session byte authority; v41 protects live-owner fencing
     // from stale recovery cleanup; v42 makes the owner tuple invariant
     // migration-safe; v43 keeps legacy orphan cleanup executable without
-    // weakening retained-size authority for live sessions. V43 is therefore
-    // the current downgrade floor.
+    // weakening retained-size authority for live sessions; v44 protects the
+    // trigger-invalidated recovery-usability cache and its durable bounded
+    // cursor. V44 is therefore the current downgrade floor.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
@@ -5922,6 +6203,10 @@ fn apply_migration_mutation(
                     ensure_orphan_cleanup_retained_size_schema(conn)?;
                     apply_raw_up_sql = false;
                 }
+                44 => {
+                    ensure_session_recovery_usability_schema(conn)?;
+                    apply_raw_up_sql = false;
+                }
                 _ => {}
             }
             if apply_raw_up_sql && !migration.up_sql.is_empty() {
@@ -5953,6 +6238,12 @@ fn apply_migration_mutation(
             if migration.version == 43 {
                 validate_session_owner_lifecycle_schema(conn)?;
                 validate_session_retained_size_schema(conn)?;
+            }
+            if migration.version == 44 {
+                validate_session_owner_lifecycle_schema(conn)?;
+                validate_session_retained_size_schema(conn)?;
+                validate_session_recovery_usability_schema(conn)?;
+                ensure_no_foreign_key_violations(conn, "migration v44")?;
             }
             set_user_version(conn, migration.version)?;
             record_migration(conn, migration.version, migration.description)?;
@@ -8882,8 +9173,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_scrollback_size_and_owner_authority_v36_through_v43_are_forward_only() {
-        for version in [36, 37, 38, 39, 40, 41, 42, 43] {
+    fn checkpoint_scrollback_size_owner_and_recovery_authority_are_forward_only() {
+        for version in [36, 37, 38, 39, 40, 41, 42, 43, 44] {
             let migration = MIGRATIONS
                 .iter()
                 .find(|migration| migration.version == version)
@@ -8908,6 +9199,8 @@ mod tests {
         assert!(build_migration_plan(42, 35).is_err());
         assert!(build_migration_plan(43, 42).is_err());
         assert!(build_migration_plan(43, 35).is_err());
+        assert!(build_migration_plan(44, 43).is_err());
+        assert!(build_migration_plan(44, 35).is_err());
     }
 
     #[test]
@@ -9878,6 +10171,27 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_reopen_fails_closed_when_recovery_trigger_drifts() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch(
+            "DROP TRIGGER session_checkpoints_recovery_usability_ai;
+             CREATE TRIGGER session_checkpoints_recovery_usability_ai
+             AFTER INSERT ON session_checkpoints BEGIN SELECT 1; END;",
+        )
+        .expect("inject same-name recovery trigger drift");
+
+        let error = initialize_schema(&conn)
+            .expect_err("a current version stamp must not mask recovery-authority drift");
+        assert!(
+            error
+                .to_string()
+                .contains("session_checkpoints_recovery_usability_ai"),
+            "drifted recovery trigger identity must be explicit: {error}"
+        );
+    }
+
+    #[test]
     fn v41_refreshes_pre_owner_retained_size_authority_atomically() {
         let conn = Connection::open_in_memory().expect("open database");
         initialize_schema(&conn).expect("initialize current schema");
@@ -10096,6 +10410,81 @@ mod tests {
             .expect("collect orphan checkpoint after its pane"),
             1
         );
+    }
+
+    #[test]
+    fn v44_upgrade_starts_incremental_backfill_and_tracks_new_mutations() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch(
+            "DROP TRIGGER mux_sessions_recovery_usability_ai;
+             DROP TRIGGER mux_sessions_recovery_usability_bu;
+             DROP TRIGGER mux_sessions_recovery_usability_bd;
+             DROP TRIGGER session_checkpoints_recovery_usability_ai;
+             DROP TRIGGER session_checkpoints_recovery_usability_au;
+             DROP TRIGGER session_checkpoints_recovery_usability_bd;
+             DROP TRIGGER mux_pane_state_recovery_usability_ai;
+             DROP TRIGGER mux_pane_state_recovery_usability_au;
+             DROP TRIGGER mux_pane_state_recovery_usability_bd;
+             DROP TRIGGER restore_attempt_lifecycle_recovery_usability_ai;
+             DROP TRIGGER restore_attempt_lifecycle_recovery_usability_au;
+             DROP TRIGGER restore_attempt_lifecycle_recovery_usability_bd;
+             DROP TABLE session_recovery_usability;
+             DROP TABLE session_recovery_selection;",
+        )
+        .expect("remove v44 objects from the v43 fixture");
+        conn.execute("DELETE FROM schema_version WHERE version = 44", [])
+            .expect("rewind migration audit fixture");
+        set_user_version(&conn, 43).expect("rewind version fixture");
+        for index in 0..130_i64 {
+            conn.execute(
+                "INSERT INTO mux_sessions (
+                     session_id, created_at, shutdown_clean, topology_json, ft_version
+                 ) VALUES (?1, ?2, 0, '{}', '0.43.0')",
+                params![format!("legacy-v44-{index:03}"), index],
+            )
+            .expect("seed legacy session");
+        }
+
+        let step = build_migration_plan(43, 44)
+            .expect("build v44 plan")
+            .steps
+            .into_iter()
+            .next()
+            .expect("v44 step");
+        apply_migration_step(&conn, &step).expect("apply bounded-recovery migration");
+
+        assert_eq!(get_user_version(&conn).unwrap(), 44);
+        validate_session_recovery_usability_schema(&conn).unwrap();
+        validate_session_retained_size_mutation_schema(&conn).unwrap();
+        let (population_complete, authority_rows): (bool, i64) = conn
+            .query_row(
+                "SELECT population_complete,
+                        (SELECT COUNT(*) FROM session_recovery_usability)
+                 FROM session_recovery_selection",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!population_complete);
+        assert_eq!(authority_rows, 0, "migration must not perform an unbounded backfill");
+
+        conn.execute(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, shutdown_clean, topology_json, ft_version
+             ) VALUES ('post-v44', 200, 0, '{}', '0.44.0')",
+            [],
+        )
+        .expect("insert post-migration session");
+        let post_state: String = conn
+            .query_row(
+                "SELECT state FROM session_recovery_usability
+                 WHERE session_id = 'post-v44'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(post_state, "dirty");
     }
 
     #[test]

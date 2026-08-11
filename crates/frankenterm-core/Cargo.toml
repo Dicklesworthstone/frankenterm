@@ -186,6 +186,7 @@ nix = { workspace = true, optional = true, features = ["fs", "socket", "user"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+rusqlite = { workspace = true, features = ["trace"] }
 proptest = "1.11.0"
 tempfile = "3.27.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }

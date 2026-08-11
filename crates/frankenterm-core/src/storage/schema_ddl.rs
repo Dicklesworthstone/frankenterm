@@ -94,7 +94,10 @@
 /// as fresh databases instead of silently retaining weaker trigger authority.
 /// Bumped 42 -> 43 so pane children beneath legacy orphan checkpoints remain
 /// collectible without weakening retained-size authority for live sessions.
-pub const SCHEMA_VERSION: i32 = 43;
+/// Bumped 43 -> 44 to replace unbounded recovery-candidate validation during
+/// retention with trigger-invalidated, incrementally reconciled usability and
+/// durable bounded-selection authority.
+pub const SCHEMA_VERSION: i32 = 44;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -1189,6 +1192,408 @@ CREATE TABLE IF NOT EXISTS mux_pane_state (
 
 CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
 CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
+
+-- FT_SESSION_RECOVERY_USABILITY_V44_BEGIN
+-- Derived recovery usability authority (ft-0yuxe.6).
+--
+-- `dirty` is deliberately fail-closed: retention may reconcile only a fixed
+-- batch per transaction and cannot delete an unacknowledged crash session
+-- while its newest snapshot has not been checked by the canonical restore
+-- loader.  The validation row is invalidated transactionally by every source
+-- mutation that can change restore semantics.
+CREATE TABLE IF NOT EXISTS session_recovery_usability (
+    session_id TEXT PRIMARY KEY
+        CHECK(typeof(session_id) = 'text'
+            AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND 256)
+        REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+    authority_version INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(authority_version) = 'integer' AND authority_version = 1),
+    state TEXT NOT NULL DEFAULT 'dirty'
+        CHECK(state IN ('dirty','usable','unusable')),
+    validated_checkpoint_id INTEGER,
+    dirty_generation INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(dirty_generation) = 'integer' AND dirty_generation >= 0),
+    CHECK(
+        (state = 'usable'
+            AND typeof(validated_checkpoint_id) = 'integer'
+            AND validated_checkpoint_id > 0)
+        OR (state IN ('dirty','unusable') AND validated_checkpoint_id IS NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_recovery_usability_state
+    ON session_recovery_usability(validated_checkpoint_id DESC, session_id ASC)
+    WHERE state = 'usable';
+CREATE INDEX IF NOT EXISTS idx_session_recovery_usability_dirty
+    ON session_recovery_usability(dirty_generation ASC, session_id ASC)
+    WHERE state = 'dirty';
+
+-- One durable cursor makes a long prefix of live/foreign/unknown owners
+-- restart-safe.  The first source mutation after validation advances
+-- mutation_generation, marks the session dirty, and resets the cursor in the
+-- same SQLite transaction; later pane mutations coalesce while it remains
+-- dirty. Integer exhaustion aborts rather than permitting authority reuse.
+CREATE TABLE IF NOT EXISTS session_recovery_selection (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    mutation_generation INTEGER NOT NULL
+        CHECK(typeof(mutation_generation) = 'integer' AND mutation_generation >= 0),
+    population_after_rowid INTEGER
+        CHECK(population_after_rowid IS NULL
+            OR typeof(population_after_rowid) = 'integer'),
+    population_complete INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(population_complete) = 'integer'
+            AND population_complete IN (0, 1)),
+    scan_generation INTEGER NOT NULL
+        CHECK(typeof(scan_generation) = 'integer' AND scan_generation >= 0),
+    scan_after_checkpoint_id INTEGER,
+    scan_after_session_id TEXT,
+    protected_session_id TEXT,
+    protected_checkpoint_id INTEGER,
+    scan_complete INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(scan_complete) = 'integer' AND scan_complete IN (0, 1)),
+    CHECK(
+        (scan_after_checkpoint_id IS NULL AND scan_after_session_id IS NULL)
+        OR (typeof(scan_after_checkpoint_id) = 'integer'
+            AND scan_after_checkpoint_id > 0
+            AND typeof(scan_after_session_id) = 'text'
+            AND length(CAST(scan_after_session_id AS BLOB)) BETWEEN 1 AND 256)
+    ),
+    CHECK(
+        (protected_session_id IS NULL AND protected_checkpoint_id IS NULL)
+        OR (typeof(protected_session_id) = 'text'
+            AND length(CAST(protected_session_id AS BLOB)) BETWEEN 1 AND 256
+            AND typeof(protected_checkpoint_id) = 'integer'
+            AND protected_checkpoint_id > 0)
+    )
+);
+
+INSERT OR IGNORE INTO session_recovery_selection (
+    singleton, mutation_generation, population_complete,
+    scan_generation, scan_complete
+) VALUES (1, 0, 1, 0, 0);
+
+CREATE TRIGGER IF NOT EXISTS mux_sessions_recovery_usability_ai
+AFTER INSERT ON mux_sessions BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+    INSERT INTO session_recovery_usability (
+        session_id, state, validated_checkpoint_id, dirty_generation
+    ) VALUES (
+        new.session_id, 'dirty', NULL,
+        (SELECT mutation_generation FROM session_recovery_selection WHERE singleton = 1)
+    ) ON CONFLICT(session_id) DO UPDATE SET
+        state = 'dirty',
+        validated_checkpoint_id = NULL,
+        dirty_generation = excluded.dirty_generation;
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_sessions_recovery_usability_bu
+BEFORE UPDATE OF shutdown_clean, recovery_acknowledged_at,
+                 host_id, owner_pid, owner_process_start ON mux_sessions
+WHEN new.shutdown_clean IS NOT old.shutdown_clean
+  OR new.recovery_acknowledged_at IS NOT old.recovery_acknowledged_at
+  OR new.host_id IS NOT old.host_id
+  OR new.owner_pid IS NOT old.owner_pid
+  OR new.owner_process_start IS NOT old.owner_process_start
+BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_sessions_recovery_usability_bd
+BEFORE DELETE ON mux_sessions BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+    DELETE FROM session_recovery_usability
+    WHERE session_id = old.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_checkpoints_recovery_usability_ai
+AFTER INSERT ON session_checkpoints
+WHEN EXISTS (
+    SELECT 1 FROM session_recovery_usability
+    WHERE session_id = new.session_id AND state <> 'dirty'
+)
+BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+    UPDATE session_recovery_usability
+    SET state = 'dirty',
+        validated_checkpoint_id = NULL,
+        dirty_generation = (
+            SELECT mutation_generation FROM session_recovery_selection WHERE singleton = 1
+        )
+    WHERE session_id = new.session_id AND state <> 'dirty';
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_checkpoints_recovery_usability_au
+AFTER UPDATE ON session_checkpoints
+WHEN EXISTS (
+    SELECT 1 FROM session_recovery_usability
+    WHERE session_id IN (old.session_id, new.session_id)
+      AND state <> 'dirty'
+)
+BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+    UPDATE session_recovery_usability
+    SET state = 'dirty', validated_checkpoint_id = NULL,
+        dirty_generation = (
+            SELECT mutation_generation FROM session_recovery_selection WHERE singleton = 1
+        )
+    WHERE session_id IN (old.session_id, new.session_id)
+      AND state <> 'dirty';
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_checkpoints_recovery_usability_bd
+BEFORE DELETE ON session_checkpoints
+WHEN EXISTS (
+    SELECT 1 FROM session_recovery_usability
+    WHERE session_id = old.session_id AND state <> 'dirty'
+)
+BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+    UPDATE session_recovery_usability
+    SET state = 'dirty', validated_checkpoint_id = NULL,
+        dirty_generation = (
+            SELECT mutation_generation FROM session_recovery_selection WHERE singleton = 1
+        )
+    WHERE session_id = old.session_id AND state <> 'dirty';
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_pane_state_recovery_usability_ai
+AFTER INSERT ON mux_pane_state
+WHEN EXISTS (
+    SELECT 1
+    FROM session_recovery_usability AS usability
+    INNER JOIN session_checkpoints AS checkpoint
+      ON checkpoint.session_id = usability.session_id
+    WHERE checkpoint.id = new.checkpoint_id
+      AND usability.state <> 'dirty'
+)
+BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+    UPDATE session_recovery_usability
+    SET state = 'dirty', validated_checkpoint_id = NULL,
+        dirty_generation = (
+            SELECT mutation_generation FROM session_recovery_selection WHERE singleton = 1
+        )
+    WHERE state <> 'dirty' AND session_id = (
+        SELECT session_id FROM session_checkpoints WHERE id = new.checkpoint_id
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_pane_state_recovery_usability_au
+AFTER UPDATE ON mux_pane_state
+WHEN EXISTS (
+    SELECT 1
+    FROM session_recovery_usability AS usability
+    INNER JOIN session_checkpoints AS checkpoint
+      ON checkpoint.session_id = usability.session_id
+    WHERE checkpoint.id IN (old.checkpoint_id, new.checkpoint_id)
+      AND usability.state <> 'dirty'
+)
+BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+    UPDATE session_recovery_usability
+    SET state = 'dirty', validated_checkpoint_id = NULL,
+        dirty_generation = (
+            SELECT mutation_generation FROM session_recovery_selection WHERE singleton = 1
+        )
+    WHERE state <> 'dirty' AND session_id IN (
+        SELECT session_id FROM session_checkpoints
+        WHERE id IN (old.checkpoint_id, new.checkpoint_id)
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS mux_pane_state_recovery_usability_bd
+BEFORE DELETE ON mux_pane_state
+WHEN EXISTS (
+    SELECT 1
+    FROM session_recovery_usability AS usability
+    INNER JOIN session_checkpoints AS checkpoint
+      ON checkpoint.session_id = usability.session_id
+    WHERE checkpoint.id = old.checkpoint_id
+      AND usability.state <> 'dirty'
+)
+BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1;
+    UPDATE session_recovery_usability
+    SET state = 'dirty', validated_checkpoint_id = NULL,
+        dirty_generation = (
+            SELECT mutation_generation FROM session_recovery_selection WHERE singleton = 1
+        )
+    WHERE state <> 'dirty' AND session_id = (
+        SELECT session_id FROM session_checkpoints WHERE id = old.checkpoint_id
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS restore_attempt_lifecycle_recovery_usability_ai
+AFTER INSERT ON restore_attempt_lifecycle BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1
+      AND EXISTS (
+          SELECT 1 FROM session_recovery_usability
+          WHERE session_id = new.session_id
+      );
+END;
+
+CREATE TRIGGER IF NOT EXISTS restore_attempt_lifecycle_recovery_usability_au
+AFTER UPDATE ON restore_attempt_lifecycle BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1
+      AND EXISTS (
+          SELECT 1 FROM session_recovery_usability
+          WHERE session_id IN (old.session_id, new.session_id)
+      );
+END;
+
+CREATE TRIGGER IF NOT EXISTS restore_attempt_lifecycle_recovery_usability_bd
+BEFORE DELETE ON restore_attempt_lifecycle BEGIN
+    UPDATE session_recovery_selection
+    SET mutation_generation = CASE
+            WHEN mutation_generation < 9223372036854775807
+            THEN mutation_generation + 1
+            ELSE RAISE(ABORT, 'recovery usability generation exhausted')
+        END,
+        scan_generation = 0,
+        scan_after_checkpoint_id = NULL,
+        scan_after_session_id = NULL,
+        protected_session_id = NULL,
+        protected_checkpoint_id = NULL,
+        scan_complete = 0
+    WHERE singleton = 1
+      AND EXISTS (
+          SELECT 1 FROM session_recovery_usability
+          WHERE session_id = old.session_id
+      );
+END;
+-- FT_SESSION_RECOVERY_USABILITY_V44_END
 
 -- FT_SESSION_RETAINED_SIZE_V40_BEGIN
 -- Exact logical retained-payload bytes for session size retention (ft-0yuxe.3).

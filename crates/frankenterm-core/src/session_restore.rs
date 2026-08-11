@@ -1955,15 +1955,16 @@ fn restore_candidate_checkpoint_from_conn(
     }))
 }
 
-/// Return whether the latest snapshot for one session is a bounded, non-empty,
-/// fully verified recovery point. Retention uses the same loader as restore so
-/// it never preserves a descriptor that the actual recovery path would reject.
-pub(crate) fn session_has_usable_recovery_point_from_conn(
+/// Return the latest snapshot ID when it is a bounded, non-empty, fully
+/// verified recovery point. Retention uses the same loader as restore and
+/// persists this exact identity, so it never advertises a descriptor that the
+/// actual recovery path would reject.
+pub(crate) fn usable_recovery_checkpoint_id_from_conn(
     conn: &Connection,
     session_id: &str,
-) -> Result<bool, RestoreError> {
+) -> Result<Option<i64>, RestoreError> {
     if validate_session_selector(session_id).is_err() {
-        return Ok(false);
+        return Ok(None);
     }
     let checkpoint_id = conn
         .query_row(
@@ -1978,33 +1979,36 @@ pub(crate) fn session_has_usable_recovery_point_from_conn(
         )
         .optional()?;
     let Some(checkpoint_id) = checkpoint_id else {
-        return Ok(false);
+        return Ok(None);
     };
+    if checkpoint_id <= 0 {
+        return Ok(None);
+    }
     let descriptor = match restore_candidate_checkpoint_from_conn(conn, checkpoint_id) {
         Ok(Some(descriptor)) => descriptor,
-        Ok(None) => return Ok(false),
+        Ok(None) => return Ok(None),
         Err(RestoreError::Database(message)) => return Err(RestoreError::Database(message)),
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     if descriptor.verification != CheckpointVerification::VerifiedV2 {
-        return Ok(false);
+        return Ok(None);
     }
     let checkpoint = match load_checkpoint_by_id_from_conn(conn, checkpoint_id) {
         Ok(Some(checkpoint)) => checkpoint,
-        Ok(None) => return Ok(false),
+        Ok(None) => return Ok(None),
         Err(RestoreError::Database(message)) => return Err(RestoreError::Database(message)),
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     if checkpoint.verification != CheckpointVerification::VerifiedV2
         || checkpoint.pane_states.is_empty()
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(topology_json) = checkpoint.topology_json.as_deref() else {
-        return Ok(false);
+        return Ok(None);
     };
     let Ok(topology) = TopologySnapshot::from_json(topology_json) else {
-        return Ok(false);
+        return Ok(None);
     };
     let pane_ids = checkpoint
         .pane_states
@@ -2019,9 +2023,9 @@ pub(crate) fn session_has_usable_recovery_point_from_conn(
     )
     .is_err()
     {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(true)
+    Ok(Some(checkpoint_id))
 }
 
 /// Load a specific checkpoint by row ID, including pane states.

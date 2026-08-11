@@ -16,14 +16,15 @@
 
 #[cfg(test)]
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::checkpoint_witness::{
-    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES, MAX_SESSION_HOST_ID_BYTES,
+    MAX_CHECKPOINT_METADATA_BYTES, MAX_CHECKPOINT_SESSION_ID_BYTES,
+    MAX_PERSISTED_CHECKPOINT_TEXT_BYTES, MAX_SESSION_HOST_ID_BYTES,
 };
 use crate::config::SessionRetentionConfig;
 
@@ -516,82 +517,485 @@ struct SessionRetentionAuthority {
     recovery_acknowledged_at: Option<i64>,
 }
 
-fn session_has_usable_recovery_point(
+// One retention transaction performs at most one of these bounded advancement
+// phases before returning `Pending`. Population executes one ordered query,
+// at most 64 idempotent inserts, and one cursor update. Reconciliation invokes
+// the canonical restore loader at most four times; that loader preflights and
+// admits at most MAX_PERSISTED_CHECKPOINT_TEXT_BYTES per candidate. Selection
+// reads at most 64 indexed authority rows and performs at most two indexed
+// eligibility queries per row. The cooperative wall budget is checked between
+// canonical candidates; one already-bounded loader call always reaches an
+// authoritative result so an overloaded host cannot livelock at row zero.
+const RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS: usize = 64;
+const RECOVERY_AUTHORITY_RECONCILE_BATCH_ROWS: usize = 4;
+const RECOVERY_SELECTION_SCAN_BATCH_ROWS: usize = 64;
+const RECOVERY_AUTHORITY_RECONCILE_MAX_ADMITTED_BYTES: usize =
+    RECOVERY_AUTHORITY_RECONCILE_BATCH_ROWS * MAX_PERSISTED_CHECKPOINT_TEXT_BYTES;
+const RECOVERY_AUTHORITY_RECONCILE_WALL_BUDGET: Duration = Duration::from_millis(40);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProtectedRecoverySelection {
+    Ready(Option<ProtectedRecoveryPoint>),
+    Pending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProtectedRecoveryPoint {
+    session_id: String,
+    checkpoint_id: i64,
+}
+
+#[derive(Debug)]
+struct RecoverySelectionState {
+    mutation_generation: i64,
+    population_after_rowid: Option<i64>,
+    population_complete: bool,
+    scan_generation: i64,
+    scan_after_checkpoint_id: Option<i64>,
+    scan_after_session_id: Option<String>,
+    scan_complete: bool,
+}
+
+fn load_recovery_selection_state(
+    conn: &Connection,
+) -> Result<RecoverySelectionState, rusqlite::Error> {
+    conn.query_row(
+        "SELECT mutation_generation,
+                population_after_rowid,
+                population_complete,
+                scan_generation,
+                scan_after_checkpoint_id,
+                scan_after_session_id,
+                scan_complete
+         FROM session_recovery_selection
+         WHERE singleton = 1",
+        [],
+        |row| {
+            Ok(RecoverySelectionState {
+                mutation_generation: row.get(0)?,
+                population_after_rowid: row.get(1)?,
+                population_complete: row.get(2)?,
+                scan_generation: row.get(3)?,
+                scan_after_checkpoint_id: row.get(4)?,
+                scan_after_session_id: row.get(5)?,
+                scan_complete: row.get(6)?,
+            })
+        },
+    )
+}
+
+fn advance_recovery_authority_population(
+    conn: &Connection,
+    state: &RecoverySelectionState,
+) -> Result<bool, rusqlite::Error> {
+    if state.population_complete {
+        return Ok(false);
+    }
+    let query_limit = RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS.saturating_add(1);
+    let max_session_id_bytes =
+        i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX);
+    let query_limit = i64::try_from(query_limit).unwrap_or(i64::MAX);
+    let sessions: Vec<(i64, Option<String>)> =
+        if let Some(after_rowid) = state.population_after_rowid {
+            let mut statement = conn.prepare(
+                "SELECT rowid,
+                        CASE
+                            WHEN typeof(session_id) = 'text'
+                             AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?2
+                            THEN session_id
+                        END
+                 FROM mux_sessions
+                 WHERE rowid > ?1
+                 ORDER BY rowid ASC
+                 LIMIT ?3",
+            )?;
+            statement
+                .query_map(
+                    rusqlite::params![after_rowid, max_session_id_bytes, query_limit],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+                .collect::<Result<_, _>>()?
+        } else {
+            let mut statement = conn.prepare(
+                "SELECT rowid,
+                        CASE
+                            WHEN typeof(session_id) = 'text'
+                             AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?1
+                            THEN session_id
+                        END
+                 FROM mux_sessions
+                 ORDER BY rowid ASC
+                 LIMIT ?2",
+            )?;
+            statement
+                .query_map(
+                    rusqlite::params![max_session_id_bytes, query_limit],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+                .collect::<Result<_, _>>()?
+        };
+    let population_complete = sessions.len() <= RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS;
+    let batch_len = sessions
+        .len()
+        .min(RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS);
+    let batch = &sessions[..batch_len];
+    for (_, session_id) in batch {
+        let Some(session_id) = session_id else {
+            continue;
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO session_recovery_usability (
+                 session_id, state, validated_checkpoint_id, dirty_generation
+             ) VALUES (?1, 'dirty', NULL, ?2)",
+            rusqlite::params![session_id, state.mutation_generation],
+        )?;
+    }
+    let next_cursor = batch
+        .last()
+        .map(|(rowid, _)| *rowid)
+        .or(state.population_after_rowid);
+    let changed = conn.execute(
+        "UPDATE session_recovery_selection
+         SET population_after_rowid = ?1,
+             population_complete = ?2
+         WHERE singleton = 1",
+        rusqlite::params![next_cursor, population_complete],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::StatementChangedRows(changed));
+    }
+    Ok(!batch.is_empty() || !population_complete)
+}
+
+fn advance_dirty_recovery_authority(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let dirty_rows: Vec<(i64, Option<String>, i64)> = {
+        let mut statement = conn.prepare(
+            "SELECT rowid,
+                    CASE
+                        WHEN typeof(session_id) = 'text'
+                         AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?1
+                        THEN session_id
+                    END,
+                    dirty_generation
+             FROM session_recovery_usability
+                  INDEXED BY idx_session_recovery_usability_dirty
+             WHERE state = 'dirty'
+             ORDER BY dirty_generation ASC, session_id ASC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(
+                rusqlite::params![
+                    i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
+                    i64::try_from(RECOVERY_AUTHORITY_RECONCILE_BATCH_ROWS).unwrap_or(i64::MAX),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+            .collect::<Result<_, _>>()?
+    };
+    let started = Instant::now();
+    let mut processed = 0_usize;
+    for (authority_rowid, session_id, dirty_generation) in &dirty_rows {
+        if processed > 0 && started.elapsed() >= RECOVERY_AUTHORITY_RECONCILE_WALL_BUDGET {
+            break;
+        }
+        let checkpoint_id = session_id
+            .as_deref()
+            .map(|session_id| {
+                crate::session_restore::usable_recovery_checkpoint_id_from_conn(conn, session_id)
+                    .map_err(clean_authority_error)
+            })
+            .transpose()?
+            .flatten();
+        let (state, checkpoint_id) = checkpoint_id.map_or(("unusable", None), |checkpoint_id| {
+            ("usable", Some(checkpoint_id))
+        });
+        let changed = conn.execute(
+            "UPDATE session_recovery_usability
+             SET state = ?3, validated_checkpoint_id = ?4
+             WHERE rowid = ?1
+               AND state = 'dirty'
+               AND dirty_generation = ?2",
+            rusqlite::params![authority_rowid, dirty_generation, state, checkpoint_id],
+        )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed));
+        }
+        processed = processed.saturating_add(1);
+    }
+    debug_assert!(
+        RECOVERY_AUTHORITY_RECONCILE_MAX_ADMITTED_BYTES
+            >= MAX_PERSISTED_CHECKPOINT_TEXT_BYTES
+    );
+    Ok(processed < dirty_rows.len()
+        || dirty_rows.len() == RECOVERY_AUTHORITY_RECONCILE_BATCH_ROWS)
+}
+
+fn invalidate_recovery_authority_row(
     conn: &Connection,
     session_id: &str,
+) -> Result<(), rusqlite::Error> {
+    let changed = conn.execute(
+        "UPDATE session_recovery_selection
+         SET mutation_generation = mutation_generation + 1,
+             scan_generation = 0,
+             scan_after_checkpoint_id = NULL,
+             scan_after_session_id = NULL,
+             protected_session_id = NULL,
+             protected_checkpoint_id = NULL,
+             scan_complete = 0
+         WHERE singleton = 1
+           AND mutation_generation < 9223372036854775807",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::StatementChangedRows(changed));
+    }
+    let changed = conn.execute(
+        "UPDATE session_recovery_usability
+         SET state = 'dirty',
+             validated_checkpoint_id = NULL,
+             dirty_generation = (
+                 SELECT mutation_generation
+                 FROM session_recovery_selection
+                 WHERE singleton = 1
+             )
+         WHERE session_id = ?1",
+        [session_id],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::StatementChangedRows(changed));
+    }
+    Ok(())
+}
+
+fn verify_protected_recovery_checkpoint(
+    conn: &Connection,
+    session_id: &str,
+    expected_checkpoint_id: i64,
 ) -> Result<bool, rusqlite::Error> {
-    crate::session_restore::session_has_usable_recovery_point_from_conn(conn, session_id)
-        .map_err(clean_authority_error)
+    let observed = crate::session_restore::usable_recovery_checkpoint_id_from_conn(conn, session_id)
+        .map_err(clean_authority_error)?;
+    Ok(observed == Some(expected_checkpoint_id))
+}
+
+fn recovery_session_is_protectable(
+    conn: &Connection,
+    session_id: &str,
+    observer: &impl SessionOwnerObserver,
+) -> Result<bool, rusqlite::Error> {
+    let authority = conn
+        .query_row(
+            "SELECT shutdown_clean,
+                    CASE
+                        WHEN typeof(host_id) = 'text'
+                         AND length(CAST(host_id AS BLOB)) <= ?2
+                        THEN host_id
+                    END,
+                    owner_pid,
+                    owner_process_start,
+                    owner_heartbeat_at,
+                    recovery_acknowledged_at
+             FROM mux_sessions
+             WHERE session_id = ?1",
+            rusqlite::params![
+                session_id,
+                i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        shutdown_clean,
+        host_id,
+        owner_pid,
+        owner_process_start,
+        owner_heartbeat_at,
+        recovery_acknowledged_at,
+    )) = authority
+    else {
+        return Err(recovery_authority_error(
+            "recovery usability authority has no persisted session",
+        ));
+    };
+    if shutdown_clean != 0 || recovery_acknowledged_at.is_some() {
+        return Ok(false);
+    }
+    if classify_unclean_session_owner_with_observer(
+        host_id.as_deref(),
+        owner_pid,
+        owner_process_start,
+        owner_heartbeat_at,
+        observer,
+    ) != UncleanSessionOwnerState::RecoveryCandidate
+    {
+        return Ok(false);
+    }
+    Ok(!has_unresolved_restore_intent(conn, session_id)?)
+}
+
+fn reset_recovery_selection_scan(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let changed = conn.execute(
+        "UPDATE session_recovery_selection
+         SET scan_generation = mutation_generation,
+             scan_after_checkpoint_id = NULL,
+             scan_after_session_id = NULL,
+             protected_session_id = NULL,
+             protected_checkpoint_id = NULL,
+             scan_complete = 0
+         WHERE singleton = 1",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::StatementChangedRows(changed));
+    }
+    Ok(())
 }
 
 fn newest_usable_recovery_session(
-    conn: &Connection,
+    conn: &Transaction<'_>,
     observer: &impl SessionOwnerObserver,
-) -> Result<Option<String>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT session.session_id,
-                CASE
-                    WHEN typeof(session.host_id) = 'text'
-                     AND length(CAST(session.host_id AS BLOB)) <= ?1
-                    THEN session.host_id
-                END,
-                session.owner_pid,
-                session.owner_process_start,
-                session.owner_heartbeat_at
-         FROM mux_sessions AS session
-         WHERE session.shutdown_clean = 0
-           AND session.recovery_acknowledged_at IS NULL
-           AND typeof(session.session_id) = 'text'
-           AND length(CAST(session.session_id AS BLOB)) BETWEEN 1 AND ?2
-         ORDER BY COALESCE((
-                      SELECT MAX(checkpoint.id)
-                      FROM session_checkpoints AS checkpoint
-                      WHERE checkpoint.session_id = session.session_id
-                        AND checkpoint.checkpoint_role = 'snapshot'
-                  ), -1) DESC,
-                  session.session_id ASC",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::params![
-            i64::try_from(MAX_SESSION_HOST_ID_BYTES).unwrap_or(i64::MAX),
-            i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX),
-        ],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        },
-    )?;
-    for row in rows {
-        let (session_id, host_id, owner_pid, owner_process_start, owner_heartbeat_at) = row?;
-        if has_unresolved_restore_intent(conn, &session_id)? {
-            continue;
+) -> Result<ProtectedRecoverySelection, rusqlite::Error> {
+    let mut state = load_recovery_selection_state(conn)?;
+    if advance_recovery_authority_population(conn, &state)? {
+        return Ok(ProtectedRecoverySelection::Pending);
+    }
+    if advance_dirty_recovery_authority(conn)? {
+        return Ok(ProtectedRecoverySelection::Pending);
+    }
+
+    state = load_recovery_selection_state(conn)?;
+    // Owner liveness is external to SQLite: a process can die without any
+    // trigger advancing mutation_generation. A completed scan is therefore a
+    // durable receipt for one cleanup invocation, never a reusable liveness
+    // verdict. Incomplete scans retain their cursor; completed scans restart.
+    if state.scan_generation != state.mutation_generation || state.scan_complete {
+        reset_recovery_selection_scan(conn)?;
+        state = load_recovery_selection_state(conn)?;
+    }
+
+    let selection_limit =
+        i64::try_from(RECOVERY_SELECTION_SCAN_BATCH_ROWS).unwrap_or(i64::MAX);
+    let usable_rows: Vec<(String, i64)> = match (
+        state.scan_after_checkpoint_id,
+        state.scan_after_session_id.as_deref(),
+    ) {
+        (Some(after_checkpoint_id), Some(after_session_id)) => {
+            let mut statement = conn.prepare(
+                "SELECT session_id, validated_checkpoint_id
+                 FROM session_recovery_usability
+                      INDEXED BY idx_session_recovery_usability_state
+                 WHERE state = 'usable'
+                   AND validated_checkpoint_id <= ?1
+                   AND (
+                       validated_checkpoint_id < ?1
+                       OR (validated_checkpoint_id = ?1 AND session_id > ?2)
+                   )
+                 ORDER BY validated_checkpoint_id DESC, session_id ASC
+                 LIMIT ?3",
+            )?;
+            statement
+                .query_map(
+                    rusqlite::params![after_checkpoint_id, after_session_id, selection_limit],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+                .collect::<Result<_, _>>()?
         }
-        if classify_unclean_session_owner_with_observer(
-            host_id.as_deref(),
-            owner_pid,
-            owner_process_start,
-            owner_heartbeat_at,
-            observer,
-        ) != UncleanSessionOwnerState::RecoveryCandidate
-        {
-            continue;
+        (None, None) => {
+            let mut statement = conn.prepare(
+                "SELECT session_id, validated_checkpoint_id
+                 FROM session_recovery_usability
+                      INDEXED BY idx_session_recovery_usability_state
+                 WHERE state = 'usable'
+                 ORDER BY validated_checkpoint_id DESC, session_id ASC
+                 LIMIT ?1",
+            )?;
+            statement
+                .query_map([selection_limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?
         }
-        if session_has_usable_recovery_point(conn, &session_id)? {
-            return Ok(Some(session_id));
+        _ => {
+            return Err(recovery_authority_error(
+                "recovery selection cursor identity is partial",
+            ));
+        }
+    };
+
+    let mut protected = None;
+    for (session_id, checkpoint_id) in &usable_rows {
+        if recovery_session_is_protectable(conn, session_id, observer)? {
+            protected = Some((session_id.as_str(), *checkpoint_id));
+            break;
         }
     }
-    Ok(None)
+
+    if let Some((session_id, checkpoint_id)) = protected {
+        if !verify_protected_recovery_checkpoint(conn, session_id, checkpoint_id)? {
+            invalidate_recovery_authority_row(conn, session_id)?;
+            return Ok(ProtectedRecoverySelection::Pending);
+        }
+        let changed = conn.execute(
+            "UPDATE session_recovery_selection
+             SET protected_session_id = ?1,
+                 protected_checkpoint_id = ?2,
+                 scan_complete = 1
+             WHERE singleton = 1
+               AND scan_generation = mutation_generation",
+            rusqlite::params![session_id, checkpoint_id],
+        )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(changed));
+        }
+        return Ok(ProtectedRecoverySelection::Ready(Some(
+            ProtectedRecoveryPoint {
+                session_id: session_id.to_string(),
+                checkpoint_id,
+            },
+        )));
+    }
+
+    let scan_complete = usable_rows.len() < RECOVERY_SELECTION_SCAN_BATCH_ROWS;
+    let last = usable_rows.last();
+    let changed = conn.execute(
+        "UPDATE session_recovery_selection
+         SET scan_after_checkpoint_id = ?1,
+             scan_after_session_id = ?2,
+             protected_session_id = NULL,
+             protected_checkpoint_id = NULL,
+             scan_complete = ?3
+         WHERE singleton = 1
+           AND scan_generation = mutation_generation",
+        rusqlite::params![
+            last.map(|(_, checkpoint_id)| *checkpoint_id)
+                .or(state.scan_after_checkpoint_id),
+            last.map(|(session_id, _)| session_id.as_str())
+                .or(state.scan_after_session_id.as_deref()),
+            scan_complete,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::StatementChangedRows(changed));
+    }
+    if scan_complete {
+        Ok(ProtectedRecoverySelection::Ready(None))
+    } else {
+        Ok(ProtectedRecoverySelection::Pending)
+    }
 }
 
 fn session_is_deletion_eligible(
     conn: &Connection,
     candidate: &SessionRetentionAuthority,
-    protected_recovery_session: Option<&str>,
+    protected_recovery_point: Option<&ProtectedRecoveryPoint>,
     observer: &impl SessionOwnerObserver,
 ) -> Result<bool, rusqlite::Error> {
     let owner_state = classify_unclean_session_owner_with_observer(
@@ -633,10 +1037,40 @@ fn session_is_deletion_eligible(
     if candidate.recovery_acknowledged_at.is_some() {
         return Ok(true);
     }
-    if protected_recovery_session == Some(candidate.session_id.as_str()) {
-        return Ok(false);
+    let usability = conn
+        .query_row(
+            "SELECT state, validated_checkpoint_id
+             FROM session_recovery_usability
+             WHERE session_id = ?1",
+            [&candidate.session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    match usability {
+        // If no candidate was protectable in this transaction, retain every
+        // unacknowledged session, including corrupt/unusable rows.
+        Some((state, Some(candidate_checkpoint_id))) if state == "usable" => {
+            if candidate_checkpoint_id <= 0 {
+                return Err(recovery_authority_error(
+                    "recovery usability authority has an invalid checkpoint identity",
+                ));
+            }
+            let Some(protected) = protected_recovery_point else {
+                return Ok(false);
+            };
+            // Liveness can change after an earlier cursor batch. Even with a
+            // valid older protected point, a newly dead newer usable session
+            // must survive until the next completed scan promotes it.
+            Ok(candidate.session_id.as_str() != protected.session_id.as_str()
+                && candidate_checkpoint_id < protected.checkpoint_id)
+        }
+        Some((state, None)) if state == "unusable" => Ok(protected_recovery_point.is_some()),
+        Some((state, None)) if state == "dirty" => Ok(false),
+        None => Ok(false),
+        Some(_) => Err(recovery_authority_error(
+            "recovery usability authority has an invalid state",
+        )),
     }
-    session_has_usable_recovery_point(conn, &candidate.session_id)
 }
 
 fn recovery_authority_error(message: &'static str) -> rusqlite::Error {
@@ -822,15 +1256,14 @@ pub(crate) fn has_unresolved_restore_intent(
 }
 
 /// Fail closed when unaudited authority-table triggers could invalidate direct
-/// SQLite row-count receipts. Schema-v40 retained-size triggers are the sole
-/// persistent allowlist: migration validation pins their bodies, and cleanup
-/// depends on them to keep byte deletion receipts exact.
+/// SQLite row-count receipts or cached recovery usability. Migration
+/// validation pins the v40 retained-size and v44 recovery-usability bodies;
+/// cleanup depends on both before any destructive decision.
 ///
-/// The complete 15-trigger set is required, not merely allowed: 12 source
-/// maintenance triggers ensure exactly one summary mutation per source-row
-/// mutation, while three summary self-guards prevent direct authority drift.
-/// SQLite identifiers are case-insensitive while both schema catalogs preserve
-/// the spelling used by `CREATE TRIGGER`, so comparisons use `NOCASE`.
+/// Current schema requires 27 audited triggers: 15 retained-size guards and 12
+/// recovery invalidators. SQLite identifiers are case-insensitive while both
+/// schema catalogs preserve the spelling used by `CREATE TRIGGER`, so
+/// comparisons use `NOCASE`.
 ///
 /// # Errors
 ///
@@ -843,7 +1276,7 @@ pub(crate) fn ensure_session_authority_tables_have_no_unaudited_triggers(
     crate::storage::migrations::validate_session_retained_size_mutation_schema(conn).map_err(
         |error| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
-                "session authority mutation requires the exact canonical retained-size schema: {error}"
+                "session authority mutation requires the exact canonical schema: {error}"
             ))))
         },
     )
@@ -873,7 +1306,13 @@ fn delete_sessions_by_age_with_observer(
 
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
-    let protected_recovery_session = newest_usable_recovery_session(&tx, observer)?;
+    let protected_recovery_session = match newest_usable_recovery_session(&tx, observer)? {
+        ProtectedRecoverySelection::Ready(session_id) => session_id,
+        ProtectedRecoverySelection::Pending => {
+            tx.commit()?;
+            return Ok(0);
+        }
+    };
     let candidates: Vec<SessionRetentionAuthority> = {
         let mut stmt = tx.prepare(
             "SELECT session_id,
@@ -929,7 +1368,7 @@ fn delete_sessions_by_age_with_observer(
         if !session_is_deletion_eligible(
             &tx,
             &candidate,
-            protected_recovery_session.as_deref(),
+            protected_recovery_session.as_ref(),
             observer,
         )? {
             continue;
@@ -964,7 +1403,13 @@ fn delete_excess_closed_sessions_with_observer(
 ) -> Result<usize, rusqlite::Error> {
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
-    let protected_recovery_session = newest_usable_recovery_session(&tx, observer)?;
+    let protected_recovery_session = match newest_usable_recovery_session(&tx, observer)? {
+        ProtectedRecoverySelection::Ready(session_id) => session_id,
+        ProtectedRecoverySelection::Pending => {
+            tx.commit()?;
+            return Ok(0);
+        }
+    };
     let candidates: Vec<SessionRetentionAuthority> = {
         let mut stmt = tx.prepare(
             "SELECT session_id,
@@ -1020,7 +1465,7 @@ fn delete_excess_closed_sessions_with_observer(
         if !session_is_deletion_eligible(
             &tx,
             &candidate,
-            protected_recovery_session.as_deref(),
+            protected_recovery_session.as_ref(),
             observer,
         )? {
             continue;
@@ -1212,8 +1657,14 @@ fn delete_sessions_by_size_with_observer(
     // connection did not delete.
     let tx = begin_retention_transaction(conn)?;
     ensure_session_authority_tables_have_no_unaudited_triggers(&tx)?;
+    let protected_recovery_session = match newest_usable_recovery_session(&tx, observer)? {
+        ProtectedRecoverySelection::Ready(session_id) => session_id,
+        ProtectedRecoverySelection::Pending => {
+            tx.commit()?;
+            return Ok(SizeCleanupOutcome::default());
+        }
+    };
     validate_session_retained_size_authority(&tx)?;
-    let protected_recovery_session = newest_usable_recovery_session(&tx, observer)?;
 
     // The generated retained_bytes column is checked non-negative and each
     // summary row belongs to exactly one live mux session. SUM overflow is a
@@ -1315,7 +1766,7 @@ fn delete_sessions_by_size_with_observer(
         if session_is_deletion_eligible(
             &tx,
             &candidate,
-            protected_recovery_session.as_deref(),
+            protected_recovery_session.as_ref(),
             observer,
         )? {
             sessions.push((candidate.session_id, session_bytes));
@@ -1593,6 +2044,8 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    use std::sync::{LazyLock, Mutex};
 
     use super::*;
 
@@ -1600,6 +2053,17 @@ mod tests {
     const TEST_MACHINE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const TEST_BOOT_A: &str = "11111111-1111-4111-8111-111111111111";
     const TEST_BOOT_B: &str = "22222222-2222-4222-8222-222222222222";
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    static RECOVERY_TRACE_STATEMENTS: LazyLock<Mutex<Vec<String>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    fn record_recovery_trace_statement(sql: &str) {
+        RECOVERY_TRACE_STATEMENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sql.to_string());
+    }
 
     struct FakeOwnerObserver {
         current_host: Option<SessionHostIdentity>,
@@ -1950,6 +2414,23 @@ mod tests {
             .unwrap();
         conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
         conn
+    }
+
+    fn drive_recovery_selection(
+        conn: &Connection,
+        observer: &impl SessionOwnerObserver,
+        max_steps: usize,
+    ) -> Option<String> {
+        for _ in 0..max_steps {
+            let transaction = begin_retention_transaction(conn).unwrap();
+            ensure_session_authority_tables_have_no_unaudited_triggers(&transaction).unwrap();
+            let selection = newest_usable_recovery_session(&transaction, observer).unwrap();
+            transaction.commit().unwrap();
+            if let ProtectedRecoverySelection::Ready(point) = selection {
+                return point.map(|point| point.session_id);
+            }
+        }
+        panic!("recovery selection did not converge within {max_steps} bounded steps");
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -2415,8 +2896,9 @@ mod tests {
         );
         assert_eq!(count_sessions(&conn), 1);
         assert!(
-            crate::session_restore::session_has_usable_recovery_point_from_conn(&conn, "crash-new")
+            crate::session_restore::usable_recovery_checkpoint_id_from_conn(&conn, "crash-new")
                 .unwrap()
+                .is_some()
         );
 
         insert_session(&conn, "crash-newer", 200, false);
@@ -2459,12 +2941,36 @@ mod tests {
         )
         .unwrap();
 
-        for session_id in ["empty-crash", "mismatched-crash", "corrupt-crash"] {
+        insert_session(&conn, "legacy-crash", 4, false);
+        set_unclean_owner(&conn, "legacy-crash", &host_id, 44, 904, 4);
+        let legacy_checkpoint = insert_v2_recovery_snapshot(&conn, "legacy-crash", 4, 40, 40);
+        conn.execute(
+            "UPDATE session_checkpoints SET state_hash = 'legacy-unverified' WHERE id = ?1",
+            [legacy_checkpoint],
+        )
+        .unwrap();
+
+        insert_session(&conn, "missing-pane-crash", 5, false);
+        set_unclean_owner(&conn, "missing-pane-crash", &host_id, 45, 905, 5);
+        let missing_pane_checkpoint =
+            insert_v2_recovery_snapshot(&conn, "missing-pane-crash", 5, 50, 50);
+        conn.execute(
+            "DELETE FROM mux_pane_state WHERE checkpoint_id = ?1",
+            [missing_pane_checkpoint],
+        )
+        .unwrap();
+
+        for session_id in [
+            "empty-crash",
+            "mismatched-crash",
+            "corrupt-crash",
+            "legacy-crash",
+            "missing-pane-crash",
+        ] {
             assert!(
-                !crate::session_restore::session_has_usable_recovery_point_from_conn(
-                    &conn, session_id
-                )
-                .unwrap(),
+                crate::session_restore::usable_recovery_checkpoint_id_from_conn(&conn, session_id)
+                    .unwrap()
+                    .is_none(),
                 "{session_id} must not be represented as a usable recovery authority"
             );
         }
@@ -2473,7 +2979,962 @@ mod tests {
             0,
             "ambiguous or unusable recovery state must require explicit acknowledgement"
         );
-        assert_eq!(count_sessions(&conn), 3);
+        assert_eq!(count_sessions(&conn), 5);
+        assert_eq!(drive_recovery_selection(&conn, &dead, 4), None);
+        let usable_authorities: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_recovery_usability WHERE state = 'usable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usable_authorities, 0);
+    }
+
+    #[test]
+    fn stale_selected_checkpoint_identity_is_invalidated_fail_closed() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        insert_session(&conn, "stale-selected-identity", 1, false);
+        set_unclean_owner(
+            &conn,
+            "stale-selected-identity",
+            &host_id,
+            46,
+            906,
+            1,
+        );
+        let canonical_checkpoint =
+            insert_v2_recovery_snapshot(&conn, "stale-selected-identity", 1, 46, 46);
+        conn.execute(
+            "UPDATE session_recovery_usability
+             SET state = 'usable',
+                 validated_checkpoint_id = ?2
+             WHERE session_id = ?1",
+            rusqlite::params!["stale-selected-identity", canonical_checkpoint + 1],
+        )
+        .unwrap();
+
+        let generation_before: i64 = conn
+            .query_row(
+                "SELECT mutation_generation FROM session_recovery_selection",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let transaction = begin_retention_transaction(&conn).unwrap();
+        assert_eq!(
+            newest_usable_recovery_session(&transaction, &dead).unwrap(),
+            ProtectedRecoverySelection::Pending,
+            "a stale selected identity must be invalidated before cleanup can continue"
+        );
+        transaction.commit().unwrap();
+        let (state, checkpoint_id, generation_after): (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT usability.state,
+                        usability.validated_checkpoint_id,
+                        selection.mutation_generation
+                 FROM session_recovery_usability AS usability
+                 CROSS JOIN session_recovery_selection AS selection
+                 WHERE usability.session_id = 'stale-selected-identity'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "dirty");
+        assert_eq!(checkpoint_id, None);
+        assert_eq!(generation_after, generation_before + 1);
+    }
+
+    #[test]
+    fn legacy_population_is_durable_and_bounded_across_thousands_of_sessions() {
+        const SESSION_COUNT: usize = 2_049;
+        let conn = make_test_db();
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        for index in 0..SESSION_COUNT {
+            insert_session(
+                &conn,
+                &format!("legacy-{index:05}"),
+                i64::try_from(index).unwrap(),
+                false,
+            );
+        }
+        conn.execute("DELETE FROM session_recovery_usability", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE session_recovery_selection
+             SET population_after_rowid = NULL,
+                 population_complete = 0,
+                 scan_generation = 0,
+                 scan_after_checkpoint_id = NULL,
+                 scan_after_session_id = NULL,
+                 protected_session_id = NULL,
+                 protected_checkpoint_id = NULL,
+                 scan_complete = 0",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
+            0,
+            "the first bounded legacy batch must never authorize deletion"
+        );
+        let first_batch: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_recovery_usability", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            first_batch,
+            i64::try_from(RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS).unwrap()
+        );
+        assert_eq!(count_sessions(&conn), i64::try_from(SESSION_COUNT).unwrap());
+
+        for _ in 0..SESSION_COUNT.div_ceil(RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS) {
+            let transaction = begin_retention_transaction(&conn).unwrap();
+            let _ = newest_usable_recovery_session(&transaction, &dead).unwrap();
+            transaction.commit().unwrap();
+            let complete: bool = conn
+                .query_row(
+                    "SELECT population_complete FROM session_recovery_selection",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if complete {
+                break;
+            }
+        }
+        let (authority_rows, population_complete): (i64, bool) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM session_recovery_usability),
+                        population_complete
+                 FROM session_recovery_selection",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(authority_rows, i64::try_from(SESSION_COUNT).unwrap());
+        assert!(population_complete);
+        assert_eq!(count_sessions(&conn), i64::try_from(SESSION_COUNT).unwrap());
+    }
+
+    #[test]
+    fn legacy_population_cursor_admits_negative_sqlite_rowids() {
+        let conn = make_test_db();
+        insert_session(&conn, "negative-rowid", 1, false);
+        conn.execute(
+            "UPDATE mux_sessions SET rowid = -7 WHERE session_id = 'negative-rowid'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM session_recovery_usability", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE session_recovery_selection
+             SET population_after_rowid = NULL,
+                 population_complete = 0,
+                 scan_generation = 0,
+                 scan_after_checkpoint_id = NULL,
+                 scan_after_session_id = NULL,
+                 protected_session_id = NULL,
+                 protected_checkpoint_id = NULL,
+                 scan_complete = 0",
+            [],
+        )
+        .unwrap();
+
+        let transaction = begin_retention_transaction(&conn).unwrap();
+        assert_eq!(
+            newest_usable_recovery_session(
+                &transaction,
+                &FakeOwnerObserver {
+                    current_host: Some(test_host("trj", "boot-a")),
+                    processes: BTreeMap::new(),
+                },
+            )
+            .unwrap(),
+            ProtectedRecoverySelection::Pending
+        );
+        transaction.commit().unwrap();
+        let (cursor, complete, authority_rows): (i64, bool, i64) = conn
+            .query_row(
+                "SELECT population_after_rowid,
+                        population_complete,
+                        (SELECT COUNT(*) FROM session_recovery_usability)
+                 FROM session_recovery_selection",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cursor, -7);
+        assert!(complete);
+        assert_eq!(authority_rows, 1);
+    }
+
+    #[test]
+    fn bounded_recovery_queries_have_fixed_limits_and_keyset_plans() {
+        assert_eq!(RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS, 64);
+        assert_eq!(RECOVERY_AUTHORITY_RECONCILE_BATCH_ROWS, 4);
+        assert_eq!(RECOVERY_SELECTION_SCAN_BATCH_ROWS, 64);
+        assert_eq!(MAX_CHECKPOINT_SESSION_ID_BYTES, 256);
+        assert_eq!(
+            RECOVERY_AUTHORITY_RECONCILE_MAX_ADMITTED_BYTES,
+            4 * MAX_PERSISTED_CHECKPOINT_TEXT_BYTES
+        );
+        assert_eq!(
+            RECOVERY_AUTHORITY_RECONCILE_WALL_BUDGET,
+            Duration::from_millis(40)
+        );
+
+        let conn = make_test_db();
+        let plan_details = |sql: &str| -> Vec<String> {
+            let mut statement = conn.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let population = plan_details(
+            "EXPLAIN QUERY PLAN
+             SELECT rowid FROM mux_sessions
+             WHERE rowid > 10 ORDER BY rowid ASC LIMIT 65",
+        )
+        .join(" ");
+        assert!(
+            population.contains("INTEGER PRIMARY KEY"),
+            "resumed population must seek by rowid: {population}"
+        );
+        let reconciliation = plan_details(
+            "EXPLAIN QUERY PLAN
+             SELECT session_id, dirty_generation
+             FROM session_recovery_usability
+                  INDEXED BY idx_session_recovery_usability_dirty
+             WHERE state = 'dirty'
+             ORDER BY dirty_generation ASC, session_id ASC
+             LIMIT 4",
+        )
+        .join(" ");
+        assert!(
+            reconciliation.contains("idx_session_recovery_usability_dirty"),
+            "dirty reconciliation must use its bounded-order index: {reconciliation}"
+        );
+        let selection = plan_details(
+            "EXPLAIN QUERY PLAN
+             SELECT session_id, validated_checkpoint_id
+             FROM session_recovery_usability
+                  INDEXED BY idx_session_recovery_usability_state
+             WHERE state = 'usable'
+               AND validated_checkpoint_id <= 100
+               AND (validated_checkpoint_id < 100
+                    OR (validated_checkpoint_id = 100 AND session_id > 'cursor'))
+             ORDER BY validated_checkpoint_id DESC, session_id ASC
+             LIMIT 64",
+        )
+        .join(" ");
+        assert!(
+            selection.contains("idx_session_recovery_usability_state"),
+            "resumed selection must seek the ordered usability index: {selection}"
+        );
+    }
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[test]
+    #[allow(deprecated)]
+    fn bounded_reconciliation_statement_count_is_history_independent() {
+        fn first_step_statement_count(session_count: usize) -> usize {
+            let mut conn = make_test_db();
+            for index in 0..session_count {
+                insert_session(
+                    &conn,
+                    &format!("statement-count-{index:05}"),
+                    i64::try_from(index).unwrap(),
+                    false,
+                );
+            }
+            RECOVERY_TRACE_STATEMENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            conn.trace(Some(record_recovery_trace_statement));
+            let transaction = begin_retention_transaction(&conn).unwrap();
+            let observer = FakeOwnerObserver {
+                current_host: Some(test_host("trj", "boot-a")),
+                processes: BTreeMap::new(),
+            };
+            assert_eq!(
+                newest_usable_recovery_session(&transaction, &observer).unwrap(),
+                ProtectedRecoverySelection::Pending
+            );
+            transaction.commit().unwrap();
+            conn.trace(None);
+            RECOVERY_TRACE_STATEMENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+
+        let exact_batch_count = first_step_statement_count(4);
+        let long_history_count = first_step_statement_count(2_049);
+        assert_eq!(exact_batch_count, long_history_count);
+        assert_eq!(
+            long_history_count, 12,
+            "BEGIN + two bounded authority queries + four canonical probes + four authority updates + COMMIT"
+        );
+    }
+
+    #[test]
+    fn long_corrupt_prefix_defers_then_preserves_the_newest_canonical_point() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        insert_session(&conn, "usable-old", 1, false);
+        set_unclean_owner(&conn, "usable-old", &host_id, 40, 940, 1);
+        insert_v2_recovery_snapshot(&conn, "usable-old", 1, 1, 1);
+        for index in 0_i64..13 {
+            let session_id = format!("corrupt-{index:02}");
+            insert_session(&conn, &session_id, 10 + index, false);
+            set_unclean_owner(
+                &conn,
+                &session_id,
+                &host_id,
+                100 + index,
+                1_000 + index,
+                10 + index,
+            );
+            let checkpoint_id = insert_v2_recovery_snapshot(
+                &conn,
+                &session_id,
+                10 + index,
+                u64::try_from(index + 10).unwrap(),
+                u64::try_from(index + 10).unwrap(),
+            );
+            conn.execute(
+                "UPDATE session_checkpoints
+                 SET state_hash = 'snp2:corrupt'
+                 WHERE id = ?1",
+                [checkpoint_id],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
+            0,
+            "the first reconciliation batch must commit progress without deleting"
+        );
+        assert_eq!(count_sessions(&conn), 14);
+        let mut deleted = 0_usize;
+        for _ in 0..8 {
+            deleted = deleted.saturating_add(
+                delete_excess_closed_sessions_with_observer(&conn, 0, &dead).unwrap(),
+            );
+            if deleted == 13 {
+                break;
+            }
+        }
+        assert_eq!(deleted, 13);
+        assert_eq!(count_sessions(&conn), 1);
+        assert_eq!(
+            conn.query_row("SELECT session_id FROM mux_sessions", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "usable-old"
+        );
+        assert!(
+            crate::session_restore::usable_recovery_checkpoint_id_from_conn(&conn, "usable-old")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn interrupted_reconciliation_rolls_back_and_committed_selection_survives_restart() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
+        insert_session(&conn, "restart-authority", 1, false);
+        set_unclean_owner(&conn, "restart-authority", &host_id, 81, 981, 1);
+        let restart_checkpoint =
+            insert_v2_recovery_snapshot(&conn, "restart-authority", 1, 81, 81);
+
+        {
+            let transaction = begin_retention_transaction(&conn).unwrap();
+            assert_eq!(
+                newest_usable_recovery_session(&transaction, &dead).unwrap(),
+                ProtectedRecoverySelection::Ready(Some(ProtectedRecoveryPoint {
+                    session_id: "restart-authority".to_string(),
+                    checkpoint_id: restart_checkpoint,
+                }))
+            );
+            // Drop without commit to model interruption after reconciliation
+            // and selection but before the transaction receipt is durable.
+        }
+        let rolled_back_state: String = conn
+            .query_row(
+                "SELECT state FROM session_recovery_usability
+                 WHERE session_id = 'restart-authority'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rolled_back_state, "dirty");
+        assert_eq!(
+            drive_recovery_selection(&conn, &dead, 4).as_deref(),
+            Some("restart-authority")
+        );
+        drop(conn);
+
+        let reopened = Connection::open(&path).unwrap();
+        reopened.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        assert_eq!(
+            drive_recovery_selection(&reopened, &dead, 1).as_deref(),
+            Some("restart-authority"),
+            "restart must recompute and canonically verify the protected identity"
+        );
+    }
+
+    #[test]
+    fn cached_selection_rechecks_host_fence_after_database_move() {
+        let conn = make_test_db();
+        let host_a = serde_json::to_string(&test_host_on_machine(
+            "host-a",
+            TEST_MACHINE_A,
+            "boot-a",
+        ))
+        .unwrap();
+        let host_b = serde_json::to_string(&test_host_on_machine(
+            "host-b",
+            TEST_MACHINE_B,
+            "boot-b",
+        ))
+        .unwrap();
+        let observer_a = FakeOwnerObserver {
+            current_host: Some(test_host_on_machine(
+                "host-a",
+                TEST_MACHINE_A,
+                "boot-a",
+            )),
+            processes: BTreeMap::new(),
+        };
+        let observer_b = FakeOwnerObserver {
+            current_host: Some(test_host_on_machine(
+                "host-b",
+                TEST_MACHINE_B,
+                "boot-b",
+            )),
+            processes: BTreeMap::new(),
+        };
+
+        insert_session(&conn, "candidate-on-b", 1, false);
+        set_unclean_owner(&conn, "candidate-on-b", &host_b, 701, 1_701, 1);
+        insert_v2_recovery_snapshot(&conn, "candidate-on-b", 1, 701, 701);
+        insert_session(&conn, "candidate-on-a", 2, false);
+        set_unclean_owner(&conn, "candidate-on-a", &host_a, 702, 1_702, 2);
+        insert_v2_recovery_snapshot(&conn, "candidate-on-a", 2, 702, 702);
+
+        assert_eq!(
+            drive_recovery_selection(&conn, &observer_a, 4).as_deref(),
+            Some("candidate-on-a")
+        );
+        assert_eq!(
+            drive_recovery_selection(&conn, &observer_b, 2).as_deref(),
+            Some("candidate-on-b"),
+            "a persisted cache must not carry one machine's owner verdict onto another machine"
+        );
+    }
+
+    #[test]
+    fn newly_dead_candidate_above_durable_cursor_is_retained_until_promoted() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        insert_session(&conn, "cursor-protected-old", 1, false);
+        set_unclean_owner(&conn, "cursor-protected-old", &host_id, 800, 1_800, 1);
+        insert_v2_recovery_snapshot(&conn, "cursor-protected-old", 1, 800, 800);
+
+        let mut live_processes = BTreeMap::new();
+        for index in 0_i64..65 {
+            let session_id = format!("cursor-live-{index:03}");
+            let pid = 801 + index;
+            let process_start = 1_801 + index;
+            insert_session(&conn, &session_id, 2 + index, false);
+            set_unclean_owner(
+                &conn,
+                &session_id,
+                &host_id,
+                pid,
+                process_start,
+                2 + index,
+            );
+            insert_v2_recovery_snapshot(
+                &conn,
+                &session_id,
+                2 + index,
+                u64::try_from(pid).unwrap(),
+                u64::try_from(pid).unwrap(),
+            );
+            live_processes.insert(
+                u32::try_from(pid).unwrap(),
+                procinfo::ProcessStartTimeObservation::Running(
+                    u64::try_from(process_start).unwrap(),
+                ),
+            );
+        }
+        let live = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: live_processes.clone(),
+        };
+        assert_eq!(
+            drive_recovery_selection(&conn, &live, 96).as_deref(),
+            Some("cursor-protected-old")
+        );
+
+        let transaction = begin_retention_transaction(&conn).unwrap();
+        assert_eq!(
+            newest_usable_recovery_session(&transaction, &live).unwrap(),
+            ProtectedRecoverySelection::Pending,
+            "the first restarted scan must stop at the exact 64-row boundary"
+        );
+        transaction.commit().unwrap();
+
+        let mut after_death_processes = live_processes;
+        after_death_processes.remove(&865);
+        let after_death = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: after_death_processes,
+        };
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&conn, 0, &after_death).unwrap(),
+            0,
+            "a newer candidate that died above the durable cursor must not be deleted behind the older protected point"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM mux_sessions WHERE session_id = 'cursor-live-064'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            delete_excess_closed_sessions_with_observer(&conn, 0, &after_death).unwrap(),
+            1,
+            "the next completed scan must promote the newly dead newest candidate and reclaim the older point"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM mux_sessions WHERE session_id = 'cursor-live-064'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM mux_sessions WHERE session_id = 'cursor-protected-old'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_checkpoint_commit_cannot_cross_selection_transaction() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        let selector = Connection::open(&path).unwrap();
+        selector
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+            .unwrap();
+        selector
+            .execute_batch(crate::storage::SCHEMA_SQL)
+            .unwrap();
+        insert_session(&selector, "concurrent-authority", 1, false);
+        set_unclean_owner(
+            &selector,
+            "concurrent-authority",
+            &host_id,
+            401,
+            1_401,
+            1,
+        );
+        let concurrent_checkpoint =
+            insert_v2_recovery_snapshot(&selector, "concurrent-authority", 1, 401, 401);
+        assert_eq!(
+            drive_recovery_selection(&selector, &dead, 4).as_deref(),
+            Some("concurrent-authority")
+        );
+
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        writer.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let transaction = begin_retention_transaction(&selector).unwrap();
+        assert_eq!(
+            newest_usable_recovery_session(&transaction, &dead).unwrap(),
+            ProtectedRecoverySelection::Ready(Some(ProtectedRecoveryPoint {
+                session_id: "concurrent-authority".to_string(),
+                checkpoint_id: concurrent_checkpoint,
+            }))
+        );
+        let blocked = writer.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role, topology_json
+             ) VALUES (
+                 'concurrent-authority', 2, 'periodic', 'legacy',
+                 0, 0, 'snapshot', '{}'
+             )",
+            [],
+        );
+        assert!(
+            blocked.as_ref().is_err_and(|error| matches!(
+                error.sqlite_error_code(),
+                Some(
+                    rusqlite::ffi::ErrorCode::DatabaseBusy
+                        | rusqlite::ffi::ErrorCode::DatabaseLocked
+                )
+            )),
+            "the immediate selection transaction must serialize checkpoint commits: {blocked:?}"
+        );
+        transaction.commit().unwrap();
+        writer
+            .execute(
+                "INSERT INTO session_checkpoints (
+                     session_id, checkpoint_at, checkpoint_type, state_hash,
+                     pane_count, total_bytes, checkpoint_role, topology_json
+                 ) VALUES (
+                     'concurrent-authority', 2, 'periodic', 'legacy',
+                     0, 0, 'snapshot', '{}'
+                 )",
+                [],
+            )
+            .unwrap();
+        let (state, scan_complete): (String, bool) = selector
+            .query_row(
+                "SELECT usability.state, selection.scan_complete
+                 FROM session_recovery_usability AS usability
+                 CROSS JOIN session_recovery_selection AS selection
+                 WHERE usability.session_id = 'concurrent-authority'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "dirty");
+        assert!(!scan_complete);
+    }
+
+    #[test]
+    fn every_recovery_source_mutation_invalidates_or_removes_authority() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        let cases = [
+            "checkpoint-insert",
+            "checkpoint-update",
+            "checkpoint-delete",
+            "pane-insert",
+            "pane-update",
+            "pane-delete",
+        ];
+        let mut checkpoints = BTreeMap::new();
+        for (index, session_id) in cases.into_iter().enumerate() {
+            insert_session(&conn, session_id, i64::try_from(index).unwrap(), false);
+            set_unclean_owner(
+                &conn,
+                session_id,
+                &host_id,
+                200 + i64::try_from(index).unwrap(),
+                1_200 + i64::try_from(index).unwrap(),
+                i64::try_from(index).unwrap(),
+            );
+            let checkpoint_id = insert_v2_recovery_snapshot(
+                &conn,
+                session_id,
+                i64::try_from(index).unwrap(),
+                200 + u64::try_from(index).unwrap(),
+                200 + u64::try_from(index).unwrap(),
+            );
+            checkpoints.insert(session_id, checkpoint_id);
+        }
+        assert!(drive_recovery_selection(&conn, &dead, 8).is_some());
+
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, checkpoint_role, topology_json
+             ) VALUES ('checkpoint-insert', 90, 'periodic', 'legacy', 0, 0,
+                       'snapshot', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_checkpoints SET topology_json = '{\"changed\":true}'
+             WHERE id = ?1",
+            [checkpoints["checkpoint-update"]],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM session_checkpoints WHERE id = ?1",
+            [checkpoints["checkpoint-delete"]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mux_pane_state (
+                 checkpoint_id, pane_id, terminal_state_json
+             ) VALUES (?1, 999, '{}')",
+            [checkpoints["pane-insert"]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_pane_state SET terminal_state_json = '{\"changed\":true}'
+             WHERE checkpoint_id = ?1",
+            [checkpoints["pane-update"]],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM mux_pane_state WHERE checkpoint_id = ?1",
+            [checkpoints["pane-delete"]],
+        )
+        .unwrap();
+
+        for session_id in cases {
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM session_recovery_usability WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "dirty", "{session_id} mutation must invalidate");
+        }
+        let scan_complete: bool = conn
+            .query_row(
+                "SELECT scan_complete FROM session_recovery_selection",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!scan_complete);
+
+        insert_session(&conn, "ack-preserve-authority", 99, false);
+        set_unclean_owner(
+            &conn,
+            "ack-preserve-authority",
+            &host_id,
+            299,
+            1_299,
+            99,
+        );
+        insert_v2_recovery_snapshot(&conn, "ack-preserve-authority", 99, 299, 299);
+        assert_eq!(
+            drive_recovery_selection(&conn, &dead, 8).as_deref(),
+            Some("ack-preserve-authority")
+        );
+        set_recovery_acknowledgement_with_observer(
+            &conn,
+            "ack-preserve-authority",
+            Some(100),
+            &dead,
+        )
+        .unwrap();
+        let (ack_state, ack_scan_complete): (String, bool) = conn
+            .query_row(
+                "SELECT usability.state, selection.scan_complete
+                 FROM session_recovery_usability AS usability
+                 CROSS JOIN session_recovery_selection AS selection
+                 WHERE usability.session_id = 'ack-preserve-authority'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ack_state, "usable");
+        assert!(!ack_scan_complete);
+        set_recovery_acknowledgement_with_observer(
+            &conn,
+            "ack-preserve-authority",
+            None,
+            &dead,
+        )
+        .unwrap();
+        let preserved_ack: Option<i64> = conn
+            .query_row(
+                "SELECT recovery_acknowledged_at FROM mux_sessions
+                 WHERE session_id = 'ack-preserve-authority'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_ack, None);
+
+        insert_session(&conn, "lifecycle-authority", 100, false);
+        set_unclean_owner(
+            &conn,
+            "lifecycle-authority",
+            &host_id,
+            301,
+            1_301,
+            100,
+        );
+        let lifecycle_source =
+            insert_v2_recovery_snapshot(&conn, "lifecycle-authority", 100, 301, 301);
+        conn.execute(
+            "INSERT INTO session_checkpoints (
+                 session_id, checkpoint_at, checkpoint_type, state_hash,
+                 pane_count, total_bytes, metadata_json, checkpoint_role
+             ) VALUES (
+                 'lifecycle-authority', 101, 'startup', 'pending:rsi2',
+                 0, 0, '{\"restore_attempt\":{\"phase\":\"intent\"}}',
+                 'restore_intent'
+             )",
+            [],
+        )
+        .unwrap();
+        let lifecycle_intent = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO restore_attempt_lifecycle (
+                 intent_checkpoint_id, session_id, source_checkpoint_id,
+                 status, created_at, resolved_at
+             ) VALUES (?1, 'lifecycle-authority', ?2, 'resolved', 101, 101)",
+            rusqlite::params![lifecycle_intent, lifecycle_source],
+        )
+        .unwrap();
+        assert!(drive_recovery_selection(&conn, &dead, 8).is_some());
+        conn.execute(
+            "UPDATE restore_attempt_lifecycle
+             SET resolved_at = 102
+             WHERE intent_checkpoint_id = ?1",
+            [lifecycle_intent],
+        )
+        .unwrap();
+        let lifecycle_scan_complete: bool = conn
+            .query_row(
+                "SELECT scan_complete FROM session_recovery_selection",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!lifecycle_scan_complete);
+        conn.execute(
+            "DELETE FROM restore_attempt_lifecycle WHERE intent_checkpoint_id = ?1",
+            [lifecycle_intent],
+        )
+        .unwrap();
+
+        insert_session(&conn, "cascade-authority", 100, false);
+        set_unclean_owner(&conn, "cascade-authority", &host_id, 300, 1_300, 100);
+        insert_v2_recovery_snapshot(&conn, "cascade-authority", 100, 300, 300);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "DELETE FROM mux_sessions WHERE session_id = 'cascade-authority'",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let orphaned_authority: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM session_recovery_usability
+                     WHERE session_id = 'cascade-authority'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!orphaned_authority);
+    }
+
+    #[test]
+    fn checkpoint_pane_burst_coalesces_to_one_authority_generation() {
+        let conn = make_test_db();
+        let host_id = encoded_test_host("trj", "boot-a");
+        let dead = FakeOwnerObserver {
+            current_host: Some(test_host("trj", "boot-a")),
+            processes: BTreeMap::new(),
+        };
+        insert_session(&conn, "pane-burst", 1, false);
+        set_unclean_owner(&conn, "pane-burst", &host_id, 501, 1_501, 1);
+        insert_v2_recovery_snapshot(&conn, "pane-burst", 1, 501, 501);
+        assert_eq!(
+            drive_recovery_selection(&conn, &dead, 4).as_deref(),
+            Some("pane-burst")
+        );
+        let generation_before: i64 = conn
+            .query_row(
+                "SELECT mutation_generation FROM session_recovery_selection",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let transaction = begin_retention_transaction(&conn).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO session_checkpoints (
+                     session_id, checkpoint_at, checkpoint_type, state_hash,
+                     pane_count, total_bytes, checkpoint_role, topology_json
+                 ) VALUES (
+                     'pane-burst', 2, 'periodic', 'pending:snp2',
+                     100, 200, 'snapshot', '{}'
+                 )",
+                [],
+            )
+            .unwrap();
+        let checkpoint_id = transaction.last_insert_rowid();
+        for pane_id in 0..100_i64 {
+            transaction
+                .execute(
+                    "INSERT INTO mux_pane_state (
+                         checkpoint_id, pane_id, terminal_state_json
+                     ) VALUES (?1, ?2, '{}')",
+                    rusqlite::params![checkpoint_id, pane_id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let (generation_after, state): (i64, String) = conn
+            .query_row(
+                "SELECT selection.mutation_generation, usability.state
+                 FROM session_recovery_selection AS selection
+                 CROSS JOIN session_recovery_usability AS usability
+                 WHERE usability.session_id = 'pane-burst'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(generation_after, generation_before + 1);
+        assert_eq!(state, "dirty");
     }
 
     #[test]
