@@ -27,10 +27,11 @@ use crate::checkpoint_witness::{
 };
 use crate::config::SessionRetentionConfig;
 
-// Version 2 records a microsecond-resolution process-start token on macOS.
-// Version 1 identities must remain unknown rather than comparing their
-// second-resolution token against the stronger incarnation fence.
-const SESSION_HOST_IDENTITY_VERSION: u8 = 2;
+// Version 2 introduced a microsecond-resolution macOS process-start token.
+// Version 3 replaces the wall-clock-derived macOS boot timestamp with the
+// kernel boot-session UUID, which cannot drift after a clock correction. Older
+// identities remain unknown rather than crossing either stronger fence.
+const SESSION_HOST_IDENTITY_VERSION: u8 = 3;
 const MAX_HOSTNAME_BYTES: usize = 255;
 const MAX_BOOT_ID_BYTES: usize = 512;
 

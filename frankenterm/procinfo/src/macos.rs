@@ -50,31 +50,36 @@ impl LocalProcessInfo {
                 ProcessStartTimeObservation::Running,
             );
         }
-        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        if read == 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
             ProcessStartTimeObservation::Absent
         } else {
             ProcessStartTimeObservation::Unknown
         }
     }
 
-    /// Derive a stable macOS boot identity from the kernel boot timestamp.
+    /// Read the kernel-generated UUID that is stable for one boot session.
     pub fn host_boot_id() -> Option<String> {
-        let mut boot_time: libc::timeval = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::timeval>();
-        let name = b"kern.boottime\0";
+        let mut value = [0_u8; 128];
+        let mut size = value.len();
+        let name = b"kern.bootsessionuuid\0";
         let result = unsafe {
             libc::sysctlbyname(
                 name.as_ptr().cast(),
-                &mut boot_time as *mut _ as *mut _,
+                value.as_mut_ptr().cast(),
                 &mut size,
                 std::ptr::null_mut(),
                 0,
             )
         };
-        if result != 0 || size != std::mem::size_of::<libc::timeval>() || boot_time.tv_sec <= 0 {
+        if result != 0 || size == 0 || size > value.len() {
             return None;
         }
-        Some(format!("{}:{}", boot_time.tv_sec, boot_time.tv_usec))
+        let bytes = &value[..size];
+        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        let boot_id = std::str::from_utf8(&bytes[..end]).ok()?.trim();
+        (!boot_id.is_empty()).then(|| boot_id.to_string())
     }
 
     pub fn current_working_dir(pid: u32) -> Option<PathBuf> {

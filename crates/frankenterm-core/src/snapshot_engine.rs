@@ -6020,7 +6020,9 @@ fn save_checkpoint_authoritatively_sync(
                     now_ms,
                     prepared.topology_json.as_str(),
                     metadata.ft_version.as_str(),
-                    metadata.host_id.as_deref(),
+                    owner_identity
+                        .map(|identity| identity.host_id.as_str())
+                        .or(metadata.host_id.as_deref()),
                     owner_identity.map(|identity| identity.pid),
                     owner_identity.map(|identity| identity.process_start),
                     owner_identity.map(|_| now_ms),
@@ -6099,7 +6101,7 @@ fn save_checkpoint_authoritatively_sync(
                      topology_json = ?2,
                      shutdown_clean = 0,
                      clean_checkpoint_id = NULL,
-                     owner_heartbeat_at = ?1,
+                     owner_heartbeat_at = ?7,
                      recovery_acknowledged_at = NULL
                  WHERE session_id = ?3
                    AND (
@@ -6117,6 +6119,7 @@ fn save_checkpoint_authoritatively_sync(
                     owner_identity.map(|identity| identity.host_id.as_str()),
                     owner_identity.map(|identity| identity.pid),
                     owner_identity.map(|identity| identity.process_start),
+                    owner_identity.map(|_| now_ms),
                 ],
             )?;
             require_exactly_one_changed_row(updated_session)?;
@@ -9716,7 +9719,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_creation_without_owner_authority_leaves_owner_tuple_null() {
+    fn checkpoint_creation_and_heartbeat_without_owner_authority_leave_owner_tuple_null() {
         let (_tmp, db_path) = setup_test_db();
         let pane = make_test_pane(1, 24, 80);
         let (topology, _) = TopologySnapshot::from_panes(std::slice::from_ref(&pane), 100);
@@ -9737,18 +9740,38 @@ mod tests {
             None,
         )
         .unwrap();
+        save_checkpoint_authoritatively_sync(
+            db_path.as_str(),
+            "owner-unavailable",
+            101,
+            "manual",
+            &prepared,
+            None,
+            None,
+        )
+        .expect("a subsequent checkpoint must not fabricate a heartbeat without owner authority");
 
-        let owner_tuple: (Option<String>, Option<i64>, Option<i64>, Option<i64>) =
+        let owner_tuple: (Option<String>, Option<i64>, Option<i64>, Option<i64>, i64) =
             Connection::open(db_path.as_str())
                 .unwrap()
                 .query_row(
-                    "SELECT host_id, owner_pid, owner_process_start, owner_heartbeat_at
+                    "SELECT host_id, owner_pid, owner_process_start, owner_heartbeat_at,
+                            (SELECT COUNT(*) FROM session_checkpoints
+                             WHERE session_id = mux_sessions.session_id)
                      FROM mux_sessions WHERE session_id = 'owner-unavailable'",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .unwrap();
-        assert_eq!(owner_tuple, (None, None, None, None));
+        assert_eq!(owner_tuple, (None, None, None, None, 2));
     }
 
     #[test]

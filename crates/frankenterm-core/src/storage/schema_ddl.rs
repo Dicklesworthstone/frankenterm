@@ -1079,7 +1079,8 @@ CREATE TABLE IF NOT EXISTS mux_sessions (
             AND owner_heartbeat_at IS NULL)
         OR (owner_pid IS NOT NULL
             AND owner_process_start IS NOT NULL
-            AND owner_heartbeat_at IS NOT NULL)
+            AND owner_heartbeat_at IS NOT NULL
+            AND host_id IS NOT NULL)
     )
 );
 
@@ -1308,6 +1309,15 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS mux_sessions_retained_size_ai
 AFTER INSERT ON mux_sessions BEGIN
+    SELECT CASE WHEN NOT (
+        (new.owner_pid IS NULL
+            AND new.owner_process_start IS NULL
+            AND new.owner_heartbeat_at IS NULL)
+        OR (new.owner_pid IS NOT NULL
+            AND new.owner_process_start IS NOT NULL
+            AND new.owner_heartbeat_at IS NOT NULL
+            AND new.host_id IS NOT NULL)
+    ) THEN RAISE(ABORT, 'invalid session owner lifecycle tuple') END;
     INSERT INTO session_retained_size (session_id, session_row_bytes)
     VALUES (
         new.session_id,
@@ -1329,6 +1339,15 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS mux_sessions_retained_size_au
 AFTER UPDATE ON mux_sessions BEGIN
+    SELECT CASE WHEN NOT (
+        (new.owner_pid IS NULL
+            AND new.owner_process_start IS NULL
+            AND new.owner_heartbeat_at IS NULL)
+        OR (new.owner_pid IS NOT NULL
+            AND new.owner_process_start IS NOT NULL
+            AND new.owner_heartbeat_at IS NOT NULL
+            AND new.host_id IS NOT NULL)
+    ) THEN RAISE(ABORT, 'invalid session owner lifecycle tuple') END;
     SELECT CASE WHEN new.session_id != old.session_id THEN
         RAISE(ABORT, 'session retained-size identity is immutable')
     END;

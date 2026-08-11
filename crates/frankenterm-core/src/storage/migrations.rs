@@ -9556,6 +9556,21 @@ mod tests {
         assert_eq!(stored, expected);
         validate_session_owner_lifecycle_schema(&conn).unwrap();
         validate_session_retained_size_schema(&conn).unwrap();
+
+        // Upgraded databases cannot gain the fresh-table CHECK constraint via
+        // ALTER TABLE. The canonical retained-size triggers must independently
+        // enforce the same tuple invariant. Ignore table CHECK constraints here
+        // so this assertion specifically exercises that migration-safe guard.
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("isolate trigger enforcement from the fresh-table CHECK");
+        let partial_owner = conn
+            .execute(
+                "UPDATE mux_sessions SET owner_process_start = NULL
+                 WHERE session_id = 'owned-v41'",
+                [],
+            )
+            .expect_err("canonical v41 trigger must reject a partial owner tuple");
+        assert!(partial_owner.to_string().contains("invalid session owner lifecycle tuple"));
     }
 
     #[test]
