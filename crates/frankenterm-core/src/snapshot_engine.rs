@@ -5949,7 +5949,8 @@ fn mark_shutdown_authoritatively_sync(
                )
                AND (
                    (?5 IS NULL AND session.owner_pid IS NULL
-                       AND session.owner_process_start IS NULL)
+                       AND session.owner_process_start IS NULL
+                       AND session.owner_heartbeat_at IS NULL)
                    OR (session.host_id = ?5
                        AND session.owner_pid = ?6
                        AND session.owner_process_start = ?7)
@@ -6013,7 +6014,7 @@ fn save_checkpoint_authoritatively_sync(
                 "INSERT INTO mux_sessions
                  (session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id,
                   owner_pid, owner_process_start, owner_heartbeat_at)
-                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?2)",
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     session_id,
                     now_ms,
@@ -6022,6 +6023,7 @@ fn save_checkpoint_authoritatively_sync(
                     metadata.host_id.as_deref(),
                     owner_identity.map(|identity| identity.pid),
                     owner_identity.map(|identity| identity.process_start),
+                    owner_identity.map(|_| now_ms),
                 ],
             )?;
             require_exactly_one_changed_row(inserted_session)?;
@@ -6102,7 +6104,8 @@ fn save_checkpoint_authoritatively_sync(
                  WHERE session_id = ?3
                    AND (
                        (?4 IS NULL AND owner_pid IS NULL
-                           AND owner_process_start IS NULL)
+                           AND owner_process_start IS NULL
+                           AND owner_heartbeat_at IS NULL)
                        OR (host_id = ?4
                            AND owner_pid = ?5
                            AND owner_process_start = ?6)
@@ -9710,6 +9713,42 @@ mod tests {
                 .unwrap();
             assert_eq!(shutdown_clean, 1);
         });
+    }
+
+    #[test]
+    fn checkpoint_creation_without_owner_authority_leaves_owner_tuple_null() {
+        let (_tmp, db_path) = setup_test_db();
+        let pane = make_test_pane(1, 24, 80);
+        let (topology, _) = TopologySnapshot::from_panes(std::slice::from_ref(&pane), 100);
+        let pane_state = PaneStateSnapshot::from_pane_info(&pane, 100, false);
+        let prepared = prepare_snapshot_persistence(&topology, &[pane_state], None).unwrap();
+        let new_session = NewSessionMetadata {
+            ft_version: crate::VERSION.to_string(),
+            host_id: None,
+        };
+
+        save_checkpoint_authoritatively_sync(
+            db_path.as_str(),
+            "owner-unavailable",
+            100,
+            "manual",
+            &prepared,
+            Some(&new_session),
+            None,
+        )
+        .unwrap();
+
+        let owner_tuple: (Option<String>, Option<i64>, Option<i64>, Option<i64>) =
+            Connection::open(db_path.as_str())
+                .unwrap()
+                .query_row(
+                    "SELECT host_id, owner_pid, owner_process_start, owner_heartbeat_at
+                     FROM mux_sessions WHERE session_id = 'owner-unavailable'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(owner_tuple, (None, None, None, None));
     }
 
     #[test]

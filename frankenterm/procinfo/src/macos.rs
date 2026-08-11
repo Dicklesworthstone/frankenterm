@@ -16,6 +16,15 @@ impl From<u32> for LocalProcessStatus {
     }
 }
 
+fn process_start_token(seconds: u64, microseconds: u64) -> Option<u64> {
+    if seconds == 0 || microseconds >= 1_000_000 {
+        return None;
+    }
+    seconds
+        .checked_mul(1_000_000)?
+        .checked_add(microseconds)
+}
+
 impl LocalProcessInfo {
     /// Read one process-incarnation token without enumerating the process tree.
     pub fn process_start_time(pid: u32) -> Option<u64> {
@@ -37,8 +46,11 @@ impl LocalProcessInfo {
                 wanted_size,
             )
         };
-        if read == wanted_size && info.pbi_start_tvsec > 0 {
-            return ProcessStartTimeObservation::Running(info.pbi_start_tvsec);
+        if read == wanted_size {
+            return process_start_token(info.pbi_start_tvsec, info.pbi_start_tvusec).map_or(
+                ProcessStartTimeObservation::Unknown,
+                ProcessStartTimeObservation::Running,
+            );
         }
         if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             ProcessStartTimeObservation::Absent
@@ -298,7 +310,15 @@ fn parse_exe_and_argv_sysctl(buf: Vec<u8>) -> Option<(PathBuf, Vec<String>)> {
 mod tests {
     use std::path::Path;
 
-    use super::parse_exe_and_argv_sysctl;
+    use super::{parse_exe_and_argv_sysctl, process_start_token};
+
+    #[test]
+    fn process_start_token_uses_microseconds_and_rejects_invalid_inputs() {
+        assert_eq!(process_start_token(42, 123_456), Some(42_123_456));
+        assert_eq!(process_start_token(0, 1), None);
+        assert_eq!(process_start_token(1, 1_000_000), None);
+        assert_eq!(process_start_token(u64::MAX, 0), None);
+    }
 
     #[test]
     fn test_trailing_zeros() {
