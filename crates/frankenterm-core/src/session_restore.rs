@@ -1594,6 +1594,19 @@ pub fn find_unclean_sessions(db_path: &str) -> Result<Vec<SessionCandidate>, Res
 fn find_unclean_sessions_from_conn(
     conn: &Connection,
 ) -> Result<Vec<SessionCandidate>, RestoreError> {
+    find_unclean_sessions_with_owner_policy_from_conn(conn, false)
+}
+
+fn find_proven_dead_recovery_sessions_from_conn(
+    conn: &Connection,
+) -> Result<Vec<SessionCandidate>, RestoreError> {
+    find_unclean_sessions_with_owner_policy_from_conn(conn, true)
+}
+
+fn find_unclean_sessions_with_owner_policy_from_conn(
+    conn: &Connection,
+    require_proven_dead_owner: bool,
+) -> Result<Vec<SessionCandidate>, RestoreError> {
     let mut stmt = conn.prepare(
         "SELECT CASE
                     WHEN typeof(session.session_id) = 'text'
@@ -1684,8 +1697,12 @@ fn find_unclean_sessions_from_conn(
         if assess_clean_authority(conn, &session_id, shutdown_clean, clean_checkpoint_id)? {
             continue;
         }
-        if owner_classifier.classify(host_id.as_deref(), owner_pid, owner_process_start)
-            == crate::session_retention::UncleanSessionOwnerState::Live
+        let owner_state =
+            owner_classifier.classify(host_id.as_deref(), owner_pid, owner_process_start);
+        if owner_state == crate::session_retention::UncleanSessionOwnerState::Live
+            || (require_proven_dead_owner
+                && owner_state
+                    != crate::session_retention::UncleanSessionOwnerState::RecoveryCandidate)
         {
             continue;
         }
@@ -5494,7 +5511,10 @@ impl SessionRestorer {
         &self,
         conn: &Connection,
     ) -> Result<Option<SessionCandidate>, RestoreError> {
-        let mut candidates = find_unclean_sessions_from_conn(conn)?;
+        // Automatic or prompted restore must share retention's owner-death
+        // authority. Unknown/foreign/legacy ownership remains visible through
+        // list/doctor surfaces but is never admitted to a mux-mutating restore.
+        let mut candidates = find_proven_dead_recovery_sessions_from_conn(conn)?;
 
         if candidates.is_empty() {
             debug!("No unclean sessions found — clean startup");
@@ -7855,6 +7875,25 @@ mod tests {
         .unwrap();
         if shutdown_clean {
             insert_clean_receipt(conn, session_id, 1000);
+        } else if let Some(owner) = crate::session_retention::current_session_owner_identity() {
+            let mut host: serde_json::Value = serde_json::from_str(&owner.host_id).unwrap();
+            let boot_id = host
+                .get_mut("boot_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|boot_id| format!("{boot_id}-prior-test-boot"))
+                .unwrap();
+            host["boot_id"] = serde_json::Value::String(boot_id);
+            let prior_boot_host_id = serde_json::to_string(&host).unwrap();
+            conn.execute(
+                "UPDATE mux_sessions
+                 SET host_id = ?2,
+                     owner_pid = 1,
+                     owner_process_start = 1,
+                     owner_heartbeat_at = created_at
+                 WHERE session_id = ?1",
+                params![session_id, prior_boot_host_id],
+            )
+            .unwrap();
         }
     }
 
@@ -8174,6 +8213,34 @@ mod tests {
         let candidates = find_unclean_sessions(&db_path).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "sess-crash");
+    }
+
+    #[test]
+    fn unknown_owner_is_visible_to_status_but_not_admitted_to_restore() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let topology = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
+        conn.execute(
+            "INSERT INTO mux_sessions
+             (session_id, created_at, topology_json, ft_version, shutdown_clean)
+             VALUES ('sess-unknown-owner', 1000, ?1, '0.1.0', 0)",
+            [topology],
+        )
+        .unwrap();
+
+        let visible = find_unclean_sessions(&db_path).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].session_id, "sess-unknown-owner");
+        let restorer = SessionRestorer::new(
+            Arc::new(db_path),
+            SessionRestoreConfig {
+                auto_restore: true,
+                ..SessionRestoreConfig::default()
+            },
+        );
+        assert!(
+            restorer.detect().unwrap().is_none(),
+            "unknown ownership must not cross the mux-mutation admission boundary"
+        );
     }
 
     #[test]
