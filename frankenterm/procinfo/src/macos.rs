@@ -20,9 +20,7 @@ fn process_start_token(seconds: u64, microseconds: u64) -> Option<u64> {
     if seconds == 0 || microseconds >= 1_000_000 {
         return None;
     }
-    seconds
-        .checked_mul(1_000_000)?
-        .checked_add(microseconds)
+    seconds.checked_mul(1_000_000)?.checked_add(microseconds)
 }
 
 impl LocalProcessInfo {
