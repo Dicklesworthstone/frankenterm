@@ -52,7 +52,7 @@ impl CleanupResult {
             .saturating_add(self.deleted_by_size)
     }
 
-    /// Whether any cleanup was performed.
+    /// Whether cleanup or prerequisite recovery reconciliation performed work.
     #[must_use]
     pub fn any_work_done(&self) -> bool {
         self.recovery_reconciliation_pending

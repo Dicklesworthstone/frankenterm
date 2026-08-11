@@ -1325,6 +1325,7 @@ fn delete_sessions_by_age(conn: &Connection, max_age_days: u64) -> Result<usize,
     delete_sessions_by_age_with_observer(conn, max_age_days, &observer)
 }
 
+#[cfg(test)]
 fn delete_sessions_by_age_with_observer(
     conn: &Connection,
     max_age_days: u64,
@@ -1437,6 +1438,7 @@ fn delete_excess_closed_sessions(
     delete_excess_closed_sessions_with_observer(conn, max_count, &observer)
 }
 
+#[cfg(test)]
 fn delete_excess_closed_sessions_with_observer(
     conn: &Connection,
     max_count: usize,
@@ -1689,6 +1691,7 @@ fn delete_sessions_by_size(
     delete_sessions_by_size_with_observer(conn, max_total_mb, &observer)
 }
 
+#[cfg(test)]
 fn delete_sessions_by_size_with_observer(
     conn: &Connection,
     max_total_mb: u64,

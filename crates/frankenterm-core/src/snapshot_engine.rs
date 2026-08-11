@@ -3952,11 +3952,12 @@ impl SnapshotEngine {
     ///
     /// `cleanup_interval_hours == 0` means "one authoritative startup
     /// completion": admission contention or a typed retry-safe failure is
-    /// retried after [`SESSION_CLEANUP_RETRY_DELAY`], while the first successful
-    /// receipt ends automatic cleanup for this scheduler invocation. A positive
-    /// value reruns every N hours after authoritative success. The DB connection
-    /// is opened fresh inside the cleanup engine (a blocking SQLite pipeline run
-    /// on the blocking pool). If its authoritative completion is lost, the
+    /// retried after [`SESSION_CLEANUP_RETRY_DELAY`], while the first
+    /// authoritative completed receipt ends automatic cleanup for this scheduler
+    /// invocation. A positive value reruns every N hours after authoritative
+    /// success. The DB connection is opened fresh inside the cleanup engine (a
+    /// blocking SQLite pipeline run on the blocking pool). If its authoritative
+    /// completion is lost, the
     /// engine latches both `session_cleanup_reconciliation_required` and the
     /// shared snapshot-authority reconciliation state. This suppresses every
     /// later mutation of the same authority tables for this engine instance,
