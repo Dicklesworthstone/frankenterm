@@ -65,23 +65,23 @@ fn frame_optional(hasher: &mut Sha256, label: &str, value: Option<&[u8]>) {
     }
 }
 
-fn empty_restore_receipt_witness(
+fn empty_shutdown_snapshot_witness(
     session_id: &str,
     checkpoint_id: i64,
     checkpoint_at: i64,
-    metadata_json: &str,
+    topology_json: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    frame_required(&mut hasher, "domain", b"frankenterm:restore-receipt:v2");
-    frame_required(&mut hasher, "checkpoint_role", b"restore_receipt");
+    frame_required(&mut hasher, "domain", b"frankenterm:snapshot-checkpoint:v2");
+    frame_required(&mut hasher, "checkpoint_role", b"snapshot");
     frame_required(&mut hasher, "session_id", session_id.as_bytes());
     frame_required(&mut hasher, "checkpoint_id", &checkpoint_id.to_be_bytes());
     frame_required(&mut hasher, "checkpoint_at", &checkpoint_at.to_be_bytes());
-    frame_required(&mut hasher, "checkpoint_type", b"startup");
+    frame_required(&mut hasher, "checkpoint_type", b"shutdown");
     frame_required(&mut hasher, "pane_count", &0_i64.to_be_bytes());
     frame_required(&mut hasher, "total_bytes", &0_i64.to_be_bytes());
-    frame_optional(&mut hasher, "metadata_json", Some(metadata_json.as_bytes()));
-    frame_optional(&mut hasher, "topology_json", None);
+    frame_optional(&mut hasher, "metadata_json", None);
+    frame_optional(&mut hasher, "topology_json", Some(topology_json.as_bytes()));
     frame_required(
         &mut hasher,
         "persisted_pane_row_count",
@@ -89,7 +89,7 @@ fn empty_restore_receipt_witness(
     );
     let digest = hasher.finalize();
     let mut encoded = String::with_capacity(5 + digest.len() * 2);
-    encoded.push_str("rst2:");
+    encoded.push_str("snp2:");
     for byte in digest {
         use std::fmt::Write as _;
         write!(&mut encoded, "{byte:02x}").unwrap();
@@ -97,20 +97,30 @@ fn empty_restore_receipt_witness(
     encoded
 }
 
-fn insert_v2_clean_receipt(conn: &Connection, session_id: &str, checkpoint_at: i64) -> i64 {
-    let metadata_json = r#"{"old_to_new":{}}"#;
+fn insert_v2_clean_shutdown_snapshot(
+    conn: &Connection,
+    session_id: &str,
+    checkpoint_at: i64,
+) -> i64 {
+    let topology_json: String = conn
+        .query_row(
+            "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .expect("load clean shutdown topology");
     conn.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count,
           total_bytes, metadata_json, checkpoint_role, topology_json)
-         VALUES (?1, ?2, 'startup', 'pending:rst2', 0, 0, ?3,
-                 'restore_receipt', NULL)",
-        params![session_id, checkpoint_at, metadata_json],
+         VALUES (?1, ?2, 'shutdown', 'pending:snp2', 0, 0, NULL,
+                 'snapshot', ?3)",
+        params![session_id, checkpoint_at, &topology_json],
     )
     .unwrap();
     let checkpoint_id = conn.last_insert_rowid();
     let state_hash =
-        empty_restore_receipt_witness(session_id, checkpoint_id, checkpoint_at, metadata_json);
+        empty_shutdown_snapshot_witness(session_id, checkpoint_id, checkpoint_at, &topology_json);
     conn.execute(
         "UPDATE session_checkpoints SET state_hash = ?1 WHERE id = ?2",
         params![state_hash, checkpoint_id],
@@ -136,7 +146,7 @@ fn insert_session(conn: &Connection, id: &str, created_at: i64, shutdown_clean: 
     )
     .unwrap();
     if shutdown_clean {
-        insert_v2_clean_receipt(conn, id, created_at);
+        insert_v2_clean_shutdown_snapshot(conn, id, created_at);
     }
 }
 
@@ -153,7 +163,8 @@ fn insert_checkpoint(
              FROM mux_sessions
              WHERE session_id = ?1
          )
-           AND checkpoint_role = 'restore_receipt'
+           AND checkpoint_type = 'shutdown'
+           AND checkpoint_role = 'snapshot'
            AND total_bytes = 0",
         [session_id],
     )
@@ -182,7 +193,7 @@ fn insert_checkpoint(
     )
     .unwrap();
     if shutdown_clean {
-        insert_v2_clean_receipt(conn, session_id, checkpoint_at);
+        insert_v2_clean_shutdown_snapshot(conn, session_id, checkpoint_at);
     }
     checkpoint_id
 }
