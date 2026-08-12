@@ -1,6 +1,6 @@
-//! Property-based tests for the runtime_async dual-runtime abstraction layer.
+//! Property-based tests for the canonical asupersync-backed `runtime_async` surface.
 //!
-//! Verifies critical invariants of the tokio↔asupersync migration bridge:
+//! Verifies critical invariants preserved after the retired Tokio fallback was removed:
 //! - MPSC channel FIFO ordering: messages arrive in send order
 //! - MPSC channel completeness: all sent messages are received
 //! - MPSC helpers roundtrip: mpsc_send + mpsc_recv_option preserve values
@@ -87,17 +87,17 @@ fn arb_write_sequence() -> impl Strategy<Value = Vec<i32>> {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Helper: run async property inside tokio runtime
+// Helper: run an async property inside the canonical project runtime
 // ────────────────────────────────────────────────────────────────────
 
-fn with_tokio<F, Fut>(f: F)
+fn with_runtime<F, Fut>(f: F)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     let rt = RuntimeBuilder::current_thread()
         .build()
-        .expect("tokio runtime");
+        .expect("canonical asupersync runtime");
     rt.block_on(f());
 }
 
@@ -139,7 +139,7 @@ proptest! {
     ) {
         let cap = cap.max(msgs.len().max(1));
         let msgs_clone = msgs.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = mpsc::channel(cap);
             for m in &msgs_clone {
                 runtime_async::mpsc_send(&tx, *m).await.expect("send");
@@ -161,7 +161,7 @@ proptest! {
     ) {
         let cap = cap.max(msgs.len().max(1));
         let count = msgs.len();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = mpsc::channel(cap);
             for m in msgs {
                 runtime_async::mpsc_send(&tx, m).await.expect("send");
@@ -178,7 +178,7 @@ proptest! {
     /// mpsc_send to a closed receiver returns Err containing the original value.
     #[test]
     fn mpsc_send_to_closed_returns_value(val in arb_numeric_value()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, rx) = mpsc::channel::<i64>(1);
             drop(rx);
             let err = runtime_async::mpsc_send(&tx, val).await;
@@ -204,7 +204,7 @@ proptest! {
     fn mpsc_recv_none_after_close(
         msgs in arb_small_message_sequence(),
     ) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = mpsc::channel(msgs.len().max(1));
             for m in &msgs {
                 runtime_async::mpsc_send(&tx, *m).await.expect("send");
@@ -226,7 +226,7 @@ proptest! {
         msgs in arb_string_sequence(),
     ) {
         let msgs_clone = msgs.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = mpsc::channel(msgs_clone.len().max(1));
             for m in &msgs_clone {
                 runtime_async::mpsc_send(&tx, m.clone()).await.expect("send");
@@ -254,7 +254,7 @@ proptest! {
         values in arb_write_sequence(),
     ) {
         prop_assume!(!values.is_empty());
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, rx) = watch::channel(0i32);
             let expected = *values.last().unwrap();
             for v in &values {
@@ -268,7 +268,7 @@ proptest! {
     /// Watch channel with initial value: borrow before any send returns init.
     #[test]
     fn watch_initial_value_preserved(init in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (_, rx) = watch::channel(init);
             assert_eq!(*rx.borrow(), init, "initial value must be preserved");
         });
@@ -280,7 +280,7 @@ proptest! {
         values in arb_write_sequence(),
     ) {
         prop_assume!(!values.is_empty());
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, rx1) = watch::channel(0i32);
             let rx2 = rx1.clone();
             for v in &values {
@@ -293,7 +293,7 @@ proptest! {
     /// Watch send after all receivers dropped returns Err.
     #[test]
     fn watch_send_to_no_receivers_fails(val in any::<i32>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, rx) = watch::channel(0i32);
             drop(rx);
             let result = tx.send(val);
@@ -316,7 +316,7 @@ proptest! {
     ) {
         let cap = msgs.len() + 1;
         let msgs_clone = msgs.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = broadcast::channel(cap);
             for m in &msgs_clone {
                 tx.send(*m).expect("broadcast send");
@@ -336,7 +336,7 @@ proptest! {
     ) {
         let cap = msgs.len() + 1;
         let msgs_clone = msgs.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx1) = broadcast::channel(cap);
             let mut rx2 = tx.subscribe();
             let mut rx3 = tx.subscribe();
@@ -360,7 +360,7 @@ proptest! {
     /// Broadcast send with no receivers returns error.
     #[test]
     fn broadcast_no_receivers_error(val in any::<i32>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, rx) = broadcast::channel::<i32>(16);
             drop(rx);
             let result = tx.send(val);
@@ -379,7 +379,7 @@ proptest! {
     /// Semaphore initial permits match constructor argument.
     #[test]
     fn semaphore_initial_permits(n in arb_semaphore_permits()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let sem = Semaphore::new(n);
             assert_eq!(sem.available_permits(), n, "initial permits must match constructor");
         });
@@ -392,7 +392,7 @@ proptest! {
         acquire_count in 1usize..=50,
     ) {
         let acquire_count = acquire_count.min(total);
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let sem = Semaphore::new(total);
             let mut permits = Vec::new();
             for i in 0..acquire_count {
@@ -415,7 +415,7 @@ proptest! {
         acquire_count in 1usize..=50,
     ) {
         let acquire_count = acquire_count.min(total);
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let sem = Semaphore::new(total);
             let mut permits = Vec::new();
             for _ in 0..acquire_count {
@@ -430,7 +430,7 @@ proptest! {
     /// try_acquire after exhaustion returns NoPermits error.
     #[test]
     fn semaphore_exhausted_returns_no_permits(total in arb_semaphore_permits()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let sem = Semaphore::new(total);
             let mut held = Vec::new();
             for _ in 0..total {
@@ -445,7 +445,7 @@ proptest! {
     /// Closed semaphore rejects all try_acquire.
     #[test]
     fn semaphore_closed_rejects_try_acquire(total in arb_semaphore_permits()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let sem = Semaphore::new(total);
             sem.close();
             let result = sem.try_acquire();
@@ -460,7 +460,7 @@ proptest! {
         hold_count in 1usize..=19,
     ) {
         let hold_count = hold_count.min(total - 1);
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let sem = Semaphore::new(total);
             let mut held = Vec::new();
             for _ in 0..hold_count {
@@ -489,7 +489,7 @@ proptest! {
     ) {
         prop_assume!(!writes.is_empty());
         let expected = *writes.last().unwrap();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let m = Mutex::new(0i32);
             for w in &writes {
                 let mut guard = m.lock().await;
@@ -506,7 +506,7 @@ proptest! {
         values in prop::collection::vec(1i64..100, 1..30),
     ) {
         let expected: i64 = values.iter().sum();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let m = Mutex::new(0i64);
             for v in &values {
                 let mut guard = m.lock().await;
@@ -523,7 +523,7 @@ proptest! {
         items in prop::collection::vec(any::<u16>(), 0..30),
     ) {
         let items_clone = items.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let m = Mutex::new(Vec::new());
             for item in &items_clone {
                 let mut guard = m.lock().await;
@@ -537,7 +537,7 @@ proptest! {
     /// Mutex initial value preserved when no writes occur.
     #[test]
     fn mutex_initial_value_preserved(init in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let m = Mutex::new(init);
             let guard = m.lock().await;
             assert_eq!(*guard, init, "initial value must be preserved with no writes");
@@ -555,7 +555,7 @@ proptest! {
     /// RwLock write then read returns the written value.
     #[test]
     fn rwlock_write_then_read(val in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let rw = RwLock::new(0i64);
             {
                 let mut guard = rw.write().await;
@@ -573,7 +573,7 @@ proptest! {
     ) {
         prop_assume!(!writes.is_empty());
         let expected = *writes.last().unwrap();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let rw = RwLock::new(0i32);
             for w in &writes {
                 let mut guard = rw.write().await;
@@ -590,7 +590,7 @@ proptest! {
         values in prop::collection::vec(1i64..100, 1..30),
     ) {
         let expected: i64 = values.iter().sum();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let rw = RwLock::new(0i64);
             for v in &values {
                 let mut guard = rw.write().await;
@@ -604,7 +604,7 @@ proptest! {
     /// RwLock initial value preserved with read-only access.
     #[test]
     fn rwlock_initial_value_preserved(init in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let rw = RwLock::new(init);
             let g1 = rw.read().await;
             assert_eq!(*g1, init);
@@ -620,7 +620,7 @@ proptest! {
         items in prop::collection::vec(any::<u8>(), 0..30),
     ) {
         let items_clone = items.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let rw = RwLock::new(Vec::new());
             {
                 let mut guard = rw.write().await;
@@ -730,7 +730,7 @@ proptest! {
         val in any::<i64>(),
         timeout_ms in arb_timeout_ms(),
     ) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let dur = Duration::from_millis(timeout_ms);
             let result = runtime_async::timeout(dur, async move { val }).await;
             assert!(result.is_ok(), "immediate future must not timeout");
@@ -744,7 +744,7 @@ proptest! {
         items in prop::collection::vec(any::<u8>(), 0..20),
     ) {
         let items_clone = items.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = runtime_async::timeout(
                 Duration::from_secs(5),
                 async move { items_clone },
@@ -758,7 +758,7 @@ proptest! {
     /// Timeout preserves Result<T, E> types.
     #[test]
     fn timeout_preserves_result_type(val in any::<i32>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = runtime_async::timeout(
                 Duration::from_secs(5),
                 async move { Ok::<_, String>(val) },
@@ -777,7 +777,7 @@ proptest! {
         short_timeout_ms in arb_short_timeout_ms(),
         long_timeout_padding_ms in arb_long_timeout_padding_ms(),
     ) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let short = runtime_async::timeout(
                 Duration::from_millis(short_timeout_ms),
                 async move {
@@ -812,7 +812,7 @@ proptest! {
     /// spawn_blocking returns the closure's result.
     #[test]
     fn spawn_blocking_returns_closure_result(val in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = runtime_async::spawn_blocking(move || val).await;
             assert!(result.is_ok(), "spawn_blocking must succeed");
             assert_eq!(result.unwrap(), val, "spawn_blocking must return closure result");
@@ -823,7 +823,7 @@ proptest! {
     #[test]
     fn spawn_blocking_computation(a in 0i64..1000, b in 0i64..1000) {
         let expected = a * b + a + b;
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = runtime_async::spawn_blocking(move || {
                 a * b + a + b
             })
@@ -837,7 +837,7 @@ proptest! {
     #[test]
     fn spawn_blocking_string_roundtrip(s in "[a-zA-Z0-9]{0,50}") {
         let s_clone = s.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = runtime_async::spawn_blocking(move || s_clone).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), s, "spawn_blocking must preserve String");
@@ -850,7 +850,7 @@ proptest! {
         items in prop::collection::vec(any::<u16>(), 0..50),
     ) {
         let items_clone = items.clone();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = runtime_async::spawn_blocking(move || {
                 items_clone.into_iter().collect::<Vec<_>>()
             })
@@ -871,7 +871,7 @@ proptest! {
     /// Sleep with any small duration completes without panic.
     #[test]
     fn sleep_always_completes(ms in arb_sleep_ms()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             runtime_async::sleep(Duration::from_millis(ms)).await;
             // If we get here, sleep completed without panic
         });
@@ -880,7 +880,7 @@ proptest! {
     /// Sleep with zero duration completes almost instantly.
     #[test]
     fn sleep_zero_instant(_dummy in 0u8..1) {
-        with_tokio(|| async {
+        with_runtime(|| async {
             let start = std::time::Instant::now();
             runtime_async::sleep(Duration::ZERO).await;
             assert!(
@@ -905,7 +905,7 @@ proptest! {
     ) {
         let msg_count = msgs.len();
         let expected_sum: u32 = msgs.iter().sum();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let counter = Mutex::new(0u32);
             let (tx, mut rx) = mpsc::channel(msg_count.max(1));
             // Send all messages
@@ -929,7 +929,7 @@ proptest! {
         permits in 1usize..=5,
         iterations in 1usize..=20,
     ) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let sem = Semaphore::new(permits);
             let counter = Mutex::new(0usize);
             for _ in 0..iterations {
@@ -984,7 +984,7 @@ proptest! {
     /// join! preserves both values from concurrent futures.
     #[test]
     fn join_preserves_both_values(a in any::<i64>(), b in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (ra, rb) = runtime_async::join!(async { a }, async { b });
             assert_eq!(ra, a, "first future value preserved");
             assert_eq!(rb, b, "second future value preserved");
@@ -994,7 +994,7 @@ proptest! {
     /// join! preserves ordering of three futures (all values returned).
     #[test]
     fn join_three_preserves_all(a in any::<i32>(), b in any::<i32>(), c in any::<i32>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (ra, rb, rc) = runtime_async::join!(
                 async { a },
                 async { b },
@@ -1009,7 +1009,7 @@ proptest! {
     /// join! with channel operations: send on one side, receive on the other.
     #[test]
     fn join_channel_roundtrip(val in any::<u64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
             let ((), recv_result) = runtime_async::join!(
                 async {
@@ -1034,7 +1034,7 @@ proptest! {
     /// select! returns the value from an immediately-ready branch.
     #[test]
     fn select_immediate_branch_returns_value(val in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = select_runtime_async_test! {
                 v = async { val } => v,
                 () = runtime_async::sleep(Duration::from_secs(60)) => -1,
@@ -1046,7 +1046,7 @@ proptest! {
     /// select! with channel: ready channel wins over sleep.
     #[test]
     fn select_channel_wins_over_sleep(val in any::<u32>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
             runtime_async::mpsc_send(&tx, val).await.expect("send");
             let result = select_runtime_async_test! {
@@ -1060,7 +1060,7 @@ proptest! {
     /// select! biased always picks the first ready branch.
     #[test]
     fn select_biased_first_wins(a in any::<i32>(), b in any::<i32>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = select_runtime_async_test! {
                 biased;
                 v = async { a } => v,
@@ -1081,7 +1081,7 @@ proptest! {
     /// task::spawn_blocking preserves the return value through the JoinHandle.
     #[test]
     fn task_spawn_blocking_preserves_value(val in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let handle = runtime_async::task::spawn_blocking(move || val);
             let result = handle.await.expect("join");
             assert_eq!(result, val, "spawn_blocking must preserve closure return");
@@ -1092,7 +1092,7 @@ proptest! {
     #[test]
     fn task_spawn_blocking_computation(n in 0u64..1000) {
         let expected: u64 = (0..n).sum();
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let handle = runtime_async::task::spawn_blocking(move || {
                 (0..n).sum::<u64>()
             });
@@ -1112,7 +1112,7 @@ proptest! {
     /// yield_now does not lose values: interleaved yields preserve counter.
     #[test]
     fn yield_preserves_counter(n in 1usize..50) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let mut counter = 0usize;
             for _ in 0..n {
                 counter += 1;
@@ -1133,7 +1133,7 @@ proptest! {
     /// spawn_blocking + join!: blocking computation and async work run concurrently.
     #[test]
     fn spawn_blocking_with_join(a in 0u64..100, b in 0u64..100) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let blocking_handle = runtime_async::task::spawn_blocking(move || {
                 (0..a).sum::<u64>()
             });
@@ -1151,7 +1151,7 @@ proptest! {
     /// select! with channel + timeout: value arrives before timeout.
     #[test]
     fn select_channel_before_timeout(val in any::<u64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
             // Send immediately so channel is ready before timeout.
             runtime_async::mpsc_send(&tx, val).await.expect("send");
@@ -1166,7 +1166,7 @@ proptest! {
     /// Mutex + spawn: concurrent tasks safely accumulate into shared state.
     #[test]
     fn mutex_concurrent_spawn_accumulation(n in 1usize..20) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let shared = Arc::new(Mutex::new(0u64));
             let mut handles = Vec::new();
             for _ in 0..n {
@@ -1187,7 +1187,7 @@ proptest! {
     /// Channel fan-in: multiple senders, single receiver collects all values.
     #[test]
     fn channel_fan_in_collects_all(vals in proptest::collection::vec(any::<i32>(), 1..20)) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = mpsc::channel(vals.len() + 1);
             for v in &vals {
                 let tx_clone = tx.clone();
@@ -1211,7 +1211,7 @@ proptest! {
     /// Semaphore + spawn: bounded concurrency with N permits.
     #[test]
     fn semaphore_bounds_concurrency(permits in 1usize..5, tasks in 2usize..10) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let sem = Arc::new(Semaphore::new(permits));
             let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let mut handles = Vec::new();
@@ -1235,7 +1235,7 @@ proptest! {
     /// Watch + select!: latest value observed when combined with timeout.
     #[test]
     fn watch_latest_via_select(vals in proptest::collection::vec(1i32..1000, 1..10)) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let (tx, mut rx) = runtime_async::watch::channel(0i32);
             for v in &vals {
                 tx.send(*v).expect("send");
@@ -1256,7 +1256,7 @@ proptest! {
     /// spawn_blocking inside select!: blocking work completes before timeout.
     #[test]
     fn select_spawn_blocking_before_timeout(val in any::<i64>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let result = select_runtime_async_test! {
                 v = async {
                     runtime_async::task::spawn_blocking(move || val)
@@ -1272,7 +1272,7 @@ proptest! {
     /// Notify + spawn: notified task resumes and produces correct value.
     #[test]
     fn notify_resumes_waiting_task(val in any::<u32>()) {
-        with_tokio(move || async move {
+        with_runtime(move || async move {
             let notify = Arc::new(notify::Notify::new());
             let n = notify.clone();
             let handle = runtime_async::task::spawn(async move {
