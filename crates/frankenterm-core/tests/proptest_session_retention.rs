@@ -1297,7 +1297,11 @@ proptest! {
 
         let cp_before = count_checkpoints(&conn);
         let ps_before = count_pane_states(&conn);
-        prop_assert_eq!(cp_before, num_checkpoints as i64, "checkpoints inserted");
+        prop_assert_eq!(
+            cp_before,
+            num_checkpoints as i64 + 1,
+            "periodic checkpoints plus the authoritative shutdown snapshot inserted"
+        );
         prop_assert_eq!(ps_before, (num_checkpoints * num_panes_per_cp) as i64, "pane states inserted");
 
         let config = SessionRetentionConfig {
