@@ -2487,8 +2487,7 @@ const MUX_SESSIONS_SCHEMA_BEGIN: &str = "-- FT_MUX_SESSIONS_SCHEMA_BEGIN";
 const MUX_SESSIONS_SCHEMA_END: &str = "-- FT_MUX_SESSIONS_SCHEMA_END";
 const SESSION_RETAINED_SIZE_V40_BEGIN: &str = "-- FT_SESSION_RETAINED_SIZE_V40_BEGIN";
 const SESSION_RETAINED_SIZE_V40_END: &str = "-- FT_SESSION_RETAINED_SIZE_V40_END";
-const SESSION_RECOVERY_USABILITY_V44_BEGIN: &str =
-    "-- FT_SESSION_RECOVERY_USABILITY_V44_BEGIN";
+const SESSION_RECOVERY_USABILITY_V44_BEGIN: &str = "-- FT_SESSION_RECOVERY_USABILITY_V44_BEGIN";
 const SESSION_RECOVERY_USABILITY_V44_END: &str = "-- FT_SESSION_RECOVERY_USABILITY_V44_END";
 
 /// Return the single canonical `mux_sessions` table DDL section.
@@ -2689,21 +2688,9 @@ fn validate_session_recovery_usability_schema_objects(conn: &Connection) -> Resu
             "TRIGGER",
             "session_checkpoints_recovery_usability_bd",
         ),
-        (
-            "trigger",
-            "TRIGGER",
-            "mux_pane_state_recovery_usability_ai",
-        ),
-        (
-            "trigger",
-            "TRIGGER",
-            "mux_pane_state_recovery_usability_au",
-        ),
-        (
-            "trigger",
-            "TRIGGER",
-            "mux_pane_state_recovery_usability_bd",
-        ),
+        ("trigger", "TRIGGER", "mux_pane_state_recovery_usability_ai"),
+        ("trigger", "TRIGGER", "mux_pane_state_recovery_usability_au"),
+        ("trigger", "TRIGGER", "mux_pane_state_recovery_usability_bd"),
         (
             "trigger",
             "TRIGGER",
@@ -2774,9 +2761,11 @@ fn ensure_session_recovery_usability_schema(conn: &Connection) -> Result<()> {
     // arbitrarily many sessions that predate those triggers, so reset only the
     // migration-time population cursor and let cleanup backfill incrementally.
     let has_existing_sessions: bool = conn
-        .query_row("SELECT EXISTS(SELECT 1 FROM mux_sessions LIMIT 1)", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mux_sessions LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|error| StorageError::Database(error.to_string()))?;
     conn.execute(
         "UPDATE session_recovery_selection
@@ -2791,9 +2780,11 @@ fn ensure_session_recovery_usability_schema(conn: &Connection) -> Result<()> {
          WHERE singleton = 1",
         [!has_existing_sessions],
     )
-    .map_err(|error| StorageError::MigrationFailed(format!(
-        "session recovery-usability population reset failed: {error}"
-    )))?;
+    .map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "session recovery-usability population reset failed: {error}"
+        ))
+    })?;
     validate_session_recovery_usability_schema(conn)
 }
 
@@ -5537,24 +5528,31 @@ fn check_v0_init_fault(step: V0InitStep) -> Result<()> {
 /// Split `SCHEMA_SQL` into (PRAGMA preamble, table/index body). PRAGMA
 /// statements like `journal_mode = WAL` and `synchronous = NORMAL` are
 /// rejected by SQLite when run inside a transaction; the v0-init wrapper
-/// applies the preamble before BEGIN and the body inside.
+/// applies the preamble before BEGIN and the body inside. Authority sections
+/// whose historical migration ordering is itself part of the safety contract
+/// are omitted here and installed by their versioned migration step.
 pub(crate) fn split_schema_sql_pragmas() -> (String, String) {
     let mut preamble = String::new();
     let mut body = String::new();
-    let mut skipping_v40_retained_size = false;
+    let mut deferred_authority_end: Option<&'static str> = None;
     for line in SCHEMA_SQL.lines() {
         let trimmed = line.trim();
-        if trimmed == SESSION_RETAINED_SIZE_V40_BEGIN {
-            skipping_v40_retained_size = true;
+        if let Some(expected_end) = deferred_authority_end {
+            if trimmed == expected_end {
+                deferred_authority_end = None;
+            }
             continue;
         }
-        if trimmed == SESSION_RETAINED_SIZE_V40_END {
-            skipping_v40_retained_size = false;
+        deferred_authority_end = match trimmed {
+            SESSION_RETAINED_SIZE_V40_BEGIN => Some(SESSION_RETAINED_SIZE_V40_END),
+            SESSION_RECOVERY_USABILITY_V44_BEGIN => Some(SESSION_RECOVERY_USABILITY_V44_END),
+            _ => None,
+        };
+        if deferred_authority_end.is_some() {
             continue;
         }
-        if skipping_v40_retained_size {
-            continue;
-        }
+        debug_assert_ne!(trimmed, SESSION_RETAINED_SIZE_V40_END);
+        debug_assert_ne!(trimmed, SESSION_RECOVERY_USABILITY_V44_END);
         if line
             .trim_start()
             .to_ascii_uppercase()
@@ -5567,6 +5565,7 @@ pub(crate) fn split_schema_sql_pragmas() -> (String, String) {
             body.push('\n');
         }
     }
+    debug_assert!(deferred_authority_end.is_none());
     (preamble, body)
 }
 
@@ -5939,6 +5938,7 @@ fn run_v0_init_in_transaction(conn: &Connection, stamp_fresh_fts_index: bool) ->
 
     run_owned_migration_transaction_with_foreign_keys_suspended(conn, "v0 init", |transaction| {
         repair_existing_v0_tables_before_schema_sql(transaction)?;
+        suspend_canonical_session_authority_triggers_for_v0_replay(transaction)?;
         #[cfg(test)]
         check_v0_init_fault(V0InitStep::RepairComplete)?;
 
@@ -5973,6 +5973,65 @@ fn run_v0_init_in_transaction(conn: &Connection, stamp_fresh_fts_index: bool) ->
         }
         Ok(())
     })
+}
+
+/// Temporarily remove only the exact current v40/v44 session-authority
+/// triggers before replaying the historical migration sequence for an
+/// existing database whose `user_version` stamp was lost.
+///
+/// Migration v38 deliberately refuses to rebuild or validate checkpoint
+/// identity while any trigger can observe its cutover. A current unversioned
+/// database legitimately has the later v40/v44 triggers, so validate their
+/// complete canonical catalog before suspending them. The enclosing v0
+/// transaction rolls every drop back on failure, while migrations v40 and v44
+/// reinstall the same definitions in their authoritative order. Historical,
+/// partial, drifted, extra, and TEMP trigger sets remain fail-closed.
+fn suspend_canonical_session_authority_triggers_for_v0_replay(conn: &Connection) -> Result<()> {
+    let retained_size_exists = table_exists(conn, "session_retained_size")?;
+    let recovery_usability_exists = table_exists(conn, "session_recovery_usability")?;
+    let recovery_selection_exists = table_exists(conn, "session_recovery_selection")?;
+    if !retained_size_exists && !recovery_usability_exists && !recovery_selection_exists {
+        return Ok(());
+    }
+
+    // This validator checks every canonical body plus exact catalog
+    // cardinality before the first DROP. It also rejects a partial v44 pair.
+    validate_session_retained_size_mutation_schema(conn)?;
+    conn.execute_batch(
+        "DROP TRIGGER mux_sessions_retained_size_ai;
+         DROP TRIGGER mux_sessions_retained_size_au;
+         DROP TRIGGER mux_sessions_retained_size_ad;
+         DROP TRIGGER session_checkpoints_retained_size_ai;
+         DROP TRIGGER session_checkpoints_retained_size_au;
+         DROP TRIGGER session_checkpoints_retained_size_bd;
+         DROP TRIGGER mux_pane_state_retained_size_ai;
+         DROP TRIGGER mux_pane_state_retained_size_au;
+         DROP TRIGGER mux_pane_state_retained_size_ad;
+         DROP TRIGGER restore_attempt_lifecycle_retained_size_ai;
+         DROP TRIGGER restore_attempt_lifecycle_retained_size_au;
+         DROP TRIGGER restore_attempt_lifecycle_retained_size_ad;
+         DROP TRIGGER session_retained_size_bi;
+         DROP TRIGGER session_retained_size_bd;
+         DROP TRIGGER session_retained_size_session_id_bu;
+         DROP TRIGGER IF EXISTS mux_sessions_recovery_usability_ai;
+         DROP TRIGGER IF EXISTS mux_sessions_recovery_usability_bu;
+         DROP TRIGGER IF EXISTS mux_sessions_recovery_usability_bd;
+         DROP TRIGGER IF EXISTS session_checkpoints_recovery_usability_ai;
+         DROP TRIGGER IF EXISTS session_checkpoints_recovery_usability_au;
+         DROP TRIGGER IF EXISTS session_checkpoints_recovery_usability_bd;
+         DROP TRIGGER IF EXISTS mux_pane_state_recovery_usability_ai;
+         DROP TRIGGER IF EXISTS mux_pane_state_recovery_usability_au;
+         DROP TRIGGER IF EXISTS mux_pane_state_recovery_usability_bd;
+         DROP TRIGGER IF EXISTS restore_attempt_lifecycle_recovery_usability_ai;
+         DROP TRIGGER IF EXISTS restore_attempt_lifecycle_recovery_usability_au;
+         DROP TRIGGER IF EXISTS restore_attempt_lifecycle_recovery_usability_bd;",
+    )
+    .map_err(|error| {
+        StorageError::MigrationFailed(format!(
+            "v0 init: canonical session-authority trigger suspension failed: {error}"
+        ))
+    })?;
+    ensure_no_checkpoint_authority_triggers(conn, "v0 init")
 }
 
 fn repair_existing_v0_tables_before_schema_sql(conn: &Connection) -> Result<()> {
@@ -6863,17 +6922,116 @@ mod tests {
     }
 
     #[test]
-    fn v0_schema_body_defers_v40_until_legacy_session_columns_exist() {
+    fn v0_schema_body_defers_versioned_authorities_until_their_migrations() {
         let (_, schema_body) = split_schema_sql_pragmas();
         assert!(!schema_body.contains(SESSION_RETAINED_SIZE_V40_BEGIN));
         assert!(!schema_body.contains("CREATE TABLE IF NOT EXISTS session_retained_size"));
         assert!(!schema_body.contains("session_checkpoints_retained_size_ai"));
+        assert!(!schema_body.contains(SESSION_RECOVERY_USABILITY_V44_BEGIN));
+        assert!(!schema_body.contains("CREATE TABLE IF NOT EXISTS session_recovery_usability"));
+        assert!(!schema_body.contains("session_checkpoints_recovery_usability_ai"));
 
         let conn = Connection::open_in_memory().expect("open current-schema fixture");
         initialize_schema(&conn).expect("v0 migration sequence installs current schema");
         validate_session_retained_size_schema(&conn)
             .expect("v40 must be installed after all legacy session columns exist");
+        validate_session_recovery_usability_schema(&conn)
+            .expect("v44 must be installed only after historical rebuild migrations complete");
         assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn current_schema_with_lost_version_stamp_replays_authorities_without_data_loss() {
+        let conn = Connection::open_in_memory().expect("open current-schema fixture");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute(
+            "INSERT INTO mux_sessions (
+                 session_id, created_at, shutdown_clean, topology_json,
+                 window_metadata_json, ft_version
+             ) VALUES ('stamp-loss', 41, 0, '{\"tabs\":[3,1,2]}',
+                       '{\"window\":7}', '0.44.0')",
+            [],
+        )
+        .expect("seed persisted session");
+        let retained_bytes_before: i64 = conn
+            .query_row(
+                "SELECT retained_bytes FROM session_retained_size
+                 WHERE session_id = 'stamp-loss'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read retained-size authority before replay");
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM session_recovery_usability
+                 WHERE session_id = 'stamp-loss'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "dirty"
+        );
+
+        set_user_version(&conn, 0).expect("simulate a lost version stamp");
+        initialize_schema(&conn).expect("replay current unversioned schema");
+
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            conn.query_row(
+                "SELECT topology_json FROM mux_sessions
+                 WHERE session_id = 'stamp-loss'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "{\"tabs\":[3,1,2]}"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT retained_bytes FROM session_retained_size
+                 WHERE session_id = 'stamp-loss'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            retained_bytes_before
+        );
+        validate_session_retained_size_schema(&conn)
+            .expect("replayed v40 authority must remain canonical");
+        validate_session_recovery_usability_schema(&conn)
+            .expect("replayed v44 authority must remain canonical");
+        initialize_schema(&conn).expect("ordinary reopen after replay");
+    }
+
+    #[test]
+    fn lost_version_stamp_replay_rejects_and_preserves_drifted_authority() {
+        let conn = Connection::open_in_memory().expect("open current-schema fixture");
+        initialize_schema(&conn).expect("initialize current schema");
+        conn.execute_batch(
+            "DROP TRIGGER mux_sessions_retained_size_ai;
+             CREATE TRIGGER mux_sessions_retained_size_ai
+             AFTER INSERT ON mux_sessions BEGIN
+                 SELECT 1;
+             END;
+             PRAGMA user_version = 0;",
+        )
+        .expect("install drifted authority and lose version stamp");
+
+        initialize_schema(&conn).expect_err("drifted trigger catalog must fail closed");
+
+        assert_eq!(get_user_version(&conn).unwrap(), 0);
+        let trigger_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'trigger' AND name = 'mux_sessions_retained_size_ai'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed replay must roll back trigger suspension");
+        assert!(
+            compact_schema_sql(&trigger_sql).contains("select1"),
+            "the rejected drifted trigger must remain available for diagnosis"
+        );
     }
 
     fn create_v35_checkpoint_fixture(conn: &Connection) {
@@ -10467,7 +10625,10 @@ mod tests {
             )
             .unwrap();
         assert!(!population_complete);
-        assert_eq!(authority_rows, 0, "migration must not perform an unbounded backfill");
+        assert_eq!(
+            authority_rows, 0,
+            "migration must not perform an unbounded backfill"
+        );
 
         conn.execute(
             "INSERT INTO mux_sessions (

@@ -427,8 +427,7 @@ pub fn cleanup_sessions(
                 .ok_or_else(|| recovery_authority_error("age retention has no owner observer"))?,
         )?;
         result.deleted_by_age = phase.value;
-        result.recovery_reconciliation_pending |=
-            phase.recovery_reconciliation_pending;
+        result.recovery_reconciliation_pending |= phase.recovery_reconciliation_pending;
         if result.deleted_by_age > 0 {
             info!(
                 deleted = result.deleted_by_age,
@@ -448,8 +447,7 @@ pub fn cleanup_sessions(
                 .ok_or_else(|| recovery_authority_error("count retention has no owner observer"))?,
         )?;
         result.deleted_by_count = phase.value;
-        result.recovery_reconciliation_pending |=
-            phase.recovery_reconciliation_pending;
+        result.recovery_reconciliation_pending |= phase.recovery_reconciliation_pending;
         if result.deleted_by_count > 0 {
             info!(
                 deleted = result.deleted_by_count,
@@ -469,8 +467,7 @@ pub fn cleanup_sessions(
                 .ok_or_else(|| recovery_authority_error("size retention has no owner observer"))?,
         )?;
         let size_outcome = phase.value;
-        result.recovery_reconciliation_pending |=
-            phase.recovery_reconciliation_pending;
+        result.recovery_reconciliation_pending |= phase.recovery_reconciliation_pending;
         result.deleted_by_size = size_outcome.deleted;
         result.size_measured_bytes = size_outcome.measured_bytes;
         result.size_deleted_bytes = size_outcome.deleted_bytes;
@@ -623,8 +620,7 @@ fn advance_recovery_authority_population(
         return Ok(false);
     }
     let query_limit = RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS.saturating_add(1);
-    let max_session_id_bytes =
-        i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX);
+    let max_session_id_bytes = i64::try_from(MAX_CHECKPOINT_SESSION_ID_BYTES).unwrap_or(i64::MAX);
     let query_limit = i64::try_from(query_limit).unwrap_or(i64::MAX);
     let sessions: Vec<(i64, Option<String>)> =
         if let Some(after_rowid) = state.population_after_rowid {
@@ -666,9 +662,7 @@ fn advance_recovery_authority_population(
                 .collect::<Result<_, _>>()?
         };
     let population_complete = sessions.len() <= RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS;
-    let batch_len = sessions
-        .len()
-        .min(RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS);
+    let batch_len = sessions.len().min(RECOVERY_AUTHORITY_POPULATION_BATCH_ROWS);
     let batch = &sessions[..batch_len];
     for (_, session_id) in batch {
         let Some(session_id) = session_id else {
@@ -755,11 +749,9 @@ fn advance_dirty_recovery_authority(conn: &Connection) -> Result<bool, rusqlite:
         processed = processed.saturating_add(1);
     }
     debug_assert!(
-        RECOVERY_AUTHORITY_RECONCILE_MAX_ADMITTED_BYTES
-            >= MAX_PERSISTED_CHECKPOINT_TEXT_BYTES
+        RECOVERY_AUTHORITY_RECONCILE_MAX_ADMITTED_BYTES >= MAX_PERSISTED_CHECKPOINT_TEXT_BYTES
     );
-    Ok(processed < dirty_rows.len()
-        || dirty_rows.len() == RECOVERY_AUTHORITY_RECONCILE_BATCH_ROWS)
+    Ok(processed < dirty_rows.len() || dirty_rows.len() == RECOVERY_AUTHORITY_RECONCILE_BATCH_ROWS)
 }
 
 fn invalidate_recovery_authority_row(
@@ -805,8 +797,9 @@ fn verify_protected_recovery_checkpoint(
     session_id: &str,
     expected_checkpoint_id: i64,
 ) -> Result<bool, rusqlite::Error> {
-    let observed = crate::session_restore::usable_recovery_checkpoint_id_from_conn(conn, session_id)
-        .map_err(clean_authority_error)?;
+    let observed =
+        crate::session_restore::usable_recovery_checkpoint_id_from_conn(conn, session_id)
+            .map_err(clean_authority_error)?;
     Ok(observed == Some(expected_checkpoint_id))
 }
 
@@ -914,8 +907,7 @@ fn newest_usable_recovery_session(
         state = load_recovery_selection_state(conn)?;
     }
 
-    let selection_limit =
-        i64::try_from(RECOVERY_SELECTION_SCAN_BATCH_ROWS).unwrap_or(i64::MAX);
+    let selection_limit = i64::try_from(RECOVERY_SELECTION_SCAN_BATCH_ROWS).unwrap_or(i64::MAX);
     let usable_rows: Vec<(String, i64)> = match (
         state.scan_after_checkpoint_id,
         state.scan_after_session_id.as_deref(),
@@ -1092,8 +1084,10 @@ fn session_is_deletion_eligible(
             // Liveness can change after an earlier cursor batch. Even with a
             // valid older protected point, a newly dead newer usable session
             // must survive until the next completed scan promotes it.
-            Ok(candidate.session_id.as_str() != protected.session_id.as_str()
-                && candidate_checkpoint_id < protected.checkpoint_id)
+            Ok(
+                candidate.session_id.as_str() != protected.session_id.as_str()
+                    && candidate_checkpoint_id < protected.checkpoint_id,
+            )
         }
         Some((state, None)) if state == "unusable" => Ok(protected_recovery_point.is_some()),
         Some((state, None)) if state == "dirty" => Ok(false),
@@ -1331,9 +1325,7 @@ fn delete_sessions_by_age_with_observer(
     max_age_days: u64,
     observer: &impl SessionOwnerObserver,
 ) -> Result<usize, rusqlite::Error> {
-    Ok(
-        delete_sessions_by_age_phase_with_observer(conn, max_age_days, observer)?.value,
-    )
+    Ok(delete_sessions_by_age_phase_with_observer(conn, max_age_days, observer)?.value)
 }
 
 fn delete_sessions_by_age_phase_with_observer(
@@ -1444,9 +1436,7 @@ fn delete_excess_closed_sessions_with_observer(
     max_count: usize,
     observer: &impl SessionOwnerObserver,
 ) -> Result<usize, rusqlite::Error> {
-    Ok(
-        delete_excess_closed_sessions_phase_with_observer(conn, max_count, observer)?.value,
-    )
+    Ok(delete_excess_closed_sessions_phase_with_observer(conn, max_count, observer)?.value)
 }
 
 fn delete_excess_closed_sessions_phase_with_observer(
@@ -1697,9 +1687,7 @@ fn delete_sessions_by_size_with_observer(
     max_total_mb: u64,
     observer: &impl SessionOwnerObserver,
 ) -> Result<SizeCleanupOutcome, rusqlite::Error> {
-    Ok(
-        delete_sessions_by_size_phase_with_observer(conn, max_total_mb, observer)?.value,
-    )
+    Ok(delete_sessions_by_size_phase_with_observer(conn, max_total_mb, observer)?.value)
 }
 
 fn delete_sessions_by_size_phase_with_observer(
@@ -1725,9 +1713,7 @@ fn delete_sessions_by_size_phase_with_observer(
         ProtectedRecoverySelection::Ready(session_id) => session_id,
         ProtectedRecoverySelection::Pending => {
             tx.commit()?;
-            return Ok(RetentionPhaseOutcome::pending(
-                SizeCleanupOutcome::default(),
-            ));
+            return Ok(RetentionPhaseOutcome::pending(SizeCleanupOutcome::default()));
         }
     };
     validate_session_retained_size_authority(&tx)?;
@@ -3077,14 +3063,7 @@ mod tests {
             processes: BTreeMap::new(),
         };
         insert_session(&conn, "stale-selected-identity", 1, false);
-        set_unclean_owner(
-            &conn,
-            "stale-selected-identity",
-            &host_id,
-            46,
-            906,
-            1,
-        );
+        set_unclean_owner(&conn, "stale-selected-identity", &host_id, 46, 906, 1);
         let canonical_checkpoint =
             insert_v2_recovery_snapshot(&conn, "stale-selected-identity", 1, 46, 46);
         conn.execute(
@@ -3165,9 +3144,11 @@ mod tests {
             "the first bounded legacy batch must never authorize deletion"
         );
         let first_batch: i64 = conn
-            .query_row("SELECT COUNT(*) FROM session_recovery_usability", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM session_recovery_usability",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(
             first_batch,
@@ -3452,8 +3433,7 @@ mod tests {
         conn.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
         insert_session(&conn, "restart-authority", 1, false);
         set_unclean_owner(&conn, "restart-authority", &host_id, 81, 981, 1);
-        let restart_checkpoint =
-            insert_v2_recovery_snapshot(&conn, "restart-authority", 1, 81, 81);
+        let restart_checkpoint = insert_v2_recovery_snapshot(&conn, "restart-authority", 1, 81, 81);
 
         {
             let transaction = begin_retention_transaction(&conn).unwrap();
@@ -3494,32 +3474,18 @@ mod tests {
     #[test]
     fn cached_selection_rechecks_host_fence_after_database_move() {
         let conn = make_test_db();
-        let host_a = serde_json::to_string(&test_host_on_machine(
-            "host-a",
-            TEST_MACHINE_A,
-            "boot-a",
-        ))
-        .unwrap();
-        let host_b = serde_json::to_string(&test_host_on_machine(
-            "host-b",
-            TEST_MACHINE_B,
-            "boot-b",
-        ))
-        .unwrap();
+        let host_a =
+            serde_json::to_string(&test_host_on_machine("host-a", TEST_MACHINE_A, "boot-a"))
+                .unwrap();
+        let host_b =
+            serde_json::to_string(&test_host_on_machine("host-b", TEST_MACHINE_B, "boot-b"))
+                .unwrap();
         let observer_a = FakeOwnerObserver {
-            current_host: Some(test_host_on_machine(
-                "host-a",
-                TEST_MACHINE_A,
-                "boot-a",
-            )),
+            current_host: Some(test_host_on_machine("host-a", TEST_MACHINE_A, "boot-a")),
             processes: BTreeMap::new(),
         };
         let observer_b = FakeOwnerObserver {
-            current_host: Some(test_host_on_machine(
-                "host-b",
-                TEST_MACHINE_B,
-                "boot-b",
-            )),
+            current_host: Some(test_host_on_machine("host-b", TEST_MACHINE_B, "boot-b")),
             processes: BTreeMap::new(),
         };
 
@@ -3555,14 +3521,7 @@ mod tests {
             let pid = 801 + index;
             let process_start = 1_801 + index;
             insert_session(&conn, &session_id, 2 + index, false);
-            set_unclean_owner(
-                &conn,
-                &session_id,
-                &host_id,
-                pid,
-                process_start,
-                2 + index,
-            );
+            set_unclean_owner(&conn, &session_id, &host_id, pid, process_start, 2 + index);
             insert_v2_recovery_snapshot(
                 &conn,
                 &session_id,
@@ -3653,18 +3612,9 @@ mod tests {
         selector
             .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
             .unwrap();
-        selector
-            .execute_batch(crate::storage::SCHEMA_SQL)
-            .unwrap();
+        selector.execute_batch(crate::storage::SCHEMA_SQL).unwrap();
         insert_session(&selector, "concurrent-authority", 1, false);
-        set_unclean_owner(
-            &selector,
-            "concurrent-authority",
-            &host_id,
-            401,
-            1_401,
-            1,
-        );
+        set_unclean_owner(&selector, "concurrent-authority", &host_id, 401, 1_401, 1);
         let concurrent_checkpoint =
             insert_v2_recovery_snapshot(&selector, "concurrent-authority", 1, 401, 401);
         assert_eq!(
@@ -3827,14 +3777,7 @@ mod tests {
         assert!(!scan_complete);
 
         insert_session(&conn, "ack-preserve-authority", 99, false);
-        set_unclean_owner(
-            &conn,
-            "ack-preserve-authority",
-            &host_id,
-            299,
-            1_299,
-            99,
-        );
+        set_unclean_owner(&conn, "ack-preserve-authority", &host_id, 299, 1_299, 99);
         insert_v2_recovery_snapshot(&conn, "ack-preserve-authority", 99, 299, 299);
         assert_eq!(
             drive_recovery_selection(&conn, &dead, 8).as_deref(),
@@ -3859,13 +3802,8 @@ mod tests {
             .unwrap();
         assert_eq!(ack_state, "usable");
         assert!(!ack_scan_complete);
-        set_recovery_acknowledgement_with_observer(
-            &conn,
-            "ack-preserve-authority",
-            None,
-            &dead,
-        )
-        .unwrap();
+        set_recovery_acknowledgement_with_observer(&conn, "ack-preserve-authority", None, &dead)
+            .unwrap();
         let preserved_ack: Option<i64> = conn
             .query_row(
                 "SELECT recovery_acknowledged_at FROM mux_sessions
@@ -3877,14 +3815,7 @@ mod tests {
         assert_eq!(preserved_ack, None);
 
         insert_session(&conn, "lifecycle-authority", 100, false);
-        set_unclean_owner(
-            &conn,
-            "lifecycle-authority",
-            &host_id,
-            301,
-            1_301,
-            100,
-        );
+        set_unclean_owner(&conn, "lifecycle-authority", &host_id, 301, 1_301, 100);
         let lifecycle_source =
             insert_v2_recovery_snapshot(&conn, "lifecycle-authority", 100, 301, 301);
         conn.execute(
@@ -4192,7 +4123,7 @@ mod tests {
             "DROP TRIGGER mux_sessions_recovery_usability_ai;
              PRAGMA ignore_check_constraints = ON;",
         )
-            .expect("enable historical-corruption fixture insertion");
+        .expect("enable historical-corruption fixture insertion");
         conn.execute(
             "INSERT INTO mux_sessions (
                  session_id, created_at, last_checkpoint_at, shutdown_clean,
