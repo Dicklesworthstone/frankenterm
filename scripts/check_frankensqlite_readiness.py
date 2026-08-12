@@ -45,8 +45,8 @@ checkout.
 ## What the script reads
 
 In order of preference:
-1. ``CHANGELOG.md`` — looks for the most recent "## [Phase N]"
-   header.
+1. ``CHANGELOG.md`` — looks for the highest "## [Phase N]" header or
+   an explicit bullet such as "Phase 5A complete".
 2. ``VERSION`` — single-line phase number ("5", "5.0", etc.).
 3. ``Cargo.toml`` — package.metadata.frankenterm.phase key, when
    present.
@@ -67,6 +67,12 @@ CONVENTIONAL_PATHS = [
 ]
 
 PHASE_HEADER_RE = re.compile(r"##\s*\[?Phase\s+(\d+)", re.IGNORECASE)
+PHASE_COMPLETION_RE = re.compile(
+    r"^\s*[-*]\s+(?:\*\*)?Phase\s+(\d+)"
+    r"(?:[A-Za-z][A-Za-z0-9.-]*)?\s+complete(?:\*\*)?\s*"
+    r"(?:--|—|–|:|\.|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 SEMVER_HEADER_RE = re.compile(r"##\s*\[(\d+)\.(\d+)\.(\d+)(?:[^\]]*)?\]")
 VERSION_RE = re.compile(r"^\s*(\d+)(?:\.\d+)?\s*$", re.MULTILINE)
 
@@ -79,12 +85,13 @@ SEMVER_READY_MAJOR = 1
 PHASE_READY_THRESHOLD = 5
 
 
-def _read_changelog_phase(path: Path) -> int | None:
-    """Return the highest Phase N referenced in CHANGELOG.md.
+def _phase_from_changelog_text(text: str) -> int | None:
+    """Return the highest authoritative phase in changelog text.
 
-    The substrate's CHANGELOG convention is `## [Phase N] - YYYY-MM-DD`;
-    we match the leading-N pattern and take the max so out-of-order
-    entries do not understate readiness.
+    A phase heading is authoritative under the original upstream contract. A
+    lettered phase is authoritative only when a changelog bullet explicitly
+    marks it complete. Narrative mentions and roadmap statements do not unlock
+    the backend.
 
     br-ft-o8997: when no Phase markers exist but the CHANGELOG uses
     semver (`## [1.0.0]` etc.), interpret major-version >= 1 as
@@ -92,17 +99,24 @@ def _read_changelog_phase(path: Path) -> int | None:
     matches /dp/frankensqlite's actual CHANGELOG format
     (`## [0.1.2] -- 2026-03-21`) without requiring upstream to adopt
     the Phase scheme.
+
+    >>> _phase_from_changelog_text("## [Phase 4] -- shipped")
+    4
+    >>> _phase_from_changelog_text("- **Phase 5A complete** -- schema loading")
+    5
+    >>> _phase_from_changelog_text("Phase 9 complete is the future goal") is None
+    True
+    >>> _phase_from_changelog_text("- **Phase 9A planned** -- not shipped") is None
+    True
+    >>> _phase_from_changelog_text("## [0.2.1] -- stable")
+    0
     """
-    changelog = path / "CHANGELOG.md"
-    if not changelog.exists():
-        return None
-    try:
-        text = changelog.read_text(encoding="utf-8")
-    except OSError:
-        return None
     phase_matches = PHASE_HEADER_RE.findall(text)
-    if phase_matches:
-        return max(int(m) for m in phase_matches)
+    completion_matches = PHASE_COMPLETION_RE.findall(text)
+    authoritative_phases = [int(match) for match in phase_matches]
+    authoritative_phases.extend(int(match) for match in completion_matches)
+    if authoritative_phases:
+        return max(authoritative_phases)
     # Fallback: parse semver headers; treat MAJOR >= SEMVER_READY_MAJOR
     # as ready (PHASE_READY_THRESHOLD), else not-ready (return phase 0
     # so the caller's >= 5 gate fails cleanly).
@@ -113,6 +127,18 @@ def _read_changelog_phase(path: Path) -> int | None:
     if max_major >= SEMVER_READY_MAJOR:
         return PHASE_READY_THRESHOLD
     return 0
+
+
+def _read_changelog_phase(path: Path) -> int | None:
+    """Return the highest authoritative phase in CHANGELOG.md."""
+    changelog = path / "CHANGELOG.md"
+    if not changelog.exists():
+        return None
+    try:
+        text = changelog.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return _phase_from_changelog_text(text)
 
 
 def _read_version_phase(path: Path) -> int | None:
