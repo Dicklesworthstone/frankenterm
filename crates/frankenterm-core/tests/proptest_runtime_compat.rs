@@ -129,7 +129,11 @@ macro_rules! select_runtime_async_test {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(ProptestConfig {
+        cases: 200,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// All messages sent through mpsc arrive in FIFO order.
     #[test]
@@ -246,7 +250,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(ProptestConfig {
+        cases: 200,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// Watch channel borrow always returns the most recently sent value.
     #[test]
@@ -290,14 +298,22 @@ proptest! {
         });
     }
 
-    /// Watch send after all receivers dropped returns Err.
+    /// Watch retains the latest value across a zero-receiver gap.
     #[test]
-    fn watch_send_to_no_receivers_fails(val in any::<i32>()) {
+    fn watch_send_to_no_receivers_preserves_value_for_future_subscriber(val in any::<i32>()) {
         with_runtime(move || async move {
             let (tx, rx) = watch::channel(0i32);
             drop(rx);
-            let result = tx.send(val);
-            assert!(result.is_err(), "send with no receivers must fail");
+            assert_eq!(tx.receiver_count(), 0);
+            assert!(tx.is_closed(), "zero active receivers must be observable");
+            tx.send(val)
+                .expect("watch send must preserve the cell without active receivers");
+            let future_rx = tx.subscribe();
+            assert_eq!(
+                *future_rx.borrow(),
+                val,
+                "a future subscriber must observe the value sent during the receiver gap"
+            );
         });
     }
 }
@@ -307,7 +323,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(150))]
+    #![proptest_config(ProptestConfig {
+        cases: 150,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// Broadcast receivers get messages in FIFO order.
     #[test]
@@ -374,7 +394,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(ProptestConfig {
+        cases: 200,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// Semaphore initial permits match constructor argument.
     #[test]
@@ -480,7 +504,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(ProptestConfig {
+        cases: 200,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// Mutex preserves the last written value.
     #[test]
@@ -550,7 +578,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
+    #![proptest_config(ProptestConfig {
+        cases: 200,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// RwLock write then read returns the written value.
     #[test]
@@ -639,7 +671,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// RuntimeBuilder::current_thread always builds successfully.
     #[test]
@@ -722,7 +758,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// Immediate futures never timeout regardless of timeout duration.
     #[test]
@@ -807,7 +847,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(ProptestConfig {
+        cases: 100,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// spawn_blocking returns the closure's result.
     #[test]
@@ -866,7 +910,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
+    #![proptest_config(ProptestConfig {
+        cases: 30,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// Sleep with any small duration completes without panic.
     #[test]
@@ -896,7 +944,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+    #![proptest_config(ProptestConfig {
+        cases: 50,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// Mutex + mpsc integration: protected counter matches message count.
     #[test]
@@ -979,7 +1031,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+    #![proptest_config(ProptestConfig {
+        cases: 50,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// join! preserves both values from concurrent futures.
     #[test]
@@ -1029,7 +1085,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+    #![proptest_config(ProptestConfig {
+        cases: 50,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// select! returns the value from an immediately-ready branch.
     #[test]
@@ -1076,7 +1136,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+    #![proptest_config(ProptestConfig {
+        cases: 50,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// task::spawn_blocking preserves the return value through the JoinHandle.
     #[test]
@@ -1107,7 +1171,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
+    #![proptest_config(ProptestConfig {
+        cases: 30,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// yield_now does not lose values: interleaved yields preserve counter.
     #[test]
@@ -1128,7 +1196,11 @@ proptest! {
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(30))]
+    #![proptest_config(ProptestConfig {
+        cases: 30,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     /// spawn_blocking + join!: blocking computation and async work run concurrently.
     #[test]
