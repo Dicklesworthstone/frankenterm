@@ -332,6 +332,86 @@ fn total_retained_bytes(conn: &Connection) -> u64 {
     u64::try_from(retained).unwrap()
 }
 
+/// Drive the production bounded-continuation contract to an authoritative
+/// completion and combine its per-pass receipts for invariant assertions.
+///
+/// Recovery-usability reconciliation deliberately commits a finite batch and
+/// returns `recovery_reconciliation_pending` instead of scanning an arbitrary
+/// session history in one call. Property tests that assert the final retention
+/// state must therefore model the scheduler's prompt retries. The generated
+/// cases contain at most 30 sessions, so 128 passes is a deliberately generous
+/// finite test bound that still turns a non-converging implementation into a
+/// deterministic failure.
+fn cleanup_sessions_until_settled(
+    conn: &Connection,
+    config: &SessionRetentionConfig,
+) -> CleanupResult {
+    const MAX_SETTLEMENT_PASSES: usize = 128;
+    let mut combined = CleanupResult::default();
+
+    for _ in 0..MAX_SETTLEMENT_PASSES {
+        let receipt = cleanup_sessions(conn, config).expect("valid cleanup campaign must succeed");
+        combined.deleted_by_age = combined
+            .deleted_by_age
+            .saturating_add(receipt.deleted_by_age);
+        combined.deleted_by_count = combined
+            .deleted_by_count
+            .saturating_add(receipt.deleted_by_count);
+        combined.deleted_by_size = combined
+            .deleted_by_size
+            .saturating_add(receipt.deleted_by_size);
+        combined.size_deleted_bytes = combined
+            .size_deleted_bytes
+            .saturating_add(receipt.size_deleted_bytes);
+        combined.size_retained_bytes = receipt.size_retained_bytes;
+        combined.size_ineligible_shortfall_bytes = receipt.size_ineligible_shortfall_bytes;
+        combined.size_measured_bytes = combined
+            .size_deleted_bytes
+            .saturating_add(combined.size_retained_bytes);
+        combined.orphaned_restore_lifecycle_rows = combined
+            .orphaned_restore_lifecycle_rows
+            .saturating_add(receipt.orphaned_restore_lifecycle_rows);
+        combined.orphaned_checkpoints = combined
+            .orphaned_checkpoints
+            .saturating_add(receipt.orphaned_checkpoints);
+        combined.orphaned_pane_states = combined
+            .orphaned_pane_states
+            .saturating_add(receipt.orphaned_pane_states);
+        combined.recovery_reconciliation_pending = receipt.recovery_reconciliation_pending;
+
+        if !receipt.recovery_reconciliation_pending {
+            return combined;
+        }
+    }
+
+    panic!("cleanup campaign did not settle within {MAX_SETTLEMENT_PASSES} bounded passes");
+}
+
+#[test]
+fn bounded_cleanup_harness_retries_pending_authority_to_completion() {
+    let conn = make_test_db();
+    let old = i64::try_from(epoch_ms()).expect("test epoch fits SQLite integer") - 90 * 86_400_000;
+    for index in 0..9 {
+        insert_session(&conn, &format!("old-{index}"), old, true);
+    }
+    let config = SessionRetentionConfig {
+        max_age_days: 30,
+        max_closed_sessions: 0,
+        max_total_size_mb: 0,
+        cleanup_interval_hours: 0,
+    };
+
+    let first = cleanup_sessions(&conn, &config).expect("first bounded cleanup step");
+    assert!(first.recovery_reconciliation_pending);
+    assert_eq!(first.deleted_by_age, 0);
+    assert_eq!(count_sessions(&conn), 9);
+
+    let settled = cleanup_sessions_until_settled(&conn, &config);
+    assert!(!settled.recovery_reconciliation_pending);
+    assert_eq!(settled.deleted_by_age, 9);
+    assert_eq!(count_sessions(&conn), 0);
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Strategies
 // ────────────────────────────────────────────────────────────────────
@@ -481,7 +561,7 @@ fn online_cleanup_leaves_reclaimed_pages_on_freelist_without_compaction() {
         max_total_size_mb: 0,
         cleanup_interval_hours: 0,
     };
-    let result = cleanup_sessions(&conn, &config).expect("logical cleanup succeeds");
+    let result = cleanup_sessions_until_settled(&conn, &config);
     assert_eq!(result.deleted_by_age, 1);
 
     let pages_after: i64 = conn
@@ -619,7 +699,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let _result = cleanup_sessions(&conn, &config).unwrap();
+        let _result = cleanup_sessions_until_settled(&conn, &config);
         let active_after = count_active_sessions(&conn);
 
         prop_assert_eq!(
@@ -668,7 +748,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
 
         // All old closed sessions should be deleted
         prop_assert_eq!(
@@ -715,7 +795,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
         let remaining = count_closed_sessions(&conn) as usize;
 
         prop_assert!(
@@ -1009,7 +1089,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
         let total_deleted = result.total_sessions_deleted();
         prop_assert_eq!(total_deleted, num_old);
         insert_session(&conn, "interactive-sentinel", now, false);
@@ -1057,10 +1137,10 @@ proptest! {
         };
 
         // First cleanup
-        let _first = cleanup_sessions(&conn, &config).unwrap();
+        let _first = cleanup_sessions_until_settled(&conn, &config);
 
         // Second cleanup should find nothing to do
-        let second = cleanup_sessions(&conn, &config).unwrap();
+        let second = cleanup_sessions_until_settled(&conn, &config);
 
         prop_assert_eq!(
             second.deleted_by_age, 0usize,
@@ -1119,7 +1199,7 @@ proptest! {
             insert_session(&conn, &format!("active-{}", i), created, false);
         }
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
 
         prop_assert!(
             result.total_sessions_deleted() <= num_closed,
@@ -1160,7 +1240,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
 
         let remaining_bytes = total_retained_bytes(&conn);
         let budget_bytes = max_size_mb * 1024 * 1024;
@@ -1216,7 +1296,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
         prop_assert_eq!(result.deleted_by_age, 1usize, "one session deleted by age");
 
         prop_assert_eq!(count_sessions(&conn), 0i64, "session deleted");
@@ -1253,7 +1333,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let _result = cleanup_sessions(&conn, &config).unwrap();
+        let _result = cleanup_sessions_until_settled(&conn, &config);
 
         // Remaining sessions should be the most recent ones
         let remaining: Vec<String> = {
@@ -1325,7 +1405,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
         let active_after = count_active_sessions(&conn);
 
         prop_assert_eq!(
@@ -1431,7 +1511,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
         let final_total = count_sessions(&conn);
         let final_active = count_active_sessions(&conn) as usize;
 
@@ -1619,7 +1699,7 @@ proptest! {
             cleanup_interval_hours: 24,
         };
 
-        let result = cleanup_sessions(&conn, &config).unwrap();
+        let result = cleanup_sessions_until_settled(&conn, &config);
 
         // The sum of all categories must equal total_sessions_deleted
         let sum = result
@@ -1967,7 +2047,7 @@ proptest! {
             max_total_size_mb: 1,
             cleanup_interval_hours: 0,
         };
-        cleanup_sessions(&conn, &config).unwrap();
+        cleanup_sessions_until_settled(&conn, &config);
 
         // SAFETY: every open/active session survives, with its full subtree.
         let surviving_open_sessions: i64 = conn
@@ -2032,7 +2112,7 @@ proptest! {
         prop_assert_eq!(orphan_ps, 0_i64, "cleanup must leave no orphan pane_state");
 
         // IDEMPOTENCY: a second pass does no further work.
-        let second = cleanup_sessions(&conn, &config).unwrap();
+        let second = cleanup_sessions_until_settled(&conn, &config);
         prop_assert!(
             !second.any_work_done(),
             "second cleanup pass must be a complete no-op"
@@ -2067,7 +2147,7 @@ fn gc_golden_preserves_active_drops_old_closed_and_stays_consistent() {
         max_total_size_mb: 1024,
         cleanup_interval_hours: 0,
     };
-    cleanup_sessions(&conn, &config).unwrap();
+    cleanup_sessions_until_settled(&conn, &config);
 
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
 
