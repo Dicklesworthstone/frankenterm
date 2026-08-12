@@ -8,8 +8,9 @@
 //! - time helpers (`sleep`, `timeout`, `sleep_with_cx`, `timeout_with_cx`)
 //!
 //! The dual-runtime Tokio fallback was removed in ft-xbnl0.2.5. Asupersync
-//! is now the sole async runtime. The `asupersync-runtime` feature flag is
-//! retained as a no-op for backward compatibility with test target metadata.
+//! is now the sole async runtime. The `asupersync-runtime` feature remains an
+//! explicit build-profile contract for runtime-specific tests and benchmarks;
+//! it no longer selects between competing production runtimes.
 
 use std::future::Future;
 use std::time::Duration;
@@ -6454,13 +6455,6 @@ impl RuntimeBuilder {
     /// No-op: asupersync handles I/O and timers automatically.
     #[must_use]
     pub fn enable_all(self) -> Self {
-        self
-    }
-
-    /// No-op: paused time control is only available on tokio-backed test runtimes.
-    #[cfg(test)]
-    #[must_use]
-    pub fn start_paused(self, _start_paused: bool) -> Self {
         self
     }
 

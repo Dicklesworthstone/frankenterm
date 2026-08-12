@@ -74,6 +74,23 @@ fn scan_for_patterns(
     violations
 }
 
+fn imports_runtime_async_item(contents: &str, item: &str) -> bool {
+    let compact: String = contents
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if compact.contains(&format!("usecrate::runtime_async::{item};")) {
+        return true;
+    }
+
+    let group_prefix = "usecrate::runtime_async::{";
+    compact
+        .split(group_prefix)
+        .skip(1)
+        .filter_map(|suffix| suffix.split_once("};").map(|(items, _)| items))
+        .any(|items| items.split(',').any(|candidate| candidate == item))
+}
+
 fn workspace_root() -> PathBuf {
     let core_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     core_root
@@ -160,30 +177,22 @@ fn runtime_async_helper_shims_do_not_reappear_in_production_surfaces() {
 }
 
 #[test]
-fn runtime_builder_tokio_fallback_stays_explicitly_quarantined() {
+fn raw_tokio_runtime_builder_quarantine_stays_empty() {
     let workspace_root = workspace_root();
     let runtime_async =
         fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/runtime_async.rs"))
             .expect("failed to read runtime_async.rs");
 
     let allowed_apis = allowed_raw_tokio_runtime_builder_apis();
-    for api in allowed_apis {
-        assert_eq!(
-            runtime_async.matches(api).count(),
-            1,
-            "runtime_async.rs must keep exactly one quarantined use of {api}"
-        );
-    }
+    assert!(
+        allowed_apis.is_empty(),
+        "the raw tokio runtime-builder quarantine must remain empty after the asupersync-only cutover"
+    );
 
     assert_eq!(
         runtime_async.matches("tokio::runtime::Builder::").count(),
-        allowed_apis.len(),
-        "runtime_async.rs must not grow additional raw tokio runtime builder constructors"
-    );
-    assert!(
-        runtime_async
-            .contains("Raw tokio runtime constructors stay quarantined here until wa-e34d9"),
-        "runtime_async.rs must document the remaining raw tokio builder quarantine"
+        0,
+        "runtime_async.rs must not reintroduce raw tokio runtime builder constructors"
     );
 }
 
@@ -202,40 +211,44 @@ fn web_and_cli_async_surfaces_route_through_runtime_async() {
         .expect("failed to read main.rs");
 
     assert!(
-        runtime_async.contains("pub use tokio::select;"),
-        "runtime_async.rs must continue to expose a select bridge while this migration contract is active"
+        runtime_async.contains("macro_rules! select")
+            && runtime_async.contains("pub use crate::select;"),
+        "runtime_async.rs must expose the project-owned, non-tokio select macro"
+    );
+    assert!(
+        !runtime_async.contains("pub use tokio::select;"),
+        "runtime_async.rs must not regress to the retired tokio select re-export"
     );
     assert!(
         runtime_async.contains("pub mod broadcast"),
-        "runtime_async.rs must continue to expose a broadcast bridge while this migration contract is active"
+        "runtime_async.rs must expose the project-owned broadcast surface"
     );
     assert!(
         runtime_async.contains("pub mod oneshot"),
-        "runtime_async.rs must continue to expose a oneshot bridge while this migration contract is active"
+        "runtime_async.rs must expose the project-owned oneshot surface"
     );
     assert!(
         runtime_async.contains("pub mod notify"),
-        "runtime_async.rs must continue to expose a notify bridge while this migration contract is active"
+        "runtime_async.rs must expose the project-owned notify surface"
     );
     assert!(
         runtime_async.contains("pub mod signal"),
-        "runtime_async.rs must continue to expose a signal bridge while this migration contract is active"
+        "runtime_async.rs must expose the project-owned signal surface"
     );
     assert!(
         runtime_async.contains("pub mod process"),
-        "runtime_async.rs must continue to expose a process bridge while this migration contract is active"
+        "runtime_async.rs must expose the project-owned process surface"
     );
     assert!(
-        runtime_async.contains("pub fn start_paused"),
-        "runtime_async.rs must continue to expose a paused-test runtime builder bridge while this migration contract is active"
+        imports_runtime_async_item(&web_server, "signal")
+            && web_server.contains("crate::runtime_async::select!"),
+        "web/server.rs must route server lifecycle selection and signals through runtime_async"
     );
     assert!(
-        web_server.contains("use crate::runtime_async::{select, signal};"),
-        "web/server.rs must import runtime_async bridges for server lifecycle operations"
-    );
-    assert!(
-        web_sse.contains("use crate::runtime_async::{mpsc, select, sleep, task, timeout};"),
-        "web/sse.rs must import runtime_async bridges for stream runtime operations"
+        ["mpsc", "select", "sleep", "task"]
+            .iter()
+            .all(|item| imports_runtime_async_item(&web_sse, item)),
+        "web/sse.rs must import the runtime_async stream primitives it uses"
     );
     assert!(
         !web_server.contains("tokio::select!") && !web_server.contains("tokio::signal::"),
@@ -299,7 +312,7 @@ fn production_channel_surfaces_route_through_runtime_async() {
         "events.rs must route broadcast fan-out through runtime_async"
     );
     assert!(
-        storage.contains("use crate::runtime_async::oneshot;"),
+        imports_runtime_async_item(&storage, "oneshot"),
         "storage.rs must route request/response oneshot channels through runtime_async"
     );
     for (path, contents) in [
