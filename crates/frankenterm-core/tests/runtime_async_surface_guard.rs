@@ -321,7 +321,7 @@ fn production_channel_surfaces_route_through_runtime_async() {
         ("spsc_ring_buffer.rs", &spsc_ring_buffer),
     ] {
         assert!(
-            contents.contains("use crate::runtime_async::notify::Notify;"),
+            imports_runtime_async_item(contents, "notify::Notify"),
             "{path} must route async notifications through runtime_async::notify"
         );
     }
