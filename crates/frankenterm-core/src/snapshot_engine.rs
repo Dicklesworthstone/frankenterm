@@ -9326,6 +9326,10 @@ mod tests {
         .unwrap();
         conn.execute_batch(crate::storage::migrations::session_retained_size_schema_sql().unwrap())
             .expect("snapshot fixture must install the canonical v40 retained-size authority");
+        conn.execute_batch(
+            crate::storage::migrations::session_recovery_usability_schema_sql().unwrap(),
+        )
+        .expect("snapshot fixture must install the canonical v44 recovery-usability authority");
 
         (tmp, db_path)
     }
