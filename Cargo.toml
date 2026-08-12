@@ -556,8 +556,8 @@ wasmtime-wasi = { version = "45.0.1", default-features = false, features = ["p1"
 criterion = "0.8.2"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.3.5" }
-asupersync-macros = { version = "0.3.5" }
+asupersync = { version = "0.3.10" }
+asupersync-macros = { version = "0.3.10" }
 log = "0.4.32"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 glob = "0.3.3"
@@ -646,9 +646,9 @@ debug = 1
 # external contributors). Do NOT use absolute /dp/... path patches: they break every
 # build outside the dev fleet (and CI's --locked jobs), since /dp only exists there.
 #
-# asupersync no longer needs a patch here: 0.3.5 is published on crates.io, so
+# asupersync no longer needs a patch here: 0.3.10 is published on crates.io, so
 # frankenterm's own crates depend on it by version (see [workspace.dependencies]) and
-# the fastmcp/fastapi/frankensearch deps resolve that same registry 0.3.5 — the whole
+# the fastmcp/fastapi/frankensearch deps resolve that same registry 0.3.10 — the whole
 # graph unifies on a single source without any git-rev redirect.
 [patch.crates-io]
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
