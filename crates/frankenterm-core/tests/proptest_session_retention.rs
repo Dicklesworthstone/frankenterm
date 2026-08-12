@@ -3,7 +3,8 @@
 //! Verifies cleanup invariants across arbitrary session configurations:
 //!
 //! - CleanupResult::total_sessions_deleted is the saturating age + count + size sum
-//! - CleanupResult::any_work_done iff total > 0 OR orphans > 0
+//! - CleanupResult::any_work_done iff reconciliation is pending, total > 0,
+//!   or orphan cleanup made progress
 //! - CleanupResult::default is all zeros and not any_work_done
 //! - SessionRetentionConfig serde roundtrip (JSON and TOML)
 //! - Active sessions (shutdown_clean=0) are NEVER deleted
@@ -337,6 +338,7 @@ fn total_retained_bytes(conn: &Connection) -> u64 {
 
 fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
     (
+        any::<bool>(),
         any::<usize>(),
         any::<usize>(),
         any::<usize>(),
@@ -350,6 +352,7 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
     )
         .prop_map(
             |(
+                recovery_reconciliation_pending,
                 age,
                 count,
                 size,
@@ -361,7 +364,7 @@ fn arb_cleanup_result() -> impl Strategy<Value = CleanupResult> {
                 orphan_cp,
                 orphan_ps,
             )| CleanupResult {
-                recovery_reconciliation_pending: false,
+                recovery_reconciliation_pending,
                 deleted_by_age: age,
                 deleted_by_count: count,
                 deleted_by_size: size,
@@ -415,23 +418,26 @@ proptest! {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 2. CleanupResult::any_work_done iff total > 0 OR orphans > 0
+// 2. CleanupResult::any_work_done iff reconciliation is pending, total > 0,
+//    or orphan cleanup made progress
 // ────────────────────────────────────────────────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
     #[test]
-    fn any_work_done_iff_total_or_orphans_positive(result in arb_cleanup_result()) {
-        let expected = result.total_sessions_deleted() > 0
+    fn any_work_done_iff_reconciliation_total_or_orphans_positive(result in arb_cleanup_result()) {
+        let expected = result.recovery_reconciliation_pending
+            || result.total_sessions_deleted() > 0
             || result.orphaned_restore_lifecycle_rows > 0
             || result.orphaned_checkpoints > 0
             || result.orphaned_pane_states > 0;
         prop_assert_eq!(
             result.any_work_done(),
             expected,
-            "any_work_done() should be {} for total={}, orphan_lifecycle={}, orphan_cp={}, orphan_ps={}",
+            "any_work_done() should be {} for pending={}, total={}, orphan_lifecycle={}, orphan_cp={}, orphan_ps={}",
             expected,
+            result.recovery_reconciliation_pending,
             result.total_sessions_deleted(),
             result.orphaned_restore_lifecycle_rows,
             result.orphaned_checkpoints,
@@ -1458,6 +1464,11 @@ proptest! {
     #[test]
     fn cleanup_result_clone_preserves_fields(result in arb_cleanup_result()) {
         let cloned = result.clone();
+        prop_assert_eq!(
+            cloned.recovery_reconciliation_pending,
+            result.recovery_reconciliation_pending,
+            "recovery reconciliation state preserved"
+        );
         prop_assert_eq!(cloned.deleted_by_age, result.deleted_by_age, "age preserved");
         prop_assert_eq!(cloned.deleted_by_count, result.deleted_by_count, "count preserved");
         prop_assert_eq!(cloned.deleted_by_size, result.deleted_by_size, "size preserved");
@@ -1487,6 +1498,10 @@ proptest! {
     #[test]
     fn no_work_done_implies_all_counters_zero(result in arb_cleanup_result()) {
         if !result.any_work_done() {
+            prop_assert!(
+                !result.recovery_reconciliation_pending,
+                "reconciliation must not be pending when no work"
+            );
             prop_assert_eq!(result.deleted_by_age, 0usize, "age must be 0 when no work");
             prop_assert_eq!(result.deleted_by_count, 0usize, "count must be 0 when no work");
             prop_assert_eq!(result.deleted_by_size, 0usize, "size must be 0 when no work");
