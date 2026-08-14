@@ -8792,6 +8792,7 @@ mod tests {
                 tabs: vec![],
                 tab_titles: vec![],
                 window_titles: HashMap::new(),
+                floating_panes: Vec::new(),
             }),
         });
 
@@ -10215,11 +10216,13 @@ mod tests {
                             tabs,
                             tab_titles,
                             window_titles,
+                            floating_panes,
                         }),
                     ) => {
                         prop_assert!(tabs.is_empty());
                         prop_assert!(tab_titles.is_empty());
                         prop_assert!(window_titles.is_empty());
+                        prop_assert!(floating_panes.is_empty());
                     }
                     (
                         MissingMuxSessionErrorOp::ListPanesTabStacks,
