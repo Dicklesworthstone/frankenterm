@@ -8522,36 +8522,13 @@ fn explicit_mux_socket_path_is_usable(config: &crate::config::Config) -> bool {
 #[cfg(feature = "vendored")]
 fn compatibility_inputs_for_backend_selection(
     report: &crate::vendored::VendoredCompatibilityReport,
-    explicit_mux_socket_found: bool,
 ) -> (bool, String, Option<serde_json::Value>) {
-    let mut json = serde_json::to_value(report).ok();
-    let explicit_socket_overrides_missing_local_cli = explicit_mux_socket_found
-        && report.vendored_enabled
-        && report.vendored_commit.is_some()
-        && report.local_version.is_none()
-        && report.message.contains("local WezTerm version unavailable");
-
-    if explicit_socket_overrides_missing_local_cli {
-        if let Some(serde_json::Value::Object(map)) = json.as_mut() {
-            map.insert(
-                "explicit_mux_socket_override".to_string(),
-                serde_json::Value::Bool(true),
-            );
-            map.insert(
-                "effective_allow_vendored".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-        return (
-            true,
-            format!(
-                "explicit vendored.mux_socket_path configured; using vendored backend without local WezTerm CLI ({})",
-                report.message
-            ),
-            json,
-        );
-    }
-
+    // GH #78: the compatibility report no longer gates the vendored backend
+    // on an external `wezterm` binary, so the historical
+    // "explicit mux_socket_path overrides missing local CLI" special case is
+    // gone — the report's own `allow_vendored` is authoritative and the
+    // connect-time codec handshake enforces real compatibility.
+    let json = serde_json::to_value(report).ok();
     (report.allow_vendored, report.message.clone(), json)
 }
 
@@ -8575,7 +8552,7 @@ pub fn build_unified_client(config: &crate::config::Config) -> UnifiedClient {
         {
             let local_version = crate::vendored::read_local_wezterm_version();
             let report = crate::vendored::compatibility_report(local_version.as_ref());
-            compatibility_inputs_for_backend_selection(&report, explicit_socket_found)
+            compatibility_inputs_for_backend_selection(&report)
         }
         #[cfg(not(feature = "vendored"))]
         {
@@ -11200,73 +11177,28 @@ mod unified_tests {
         assert_eq!(sel.kind, BackendKind::Vendored);
     }
 
+    /// GH #78 regression: a stock install with no external WezTerm binary
+    /// (only the FrankenTerm build itself) must select the vendored backend
+    /// when a mux socket is discovered — no explicit `mux_socket_path`
+    /// override is required.
     #[cfg(feature = "vendored")]
     #[test]
-    fn explicit_mux_socket_overrides_missing_local_wezterm_cli_probe() {
-        let report = crate::vendored::VendoredCompatibilityReport {
-            status: crate::vendored::VendoredCompatibilityStatus::Incompatible,
-            vendored_enabled: true,
-            allow_vendored: false,
-            local_version: None,
-            local_commit: None,
-            vendored_commit: Some("abcdef12".to_string()),
-            vendored_version: Some("frankenterm-test".to_string()),
-            message:
-                "local WezTerm version unavailable; refusing vendored backend compatibility probe"
-                    .to_string(),
-            recommendation: Some(
-                "Install WezTerm or ensure the wezterm binary is on PATH".to_string(),
-            ),
-        };
+    fn missing_local_wezterm_cli_selects_vendored_backend() {
+        let report = crate::vendored::compatibility_report_with(
+            crate::vendored::VendoredWeztermMetadata {
+                commit: Some("abcdef12".to_string()),
+                version: Some("frankenterm-test".to_string()),
+                source: None,
+                enabled: true,
+            },
+            None,
+        );
 
         let (allow_vendored, compat_message, compat_json) =
-            compatibility_inputs_for_backend_selection(&report, true);
+            compatibility_inputs_for_backend_selection(&report);
 
         assert!(allow_vendored);
-        assert!(compat_message.contains("explicit vendored.mux_socket_path configured"));
-        let compat_json = compat_json.expect("compatibility JSON");
-        assert_eq!(
-            compat_json["explicit_mux_socket_override"].as_bool(),
-            Some(true)
-        );
-        assert_eq!(
-            compat_json["effective_allow_vendored"].as_bool(),
-            Some(true)
-        );
-
-        let sel = evaluate_backend_selection(&BackendSelectionInputs {
-            vendored_feature_enabled: true,
-            allow_vendored,
-            compat_message,
-            compat_json: Some(compat_json),
-            socket_discovered: true,
-        });
-        assert_eq!(sel.kind, BackendKind::Vendored);
-    }
-
-    #[cfg(feature = "vendored")]
-    #[test]
-    fn missing_local_wezterm_cli_without_explicit_socket_stays_cli() {
-        let report = crate::vendored::VendoredCompatibilityReport {
-            status: crate::vendored::VendoredCompatibilityStatus::Incompatible,
-            vendored_enabled: true,
-            allow_vendored: false,
-            local_version: None,
-            local_commit: None,
-            vendored_commit: Some("abcdef12".to_string()),
-            vendored_version: Some("frankenterm-test".to_string()),
-            message:
-                "local WezTerm version unavailable; refusing vendored backend compatibility probe"
-                    .to_string(),
-            recommendation: Some(
-                "Install WezTerm or ensure the wezterm binary is on PATH".to_string(),
-            ),
-        };
-
-        let (allow_vendored, compat_message, compat_json) =
-            compatibility_inputs_for_backend_selection(&report, false);
-
-        assert!(!allow_vendored);
+        assert!(compat_message.contains("no external WezTerm CLI found"));
         let sel = evaluate_backend_selection(&BackendSelectionInputs {
             vendored_feature_enabled: true,
             allow_vendored,
@@ -11274,7 +11206,38 @@ mod unified_tests {
             compat_json,
             socket_discovered: true,
         });
-        assert_eq!(sel.kind, BackendKind::Cli);
+        assert_eq!(sel.kind, BackendKind::Vendored);
+    }
+
+    /// GH #78 regression: a mismatched external `wezterm` CLI no longer
+    /// forces the stale CLI backend; the vendored backend is selected and the
+    /// connect-time codec handshake is the authoritative compatibility gate.
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn mismatched_external_wezterm_cli_still_selects_vendored_backend() {
+        let local = crate::vendored::WeztermVersion::parse("wezterm 20240203-110809-5046fc22");
+        let report = crate::vendored::compatibility_report_with(
+            crate::vendored::VendoredWeztermMetadata {
+                commit: Some("3ebd6056602f9a043ea9da280432b8078c9c4cd0".to_string()),
+                version: Some("frankenterm-test".to_string()),
+                source: None,
+                enabled: true,
+            },
+            Some(&local),
+        );
+
+        let (allow_vendored, compat_message, compat_json) =
+            compatibility_inputs_for_backend_selection(&report);
+
+        assert!(allow_vendored);
+        let sel = evaluate_backend_selection(&BackendSelectionInputs {
+            vendored_feature_enabled: true,
+            allow_vendored,
+            compat_message,
+            compat_json,
+            socket_discovered: true,
+        });
+        assert_eq!(sel.kind, BackendKind::Vendored);
     }
 
     #[test]

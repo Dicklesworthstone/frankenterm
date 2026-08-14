@@ -227,7 +227,8 @@ pub fn compatibility_report(local: Option<&WeztermVersion>) -> VendoredCompatibi
     compatibility_report_with(vendored_metadata(), local)
 }
 
-fn compatibility_report_with(
+#[must_use]
+pub fn compatibility_report_with(
     meta: VendoredWeztermMetadata,
     local: Option<&WeztermVersion>,
 ) -> VendoredCompatibilityReport {
@@ -267,21 +268,26 @@ fn compatibility_report_with(
         };
     }
 
+    // GH #78: an external `wezterm` binary is not what the vendored backend
+    // talks to — the in-process client speaks to whatever mux server owns the
+    // discovered socket, and real compatibility is enforced by the
+    // `GetCodecVersion` handshake at connect time
+    // (`DirectMuxClient::verify_codec_version_with_cx`), which fails closed.
+    // The external CLI's version is therefore informational only and must
+    // never veto the vendored backend. In particular, a stock install with no
+    // WezTerm at all (only FrankenTerm.app) is the expected healthy state.
     if local_version.is_none() {
         return VendoredCompatibilityReport {
-            status: VendoredCompatibilityStatus::Incompatible,
+            status: VendoredCompatibilityStatus::Compatible,
             vendored_enabled,
-            allow_vendored: false,
+            allow_vendored: true,
             local_version,
             local_commit,
             vendored_commit,
             vendored_version,
-            message:
-                "local WezTerm version unavailable; refusing vendored backend compatibility probe"
-                    .to_string(),
-            recommendation: Some(
-                "Install WezTerm or ensure the wezterm binary is on PATH".to_string(),
-            ),
+            message: "no external WezTerm CLI found; vendored backend uses its own build identity (codec version verified at connect time)"
+                .to_string(),
+            recommendation: None,
         };
     }
 
@@ -289,18 +295,16 @@ fn compatibility_report_with(
 
     if local_commit.is_none() {
         return VendoredCompatibilityReport {
-            status: VendoredCompatibilityStatus::Incompatible,
+            status: VendoredCompatibilityStatus::Compatible,
             vendored_enabled,
-            allow_vendored: false,
+            allow_vendored: true,
             local_version,
             local_commit,
             vendored_commit: Some(vendored_commit),
             vendored_version,
-            message: "unable to parse commit from local WezTerm version; refusing vendored backend"
+            message: "external WezTerm CLI version has no parseable commit; it does not gate the vendored backend (codec version verified at connect time)"
                 .to_string(),
-            recommendation: Some(
-                "Use a WezTerm build that includes a commit hash in --version".to_string(),
-            ),
+            recommendation: None,
         };
     }
 
@@ -319,19 +323,23 @@ fn compatibility_report_with(
         };
     }
 
+    // Status stays `Incompatible` so `ft doctor` can still report that the
+    // external CLI differs from the vendored build, but the difference does
+    // not disable the vendored backend (GH #78): the connect-time codec
+    // handshake is the authoritative compatibility gate.
     VendoredCompatibilityReport {
         status: VendoredCompatibilityStatus::Incompatible,
         vendored_enabled,
-        allow_vendored: false,
+        allow_vendored: true,
         local_version,
         local_commit: Some(local_commit.clone()),
         vendored_commit: Some(vendored_commit.clone()),
         vendored_version,
         message: format!(
-            "local WezTerm commit {local_commit} does not match vendored {vendored_commit}"
+            "external WezTerm CLI commit {local_commit} differs from vendored {vendored_commit}; vendored backend selected anyway (codec version verified at connect time)"
         ),
         recommendation: Some(format!(
-            "Update WezTerm to {vendored_commit} or rebuild ft with matching vendored commit"
+            "The external `wezterm` CLI is unrelated to the vendored backend; update it to {vendored_commit} only if you drive it directly"
         )),
     }
 }
@@ -435,28 +443,40 @@ mod tests {
         assert!(report.allow_vendored);
     }
 
+    /// GH #78 regression: a mismatched external `wezterm` CLI is reported as
+    /// `Incompatible` for observability, but must not veto the vendored
+    /// backend — codec compatibility is enforced at connect time.
     #[test]
-    fn compatibility_incompatible_disables_vendored() {
+    fn compatibility_mismatched_external_cli_still_allows_vendored() {
         let meta = meta_with(Some("abcdef12"), true);
         let local = WeztermVersion::parse("wezterm 20240101-123456-deadbeef");
         let report = compatibility_report_with(meta, Some(&local));
         assert_eq!(report.status, VendoredCompatibilityStatus::Incompatible);
-        assert!(!report.allow_vendored);
-        assert!(
-            report
-                .recommendation
-                .as_deref()
-                .unwrap_or("")
-                .contains("Update WezTerm")
-        );
+        assert!(report.allow_vendored);
+        assert!(report.message.contains("codec version verified"));
     }
 
+    /// GH #78 regression: a stock install with no external WezTerm binary at
+    /// all (only FrankenTerm.app) must be allowed to use the vendored
+    /// backend — absence of an irrelevant binary is not incompatibility.
     #[test]
-    fn compatibility_missing_local_disables_vendored() {
+    fn compatibility_missing_local_allows_vendored() {
         let meta = meta_with(Some("abcdef12"), true);
         let report = compatibility_report_with(meta, None);
-        assert_eq!(report.status, VendoredCompatibilityStatus::Incompatible);
-        assert!(!report.allow_vendored);
+        assert_eq!(report.status, VendoredCompatibilityStatus::Compatible);
+        assert!(report.allow_vendored);
+        assert!(report.message.contains("no external WezTerm CLI found"));
+    }
+
+    /// GH #78 regression: an external CLI whose version has no parseable
+    /// commit hash is informational only and does not gate the backend.
+    #[test]
+    fn compatibility_unparseable_local_commit_allows_vendored() {
+        let meta = meta_with(Some("abcdef12"), true);
+        let local = WeztermVersion::parse("wezterm 20240203");
+        let report = compatibility_report_with(meta, Some(&local));
+        assert_eq!(report.status, VendoredCompatibilityStatus::Compatible);
+        assert!(report.allow_vendored);
     }
 
     #[test]
