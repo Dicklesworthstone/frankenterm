@@ -14227,6 +14227,7 @@ mod tests {
                     tabs: Vec::new(),
                     tab_titles: Vec::new(),
                     window_titles: HashMap::new(),
+                    floating_panes: Vec::new(),
                 },
             }),
         })
@@ -14270,6 +14271,7 @@ mod tests {
                     })],
                     tab_titles: vec![format!("{label} tab")],
                     window_titles: HashMap::from([(41, format!("{label} window"))]),
+                    floating_panes: Vec::new(),
                 },
             }),
         })

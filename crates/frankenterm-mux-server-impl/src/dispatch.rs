@@ -6909,6 +6909,7 @@ mod tests {
                     tabs: Vec::new(),
                     tab_titles: Vec::new(),
                     window_titles: std::collections::HashMap::new(),
+                    floating_panes: Vec::new(),
                 },
             }),
         }
@@ -6950,8 +6951,10 @@ mod tests {
                     tabs: Vec::new(),
                     tab_titles: Vec::new(),
                     window_titles: std::collections::HashMap::new(),
+                    floating_panes: Vec::new(),
                 })
                 .expect("empty ordered-pane arena must be valid"),
+                floating_panes: Vec::new(),
                 ordered_windows: Vec::new(),
             }),
         }
@@ -10137,6 +10140,7 @@ mod tests {
             })],
             tab_titles: vec!["pane tab".to_string()],
             window_titles: std::collections::HashMap::from([(window_id, "window".to_string())]),
+            floating_panes: Vec::new(),
         })
         .expect("cross-wired ordered-pane fixture must flatten");
         snapshot.ordered_windows = vec![codec::OrderedWindowStateV1 {

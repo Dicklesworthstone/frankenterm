@@ -2176,6 +2176,9 @@ impl ClientDomain {
         panes: ListPanesResponse,
         mut primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
+        panes
+            .validate_floating_panes()
+            .context("validating bounded floating-pane snapshot")?;
         if panes.tabs.len() != panes.tab_titles.len() {
             bail!(
                 "malformed ListPanes response: {} tab tree(s) but {} tab title(s); refusing \
@@ -2199,7 +2202,7 @@ impl ClientDomain {
         // PaneId namespace.
         let mut remote_pane_ids = Vec::new();
         let mut seen_remote_pane_ids = HashSet::new();
-        let mut seen_remote_tab_ids = HashSet::new();
+        let mut remote_tab_owners = HashMap::new();
         for tabroot in &panes.tabs {
             let mut tree_identity = None;
             collect_remote_pane_ids(
@@ -2208,14 +2211,57 @@ impl ClientDomain {
                 &mut seen_remote_pane_ids,
                 &mut remote_pane_ids,
             )?;
-            if let Some((_, tab_id)) = tree_identity {
-                if !seen_remote_tab_ids.insert(tab_id) {
+            if let Some((window_id, tab_id)) = tree_identity {
+                if remote_tab_owners.insert(tab_id, window_id).is_some() {
                     bail!(
                         "malformed ListPanes response: remote tab {tab_id} appears in more than \
                          one tree"
                     );
                 }
             }
+        }
+        for floating in &panes.floating_panes {
+            let entry = &floating.pane;
+            let Some(expected_window_id) = remote_tab_owners.get(&entry.tab_id).copied() else {
+                bail!(
+                    "malformed ListPanes response: floating pane {} names absent remote tab {}",
+                    entry.pane_id,
+                    entry.tab_id
+                );
+            };
+            if expected_window_id != entry.window_id {
+                bail!(
+                    "malformed ListPanes response: floating pane {} names window/tab {}/{}, but \
+                     the tab tree belongs to window {}",
+                    entry.pane_id,
+                    entry.window_id,
+                    entry.tab_id,
+                    expected_window_id
+                );
+            }
+            if !seen_remote_pane_ids.insert(entry.pane_id) {
+                bail!(
+                    "malformed ListPanes response: remote pane {} has more than one tiled/floating owner",
+                    entry.pane_id
+                );
+            }
+            if entry.is_active_pane != floating.focused || entry.is_zoomed_pane {
+                bail!(
+                    "malformed ListPanes response: floating pane {} carries contradictory focus/zoom metadata",
+                    entry.pane_id
+                );
+            }
+            if entry.left_col != floating.rect.left
+                || entry.top_row != floating.rect.top
+                || entry.size.cols as usize != floating.rect.width
+                || entry.size.rows as usize != floating.rect.height
+            {
+                bail!(
+                    "malformed ListPanes response: floating pane {} geometry disagrees with its pane entry",
+                    entry.pane_id
+                );
+            }
+            remote_pane_ids.push(entry.pane_id);
         }
         let mut reserved_local_pane_ids = inner
             .reserve_local_pane_ids(remote_pane_ids)
@@ -3172,6 +3218,7 @@ mod tests {
             })],
             tab_titles: vec!["remote tab".to_string()],
             window_titles: HashMap::from([(41, "ops window".to_string())]),
+            floating_panes: Vec::new(),
         }
     }
 
