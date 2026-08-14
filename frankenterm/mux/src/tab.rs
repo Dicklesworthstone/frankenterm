@@ -4980,7 +4980,7 @@ impl Mux {
                 floating_focus: inner.floating_focus,
                 zoomed_pane: inner.zoomed.as_ref().map(Arc::clone),
                 size: inner.size,
-                tab,
+                tab: Arc::clone(&tab),
             });
         }
 
@@ -5105,12 +5105,24 @@ impl Mux {
                     )
                 })?;
             let mut foreign_focus = None;
+            let mut desired_states = states.iter();
             for floating in &tab.floating_panes {
                 let identity = pane_identity(&floating.pane);
                 let pane_id = structural_ids[&identity];
                 let live_index = live_by_id[&pane_id];
                 let registered_domain_id = live_registrations[live_index].3;
                 if registered_domain_id == domain_id {
+                    if let Some(state) = desired_states.next() {
+                        replacement.push(FloatingPane {
+                            pane: Arc::clone(&state.pane),
+                            pane_id: state.pane_id,
+                            rect: state.rect,
+                            z_order: state.z_order,
+                            visible: state.visible,
+                            pinned: state.pinned,
+                            opacity: state.opacity,
+                        });
+                    }
                     continue;
                 }
                 if tab.floating_focus == Some(floating.pane_id) {
@@ -5151,7 +5163,7 @@ impl Mux {
                 "tab {} cannot preserve foreign floating focus while applying domain focus",
                 tab.tab.tab_id
             );
-            for state in states {
+            for state in desired_states {
                 replacement.push(FloatingPane {
                     pane: Arc::clone(&state.pane),
                     pane_id: state.pane_id,

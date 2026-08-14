@@ -13,8 +13,9 @@ use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::domain::{Domain, DomainId, DomainState, alloc_domain_id};
 use mux::pane::{Pane, PaneId, reserve_pane_ids};
 use mux::tab::{
-    PaneArena, PaneArenaNode, PaneArenaPreparationScratch, PaneEntry, PaneNode, PreparedPaneTree,
-    SplitRequest, Tab, TabId, prepare_pane_tree_from_arena_with_scratch,
+    DomainFloatingPaneState, PaneArena, PaneArenaNode, PaneArenaPreparationScratch, PaneEntry,
+    PaneNode, PreparedPaneTree, SplitRequest, Tab, TabId,
+    prepare_pane_tree_from_arena_with_scratch,
 };
 use mux::window::WindowId;
 use mux::{
@@ -58,12 +59,25 @@ fn collect_remote_pane_ids(
     expected_tree_identity: &mut Option<(WindowId, TabId)>,
     seen_pane_ids: &mut HashSet<PaneId>,
     pane_ids: &mut Vec<PaneId>,
+    pane_tab_ids: &mut HashMap<PaneId, TabId>,
 ) -> anyhow::Result<()> {
     match node {
         PaneNode::Empty => {}
         PaneNode::Split { left, right, .. } => {
-            collect_remote_pane_ids(left, expected_tree_identity, seen_pane_ids, pane_ids)?;
-            collect_remote_pane_ids(right, expected_tree_identity, seen_pane_ids, pane_ids)?;
+            collect_remote_pane_ids(
+                left,
+                expected_tree_identity,
+                seen_pane_ids,
+                pane_ids,
+                pane_tab_ids,
+            )?;
+            collect_remote_pane_ids(
+                right,
+                expected_tree_identity,
+                seen_pane_ids,
+                pane_ids,
+                pane_tab_ids,
+            )?;
         }
         PaneNode::Leaf(entry) => {
             let identity = (entry.window_id, entry.tab_id);
@@ -79,6 +93,12 @@ fn collect_remote_pane_ids(
             if !seen_pane_ids.insert(entry.pane_id) {
                 bail!(
                     "malformed ListPanes response: remote pane {} appears more than once",
+                    entry.pane_id
+                );
+            }
+            if pane_tab_ids.insert(entry.pane_id, entry.tab_id).is_some() {
+                bail!(
+                    "malformed ListPanes response: remote pane {} has conflicting tab owners",
                     entry.pane_id
                 );
             }
@@ -731,6 +751,66 @@ struct LocalPaneIdReservations<'a> {
 impl LocalPaneIdReservations<'_> {
     fn take(&mut self, remote_pane_id: PaneId) -> Option<PaneId> {
         self.by_remote_pane.remove(&remote_pane_id)
+    }
+
+    fn restore(&mut self, remote_pane_id: PaneId, local_pane_id: PaneId) {
+        match self.by_remote_pane.entry(remote_pane_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(local_pane_id);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                log::error!(
+                    "remote pane {remote_pane_id} already retained a local identifier \
+                     reservation; returning duplicate reservation {local_pane_id} to the spare pool"
+                );
+                lock_or_recover(self.spare_pool, "spare_local_pane_ids").push(local_pane_id);
+            }
+        }
+    }
+}
+
+struct PendingFloatingPaneMappings<'reservations, 'pool> {
+    reservations: &'reservations mut LocalPaneIdReservations<'pool>,
+    mappings: Vec<(PaneId, PaneId)>,
+    committed: bool,
+}
+
+impl<'reservations, 'pool> PendingFloatingPaneMappings<'reservations, 'pool> {
+    fn new(
+        reservations: &'reservations mut LocalPaneIdReservations<'pool>,
+        capacity: usize,
+    ) -> anyhow::Result<Self> {
+        let mut mappings = Vec::new();
+        mappings
+            .try_reserve_exact(capacity)
+            .context("reserve pending floating-pane mappings")?;
+        Ok(Self {
+            reservations,
+            mappings,
+            committed: false,
+        })
+    }
+
+    fn take(&mut self, remote_pane_id: PaneId) -> Option<PaneId> {
+        let local_pane_id = self.reservations.take(remote_pane_id)?;
+        self.mappings.push((remote_pane_id, local_pane_id));
+        Some(local_pane_id)
+    }
+
+    fn commit(mut self) -> Vec<(PaneId, PaneId)> {
+        self.committed = true;
+        std::mem::take(&mut self.mappings)
+    }
+}
+
+impl Drop for PendingFloatingPaneMappings<'_, '_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (remote_pane_id, local_pane_id) in self.mappings.drain(..) {
+            self.reservations.restore(remote_pane_id, local_pane_id);
+        }
     }
 }
 
@@ -2201,6 +2281,7 @@ impl ClientDomain {
         let mut remote_pane_ids = Vec::new();
         let mut seen_remote_pane_ids = HashSet::new();
         let mut remote_tab_owners = HashMap::new();
+        let mut remote_pane_tabs = HashMap::new();
         for tabroot in &panes.tabs {
             let mut tree_identity = None;
             collect_remote_pane_ids(
@@ -2208,6 +2289,7 @@ impl ClientDomain {
                 &mut tree_identity,
                 &mut seen_remote_pane_ids,
                 &mut remote_pane_ids,
+                &mut remote_pane_tabs,
             )?;
             if let Some((window_id, tab_id)) = tree_identity {
                 if remote_tab_owners.insert(tab_id, window_id).is_some() {
@@ -2240,6 +2322,15 @@ impl ClientDomain {
             if !seen_remote_pane_ids.insert(entry.pane_id) {
                 bail!(
                     "malformed ListPanes response: remote pane {} has more than one tiled/floating owner",
+                    entry.pane_id
+                );
+            }
+            if remote_pane_tabs
+                .insert(entry.pane_id, entry.tab_id)
+                .is_some()
+            {
+                bail!(
+                    "malformed ListPanes response: floating pane {} has conflicting tab owners",
                     entry.pane_id
                 );
             }
@@ -2278,6 +2369,16 @@ impl ClientDomain {
                     continue;
                 }
                 let remote_pane_id = client_pane.remote_pane_id();
+                if let Some(expected_remote_tab_id) = remote_pane_tabs.get(&remote_pane_id).copied()
+                {
+                    if client_pane.remote_tab_id != expected_remote_tab_id {
+                        bail!(
+                            "remote pane {remote_pane_id} moved from tab {} to tab \
+                             {expected_remote_tab_id}; atomic pane migration is required",
+                            client_pane.remote_tab_id
+                        );
+                    }
+                }
                 let local_pane_id = pane.pane_id();
                 index_live_client_pane(
                     &mut local_pane_ids_by_remote,
@@ -2312,6 +2413,19 @@ impl ClientDomain {
                 .keys()
                 .copied()
                 .collect();
+
+        let mut local_tabs_by_remote = HashMap::new();
+        local_tabs_by_remote
+            .try_reserve(remote_tab_owners.len())
+            .context("reserve local tab identities for floating-pane reconciliation")?;
+        let mut authoritative_panes_by_remote = HashMap::new();
+        authoritative_panes_by_remote
+            .try_reserve(seen_remote_pane_ids.len())
+            .context("reserve authoritative pane identities for floating reconciliation")?;
+        let mut pending_tiled_sync = Vec::new();
+        pending_tiled_sync
+            .try_reserve_exact(seen_remote_pane_ids.len())
+            .context("reserve pending tiled-pane state updates")?;
 
         for (tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
             let root_size = match tabroot.root_size() {
@@ -2349,6 +2463,14 @@ impl ClientDomain {
                     inner.record_remote_to_local_tab_mapping(remote_tab_id, tab.tab_id());
                 }
 
+                if local_tabs_by_remote
+                    .insert(remote_tab_id, Arc::clone(&tab))
+                    .is_some()
+                {
+                    bail!(
+                        "malformed ListPanes response: remote tab {remote_tab_id} resolved more than once"
+                    );
+                }
                 mux.set_tab_title(tab.tab_id(), tab_title);
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
@@ -2436,8 +2558,17 @@ impl ClientDomain {
                         local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
                         pane
                     };
-                    if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
-                        client_pane.sync_remote_listing_state(entry.alt_screen_active);
+                    if pane.downcast_ref::<ClientPane>().is_some() {
+                        pending_tiled_sync.push((Arc::clone(&pane), entry.alt_screen_active));
+                    }
+                    if authoritative_panes_by_remote
+                        .insert(entry.pane_id, Arc::clone(&pane))
+                        .is_some()
+                    {
+                        bail!(
+                            "malformed ListPanes response: remote pane {} resolved more than once",
+                            entry.pane_id
+                        );
                     }
                     Ok(pane)
                 })?;
@@ -2539,6 +2670,174 @@ impl ClientDomain {
                 mux.add_tab_to_window(&tab, *local_window_id)?;
             }
         }
+
+        let mut desired_floating = Vec::new();
+        desired_floating
+            .try_reserve_exact(panes.floating_panes.len())
+            .context("reserve authoritative floating-pane states")?;
+        let mut pending_float_mappings = PendingFloatingPaneMappings::new(
+            &mut reserved_local_pane_ids,
+            panes.floating_panes.len(),
+        )?;
+        let mut pending_float_sync = Vec::new();
+        pending_float_sync
+            .try_reserve_exact(panes.floating_panes.len())
+            .context("reserve pending floating-pane state updates")?;
+
+        for floating in panes.floating_panes {
+            let entry = floating.pane;
+            remote_panes_to_forget.remove(&entry.pane_id);
+            let tab = local_tabs_by_remote
+                .get(&entry.tab_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "floating pane {} lost its local tab mapping for remote tab {}",
+                        entry.pane_id,
+                        entry.tab_id
+                    )
+                })?;
+
+            let pane = if let Some(local_pane_id) =
+                local_pane_ids_by_remote.get(&entry.pane_id).copied()
+            {
+                match mux.get_pane(local_pane_id) {
+                    Some(pane)
+                        if pane
+                            .downcast_ref::<ClientPane>()
+                            .is_some_and(|client_pane| {
+                                client_pane.belongs_to_client(&inner)
+                                    && client_pane.remote_pane_id() == entry.pane_id
+                                    && client_pane.remote_tab_id == entry.tab_id
+                            }) =>
+                    {
+                        pending_float_sync.push((Arc::clone(&pane), entry.alt_screen_active));
+                        pane
+                    }
+                    Some(_) | None => {
+                        let local_pane_id =
+                            pending_float_mappings.take(entry.pane_id).ok_or_else(|| {
+                                anyhow!(
+                                    "remote floating pane {} needs a local identifier, but no \
+                                     identifier was reserved",
+                                    entry.pane_id
+                                )
+                            })?;
+                        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                            &inner,
+                            local_pane_id,
+                            entry.tab_id,
+                            entry.pane_id,
+                            entry.size,
+                            &entry.title,
+                            entry.alt_screen_active,
+                        ));
+                        local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+                        pane
+                    }
+                }
+            } else {
+                let local_pane_id =
+                    pending_float_mappings.take(entry.pane_id).ok_or_else(|| {
+                        anyhow!(
+                            "remote floating pane {} needs a local identifier, but no identifier \
+                             was reserved",
+                            entry.pane_id
+                        )
+                    })?;
+                let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+                    &inner,
+                    local_pane_id,
+                    entry.tab_id,
+                    entry.pane_id,
+                    entry.size,
+                    &entry.title,
+                    entry.alt_screen_active,
+                ));
+                local_pane_ids_by_remote.insert(entry.pane_id, local_pane_id);
+                pane
+            };
+
+            if authoritative_panes_by_remote
+                .insert(entry.pane_id, Arc::clone(&pane))
+                .is_some()
+            {
+                bail!(
+                    "malformed ListPanes response: remote floating pane {} resolved more than once",
+                    entry.pane_id
+                );
+            }
+            desired_floating.push(DomainFloatingPaneState {
+                tab,
+                pane,
+                pane_id: local_pane_ids_by_remote[&entry.pane_id],
+                rect: floating.rect,
+                z_order: floating.z_order,
+                visible: floating.visible,
+                pinned: floating.pinned,
+                opacity: floating.opacity,
+                focused: floating.focused,
+            });
+        }
+
+        if authoritative_panes_by_remote.len() != seen_remote_pane_ids.len() {
+            bail!(
+                "ListPanes resolved {} of {} authoritative panes",
+                authoritative_panes_by_remote.len(),
+                seen_remote_pane_ids.len()
+            );
+        }
+        let mut authoritative_panes = Vec::new();
+        authoritative_panes
+            .try_reserve_exact(authoritative_panes_by_remote.len())
+            .context("reserve authoritative local pane set")?;
+        authoritative_panes.extend(authoritative_panes_by_remote.into_values());
+
+        let reconcile_receipt = mux
+            .reconcile_domain_floating_panes(
+                inner.local_domain_id,
+                authoritative_panes,
+                desired_floating,
+            )
+            .context("reconcile authoritative floating-pane topology")?;
+        let mut pending_float_mappings = pending_float_mappings.commit();
+        pending_float_mappings.sort_unstable_by_key(|(_, local_pane_id)| *local_pane_id);
+        debug_assert_eq!(
+            pending_float_mappings.len(),
+            reconcile_receipt.registered_pane_ids.len()
+        );
+        debug_assert!(
+            pending_float_mappings
+                .iter()
+                .map(|(_, local_pane_id)| *local_pane_id)
+                .eq(reconcile_receipt.registered_pane_ids.iter().copied())
+        );
+
+        for (pane, alt_screen_active) in pending_tiled_sync {
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                client_pane.sync_remote_listing_state(alt_screen_active);
+            }
+        }
+        for (pane, alt_screen_active) in pending_float_sync {
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                client_pane.sync_remote_listing_state(alt_screen_active);
+            }
+        }
+        {
+            let mut pane_mappings =
+                lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
+            for (remote_pane_id, local_pane_id) in &pending_float_mappings {
+                pane_mappings.insert(*remote_pane_id, *local_pane_id);
+            }
+        }
+        log::debug!(
+            "domain {} floating reconciliation changed {} tab(s), registered {} pane(s), and \
+             retired {} pane(s)",
+            inner.local_domain_id,
+            reconcile_receipt.changed_tab_ids.len(),
+            reconcile_receipt.registered_pane_ids.len(),
+            reconcile_receipt.retired_pane_ids.len(),
+        );
 
         for (remote_window_id, window_title) in panes.window_titles {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
@@ -3148,6 +3447,27 @@ mod tests {
         ))
     }
 
+    fn register_test_client_domain(mux: &Arc<Mux>, inner: &Arc<ClientInner>) -> Arc<ClientDomain> {
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: format!("test-client-domain-{}", inner.local_domain_id),
+            ..UnixDomain::default()
+        });
+        let domain = Arc::new(ClientDomain {
+            label: config.label(),
+            config,
+            inner: Mutex::new(Some(Arc::clone(inner))),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id: inner.local_domain_id,
+            mux_owner: Arc::downgrade(mux),
+            mux_subscriber_id: None,
+        });
+        let registered: Arc<dyn Domain> = domain.clone();
+        mux.add_domain(&registered)
+            .expect("test client domain should register with its exact mux");
+        domain
+    }
+
     #[test]
     fn stale_attachment_cannot_detach_a_same_domain_replacement() {
         let scope = MuxTestScope::enter();
@@ -3218,6 +3538,45 @@ mod tests {
             window_titles: HashMap::from([(41, "ops window".to_string())]),
             floating_panes: Vec::new(),
         }
+    }
+
+    fn sample_remote_tab_listing_with_float() -> ListPanesResponse {
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(template) = listing.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        let mut pane = template;
+        pane.pane_id = 62;
+        pane.title = "remote floating shell".to_string();
+        pane.size = TerminalSize {
+            cols: 20,
+            rows: 8,
+            pixel_width: 200,
+            pixel_height: 160,
+            dpi: 96,
+        };
+        pane.alt_screen_active = false;
+        pane.is_active_pane = false;
+        pane.is_zoomed_pane = false;
+        pane.left_col = 4;
+        pane.top_row = 3;
+        listing
+            .floating_panes
+            .push(codec::FloatingPaneSnapshotEntry {
+                pane,
+                rect: mux::tab::FloatingPaneRect {
+                    left: 4,
+                    top: 3,
+                    width: 20,
+                    height: 8,
+                },
+                z_order: 7,
+                visible: true,
+                pinned: true,
+                opacity: 0.75,
+                focused: false,
+            });
+        listing
     }
 
     fn sample_remote_pane_arena(tab_and_pane_ids: &[(TabId, PaneId)]) -> PaneArena {
@@ -3838,7 +4197,8 @@ mod tests {
             error
                 .to_string()
                 .contains("remote pane 61 has more than one tiled/floating owner"),
-            "unexpected error: {error:#}"
+            "unexpected error: {error:#}",
+            error = error,
         );
         assert!(mux.iter_panes().is_empty());
         assert!(mux.iter_windows().is_empty());
@@ -3853,6 +4213,7 @@ mod tests {
         scope.set_mux(&ambient_mux);
         let target_mux = Arc::new(Mux::new(None));
         let inner = test_client_inner(91_004);
+        let _domain = register_test_client_domain(&target_mux, &inner);
 
         ClientDomain::process_pane_list(
             &target_mux,
@@ -3904,6 +4265,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(91_002);
+        let _domain = register_test_client_domain(&mux, &inner);
 
         ClientDomain::process_pane_list(
             &mux,
@@ -3940,6 +4302,83 @@ mod tests {
             spare_after_second_sync,
             "steady-state resync must return and reuse the same unconsumed fallback"
         );
+        assert_eq!(mux.iter_panes().len(), 1);
+    }
+
+    #[test]
+    fn floating_snapshot_publish_replay_and_retire_preserve_exact_ownership() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_018);
+        let _domain = register_test_client_domain(&mux, &inner);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing_with_float(),
+            None,
+        )
+        .expect("initial floating snapshot should attach atomically");
+
+        let local_tab_id = inner
+            .remote_to_local_tab_id(51)
+            .expect("remote floating owner tab should map locally");
+        let tab = mux
+            .get_tab(local_tab_id)
+            .expect("remote floating owner tab should be registered");
+        let local_float_id = inner
+            .remote_to_local_pane_id(&mux, 62)
+            .expect("remote floating pane should map locally");
+        let floating_pane = mux
+            .get_pane(local_float_id)
+            .expect("remote floating pane should publish with its owner");
+        let positioned = tab.iter_floating_panes();
+        assert_eq!(positioned.len(), 1);
+        assert_eq!(positioned[0].pane_id, local_float_id);
+        assert!(Arc::ptr_eq(&positioned[0].pane, &floating_pane));
+        assert_eq!(
+            (
+                positioned[0].left,
+                positioned[0].top,
+                positioned[0].width,
+                positioned[0].height,
+            ),
+            (4, 3, 20, 8),
+        );
+        assert_eq!(positioned[0].z_order, 7);
+        assert!(positioned[0].visible);
+        assert!(positioned[0].pinned);
+        assert_eq!(positioned[0].opacity.to_bits(), 0.75_f32.to_bits());
+        assert!(!positioned[0].is_focused);
+        assert_eq!(mux.iter_panes().len(), 2);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing_with_float(),
+            None,
+        )
+        .expect("identical floating snapshot should be a no-op replay");
+        let replayed = mux
+            .get_pane(local_float_id)
+            .expect("no-op replay should preserve the floating registration");
+        assert!(Arc::ptr_eq(&replayed, &floating_pane));
+        let replayed_positioned = tab.iter_floating_panes();
+        assert_eq!(replayed_positioned.len(), 1);
+        assert!(Arc::ptr_eq(&replayed_positioned[0].pane, &floating_pane));
+        assert_eq!(mux.iter_panes().len(), 2);
+
+        ClientDomain::process_pane_list(
+            &mux,
+            Arc::clone(&inner),
+            sample_remote_tab_listing(),
+            None,
+        )
+        .expect("snapshot removal should retire the stale floating mirror");
+        assert!(tab.iter_floating_panes().is_empty());
+        assert!(mux.get_pane(local_float_id).is_none());
+        assert_eq!(inner.remote_to_local_pane_id(&mux, 62), None);
         assert_eq!(mux.iter_panes().len(), 1);
     }
 
@@ -4012,6 +4451,7 @@ mod tests {
 
         let local_domain_id = alloc_domain_id();
         let inner = test_client_inner(local_domain_id);
+        let _domain = register_test_client_domain(&mux, &inner);
         let local_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
 
         ClientDomain::process_pane_list(
@@ -4048,6 +4488,7 @@ mod tests {
 
         let local_domain_id = alloc_domain_id();
         let inner = test_client_inner(local_domain_id);
+        let _domain = register_test_client_domain(&mux, &inner);
         let local_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
         inner.record_remote_to_local_window_mapping(41, local_window_id);
         let observed_additions = Arc::new(Mutex::new(Vec::new()));
@@ -4110,6 +4551,7 @@ mod tests {
 
         let local_domain_id = alloc_domain_id();
         let inner = test_client_inner(local_domain_id);
+        let _domain = register_test_client_domain(&mux, &inner);
         let requested_window_id = *mux.new_empty_window(Some("local-workspace".to_string()), None);
 
         ClientDomain::process_pane_list(
@@ -4137,6 +4579,7 @@ mod tests {
 
         let local_domain_id = alloc_domain_id();
         let inner = test_client_inner(local_domain_id);
+        let _domain = register_test_client_domain(&mux, &inner);
         let local_window_id = *mux.new_empty_window(Some("ops".to_string()), None);
 
         ClientDomain::process_pane_list(

@@ -9730,6 +9730,7 @@ mod tests {
 
     struct KillCountingPane {
         id: PaneId,
+        domain_id: DomainId,
         size: Mutex<TerminalSize>,
         kills: Arc<AtomicUsize>,
         actions: Arc<AtomicUsize>,
@@ -9761,6 +9762,7 @@ mod tests {
             let kills = Arc::new(AtomicUsize::new(0));
             let pane: Arc<dyn Pane> = Arc::new(Self {
                 id,
+                domain_id: 1,
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
@@ -9780,6 +9782,34 @@ mod tests {
             (pane, kills)
         }
 
+        fn new_with_domain(
+            id: PaneId,
+            size: TerminalSize,
+            domain_id: DomainId,
+        ) -> (Arc<dyn Pane>, Arc<AtomicUsize>) {
+            let kills = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn Pane> = Arc::new(Self {
+                id,
+                domain_id,
+                size: Mutex::new(size),
+                kills: Arc::clone(&kills),
+                actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
+                writes: Mutex::new(Vec::new()),
+                reader: Mutex::new(None),
+                on_reader: Mutex::new(None),
+                on_actions: Mutex::new(None),
+                on_kill: Mutex::new(None),
+                on_domain_id: Mutex::new(None),
+                focus_events: Arc::new(Mutex::new(Vec::new())),
+                pane_id_calls: None,
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
+                fail_reader: false,
+                search_pending: false,
+            });
+            (pane, kills)
+        }
+
         fn new_with_pending_search(
             id: PaneId,
             size: TerminalSize,
@@ -9787,6 +9817,7 @@ mod tests {
             let kills = Arc::new(AtomicUsize::new(0));
             let pane: Arc<dyn Pane> = Arc::new(Self {
                 id,
+                domain_id: 1,
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
@@ -9814,6 +9845,7 @@ mod tests {
             let kills = Arc::new(AtomicUsize::new(0));
             let pane: Arc<dyn Pane> = Arc::new(Self {
                 id,
+                domain_id: 1,
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
@@ -9841,6 +9873,7 @@ mod tests {
             let kills = Arc::new(AtomicUsize::new(0));
             let pane: Arc<dyn Pane> = Arc::new(Self {
                 id,
+                domain_id: 1,
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
@@ -9868,6 +9901,7 @@ mod tests {
             let kills = Arc::new(AtomicUsize::new(0));
             let pane: Arc<dyn Pane> = Arc::new(Self {
                 id,
+                domain_id: 1,
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
@@ -9894,6 +9928,7 @@ mod tests {
             let focus_events = Arc::new(Mutex::new(Vec::new()));
             let pane: Arc<dyn Pane> = Arc::new(Self {
                 id,
+                domain_id: 1,
                 size: Mutex::new(size),
                 kills: Arc::new(AtomicUsize::new(0)),
                 actions: Arc::new(AtomicUsize::new(0)),
@@ -9921,6 +9956,7 @@ mod tests {
             let pane_id_calls = Arc::new(AtomicUsize::new(0));
             let pane: Arc<dyn Pane> = Arc::new(Self {
                 id,
+                domain_id: 1,
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
@@ -10099,7 +10135,7 @@ mod tests {
             if let Some(on_domain_id) = on_domain_id {
                 on_domain_id();
             }
-            1
+            self.domain_id
         }
 
         fn is_mouse_grabbed(&self) -> bool {
@@ -10116,6 +10152,7 @@ mod tests {
     }
 
     struct GuardedMutationTestDomain {
+        domain_id: DomainId,
         spawned_panes: Mutex<VecDeque<Arc<dyn Pane>>>,
         after_registration:
             Mutex<Option<Box<dyn FnOnce(&Arc<Mux>, &Arc<dyn Pane>) + Send + 'static>>>,
@@ -10125,6 +10162,7 @@ mod tests {
     impl GuardedMutationTestDomain {
         fn new(next_spawned_pane: Option<Arc<dyn Pane>>) -> Self {
             Self {
+                domain_id: 1,
                 spawned_panes: Mutex::new(next_spawned_pane.into_iter().collect()),
                 after_registration: Mutex::new(None),
                 supports_floating_spawn: true,
@@ -10133,6 +10171,7 @@ mod tests {
 
         fn with_panes(spawned_panes: Vec<Arc<dyn Pane>>) -> Self {
             Self {
+                domain_id: 1,
                 spawned_panes: Mutex::new(spawned_panes.into()),
                 after_registration: Mutex::new(None),
                 supports_floating_spawn: true,
@@ -10141,6 +10180,7 @@ mod tests {
 
         fn unsupported_floating(next_spawned_pane: Arc<dyn Pane>) -> Self {
             Self {
+                domain_id: 1,
                 spawned_panes: Mutex::new(VecDeque::from([next_spawned_pane])),
                 after_registration: Mutex::new(None),
                 supports_floating_spawn: false,
@@ -10152,8 +10192,18 @@ mod tests {
             after_registration: impl FnOnce(&Arc<Mux>, &Arc<dyn Pane>) + Send + 'static,
         ) -> Self {
             Self {
+                domain_id: 1,
                 spawned_panes: Mutex::new(VecDeque::from([next_spawned_pane])),
                 after_registration: Mutex::new(Some(Box::new(after_registration))),
+                supports_floating_spawn: true,
+            }
+        }
+
+        fn for_domain(domain_id: DomainId) -> Self {
+            Self {
+                domain_id,
+                spawned_panes: Mutex::new(VecDeque::new()),
+                after_registration: Mutex::new(None),
                 supports_floating_spawn: true,
             }
         }
@@ -10202,7 +10252,7 @@ mod tests {
         }
 
         fn domain_id(&self) -> DomainId {
-            1
+            self.domain_id
         }
 
         fn domain_name(&self) -> &str {
@@ -11928,6 +11978,257 @@ mod tests {
         assert!(replacement_mux.windows.read().is_empty());
         assert!(Mux::try_get().is_some_and(|mux| Arc::ptr_eq(&mux, &replacement_mux)));
         assert_eq!(spawned_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn domain_floating_reconcile_publishes_replays_and_retires_exact_owner() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (tiled, tiled_kills) = KillCountingPane::new(202, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &tiled);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain)
+            .expect("register authoritative floating test domain");
+        let (floating, floating_kills) = KillCountingPane::new(203, test_size());
+        let rect = FloatingPaneRect {
+            left: 4,
+            top: 3,
+            width: 20,
+            height: 8,
+        };
+        let desired = || DomainFloatingPaneState {
+            tab: Arc::clone(&tab),
+            pane: Arc::clone(&floating),
+            pane_id: 203,
+            rect,
+            z_order: 7,
+            visible: true,
+            pinned: true,
+            opacity: 0.75,
+            focused: false,
+        };
+
+        let receipt = mux
+            .reconcile_domain_floating_panes(
+                1,
+                vec![Arc::clone(&tiled), Arc::clone(&floating)],
+                vec![desired()],
+            )
+            .expect("new floating mirror should publish with its exact owner");
+        assert_eq!(receipt.changed_tab_ids, vec![tab.tab_id()]);
+        assert_eq!(receipt.invalidated_window_ids, vec![window_id]);
+        assert_eq!(receipt.registered_pane_ids, vec![203]);
+        assert!(receipt.retired_pane_ids.is_empty());
+        assert!(
+            mux.get_pane(203)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &floating))
+        );
+        let positioned = tab.iter_floating_panes();
+        assert_eq!(positioned.len(), 1);
+        assert!(Arc::ptr_eq(&positioned[0].pane, &floating));
+        assert_eq!(positioned[0].pane_id, 203);
+        assert_eq!(
+            (
+                positioned[0].left,
+                positioned[0].top,
+                positioned[0].width,
+                positioned[0].height,
+            ),
+            (4, 3, 20, 8),
+        );
+        assert_eq!(positioned[0].z_order, 7);
+        assert!(positioned[0].visible);
+        assert!(positioned[0].pinned);
+        assert_eq!(positioned[0].opacity.to_bits(), 0.75_f32.to_bits());
+        assert!(!positioned[0].is_focused);
+        assert_eq!(floating_kills.load(Ordering::SeqCst), 0);
+
+        let replay = mux
+            .reconcile_domain_floating_panes(
+                1,
+                vec![Arc::clone(&tiled), Arc::clone(&floating)],
+                vec![desired()],
+            )
+            .expect("identical authoritative replay should succeed");
+        assert_eq!(replay, DomainFloatingPaneReconcileReceipt::default());
+        let replayed = tab.iter_floating_panes();
+        assert_eq!(replayed.len(), 1);
+        assert!(Arc::ptr_eq(&replayed[0].pane, &floating));
+        assert_eq!(floating_kills.load(Ordering::SeqCst), 0);
+
+        let retired = mux
+            .reconcile_domain_floating_panes(1, vec![Arc::clone(&tiled)], Vec::new())
+            .expect("absent remote float should detach and retire without a pane callback");
+        assert_eq!(retired.changed_tab_ids, vec![tab.tab_id()]);
+        assert_eq!(retired.invalidated_window_ids, vec![window_id]);
+        assert!(retired.registered_pane_ids.is_empty());
+        assert_eq!(retired.retired_pane_ids, vec![203]);
+        assert!(tab.iter_floating_panes().is_empty());
+        assert!(mux.get_pane(203).is_none());
+        assert_eq!(floating_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(tiled_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn domain_floating_reconcile_rejects_tiled_alias_without_mutation() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (tiled, tiled_kills) = KillCountingPane::new(204, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &tiled);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain)
+            .expect("register authoritative floating test domain");
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid test window")
+            .expect("attached test window");
+
+        let error = mux
+            .reconcile_domain_floating_panes(
+                1,
+                vec![Arc::clone(&tiled)],
+                vec![DomainFloatingPaneState {
+                    tab: Arc::clone(&tab),
+                    pane: Arc::clone(&tiled),
+                    pane_id: 204,
+                    rect: FloatingPaneRect {
+                        left: 0,
+                        top: 0,
+                        width: 20,
+                        height: 8,
+                    },
+                    z_order: 0,
+                    visible: true,
+                    pinned: false,
+                    opacity: 1.0,
+                    focused: false,
+                }],
+            )
+            .expect_err("one exact pane cannot be both tiled and floating");
+
+        assert!(
+            error.to_string().contains("also tiled"),
+            "unexpected error: {error:#}"
+        );
+        assert!(tab.iter_floating_panes().is_empty());
+        assert!(
+            mux.get_pane(204)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &tiled))
+        );
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid test window after rejection")
+            .expect("attached test window after rejection");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(after.active_tab_id(), before.active_tab_id());
+        assert_eq!(tiled_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn domain_floating_reconcile_preserves_foreign_slots_and_replays_wire_order() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let _mux_override = ScopedMuxOverride::install(&mux);
+        let (tiled, tiled_kills) = KillCountingPane::new(205, test_size());
+        let (tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &tiled);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let foreign_domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(2));
+        mux.add_domain(&domain)
+            .expect("register reconciled floating test domain");
+        mux.add_domain(&foreign_domain)
+            .expect("register preserved foreign floating test domain");
+
+        let (foreign, foreign_kills) = KillCountingPane::new_with_domain(206, test_size(), 2);
+        mux.add_pane(&foreign)
+            .expect("register the pre-existing foreign float");
+        tab.add_floating_pane(
+            Arc::clone(&foreign),
+            FloatingPaneRect {
+                left: 1,
+                top: 1,
+                width: 12,
+                height: 6,
+            },
+        )
+        .expect("attach the pre-existing foreign float");
+        let foreign_before = tab.iter_floating_panes()[0].clone();
+
+        let (first, first_kills) = KillCountingPane::new(207, test_size());
+        let (second, second_kills) = KillCountingPane::new(208, test_size());
+        let desired = |pane: &Arc<dyn Pane>, pane_id, left, z_order| DomainFloatingPaneState {
+            tab: Arc::clone(&tab),
+            pane: Arc::clone(pane),
+            pane_id,
+            rect: FloatingPaneRect {
+                left,
+                top: 3,
+                width: 20,
+                height: 8,
+            },
+            z_order,
+            visible: true,
+            pinned: false,
+            opacity: 1.0,
+            focused: false,
+        };
+        let authoritative = || vec![Arc::clone(&tiled), Arc::clone(&first), Arc::clone(&second)];
+
+        mux.reconcile_domain_floating_panes(
+            1,
+            authoritative(),
+            vec![desired(&first, 207, 3, 3), desired(&second, 208, 5, 5)],
+        )
+        .expect("initial domain floats should publish around the foreign slot");
+        let initial = tab.iter_floating_panes();
+        assert_eq!(initial.len(), 3);
+        assert!(Arc::ptr_eq(&initial[0].pane, &foreign));
+        assert!(Arc::ptr_eq(&initial[1].pane, &first));
+        assert!(Arc::ptr_eq(&initial[2].pane, &second));
+
+        let reordered = mux
+            .reconcile_domain_floating_panes(
+                1,
+                authoritative(),
+                vec![desired(&second, 208, 5, 5), desired(&first, 207, 3, 3)],
+            )
+            .expect("authoritative order should replace only the reconciled domain slots");
+        assert_eq!(reordered.changed_tab_ids, vec![tab.tab_id()]);
+        let current = tab.iter_floating_panes();
+        assert_eq!(current.len(), 3);
+        assert!(Arc::ptr_eq(&current[0].pane, &foreign));
+        assert!(Arc::ptr_eq(&current[1].pane, &second));
+        assert!(Arc::ptr_eq(&current[2].pane, &first));
+        assert_eq!(current[0].pane_id, foreign_before.pane_id);
+        assert_eq!(current[0].left, foreign_before.left);
+        assert_eq!(current[0].top, foreign_before.top);
+        assert_eq!(current[0].width, foreign_before.width);
+        assert_eq!(current[0].height, foreign_before.height);
+        assert_eq!(current[0].z_order, foreign_before.z_order);
+        assert_eq!(current[0].visible, foreign_before.visible);
+        assert_eq!(current[0].pinned, foreign_before.pinned);
+        assert_eq!(
+            current[0].opacity.to_bits(),
+            foreign_before.opacity.to_bits()
+        );
+        assert_eq!(current[0].is_focused, foreign_before.is_focused);
+
+        let replay = mux
+            .reconcile_domain_floating_panes(
+                1,
+                authoritative(),
+                vec![desired(&second, 208, 5, 5), desired(&first, 207, 3, 3)],
+            )
+            .expect("stable mixed-domain replay should be an exact no-op");
+        assert_eq!(replay, DomainFloatingPaneReconcileReceipt::default());
+        let replayed = tab.iter_floating_panes();
+        assert_eq!(replayed.len(), 3);
+        assert!(Arc::ptr_eq(&replayed[0].pane, &foreign));
+        assert!(Arc::ptr_eq(&replayed[1].pane, &second));
+        assert!(Arc::ptr_eq(&replayed[2].pane, &first));
+        assert_eq!(tiled_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(foreign_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(first_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(second_kills.load(Ordering::SeqCst), 0);
     }
 
     #[test]
