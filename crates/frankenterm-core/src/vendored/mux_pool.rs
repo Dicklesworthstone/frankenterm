@@ -1593,6 +1593,7 @@ mod tests {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: HashMap::new(),
+                                    floating_panes: Vec::new(),
                                 }),
                                 Pdu::GetLines(req) => Pdu::GetLinesResponse(GetLinesResponse {
                                     pane_id: req.pane_id,
@@ -1699,6 +1700,7 @@ mod tests {
                                             tabs: Vec::new(),
                                             tab_titles: Vec::new(),
                                             window_titles: HashMap::new(),
+                                            floating_panes: Vec::new(),
                                         })
                                     }
                                 }
@@ -1836,6 +1838,7 @@ mod tests {
                                             tabs: Vec::new(),
                                             tab_titles: Vec::new(),
                                             window_titles: HashMap::new(),
+                                            floating_panes: Vec::new(),
                                         })
                                     } else {
                                         Pdu::UnitResponse(UnitResponse {})
@@ -1847,6 +1850,7 @@ mod tests {
                                             tabs: Vec::new(),
                                             tab_titles: Vec::new(),
                                             window_titles: HashMap::new(),
+                                            floating_panes: Vec::new(),
                                         })
                                     } else {
                                         Pdu::UnitResponse(UnitResponse {})

@@ -5211,6 +5211,7 @@ mod tests {
             tabs: Vec::new(),
             tab_titles: Vec::new(),
             window_titles: HashMap::new(),
+            floating_panes: Vec::new(),
         })
     }
 
@@ -5382,6 +5383,7 @@ mod tests {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: HashMap::new(),
+                                    floating_panes: Vec::new(),
                                 };
                                 Pdu::ListPanesResponse(payload)
                             }
@@ -5446,6 +5448,7 @@ mod tests {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: HashMap::new(),
+                                    floating_panes: Vec::new(),
                                 };
                                 Pdu::ListPanesResponse(payload)
                             }
@@ -5770,6 +5773,7 @@ mod tests {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: std::collections::HashMap::new(),
+                                    floating_panes: Vec::new(),
                                 })
                             }
                             _ => continue,
@@ -6711,6 +6715,7 @@ mod tests {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: HashMap::new(),
+                                    floating_panes: Vec::new(),
                                 })
                             }
                             _ => continue,
@@ -6849,6 +6854,7 @@ mod tests {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: HashMap::new(),
+                                    floating_panes: Vec::new(),
                                 };
                                 Pdu::ListPanesResponse(payload)
                             }
@@ -9740,6 +9746,7 @@ mod tests {
                                             tabs: Vec::new(),
                                             tab_titles: Vec::new(),
                                             window_titles: HashMap::new(),
+                                            floating_panes: Vec::new(),
                                         });
                                         let mut out = Vec::new();
                                         response.encode(&mut out, serial).expect("encode response");
@@ -9873,6 +9880,7 @@ mod tests {
                                             tabs: Vec::new(),
                                             tab_titles: Vec::new(),
                                             window_titles: HashMap::new(),
+                                            floating_panes: Vec::new(),
                                         })
                                     }
                                     _ => continue,
@@ -12313,6 +12321,7 @@ mod tests {
                                         tabs: Vec::new(),
                                         tab_titles: Vec::new(),
                                         window_titles: HashMap::new(),
+                                        floating_panes: Vec::new(),
                                     });
                                     let mut out = Vec::new();
                                     response
@@ -12557,6 +12566,7 @@ mod tests {
                                         tabs: Vec::new(),
                                         tab_titles: Vec::new(),
                                         window_titles: HashMap::new(),
+                                        floating_panes: Vec::new(),
                                     });
                                     let mut out = Vec::new();
                                     response
@@ -12818,6 +12828,7 @@ mod tests {
                                         tabs: Vec::new(),
                                         tab_titles: Vec::new(),
                                         window_titles,
+                                        floating_panes: Vec::new(),
                                     });
                                     let mut out = Vec::new();
                                     response
@@ -12940,6 +12951,7 @@ mod tests {
                                         tabs: Vec::new(),
                                         tab_titles: Vec::new(),
                                         window_titles,
+                                        floating_panes: Vec::new(),
                                     });
                                     let mut out = Vec::new();
                                     response

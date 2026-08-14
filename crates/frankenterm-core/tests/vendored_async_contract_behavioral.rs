@@ -2764,6 +2764,7 @@ fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: Default::default(),
+                                    floating_panes: Vec::new(),
                                 }),
                             )
                             .await;
@@ -2889,6 +2890,7 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: Default::default(),
+                                    floating_panes: Vec::new(),
                                 }),
                             )
                             .await;
@@ -3025,6 +3027,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
                                         tabs: Vec::new(),
                                         tab_titles: Vec::new(),
                                         window_titles: Default::default(),
+                                        floating_panes: Vec::new(),
                                     }),
                                 )
                                 .await;
@@ -3156,6 +3159,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: Default::default(),
+                                    floating_panes: Vec::new(),
                                 }),
                             )
                             .await;
@@ -3292,6 +3296,7 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: Default::default(),
+                                    floating_panes: Vec::new(),
                                 }),
                             )
                             .await;
@@ -3414,6 +3419,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
                                         tabs: Vec::new(),
                                         tab_titles: Vec::new(),
                                         window_titles: Default::default(),
+                                        floating_panes: Vec::new(),
                                     }),
                                 )
                                 .await;
@@ -3541,6 +3547,7 @@ fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: Default::default(),
+                                    floating_panes: Vec::new(),
                                 }),
                             )
                             .await;
@@ -3669,6 +3676,7 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: Default::default(),
+                                    floating_panes: Vec::new(),
                                 }),
                             )
                             .await;
@@ -3792,6 +3800,7 @@ fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
                                     tabs: Vec::new(),
                                     tab_titles: Vec::new(),
                                     window_titles: Default::default(),
+                                    floating_panes: Vec::new(),
                                 }),
                             )
                             .await;

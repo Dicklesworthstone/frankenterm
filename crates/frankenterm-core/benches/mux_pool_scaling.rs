@@ -106,6 +106,7 @@ async fn spawn_mock_server(temp_dir: &tempfile::TempDir, response_delay: Duratio
                                 tabs: Vec::new(),
                                 tab_titles: Vec::new(),
                                 window_titles: HashMap::new(),
+                                floating_panes: Vec::new(),
                             }),
                             Pdu::WriteToPane(_) => Pdu::UnitResponse(UnitResponse {}),
                             Pdu::SendPaste(_) => Pdu::UnitResponse(UnitResponse {}),

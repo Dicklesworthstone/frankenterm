@@ -81,6 +81,7 @@ fn build_list_panes_response(config: MockServerConfig) -> ListPanesResponse {
         tabs: Vec::new(),
         tab_titles: Vec::new(),
         window_titles,
+        floating_panes: Vec::new(),
     }
 }
 
