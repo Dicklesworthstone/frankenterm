@@ -960,6 +960,7 @@ impl PreparedFloatingPaneGeometry {
     }
 }
 
+#[derive(Clone)]
 struct FloatingPane {
     pane: Arc<dyn Pane>,
     /// Stable numeric identity admitted before the pane enters the tab lock.
@@ -972,6 +973,77 @@ struct FloatingPane {
     visible: bool,
     pinned: bool,
     opacity: f32,
+}
+
+/// One authoritative floating-pane state supplied by a client-domain
+/// snapshot reconciler.
+///
+/// `pane_id` is observed before entering the mux transaction and must match
+/// the exact `pane` registration. The reconciler never invokes pane resize or
+/// focus callbacks: this state mirrors a remote authority and must not echo
+/// local mutations back to it.
+#[derive(Clone)]
+pub struct DomainFloatingPaneState {
+    pub tab: Arc<Tab>,
+    pub pane: Arc<dyn Pane>,
+    pub pane_id: PaneId,
+    pub rect: FloatingPaneRect,
+    pub z_order: u32,
+    pub visible: bool,
+    pub pinned: bool,
+    pub opacity: f32,
+    pub focused: bool,
+}
+
+/// Result of one domain-selective floating-pane reconciliation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DomainFloatingPaneReconcileReceipt {
+    pub changed_tab_ids: Vec<TabId>,
+    pub invalidated_window_ids: Vec<WindowId>,
+    pub registered_pane_ids: Vec<PaneId>,
+    pub retired_pane_ids: Vec<PaneId>,
+}
+
+struct PreparedDomainPanePublication<'a> {
+    pane: Arc<dyn Pane>,
+    pane_id: PaneId,
+    preparation_claim: crate::PanePreparationClaim<'a>,
+    reader_start_gate: Option<crate::PaneReaderStartGate>,
+    registration_reservation:
+        Option<crate::pane_registration_handle::PaneRegistrationReservation>,
+}
+
+struct ObservedDomainFloatingTab {
+    tab: Arc<Tab>,
+    panes: Vec<Arc<dyn Pane>>,
+    floating_panes: Vec<FloatingPane>,
+    floating_focus: Option<PaneId>,
+    size: TerminalSize,
+    parent_window_id: Option<WindowId>,
+}
+
+struct PreparedDomainFloatingTab {
+    replacement: Option<Vec<FloatingPane>>,
+    floating_focus: Option<PaneId>,
+    changed: bool,
+}
+
+fn floating_pane_state_eq(left: &FloatingPane, right: &FloatingPane) -> bool {
+    Arc::ptr_eq(&left.pane, &right.pane)
+        && left.pane_id == right.pane_id
+        && left.rect == right.rect
+        && left.z_order == right.z_order
+        && left.visible == right.visible
+        && left.pinned == right.pinned
+        && left.opacity.to_bits() == right.opacity.to_bits()
+}
+
+fn floating_pane_vectors_eq(left: &[FloatingPane], right: &[FloatingPane]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| floating_pane_state_eq(left, right))
 }
 
 #[derive(Clone)]
@@ -3408,7 +3480,7 @@ impl Tab {
             preparation_claim.pane_id,
             &preparation_claim.generation,
         )?;
-        let (mut reader_start_gate, mut registration_reservation) =
+        let (mut reader_start_gate, registration_reservation) =
             mux.spawn_prepared_pane_reader(&pane, prepared, &preparation_claim.generation)?;
         let spawned_id = preparation_claim.pane_id;
 
@@ -3675,8 +3747,6 @@ impl Tab {
             // above. The reservation is exclusive, so losing it here is an
             // internal invariant violation rather than a recoverable race.
             let commit_guard = registration_reservation
-                .take()
-                .expect("prepared floating pane retains its registration reservation")
                 .commit()
                 .expect("validated exclusive pane registration reservation must commit");
             let registration = PaneRegistrationHandle::new(&pane, &preparation_claim.generation);
@@ -3685,6 +3755,7 @@ impl Tab {
                 crate::LivePaneRegistration {
                     pane: Arc::clone(&pane),
                     generation: Arc::clone(&preparation_claim.generation),
+                    domain_id: expected_domain_id,
                 },
             );
             debug_assert!(prior.is_none());

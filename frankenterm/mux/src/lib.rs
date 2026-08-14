@@ -3196,6 +3196,10 @@ struct PanePreparation {
 struct LivePaneRegistration {
     pane: Arc<dyn Pane>,
     generation: Arc<PaneRegistrationGeneration>,
+    /// Stable domain identity observed before publication. Registry and
+    /// topology transactions use this callback-free value while holding mux
+    /// locks; invoking `Pane::domain_id` there would permit reentrant deadlock.
+    domain_id: DomainId,
 }
 
 impl Drop for LivePaneRegistration {
@@ -3208,6 +3212,7 @@ struct PanePreparationClaim<'a> {
     registration: &'a Mutex<()>,
     claims: &'a Mutex<HashMap<PaneId, PanePreparation>>,
     pane_id: PaneId,
+    domain_id: DomainId,
     pane: Weak<dyn Pane>,
     generation: Arc<PaneRegistrationGeneration>,
     active: bool,
@@ -3482,6 +3487,33 @@ struct PreparedPaneLifecycleEnqueue<'a> {
     vacant_queue: Option<VecDeque<PendingPaneLifecycleNotification>>,
 }
 
+struct PreparedPaneLifecycleBatchEntry {
+    pane_id: PaneId,
+    ready: Arc<AtomicBool>,
+    vacant_queue: Option<VecDeque<PendingPaneLifecycleNotification>>,
+}
+
+/// Allocation-complete authority for appending several independent pane
+/// lifecycle edges in one structural transaction.
+///
+/// The queue guard remains held through the caller's final commit cut. Every
+/// map, queue, ready-set, and result-vector allocation is reserved up front,
+/// so [`PreparedPaneLifecycleBatchEnqueue::enqueue`] only moves prepared
+/// values into already-owned storage.
+struct PreparedPaneLifecycleBatchEnqueue<'a> {
+    pending: parking_lot::MutexGuard<'a, PendingPaneLifecycleNotifications>,
+    entries: Vec<PreparedPaneLifecycleBatchEntry>,
+    tickets: Vec<PaneLifecycleNotificationTicket>,
+}
+
+struct PreparedPaneLifecycleBatchNotification {
+    notification: PaneLifecycleNotification,
+    topology: MuxTopologyStamp,
+    reader_start_gate: Option<PaneReaderStartGate>,
+    cleanup_complete: Option<Arc<AtomicBool>>,
+    removal_follow_up: PaneRemovalFollowUp,
+}
+
 impl PreparedPaneLifecycleEnqueue<'_> {
     fn enqueue(
         mut self,
@@ -3516,6 +3548,42 @@ impl PreparedPaneLifecycleEnqueue<'_> {
             pane_id: self.pane_id,
             ready: ticket_ready,
         }
+    }
+}
+
+impl PreparedPaneLifecycleBatchEnqueue<'_> {
+    fn enqueue(
+        mut self,
+        notifications: Vec<PreparedPaneLifecycleBatchNotification>,
+    ) -> Vec<PaneLifecycleNotificationTicket> {
+        assert_eq!(
+            notifications.len(),
+            self.entries.len(),
+            "prepared lifecycle batch cardinality changed before commit"
+        );
+        for (mut entry, notification) in self.entries.drain(..).zip(notifications) {
+            debug_assert_eq!(notification.notification.pane_id(), entry.pane_id);
+            let pending_notification = PendingPaneLifecycleNotification {
+                notification: notification.notification,
+                topology: notification.topology,
+                ready: entry.ready,
+                reader_start_gate: notification.reader_start_gate,
+                cleanup_complete: notification.cleanup_complete,
+                removal_follow_up: notification.removal_follow_up,
+            };
+            if let Some(queue) = self.pending.by_pane.get_mut(&entry.pane_id) {
+                queue.push_back(pending_notification);
+            } else {
+                let mut queue = entry
+                    .vacant_queue
+                    .take()
+                    .expect("a vacant lifecycle batch slot retains its prepared queue");
+                queue.push_back(pending_notification);
+                let prior = self.pending.by_pane.insert(entry.pane_id, queue);
+                debug_assert!(prior.is_none());
+            }
+        }
+        self.tickets
     }
 }
 
@@ -5322,7 +5390,7 @@ impl Mux {
     ) -> Result<[MuxNotificationEnvelope; N], TopologyRevisionExhausted> {
         debug_assert!(notifications.iter().all(MuxNotification::is_topology));
         let first = self.topology.lock().reserve_revisions(N)?;
-        let mut notifications = notifications.into_iter();
+        let mut notifications = IntoIterator::into_iter(notifications);
         Ok(std::array::from_fn(|index| MuxNotificationEnvelope {
             notification: notifications
                 .next()
@@ -5707,7 +5775,6 @@ impl Mux {
         cleanup_complete: Option<Arc<AtomicBool>>,
         removal_follow_up: PaneRemovalFollowUp,
     ) -> PaneLifecycleNotificationTicket {
-        let pane_id = notification.pane_id();
         let topology = self
             .envelope_notification(notification.clone().into())
             .topology;
@@ -5760,6 +5827,99 @@ impl Mux {
             pane_id,
             ready,
             vacant_queue,
+        })
+    }
+
+    /// Reserve every recoverably fallible allocation needed to append one
+    /// lifecycle edge for each distinct pane ID in `pane_ids`.
+    ///
+    /// The returned guard intentionally retains `pending_pane_lifecycle` so a
+    /// concurrent producer cannot consume the reserved map or queue capacity
+    /// before the enclosing multi-pane topology transaction commits.
+    fn prepare_pane_lifecycle_batch_enqueue(
+        &self,
+        pane_ids: &[PaneId],
+    ) -> anyhow::Result<PreparedPaneLifecycleBatchEnqueue<'_>> {
+        let mut unique = HashSet::new();
+        unique
+            .try_reserve(pane_ids.len())
+            .map_err(|error| anyhow!("reserve lifecycle batch identity set: {error}"))?;
+        for &pane_id in pane_ids {
+            anyhow::ensure!(
+                unique.insert(pane_id),
+                "pane {pane_id} appears more than once in one lifecycle batch"
+            );
+        }
+
+        let mut ready_tokens = Vec::new();
+        ready_tokens
+            .try_reserve_exact(pane_ids.len())
+            .map_err(|error| anyhow!("reserve lifecycle batch readiness tokens: {error}"))?;
+        ready_tokens.extend(
+            pane_ids
+                .iter()
+                .map(|_| Arc::new(AtomicBool::new(false))),
+        );
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(pane_ids.len())
+            .map_err(|error| anyhow!("reserve lifecycle batch entries: {error}"))?;
+        let mut tickets = Vec::new();
+        tickets
+            .try_reserve_exact(pane_ids.len())
+            .map_err(|error| anyhow!("reserve lifecycle batch tickets: {error}"))?;
+
+        let mut pending = self.pending_pane_lifecycle.lock();
+        let absent = pane_ids
+            .iter()
+            .filter(|pane_id| !pending.by_pane.contains_key(pane_id))
+            .count();
+        pending
+            .by_pane
+            .try_reserve(absent)
+            .map_err(|error| anyhow!("reserve lifecycle batch pane map: {error}"))?;
+        let ready_needed = pane_ids
+            .iter()
+            .filter(|pane_id| !pending.ready_set.contains(pane_id))
+            .count();
+        pending
+            .ready_panes
+            .try_reserve(ready_needed)
+            .map_err(|error| anyhow!("reserve lifecycle batch ready queue: {error}"))?;
+        pending
+            .ready_set
+            .try_reserve(ready_needed)
+            .map_err(|error| anyhow!("reserve lifecycle batch ready set: {error}"))?;
+
+        for (&pane_id, ready) in pane_ids.iter().zip(ready_tokens) {
+            let vacant_queue = if let Some(queue) = pending.by_pane.get_mut(&pane_id) {
+                queue.try_reserve(1).map_err(|error| {
+                    anyhow!("reserve pane {pane_id} lifecycle batch queue: {error}")
+                })?;
+                None
+            } else {
+                let mut queue = VecDeque::new();
+                queue.try_reserve(1).map_err(|error| {
+                    anyhow!("reserve pane {pane_id} lifecycle batch queue: {error}")
+                })?;
+                Some(queue)
+            };
+            tickets.push(PaneLifecycleNotificationTicket {
+                pane_id,
+                ready: Arc::clone(&ready),
+            });
+            entries.push(PreparedPaneLifecycleBatchEntry {
+                pane_id,
+                ready,
+                vacant_queue,
+            });
+        }
+
+        Ok(PreparedPaneLifecycleBatchEnqueue {
+            pending,
+            entries,
+            tickets,
         })
     }
 
@@ -6606,6 +6766,7 @@ impl Mux {
         pane: &Arc<dyn Pane>,
     ) -> Result<Option<PanePreparationClaim<'_>>, Error> {
         let pane_id = pane.pane_id();
+        let domain_id = pane.domain_id();
         let weak_pane = Arc::downgrade(pane);
         let generation =
             PaneRegistrationGeneration::new(pane_id, &self.pane_retirements, Arc::downgrade(self));
@@ -6642,6 +6803,7 @@ impl Mux {
             registration: &self.pane_registration,
             claims: &self.pane_preparations,
             pane_id,
+            domain_id,
             pane: weak_pane,
             generation,
             active: true,
@@ -6700,6 +6862,7 @@ impl Mux {
     fn insert_pane_registration_locked(
         &self,
         pane_id: PaneId,
+        domain_id: DomainId,
         pane: &Arc<dyn Pane>,
         generation: &Arc<PaneRegistrationGeneration>,
     ) -> Result<(), Error> {
@@ -6722,6 +6885,7 @@ impl Mux {
             LivePaneRegistration {
                 pane: Arc::clone(pane),
                 generation: Arc::clone(generation),
+                domain_id,
             },
         );
         Ok(())
@@ -7016,7 +7180,12 @@ impl Mux {
                     return Err(PanePreparationCancelled { pane_id }.into());
                 }
                 let commit_guard = registration_reservation.commit()?;
-                self.insert_pane_registration_locked(pane_id, pane, &preparation_claim.generation)?;
+                self.insert_pane_registration_locked(
+                    pane_id,
+                    preparation_claim.domain_id,
+                    pane,
+                    &preparation_claim.generation,
+                )?;
                 let lifecycle_notification = self.enqueue_pane_lifecycle_notification_locked(
                     PaneLifecycleNotification::Added(pane_id),
                     reader_start_gate.take(),
@@ -7132,6 +7301,7 @@ impl Mux {
                             LivePaneRegistration {
                                 pane: Arc::clone(&pane),
                                 generation: Arc::clone(&claim.generation),
+                                domain_id: claim.domain_id,
                             },
                         );
                         if tab_needs_insert {
@@ -10852,7 +11022,7 @@ mod tests {
             PaneRegistrationGeneration::new(109, &mux.pane_retirements, Arc::downgrade(&mux));
         let added = {
             let _registration = mux.pane_registration.lock();
-            mux.insert_pane_registration_locked(109, &pane, &generation)
+            mux.insert_pane_registration_locked(109, pane.domain_id(), &pane, &generation)
                 .expect("test pane registration should publish");
             mux.enqueue_pane_lifecycle_notification_locked(
                 PaneLifecycleNotification::Added(109),
@@ -14597,6 +14767,7 @@ mod tests {
             LivePaneRegistration {
                 pane: Arc::clone(&replacement),
                 generation: PaneRegistrationGeneration::new(91, &mux.pane_retirements, Weak::new()),
+                domain_id: replacement.domain_id(),
             },
         );
 
