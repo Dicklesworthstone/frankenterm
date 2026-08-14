@@ -19272,6 +19272,7 @@ mod tests {
         assert!(
             format!("{error:#}").contains("source window"),
             "unexpected exhausted-source error: {error:#}",
+            error = error,
         );
 
         let source = mux.get_window(source_id).expect("source window survives");
@@ -19351,6 +19352,7 @@ mod tests {
         assert!(
             format!("{error:#}").contains("ordered-window limit"),
             "unexpected full-destination error: {error:#}",
+            error = error,
         );
         let source_after = mux
             .window_order_snapshot(source_id)
@@ -19483,7 +19485,8 @@ mod tests {
         };
         assert!(
             format!("{error:#}").contains("empty prepared final state"),
-            "unexpected nonempty-retirement error: {error:#}"
+            "unexpected nonempty-retirement error: {error:#}",
+            error = error,
         );
         let after = mux
             .window_order_snapshot(window_id)

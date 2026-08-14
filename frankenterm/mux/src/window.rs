@@ -895,18 +895,6 @@ impl Window {
     }
 
     #[cfg(test)]
-    pub(crate) fn remove_by_idx(&mut self, idx: usize) -> Arc<Tab> {
-        assert!(
-            idx < self.tabs.len(),
-            "cannot remove tab index {idx} from window {} with {} tabs",
-            self.id,
-            self.tabs.len()
-        );
-        let active = self.get_active().map(Arc::clone);
-        self.do_remove_idx(idx, active)
-    }
-
-    #[cfg(test)]
     pub(crate) fn remove_by_id(&mut self, id: TabId) {
         let active = self.get_active().map(Arc::clone);
         if let Some(idx) = self.idx_by_id(id) {
