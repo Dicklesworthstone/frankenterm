@@ -15787,29 +15787,34 @@ mod tests {
                 use std::task::Poll;
 
                 let mutex = Mutex::new(41u32);
-                let owner_cx = crate::cx::for_request();
-                let owner = mutex
-                    .lock_with_cx(&owner_cx)
-                    .await
-                    .expect("owner must acquire mutex");
+                // The guard is !Send, and the LabRuntime task must be Send:
+                // scope the owner in a block (rustc's async auto-trait
+                // analysis does not honor an explicit `drop()` here) so it
+                // is provably dead before the probe acquisition awaits.
                 {
-                    let waiter_cx = crate::cx::for_testing();
-                    let mut waiter = Box::pin(mutex.lock_with_cx(&waiter_cx));
-                    let waker = futures::task::noop_waker();
-                    let mut task_cx = std::task::Context::from_waker(&waker);
+                    let owner_cx = crate::cx::for_request();
+                    let owner = mutex
+                        .lock_with_cx(&owner_cx)
+                        .await
+                        .expect("owner must acquire mutex");
+                    {
+                        let waiter_cx = crate::cx::for_testing();
+                        let mut waiter = Box::pin(mutex.lock_with_cx(&waiter_cx));
+                        let waker = futures::task::noop_waker();
+                        let mut task_cx = std::task::Context::from_waker(&waker);
 
-                    assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
-                    waiter_cx.cancel_with(
-                        crate::outcome::CancelKind::User,
-                        Some("cancel queued mutex waiter"),
-                    );
-                    assert!(matches!(
-                        waiter.as_mut().poll(&mut task_cx),
-                        Poll::Ready(Err(LockAcquireError::Cancelled))
-                    ));
+                        assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
+                        waiter_cx.cancel_with(
+                            crate::outcome::CancelKind::User,
+                            Some("cancel queued mutex waiter"),
+                        );
+                        assert!(matches!(
+                            waiter.as_mut().poll(&mut task_cx),
+                            Poll::Ready(Err(LockAcquireError::Cancelled))
+                        ));
+                    }
+                    assert_eq!(*owner, 41, "cancelled waiter must not acquire or mutate");
                 }
-                assert_eq!(*owner, 41, "cancelled waiter must not acquire or mutate");
-                drop(owner);
 
                 let probe_cx = crate::cx::for_request();
                 let probe = mutex

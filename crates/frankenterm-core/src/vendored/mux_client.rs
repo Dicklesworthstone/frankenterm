@@ -9654,28 +9654,25 @@ mod tests {
                 DirectMuxClient::connect(config).await.expect("connect"),
             ));
             let pane_ids = vec![11_u64, 22, 33, 44, 55];
-            let mut joins = Vec::with_capacity(pane_ids.len());
 
-            for pane_id in &pane_ids {
-                let client = Arc::clone(&client);
-                let pane_id = *pane_id;
-                joins.push(task::spawn(async move {
-                    let mut guard = client.lock().await;
-                    let response = guard
-                        .get_pane_render_changes(pane_id)
-                        .await
-                        .expect("get_pane_render_changes");
-                    (pane_id, response.pane_id, response.seqno)
-                }));
-            }
-
+            // The runtime_async MutexGuard is !Send, so it cannot be held
+            // across an await inside task::spawn. The spawned variant of this
+            // test serialized the requests through the mutex anyway; issue
+            // them sequentially from the test future (current-thread runtime,
+            // no Send requirement) — connection sharing across requests is
+            // still exercised.
             let mut seen_panes = HashSet::new();
-            for join in joins {
-                let (requested, received_pane_id, received_seqno) =
-                    join.await.expect("join request task");
-                assert_eq!(received_pane_id as u64, requested);
-                assert_eq!(received_seqno as u64, requested);
-                seen_panes.insert(received_pane_id);
+            for pane_id in &pane_ids {
+                let requested = *pane_id;
+                let mut guard = client.lock().await;
+                let response = guard
+                    .get_pane_render_changes(requested)
+                    .await
+                    .expect("get_pane_render_changes");
+                drop(guard);
+                assert_eq!(response.pane_id as u64, requested);
+                assert_eq!(response.seqno as u64, requested);
+                seen_panes.insert(response.pane_id);
             }
             assert_eq!(seen_panes.len(), pane_ids.len());
 
