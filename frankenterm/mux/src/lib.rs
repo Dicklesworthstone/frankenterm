@@ -2543,10 +2543,7 @@ mod pane_registration_handle {
 
         /// Validate this exact weak pane/generation against a live registry
         /// entry. The caller must hold the owning mux's registration serializer.
-        pub(crate) fn matches_live_registration(
-            &self,
-            registered: &LivePaneRegistration,
-        ) -> bool {
+        pub(crate) fn matches_live_registration(&self, registered: &LivePaneRegistration) -> bool {
             Weak::ptr_eq(&self.pane, &Arc::downgrade(&registered.pane))
                 && Arc::ptr_eq(&self.generation, &registered.generation)
         }
@@ -3470,6 +3467,56 @@ struct PendingPaneLifecycleNotifications {
     ready_panes: VecDeque<PaneId>,
     ready_set: HashSet<PaneId>,
     draining: bool,
+}
+
+/// Allocation-complete authority to append one lifecycle event while retaining
+/// the lifecycle queue lock through a structural commit.
+///
+/// The final append itself is infallible: map, per-pane queue, ready queue, and
+/// ready-set capacity are all reserved before the caller acquires topology
+/// revision authority or mutates mux state.
+struct PreparedPaneLifecycleEnqueue<'a> {
+    pending: parking_lot::MutexGuard<'a, PendingPaneLifecycleNotifications>,
+    pane_id: PaneId,
+    ready: Arc<AtomicBool>,
+    vacant_queue: Option<VecDeque<PendingPaneLifecycleNotification>>,
+}
+
+impl PreparedPaneLifecycleEnqueue<'_> {
+    fn enqueue(
+        mut self,
+        notification: PaneLifecycleNotification,
+        topology: MuxTopologyStamp,
+        reader_start_gate: Option<PaneReaderStartGate>,
+        cleanup_complete: Option<Arc<AtomicBool>>,
+        removal_follow_up: PaneRemovalFollowUp,
+    ) -> PaneLifecycleNotificationTicket {
+        debug_assert_eq!(notification.pane_id(), self.pane_id);
+        let ticket_ready = Arc::clone(&self.ready);
+        let pending_notification = PendingPaneLifecycleNotification {
+            notification,
+            topology,
+            ready: self.ready,
+            reader_start_gate,
+            cleanup_complete,
+            removal_follow_up,
+        };
+        if let Some(queue) = self.pending.by_pane.get_mut(&self.pane_id) {
+            queue.push_back(pending_notification);
+        } else {
+            let mut queue = self
+                .vacant_queue
+                .take()
+                .expect("a vacant lifecycle slot retains its prepared queue");
+            queue.push_back(pending_notification);
+            let prior = self.pending.by_pane.insert(self.pane_id, queue);
+            debug_assert!(prior.is_none());
+        }
+        PaneLifecycleNotificationTicket {
+            pane_id: self.pane_id,
+            ready: ticket_ready,
+        }
+    }
 }
 
 impl PendingPaneLifecycleNotifications {
@@ -5671,6 +5718,49 @@ impl Mux {
             cleanup_complete,
             removal_follow_up,
         )
+    }
+
+    /// Reserve every recoverably fallible allocation required to append one
+    /// pane lifecycle event, retaining the queue lock until the caller commits
+    /// and appends it.
+    fn prepare_pane_lifecycle_enqueue(
+        &self,
+        pane_id: PaneId,
+    ) -> anyhow::Result<PreparedPaneLifecycleEnqueue<'_>> {
+        let ready = Arc::new(AtomicBool::new(false));
+        let mut pending = self.pending_pane_lifecycle.lock();
+        let vacant_queue = if let Some(queue) = pending.by_pane.get_mut(&pane_id) {
+            queue
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve pane {pane_id} lifecycle queue: {error}"))?;
+            None
+        } else {
+            pending
+                .by_pane
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve pane lifecycle map: {error}"))?;
+            let mut queue = VecDeque::new();
+            queue
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve pane {pane_id} lifecycle queue: {error}"))?;
+            Some(queue)
+        };
+        if !pending.ready_set.contains(&pane_id) {
+            pending
+                .ready_panes
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve pane lifecycle ready queue: {error}"))?;
+            pending
+                .ready_set
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve pane lifecycle ready set: {error}"))?;
+        }
+        Ok(PreparedPaneLifecycleEnqueue {
+            pending,
+            pane_id,
+            ready,
+            vacant_queue,
+        })
     }
 
     /// Enqueue a lifecycle event using topology authority already reserved by
@@ -9426,6 +9516,28 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
     }
 
+    struct ScopedMuxOverride {
+        prior: Option<Arc<Mux>>,
+    }
+
+    impl ScopedMuxOverride {
+        fn install(mux: &Arc<Mux>) -> Self {
+            let prior = Mux::try_get();
+            Mux::set_mux(mux);
+            Self { prior }
+        }
+    }
+
+    impl Drop for ScopedMuxOverride {
+        fn drop(&mut self) {
+            if let Some(prior) = self.prior.take() {
+                Mux::set_mux(&prior);
+            } else {
+                Mux::shutdown();
+            }
+        }
+    }
+
     struct BoundedTestExecutor {
         receiver: std::sync::mpsc::Receiver<promise::spawn::Runnable>,
     }
@@ -11534,7 +11646,7 @@ mod tests {
             .expect("register floating test domain");
         {
             let mut topology = mux.topology.lock();
-            topology.revision = TopologyRevision(u64::MAX - 2);
+            topology.revision = TopologyRevision(u64::MAX - 1);
             topology.exhausted = false;
         }
 
@@ -11635,7 +11747,7 @@ mod tests {
     fn floating_spawn_uses_originating_mux_after_global_singleton_swap() {
         let global_guard = global_test_lock();
         let originating_mux = Arc::new(Mux::new(None));
-        Mux::set_mux(&originating_mux);
+        let _mux_override = ScopedMuxOverride::install(&originating_mux);
         let replacement_mux = Arc::new(Mux::new(None));
         let (target, _target_kills) = KillCountingPane::new(198, test_size());
         let (destination, window_id) =

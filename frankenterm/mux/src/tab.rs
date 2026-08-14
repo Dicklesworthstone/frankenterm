@@ -3368,8 +3368,9 @@ impl Tab {
     /// All pane callbacks and fallible reader preparation finish first. The
     /// final lock order is `domain_registration -> pane_registration -> tabs
     /// -> windows -> Tab::inner (stable pointer order) -> pane_preparations ->
-    /// panes -> clients -> topology`. No callback or subscriber runs inside
-    /// that cut, and a rejected commit emits no pane lifecycle edge.
+    /// panes -> clients -> pending_pane_lifecycle -> topology`. No callback or
+    /// subscriber runs inside that cut, and a rejected commit emits no pane
+    /// lifecycle edge.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_unpublished_floating_pane(
         self: &Arc<Self>,
@@ -3614,6 +3615,9 @@ impl Tab {
                 !panes.contains_key(&spawned_id),
                 "floating-pane id {spawned_id} became registered before commit"
             );
+            panes
+                .try_reserve(1)
+                .map_err(|error| anyhow::anyhow!("reserve floating-pane registry slot: {error}"))?;
 
             let mut clients = owner_client_id.map(|_| mux.clients.write());
             let client_info = match owner_client_id {
@@ -3633,14 +3637,15 @@ impl Tab {
             let target_is_active = inner
                 .raw_active_pane_retained_id()
                 .is_some_and(|active| target_registration.is_same_pane(&active));
-            let client_focus_is_current = client_info.as_ref().is_none_or(|info| {
-                match info.focused_pane_registration() {
-                    Some(focused) => focused.same_registration(target_registration),
-                    None => info
-                        .focused_pane_id
-                        .is_none_or(|pane_id| pane_id == target_registration.pane_id()),
-                }
-            });
+            let client_focus_is_current =
+                client_info
+                    .as_ref()
+                    .is_none_or(|info| match info.focused_pane_registration() {
+                        Some(focused) => focused.same_registration(target_registration),
+                        None => info
+                            .focused_pane_id
+                            .is_none_or(|pane_id| pane_id == target_registration.pane_id()),
+                    });
             // Zoom is an explicit exclusive-view state. Preserve it and attach
             // the new float unfocused rather than claiming focus that active
             // pane resolution would still give to the zoomed pane.
@@ -3658,6 +3663,7 @@ impl Tab {
                 .floating_panes
                 .try_reserve(1)
                 .map_err(|error| anyhow::anyhow!("reserve floating-pane slot: {error}"))?;
+            let lifecycle_enqueue = mux.prepare_pane_lifecycle_enqueue(spawned_id)?;
 
             let mut topology = mux.topology.lock();
             let topology_stamp = crate::MuxTopologyStamp::Revision(
@@ -3699,7 +3705,7 @@ impl Tab {
                 expected_window_id,
                 &positioned,
             );
-            let lifecycle_ticket = mux.enqueue_pane_lifecycle_notification_at_topology_locked(
+            let lifecycle_ticket = lifecycle_enqueue.enqueue(
                 crate::PaneLifecycleNotification::FloatingSpawnCommitted(frozen),
                 topology_stamp,
                 reader_start_gate.take(),
