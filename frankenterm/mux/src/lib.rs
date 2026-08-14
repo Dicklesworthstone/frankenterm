@@ -11041,6 +11041,28 @@ mod tests {
     }
 
     #[test]
+    fn domain_spawn_missing_window_rolls_back_registered_tab_and_pane() {
+        let mux = Arc::new(Mux::new(None));
+        let (spawned, spawned_kills) = KillCountingPane::new(179, test_size());
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::new(Some(Arc::clone(&spawned))));
+
+        let result = promise::spawn::block_on(domain.spawn(
+            &mux,
+            test_size(),
+            None,
+            None,
+            usize::MAX,
+        ));
+
+        assert!(result.is_err());
+        assert!(mux.get_pane(spawned.pane_id()).is_none());
+        assert!(mux.tabs.read().is_empty());
+        assert!(mux.windows.read().is_empty());
+        assert_eq!(spawned_kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn floating_spawn_commits_without_any_tab_or_window_order_churn() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));

@@ -105,6 +105,15 @@ impl PreparedPane {
         )
     }
 
+    fn commit_tab(mut self, tab: Arc<Tab>) -> Arc<Tab> {
+        self.armed = false;
+        tab
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+
     fn commit_floating(
         mut self,
         tab: Arc<Tab>,
@@ -120,6 +129,31 @@ impl PreparedPane {
             positioned,
         )
     }
+}
+
+fn prepare_registered_pane(
+    mux: &Arc<Mux>,
+    pane: &Arc<dyn Pane>,
+) -> anyhow::Result<PreparedPane> {
+    let registration = match mux.capture_pane_registration(pane) {
+        Some(registration) => registration,
+        None => {
+            let rollback = catch_recoverable(
+                RecoverablePanicSite::MuxRegistrationRollback,
+                std::panic::AssertUnwindSafe(|| pane.kill()),
+            );
+            if rollback.is_err() {
+                log::error!(
+                    "unregistered spawned-pane rollback panicked for exact pane identity {:p}",
+                    Arc::as_ptr(pane)
+                );
+            }
+            anyhow::bail!(
+                "spawned pane has no exact mux registration; rolled back the unregistered pane"
+            );
+        }
+    };
+    Ok(PreparedPane::new(Arc::clone(pane), registration))
 }
 
 impl Drop for PreparedPane {
@@ -174,14 +208,23 @@ pub trait Domain: Downcast + Send + Sync {
             .spawn_pane(mux, size, command, command_dir)
             .await
             .context("spawn")?;
+        let prepared = prepare_registered_pane(mux, &pane)?;
 
         let tab = Arc::new(Tab::new(&size));
         tab.assign_pane(&pane);
 
         mux.add_tab_and_active_pane(&tab)?;
-        mux.add_tab_to_window(&tab, window)?;
+        if let Err(error) = mux.add_tab_to_window(&tab, window) {
+            if mux
+                .remove_tab_internal_if_same_with_pane_disposition(&tab, true)
+                .is_some()
+            {
+                prepared.disarm();
+            }
+            return Err(error);
+        }
 
-        Ok(tab)
+        Ok(prepared.commit_tab(tab))
     }
 
     /// Spawn a new pane and commit it beside the exact admitted target.
@@ -219,13 +262,7 @@ pub trait Domain: Downcast + Send + Sync {
         let pane = self
             .spawn_pane(mux, split_size.second, command, command_dir)
             .await?;
-        let registration = mux.capture_pane_registration(&pane).ok_or_else(|| {
-            anyhow!(
-                "spawned pane {} has no exact registration before split commit",
-                pane.pane_id()
-            )
-        })?;
-        let prepared = PreparedPane::new(Arc::clone(&pane), registration);
+        let prepared = prepare_registered_pane(mux, &pane)?;
         if let Some(config) = target_config {
             pane.set_config(config);
         }
@@ -276,25 +313,7 @@ pub trait Domain: Downcast + Send + Sync {
             .spawn_pane(mux, size, command, command_dir)
             .await
             .context("spawn floating pane")?;
-        let registration = match mux.capture_pane_registration(&pane) {
-            Some(registration) => registration,
-            None => {
-                let rollback = catch_recoverable(
-                    RecoverablePanicSite::MuxRegistrationRollback,
-                    std::panic::AssertUnwindSafe(|| pane.kill()),
-                );
-                if rollback.is_err() {
-                    log::error!(
-                        "unregistered floating-pane spawn rollback panicked for exact pane identity {:p}",
-                        Arc::as_ptr(&pane)
-                    );
-                }
-                anyhow::bail!(
-                    "spawned floating pane has no exact mux registration; rolled back the unregistered pane"
-                );
-            }
-        };
-        let prepared = PreparedPane::new(Arc::clone(&pane), registration);
+        let prepared = prepare_registered_pane(mux, &pane)?;
 
         // Configuration callbacks are intentionally before the structural
         // commit. If they unwind, the still-armed exact-generation rollback
