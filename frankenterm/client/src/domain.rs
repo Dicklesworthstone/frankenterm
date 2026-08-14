@@ -2342,8 +2342,8 @@ impl ClientDomain {
             }
             if entry.left_col != floating.rect.left
                 || entry.top_row != floating.rect.top
-                || entry.size.cols as usize != floating.rect.width
-                || entry.size.rows as usize != floating.rect.height
+                || entry.size.cols != floating.rect.width
+                || entry.size.rows != floating.rect.height
             {
                 bail!(
                     "malformed ListPanes response: floating pane {} geometry disagrees with its pane entry",

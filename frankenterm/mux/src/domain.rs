@@ -1750,7 +1750,8 @@ mod tests {
             }
             assert!(
                 started.load(Ordering::Acquire),
-                "blocking spawn worker did not start within {WAIT_LIMIT:?}"
+                "blocking spawn worker did not start within {wait_limit:?}",
+                wait_limit = WAIT_LIMIT,
             );
 
             drop(spawn);

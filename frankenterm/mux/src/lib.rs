@@ -9635,6 +9635,7 @@ mod tests {
     use super::*;
     use crate::pane::{ForEachPaneLogicalLine, LogicalLine, WithPaneLines};
     use crate::renderable::{RenderableDimensions, StableCursorPosition};
+    use crate::tab::{DomainFloatingPaneReconcileReceipt, DomainFloatingPaneState};
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
     use parking_lot::{MappedMutexGuard, MutexGuard};
@@ -10256,7 +10257,11 @@ mod tests {
         }
 
         fn domain_name(&self) -> &str {
-            "guarded-mutation-test"
+            match self.domain_id {
+                1 => "guarded-mutation-test",
+                2 => "guarded-mutation-foreign-test",
+                _ => "guarded-mutation-other-test",
+            }
         }
 
         async fn attach(
@@ -12108,7 +12113,8 @@ mod tests {
 
         assert!(
             error.to_string().contains("also tiled"),
-            "unexpected error: {error:#}"
+            "unexpected error: {error:#}",
+            error = error,
         );
         assert!(tab.iter_floating_panes().is_empty());
         assert!(
@@ -12176,7 +12182,7 @@ mod tests {
         mux.reconcile_domain_floating_panes(
             1,
             authoritative(),
-            vec![desired(&first, 207, 3, 3), desired(&second, 208, 5, 5)],
+            vec![desired(&first, 207, 3, 3), desired(&second, 208, 5, 3)],
         )
         .expect("initial domain floats should publish around the foreign slot");
         let initial = tab.iter_floating_panes();
@@ -12189,7 +12195,7 @@ mod tests {
             .reconcile_domain_floating_panes(
                 1,
                 authoritative(),
-                vec![desired(&second, 208, 5, 5), desired(&first, 207, 3, 3)],
+                vec![desired(&second, 208, 5, 3), desired(&first, 207, 3, 3)],
             )
             .expect("authoritative order should replace only the reconciled domain slots");
         assert_eq!(reordered.changed_tab_ids, vec![tab.tab_id()]);
@@ -12216,7 +12222,7 @@ mod tests {
             .reconcile_domain_floating_panes(
                 1,
                 authoritative(),
-                vec![desired(&second, 208, 5, 5), desired(&first, 207, 3, 3)],
+                vec![desired(&second, 208, 5, 3), desired(&first, 207, 3, 3)],
             )
             .expect("stable mixed-domain replay should be an exact no-op");
         assert_eq!(replay, DomainFloatingPaneReconcileReceipt::default());
