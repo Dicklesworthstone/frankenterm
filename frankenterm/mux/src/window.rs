@@ -2,6 +2,7 @@ use crate::pane::CloseReason;
 use crate::tab::{TabStackEntry, TabStackError, TabStackId, TabStackState};
 use crate::{Mux, MuxNotification, Pane, Tab, TabId, DEFAULT_WORKSPACE};
 use config::GuiPosition;
+#[cfg(test)]
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -634,6 +635,7 @@ impl Window {
         Ok(())
     }
 
+    #[cfg(test)]
     fn next_order_revision_or_panic(&self) -> WindowOrderRevision {
         self.next_order_revision()
             .unwrap_or_else(|err| panic!("window {} cannot mutate ordered state: {err}", self.id))
@@ -836,6 +838,7 @@ impl Window {
     ///
     /// An empty window activates its first inserted tab. Invalid indices fail
     /// before any window state changes.
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, index: usize, tab: &Arc<Tab>) -> anyhow::Result<()> {
         anyhow::ensure!(
             index <= self.tabs.len(),
@@ -856,6 +859,7 @@ impl Window {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn push(&mut self, tab: &Arc<Tab>) -> anyhow::Result<()> {
         self.insert(self.tabs.len(), tab)
     }
@@ -890,6 +894,7 @@ impl Window {
         None
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_by_idx(&mut self, idx: usize) -> Arc<Tab> {
         assert!(
             idx < self.tabs.len(),
@@ -901,6 +906,7 @@ impl Window {
         self.do_remove_idx(idx, active)
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_by_id(&mut self, id: TabId) {
         let active = self.get_active().map(Arc::clone);
         if let Some(idx) = self.idx_by_id(id) {
@@ -908,6 +914,7 @@ impl Window {
         }
     }
 
+    #[cfg(test)]
     fn do_remove_idx(&mut self, idx: usize, active: Option<Arc<Tab>>) -> Arc<Tab> {
         let next_revision = self.next_order_revision_or_panic();
         let prior_active_pane = active
@@ -966,6 +973,7 @@ impl Window {
         tab
     }
 
+    #[cfg(test)]
     fn enqueue_focus_lost(&self, pane: Arc<dyn Pane>) {
         if let Some(mux) = self.owner.upgrade() {
             mux.enqueue_window_focus_lost(pane);
@@ -991,7 +999,8 @@ impl Window {
         self.active
     }
 
-    pub fn save_last_active(&mut self) {
+    #[cfg(test)]
+    fn save_last_active(&mut self) {
         self.last_active = self.get_by_idx(self.active).map(|tab| tab.tab_id());
     }
 
@@ -1007,6 +1016,7 @@ impl Window {
     /// If `idx` is different from the current active tab,
     /// save the current tabid and then make `idx` the active
     /// tab position.
+    #[cfg(test)]
     pub(crate) fn save_and_then_set_active(&mut self, idx: usize) {
         assert!(idx < self.tabs.len());
         if idx == self.get_active_idx() {
@@ -1019,6 +1029,7 @@ impl Window {
 
     /// Make `idx` the active tab position.
     /// The saved tab id is not changed.
+    #[cfg(test)]
     pub(crate) fn set_active_without_saving(&mut self, idx: usize) {
         assert!(idx < self.tabs.len());
         if self.active == idx {
@@ -1028,6 +1039,7 @@ impl Window {
         self.set_active_without_saving_at_revision(idx, next_revision);
     }
 
+    #[cfg(test)]
     fn set_active_without_saving_at_revision(
         &mut self,
         idx: usize,
@@ -1074,6 +1086,7 @@ impl Window {
         Some(tabs)
     }
 
+    #[cfg(test)]
     pub(crate) fn cycle_tab_stack(&mut self, stack_id: TabStackId, delta: isize) -> Option<TabId> {
         // Check terminal revision authority before mutating the stack's
         // visible cursor. `&mut self` makes the subsequent reservation stable.
@@ -2366,11 +2379,11 @@ mod tests {
             prior_order,
         );
         let invalid_destination = window.len();
-        assert!(window
-            .prepare_reorder_exact(&active, 2, invalid_destination)
-            .expect_err("out-of-range reorder must fail")
-            .to_string()
-            .contains("cannot move tab to index"));
+        let error = match window.prepare_reorder_exact(&active, 2, invalid_destination) {
+            Ok(_) => panic!("out-of-range reorder must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot move tab to index"));
         assert_eq!(
             window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
             prior_order,

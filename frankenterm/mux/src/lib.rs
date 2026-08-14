@@ -8906,10 +8906,22 @@ impl Mux {
         save_last_active: bool,
     ) -> anyhow::Result<bool> {
         let changed = {
+            let tabs = self.tabs.read();
             let mut windows = self.windows.write();
             let window = windows
                 .get(&window_id)
                 .ok_or_else(|| anyhow!("activate_tab_at_index: no such window {window_id}"))?;
+            let selected = window.get_by_idx(tab_index).ok_or_else(|| {
+                anyhow!(
+                    "activate_tab_at_index: index {tab_index} is out of range for window {window_id}"
+                )
+            })?;
+            let selected_id = selected.tab_id();
+            anyhow::ensure!(
+                tabs.get(&selected_id)
+                    .is_some_and(|registered| Arc::ptr_eq(registered, selected)),
+                "activate_tab_at_index: tab {selected_id} is not the current registered instance"
+            );
             let Some(state) = window.prepare_set_active(tab_index, save_last_active)? else {
                 return Ok(false);
             };
