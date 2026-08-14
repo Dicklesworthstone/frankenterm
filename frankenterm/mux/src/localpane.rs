@@ -9,10 +9,10 @@ use crate::{Domain, PaneRegistrationHandle, PaneRegistrationSlot};
 use anyhow::Error;
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
+use config::{ExitBehavior, ExitBehaviorMessaging, configuration};
 use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
     Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
@@ -28,11 +28,11 @@ use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
-use termwiz::escape::csi::{Sgr, CSI};
+use termwiz::escape::csi::{CSI, Sgr};
 use termwiz::escape::{Action, DeviceControlMode};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
@@ -4229,8 +4229,8 @@ mod tests {
 mod disruptor_ring_keep_gate {
     use super::*;
     use crossbeam::queue::ArrayQueue;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     /// A batch is the little-endian bytes of its sequence index plus a sentinel

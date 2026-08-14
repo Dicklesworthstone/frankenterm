@@ -1,8 +1,8 @@
 use crate::pane::CloseReason;
 use crate::tab::{TabStackEntry, TabStackError, TabStackId, TabStackState};
-use crate::{Mux, MuxNotification, Pane, Tab, TabId, DEFAULT_WORKSPACE};
+use crate::{DEFAULT_WORKSPACE, Mux, MuxNotification, Pane, Tab, TabId};
 use config::GuiPosition;
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -2028,25 +2028,31 @@ mod tests {
             .insert(0, &before_active)
             .expect("insert before active");
         assert_eq!(window.get_active_idx(), 2);
-        assert!(window
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
 
         let active_index = window.get_active_idx();
         window
             .insert(active_index, &at_active)
             .expect("insert at the active numeric index");
         assert_eq!(window.get_active_idx(), active_index + 1);
-        assert!(window
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
 
         window
             .insert(window.len(), &after_active)
             .expect("insert after active");
-        assert!(window
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
 
         let prior_order = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
         let prior_active_index = window.get_active_idx();
@@ -2073,16 +2079,20 @@ mod tests {
             "failed insertion must preserve exact order",
         );
         assert_eq!(window.get_active_idx(), prior_active_index);
-        assert!(window
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
 
         let only = test_tab();
         let mut empty = Window::new(None, None);
         empty.insert(0, &only).expect("insert into empty window");
-        assert!(empty
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &only)));
+        assert!(
+            empty
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &only))
+        );
     }
 
     #[test]
@@ -2105,28 +2115,36 @@ mod tests {
             )
             .expect("create stack before reorder");
 
-        assert!(window
-            .reorder_tab_if_same(&first, 0, 2)
-            .expect("inactive reorder must validate"));
+        assert!(
+            window
+                .reorder_tab_if_same(&first, 0, 2)
+                .expect("inactive reorder must validate")
+        );
         assert_eq!(
             window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>(),
             vec![active.tab_id(), third.tab_id(), first.tab_id()],
         );
-        assert!(window
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
 
-        assert!(window
-            .reorder_tab_if_same(&active, 0, 2)
-            .expect("active reorder must validate"));
+        assert!(
+            window
+                .reorder_tab_if_same(&active, 0, 2)
+                .expect("active reorder must validate")
+        );
         assert_eq!(
             window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>(),
             vec![third.tab_id(), first.tab_id(), active.tab_id()],
         );
         assert_eq!(window.get_active_idx(), 2);
-        assert!(window
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
         for tab in [&first, &active, &third] {
             assert_eq!(
                 window.tab_stack_for_tab(tab.tab_id()),
@@ -2137,27 +2155,33 @@ mod tests {
         }
 
         let prior_order = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
-        assert!(!window
-            .reorder_tab_if_same(&absent, 1, 1)
-            .expect("missing exact identity is not a malformed index"));
+        assert!(
+            !window
+                .reorder_tab_if_same(&absent, 1, 1)
+                .expect("missing exact identity is not a malformed index")
+        );
         assert_eq!(
             window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
             prior_order,
         );
         let invalid_destination = window.len();
-        assert!(window
-            .reorder_tab_if_same(&active, 2, invalid_destination)
-            .expect_err("out-of-range reorder must fail")
-            .to_string()
-            .contains("cannot move tab to index"));
+        assert!(
+            window
+                .reorder_tab_if_same(&active, 2, invalid_destination)
+                .expect_err("out-of-range reorder must fail")
+                .to_string()
+                .contains("cannot move tab to index")
+        );
         assert_eq!(
             window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
             prior_order,
             "invalid reorder must preserve exact order",
         );
-        assert!(window
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
     }
 
     #[test]
@@ -2346,9 +2370,11 @@ mod tests {
                 Arc::as_ptr(&third),
             ]
         );
-        assert!(before
-            .active_tab()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            before
+                .active_tab()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
 
         let desired = [third.tab_id(), first.tab_id(), active.tab_id()];
         let validated = window
@@ -2371,9 +2397,11 @@ mod tests {
                 Arc::as_ptr(&active),
             ]
         );
-        assert!(committed
-            .active_tab()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        assert!(
+            committed
+                .active_tab()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
         assert_eq!(window.tab_stack_entries(), stack_before);
     }
 
@@ -2453,15 +2481,19 @@ mod tests {
         let insert_error = window
             .insert(window.len(), &added)
             .expect_err("terminal order revision must reject membership change");
-        assert!(insert_error
-            .to_string()
-            .contains("revision space is exhausted"));
+        assert!(
+            insert_error
+                .to_string()
+                .contains("revision space is exhausted")
+        );
         let push_error = window
             .push(&added)
             .expect_err("fallible append must reject terminal order revision");
-        assert!(push_error
-            .to_string()
-            .contains("revision space is exhausted"));
+        assert!(
+            push_error
+                .to_string()
+                .contains("revision space is exhausted")
+        );
         let validated = window
             .validate_exact_order(&[active.tab_id(), first.tab_id()], Some(active.tab_id()))
             .expect("terminal order revision does not outrank semantic validity");
@@ -2515,8 +2547,10 @@ mod tests {
         assert_eq!(window.order_revision().get(), 7);
         assert!(!window.remove_tabs_by_exact_identity_set(&removals));
         assert_eq!(window.order_revision().get(), 7);
-        assert!(window
-            .get_active()
-            .is_some_and(|tab| Arc::ptr_eq(tab, &second)));
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &second))
+        );
     }
 }

@@ -2,8 +2,8 @@ use crate::{PaneId, PaneRegistrationHandle};
 use chrono::serde::ts_milliseconds;
 use chrono::{DateTime, Utc};
 use serde::*;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::SystemTime;
 
 static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
