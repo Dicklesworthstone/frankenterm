@@ -2801,7 +2801,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 57;
+pub const CODEC_VERSION: usize = 58;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -2825,7 +2825,7 @@ pub const CODEC_VERSION: usize = 57;
 /// at handshake time for the full release cycle before the bump. The CI
 /// guard `scripts/check_codec_version_release_notes.sh` (ft-8smkj) blocks
 /// silent advances.
-pub const CODEC_VERSION_MIN_SUPPORTED: usize = 56;
+pub const CODEC_VERSION_MIN_SUPPORTED: usize = 58;
 
 /// Outcome of [`check_compat`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2913,7 +2913,8 @@ pdu! {
     Ping: 1, 46, client_request, none;
     Pong: 2, 46, server_reply, none;
     ListPanes: 3, 46, client_request, none;
-    ListPanesResponse: 4, 46, server_reply, none;
+    ListPanesResponse: 4, 58, server_reply, none
+        => deserialize_list_panes_response;
     SpawnResponse: 8, 46, server_reply, none;
     WriteToPane: 9, 46, client_request, none;
     UnitResponse: 10, 46, server_reply, none;
@@ -3664,11 +3665,26 @@ fn deserialize_list_panes_coherent(
     deserialize_exact_payload(data, is_compressed, "ListPanesCoherent")
 }
 
+fn deserialize_list_panes_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ListPanesResponse, Error> {
+    let response: ListPanesResponse =
+        deserialize_exact_payload(data, is_compressed, "ListPanesResponse")?;
+    response.validate_floating_panes()?;
+    Ok(response)
+}
+
 fn deserialize_list_panes_coherent_response(
     data: &[u8],
     is_compressed: bool,
 ) -> Result<ListPanesCoherentResponse, Error> {
-    deserialize_exact_payload(data, is_compressed, "ListPanesCoherentResponse")
+    let response: ListPanesCoherentResponse =
+        deserialize_exact_payload(data, is_compressed, "ListPanesCoherentResponse")?;
+    if let ListPanesCoherentOutcome::Snapshot(snapshot) = &response.outcome {
+        snapshot.panes.validate_floating_panes()?;
+    }
+    Ok(response)
 }
 
 fn deserialize_topology_event(data: &[u8], is_compressed: bool) -> Result<TopologyEvent, Error> {
@@ -4121,6 +4137,14 @@ pub enum TopologyEventKind {
     PaneAdded {
         pane_id: PaneId,
     },
+    /// One atomic pane-publication and floating-tab attachment transition.
+    /// Geometry and presentation state are recovered from the authoritative
+    /// snapshot; keeping this event compact bounds retained stream memory.
+    FloatingPaneSpawned {
+        pane_id: PaneId,
+        tab_id: TabId,
+        window_id: WindowId,
+    },
     PaneRemoved {
         pane_id: PaneId,
     },
@@ -4456,6 +4480,11 @@ pub struct OrderedPaneSnapshotV1 {
     )]
     pub panes: PaneArena,
     #[serde(
+        serialize_with = "serialize_floating_pane_snapshot",
+        deserialize_with = "deserialize_floating_pane_snapshot"
+    )]
+    pub floating_panes: Vec<FloatingPaneSnapshotEntry>,
+    #[serde(
         serialize_with = "serialize_ordered_window_section",
         deserialize_with = "deserialize_ordered_window_section"
     )]
@@ -4470,7 +4499,9 @@ impl OrderedPaneSnapshotV1 {
 
     fn validate_envelope_and_panes(&self) -> Result<(), OrderedWindowProtocolError> {
         self.validate_envelope()?;
-        validate_ordered_pane_arena(&self.panes)
+        validate_ordered_pane_arena(&self.panes)?;
+        validate_floating_pane_snapshot(&self.floating_panes)
+            .map_err(OrderedWindowProtocolError::FloatingPaneSnapshot)
     }
 
     pub fn validate(&self) -> Result<(), OrderedWindowProtocolError> {
@@ -5010,6 +5041,8 @@ pub enum OrderedWindowProtocolError {
     TooManyPaneNodes { count: usize, max: usize },
     #[error("ordered-window pane snapshot has {count} pane leaves; maximum is {max}")]
     TooManyPaneLeaves { count: usize, max: usize },
+    #[error("ordered-window floating-pane snapshot is invalid: {0}")]
+    FloatingPaneSnapshot(FloatingPaneSnapshotError),
     #[error("ordered-window pane tree {tree_index} has {count} {resource}; maximum is {max}")]
     PaneTreeResourceLimit {
         tree_index: usize,
@@ -5643,6 +5676,7 @@ fn flatten_ordered_panes(
         tabs,
         tab_titles,
         window_titles: pane_window_titles,
+        floating_panes: _,
     } = panes;
     if tabs.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
         return Err(OrderedWindowProtocolError::TooManyPaneTrees {
@@ -9491,11 +9525,120 @@ pub struct ListPanesTabStackEntry {
     pub is_visible: bool,
 }
 
+/// Maximum number of floating panes carried by one authoritative topology
+/// snapshot. This shares the ordered protocol's whole-snapshot pane ceiling,
+/// preventing an independently unbounded overlay vector from bypassing the
+/// pane census budget.
+pub const MAX_FLOATING_PANES_PER_SNAPSHOT: usize = MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT;
+
+/// Complete remote state for one floating pane. `pane` carries its exact
+/// window/tab owner plus the same process and terminal metadata as a tiled
+/// leaf; the remaining fields reconstruct overlay geometry and presentation.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct FloatingPaneSnapshotEntry {
+    pub pane: mux::tab::PaneEntry,
+    pub rect: FloatingPaneRect,
+    pub z_order: u32,
+    pub visible: bool,
+    pub pinned: bool,
+    pub opacity: f32,
+    pub focused: bool,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum FloatingPaneSnapshotError {
+    #[error("floating pane snapshot contains duplicate pane id {pane_id}")]
+    DuplicatePaneId { pane_id: PaneId },
+    #[error("floating pane {pane_id} has an empty {axis} extent")]
+    EmptyExtent {
+        pane_id: PaneId,
+        axis: &'static str,
+    },
+    #[error("floating pane {pane_id} has invalid opacity {opacity}")]
+    InvalidOpacity { pane_id: PaneId, opacity: String },
+    #[error("floating tab {tab_id} contains more than one focused pane")]
+    MultipleFocusedPanes { tab_id: TabId },
+}
+
+fn serialize_floating_pane_snapshot<S>(
+    values: &[FloatingPaneSnapshotEntry],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serialize_bounded_vec::<S, _, MAX_FLOATING_PANES_PER_SNAPSHOT>(
+        values,
+        serializer,
+        "floating pane snapshot entries",
+    )
+}
+
+fn deserialize_floating_pane_snapshot<'de, D>(
+    deserializer: D,
+) -> Result<Vec<FloatingPaneSnapshotEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, _, MAX_FLOATING_PANES_PER_SNAPSHOT>(
+        deserializer,
+        "floating pane snapshot entries",
+    )
+}
+
+fn validate_floating_pane_snapshot(
+    floating_panes: &[FloatingPaneSnapshotEntry],
+) -> Result<(), FloatingPaneSnapshotError> {
+    let mut pane_ids = HashSet::with_capacity(floating_panes.len());
+    let mut focused_tabs = HashSet::new();
+    for floating in floating_panes {
+        let pane_id = floating.pane.pane_id;
+        if !pane_ids.insert(pane_id) {
+            return Err(FloatingPaneSnapshotError::DuplicatePaneId { pane_id });
+        }
+        if floating.rect.width == 0 {
+            return Err(FloatingPaneSnapshotError::EmptyExtent {
+                pane_id,
+                axis: "width",
+            });
+        }
+        if floating.rect.height == 0 {
+            return Err(FloatingPaneSnapshotError::EmptyExtent {
+                pane_id,
+                axis: "height",
+            });
+        }
+        if !floating.opacity.is_finite() || !(0.0..=1.0).contains(&floating.opacity) {
+            return Err(FloatingPaneSnapshotError::InvalidOpacity {
+                pane_id,
+                opacity: floating.opacity.to_string(),
+            });
+        }
+        if floating.focused && !focused_tabs.insert(floating.pane.tab_id) {
+            return Err(FloatingPaneSnapshotError::MultipleFocusedPanes {
+                tab_id: floating.pane.tab_id,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanesResponse {
     pub tabs: Vec<PaneNode>,
     pub tab_titles: Vec<String>,
     pub window_titles: HashMap<WindowId, String>,
+    #[serde(
+        serialize_with = "serialize_floating_pane_snapshot",
+        deserialize_with = "deserialize_floating_pane_snapshot"
+    )]
+    pub floating_panes: Vec<FloatingPaneSnapshotEntry>,
+}
+
+impl ListPanesResponse {
+    pub fn validate_floating_panes(&self) -> Result<(), FloatingPaneSnapshotError> {
+        validate_floating_pane_snapshot(&self.floating_panes)
+    }
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -12489,6 +12632,7 @@ mod test {
             tabs: Vec::new(),
             tab_titles: Vec::new(),
             window_titles: HashMap::new(),
+            floating_panes: Vec::new(),
         }
     }
 
@@ -12980,6 +13124,7 @@ mod test {
                         topology_revision: TopologyRevision::new(11),
                         panes: ordered_pane_arena_from_list_panes(empty_pane_list())
                             .expect("empty ordered-pane arena must be valid"),
+                        floating_panes: Vec::new(),
                         ordered_windows: vec![window.clone()],
                     }),
                 }),
@@ -15938,6 +16083,7 @@ mod test {
                 (9, "wire-golden-window-nine".to_string()),
                 (7, "wire-golden-window-seven".to_string()),
             ]),
+            floating_panes: Vec::new(),
         };
         let legacy_panes =
             serialize_uncompressed(&panes).expect("serialize legacy pane representation");
@@ -15985,6 +16131,7 @@ mod test {
             }],
             tab_titles: vec!["golden-tab".to_string()],
             window_titles: HashMap::from([(1, "golden-window".to_string())]),
+            floating_panes: Vec::new(),
         };
         let arena =
             ordered_pane_arena_from_list_panes(panes).expect("convert v54 split-tree golden body");
@@ -16013,6 +16160,7 @@ mod test {
             tabs: vec![left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH)],
             tab_titles: vec!["depth-boundary".to_string()],
             window_titles: HashMap::from([(1, "window-1".to_string())]),
+            floating_panes: Vec::new(),
         };
         let arena = ordered_pane_arena_from_list_panes(panes)
             .expect("maximum admitted pane-tree depth must flatten");
@@ -16031,6 +16179,7 @@ mod test {
             tabs: vec![left_deep_pane_tree(MAX_ORDERED_PANE_TREE_DEPTH + 1)],
             tab_titles: vec!["depth-plus-one".to_string()],
             window_titles: HashMap::new(),
+            floating_panes: Vec::new(),
         };
         let error = ordered_pane_arena_from_list_panes(too_deep)
             .expect_err("depth-plus-one pane tree must fail before wire emission");
@@ -16047,6 +16196,7 @@ mod test {
             tabs: vec![broad_pane_tree(MAX_ORDERED_PANE_LEAVES_PER_TREE)],
             tab_titles: vec!["broad-boundary".to_string()],
             window_titles: HashMap::from([(1, "window-1".to_string())]),
+            floating_panes: Vec::new(),
         };
         let flat = flatten_ordered_panes(panes)
             .expect("exact broad-tree resource boundaries must flatten");
@@ -16094,6 +16244,7 @@ mod test {
                 .collect(),
             tabs,
             window_titles: HashMap::new(),
+            floating_panes: Vec::new(),
         };
         let flat = flatten_ordered_panes(panes)
             .expect("exact snapshot node and leaf ceilings must flatten");
@@ -16227,6 +16378,7 @@ mod test {
                 tabs: vec![left_deep_pane_tree(depth)],
                 tab_titles: vec![format!("depth-{depth}")],
                 window_titles: HashMap::new(),
+                floating_panes: Vec::new(),
             };
             let flat = flatten_ordered_panes(panes)
                 .unwrap_or_else(|error| panic!("admitted depth {} failed: {error:#}", depth));
@@ -16265,6 +16417,7 @@ mod test {
                 tabs: vec![tree],
                 tab_titles: vec!["generated-chain".to_string()],
                 window_titles: HashMap::new(),
+                floating_panes: Vec::new(),
             };
             let arena = ordered_pane_arena_from_list_panes(panes)
                 .unwrap_or_else(|error| {
@@ -16291,6 +16444,7 @@ mod test {
                 tabs: vec![pane_tree_with_slots(q, 0, 0)],
                 tab_titles: vec![format!("split-heavy-q-{q}")],
                 window_titles: HashMap::new(),
+                floating_panes: Vec::new(),
             };
             let first = flatten_ordered_panes(panes.clone())
                 .unwrap_or_else(|error| panic!("q={} first flatten failed: {error:#}", q));
@@ -16533,6 +16687,7 @@ mod test {
                 tabs,
                 tab_titles,
                 window_titles: HashMap::from([(window_id, format!("window-{window_id}"))]),
+                floating_panes: Vec::new(),
             })
             .expect("body-limit fixture must flatten");
         }
@@ -16686,8 +16841,10 @@ mod test {
                     tabs,
                     tab_titles,
                     window_titles,
+                    floating_panes: Vec::new(),
                 })
                 .expect("dense maximum-cardinality pane listing must flatten"),
+                floating_panes: Vec::new(),
                 ordered_windows,
             }),
         };
@@ -17203,6 +17360,7 @@ mod test {
                 topology_revision: TopologyRevision::new(1),
                 panes: ordered_pane_arena_from_list_panes(empty_pane_list())
                     .expect("empty ordered-pane arena must be valid"),
+                floating_panes: Vec::new(),
                 ordered_windows: windows_at_limit.clone(),
             }),
         });
@@ -17349,9 +17507,9 @@ mod test {
     }
 
     #[test]
-    fn codec_v57_retains_v56_atomic_paste_floor_and_feature_minima() {
-        assert_eq!(CODEC_VERSION, 57);
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 56);
+    fn codec_v58_requires_atomic_floating_snapshot_redeploy_and_retains_feature_minima() {
+        assert_eq!(CODEC_VERSION, 58);
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 58);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
         assert!(!codec_version_supports_ordered_window_v1(51));
@@ -17364,10 +17522,9 @@ mod test {
             check_compat(56, 56, 55, 55).is_err(),
             "the SendPaste byte-schema change requires an atomic v56 redeploy"
         );
-        assert_eq!(
-            check_compat(57, 56, 56, 56),
-            Ok(CompatDecision::Compatible { agreed: 56 }),
-            "the additive health PDU must preserve interoperability with a v56 peer"
+        assert!(
+            check_compat(58, 58, 57, 56).is_err(),
+            "the authoritative floating snapshot schema requires an atomic v58 redeploy"
         );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
@@ -17750,6 +17907,7 @@ mod test {
                     tabs: Vec::new(),
                     tab_titles: Vec::new(),
                     window_titles: HashMap::new(),
+                    floating_panes: Vec::new(),
                 },
             }),
             ListPanesCoherentOutcome::Contended {
@@ -18201,7 +18359,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 57);
+        assert_eq!(CODEC_VERSION, 58);
     }
 
     #[test]
@@ -18529,6 +18687,7 @@ mod test {
     fn pdu_wire_registry_minimum_dialects_are_exhaustive() {
         for spec in Pdu::all_wire_specs() {
             let expected = match spec.ident {
+                4 => 58,
                 13 => 56,
                 23 | 47 => 55,
                 0..=74 => 46,
@@ -18739,12 +18898,13 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_retains_v56_floor_for_additive_v57() {
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 56);
-        assert_eq!(CODEC_VERSION, 57);
+    fn check_compat_current_build_requires_atomic_v58_floating_snapshot_schema() {
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 58);
+        assert_eq!(CODEC_VERSION, 58);
+        assert!(check_compat(58, 58, 57, 56).is_err());
         assert_eq!(
-            check_compat(57, 56, 56, 56),
-            Ok(CompatDecision::Compatible { agreed: 56 })
+            check_compat(58, 58, 58, 58),
+            Ok(CompatDecision::Compatible { agreed: 58 })
         );
     }
 

@@ -7,9 +7,7 @@ use anyhow::{Context, Error};
 use config::keyassignment::{KeyAssignment, SpawnCommand};
 use config::{ConfigSubscription, NotificationHandling};
 use frankenterm_core::osc_protocol_integration::{CursorShapeSlug, Osc22PerPaneCursorMap};
-use frankenterm_gui::workspace_reconcile::{
-    WorkspaceReconcileGate, WorkspaceReconcileWaiters,
-};
+use frankenterm_gui::workspace_reconcile::{WorkspaceReconcileGate, WorkspaceReconcileWaiters};
 use frankenterm_toast_notification::*;
 use mux::client::ClientId;
 use mux::window::WindowId as MuxWindowId;
@@ -124,6 +122,12 @@ impl GuiFrontEnd {
                 MuxNotification::PaneOutput(_) => {}
                 MuxNotification::SynchronizedOutput { .. } => {}
                 MuxNotification::PaneAdded(_) => {}
+                MuxNotification::FloatingPaneSpawnCommitted(_) => {
+                    // Exact focus and tab ownership were already committed by
+                    // the mux transaction. Never queue numeric-id focus
+                    // reconciliation here: it could override a newer user tab
+                    // switch or target a same-id successor.
+                }
                 MuxNotification::Alert {
                     pane_id,
                     alert:
@@ -520,12 +524,9 @@ impl GuiFrontEnd {
                 }
                 fe.spawned_mux_window.borrow_mut().insert(mux_window_id);
                 log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
-                if let Err(err) = TermWindow::new_window(
-                    mux_window_id,
-                    workspace.clone(),
-                    saved_window_state,
-                )
-                .await
+                if let Err(err) =
+                    TermWindow::new_window(mux_window_id, workspace.clone(), saved_window_state)
+                        .await
                 {
                     log::error!("Failed to create window: {:#}", err);
                     if let Some(mux) = Mux::try_get() {

@@ -1666,6 +1666,11 @@ pub enum NotificationRenderKey {
 pub enum NotificationTopologyEffect<'a> {
     None,
     PaneAdded(PaneId),
+    FloatingPaneSpawned {
+        pane_id: PaneId,
+        tab_id: TabId,
+        window_id: WindowId,
+    },
     PaneRemovedTombstone(PaneId),
     WindowCreated(WindowId),
     WindowRemoved(WindowId),
@@ -2000,6 +2005,29 @@ pub fn notification_effects(notification: &MuxNotification) -> NotificationEffec
         },
         MuxNotification::PaneAdded(pane_id) => NotificationEffects {
             topology: NotificationTopologyEffect::PaneAdded(*pane_id),
+            admission: NotificationAdmissionContract::PostMutationJournalThenTopologyResync,
+            ..effects(lifecycle_contract(
+                FullQueueContract::JournalThenResyncAuthoritativeState,
+            ))
+        },
+        MuxNotification::FloatingPaneSpawnCommitted(spawn) => NotificationEffects {
+            state_keys: [
+                Some(NotificationStateKey::TabGeometry(spawn.tab_id())),
+                spawn.focused().then_some(
+                    NotificationStateKey::ResolvedWindowFocusForPane(spawn.pane_id()),
+                ),
+            ],
+            render_key: Some(NotificationRenderKey::TabMembers(spawn.tab_id())),
+            topology: NotificationTopologyEffect::FloatingPaneSpawned {
+                pane_id: spawn.pane_id(),
+                tab_id: spawn.tab_id(),
+                window_id: spawn.window_id(),
+            },
+            auxiliary_snapshot: spawn
+                .focused()
+                .then_some(AuxiliarySnapshotKey::ActiveWindowTabForPane(
+                    spawn.pane_id(),
+                )),
             admission: NotificationAdmissionContract::PostMutationJournalThenTopologyResync,
             ..effects(lifecycle_contract(
                 FullQueueContract::JournalThenResyncAuthoritativeState,

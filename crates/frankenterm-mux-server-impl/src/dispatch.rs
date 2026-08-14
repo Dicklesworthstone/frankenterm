@@ -4362,6 +4362,7 @@ fn prepare_retained_topology_notification(
                     .checked_add(new_workspace.capacity())
                     .context("counting retained workspace rename bytes")?,
                 MuxNotification::PaneAdded(_)
+                | MuxNotification::FloatingPaneSpawnCommitted(_)
                 | MuxNotification::PaneRemoved(_)
                 | MuxNotification::WindowCreated(_)
                 | MuxNotification::WindowRemoved(_)
@@ -4428,6 +4429,13 @@ fn into_topology_event_kind(
     };
     let event = match notification {
         MuxNotification::PaneAdded(pane_id) => TopologyEventKind::PaneAdded { pane_id },
+        MuxNotification::FloatingPaneSpawnCommitted(spawn) => {
+            TopologyEventKind::FloatingPaneSpawned {
+                pane_id: spawn.pane_id(),
+                tab_id: spawn.tab_id(),
+                window_id: spawn.window_id(),
+            }
+        }
         MuxNotification::PaneRemoved(pane_id) => TopologyEventKind::PaneRemoved { pane_id },
         MuxNotification::WindowCreated(window_id) => TopologyEventKind::WindowCreated { window_id },
         MuxNotification::WindowRemoved(window_id) => TopologyEventKind::WindowRemoved { window_id },
@@ -6374,6 +6382,20 @@ where
                             handler.schedule_tracked_pane_push(pane_id);
                         }
                         MuxNotification::PaneAdded(_pane_id) => {}
+                        MuxNotification::FloatingPaneSpawnCommitted(spawn) => {
+                            // Legacy delivery has no atomic floating-spawn PDU.
+                            // Trigger one authoritative snapshot resync; the
+                            // compact stamped stream event handles fenced peers.
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::TabResized(codec::TabResized {
+                                    tab_id: spawn.tab_id(),
+                                }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
                         MuxNotification::PaneRemoved(pane_id) => {
                             handler.remove_per_pane(pane_id);
                             pending_outbound = Some(prepare_unilateral_pdu(

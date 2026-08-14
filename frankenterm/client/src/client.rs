@@ -4483,6 +4483,7 @@ fn append_topology_event_to_legacy_unilaterals(
 ) -> bool {
     let pdu = match event.event {
         TopologyEventKind::PaneAdded { .. }
+        | TopologyEventKind::FloatingPaneSpawned { .. }
         | TopologyEventKind::WindowCreated { .. }
         | TopologyEventKind::WindowRemoved { .. }
         | TopologyEventKind::WindowInvalidated { .. } => return true,

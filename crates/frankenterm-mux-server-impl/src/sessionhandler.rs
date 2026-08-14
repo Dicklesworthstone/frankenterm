@@ -28,7 +28,7 @@ use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::{CurrentPane, Mux, PaneRegistrationHandle};
 use promise::spawn::spawn_into_main_thread;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3027,6 +3027,80 @@ enum ListPanesSnapshotStage {
 
 fn ignore_list_panes_snapshot_stage(_: ListPanesSnapshotStage) {}
 
+fn floating_pane_snapshot_entry(
+    window_id: mux::window::WindowId,
+    tab_id: mux::tab::TabId,
+    workspace: &str,
+    positioned: mux::tab::PositionedFloatingPane,
+) -> codec::FloatingPaneSnapshotEntry {
+    let pane = positioned.pane;
+    let dimensions = pane.get_dimensions();
+    codec::FloatingPaneSnapshotEntry {
+        pane: mux::tab::PaneEntry {
+            window_id,
+            tab_id,
+            pane_id: positioned.pane_id,
+            title: pane.get_title(),
+            size: wezterm_term::TerminalSize {
+                cols: dimensions.cols,
+                rows: dimensions.viewport_rows,
+                pixel_height: dimensions.pixel_height,
+                pixel_width: dimensions.pixel_width,
+                dpi: dimensions.dpi,
+            },
+            working_dir: pane
+                .get_current_working_dir(CachePolicy::AllowStale)
+                .map(Into::into),
+            alt_screen_active: pane.is_alt_screen_active(),
+            is_active_pane: positioned.is_focused,
+            is_zoomed_pane: false,
+            workspace: workspace.to_string(),
+            cursor_pos: pane.get_cursor_position(),
+            physical_top: dimensions.physical_top,
+            top_row: positioned.top,
+            left_col: positioned.left,
+            tty_name: pane.tty_name(),
+        },
+        rect: mux::tab::FloatingPaneRect {
+            left: positioned.left,
+            top: positioned.top,
+            width: positioned.width,
+            height: positioned.height,
+        },
+        z_order: positioned.z_order,
+        visible: positioned.visible,
+        pinned: positioned.pinned,
+        opacity: positioned.opacity,
+        focused: positioned.is_focused,
+    }
+}
+
+fn append_floating_pane_snapshot(
+    output: &mut Vec<codec::FloatingPaneSnapshotEntry>,
+    window_id: mux::window::WindowId,
+    tab: &mux::tab::Tab,
+    workspace: &str,
+) -> anyhow::Result<()> {
+    let positioned = tab.iter_floating_panes();
+    let next_len = output
+        .len()
+        .checked_add(positioned.len())
+        .context("counting floating panes in authoritative snapshot")?;
+    if next_len > codec::MAX_FLOATING_PANES_PER_SNAPSHOT {
+        anyhow::bail!(
+            "floating pane snapshot has {next_len} panes; maximum is {}",
+            codec::MAX_FLOATING_PANES_PER_SNAPSHOT
+        );
+    }
+    output
+        .try_reserve_exact(positioned.len())
+        .context("reserving bounded floating pane snapshot")?;
+    output.extend(positioned.into_iter().map(|positioned| {
+        floating_pane_snapshot_entry(window_id, tab.tab_id(), workspace, positioned)
+    }));
+    Ok(())
+}
+
 fn collect_list_panes_snapshot_with_stage_observer(
     mux: &Mux,
     observer: &mut impl FnMut(ListPanesSnapshotStage),
@@ -3034,6 +3108,7 @@ fn collect_list_panes_snapshot_with_stage_observer(
     let mut tabs = Vec::new();
     let mut tab_titles = Vec::new();
     let mut window_titles = HashMap::new();
+    let mut floating_panes = Vec::new();
     let window_ids = mux.iter_windows();
     observer(ListPanesSnapshotStage::WindowsEnumerated);
     for window_id in window_ids {
@@ -3054,6 +3129,12 @@ fn collect_list_panes_snapshot_with_stage_observer(
         window_titles.insert(window_id, window_title);
         for tab in window_tabs {
             tabs.push(tab.codec_pane_tree_in_window(window_id, &workspace)?);
+            append_floating_pane_snapshot(
+                &mut floating_panes,
+                window_id,
+                tab.as_ref(),
+                &workspace,
+            )?;
             observer(ListPanesSnapshotStage::TabTreeCaptured);
             tab_titles.push(tab.get_title());
         }
@@ -3069,6 +3150,7 @@ fn collect_list_panes_snapshot_with_stage_observer(
         tabs,
         tab_titles,
         window_titles,
+        floating_panes,
     })
 }
 
@@ -3269,6 +3351,8 @@ pub(crate) fn validate_ordered_snapshot_projection(
     }
 
     let mut pane_index = 0usize;
+    let mut snapshot_tab_owners = HashSet::new();
+    let mut snapshot_pane_ids = HashSet::new();
     for window in &snapshot.ordered_windows {
         let window_id = window
             .window_id
@@ -3281,6 +3365,7 @@ pub(crate) fn validate_ordered_snapshot_projection(
                     .try_into_usize()
                     .context("narrowing PDU87 tab identity for pane projection validation")?,
             );
+            snapshot_tab_owners.insert(expected);
             let tree = pane_trees.get(pane_index).ok_or_else(|| {
                 anyhow!("PDU87 pane tree vector ended before ordered tab {pane_index}")
             })?;
@@ -3309,6 +3394,12 @@ pub(crate) fn validate_ordered_snapshot_projection(
                         first_actual = Some(actual);
                     }
                     all_match &= actual == expected;
+                    if !snapshot_pane_ids.insert(entry.pane_id) {
+                        return Err(anyhow!(
+                            "PDU87 pane {} has more than one tiled owner",
+                            entry.pane_id
+                        ));
+                    }
                 }
             }
             match (first_actual, all_match) {
@@ -3330,6 +3421,21 @@ pub(crate) fn validate_ordered_snapshot_projection(
                 }
             }
             pane_index += 1;
+        }
+    }
+    for floating in &snapshot.floating_panes {
+        let owner = (floating.pane.window_id, floating.pane.tab_id);
+        if !snapshot_tab_owners.contains(&owner) {
+            return Err(anyhow!(
+                "PDU87 floating pane {} names absent window/tab owner {owner:?}",
+                floating.pane.pane_id
+            ));
+        }
+        if !snapshot_pane_ids.insert(floating.pane.pane_id) {
+            return Err(anyhow!(
+                "PDU87 pane {} has more than one tiled/floating owner",
+                floating.pane.pane_id
+            ));
         }
     }
     Ok(())
@@ -3401,6 +3507,7 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
         let mut pane_trees = Vec::with_capacity(total_tabs);
         let mut pane_nodes = Vec::new();
         let mut pane_window_titles = Vec::with_capacity(frozen_windows.len());
+        let mut floating_panes = Vec::new();
         for (frozen, ordered_window) in frozen_windows.iter().zip(&ordered_windows) {
             let window_id = frozen.order.window_id();
             pane_window_titles.push(mux::tab::PaneArenaWindowTitle {
@@ -3422,6 +3529,12 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
                     tab_node_ceiling,
                     codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
                 )?);
+                append_floating_pane_snapshot(
+                    &mut floating_panes,
+                    window_id,
+                    tab.as_ref(),
+                    &frozen.workspace,
+                )?;
                 observer(ListPanesSnapshotStage::TabTreeCaptured);
             }
         }
@@ -3449,6 +3562,7 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
                 session_incarnation: after_session,
                 topology_revision: after_revision,
                 panes,
+                floating_panes,
                 ordered_windows,
             };
             // The dispatch coordinator is the sole PDU87 authority and runs

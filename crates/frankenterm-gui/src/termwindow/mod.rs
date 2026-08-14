@@ -4029,6 +4029,24 @@ impl TermWindow {
                     window.invalidate();
                     self.update_title_post_status();
                 }
+                MuxNotification::FloatingPaneSpawnCommitted(spawn) => {
+                    // The subscription routes this notification using the
+                    // frozen window identity, but the GUI callback may have
+                    // remained queued across a window switch. Never repaint
+                    // the replacement window for stale topology.
+                    if spawn.window_id() != self.mux_window_id {
+                        return Ok(());
+                    }
+
+                    // Focus, tab membership, and floating geometry were all
+                    // committed atomically before this event was published.
+                    // Consume it as one paint/title-status invalidation only;
+                    // queuing numeric-id focus reconciliation here could
+                    // override a newer user action.
+                    self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
+                    window.invalidate();
+                    self.update_title_post_status();
+                }
                 MuxNotification::WindowRemoved(_window_id) => {
                     // Handled by frontend
                 }
@@ -4423,6 +4441,14 @@ impl TermWindow {
                 // If some other client spawns a pane inside this window, this
                 // gives us an opportunity to attach it to the clipboard.
                 return mux.get_window(mux_window_id).is_some();
+            }
+            MuxNotification::FloatingPaneSpawnCommitted(spawn) => {
+                // The payload was frozen at the same topology revision as the
+                // structural commit, so route directly without re-reading a
+                // tab that may already have been retired or reused.
+                if spawn.window_id() != mux_window_id {
+                    return true;
+                }
             }
             MuxNotification::TabAddedToWindow { window_id, .. }
             | MuxNotification::WindowTitleChanged { window_id, .. }

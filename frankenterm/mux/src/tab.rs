@@ -1,25 +1,25 @@
 use crate::client::ClientId;
-use crate::domain::DomainId;
-use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
+use crate::domain::{Domain, DomainId, UnpublishedPane};
+use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{
-    Mux, MuxNotification, MuxNotificationEnvelope, PaneOperationGuard, PaneRegistrationHandle,
-    WindowId,
+    FrozenFloatingPaneSpawn, Mux, MuxNotification, MuxNotificationEnvelope, PaneOperationGuard,
+    PaneRegistrationHandle, WindowId,
 };
 use bintree::PathBranch;
 use config::configuration;
 use config::keyassignment::PaneDirection;
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use frankenterm_term::{StableRowIndex, TerminalSize};
 use parking_lot::Mutex;
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
+use std::panic::AssertUnwindSafe;
 #[cfg(test)]
 use std::panic::catch_unwind;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use url::Url;
 
@@ -937,6 +937,27 @@ pub struct FloatingPaneRect {
     pub top: usize,
     pub width: usize,
     pub height: usize,
+}
+
+/// Geometry admitted before an unpublished floating pane is spawned.
+///
+/// The pane is created and resized directly to this size. Final commit accepts
+/// it only if the destination still clamps the requested rectangle to the same
+/// exact geometry, avoiding a publish-then-correct resize cycle.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PreparedFloatingPaneGeometry {
+    rect: FloatingPaneRect,
+    size: TerminalSize,
+}
+
+impl PreparedFloatingPaneGeometry {
+    pub(crate) fn rect(self) -> FloatingPaneRect {
+        self.rect
+    }
+
+    pub(crate) fn size(self) -> TerminalSize {
+        self.size
+    }
 }
 
 struct FloatingPane {
@@ -3328,91 +3349,165 @@ impl Tab {
         )
     }
 
-    /// Commit a newly spawned, already-registered pane directly into this
-    /// exact tab's floating layer.
+    /// Freeze the initial geometry for an unpublished floating-pane spawn.
+    pub(crate) fn prepare_floating_spawn_geometry(
+        &self,
+        requested: FloatingPaneRect,
+    ) -> PreparedFloatingPaneGeometry {
+        let inner = self.inner.lock();
+        let rect = inner.clamp_floating_rect(requested);
+        PreparedFloatingPaneGeometry {
+            rect,
+            size: inner.floating_pane_size(rect),
+        }
+    }
+
+    /// Publish a prepared pane registration and attach it to this exact
+    /// floating layer in one structural cut.
     ///
-    /// Callback-bearing observations happen before the final lock scope. The
-    /// commit then validates exact client, pane-generation, tab-registry,
-    /// window-parent, and topology-publication authority before changing any
-    /// structure, under the project lock order
-    /// `clients -> pane_registration -> panes -> tabs -> windows -> Tab::inner -> topology`.
-    /// Pane callbacks and subscriber delivery remain deferred until all of
-    /// those locks have been released.
-    pub(crate) fn commit_spawned_floating_pane(
+    /// All pane callbacks and fallible reader preparation finish first. The
+    /// final lock order is `domain_registration -> pane_registration -> tabs
+    /// -> windows -> Tab::inner (stable pointer order) -> pane_preparations ->
+    /// panes -> clients -> topology`. No callback or subscriber runs inside
+    /// that cut, and a rejected commit emits no pane lifecycle edge.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_unpublished_floating_pane(
         self: &Arc<Self>,
         mux: &Arc<Mux>,
+        expected_domain: &Arc<dyn Domain>,
+        expected_domain_id: DomainId,
         expected_window_id: WindowId,
-        target: &PaneOperationGuard,
-        spawned: &PaneOperationGuard,
-        rect: FloatingPaneRect,
+        target_registration: &PaneRegistrationHandle,
+        unpublished: UnpublishedPane,
+        geometry: PreparedFloatingPaneGeometry,
         owner_client_id: Option<&Arc<ClientId>>,
-    ) -> anyhow::Result<PositionedFloatingPane> {
+    ) -> anyhow::Result<(
+        Arc<dyn Pane>,
+        PositionedFloatingPane,
+        PaneRegistrationHandle,
+    )> {
+        let pane = Arc::clone(unpublished.pane());
+        let target = target_registration
+            .operation_guard(mux)
+            .ok_or_else(|| anyhow::anyhow!("floating-pane target registration retired"))?;
+
+        let mut preparation_claim = mux
+            .claim_pane_preparation(&pane)?
+            .ok_or_else(|| anyhow::anyhow!("unpublished floating pane is already registered"))?;
         anyhow::ensure!(
-            target.belongs_to(mux) && spawned.belongs_to(mux),
-            "floating-pane target and spawn must belong to the originating mux"
-        );
-        anyhow::ensure!(
-            !target.same_registration(spawned),
+            target.pane_id() != preparation_claim.pane_id,
             "cannot attach floating pane {} onto itself",
-            spawned.pane_id()
+            target.pane_id()
+        );
+        let prepared = mux.prepare_claimed_pane_registration(
+            &pane,
+            preparation_claim.pane_id,
+            &preparation_claim.generation,
+        )?;
+        let (mut reader_start_gate, mut registration_reservation) =
+            mux.spawn_prepared_pane_reader(&pane, prepared, &preparation_claim.generation)?;
+        let spawned_id = preparation_claim.pane_id;
+
+        // Capture every registered or window-owned tab only after all
+        // callback-bearing pane preparation. Numeric ID observations likewise
+        // happen outside every mux/tab lock. The final combined lock cut below
+        // proves these exact pointer snapshots did not change.
+        let mut observed_tabs = mux.tabs.read().values().cloned().collect::<Vec<_>>();
+        let mut observed_tab_identities = HashSet::new();
+        observed_tab_identities
+            .try_reserve(observed_tabs.len())
+            .map_err(|error| anyhow::anyhow!("reserve observed tab identities: {error}"))?;
+        for tab in &observed_tabs {
+            anyhow::ensure!(
+                observed_tab_identities.insert(Arc::as_ptr(tab) as usize),
+                "floating-pane admission observed a duplicate registered tab identity"
+            );
+        }
+        for tab in mux
+            .windows
+            .read()
+            .values()
+            .flat_map(|window| window.iter().cloned())
+        {
+            if observed_tab_identities.insert(Arc::as_ptr(&tab) as usize) {
+                observed_tabs.push(tab);
+            }
+        }
+        observed_tabs.sort_unstable_by_key(|tab| Arc::as_ptr(tab) as usize);
+        anyhow::ensure!(
+            observed_tabs
+                .windows(2)
+                .all(|pair| !Arc::ptr_eq(&pair[0], &pair[1])),
+            "floating-pane admission observed duplicate exact tab identities"
         );
 
-        // Pane identity callbacks run before registry or topology locks. The
-        // exact-identity map also rejects a legacy destination that already
-        // contains two allocations for one numeric PaneId.
-        let observed = Self::observe_panes(self.snapshot_panes_callback_free());
-        let observed_ids = build_callback_pane_id_snapshot(self.tab_id, &observed)?;
-        anyhow::ensure!(
-            observed_ids.contains_key(&pane_identity(target.pane())),
-            "floating-pane target {} is no longer in destination tab {}",
-            target.pane_id(),
-            self.tab_id
-        );
-        anyhow::ensure!(
-            !observed_ids.contains_key(&pane_identity(spawned.pane())),
-            "spawned pane {} is already attached to destination tab {}",
-            spawned.pane_id(),
-            self.tab_id
-        );
-        anyhow::ensure!(
-            !observed_ids
-                .values()
-                .any(|pane_id| *pane_id == spawned.pane_id()),
-            "destination tab {} already contains pane id {}",
-            self.tab_id,
-            spawned.pane_id()
-        );
-        let mut topology_notifications = Vec::new();
-        topology_notifications
-            .try_reserve(2)
-            .map_err(|error| anyhow::anyhow!("reserve floating-pane notifications: {error}"))?;
-
-        let (positioned, callbacks) = {
-            let clients = owner_client_id.map(|_| mux.clients.read());
-            if let Some(owner_client_id) = owner_client_id {
+        let observed_snapshots = observed_tabs
+            .iter()
+            .map(|tab| tab.snapshot_panes_callback_free())
+            .collect::<Vec<_>>();
+        let observed_pane_count = observed_snapshots.iter().map(Vec::len).sum();
+        let mut numeric_owners = HashMap::new();
+        numeric_owners
+            .try_reserve(observed_pane_count)
+            .map_err(|error| anyhow::anyhow!("reserve numeric pane-owner census: {error}"))?;
+        let mut exact_owners = HashSet::new();
+        exact_owners
+            .try_reserve(observed_pane_count)
+            .map_err(|error| anyhow::anyhow!("reserve exact pane-owner census: {error}"))?;
+        let mut target_owners = 0usize;
+        let mut spawned_owners = 0usize;
+        for (tab, snapshot) in observed_tabs.iter().zip(&observed_snapshots) {
+            for observed in snapshot {
+                let pane_id = observe_pane_id_for_mutation(observed).map_err(|error| {
+                    error.context(format!(
+                        "audit tab {} for floating-pane structural ownership",
+                        tab.tab_id
+                    ))
+                })?;
+                let identity = pane_identity(observed);
                 anyhow::ensure!(
-                    clients.as_ref().is_some_and(|clients| clients
-                        .get(owner_client_id.as_ref())
-                        .is_some_and(|info| Arc::ptr_eq(&info.client_id, owner_client_id))),
-                    "client registration retired before floating-pane commit"
+                    exact_owners.insert(identity),
+                    "an exact pane identity has multiple structural owners before floating spawn"
+                );
+                if let Some(prior) = numeric_owners.insert(pane_id, identity) {
+                    anyhow::ensure!(
+                        prior == identity,
+                        "pane id {pane_id} has multiple exact structural owners before floating spawn"
+                    );
+                }
+                target_owners += usize::from(target.is_same_pane(observed));
+                spawned_owners += usize::from(Arc::ptr_eq(&pane, observed));
+                anyhow::ensure!(
+                    pane_id != spawned_id,
+                    "unpublished pane id {spawned_id} already has a structural owner"
                 );
             }
+        }
+        anyhow::ensure!(
+            target_owners == 1
+                && observed_tabs
+                    .iter()
+                    .zip(&observed_snapshots)
+                    .any(|(tab, panes)| {
+                        Arc::ptr_eq(tab, self) && panes.iter().any(|pane| target.is_same_pane(pane))
+                    }),
+            "floating-pane target must have exactly one structural owner in the admitted tab"
+        );
+        anyhow::ensure!(spawned_owners == 0, "unpublished pane already has an owner");
+
+        let (positioned, callbacks, registration, lifecycle_ticket) = {
+            let _domain_registration = mux.domain_registration.lock();
+            anyhow::ensure!(
+                !mux.retired_domain_ids.lock().contains(&expected_domain_id)
+                    && mux
+                        .domains
+                        .read()
+                        .get(&expected_domain_id)
+                        .is_some_and(|domain| Arc::ptr_eq(domain, expected_domain)),
+                "floating-pane domain retired or changed identity before commit"
+            );
 
             let _registration = mux.pane_registration.lock();
-            let registered_panes = mux.panes.read();
-            anyhow::ensure!(
-                registered_panes
-                    .get(&target.pane_id())
-                    .is_some_and(|registered| target.matches_live_registration(registered)),
-                "floating-pane target registration retired before commit"
-            );
-            anyhow::ensure!(
-                registered_panes
-                    .get(&spawned.pane_id())
-                    .is_some_and(|registered| spawned.matches_live_registration(registered)),
-                "spawned floating-pane registration retired before commit"
-            );
-
             let registered_tabs = mux.tabs.read();
             anyhow::ensure!(
                 registered_tabs
@@ -3421,76 +3516,204 @@ impl Tab {
                 "destination tab {} retired or changed identity before floating-pane commit",
                 self.tab_id
             );
+            anyhow::ensure!(
+                registered_tabs.len()
+                    == observed_tabs
+                        .iter()
+                        .filter(|tab| {
+                            registered_tabs
+                                .get(&tab.tab_id)
+                                .is_some_and(|registered| Arc::ptr_eq(registered, tab))
+                        })
+                        .count(),
+                "registered tab set changed during floating-pane spawn"
+            );
 
             let windows = mux.windows.read();
-            let mut exact_parent = None;
-            for (window_id, window) in windows.iter() {
-                if window.iter().any(|tab| Arc::ptr_eq(tab, self)) {
-                    anyhow::ensure!(
-                        exact_parent.replace(*window_id).is_none(),
-                        "destination tab {} has more than one exact window parent",
-                        self.tab_id
-                    );
-                }
-            }
             anyhow::ensure!(
-                exact_parent == Some(expected_window_id),
-                "destination tab {} is no longer attached to admitted window {}",
-                self.tab_id,
-                expected_window_id
+                windows
+                    .values()
+                    .flat_map(|window| window.iter())
+                    .all(|tab| observed_tab_identities.contains(&(Arc::as_ptr(tab) as usize))),
+                "window tab set changed during floating-pane spawn"
+            );
+            let exact_parent_count = windows
+                .values()
+                .filter(|window| window.iter().any(|tab| Arc::ptr_eq(tab, self)))
+                .count();
+            anyhow::ensure!(
+                exact_parent_count == 1
+                    && windows
+                        .get(&expected_window_id)
+                        .is_some_and(|window| window.iter().any(|tab| Arc::ptr_eq(tab, self))),
+                "destination tab {} no longer has exactly one admitted window parent",
+                self.tab_id
             );
             let destination_is_active = windows
                 .get(&expected_window_id)
                 .and_then(|window| window.get_active())
                 .is_some_and(|active| Arc::ptr_eq(active, self));
 
-            let mut inner = self.inner.lock();
-            let current = inner.snapshot_panes_callback_free();
+            let mut tab_guards = observed_tabs
+                .iter()
+                .map(|tab| tab.inner.lock())
+                .collect::<Vec<_>>();
+            for (guard, observed) in tab_guards.iter().zip(&observed_snapshots) {
+                let current = guard.snapshot_panes_callback_free();
+                anyhow::ensure!(
+                    current.len() == observed.len()
+                        && current
+                            .iter()
+                            .zip(observed)
+                            .all(|(current, observed)| Arc::ptr_eq(current, observed)),
+                    "tab topology changed during floating-pane spawn"
+                );
+            }
+            let destination_index = observed_tabs
+                .iter()
+                .position(|tab| Arc::ptr_eq(tab, self))
+                .ok_or_else(|| anyhow::anyhow!("destination tab left the observed topology"))?;
             anyhow::ensure!(
-                callback_snapshot_matches(&current, &observed_ids)?,
-                "destination tab {} topology changed before floating-pane commit",
-                self.tab_id
+                tab_guards[destination_index]
+                    .snapshot_panes_callback_free()
+                    .iter()
+                    .filter(|pane| target.is_same_pane(pane))
+                    .count()
+                    == 1,
+                "floating-pane target left or duplicated inside the destination tab"
             );
             anyhow::ensure!(
-                current.iter().any(|pane| target.is_same_pane(pane)),
-                "floating-pane target {} left destination tab {} before commit",
-                target.pane_id(),
-                self.tab_id
+                tab_guards.iter().all(|guard| guard
+                    .snapshot_panes_callback_free()
+                    .iter()
+                    .all(|candidate| !Arc::ptr_eq(candidate, &pane))),
+                "unpublished floating pane acquired a structural owner before commit"
             );
+            let inner = &mut tab_guards[destination_index];
             anyhow::ensure!(
-                current.iter().all(|pane| !spawned.is_same_pane(pane)),
-                "spawned pane {} acquired a structural owner before commit",
-                spawned.pane_id()
+                preparation_claim.is_authoritative_locked(),
+                "unpublished floating-pane preparation was cancelled"
             );
 
-            // A slow spawn must not undo a user's later focus choice. Focus
-            // the new float only if both the admitted tab and admitted target
-            // are still active at the linearization point.
+            let mut panes = mux.panes.write();
+            anyhow::ensure!(
+                panes
+                    .get(&target.pane_id())
+                    .is_some_and(|registered| target.matches_live_registration(registered)),
+                "floating-pane target registration retired before commit"
+            );
+            anyhow::ensure!(
+                !panes.contains_key(&spawned_id),
+                "floating-pane id {spawned_id} became registered before commit"
+            );
+
+            let mut clients = owner_client_id.map(|_| mux.clients.write());
+            let client_info = match owner_client_id {
+                Some(client_id) => Some(
+                    clients
+                        .as_mut()
+                        .and_then(|clients| clients.get_mut(client_id.as_ref()))
+                        .filter(|info| Arc::ptr_eq(&info.client_id, client_id))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "client registration retired before floating-pane commit"
+                            )
+                        })?,
+                ),
+                None => None,
+            };
             let target_is_active = inner
-                .raw_active_pane_callback_free(&observed_ids)
+                .raw_active_pane_retained_id()
                 .is_some_and(|active| target.is_same_pane(&active));
-            let focus = destination_is_active && target_is_active;
-            if focus {
-                topology_notifications.extend(mux.try_envelope_topology_batch([
-                    MuxNotification::TabResized(self.tab_id),
-                    MuxNotification::PaneFocused(spawned.pane_id()),
-                ])?);
-            } else {
-                topology_notifications.extend(mux.try_envelope_topology_batch([
-                    MuxNotification::TabResized(self.tab_id),
-                ])?);
-            }
-            let (positioned, mut callbacks) = inner.prepare_add_floating_pane_with_focus(
-                Arc::clone(spawned.pane()),
-                spawned.pane_id(),
-                rect,
+            let client_focus_is_current = client_info.as_ref().is_none_or(|info| {
+                match info.focused_pane_registration() {
+                    Some(focused) => focused.same_registration(target_registration),
+                    None => info
+                        .focused_pane_id
+                        .is_none_or(|pane_id| pane_id == target.pane_id()),
+                }
+            });
+            // Zoom is an explicit exclusive-view state. Preserve it and attach
+            // the new float unfocused rather than claiming focus that active
+            // pane resolution would still give to the zoomed pane.
+            let focus = destination_is_active
+                && target_is_active
+                && client_focus_is_current
+                && inner.zoomed.is_none();
+            let current_rect = inner.clamp_floating_rect(geometry.rect);
+            anyhow::ensure!(
+                current_rect == geometry.rect
+                    && inner.floating_pane_size(current_rect) == geometry.size,
+                "destination geometry changed while floating pane was spawning"
+            );
+            inner
+                .floating_panes
+                .try_reserve(1)
+                .map_err(|error| anyhow::anyhow!("reserve floating-pane slot: {error}"))?;
+
+            let mut topology = mux.topology.lock();
+            let topology_stamp = crate::MuxTopologyStamp::Revision(
+                topology.reserve_revision().map_err(anyhow::Error::new)?,
+            );
+
+            // Every operation after topology reservation is an infallible,
+            // allocation-free commit of state that was fully preflighted
+            // above. The reservation is exclusive, so losing it here is an
+            // internal invariant violation rather than a recoverable race.
+            let commit_guard = registration_reservation
+                .take()
+                .expect("prepared floating pane retains its registration reservation")
+                .commit()
+                .expect("validated exclusive pane registration reservation must commit");
+            let registration = PaneRegistrationHandle::new(&pane, &preparation_claim.generation);
+            let prior = panes.insert(
+                spawned_id,
+                crate::LivePaneRegistration {
+                    pane: Arc::clone(&pane),
+                    generation: Arc::clone(&preparation_claim.generation),
+                },
+            );
+            debug_assert!(prior.is_none());
+            let (positioned, callbacks) = inner.prepare_add_presized_floating_pane(
+                Arc::clone(&pane),
+                spawned_id,
+                geometry.rect,
                 focus,
             );
-            callbacks.topology_notifications = topology_notifications;
-            (positioned, callbacks)
+            if focus {
+                if let Some(info) = client_info {
+                    info.replace_focused_pane(spawned_id, Some(registration.clone()));
+                }
+            }
+            let frozen = FrozenFloatingPaneSpawn::from_exact_parts(
+                registration.clone(),
+                self.tab_id,
+                expected_window_id,
+                &positioned,
+            );
+            let lifecycle_ticket = mux.enqueue_pane_lifecycle_notification_at_topology_locked(
+                crate::PaneLifecycleNotification::FloatingSpawnCommitted(frozen),
+                topology_stamp,
+                reader_start_gate.take(),
+                None,
+                crate::PaneRemovalFollowUp::None,
+            );
+            let finalized = commit_guard.finalize();
+            debug_assert!(registration.same_registration(&finalized));
+            preparation_claim.retire_locked();
+            (positioned, callbacks, registration, lifecycle_ticket)
         };
-        callbacks.execute(Some(mux));
-        Ok(positioned)
+
+        // The exact registration and structural owner are now committed. Disarm
+        // the unpublished kill guard before any external callback can unwind;
+        // rollback after this linearization point belongs to normal mux pane
+        // retirement, never to construction-time RAII.
+        let pane = unpublished.into_pane();
+        callbacks.execute(None);
+        mux.notify_pane_registration_did_bind(&pane, &registration);
+        mux.recompute_pane_count();
+        mux.complete_pane_lifecycle_notification(lifecycle_ticket);
+        Ok((pane, positioned, registration))
     }
 
     pub fn set_floating_pane_rect(
@@ -3796,9 +4019,11 @@ impl Tab {
     ) -> Option<R> {
         let mut lock_order = tabs.iter().enumerate().collect::<Vec<_>>();
         lock_order.sort_unstable_by_key(|(_, tab)| Arc::as_ptr(tab) as usize);
-        debug_assert!(lock_order
-            .windows(2)
-            .all(|pair| { !Arc::ptr_eq(pair[0].1, pair[1].1) }));
+        debug_assert!(
+            lock_order
+                .windows(2)
+                .all(|pair| { !Arc::ptr_eq(pair[0].1, pair[1].1) })
+        );
 
         let guards = lock_order
             .iter()
@@ -4602,6 +4827,10 @@ impl TabInner {
         // semantic lane counter even with only a handful of live panes.
         // Preserve the current total order while compacting it back to a
         // dense range, then allocate the next unique top lane.
+        // Keep the physical vector order unchanged: callers use it as a stable
+        // identity/iteration order independent of semantic z-order. Equal
+        // lanes retain their prior vector order through the explicit index
+        // tie-breaker.
         let mut order: Vec<usize> = (0..self.floating_panes.len()).collect();
         order.sort_by_key(|index| (self.floating_panes[*index].z_order, *index));
         for (lane, index) in order.into_iter().enumerate() {
@@ -4642,9 +4871,30 @@ impl TabInner {
         rect: FloatingPaneRect,
         focus: bool,
     ) -> (PositionedFloatingPane, DeferredTabCallbacks) {
+        self.prepare_add_floating_pane_impl(pane, pane_id, rect, focus, true)
+    }
+
+    fn prepare_add_presized_floating_pane(
+        &mut self,
+        pane: Arc<dyn Pane>,
+        pane_id: PaneId,
+        rect: FloatingPaneRect,
+        focus: bool,
+    ) -> (PositionedFloatingPane, DeferredTabCallbacks) {
+        self.prepare_add_floating_pane_impl(pane, pane_id, rect, focus, false)
+    }
+
+    fn prepare_add_floating_pane_impl(
+        &mut self,
+        pane: Arc<dyn Pane>,
+        pane_id: PaneId,
+        rect: FloatingPaneRect,
+        focus: bool,
+        resize: bool,
+    ) -> (PositionedFloatingPane, DeferredTabCallbacks) {
         let prior = self.raw_active_pane_retained_id();
         let rect = self.clamp_floating_rect(rect);
-        let pane_size = self.floating_pane_size(rect);
+        let pane_size = resize.then(|| self.floating_pane_size(rect));
         let z_order = self.next_floating_z_order();
 
         let floating = FloatingPane {
@@ -4673,7 +4923,9 @@ impl TabInner {
             current_focus_id: focus.then_some(pane_id),
             ..DeferredTabCallbacks::default()
         };
-        callbacks.resize_work.push((pane, pane_size));
+        if let Some(pane_size) = pane_size {
+            callbacks.resize_work.push((pane, pane_size));
+        }
         (positioned, callbacks)
     }
 
@@ -7644,7 +7896,7 @@ mod test {
     use rangeset::RangeSet;
     use std::convert::TryFrom;
     use std::ops::Range;
-    use termwiz::surface::{SequenceNo, SEQ_ZERO};
+    use termwiz::surface::{SEQ_ZERO, SequenceNo};
     use url::Url;
 
     const TEST_ORDERED_PANE_CENSUS_WORK: usize = 32_767;
@@ -8215,9 +8467,10 @@ mod test {
         assert!(pane.get_logical_lines(0..10).is_empty());
         assert_eq!(pane.get_title(), "fake-pane-42");
         assert!(pane.send_paste("discarded").is_ok());
-        assert!(pane
-            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
-            .is_ok());
+        assert!(
+            pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+                .is_ok()
+        );
         assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
         assert!(pane.reader().unwrap().is_none());
         assert!(!pane.is_dead());
@@ -8267,15 +8520,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
@@ -9308,8 +9562,10 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("one numeric pane id cannot identify two exact pane objects");
-        assert!(format!("{numeric_error:#}")
-            .contains("pane id 901 belongs to more than one exact pane identity"));
+        assert!(
+            format!("{numeric_error:#}")
+                .contains("pane id 901 belongs to more than one exact pane identity")
+        );
         assert_eq!(numeric_arena, [prefix]);
     }
 
@@ -9576,8 +9832,11 @@ mod test {
 
         assert_eq!(getter_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_eq!(descriptor.node_count, 3);
-        let [PaneArenaNode::Split { .. }, PaneArenaNode::Leaf(first), PaneArenaNode::Leaf(second)] =
-            arena.as_slice()
+        let [
+            PaneArenaNode::Split { .. },
+            PaneArenaNode::Leaf(first),
+            PaneArenaNode::Leaf(second),
+        ] = arena.as_slice()
         else {
             panic!("retried split snapshot must retain canonical preorder");
         };
@@ -9666,8 +9925,11 @@ mod test {
 
         assert_eq!(callback_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_eq!(descriptor.node_count, 3);
-        let [PaneArenaNode::Split { .. }, PaneArenaNode::Leaf(first), PaneArenaNode::Leaf(second)] =
-            arena.as_slice()
+        let [
+            PaneArenaNode::Split { .. },
+            PaneArenaNode::Leaf(first),
+            PaneArenaNode::Leaf(second),
+        ] = arena.as_slice()
         else {
             panic!("retried identity snapshot must retain canonical preorder");
         };

@@ -182,7 +182,6 @@ pub async fn spawn_command_internal(
                 .spawn_floating_pane(
                     target,
                     rect,
-                    size,
                     cmd_builder,
                     cwd,
                     spawn.domain,

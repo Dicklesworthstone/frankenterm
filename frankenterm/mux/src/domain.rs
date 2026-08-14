@@ -7,23 +7,22 @@
 
 use crate::client::ClientId;
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, Pane, PaneId};
-use crate::tab::{FloatingPaneRect, SplitRequest, Tab};
+use crate::pane::{Pane, PaneId, alloc_pane_id};
+use crate::tab::{SplitRequest, Tab};
 use crate::window::WindowId;
 use crate::{
-    FloatingPaneCommitReceipt, FloatingSpawnTarget, MoveCommitReceipt, Mux, PaneOperationGuard,
-    PaneRegistrationHandle, SplitCommitReceipt,
+    MoveCommitReceipt, Mux, PaneOperationGuard, PaneRegistrationHandle, SplitCommitReceipt,
 };
-use anyhow::{anyhow, bail, Context, Error};
+use anyhow::{Context, Error, anyhow, bail};
 use async_trait::async_trait;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
-use config::{configuration, ExecDomain, SerialDomain, TermConfig, ValueOrFunc, WslDomain};
-use downcast_rs::{impl_downcast, Downcast};
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use config::{ExecDomain, SerialDomain, ValueOrFunc, WslDomain, configuration};
+use downcast_rs::{Downcast, impl_downcast};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{
-    native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem,
+    CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem, native_pty_system,
 };
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -63,6 +62,55 @@ pub(crate) fn register_spawned_pane_or_rollback(
         return Err(error);
     }
     Ok(())
+}
+
+/// An exact pane process/PTY that has not yet been published in a mux.
+///
+/// Construction is crate-private so implementations outside this crate cannot
+/// claim the unpublished-pane invariant without going through a mux-owned
+/// domain implementation. Until `UnpublishedPane::into_pane` consumes the
+/// reservation, dropping it kills the pane exactly once. This makes async
+/// cancellation and every fallible pre-publication step fail closed without
+/// briefly exposing an orphan pane registration.
+#[must_use = "an unpublished pane must be published or allowed to roll back"]
+pub struct UnpublishedPane {
+    pane: Option<Arc<dyn Pane>>,
+}
+
+impl UnpublishedPane {
+    pub(crate) fn new(pane: Arc<dyn Pane>) -> Self {
+        Self { pane: Some(pane) }
+    }
+
+    pub(crate) fn pane(&self) -> &Arc<dyn Pane> {
+        self.pane
+            .as_ref()
+            .expect("unpublished pane accessed after it was consumed")
+    }
+
+    pub(crate) fn into_pane(mut self) -> Arc<dyn Pane> {
+        self.pane
+            .take()
+            .expect("unpublished pane consumed more than once")
+    }
+}
+
+impl Drop for UnpublishedPane {
+    fn drop(&mut self) {
+        let Some(pane) = self.pane.take() else {
+            return;
+        };
+        let rollback = catch_recoverable(
+            RecoverablePanicSite::MuxRegistrationRollback,
+            std::panic::AssertUnwindSafe(|| pane.kill()),
+        );
+        if rollback.is_err() {
+            log::error!(
+                "unpublished-pane rollback panicked for exact pane identity {:p}",
+                Arc::as_ptr(&pane)
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,28 +161,9 @@ impl PreparedPane {
     fn disarm(mut self) {
         self.armed = false;
     }
-
-    fn commit_floating(
-        mut self,
-        tab: Arc<Tab>,
-        window_id: WindowId,
-        positioned: crate::tab::PositionedFloatingPane,
-    ) -> FloatingPaneCommitReceipt {
-        self.armed = false;
-        FloatingPaneCommitReceipt::from_exact_parts(
-            Arc::clone(&self.pane),
-            self.registration.clone(),
-            tab,
-            window_id,
-            positioned,
-        )
-    }
 }
 
-fn prepare_registered_pane(
-    mux: &Arc<Mux>,
-    pane: &Arc<dyn Pane>,
-) -> anyhow::Result<PreparedPane> {
+fn prepare_registered_pane(mux: &Arc<Mux>, pane: &Arc<dyn Pane>) -> anyhow::Result<PreparedPane> {
     let registration = match mux.capture_pane_registration(pane) {
         Some(registration) => registration,
         None => {
@@ -278,56 +307,6 @@ pub trait Domain: Downcast + Send + Sync {
         Ok(prepared.commit_split(tab, window_id, size))
     }
 
-    /// Spawn one pane directly into an exact tab's floating layer.
-    ///
-    /// The default path deliberately never creates or publishes a temporary
-    /// tab. `spawn_pane` registers the new pane, the prepared-pane guard owns exact
-    /// rollback until the destination transaction commits, and the final tab
-    /// mutation revalidates the originating mux, client, window, tab, target,
-    /// and spawned registration together. Domains whose topology is owned by
-    /// another mux must return `false` from
-    /// [`Domain::supports_floating_pane_spawn`] until they provide an
-    /// authoritative remote transaction.
-    async fn spawn_floating_pane(
-        &self,
-        mux: &Arc<Mux>,
-        target: &FloatingSpawnTarget,
-        rect: FloatingPaneRect,
-        size: TerminalSize,
-        command: Option<CommandBuilder>,
-        command_dir: Option<String>,
-        term_config: Arc<TermConfig>,
-        owner_client_id: Option<&Arc<ClientId>>,
-    ) -> anyhow::Result<FloatingPaneCommitReceipt> {
-        anyhow::ensure!(
-            self.supports_floating_pane_spawn(),
-            "domain `{}` has no authoritative floating-pane spawn transaction",
-            self.domain_name(),
-        );
-        anyhow::ensure!(
-            target.belongs_to(mux),
-            "floating-pane target belongs to another mux registration"
-        );
-
-        let pane = self
-            .spawn_pane(mux, size, command, command_dir)
-            .await
-            .context("spawn floating pane")?;
-        let prepared = prepare_registered_pane(mux, &pane)?;
-
-        // Configuration callbacks are intentionally before the structural
-        // commit. If they unwind, the still-armed exact-generation rollback
-        // removes and kills the spawned pane without leaving a floating entry.
-        pane.set_config(term_config);
-
-        let spawned = prepared
-            .registration
-            .operation_guard(mux)
-            .ok_or_else(|| anyhow!("spawned floating pane registration retired before commit"))?;
-        let positioned = target.commit_spawned_pane(mux, &spawned, rect, owner_client_id)?;
-        Ok(prepared.commit_floating(target.tab_arc(), target.window_id(), positioned))
-    }
-
     /// Move another exact registration into a split beside the target.
     async fn split_pane_moved(
         &self,
@@ -402,6 +381,24 @@ pub trait Domain: Downcast + Send + Sync {
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>>;
 
+    /// Construct a pane process/PTY without publishing it in a mux.
+    ///
+    /// Only domains that can uphold the unpublished reservation contract may
+    /// override this method. The returned guard kills the pane on cancellation
+    /// or any other pre-publication failure until it is consumed by mux code.
+    async fn spawn_unpublished_pane(
+        &self,
+        _mux: &Arc<Mux>,
+        _size: TerminalSize,
+        _command: Option<CommandBuilder>,
+        _command_dir: Option<String>,
+    ) -> anyhow::Result<UnpublishedPane> {
+        bail!(
+            "domain `{}` does not support unpublished pane construction",
+            self.domain_name()
+        )
+    }
+
     /// The mux will call this method on the domain of the pane that
     /// is being moved to give the domain a chance to handle the movement.
     /// `mux` is the exact originating mux that admitted that movement.
@@ -428,11 +425,11 @@ pub trait Domain: Downcast + Send + Sync {
     /// Whether this domain can authoritatively spawn directly into a local
     /// floating layer without first publishing a normal tab.
     ///
-    /// Client-backed and asynchronously materialized remote domains must
-    /// override this to `false` until their protocol exposes an atomic remote
-    /// operation. The mux checks this synchronously before attach or spawn.
+    /// Client-backed and asynchronously materialized remote domains must leave
+    /// this false until their protocol exposes an atomic remote operation. The
+    /// mux checks this synchronously before attach or spawn.
     fn supports_floating_pane_spawn(&self) -> bool {
-        true
+        false
     }
 
     /// Returns true if the `detach` method can be used
@@ -934,6 +931,57 @@ impl portable_pty::ChildKiller for FailedProcessSpawn {
     }
 }
 
+/// Owns the result of the blocking process-spawn worker until the awaiting
+/// future has actually claimed it.
+///
+/// Dropping the receiver side of `spawn_into_new_thread` does not stop its OS
+/// thread. Without this guard, a successful child produced after async
+/// cancellation would be dropped alive when the worker discovered that its
+/// result receiver was gone. Keeping the result armed in the channel makes
+/// cancellation kill that otherwise-orphaned child exactly once.
+struct KillOnDropChildResult {
+    result: Option<anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>>>,
+}
+
+impl KillOnDropChildResult {
+    fn new(result: anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>>) -> Self {
+        Self {
+            result: Some(result),
+        }
+    }
+
+    fn into_result(mut self) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+        self.result
+            .take()
+            .expect("child spawn result consumed more than once")
+    }
+}
+
+impl Drop for KillOnDropChildResult {
+    fn drop(&mut self) {
+        let Some(Ok(mut child)) = self.result.take() else {
+            return;
+        };
+        let rollback = catch_recoverable(
+            RecoverablePanicSite::MuxRegistrationRollback,
+            std::panic::AssertUnwindSafe(|| child.kill()),
+        );
+        match rollback {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::warn!(
+                    "cancelled local pane spawn could not kill its unclaimed child: {error}"
+                );
+            }
+            Err(_) => {
+                log::error!(
+                    "cancelled local pane spawn panicked while killing its unclaimed child"
+                );
+            }
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl Domain for LocalDomain {
     async fn spawn_pane(
@@ -943,6 +991,20 @@ impl Domain for LocalDomain {
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
+        let unpublished = self
+            .spawn_unpublished_pane(mux, size, command, command_dir)
+            .await?;
+        mux.add_pane(unpublished.pane())?;
+        Ok(unpublished.into_pane())
+    }
+
+    async fn spawn_unpublished_pane(
+        &self,
+        mux: &Arc<Mux>,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<UnpublishedPane> {
         let pane_id = alloc_pane_id()?;
         let cmd = self
             .build_command(mux, command, command_dir, pane_id)
@@ -980,12 +1042,15 @@ impl Domain for LocalDomain {
         // the CommandBuilder are both `Send`, and the slave is not
         // referenced anywhere else on this code path after spawn —
         // dropping it inside the worker thread once the spawn settles
-        // is correct. The worker thread returns the `child_result` so
-        // the original error reporting in the `Err(err)` arm below is
-        // unchanged.
+        // is correct. The worker returns a kill-on-drop result reservation.
+        // If this async future is cancelled while the syscall sequence is
+        // still blocked, the channel eventually drops that reservation and
+        // kills any child which materialized after cancellation.
         let PtyPair { slave, master } = pair;
-        let child_result =
-            promise::spawn::spawn_into_new_thread(move || slave.spawn_command(cmd)).await;
+        let guarded_child_result = promise::spawn::spawn_into_new_thread(move || {
+            Ok(KillOnDropChildResult::new(slave.spawn_command(cmd)))
+        })
+        .await;
         let mut writer = WriterWrapper::new(master.take_writer()?);
 
         let term_config =
@@ -1000,6 +1065,14 @@ impl Domain for LocalDomain {
         if self.is_conpty() {
             terminal.enable_conpty_quirks();
         }
+
+        // Keep the child result reservation armed through every fallible setup
+        // step above. Only the immediate LocalPane construction below takes
+        // ownership away from its kill-on-drop guard.
+        let child_result = match guarded_child_result {
+            Ok(result) => result.into_result(),
+            Err(error) => Err(error),
+        };
 
         let pane: Arc<dyn Pane> = match child_result {
             Ok(child) => Arc::new(LocalPane::new(
@@ -1037,9 +1110,11 @@ impl Domain for LocalDomain {
             }
         };
 
-        register_spawned_pane_or_rollback(mux, &pane)?;
+        Ok(UnpublishedPane::new(pane))
+    }
 
-        Ok(pane)
+    fn supports_floating_pane_spawn(&self) -> bool {
+        true
     }
 
     fn domain_id(&self) -> DomainId {
@@ -1128,12 +1203,12 @@ impl Domain for LocalDomain {
 mod tests {
     use super::*;
     use portable_pty::{Child, ChildKiller, SlavePty};
-    use std::future::{poll_fn, Future};
+    use std::future::{Future, poll_fn};
     use std::io::{Read, Result as IoResult, Write};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
     use std::task::Poll;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn mux_test_lock() -> &'static StdMutex<()> {
         &crate::MUX_TEST_LOCK
@@ -1169,10 +1244,27 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
-    struct TestChild;
+    struct TestChild {
+        kill_calls: Option<Arc<AtomicUsize>>,
+    }
+
+    impl TestChild {
+        fn untracked() -> Self {
+            Self { kill_calls: None }
+        }
+
+        fn tracked(kill_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                kill_calls: Some(kill_calls),
+            }
+        }
+    }
 
     impl ChildKiller for TestChild {
         fn kill(&mut self) -> IoResult<()> {
+            if let Some(kill_calls) = &self.kill_calls {
+                kill_calls.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
 
@@ -1280,7 +1372,7 @@ mod tests {
         ) -> Result<Box<dyn Child + Send + Sync>, Error> {
             self.spawn_calls.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(self.delay);
-            Ok(Box::new(TestChild))
+            Ok(Box::new(TestChild::untracked()))
         }
     }
 
@@ -1308,6 +1400,44 @@ mod tests {
                 slave: Box::new(SlowSpawnSlavePty {
                     delay: self.delay,
                     spawn_calls: Arc::clone(&self.spawn_calls),
+                }),
+                master: Box::new(TestMasterPty::new()),
+            })
+        }
+    }
+
+    struct CancellationSpawnSlavePty {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        kill_calls: Arc<AtomicUsize>,
+    }
+
+    impl SlavePty for CancellationSpawnSlavePty {
+        fn spawn_command(
+            &self,
+            _cmd: CommandBuilder,
+        ) -> Result<Box<dyn Child + Send + Sync>, Error> {
+            self.started.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(Box::new(TestChild::tracked(Arc::clone(&self.kill_calls))))
+        }
+    }
+
+    struct CancellationSpawnPtySystem {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        kill_calls: Arc<AtomicUsize>,
+    }
+
+    impl PtySystem for CancellationSpawnPtySystem {
+        fn openpty(&self, _size: PtySize) -> anyhow::Result<PtyPair> {
+            Ok(PtyPair {
+                slave: Box::new(CancellationSpawnSlavePty {
+                    started: Arc::clone(&self.started),
+                    release: Arc::clone(&self.release),
+                    kill_calls: Arc::clone(&self.kill_calls),
                 }),
                 master: Box::new(TestMasterPty::new()),
             })
@@ -1564,6 +1694,79 @@ mod tests {
         assert!(
             mux.get_pane(pane_id).is_some(),
             "[ft-odywh] mux should register the pane returned by spawn_pane"
+        );
+    }
+
+    #[test]
+    fn cancelled_unpublished_spawn_kills_child_materialized_after_cancellation() {
+        const WAIT_LIMIT: Duration = Duration::from_secs(2);
+
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let exec = promise::spawn::ScopedExecutor::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let kill_calls = Arc::new(AtomicUsize::new(0));
+        let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
+        let domain = LocalDomain::with_pty_system(
+            "cancelled-spawn-test",
+            Box::new(CancellationSpawnPtySystem {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                kill_calls: Arc::clone(&kill_calls),
+            }),
+        );
+
+        promise::spawn::block_on(exec.run(async {
+            let mut spawn = domain.spawn_unpublished_pane(
+                &mux,
+                TerminalSize::default(),
+                Some(CommandBuilder::new("cancelled-spawn-test")),
+                None,
+            );
+
+            let first_poll = poll_fn(|cx| {
+                Poll::Ready(match spawn.as_mut().poll(cx) {
+                    Poll::Ready(result) => Some(result),
+                    Poll::Pending => None,
+                })
+            })
+            .await;
+            assert!(
+                first_poll.is_none(),
+                "unpublished spawn unexpectedly completed before its worker was released"
+            );
+
+            let deadline = Instant::now() + WAIT_LIMIT;
+            while !started.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                started.load(Ordering::Acquire),
+                "blocking spawn worker did not start within {WAIT_LIMIT:?}"
+            );
+
+            drop(spawn);
+            release.store(true, Ordering::Release);
+        }));
+        drop(exec);
+        drop(release_on_drop);
+
+        let deadline = Instant::now() + WAIT_LIMIT;
+        while kill_calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            kill_calls.load(Ordering::SeqCst),
+            1,
+            "a child produced after spawn cancellation must be killed exactly once"
         );
     }
 }

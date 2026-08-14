@@ -608,39 +608,46 @@ fn handle_mux_notification(
     }
 
     let timestamp_ms = now_ms();
+    let pane_created_event = |pane_id| {
+        let (domain, cwd) = if let Some(pane) = mux.get_pane(pane_id) {
+            let domain_id = pane.domain_id();
+            let domain_name = mux
+                .get_domain(domain_id)
+                .map(|d| d.domain_name().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let cwd = pane
+                .get_current_working_dir(CachePolicy::AllowStale)
+                .map(|url| url.path().to_string());
+            (domain_name, cwd)
+        } else {
+            ("unknown".to_string(), None)
+        };
+        let wire_pane_id = terminal_pane_id_to_u64(pane_id);
+        if !bridge_text_field_allowed("pane_created", wire_pane_id, "domain", &domain)
+            || cwd.as_deref().is_some_and(|cwd| {
+                !bridge_text_field_allowed("pane_created", wire_pane_id, "cwd", cwd)
+            })
+        {
+            None
+        } else {
+            Some(BridgeEvent::PaneCreated {
+                pane_id: wire_pane_id,
+                domain,
+                cwd,
+                timestamp_ms,
+            })
+        }
+    };
     let event = match notification {
         MuxNotification::PaneOutput(_) => None,
 
-        MuxNotification::PaneAdded(pane_id) => {
-            let (domain, cwd) = if let Some(pane) = mux.get_pane(*pane_id) {
-                let domain_id = pane.domain_id();
-                let domain_name = mux
-                    .get_domain(domain_id)
-                    .map(|d| d.domain_name().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                let cwd = pane
-                    .get_current_working_dir(CachePolicy::AllowStale)
-                    .map(|url| url.path().to_string());
-                (domain_name, cwd)
-            } else {
-                ("unknown".to_string(), None)
-            };
-            let wire_pane_id = terminal_pane_id_to_u64(*pane_id);
-            if !bridge_text_field_allowed("pane_created", wire_pane_id, "domain", &domain)
-                || cwd.as_deref().is_some_and(|cwd| {
-                    !bridge_text_field_allowed("pane_created", wire_pane_id, "cwd", cwd)
-                })
-            {
-                None
-            } else {
-                Some(BridgeEvent::PaneCreated {
-                    pane_id: wire_pane_id,
-                    domain,
-                    cwd,
-                    timestamp_ms,
-                })
-            }
-        }
+        MuxNotification::PaneAdded(pane_id) => pane_created_event(*pane_id),
+
+        // The floating-spawn transaction publishes this while its lifecycle
+        // reader gate is still closed, just like PaneAdded. Emit the same
+        // native lifecycle record from the exact frozen pane identity without
+        // introducing a second focus or topology action.
+        MuxNotification::FloatingPaneSpawnCommitted(spawn) => pane_created_event(spawn.pane_id()),
 
         MuxNotification::PaneRemoved(pane_id) => Some(BridgeEvent::PaneDestroyed {
             pane_id: terminal_pane_id_to_u64(*pane_id),
