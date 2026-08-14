@@ -2230,6 +2230,43 @@ mod tests {
         );
     }
 
+    /// GH #79 regression companion: models the floating-pane spawn sequence
+    /// in `frankenterm-gui/src/spawn.rs`. `spawn_tab_or_window` activates the
+    /// temporary tab it creates, so the GUI must (a) capture the destination
+    /// tab before spawning and (b) restore it as active after removing the
+    /// temporary tab. This locks the window-level behavior that restore step
+    /// relies on.
+    #[test]
+    fn removing_spawn_temp_tab_and_restoring_dest_leaves_dest_active() {
+        let dest = test_tab();
+        let temp = test_tab();
+        let dest_id = dest.tab_id();
+        let temp_id = temp.tab_id();
+
+        let mut window = Window::new(None, None);
+        window.push(&dest).expect("append dest tab");
+        window.push(&temp).expect("append temp tab");
+
+        // spawn_tab_or_window installs and activates the new (temporary) tab.
+        let temp_idx = window.idx_by_id(temp_id).expect("temp tab idx");
+        window.save_and_then_set_active(temp_idx);
+        assert_eq!(window.get_active().map(|tab| tab.tab_id()), Some(temp_id));
+
+        // The fixed GUI path: remove the temporary tab, then restore the
+        // pre-spawn destination tab as active.
+        window.remove_by_id(temp_id);
+        let dest_idx = window
+            .idx_by_id(dest_id)
+            .expect("dest tab survives temp-tab removal");
+        window.set_active_without_saving(dest_idx);
+
+        assert_eq!(
+            window.get_active().map(|tab| tab.tab_id()),
+            Some(dest_id),
+            "destination tab must be active again after the temporary spawn tab is removed",
+        );
+    }
+
     #[test]
     fn removing_tab_clears_stale_last_active_reference() {
         let first = test_tab();

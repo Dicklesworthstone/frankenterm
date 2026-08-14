@@ -2112,7 +2112,11 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         ToggleFloatingPane => CommandDef {
             brief: "Toggle Floating Pane".into(),
             doc: "Toggle a floating pane overlay. Creates a new floating pane or removes the focused one.".into(),
-            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "f".into())],
+            // GH #79 (adjacent finding): CTRL+SHIFT+F is already taken by
+            // Search — SUPER+F synthesizes a CTRL+SHIFT+F alias — so the
+            // palette used to advertise a shortcut that triggered Search.
+            // "g" is unclaimed in the CTRL+SHIFT layer (mnemonic: floatinG).
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "g".into())],
             args: &[ArgType::ActiveTab],
             menubar: &["Window", "Floating"],
             icon: Some("md_picture_in_picture"),
