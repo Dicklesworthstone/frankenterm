@@ -5045,6 +5045,10 @@ pub enum OrderedWindowProtocolError {
     TooManyPaneLeaves { count: usize, max: usize },
     #[error("ordered-window floating-pane snapshot is invalid: {0}")]
     FloatingPaneSnapshot(FloatingPaneSnapshotError),
+    #[error(
+        "ordered pane-arena conversion cannot discard {count} floating panes; carry them in OrderedPaneSnapshotV1::floating_panes"
+    )]
+    FloatingPaneProjectionLost { count: usize },
     #[error("ordered-window pane tree {tree_index} has {count} {resource}; maximum is {max}")]
     PaneTreeResourceLimit {
         tree_index: usize,
@@ -5678,8 +5682,13 @@ fn flatten_ordered_panes(
         tabs,
         tab_titles,
         window_titles: pane_window_titles,
-        floating_panes: _,
+        floating_panes,
     } = panes;
+    if !floating_panes.is_empty() {
+        return Err(OrderedWindowProtocolError::FloatingPaneProjectionLost {
+            count: floating_panes.len(),
+        });
+    }
     if tabs.len() > MAX_ORDERED_TABS_PER_SNAPSHOT {
         return Err(OrderedWindowProtocolError::TooManyPaneTrees {
             count: tabs.len(),
@@ -9528,9 +9537,8 @@ pub struct ListPanesTabStackEntry {
 }
 
 /// Maximum number of floating panes carried by one authoritative topology
-/// snapshot. This shares the ordered protocol's whole-snapshot pane ceiling,
-/// preventing an independently unbounded overlay vector from bypassing the
-/// pane census budget.
+/// snapshot. Matching the ordered tiled-leaf ceiling keeps the two independent
+/// pane classes under a simple combined `2 * ceiling` cardinality bound.
 pub const MAX_FLOATING_PANES_PER_SNAPSHOT: usize = MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT;
 
 /// Complete remote state for one floating pane. `pane` carries its exact
@@ -9549,12 +9557,28 @@ pub struct FloatingPaneSnapshotEntry {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum FloatingPaneSnapshotError {
+    #[error("floating pane snapshot has {count} entries; maximum is {max}")]
+    TooManyEntries { count: usize, max: usize },
     #[error("floating pane snapshot contains duplicate pane id {pane_id}")]
     DuplicatePaneId { pane_id: PaneId },
     #[error("floating pane {pane_id} has an empty {axis} extent")]
     EmptyExtent { pane_id: PaneId, axis: &'static str },
     #[error("floating pane {pane_id} has invalid opacity {opacity}")]
     InvalidOpacity { pane_id: PaneId, opacity: String },
+    #[error("floating pane {pane_id} is focused while hidden")]
+    FocusedPaneHidden { pane_id: PaneId },
+    #[error(
+        "floating pane {pane_id} focus disagrees with pane-entry active state: focused={focused}, pane_entry_active={pane_entry_active}"
+    )]
+    FocusStateMismatch {
+        pane_id: PaneId,
+        focused: bool,
+        pane_entry_active: bool,
+    },
+    #[error("floating pane {pane_id} cannot carry tiled-pane zoom state")]
+    ZoomStatePresent { pane_id: PaneId },
+    #[error("floating pane {pane_id} geometry disagrees with its pane entry")]
+    GeometryMismatch { pane_id: PaneId },
     #[error("floating tab {tab_id} contains more than one focused pane")]
     MultipleFocusedPanes { tab_id: TabId },
 }
@@ -9588,6 +9612,12 @@ where
 fn validate_floating_pane_snapshot(
     floating_panes: &[FloatingPaneSnapshotEntry],
 ) -> Result<(), FloatingPaneSnapshotError> {
+    if floating_panes.len() > MAX_FLOATING_PANES_PER_SNAPSHOT {
+        return Err(FloatingPaneSnapshotError::TooManyEntries {
+            count: floating_panes.len(),
+            max: MAX_FLOATING_PANES_PER_SNAPSHOT,
+        });
+    }
     let mut pane_ids = HashSet::with_capacity(floating_panes.len());
     let mut focused_tabs = HashSet::new();
     for floating in floating_panes {
@@ -9612,6 +9642,26 @@ fn validate_floating_pane_snapshot(
                 pane_id,
                 opacity: floating.opacity.to_string(),
             });
+        }
+        if floating.focused && !floating.visible {
+            return Err(FloatingPaneSnapshotError::FocusedPaneHidden { pane_id });
+        }
+        if floating.pane.is_active_pane != floating.focused {
+            return Err(FloatingPaneSnapshotError::FocusStateMismatch {
+                pane_id,
+                focused: floating.focused,
+                pane_entry_active: floating.pane.is_active_pane,
+            });
+        }
+        if floating.pane.is_zoomed_pane {
+            return Err(FloatingPaneSnapshotError::ZoomStatePresent { pane_id });
+        }
+        if floating.pane.left_col != floating.rect.left
+            || floating.pane.top_row != floating.rect.top
+            || floating.pane.size.cols != floating.rect.width
+            || floating.pane.size.rows != floating.rect.height
+        {
+            return Err(FloatingPaneSnapshotError::GeometryMismatch { pane_id });
         }
         if floating.focused && !focused_tabs.insert(floating.pane.tab_id) {
             return Err(FloatingPaneSnapshotError::MultipleFocusedPanes {
@@ -17952,6 +18002,108 @@ mod test {
             assert_eq!(decoded.serial, serial);
             assert_eq!(decoded.pdu, response);
         }
+    }
+
+    #[test]
+    fn authoritative_floating_pane_snapshot_roundtrips_complete_state() {
+        let mut tiled = sample_pane_entry(0);
+        tiled.pane_id = 1;
+        let mut floating_pane = sample_pane_entry(1);
+        floating_pane.window_id = tiled.window_id;
+        floating_pane.tab_id = tiled.tab_id;
+        floating_pane.pane_id = 2;
+        floating_pane.is_active_pane = true;
+        floating_pane.left_col = 7;
+        floating_pane.top_row = 3;
+        let floating = FloatingPaneSnapshotEntry {
+            rect: FloatingPaneRect {
+                left: 7,
+                top: 3,
+                width: floating_pane.size.cols,
+                height: floating_pane.size.rows,
+            },
+            pane: floating_pane,
+            z_order: 91,
+            visible: true,
+            pinned: true,
+            opacity: 0.625,
+            focused: true,
+        };
+        let response = Pdu::ListPanesResponse(ListPanesResponse {
+            tabs: vec![PaneNode::Leaf(tiled)],
+            tab_titles: vec!["floating owner".to_string()],
+            window_titles: HashMap::from([(1, "floating window".to_string())]),
+            floating_panes: vec![floating],
+        });
+
+        let frame = response
+            .encode_frame_with_mode(44, CompressionMode::Never)
+            .expect("bounded floating pane snapshot should encode");
+        let decoded =
+            Pdu::decode(frame.as_slice()).expect("bounded floating pane snapshot should decode");
+        assert_eq!(decoded.serial, 44);
+        assert_eq!(decoded.pdu, response);
+    }
+
+    #[test]
+    fn floating_pane_snapshot_validation_rejects_duplicate_and_ambiguous_focus() {
+        let pane = sample_pane_entry(0);
+        let entry = FloatingPaneSnapshotEntry {
+            rect: FloatingPaneRect {
+                left: 0,
+                top: 0,
+                width: pane.size.cols,
+                height: pane.size.rows,
+            },
+            pane,
+            z_order: 0,
+            visible: true,
+            pinned: false,
+            opacity: 1.0,
+            focused: true,
+        };
+        assert_eq!(
+            validate_floating_pane_snapshot(&[entry.clone(), entry.clone()]),
+            Err(FloatingPaneSnapshotError::DuplicatePaneId {
+                pane_id: entry.pane.pane_id,
+            })
+        );
+
+        let mut second = entry.clone();
+        second.pane.pane_id = second.pane.pane_id.saturating_add(1);
+        assert_eq!(
+            validate_floating_pane_snapshot(&[entry.clone(), second]),
+            Err(FloatingPaneSnapshotError::MultipleFocusedPanes {
+                tab_id: entry.pane.tab_id,
+            })
+        );
+
+        let mut invalid_opacity = entry.clone();
+        invalid_opacity.focused = false;
+        invalid_opacity.pane.is_active_pane = false;
+        invalid_opacity.opacity = f32::NAN;
+        assert!(matches!(
+            validate_floating_pane_snapshot(&[invalid_opacity]),
+            Err(FloatingPaneSnapshotError::InvalidOpacity { .. })
+        ));
+
+        let mut hidden_focus = entry.clone();
+        hidden_focus.visible = false;
+        assert_eq!(
+            validate_floating_pane_snapshot(&[hidden_focus]),
+            Err(FloatingPaneSnapshotError::FocusedPaneHidden {
+                pane_id: entry.pane.pane_id,
+            })
+        );
+
+        let mut mismatched_geometry = entry.clone();
+        mismatched_geometry.rect.left = mismatched_geometry.rect.left.saturating_add(1);
+        assert_eq!(
+            validate_floating_pane_snapshot(&[mismatched_geometry]),
+            Err(FloatingPaneSnapshotError::GeometryMismatch {
+                pane_id: entry.pane.pane_id,
+            })
+        );
     }
 
     #[test]

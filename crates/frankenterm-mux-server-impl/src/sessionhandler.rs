@@ -3093,7 +3093,7 @@ fn append_floating_pane_snapshot(
         );
     }
     output
-        .try_reserve_exact(positioned.len())
+        .try_reserve(positioned.len())
         .context("reserving bounded floating pane snapshot")?;
     output.extend(positioned.into_iter().map(|positioned| {
         floating_pane_snapshot_entry(window_id, tab.tab_id(), workspace, positioned)
@@ -3146,12 +3146,16 @@ fn collect_list_panes_snapshot_with_stage_observer(
         tab_titles.len(),
         window_titles.len()
     );
-    Ok(ListPanesResponse {
+    let response = ListPanesResponse {
         tabs,
         tab_titles,
         window_titles,
         floating_panes,
-    })
+    };
+    response
+        .validate_floating_panes()
+        .context("validating collected floating-pane snapshot")?;
+    Ok(response)
 }
 
 fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
@@ -8167,6 +8171,63 @@ mod tests {
             ]),
             "the accepted retry must contain both complete window/tab generations"
         );
+    }
+
+    #[test]
+    fn authoritative_snapshot_families_preserve_complete_floating_pane_state() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_151, None)));
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &tab);
+        let floating: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_152, None));
+        mux.add_pane(&floating)
+            .expect("register floating snapshot pane");
+        let rect = mux::tab::FloatingPaneRect {
+            left: 9,
+            top: 4,
+            width: 37,
+            height: 13,
+        };
+        tab.add_floating_pane(Arc::clone(&floating), rect)
+            .expect("attach floating snapshot pane");
+        assert!(tab.set_floating_pane_z_order(floating.pane_id(), 71));
+
+        let legacy = collect_list_panes_snapshot(&mux).expect("collect legacy pane snapshot");
+        let coherent = expect_current_coherent_snapshot(
+            &mux,
+            collect_coherent_list_panes_snapshot(&mux)
+                .expect("collect coherent pane snapshot"),
+        );
+        let ordered = match collect_ordered_list_panes_snapshot(&mux)
+            .expect("collect ordered pane snapshot")
+        {
+            codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) => snapshot,
+            other => panic!("expected ordered pane snapshot, got {other:?}"),
+        };
+
+        assert_eq!(legacy.floating_panes, coherent.panes.floating_panes);
+        assert_eq!(legacy.floating_panes, ordered.floating_panes);
+        let [snapshot] = legacy.floating_panes.as_slice() else {
+            panic!("expected one floating pane in every authoritative snapshot");
+        };
+        assert_eq!(snapshot.pane.window_id, window_id);
+        assert_eq!(snapshot.pane.tab_id, tab.tab_id());
+        assert_eq!(snapshot.pane.pane_id, floating.pane_id());
+        assert_eq!(snapshot.pane.left_col, rect.left);
+        assert_eq!(snapshot.pane.top_row, rect.top);
+        assert_eq!(snapshot.pane.size.cols, rect.width);
+        assert_eq!(snapshot.pane.size.rows, rect.height);
+        assert_eq!(snapshot.rect, rect);
+        assert_eq!(snapshot.z_order, 71);
+        assert!(snapshot.visible);
+        assert!(!snapshot.pinned);
+        assert_eq!(snapshot.opacity, 1.0);
+        assert!(snapshot.focused);
+        assert!(snapshot.pane.is_active_pane);
+        assert!(!snapshot.pane.is_zoomed_pane);
     }
 
     #[test]

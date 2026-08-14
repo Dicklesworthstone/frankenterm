@@ -3805,6 +3805,48 @@ mod tests {
     }
 
     #[test]
+    fn tiled_and_floating_remote_pane_alias_is_rejected_before_topology_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(91_017);
+        let mut listing = sample_remote_tab_listing();
+        let PaneNode::Leaf(entry) = listing.tabs[0].clone() else {
+            panic!("sample remote tab must contain one pane leaf");
+        };
+        listing
+            .floating_panes
+            .push(codec::FloatingPaneSnapshotEntry {
+                pane: entry,
+                rect: mux::tab::FloatingPaneRect {
+                    left: 0,
+                    top: 0,
+                    width: 120,
+                    height: 40,
+                },
+                z_order: 0,
+                visible: true,
+                pinned: false,
+                opacity: 1.0,
+                focused: true,
+            });
+
+        let error = ClientDomain::process_pane_list(&mux, Arc::clone(&inner), listing, None)
+            .expect_err("one remote pane cannot be both tiled and floating");
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote pane 61 has more than one tiled/floating owner"),
+            "unexpected error: {error:#}"
+        );
+        assert!(mux.iter_panes().is_empty());
+        assert!(mux.iter_windows().is_empty());
+        assert!(lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab").is_empty());
+        assert!(lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane").is_empty());
+    }
+
+    #[test]
     fn process_pane_list_uses_its_explicit_mux_when_the_global_mux_differs() {
         let scope = MuxTestScope::enter();
         let ambient_mux = Arc::new(Mux::new(None));

@@ -391,6 +391,7 @@ fn arb_list_panes_response() -> impl Strategy<Value = ListPanesResponse> {
             tabs: vec![],
             tab_titles,
             window_titles: window_titles.into_iter().collect::<HashMap<_, _>>(),
+            floating_panes: vec![],
         })
 }
 
