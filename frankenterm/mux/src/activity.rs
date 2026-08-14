@@ -1,6 +1,6 @@
 //! Keeps track of the number of user-initiated activities
 use crate::Mux;
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 

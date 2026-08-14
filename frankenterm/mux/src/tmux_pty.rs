@@ -1,6 +1,6 @@
-use crate::DomainId;
 use crate::tmux::{RefTmuxRemotePane, TmuxCmdQueue, TmuxDomainState, TmuxEnqueueError};
 use crate::tmux_commands::{KillPane, Resize, SendKeys};
+use crate::DomainId;
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty};
@@ -384,10 +384,10 @@ impl MasterPty for TmuxPty {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mux;
     use crate::domain::Domain;
-    use crate::tmux::{CMD_QUEUE_MAX_DEPTH, TmuxDomain, TmuxPaneOutputState, TmuxRemotePane};
+    use crate::tmux::{TmuxDomain, TmuxPaneOutputState, TmuxRemotePane, CMD_QUEUE_MAX_DEPTH};
     use crate::tmux_commands::ListCommands;
+    use crate::Mux;
     use promise::spawn::ScopedExecutor;
     use std::sync::{Arc as StdArc, MutexGuard as StdMutexGuard};
     use termwiz::tmux_cc::Guarded;

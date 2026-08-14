@@ -1,6 +1,6 @@
 use crate::client::ClientId;
 use crate::domain::{Domain, DomainId, UnpublishedPane};
-use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
+use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{
@@ -10,16 +10,16 @@ use crate::{
 use bintree::PathBranch;
 use config::configuration;
 use config::keyassignment::PaneDirection;
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{StableRowIndex, TerminalSize};
 use parking_lot::Mutex;
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::panic::AssertUnwindSafe;
 #[cfg(test)]
 use std::panic::catch_unwind;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use url::Url;
 
@@ -4123,11 +4123,9 @@ impl Tab {
     ) -> Option<R> {
         let mut lock_order = tabs.iter().enumerate().collect::<Vec<_>>();
         lock_order.sort_unstable_by_key(|(_, tab)| Arc::as_ptr(tab) as usize);
-        debug_assert!(
-            lock_order
-                .windows(2)
-                .all(|pair| { !Arc::ptr_eq(pair[0].1, pair[1].1) })
-        );
+        debug_assert!(lock_order
+            .windows(2)
+            .all(|pair| { !Arc::ptr_eq(pair[0].1, pair[1].1) }));
 
         let guards = lock_order
             .iter()
@@ -9023,7 +9021,7 @@ mod test {
     use rangeset::RangeSet;
     use std::convert::TryFrom;
     use std::ops::Range;
-    use termwiz::surface::{SEQ_ZERO, SequenceNo};
+    use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use url::Url;
 
     const TEST_ORDERED_PANE_CENSUS_WORK: usize = 32_767;
@@ -9594,10 +9592,9 @@ mod test {
         assert!(pane.get_logical_lines(0..10).is_empty());
         assert_eq!(pane.get_title(), "fake-pane-42");
         assert!(pane.send_paste("discarded").is_ok());
-        assert!(
-            pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
-                .is_ok()
-        );
+        assert!(pane
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .is_ok());
         assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
         assert!(pane.reader().unwrap().is_none());
         assert!(!pane.is_dead());
@@ -9647,16 +9644,15 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(
-            tab.compute_split_size(
+        assert!(tab
+            .compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none()
-        );
+            .is_none());
 
         let horz_size = tab
             .compute_split_size(
@@ -10689,10 +10685,8 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("one numeric pane id cannot identify two exact pane objects");
-        assert!(
-            format!("{numeric_error:#}")
-                .contains("pane id 901 belongs to more than one exact pane identity")
-        );
+        assert!(format!("{numeric_error:#}")
+            .contains("pane id 901 belongs to more than one exact pane identity"));
         assert_eq!(numeric_arena, [prefix]);
     }
 
@@ -10959,11 +10953,8 @@ mod test {
 
         assert_eq!(getter_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_eq!(descriptor.node_count, 3);
-        let [
-            PaneArenaNode::Split { .. },
-            PaneArenaNode::Leaf(first),
-            PaneArenaNode::Leaf(second),
-        ] = arena.as_slice()
+        let [PaneArenaNode::Split { .. }, PaneArenaNode::Leaf(first), PaneArenaNode::Leaf(second)] =
+            arena.as_slice()
         else {
             panic!("retried split snapshot must retain canonical preorder");
         };
@@ -11052,11 +11043,8 @@ mod test {
 
         assert_eq!(callback_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_eq!(descriptor.node_count, 3);
-        let [
-            PaneArenaNode::Split { .. },
-            PaneArenaNode::Leaf(first),
-            PaneArenaNode::Leaf(second),
-        ] = arena.as_slice()
+        let [PaneArenaNode::Split { .. }, PaneArenaNode::Leaf(first), PaneArenaNode::Leaf(second)] =
+            arena.as_slice()
         else {
             panic!("retried identity snapshot must retain canonical preorder");
         };

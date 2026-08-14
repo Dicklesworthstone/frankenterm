@@ -1,19 +1,19 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{PaneId, alloc_pane_id};
+use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{
-    AttachState, NOTIFICATION_INTENT_DRAIN_QUANTUM, TmuxBacklogDrain, TmuxBacklogLimits,
-    TmuxDomain, TmuxDomainState, TmuxEnqueueError, TmuxNotificationIntent,
-    TmuxNotificationIntentRunDisposition, TmuxPaneOutputIngress, TmuxPaneOutputLimits,
-    TmuxPaneOutputState, TmuxRemotePane, TmuxTab, TmuxTopologyBarrierEvent,
+    AttachState, TmuxBacklogDrain, TmuxBacklogLimits, TmuxDomain, TmuxDomainState,
+    TmuxEnqueueError, TmuxNotificationIntent, TmuxNotificationIntentRunDisposition,
+    TmuxPaneOutputIngress, TmuxPaneOutputLimits, TmuxPaneOutputState, TmuxRemotePane, TmuxTab,
+    TmuxTopologyBarrierEvent, NOTIFICATION_INTENT_DRAIN_QUANTUM,
 };
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{
     Mux, MuxNotification, MuxNotificationEnvelope, MuxTopologyStamp, Pane, PaneOperationGuard,
     SplitCommitReceipt,
 };
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
@@ -2756,11 +2756,11 @@ impl TmuxCommand for AttachDone {
 mod tests {
     use super::*;
     use crate::domain::Domain;
-    use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd};
+    use filedescriptor::{poll, pollfd, AsRawSocketDescriptor, FileDescriptor, POLLIN};
     use promise::spawn::ScopedExecutor;
     use std::io::{Read as _, Write as _};
-    use std::sync::MutexGuard as StdMutexGuard;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::MutexGuard as StdMutexGuard;
     use std::time::{Duration, Instant};
 
     struct ScopedMux {
@@ -3292,10 +3292,9 @@ mod tests {
                 },
             )
             .expect_err("capture/live-output race must fail closed");
-        assert!(
-            err.to_string()
-                .contains("capture-time stream authority is ambiguous")
-        );
+        assert!(err
+            .to_string()
+            .contains("capture-time stream authority is ambiguous"));
         {
             let pane = pane_gate.lock();
             assert!(pane.output_ingress.capture_raced());
@@ -3449,14 +3448,12 @@ mod tests {
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
 
         for _ in 0..10_000 {
-            assert!(
-                tmux_domain
-                    .inner
-                    .ingest_mux_notification(MuxNotificationEnvelope {
-                        notification: MuxNotification::PaneOutput(77),
-                        topology: MuxTopologyStamp::NonTopology,
-                    })
-            );
+            assert!(tmux_domain
+                .inner
+                .ingest_mux_notification(MuxNotificationEnvelope {
+                    notification: MuxNotification::PaneOutput(77),
+                    topology: MuxTopologyStamp::NonTopology,
+                }));
         }
 
         let telemetry = tmux_domain.inner.notification_intent_telemetry.snapshot();

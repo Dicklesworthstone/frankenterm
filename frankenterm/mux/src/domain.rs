@@ -7,22 +7,22 @@
 
 use crate::client::ClientId;
 use crate::localpane::LocalPane;
-use crate::pane::{Pane, PaneId, alloc_pane_id};
+use crate::pane::{alloc_pane_id, Pane, PaneId};
 use crate::tab::{SplitRequest, Tab};
 use crate::window::WindowId;
 use crate::{
     MoveCommitReceipt, Mux, PaneOperationGuard, PaneRegistrationHandle, SplitCommitReceipt,
 };
-use anyhow::{Context, Error, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Error};
 use async_trait::async_trait;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
-use config::{ExecDomain, SerialDomain, ValueOrFunc, WslDomain, configuration};
-use downcast_rs::{Downcast, impl_downcast};
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
+use downcast_rs::{impl_downcast, Downcast};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{
-    CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem, native_pty_system,
+    native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem,
 };
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -1203,7 +1203,7 @@ impl Domain for LocalDomain {
 mod tests {
     use super::*;
     use portable_pty::{Child, ChildKiller, SlavePty};
-    use std::future::{Future, poll_fn};
+    use std::future::{poll_fn, Future};
     use std::io::{Read, Result as IoResult, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};

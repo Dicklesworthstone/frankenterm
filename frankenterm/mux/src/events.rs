@@ -1498,8 +1498,8 @@ mod tests {
     // Concurrent stress tests
     // ===================================================================
 
-    use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
 
     /// Multiple threads fire events concurrently on a shared bus.
     /// Verifies no panics, no lost actions, and handler count is consistent.
