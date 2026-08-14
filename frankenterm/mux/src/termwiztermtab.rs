@@ -75,6 +75,10 @@ impl Domain for TermWizTerminalDomain {
         false
     }
 
+    fn supports_floating_pane_spawn(&self) -> bool {
+        false
+    }
+
     fn domain_id(&self) -> DomainId {
         self.domain_id
     }

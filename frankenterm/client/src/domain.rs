@@ -2706,6 +2706,15 @@ impl Domain for ClientDomain {
         self.config.name()
     }
 
+    fn supports_floating_pane_spawn(&self) -> bool {
+        // A client-domain spawn is authoritative only on the remote mux. The
+        // current floating-pane PDUs move already-existing panes and do not
+        // combine spawn, source detachment, destination attachment, and tab
+        // retirement. Refuse before sending SpawnV2 until that transaction is
+        // represented by one remote operation.
+        false
+    }
+
     async fn domain_label(&self) -> String {
         self.label.to_string()
     }

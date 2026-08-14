@@ -5829,6 +5829,10 @@ impl TmuxDomain {
 
 #[async_trait(?Send)]
 impl Domain for TmuxDomain {
+    fn supports_floating_pane_spawn(&self) -> bool {
+        false
+    }
+
     async fn spawn(
         &self,
         _mux: &Arc<Mux>,

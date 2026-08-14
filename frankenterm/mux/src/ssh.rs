@@ -821,7 +821,7 @@ impl Domain for RemoteSshDomain {
             self.id,
             command_description,
         ));
-        mux.add_pane(&pane)?;
+        crate::domain::register_spawned_pane_or_rollback(mux, &pane)?;
 
         Ok(pane)
     }

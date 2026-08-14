@@ -8,15 +8,16 @@
 use crate::client::ClientId;
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
-use crate::tab::{SplitRequest, Tab};
+use crate::tab::{FloatingPaneRect, SplitRequest, Tab};
 use crate::window::WindowId;
 use crate::{
-    MoveCommitReceipt, Mux, PaneOperationGuard, PaneRegistrationHandle, SplitCommitReceipt,
+    FloatingPaneCommitReceipt, FloatingSpawnTarget, MoveCommitReceipt, Mux, PaneOperationGuard,
+    PaneRegistrationHandle, SplitCommitReceipt,
 };
 use anyhow::{anyhow, bail, Context, Error};
 use async_trait::async_trait;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
-use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
+use config::{configuration, ExecDomain, SerialDomain, TermConfig, ValueOrFunc, WslDomain};
 use downcast_rs::{impl_downcast, Downcast};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::TerminalSize;
@@ -44,6 +45,26 @@ pub fn alloc_domain_id() -> DomainId {
     crate::next_unique_usize_id(&DOMAIN_ID, "mux domain")
 }
 
+pub(crate) fn register_spawned_pane_or_rollback(
+    mux: &Arc<Mux>,
+    pane: &Arc<dyn Pane>,
+) -> anyhow::Result<()> {
+    if let Err(error) = mux.add_pane(pane) {
+        let rollback = catch_recoverable(
+            RecoverablePanicSite::MuxRegistrationRollback,
+            std::panic::AssertUnwindSafe(|| pane.kill()),
+        );
+        if rollback.is_err() {
+            log::error!(
+                "spawned-pane registration rollback panicked for exact pane identity {:p}",
+                Arc::as_ptr(pane)
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SplitSource {
     Spawn {
@@ -53,13 +74,13 @@ pub enum SplitSource {
     MovePane(PaneId),
 }
 
-pub(super) struct PreparedSplitPane {
+pub(super) struct PreparedPane {
     pane: Arc<dyn Pane>,
     registration: PaneRegistrationHandle,
     armed: bool,
 }
 
-impl PreparedSplitPane {
+impl PreparedPane {
     pub(super) fn new(pane: Arc<dyn Pane>, registration: PaneRegistrationHandle) -> Self {
         Self {
             pane,
@@ -68,7 +89,7 @@ impl PreparedSplitPane {
         }
     }
 
-    fn commit(
+    fn commit_split(
         mut self,
         tab: Arc<Tab>,
         window_id: WindowId,
@@ -83,9 +104,25 @@ impl PreparedSplitPane {
             size,
         )
     }
+
+    fn commit_floating(
+        mut self,
+        tab: Arc<Tab>,
+        window_id: WindowId,
+        positioned: crate::tab::PositionedFloatingPane,
+    ) -> FloatingPaneCommitReceipt {
+        self.armed = false;
+        FloatingPaneCommitReceipt::from_exact_parts(
+            Arc::clone(&self.pane),
+            self.registration.clone(),
+            tab,
+            window_id,
+            positioned,
+        )
+    }
 }
 
-impl Drop for PreparedSplitPane {
+impl Drop for PreparedPane {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -98,13 +135,13 @@ impl Drop for PreparedSplitPane {
             Ok(true) => {}
             Ok(false) => {
                 log::warn!(
-                    "prepared split pane {} lost exact registration before rollback",
+                    "prepared pane {} lost exact registration before rollback",
                     self.registration.pane_id()
                 );
             }
             Err(_) => {
                 log::error!(
-                    "prepared split pane {} rollback panicked",
+                    "prepared pane {} rollback panicked",
                     self.registration.pane_id()
                 );
             }
@@ -188,7 +225,7 @@ pub trait Domain: Downcast + Send + Sync {
                 pane.pane_id()
             )
         })?;
-        let prepared = PreparedSplitPane::new(Arc::clone(&pane), registration);
+        let prepared = PreparedPane::new(Arc::clone(&pane), registration);
         if let Some(config) = target_config {
             pane.set_config(config);
         }
@@ -201,7 +238,75 @@ pub trait Domain: Downcast + Send + Sync {
             dpi: dims.dpi,
         };
         tab.split_and_insert(pane_index, split_request, pane)?;
-        Ok(prepared.commit(tab, window_id, size))
+        Ok(prepared.commit_split(tab, window_id, size))
+    }
+
+    /// Spawn one pane directly into an exact tab's floating layer.
+    ///
+    /// The default path deliberately never creates or publishes a temporary
+    /// tab. `spawn_pane` registers the new pane, the prepared-pane guard owns exact
+    /// rollback until the destination transaction commits, and the final tab
+    /// mutation revalidates the originating mux, client, window, tab, target,
+    /// and spawned registration together. Domains whose topology is owned by
+    /// another mux must return `false` from
+    /// [`Domain::supports_floating_pane_spawn`] until they provide an
+    /// authoritative remote transaction.
+    async fn spawn_floating_pane(
+        &self,
+        mux: &Arc<Mux>,
+        target: &FloatingSpawnTarget,
+        rect: FloatingPaneRect,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        term_config: Arc<TermConfig>,
+        owner_client_id: Option<&Arc<ClientId>>,
+    ) -> anyhow::Result<FloatingPaneCommitReceipt> {
+        anyhow::ensure!(
+            self.supports_floating_pane_spawn(),
+            "domain `{}` has no authoritative floating-pane spawn transaction",
+            self.domain_name(),
+        );
+        anyhow::ensure!(
+            target.belongs_to(mux),
+            "floating-pane target belongs to another mux registration"
+        );
+
+        let pane = self
+            .spawn_pane(mux, size, command, command_dir)
+            .await
+            .context("spawn floating pane")?;
+        let registration = match mux.capture_pane_registration(&pane) {
+            Some(registration) => registration,
+            None => {
+                let rollback = catch_recoverable(
+                    RecoverablePanicSite::MuxRegistrationRollback,
+                    std::panic::AssertUnwindSafe(|| pane.kill()),
+                );
+                if rollback.is_err() {
+                    log::error!(
+                        "unregistered floating-pane spawn rollback panicked for exact pane identity {:p}",
+                        Arc::as_ptr(&pane)
+                    );
+                }
+                anyhow::bail!(
+                    "spawned floating pane has no exact mux registration; rolled back the unregistered pane"
+                );
+            }
+        };
+        let prepared = PreparedPane::new(Arc::clone(&pane), registration);
+
+        // Configuration callbacks are intentionally before the structural
+        // commit. If they unwind, the still-armed exact-generation rollback
+        // removes and kills the spawned pane without leaving a floating entry.
+        pane.set_config(term_config);
+
+        let spawned = prepared
+            .registration
+            .operation_guard(mux)
+            .ok_or_else(|| anyhow!("spawned floating pane registration retired before commit"))?;
+        let positioned = target.commit_spawned_pane(mux, &spawned, rect, owner_client_id)?;
+        Ok(prepared.commit_floating(target.tab_arc(), target.window_id(), positioned))
     }
 
     /// Move another exact registration into a split beside the target.
@@ -298,6 +403,16 @@ pub trait Domain: Downcast + Send + Sync {
     /// pre-created with local UI that we do not want to allow
     /// to show in the launcher/menu as launchable items.
     fn spawnable(&self) -> bool {
+        true
+    }
+
+    /// Whether this domain can authoritatively spawn directly into a local
+    /// floating layer without first publishing a normal tab.
+    ///
+    /// Client-backed and asynchronously materialized remote domains must
+    /// override this to `false` until their protocol exposes an atomic remote
+    /// operation. The mux checks this synchronously before attach or spawn.
+    fn supports_floating_pane_spawn(&self) -> bool {
         true
     }
 
@@ -903,7 +1018,7 @@ impl Domain for LocalDomain {
             }
         };
 
-        mux.add_pane(&pane)?;
+        register_spawned_pane_or_rollback(mux, &pane)?;
 
         Ok(pane)
     }

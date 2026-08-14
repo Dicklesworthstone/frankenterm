@@ -60,7 +60,7 @@ compile_error!(
 use crate::client::{ClientId, ClientInfo};
 use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
-use crate::tab::{SplitRequest, Tab, TabId};
+use crate::tab::{FloatingPaneRect, SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{
     FrozenWindowOrder, PrepareWindowOrderError, Window, WindowId, WindowOrderRevision,
@@ -68,7 +68,7 @@ use crate::window::{
 };
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{configuration, ExitBehavior, GuiPosition, TermConfig};
 use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
@@ -233,6 +233,33 @@ impl MuxTopologyAuthority {
         }
         self.revision = TopologyRevision(next);
         Ok(self.revision)
+    }
+
+    fn reserve_revisions(
+        &mut self,
+        count: usize,
+    ) -> Result<TopologyRevision, TopologyRevisionExhausted> {
+        if count == 0 {
+            return Ok(self.revision);
+        }
+        if self.exhausted {
+            return Err(TopologyRevisionExhausted);
+        }
+        let count = u64::try_from(count).map_err(|_| TopologyRevisionExhausted)?;
+        let Some(first) = self.revision.0.checked_add(1) else {
+            self.exhausted = true;
+            return Err(TopologyRevisionExhausted);
+        };
+        let Some(last) = self.revision.0.checked_add(count) else {
+            self.exhausted = true;
+            return Err(TopologyRevisionExhausted);
+        };
+        if last == u64::MAX {
+            self.exhausted = true;
+            return Err(TopologyRevisionExhausted);
+        }
+        self.revision = TopologyRevision(last);
+        Ok(TopologyRevision(first))
     }
 
     fn snapshot(
@@ -2007,6 +2034,11 @@ mod pane_registration_handle {
             &self.pane
         }
 
+        pub(super) fn matches_live_registration(&self, registered: &LivePaneRegistration) -> bool {
+            Arc::ptr_eq(&self.pane, &registered.pane)
+                && Arc::ptr_eq(&self.generation, &registered.generation)
+        }
+
         pub(crate) fn exact_location(&self) -> anyhow::Result<(DomainId, WindowId, Arc<Tab>)> {
             let domain_id = self.pane.domain_id();
             for window_id in self.owner.iter_windows() {
@@ -2099,6 +2131,169 @@ mod pane_registration_handle {
                 tab,
                 window_id,
             ))
+        }
+    }
+
+    /// Non-cloneable admission authority for one floating-pane spawn.
+    ///
+    /// The exact destination tab and its active pane generation are captured
+    /// together before any domain attach or spawn await. A later tab switch
+    /// therefore cannot redirect the pane to a different tab, while removal
+    /// or replacement of the captured topology makes the final commit fail
+    /// closed.
+    pub struct FloatingSpawnTarget {
+        target: PaneOperationGuard,
+        tab: Arc<Tab>,
+        window_id: WindowId,
+    }
+
+    impl std::fmt::Debug for FloatingSpawnTarget {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("FloatingSpawnTarget")
+                .field("target_pane_id", &self.target.pane_id())
+                .field("tab_id", &self.tab.tab_id())
+                .field("window_id", &self.window_id)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl FloatingSpawnTarget {
+        pub(crate) fn from_exact_parts(
+            target: PaneOperationGuard,
+            tab: Arc<Tab>,
+            window_id: WindowId,
+        ) -> Self {
+            Self {
+                target,
+                tab,
+                window_id,
+            }
+        }
+
+        pub fn target_pane_id(&self) -> PaneId {
+            self.target.pane_id()
+        }
+
+        pub fn tab_id(&self) -> TabId {
+            self.tab.tab_id()
+        }
+
+        pub fn window_id(&self) -> WindowId {
+            self.window_id
+        }
+
+        pub(crate) fn belongs_to(&self, mux: &Arc<Mux>) -> bool {
+            self.target.belongs_to(mux)
+        }
+
+        pub(crate) fn tab_arc(&self) -> Arc<Tab> {
+            Arc::clone(&self.tab)
+        }
+
+        pub(crate) fn target(&self) -> &PaneOperationGuard {
+            &self.target
+        }
+
+        pub(crate) fn commit_spawned_pane(
+            &self,
+            mux: &Arc<Mux>,
+            spawned: &PaneOperationGuard,
+            rect: crate::tab::FloatingPaneRect,
+            owner_client_id: Option<&Arc<ClientId>>,
+        ) -> anyhow::Result<crate::tab::PositionedFloatingPane> {
+            self.tab.commit_spawned_floating_pane(
+                mux,
+                self.window_id,
+                &self.target,
+                spawned,
+                rect,
+                owner_client_id,
+            )
+        }
+    }
+
+    /// Exact local result of a committed floating-pane spawn.
+    pub struct FloatingPaneCommitReceipt {
+        pane: Arc<dyn Pane>,
+        registration: PaneRegistrationHandle,
+        tab: Arc<Tab>,
+        window_id: WindowId,
+        rect: crate::tab::FloatingPaneRect,
+        z_order: u32,
+        focused: bool,
+    }
+
+    impl std::fmt::Debug for FloatingPaneCommitReceipt {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("FloatingPaneCommitReceipt")
+                .field("pane_id", &self.pane_id())
+                .field("tab_id", &self.tab_id())
+                .field("window_id", &self.window_id)
+                .field("rect", &self.rect)
+                .field("z_order", &self.z_order)
+                .field("focused", &self.focused)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl FloatingPaneCommitReceipt {
+        pub(crate) fn from_exact_parts(
+            pane: Arc<dyn Pane>,
+            registration: PaneRegistrationHandle,
+            tab: Arc<Tab>,
+            window_id: WindowId,
+            positioned: crate::tab::PositionedFloatingPane,
+        ) -> Self {
+            debug_assert_eq!(pane.pane_id(), registration.pane_id());
+            debug_assert!(Arc::ptr_eq(&pane, &positioned.pane));
+            Self {
+                pane,
+                registration,
+                tab,
+                window_id,
+                rect: crate::tab::FloatingPaneRect {
+                    left: positioned.left,
+                    top: positioned.top,
+                    width: positioned.width,
+                    height: positioned.height,
+                },
+                z_order: positioned.z_order,
+                focused: positioned.is_focused,
+            }
+        }
+
+        pub fn pane_id(&self) -> PaneId {
+            self.registration.pane_id()
+        }
+
+        pub fn tab_id(&self) -> TabId {
+            self.tab.tab_id()
+        }
+
+        pub fn window_id(&self) -> WindowId {
+            self.window_id
+        }
+
+        pub fn rect(&self) -> crate::tab::FloatingPaneRect {
+            self.rect
+        }
+
+        pub fn z_order(&self) -> u32 {
+            self.z_order
+        }
+
+        pub fn is_focused(&self) -> bool {
+            self.focused
+        }
+
+        pub fn registration(&self) -> PaneRegistrationHandle {
+            self.registration.clone()
+        }
+
+        pub fn with_pane<R>(&self, f: impl FnOnce(&dyn Pane) -> R) -> R {
+            f(self.pane.as_ref())
         }
     }
 
@@ -2892,8 +3087,9 @@ mod pane_registration_handle {
 }
 
 pub use pane_registration_handle::{
-    CurrentPane, CurrentPaneOutput, MoveCommitReceipt, PaneOperationGuard, PaneRegistrationHandle,
-    PaneRegistrationSlot, SplitCommitReceipt,
+    CurrentPane, CurrentPaneOutput, FloatingPaneCommitReceipt, FloatingSpawnTarget,
+    MoveCommitReceipt, PaneOperationGuard, PaneRegistrationHandle, PaneRegistrationSlot,
+    SplitCommitReceipt,
 };
 
 struct PanePreparation {
@@ -4962,6 +5158,32 @@ impl Mux {
             notification,
             topology,
         }
+    }
+
+    /// Reserve a contiguous topology-revision batch without partial success.
+    ///
+    /// Transactions that must publish more than one legacy notification use
+    /// this before their infallible structural commit. Exhaustion therefore
+    /// cannot leave the topology half-mutated or consume only a prefix of the
+    /// requested publication authority.
+    pub(crate) fn try_envelope_topology_batch<const N: usize>(
+        &self,
+        notifications: [MuxNotification; N],
+    ) -> Result<[MuxNotificationEnvelope; N], TopologyRevisionExhausted> {
+        debug_assert!(notifications.iter().all(MuxNotification::is_topology));
+        let first = self.topology.lock().reserve_revisions(N)?;
+        let mut notifications = notifications.into_iter();
+        Ok(std::array::from_fn(|index| MuxNotificationEnvelope {
+            notification: notifications
+                .next()
+                .expect("array iterator must yield every reserved notification"),
+            topology: MuxTopologyStamp::Revision(TopologyRevision(
+                first
+                    .get()
+                    .checked_add(u64::try_from(index).expect("array index fits u64"))
+                    .expect("reserved topology batch cannot overflow"),
+            )),
+        }))
     }
 
     /// Publish a generic mux notification.
@@ -8485,6 +8707,120 @@ impl Mux {
         })
     }
 
+    /// Capture the exact destination for a floating-pane spawn before any
+    /// asynchronous domain work begins.
+    pub fn capture_floating_spawn_target(
+        self: &Arc<Self>,
+        window_id: WindowId,
+    ) -> anyhow::Result<FloatingSpawnTarget> {
+        let (tab, pane) = {
+            let window = self
+                .get_window(window_id)
+                .ok_or_else(|| anyhow!("window {window_id} is not registered"))?;
+            let tab = window
+                .get_active()
+                .cloned()
+                .ok_or_else(|| anyhow!("window {window_id} has no active tab"))?;
+            let pane = tab.get_active_pane().ok_or_else(|| {
+                anyhow!(
+                    "active tab {} in window {window_id} has no active pane",
+                    tab.tab_id()
+                )
+            })?;
+            (tab, pane)
+        };
+        let registration = self.capture_pane_registration(&pane).ok_or_else(|| {
+            anyhow!(
+                "active pane in tab {} has no exact current registration",
+                tab.tab_id()
+            )
+        })?;
+        let target = registration.operation_guard(self).ok_or_else(|| {
+            anyhow!(
+                "active pane registration in tab {} retired during floating-spawn admission",
+                tab.tab_id()
+            )
+        })?;
+        anyhow::ensure!(
+            target.is_same_pane(&pane),
+            "floating-spawn admission resolved a different exact pane allocation"
+        );
+        let (_domain_id, exact_window_id, exact_tab) = target.exact_location()?;
+        anyhow::ensure!(
+            exact_window_id == window_id && Arc::ptr_eq(&exact_tab, &tab),
+            "floating-spawn target moved out of its admitted tab/window"
+        );
+        Ok(FloatingSpawnTarget::from_exact_parts(
+            target, tab, window_id,
+        ))
+    }
+
+    /// Spawn one pane directly into a previously captured floating layer.
+    ///
+    /// Unsupported remote domains are rejected before attach or spawn. The
+    /// destination is never re-resolved from current UI state after an await.
+    pub async fn spawn_floating_pane(
+        self: &Arc<Self>,
+        target: FloatingSpawnTarget,
+        rect: FloatingPaneRect,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        domain: SpawnTabDomain,
+        term_config: Arc<TermConfig>,
+        owner_client_id: Option<Arc<ClientId>>,
+    ) -> anyhow::Result<FloatingPaneCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(self),
+            "floating-pane target belongs to another mux"
+        );
+        if owner_client_id
+            .as_ref()
+            .is_some_and(|client_id| !self.client_registration_is_current(client_id))
+        {
+            anyhow::bail!("client registration is no longer current");
+        }
+        let domain = self
+            .resolve_spawn_tab_domain_for_operation(target.target(), &domain)
+            .context("resolve floating-pane spawn domain")?;
+        anyhow::ensure!(
+            domain.supports_floating_pane_spawn(),
+            "domain `{}` has no authoritative floating-pane spawn transaction; refusing before spawn",
+            domain.domain_name(),
+        );
+
+        if domain.state() == DomainState::Detached {
+            domain
+                .attach(self, owner_client_id.clone(), Some(target.window_id()))
+                .await?;
+        }
+        if owner_client_id
+            .as_ref()
+            .is_some_and(|client_id| !self.client_registration_is_current(client_id))
+        {
+            anyhow::bail!("client registration retired while attaching floating-pane domain");
+        }
+
+        let command_dir = self.resolve_cwd(
+            command_dir,
+            Some(Arc::clone(target.target().pane())),
+            domain.domain_id(),
+            CachePolicy::FetchImmediate,
+        );
+        domain
+            .spawn_floating_pane(
+                self,
+                &target,
+                rect,
+                size,
+                command,
+                command_dir,
+                term_config,
+                owner_client_id.as_ref(),
+            )
+            .await
+    }
+
     pub async fn split_pane(
         self: &Arc<Self>,
         source_pane_id: PaneId,
@@ -9328,19 +9664,55 @@ mod tests {
     }
 
     struct GuardedMutationTestDomain {
-        next_spawned_pane: Mutex<Option<Arc<dyn Pane>>>,
+        spawned_panes: Mutex<VecDeque<Arc<dyn Pane>>>,
+        after_registration:
+            Mutex<Option<Box<dyn FnOnce(&Arc<Mux>, &Arc<dyn Pane>) + Send + 'static>>>,
+        supports_floating_spawn: bool,
     }
 
     impl GuardedMutationTestDomain {
         fn new(next_spawned_pane: Option<Arc<dyn Pane>>) -> Self {
             Self {
-                next_spawned_pane: Mutex::new(next_spawned_pane),
+                spawned_panes: Mutex::new(next_spawned_pane.into_iter().collect()),
+                after_registration: Mutex::new(None),
+                supports_floating_spawn: true,
+            }
+        }
+
+        fn with_panes(spawned_panes: Vec<Arc<dyn Pane>>) -> Self {
+            Self {
+                spawned_panes: Mutex::new(spawned_panes.into()),
+                after_registration: Mutex::new(None),
+                supports_floating_spawn: true,
+            }
+        }
+
+        fn unsupported_floating(next_spawned_pane: Arc<dyn Pane>) -> Self {
+            Self {
+                spawned_panes: Mutex::new(VecDeque::from([next_spawned_pane])),
+                after_registration: Mutex::new(None),
+                supports_floating_spawn: false,
+            }
+        }
+
+        fn with_after_registration(
+            next_spawned_pane: Arc<dyn Pane>,
+            after_registration: impl FnOnce(&Arc<Mux>, &Arc<dyn Pane>) + Send + 'static,
+        ) -> Self {
+            Self {
+                spawned_panes: Mutex::new(VecDeque::from([next_spawned_pane])),
+                after_registration: Mutex::new(Some(Box::new(after_registration))),
+                supports_floating_spawn: true,
             }
         }
     }
 
     #[async_trait::async_trait(?Send)]
     impl Domain for GuardedMutationTestDomain {
+        fn supports_floating_pane_spawn(&self) -> bool {
+            self.supports_floating_spawn
+        }
+
         async fn spawn_pane(
             &self,
             mux: &Arc<Mux>,
@@ -9349,11 +9721,14 @@ mod tests {
             _command_dir: Option<String>,
         ) -> anyhow::Result<Arc<dyn Pane>> {
             let pane = self
-                .next_spawned_pane
+                .spawned_panes
                 .lock()
-                .take()
+                .pop_front()
                 .ok_or_else(|| anyhow!("test domain has no prepared pane"))?;
-            mux.add_pane(&pane)?;
+            domain::register_spawned_pane_or_rollback(mux, &pane)?;
+            if let Some(after_registration) = self.after_registration.lock().take() {
+                after_registration(mux, &pane);
+            }
             Ok(pane)
         }
 
@@ -10616,7 +10991,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_split_pane_rolls_back_exact_registration_without_locks() {
+    fn prepared_pane_rolls_back_exact_registration_without_locks() {
         let mux = Arc::new(Mux::new(None));
         let weak_mux = Arc::downgrade(&mux);
         let (pane, kills) = KillCountingPane::new_with_kill_callback(166, test_size(), move || {
@@ -10632,7 +11007,7 @@ mod tests {
         let registration = mux
             .capture_pane_registration(&pane)
             .expect("prepared pane handle");
-        let prepared = domain::PreparedSplitPane::new(Arc::clone(&pane), registration.clone());
+        let prepared = domain::PreparedPane::new(Arc::clone(&pane), registration.clone());
 
         drop(prepared);
 
@@ -10642,7 +11017,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_prepared_split_rollback_preserves_exact_successor() {
+    fn stale_prepared_pane_rollback_preserves_exact_successor() {
         let mux = Arc::new(Mux::new(None));
         let (original, original_kills) = KillCountingPane::new(167, test_size());
         let (replacement, replacement_kills) = KillCountingPane::new(167, test_size());
@@ -10651,7 +11026,7 @@ mod tests {
         let registration = mux
             .capture_pane_registration(&original)
             .expect("prepared original handle");
-        let prepared = domain::PreparedSplitPane::new(Arc::clone(&original), registration.clone());
+        let prepared = domain::PreparedPane::new(Arc::clone(&original), registration.clone());
 
         assert!(registration.detach_local_if_current());
         mux.add_pane(&replacement)
@@ -10663,6 +11038,415 @@ mod tests {
         assert!(mux
             .get_pane(167)
             .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)));
+    }
+
+    #[test]
+    fn floating_spawn_commits_without_any_tab_or_window_order_churn() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (target, target_kills) = KillCountingPane::new(180, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &target);
+
+        let mut spawned_panes = Vec::new();
+        let mut spawned_kills = Vec::new();
+        for pane_id in 181..189 {
+            let (pane, kills) = KillCountingPane::new(pane_id, test_size());
+            spawned_panes.push(pane);
+            spawned_kills.push(kills);
+        }
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::with_panes(spawned_panes.clone()));
+        mux.add_domain(&domain)
+            .expect("register floating test domain");
+
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid destination window")
+            .expect("destination window present");
+        assert_eq!(mux.tabs.read().len(), 1);
+
+        for spawned in &spawned_panes {
+            let target = mux
+                .capture_floating_spawn_target(window_id)
+                .expect("capture exact floating destination");
+            let receipt = promise::spawn::block_on(mux.spawn_floating_pane(
+                target,
+                FloatingPaneRect {
+                    left: 2,
+                    top: 3,
+                    width: 20,
+                    height: 8,
+                },
+                test_size(),
+                None,
+                None,
+                SpawnTabDomain::DomainId(1),
+                Arc::new(TermConfig::new()),
+                None,
+            ))
+            .expect("floating spawn should commit");
+
+            assert_eq!(receipt.pane_id(), spawned.pane_id());
+            assert_eq!(receipt.tab_id(), tab.tab_id());
+            assert_eq!(receipt.window_id(), window_id);
+            receipt.with_pane(|pane| assert!(std::ptr::eq(pane, spawned.as_ref())));
+        }
+
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid destination window after spawns")
+            .expect("destination window remains present");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(
+            after.ordered_tab_ids().collect::<Vec<_>>(),
+            before.ordered_tab_ids().collect::<Vec<_>>()
+        );
+        assert_eq!(after.active_tab_id(), before.active_tab_id());
+        assert_eq!(mux.tabs.read().len(), 1, "no temporary tabs may register");
+        assert_eq!(tab.iter_floating_panes().len(), spawned_panes.len());
+        let all_panes = tab.iter_all_panes();
+        assert_eq!(all_panes.len(), spawned_panes.len() + 1);
+        for spawned in &spawned_panes {
+            assert_eq!(
+                all_panes
+                    .iter()
+                    .filter(|candidate| Arc::ptr_eq(candidate, spawned))
+                    .count(),
+                1,
+                "each spawned allocation must have one structural owner"
+            );
+        }
+        assert_eq!(target_kills.load(Ordering::SeqCst), 0);
+        for kills in spawned_kills {
+            assert_eq!(kills.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn floating_spawn_rolls_back_when_destination_retires_during_spawn() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (target, target_kills) = KillCountingPane::new(189, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &target);
+        let (spawned, spawned_kills) = KillCountingPane::new(190, test_size());
+        let doomed_tab_id = tab.tab_id();
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::with_after_registration(
+            Arc::clone(&spawned),
+            move |mux, _spawned| {
+                assert!(mux.remove_tab(doomed_tab_id).is_some());
+            },
+        ));
+        mux.add_domain(&domain)
+            .expect("register floating test domain");
+
+        let target = mux
+            .capture_floating_spawn_target(window_id)
+            .expect("capture exact floating destination");
+        let result = promise::spawn::block_on(mux.spawn_floating_pane(
+            target,
+            FloatingPaneRect {
+                left: 0,
+                top: 0,
+                width: 10,
+                height: 5,
+            },
+            test_size(),
+            None,
+            None,
+            SpawnTabDomain::DomainId(1),
+            Arc::new(TermConfig::new()),
+            None,
+        ));
+
+        assert!(result.is_err());
+        assert!(mux.get_pane(spawned.pane_id()).is_none());
+        assert!(mux.get_tab(doomed_tab_id).is_none());
+        assert_eq!(
+            mux.tabs.read().len(),
+            0,
+            "rollback must not leak a temp tab"
+        );
+        assert_eq!(spawned_kills.load(Ordering::SeqCst), 1);
+        assert_eq!(target_kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn slow_floating_spawn_preserves_a_later_user_tab_switch() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (target, _target_kills) = KillCountingPane::new(191, test_size());
+        let (destination, window_id) = register_attached_test_pane(&global_guard, &mux, &target);
+        let (other_pane, _other_kills) = KillCountingPane::new(192, test_size());
+        let other_tab = Arc::new(Tab::new(&test_size()));
+        other_tab.assign_pane(&other_pane);
+        mux.add_tab_and_active_pane(&other_tab)
+            .expect("register other tab");
+        mux.add_tab_to_window(&other_tab, window_id)
+            .expect("attach other tab to destination window");
+        let revision_before_switch = mux
+            .window_order_snapshot(window_id)
+            .expect("valid window")
+            .expect("present window")
+            .order_revision();
+
+        let (spawned, spawned_kills) = KillCountingPane::new(193, test_size());
+        let other_tab_for_hook = Arc::clone(&other_tab);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::with_after_registration(
+            Arc::clone(&spawned),
+            move |mux, _spawned| {
+                let mut window = mux.get_window_mut(window_id).expect("live test window");
+                let other_idx = window
+                    .iter()
+                    .position(|tab| Arc::ptr_eq(tab, &other_tab_for_hook))
+                    .expect("other tab remains attached");
+                window.save_and_then_set_active(other_idx);
+            },
+        ));
+        mux.add_domain(&domain)
+            .expect("register floating test domain");
+
+        let target = mux
+            .capture_floating_spawn_target(window_id)
+            .expect("capture destination before simulated slow spawn");
+        let receipt = promise::spawn::block_on(mux.spawn_floating_pane(
+            target,
+            FloatingPaneRect {
+                left: 1,
+                top: 1,
+                width: 12,
+                height: 6,
+            },
+            test_size(),
+            None,
+            None,
+            SpawnTabDomain::DomainId(1),
+            Arc::new(TermConfig::new()),
+            None,
+        ))
+        .expect("spawn should attach to captured tab without stealing focus");
+
+        assert_eq!(receipt.tab_id(), destination.tab_id());
+        assert!(!receipt.is_focused());
+        assert!(destination.has_floating_pane(spawned.pane_id()));
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid window after spawn")
+            .expect("window remains present");
+        assert_eq!(after.active_tab_id(), Some(other_tab.tab_id()));
+        assert_eq!(
+            after.order_revision().get(),
+            revision_before_switch.get() + 1,
+            "only the simulated user switch may advance window order"
+        );
+        assert_eq!(spawned_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unsupported_floating_domain_rejects_before_spawning_any_pane() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (target, _target_kills) = KillCountingPane::new(194, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &target);
+        let (never_spawned, never_spawned_kills) = KillCountingPane::new(195, test_size());
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::unsupported_floating(
+            Arc::clone(&never_spawned),
+        ));
+        mux.add_domain(&domain)
+            .expect("register unsupported floating test domain");
+        let panes_before = mux.panes.read().len();
+        let tabs_before = mux.tabs.read().len();
+
+        let target = mux
+            .capture_floating_spawn_target(window_id)
+            .expect("capture exact destination");
+        let result = promise::spawn::block_on(mux.spawn_floating_pane(
+            target,
+            FloatingPaneRect {
+                left: 0,
+                top: 0,
+                width: 10,
+                height: 5,
+            },
+            test_size(),
+            None,
+            None,
+            SpawnTabDomain::DomainId(1),
+            Arc::new(TermConfig::new()),
+            None,
+        ));
+
+        assert!(result.is_err());
+        assert_eq!(mux.panes.read().len(), panes_before);
+        assert_eq!(mux.tabs.read().len(), tabs_before);
+        assert!(mux.get_pane(never_spawned.pane_id()).is_none());
+        assert_eq!(never_spawned_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn floating_spawn_topology_exhaustion_rolls_back_before_attachment() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (target, target_kills) = KillCountingPane::new(200, test_size());
+        let (destination, window_id) =
+            register_attached_test_pane(&global_guard, &mux, &target);
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid destination window")
+            .expect("destination window present");
+        let (spawned, spawned_kills) = KillCountingPane::new(201, test_size());
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::new(Some(Arc::clone(&spawned))));
+        mux.add_domain(&domain).expect("register floating test domain");
+        {
+            let mut topology = mux.topology.lock();
+            topology.revision = TopologyRevision(u64::MAX - 2);
+            topology.exhausted = false;
+        }
+
+        let target = mux
+            .capture_floating_spawn_target(window_id)
+            .expect("capture exact destination");
+        let result = promise::spawn::block_on(mux.spawn_floating_pane(
+            target,
+            FloatingPaneRect {
+                left: 0,
+                top: 0,
+                width: 10,
+                height: 5,
+            },
+            test_size(),
+            None,
+            None,
+            SpawnTabDomain::DomainId(1),
+            Arc::new(TermConfig::new()),
+            None,
+        ));
+
+        assert!(result.is_err());
+        assert!(!destination.has_floating_pane(spawned.pane_id()));
+        assert!(mux.get_pane(spawned.pane_id()).is_none());
+        assert_eq!(mux.tabs.read().len(), 1);
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid destination after rollback")
+            .expect("destination remains present");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(after.active_tab_id(), before.active_tab_id());
+        let topology = mux.topology.lock();
+        assert!(topology.exhausted);
+        assert_eq!(topology.revision, TopologyRevision(u64::MAX - 1));
+        assert_eq!(target_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(spawned_kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn floating_spawn_target_detach_rolls_back_with_no_mux_or_tab_locks_held() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (target, _target_kills) = KillCountingPane::new(196, test_size());
+        let (destination, window_id) = register_attached_test_pane(&global_guard, &mux, &target);
+        let weak_mux = Arc::downgrade(&mux);
+        let weak_destination = Arc::downgrade(&destination);
+        let (spawned, spawned_kills) =
+            KillCountingPane::new_with_kill_callback(197, test_size(), move || {
+                let mux = weak_mux
+                    .upgrade()
+                    .expect("rollback callback should retain originating mux");
+                let destination = weak_destination
+                    .upgrade()
+                    .expect("rollback callback should retain destination tab");
+                assert!(mux.pane_registration.try_lock().is_some());
+                assert!(mux.panes.try_write().is_some());
+                assert!(mux.tabs.try_write().is_some());
+                assert!(mux.windows.try_write().is_some());
+                let _ = destination.iter_all_panes();
+            });
+        let destination_for_hook = Arc::clone(&destination);
+        let target_id = target.pane_id();
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::with_after_registration(
+            Arc::clone(&spawned),
+            move |_mux, _spawned| {
+                let removed = destination_for_hook.remove_pane(target_id);
+                assert!(removed.is_some());
+            },
+        ));
+        mux.add_domain(&domain)
+            .expect("register floating test domain");
+
+        let target = mux
+            .capture_floating_spawn_target(window_id)
+            .expect("capture exact destination");
+        let result = promise::spawn::block_on(mux.spawn_floating_pane(
+            target,
+            FloatingPaneRect {
+                left: 0,
+                top: 0,
+                width: 10,
+                height: 5,
+            },
+            test_size(),
+            None,
+            None,
+            SpawnTabDomain::DomainId(1),
+            Arc::new(TermConfig::new()),
+            None,
+        ));
+
+        assert!(result.is_err());
+        assert!(!destination.has_floating_pane(spawned.pane_id()));
+        assert!(mux.get_pane(spawned.pane_id()).is_none());
+        assert_eq!(spawned_kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn floating_spawn_uses_originating_mux_after_global_singleton_swap() {
+        let global_guard = global_test_lock();
+        let originating_mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&originating_mux);
+        let replacement_mux = Arc::new(Mux::new(None));
+        let (target, _target_kills) = KillCountingPane::new(198, test_size());
+        let (destination, window_id) =
+            register_attached_test_pane(&global_guard, &originating_mux, &target);
+        let (spawned, spawned_kills) = KillCountingPane::new(199, test_size());
+        let replacement_for_hook = Arc::clone(&replacement_mux);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::with_after_registration(
+            Arc::clone(&spawned),
+            move |_mux, _spawned| Mux::set_mux(&replacement_for_hook),
+        ));
+        originating_mux
+            .add_domain(&domain)
+            .expect("register floating test domain");
+
+        let target = originating_mux
+            .capture_floating_spawn_target(window_id)
+            .expect("capture exact originating destination");
+        let receipt = promise::spawn::block_on(originating_mux.spawn_floating_pane(
+            target,
+            FloatingPaneRect {
+                left: 2,
+                top: 2,
+                width: 10,
+                height: 5,
+            },
+            test_size(),
+            None,
+            None,
+            SpawnTabDomain::DomainId(1),
+            Arc::new(TermConfig::new()),
+            None,
+        ))
+        .expect("originating mux should retain explicit commit authority");
+
+        assert_eq!(receipt.tab_id(), destination.tab_id());
+        assert!(destination.has_floating_pane(spawned.pane_id()));
+        assert!(originating_mux
+            .get_pane(spawned.pane_id())
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &spawned)));
+        assert!(replacement_mux.get_pane(spawned.pane_id()).is_none());
+        assert!(replacement_mux.tabs.read().is_empty());
+        assert!(replacement_mux.windows.read().is_empty());
+        assert!(Mux::try_get().is_some_and(|mux| Arc::ptr_eq(&mux, &replacement_mux)));
+        assert_eq!(spawned_kills.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -173,62 +173,31 @@ pub async fn spawn_command_internal(
                 Some(id) => id,
                 None => anyhow::bail!("no src window when creating a floating pane?"),
             };
-            // Spawn a new tab (which creates a pane), then move it to floating.
-            // spawn_tab_or_window creates a temporary tab to hold the pane;
-            // we remove that tab from the window after moving the pane to
-            // the destination tab's floating layer so it doesn't appear in
-            // the tab bar as an orphan.
-            //
-            // GH #79: the destination tab MUST be captured before spawning.
-            // spawn_tab_or_window activates the temporary tab it creates
-            // (via save_and_then_set_active), so querying the active tab
-            // after the spawn would attach the floating pane to the
-            // temporary tab — which is removed below, silently destroying
-            // the pane.
-            let dest_tab = mux
-                .get_active_tab_for_window(src_window_id)
-                .ok_or_else(|| anyhow!("no active tab in window to host the floating pane"))?;
-
-            let (spawned_tab, pane, _window_id) = mux
-                .spawn_tab_or_window(
-                    Some(src_window_id),
-                    spawn.domain,
+            // Capture exact destination authority before the domain await.
+            // The mux transaction spawns only a pane, never a temporary tab,
+            // and validates the same pane generation, tab Arc, and window
+            // parent together before attaching it to the floating layer.
+            let target = mux.capture_floating_spawn_target(src_window_id)?;
+            let receipt = mux
+                .spawn_floating_pane(
+                    target,
+                    rect,
+                    size,
                     cmd_builder,
                     cwd,
-                    size,
-                    current_pane_id,
-                    workspace,
-                    spawn.position,
+                    spawn.domain,
+                    term_config,
                     mux.active_identity(),
                 )
                 .await
-                .context("spawn_tab_or_window for floating pane")?;
-
-            pane.set_config(term_config);
-
-            // Move the pane to floating position on the tab the user was on.
-            dest_tab
-                .add_floating_pane(Arc::clone(&pane), rect)
-                .context("add_floating_pane")?;
+                .context("spawn_floating_pane")?;
             log::info!(
-                "Created floating pane {} at ({}, {})",
-                pane.pane_id(),
-                rect.left,
-                rect.top
+                "Created floating pane {} in tab {} at ({}, {})",
+                receipt.pane_id(),
+                receipt.tab_id(),
+                receipt.rect().left,
+                receipt.rect().top,
             );
-
-            // Remove the temporary tab from the window so it doesn't
-            // appear in the tab bar. The pane remains alive via the
-            // Arc held by the destination tab's floating layer. Then
-            // restore the destination tab as active, since the spawn
-            // mutated the window's active index to the temporary tab.
-            let spawned_tab_id = spawned_tab.tab_id();
-            if let Some(mut window) = mux.get_window_mut(src_window_id) {
-                window.remove_by_id(spawned_tab_id);
-                if let Some(idx) = window.idx_by_id(dest_tab.tab_id()) {
-                    window.set_active_without_saving(idx);
-                }
-            }
         }
         _ => {
             let (_tab, pane, window_id) = mux
