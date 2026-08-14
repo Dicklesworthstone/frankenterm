@@ -1571,8 +1571,15 @@ mod tests {
             let bus = bus.clone();
             let barrier = barrier.clone();
             threads.push(std::thread::spawn(move || {
+                let h: Arc<HandlerFn> = Arc::new(|_| {
+                    vec![EventAction::Log {
+                        message: "x".into(),
+                    }]
+                });
+                bus.register(HandlerPriority::Native, None, h)
+                    .expect("initial handler registration should succeed");
                 barrier.wait();
-                for _ in 0..n_ops {
+                for _ in 1..n_ops {
                     let h: Arc<HandlerFn> = Arc::new(|_| {
                         vec![EventAction::Log {
                             message: "x".into(),
@@ -1608,7 +1615,8 @@ mod tests {
 
         // All registrations should have completed.
         assert_eq!(bus.handler_count(), n_registrars * n_ops);
-        // total_actions should be > 0 (handlers accumulated during registration).
+        // Every firer starts only after each registrar has installed one
+        // handler, so this assertion does not depend on thread scheduling.
         assert!(total_actions.load(Ordering::Relaxed) > 0);
     }
 

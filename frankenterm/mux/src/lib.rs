@@ -7444,8 +7444,8 @@ impl Mux {
         };
         let (lifecycle_notification, registration) = publication_result?;
 
-        self.notify_pane_registration_did_bind(pane, &registration);
         self.complete_pane_lifecycle_notification(lifecycle_notification);
+        self.notify_pane_registration_did_bind(pane, &registration);
         self.recompute_pane_count();
         Ok(())
     }
@@ -7574,8 +7574,8 @@ impl Mux {
         let published_pane = publication_result?;
 
         let registration = if let Some((lifecycle_notification, registration)) = published_pane {
-            self.notify_pane_registration_did_bind(&pane, &registration);
             self.complete_pane_lifecycle_notification(lifecycle_notification);
+            self.notify_pane_registration_did_bind(&pane, &registration);
             Some(registration)
         } else {
             self.capture_pane_registration(&pane)
@@ -8530,8 +8530,13 @@ impl Mux {
     /// [`Mux::remove_empty_tab_local_only_if_same`] for transactions that own
     /// the staged tab from registration through publication.
     pub fn remove_tab_local_only_if_same(&self, expected: &Arc<Tab>) -> bool {
-        self.remove_tab_internal_if_same_with_pane_disposition(expected, false)
-            .is_some()
+        let removed = self
+            .remove_tab_internal_if_same_with_pane_disposition(expected, false)
+            .is_some();
+        if removed {
+            self.prune_dead_windows();
+        }
+        removed
     }
 
     /// Roll back an exact, still-empty local tab registration without risking
@@ -14010,7 +14015,7 @@ mod tests {
     }
 
     #[test]
-    fn window_retirement_publishes_parent_before_panes_without_consuming_target_revision() {
+    fn window_retirement_publishes_parent_before_panes_with_distinct_revisions() {
         let _guard = global_test_lock();
         Mux::shutdown();
 
@@ -14026,10 +14031,6 @@ mod tests {
         mux.add_tab_to_window(&tab, window_id)
             .expect("tab window attachment");
         drop(window);
-        mux.get_window_mut(window_id)
-            .expect("target window remains registered")
-            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
-
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_for_subscriber = Arc::clone(&observed);
         mux.subscribe_with_topology(move |envelope| {
@@ -17754,7 +17755,7 @@ mod tests {
     }
 
     #[test]
-    fn window_invalidated_notification_runs_after_window_lock_released() {
+    fn window_topology_notification_runs_after_window_lock_released() {
         let _guard = global_test_lock();
         Mux::shutdown();
 
@@ -17768,9 +17769,10 @@ mod tests {
         let observed_for_subscriber = Arc::clone(&observed);
         let mux_for_subscriber = Arc::clone(&mux);
         mux.subscribe(move |notification| {
-            if let MuxNotification::WindowInvalidated(notified_window_id) = notification {
-                assert_eq!(notified_window_id, window_id);
-                assert!(mux_for_subscriber.get_window(notified_window_id).is_some());
+            if let MuxNotification::WindowTopologyChanged(change) = notification
+                && change.affects_window(window_id)
+            {
+                assert!(mux_for_subscriber.get_window(window_id).is_some());
                 observed_for_subscriber.store(true, Ordering::Relaxed);
             }
             true
@@ -19700,7 +19702,7 @@ mod tests {
             .move_tab_between_windows(tab.tab_id(), dst_window_id, None)
             .expect_err("move must reject ambiguous multi-parent topology");
         assert!(
-            move_error.to_string().contains("has 2 parents"),
+            move_error.to_string().contains("has 2 exact and 2 numeric parents"),
             "unexpected ambiguous-parent error: {:#}",
             move_error
         );
@@ -19789,9 +19791,8 @@ mod tests {
             "transaction rollback must not send a remote pane kill",
         );
         assert!(
-            mux.get_window(window_id)
-                .is_some_and(|candidate| candidate.is_empty()),
-            "exact tab rollback must detach the staged tab before window cancellation",
+            mux.get_window(window_id).is_none(),
+            "exact tab rollback must prune the now-empty published window",
         );
         assert!(
             !mux.remove_tab_local_only_if_same(&tab),

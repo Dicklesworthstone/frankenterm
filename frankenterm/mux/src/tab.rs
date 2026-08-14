@@ -3814,9 +3814,9 @@ impl Tab {
         // retirement, never to construction-time RAII.
         let pane = unpublished.into_pane();
         callbacks.execute(None);
-        mux.notify_pane_registration_did_bind(&pane, &registration);
         mux.recompute_pane_count();
         mux.complete_pane_lifecycle_notification(lifecycle_ticket);
+        mux.notify_pane_registration_did_bind(&pane, &registration);
         Ok((pane, positioned, registration))
     }
 
@@ -5594,9 +5594,6 @@ impl Mux {
         self.discard_removed_pane_states(&retired_pane_ids);
 
         let new_count = published_new.len();
-        for (pane, registration, _) in &published_new {
-            self.notify_pane_registration_did_bind(pane, registration);
-        }
         for envelope in structural_envelopes {
             self.dispatch_notification_envelope(envelope);
         }
@@ -5604,6 +5601,9 @@ impl Mux {
         debug_assert_eq!(new_lifecycle_tickets.len(), new_count);
         for added in new_lifecycle_tickets {
             self.complete_pane_lifecycle_notification(added);
+        }
+        for (pane, registration, _) in &published_new {
+            self.notify_pane_registration_did_bind(pane, registration);
         }
         for removed in removed_registrations {
             self.finish_pane_removal(removed, false);
