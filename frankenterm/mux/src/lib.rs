@@ -5745,6 +5745,13 @@ impl Mux {
             "removed windows must retain one prepared final state"
         );
         anyhow::ensure!(
+            removed_windows.iter().all(|window_id| prepared
+                .iter()
+                .find(|(prepared_id, _)| prepared_id == window_id)
+                .is_some_and(|(_, state)| state.frozen().ordered_tabs().is_empty())),
+            "removed windows must have an empty prepared final state"
+        );
+        anyhow::ensure!(
             created_windows.iter().all(|window_id| prepared
                 .iter()
                 .any(|(prepared_id, _)| prepared_id == window_id)),
@@ -19426,6 +19433,70 @@ mod tests {
         assert_eq!(events.load(Ordering::SeqCst), 0);
 
         drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_transaction_rejects_nonempty_retirement_before_any_mutation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let builder = mux.new_empty_window(Some("invalid-retirement".to_string()), None);
+        let window_id = *builder;
+        let tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&tab).expect("register exact tab");
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach exact tab");
+        drop(builder);
+
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid window")
+            .expect("registered window");
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowTopologyChanged(_)) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe after setup");
+
+        let error = {
+            let mut windows = mux.windows.write();
+            let state = windows
+                .get(&window_id)
+                .expect("window remains registered")
+                .prepare_retirement_marker()
+                .expect("prepare nonempty retirement probe");
+            mux.commit_prepared_window_states_locked(
+                &mut windows,
+                vec![(window_id, state)],
+                Vec::new(),
+                Vec::new(),
+                vec![window_id],
+            )
+            .expect_err("nonempty window retirement must fail closed")
+        };
+        assert!(
+            format!("{error:#}").contains("empty prepared final state"),
+            "unexpected nonempty-retirement error: {error:#}"
+        );
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid window")
+            .expect("registered window");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(after.active_tab_id(), before.active_tab_id());
+        assert_eq!(
+            after.ordered_tab_ids().collect::<Vec<_>>(),
+            before.ordered_tab_ids().collect::<Vec<_>>()
+        );
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+
         Mux::shutdown();
     }
 
