@@ -2132,11 +2132,13 @@ mod pane_registration_handle {
                 tab.tab_id(),
                 self.pane_id()
             );
+            let size = tab.get_size();
             Ok(MoveCommitReceipt::from_exact_parts(
                 Arc::clone(&self.pane),
                 self.registration(),
                 tab,
                 window_id,
+                size,
             ))
         }
     }
@@ -2402,7 +2404,7 @@ mod pane_registration_handle {
             window_id: WindowId,
             size: TerminalSize,
         ) -> Self {
-            debug_assert_eq!(pane.pane_id(), registration.pane_id());
+            debug_assert!(registration.is_same_pane(&pane));
             Self {
                 pane,
                 registration,
@@ -2468,9 +2470,9 @@ mod pane_registration_handle {
             registration: PaneRegistrationHandle,
             tab: Arc<Tab>,
             window_id: WindowId,
+            size: TerminalSize,
         ) -> Self {
-            debug_assert_eq!(pane.pane_id(), registration.pane_id());
-            let size = tab.get_size();
+            debug_assert!(registration.is_same_pane(&pane));
             Self {
                 pane,
                 registration,
@@ -9458,6 +9460,7 @@ impl Mux {
             target.registration(),
             tab,
             window_id,
+            size,
         ))
     }
 
@@ -10508,6 +10511,42 @@ mod tests {
         mux.add_tab_to_window(&tab, window_id)
             .expect("test tab should attach to its exact window");
         (tab, window_id)
+    }
+
+    #[test]
+    fn exact_receipt_construction_does_not_reenter_pane_identity_callbacks() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills, pane_id_calls) =
+            KillCountingPane::new_with_pane_id_counter(216, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("receipt test pane registration");
+        let calls_before_receipts = pane_id_calls.load(Ordering::SeqCst);
+
+        let split = SplitCommitReceipt::from_exact_parts(
+            Arc::clone(&pane),
+            registration.clone(),
+            Arc::clone(&tab),
+            window_id,
+            test_size(),
+        );
+        let moved = MoveCommitReceipt::from_exact_parts(
+            Arc::clone(&pane),
+            registration,
+            tab,
+            window_id,
+            test_size(),
+        );
+
+        assert_eq!(split.pane_id(), 216);
+        assert_eq!(moved.pane_id(), 216);
+        assert_eq!(
+            pane_id_calls.load(Ordering::SeqCst),
+            calls_before_receipts,
+            "receipt construction must use exact registration identity instead of Pane callbacks"
+        );
     }
 
     fn pane_with_blocked_reader(
