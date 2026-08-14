@@ -2534,6 +2534,23 @@ mod pane_registration_handle {
                 && Arc::ptr_eq(&self.generation, &other.generation)
         }
 
+        /// Compare one exact pane allocation without acquiring a retirement
+        /// lease. Internal transactions use this only for preflight and then
+        /// revalidate the generation while holding `pane_registration`.
+        pub(crate) fn is_same_pane(&self, pane: &Arc<dyn Pane>) -> bool {
+            Weak::ptr_eq(&self.pane, &Arc::downgrade(pane))
+        }
+
+        /// Validate this exact weak pane/generation against a live registry
+        /// entry. The caller must hold the owning mux's registration serializer.
+        pub(crate) fn matches_live_registration(
+            &self,
+            registered: &LivePaneRegistration,
+        ) -> bool {
+            Weak::ptr_eq(&self.pane, &Arc::downgrade(&registered.pane))
+                && Arc::ptr_eq(&self.generation, &registered.generation)
+        }
+
         /// Acquire non-cloneable exact authority for a complete pane operation.
         pub fn operation_guard(&self, expected_owner: &Arc<Mux>) -> Option<PaneOperationGuard> {
             let operation = self.generation.try_acquire()?;
