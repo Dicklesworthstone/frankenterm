@@ -1306,6 +1306,109 @@ mod tests {
     }
 }
 
+/// GH #80: config-health propagation for informational CLI subcommands
+/// (`ls-fonts`, `show-keys`).
+///
+/// Documented semantics:
+/// - **Hard-broken config** (the load raised an error, so the process is
+///   running on built-in defaults): every captured message is printed to
+///   stderr and the subcommand exits nonzero. Reporting built-in defaults
+///   as if they were the user's config is worse than failing.
+/// - **Degraded config** (loaded, but some settings were discarded,
+///   unknown, or deprecated): each warning is printed to stderr ahead of
+///   normal stdout output, and the subcommand still exits 0 so a
+///   merely-deprecated key does not break scripted use.
+fn check_cli_config_health() -> anyhow::Result<()> {
+    let error = config::configuration_result()
+        .err()
+        .map(|err| format!("{err}"));
+    let messages = config::configuration_warnings_and_errors();
+    let (lines, fatal) = render_config_health(error.as_deref(), &messages);
+    for line in &lines {
+        eprintln!("{line}");
+    }
+    if fatal {
+        anyhow::bail!(
+            "configuration failed to load (see stderr above); refusing to report built-in defaults as if they were your configuration"
+        );
+    }
+    Ok(())
+}
+
+/// Pure rendering core for [`check_cli_config_health`], split out for unit
+/// testing: turns the captured load error + combined warning/error messages
+/// into labeled stderr lines and a fatality flag.
+fn render_config_health(error: Option<&str>, messages: &[String]) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    for msg in messages {
+        let label = if error == Some(msg.as_str()) {
+            "config error"
+        } else {
+            "config warning"
+        };
+        lines.push(format!("{label}: {msg}"));
+    }
+    if let Some(err) = error {
+        // `configuration_warnings_and_errors()` normally includes the error
+        // as its first entry; keep the fatal line even if it did not.
+        if !messages.iter().any(|msg| msg == err) {
+            lines.push(format!("config error: {err}"));
+        }
+    }
+    (lines, error.is_some())
+}
+
+#[cfg(test)]
+mod config_health_tests {
+    use super::render_config_health;
+
+    /// GH #80 regression: a hard config error must be fatal and labeled.
+    #[test]
+    fn hard_error_is_fatal_and_labeled() {
+        let messages = vec![
+            "runtime error: PROBE_MARKER".to_string(),
+            "Unknown field no_such_option_at_all".to_string(),
+        ];
+        let (lines, fatal) = render_config_health(Some("runtime error: PROBE_MARKER"), &messages);
+        assert!(fatal);
+        assert_eq!(lines[0], "config error: runtime error: PROBE_MARKER");
+        assert_eq!(
+            lines[1],
+            "config warning: Unknown field no_such_option_at_all"
+        );
+    }
+
+    /// GH #80 regression: warnings alone are loud on stderr but not fatal.
+    #[test]
+    fn warnings_only_are_loud_but_not_fatal() {
+        let messages = vec!["Unknown field no_such_option_at_all".to_string()];
+        let (lines, fatal) = render_config_health(None, &messages);
+        assert!(!fatal);
+        assert_eq!(
+            lines,
+            vec!["config warning: Unknown field no_such_option_at_all".to_string()]
+        );
+    }
+
+    /// GH #80 regression: a healthy config produces no stderr chatter.
+    #[test]
+    fn healthy_config_is_silent() {
+        let (lines, fatal) = render_config_health(None, &[]);
+        assert!(!fatal);
+        assert!(lines.is_empty());
+    }
+
+    /// The error stays fatal even if the combined message list somehow
+    /// omitted it; the error line is synthesized so stderr always explains
+    /// the nonzero exit.
+    #[test]
+    fn error_missing_from_messages_is_still_reported() {
+        let (lines, fatal) = render_config_health(Some("boom"), &[]);
+        assert!(fatal);
+        assert_eq!(lines, vec!["config error: boom".to_string()]);
+    }
+}
+
 fn run_show_keys(config: config::ConfigHandle, cmd: &ShowKeysCommand) -> anyhow::Result<()> {
     let map = crate::inputmap::InputMap::new(&config);
     if cmd.lua {
@@ -1319,10 +1422,9 @@ fn run_show_keys(config: config::ConfigHandle, cmd: &ShowKeysCommand) -> anyhow:
 pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyhow::Result<()> {
     use frankenterm_font::parser::ParsedFont;
 
-    if let Err(err) = config::configuration_result() {
-        log::error!("{}", err);
-        return Ok(());
-    }
+    // GH #80: config load errors are handled by check_cli_config_health()
+    // before this subcommand runs — a broken config exits nonzero instead of
+    // silently rendering built-in defaults.
 
     // Disable the normal config error UI window, as we don't have
     // a fully baked GUI environment running
@@ -1730,7 +1832,13 @@ fn run() -> anyhow::Result<()> {
             },
             Some(connect.domain_name),
         ),
-        SubCommand::LsFonts(cmd) => run_ls_fonts(config, &cmd),
-        SubCommand::ShowKeys(cmd) => run_show_keys(config, &cmd),
+        SubCommand::LsFonts(cmd) => {
+            check_cli_config_health()?;
+            run_ls_fonts(config, &cmd)
+        }
+        SubCommand::ShowKeys(cmd) => {
+            check_cli_config_health()?;
+            run_show_keys(config, &cmd)
+        }
     }
 }
