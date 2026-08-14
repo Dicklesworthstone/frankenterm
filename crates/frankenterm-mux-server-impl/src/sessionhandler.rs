@@ -3146,20 +3146,23 @@ fn collect_list_panes_snapshot_with_stage_observer(
         tab_titles.len(),
         window_titles.len()
     );
-    let response = ListPanesResponse {
+    Ok(ListPanesResponse {
         tabs,
         tab_titles,
         window_titles,
         floating_panes,
-    };
+    })
+}
+
+fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
+    let response = collect_list_panes_snapshot_with_stage_observer(
+        mux,
+        &mut ignore_list_panes_snapshot_stage,
+    )?;
     response
         .validate_floating_panes()
         .context("validating collected floating-pane snapshot")?;
     Ok(response)
-}
-
-fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
-    collect_list_panes_snapshot_with_stage_observer(mux, &mut ignore_list_panes_snapshot_stage)
 }
 
 const COHERENT_SNAPSHOT_ATTEMPTS: u8 = 3;
@@ -3223,6 +3226,9 @@ fn collect_coherent_list_panes_snapshot_with_stage_observer(
             ));
         }
         if before_revision == after_revision {
+            panes
+                .validate_floating_panes()
+                .context("validating coherent floating-pane snapshot")?;
             metrics::histogram!("mux.server.coherent_snapshot.attempts").record(attempt as f64);
             metrics::counter!(
                 "mux.server.coherent_snapshot.total",
@@ -8198,8 +8204,7 @@ mod tests {
         let legacy = collect_list_panes_snapshot(&mux).expect("collect legacy pane snapshot");
         let coherent = expect_current_coherent_snapshot(
             &mux,
-            collect_coherent_list_panes_snapshot(&mux)
-                .expect("collect coherent pane snapshot"),
+            collect_coherent_list_panes_snapshot(&mux).expect("collect coherent pane snapshot"),
         );
         let ordered = match collect_ordered_list_panes_snapshot(&mux)
             .expect("collect ordered pane snapshot")
@@ -8228,6 +8233,76 @@ mod tests {
         assert!(snapshot.focused);
         assert!(snapshot.pane.is_active_pane);
         assert!(!snapshot.pane.is_zoomed_pane);
+    }
+
+    #[test]
+    fn coherent_snapshot_retries_a_floating_geometry_callback_cut_before_validation() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_161, None)));
+        attach_snapshot_tab_to_new_window(&mux, &tab);
+        let barrier = NoSleepSnapshotBarrier::shared();
+        let barrier_for_probe = Arc::clone(&barrier);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            barrier_for_probe.collector_arrive();
+        });
+        let floating: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(7_162, probe));
+        mux.add_pane(&floating)
+            .expect("register floating callback-cut pane");
+        let initial = mux::tab::FloatingPaneRect {
+            left: 5,
+            top: 3,
+            width: 31,
+            height: 11,
+        };
+        tab.add_floating_pane(Arc::clone(&floating), initial)
+            .expect("attach floating callback-cut pane");
+
+        let replacement = mux::tab::FloatingPaneRect {
+            left: 13,
+            top: 7,
+            width: 27,
+            height: 9,
+        };
+        let barrier_for_mutator = Arc::clone(&barrier);
+        let tab_for_mutator = Arc::clone(&tab);
+        let mutator = thread::spawn(move || {
+            barrier_for_mutator
+                .mutate(|| tab_for_mutator.set_floating_pane_rect(7_162, replacement))
+        });
+
+        let mut completed_attempts = 0usize;
+        let outcome =
+            collect_coherent_list_panes_snapshot_with_stage_observer(&mux, &mut |stage| {
+                if stage == ListPanesSnapshotStage::TitlesCaptured {
+                    completed_attempts += 1;
+                }
+            });
+        assert!(
+            mutator
+                .join()
+                .expect("floating callback-cut mutator must finish")
+                .is_some(),
+            "floating callback cut must update the pane"
+        );
+        let snapshot = expect_current_coherent_snapshot(
+            &mux,
+            outcome.expect("floating callback-cut retry must remain collectable"),
+        );
+
+        assert_eq!(completed_attempts, 2, "the mixed geometry cut must retry");
+        assert!(barrier.observations() >= 2);
+        let [floating] = snapshot.panes.floating_panes.as_slice() else {
+            panic!("accepted retry must contain the floating pane");
+        };
+        assert_eq!(floating.rect, replacement);
+        assert_eq!(floating.pane.left_col, replacement.left);
+        assert_eq!(floating.pane.top_row, replacement.top);
+        assert_eq!(floating.pane.size.cols, replacement.width);
+        assert_eq!(floating.pane.size.rows, replacement.height);
     }
 
     #[test]

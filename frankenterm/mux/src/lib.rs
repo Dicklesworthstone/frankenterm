@@ -2046,11 +2046,6 @@ mod pane_registration_handle {
             &self.pane
         }
 
-        pub(super) fn matches_live_registration(&self, registered: &LivePaneRegistration) -> bool {
-            Arc::ptr_eq(&self.pane, &registered.pane)
-                && Arc::ptr_eq(&self.generation, &registered.generation)
-        }
-
         pub(crate) fn exact_location(&self) -> anyhow::Result<(DomainId, WindowId, Arc<Tab>)> {
             let domain_id = self.pane.domain_id();
             for window_id in self.owner.iter_windows() {
@@ -5378,32 +5373,6 @@ impl Mux {
         }
     }
 
-    /// Reserve a contiguous topology-revision batch without partial success.
-    ///
-    /// Transactions that must publish more than one legacy notification use
-    /// this before their infallible structural commit. Exhaustion therefore
-    /// cannot leave the topology half-mutated or consume only a prefix of the
-    /// requested publication authority.
-    pub(crate) fn try_envelope_topology_batch<const N: usize>(
-        &self,
-        notifications: [MuxNotification; N],
-    ) -> Result<[MuxNotificationEnvelope; N], TopologyRevisionExhausted> {
-        debug_assert!(notifications.iter().all(MuxNotification::is_topology));
-        let first = self.topology.lock().reserve_revisions(N)?;
-        let mut notifications = IntoIterator::into_iter(notifications);
-        Ok(std::array::from_fn(|index| MuxNotificationEnvelope {
-            notification: notifications
-                .next()
-                .expect("array iterator must yield every reserved notification"),
-            topology: MuxTopologyStamp::Revision(TopologyRevision(
-                first
-                    .get()
-                    .checked_add(u64::try_from(index).expect("array index fits u64"))
-                    .expect("reserved topology batch cannot overflow"),
-            )),
-        }))
-    }
-
     /// Publish a generic mux notification.
     ///
     /// Pane add/remove transitions are deliberately rejected here: only the
@@ -5855,11 +5824,7 @@ impl Mux {
         ready_tokens
             .try_reserve_exact(pane_ids.len())
             .map_err(|error| anyhow!("reserve lifecycle batch readiness tokens: {error}"))?;
-        ready_tokens.extend(
-            pane_ids
-                .iter()
-                .map(|_| Arc::new(AtomicBool::new(false))),
-        );
+        ready_tokens.extend(pane_ids.iter().map(|_| Arc::new(AtomicBool::new(false))));
 
         let mut entries = Vec::new();
         entries

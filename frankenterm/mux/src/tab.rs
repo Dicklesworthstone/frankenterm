@@ -951,10 +951,6 @@ pub(crate) struct PreparedFloatingPaneGeometry {
 }
 
 impl PreparedFloatingPaneGeometry {
-    pub(crate) fn rect(self) -> FloatingPaneRect {
-        self.rect
-    }
-
     pub(crate) fn size(self) -> TerminalSize {
         self.size
     }
@@ -1004,20 +1000,30 @@ pub struct DomainFloatingPaneReconcileReceipt {
     pub retired_pane_ids: Vec<PaneId>,
 }
 
+/// Wire-authoritative snapshots admit at most one floating overlay for each
+/// entry under the codec's 16,384-pane floating ceiling. Keep this mux-side
+/// admission guard independent of the codec crate so the mux does not acquire
+/// a dependency cycle.
+const MAX_DOMAIN_FLOATING_PANES_PER_RECONCILE: usize = 16_384;
+/// An authoritative domain snapshot can contain the codec's complete tiled
+/// leaf set plus its independent floating-pane set.
+const MAX_DOMAIN_PANES_PER_RECONCILE: usize = MAX_DOMAIN_FLOATING_PANES_PER_RECONCILE * 2;
+
 struct PreparedDomainPanePublication<'a> {
     pane: Arc<dyn Pane>,
     pane_id: PaneId,
     preparation_claim: crate::PanePreparationClaim<'a>,
     reader_start_gate: Option<crate::PaneReaderStartGate>,
-    registration_reservation:
-        Option<crate::pane_registration_handle::PaneRegistrationReservation>,
+    registration_reservation: Option<crate::pane_registration_handle::PaneRegistrationReservation>,
 }
 
 struct ObservedDomainFloatingTab {
     tab: Arc<Tab>,
     panes: Vec<Arc<dyn Pane>>,
+    non_floating_panes: Vec<Arc<dyn Pane>>,
     floating_panes: Vec<FloatingPane>,
     floating_focus: Option<PaneId>,
+    zoomed_pane: Option<Arc<dyn Pane>>,
     size: TerminalSize,
     parent_window_id: Option<WindowId>,
 }
@@ -2970,6 +2976,19 @@ fn observe_pane_id_for_mutation(pane: &Arc<dyn Pane>) -> anyhow::Result<PaneId> 
     })
 }
 
+fn observe_pane_domain_id_for_mutation(pane: &Arc<dyn Pane>) -> anyhow::Result<DomainId> {
+    catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| pane.domain_id()),
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "pane domain callback panicked for exact pane identity {:p}",
+            Arc::as_ptr(pane)
+        )
+    })
+}
+
 fn exact_pane_identity_set(panes: &[Arc<dyn Pane>]) -> HashSet<PaneIdentity> {
     panes.iter().map(pane_identity).collect()
 }
@@ -4607,6 +4626,988 @@ impl Tab {
     }
 }
 
+impl Mux {
+    /// Reconcile one domain's complete floating-pane overlay against an
+    /// authoritative remote snapshot.
+    ///
+    /// `authoritative_panes` names every pane from that domain which survives
+    /// the snapshot, tiled or floating. `desired` names the floating subset.
+    /// Existing foreign-domain floats are preserved. New floating-only panes
+    /// are registered in the same structural cut that attaches them, while
+    /// stale ownerless registrations are retired without invoking
+    /// `Pane::kill`, `Pane::resize`, or `Pane::focus_changed`.
+    ///
+    /// Any callback, allocation, identity, geometry, domain, registration,
+    /// tab, window, or topology-revision failure occurs before mutation. The
+    /// final callback-free cut follows the mux lock order
+    /// `domain_registration -> pane_registration -> tabs -> windows ->
+    /// Tab::inner (stable pointer order) -> pane_preparations -> panes ->
+    /// retiring panes -> pending output -> pending lifecycle -> topology`.
+    pub fn reconcile_domain_floating_panes(
+        self: &Arc<Self>,
+        domain_id: DomainId,
+        authoritative_panes: Vec<Arc<dyn Pane>>,
+        desired: Vec<DomainFloatingPaneState>,
+    ) -> anyhow::Result<DomainFloatingPaneReconcileReceipt> {
+        anyhow::ensure!(
+            authoritative_panes.len() <= MAX_DOMAIN_PANES_PER_RECONCILE,
+            "authoritative domain snapshot has {} panes; maximum is {}",
+            authoritative_panes.len(),
+            MAX_DOMAIN_PANES_PER_RECONCILE
+        );
+        anyhow::ensure!(
+            desired.len() <= MAX_DOMAIN_FLOATING_PANES_PER_RECONCILE,
+            "authoritative domain snapshot has {} floating panes; maximum is {}",
+            desired.len(),
+            MAX_DOMAIN_FLOATING_PANES_PER_RECONCILE
+        );
+        let expected_domain = self
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow::anyhow!("domain {domain_id} is not registered"))?;
+
+        let mut authoritative_by_identity = HashMap::new();
+        authoritative_by_identity
+            .try_reserve(authoritative_panes.len())
+            .map_err(|error| anyhow::anyhow!("reserve authoritative pane identities: {error}"))?;
+        let mut authoritative_ids = HashSet::new();
+        authoritative_ids
+            .try_reserve(authoritative_panes.len())
+            .map_err(|error| anyhow::anyhow!("reserve authoritative pane ids: {error}"))?;
+        for pane in authoritative_panes {
+            let pane_id = observe_pane_id_for_mutation(&pane)?;
+            let observed_domain_id = observe_pane_domain_id_for_mutation(&pane)?;
+            anyhow::ensure!(
+                observed_domain_id == domain_id,
+                "authoritative pane {pane_id} belongs to domain {observed_domain_id}, not {domain_id}"
+            );
+            let identity = pane_identity(&pane);
+            anyhow::ensure!(
+                authoritative_by_identity
+                    .insert(identity, (pane_id, Arc::clone(&pane)))
+                    .is_none(),
+                "authoritative pane {pane_id} appears more than once by exact identity"
+            );
+            anyhow::ensure!(
+                authoritative_ids.insert(pane_id),
+                "authoritative domain snapshot contains duplicate pane id {pane_id}"
+            );
+        }
+
+        let mut desired_by_identity = HashMap::new();
+        desired_by_identity
+            .try_reserve(desired.len())
+            .map_err(|error| anyhow::anyhow!("reserve desired floating identities: {error}"))?;
+        let mut desired_ids = HashSet::new();
+        desired_ids
+            .try_reserve(desired.len())
+            .map_err(|error| anyhow::anyhow!("reserve desired floating pane ids: {error}"))?;
+        let mut desired_by_tab: HashMap<usize, Vec<DomainFloatingPaneState>> = HashMap::new();
+        desired_by_tab
+            .try_reserve(desired.len())
+            .map_err(|error| anyhow::anyhow!("reserve desired floating tab index: {error}"))?;
+        for state in desired {
+            anyhow::ensure!(
+                state.rect.width > 0 && state.rect.height > 0,
+                "floating pane {} has an empty rectangle",
+                state.pane_id
+            );
+            anyhow::ensure!(
+                state.opacity.is_finite() && (0.0..=1.0).contains(&state.opacity),
+                "floating pane {} has invalid opacity {}",
+                state.pane_id,
+                state.opacity
+            );
+            anyhow::ensure!(
+                !state.focused || state.visible,
+                "hidden floating pane {} cannot be focused",
+                state.pane_id
+            );
+            let observed_id = observe_pane_id_for_mutation(&state.pane)?;
+            anyhow::ensure!(
+                observed_id == state.pane_id,
+                "floating pane state names id {}, but its exact pane reports {observed_id}",
+                state.pane_id
+            );
+            let observed_domain_id = observe_pane_domain_id_for_mutation(&state.pane)?;
+            anyhow::ensure!(
+                observed_domain_id == domain_id,
+                "floating pane {} belongs to domain {observed_domain_id}, not {domain_id}",
+                state.pane_id
+            );
+            let identity = pane_identity(&state.pane);
+            let Some((authoritative_id, authoritative_pane)) =
+                authoritative_by_identity.get(&identity)
+            else {
+                anyhow::bail!(
+                    "floating pane {} is absent from the authoritative domain pane set",
+                    state.pane_id
+                );
+            };
+            anyhow::ensure!(
+                *authoritative_id == state.pane_id && Arc::ptr_eq(authoritative_pane, &state.pane),
+                "floating pane {} does not match its authoritative exact pane identity",
+                state.pane_id
+            );
+            anyhow::ensure!(
+                desired_by_identity
+                    .insert(identity, state.pane_id)
+                    .is_none(),
+                "floating pane {} has more than one desired tab owner",
+                state.pane_id
+            );
+            anyhow::ensure!(
+                desired_ids.insert(state.pane_id),
+                "floating pane id {} appears more than once",
+                state.pane_id
+            );
+            desired_by_tab
+                .entry(Arc::as_ptr(&state.tab) as usize)
+                .or_default()
+                .push(state);
+        }
+
+        let mut existing_authoritative = HashMap::new();
+        existing_authoritative
+            .try_reserve(authoritative_by_identity.len())
+            .map_err(|error| anyhow::anyhow!("reserve authoritative registrations: {error}"))?;
+        let mut prepared_new = Vec::new();
+        prepared_new
+            .try_reserve_exact(desired_by_identity.len())
+            .map_err(|error| anyhow::anyhow!("reserve new floating publications: {error}"))?;
+
+        for (&identity, (pane_id, pane)) in &authoritative_by_identity {
+            if let Some(registration) = self.capture_pane_registration(pane) {
+                anyhow::ensure!(
+                    registration.pane_id() == *pane_id,
+                    "authoritative pane registration changed numeric identity"
+                );
+                existing_authoritative.insert(identity, registration);
+                continue;
+            }
+            anyhow::ensure!(
+                desired_by_identity.contains_key(&identity),
+                "authoritative tiled pane {pane_id} is not registered"
+            );
+            let Some(preparation_claim) = self.claim_pane_preparation(pane)? else {
+                let registration = self.capture_pane_registration(pane).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pane {pane_id} became registered without exact capture authority"
+                    )
+                })?;
+                existing_authoritative.insert(identity, registration);
+                continue;
+            };
+            anyhow::ensure!(
+                preparation_claim.domain_id == domain_id,
+                "new floating pane {pane_id} changed domain during preparation"
+            );
+            let prepared = self.prepare_claimed_pane_registration(
+                pane,
+                preparation_claim.pane_id,
+                &preparation_claim.generation,
+            )?;
+            let (reader_start_gate, registration_reservation) =
+                self.spawn_prepared_pane_reader(pane, prepared, &preparation_claim.generation)?;
+            prepared_new.push(PreparedDomainPanePublication {
+                pane: Arc::clone(pane),
+                pane_id: *pane_id,
+                preparation_claim,
+                reader_start_gate,
+                registration_reservation: Some(registration_reservation),
+            });
+        }
+        prepared_new.sort_unstable_by_key(|prepared| prepared.pane_id);
+
+        let (live_registrations, live_by_id, live_by_identity) = {
+            let _registration = self.pane_registration.lock();
+            let panes = self.panes.read();
+            let mut live_registrations = Vec::new();
+            live_registrations
+                .try_reserve_exact(panes.len())
+                .map_err(|error| anyhow::anyhow!("reserve live pane registrations: {error}"))?;
+            let mut live_by_id = HashMap::new();
+            live_by_id
+                .try_reserve(panes.len())
+                .map_err(|error| anyhow::anyhow!("reserve live pane id index: {error}"))?;
+            let mut live_by_identity = HashMap::new();
+            live_by_identity
+                .try_reserve(panes.len())
+                .map_err(|error| anyhow::anyhow!("reserve live pane identity index: {error}"))?;
+            for (&pane_id, registered) in panes.iter() {
+                let index = live_registrations.len();
+                let registration =
+                    PaneRegistrationHandle::new(&registered.pane, &registered.generation);
+                live_registrations.push((
+                    pane_id,
+                    Arc::clone(&registered.pane),
+                    registration,
+                    registered.domain_id,
+                ));
+                anyhow::ensure!(
+                    live_by_id.insert(pane_id, index).is_none(),
+                    "live pane registry contains duplicate pane id {pane_id}"
+                );
+                anyhow::ensure!(
+                    live_by_identity
+                        .insert(pane_identity(&registered.pane), index)
+                        .is_none(),
+                    "one exact pane identity has multiple live registrations"
+                );
+            }
+            (live_registrations, live_by_id, live_by_identity)
+        };
+
+        for (&identity, registration) in &existing_authoritative {
+            let Some(&index) = live_by_identity.get(&identity) else {
+                anyhow::bail!("authoritative pane registration retired during preflight");
+            };
+            let (pane_id, _, current, registered_domain_id) = &live_registrations[index];
+            anyhow::ensure!(
+                registration.same_registration(current),
+                "authoritative pane {pane_id} changed registration generation during preflight"
+            );
+            anyhow::ensure!(
+                *registered_domain_id == domain_id,
+                "authoritative pane {pane_id} is registered to domain {registered_domain_id}, not {domain_id}"
+            );
+        }
+
+        let registered_tabs_snapshot = self.tabs.read().clone();
+        let windows_snapshot = self
+            .windows
+            .read()
+            .iter()
+            .map(|(&window_id, window)| (window_id, window.iter().cloned().collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let mut observed_tabs = registered_tabs_snapshot
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut observed_tab_identities = HashSet::new();
+        observed_tab_identities
+            .try_reserve(
+                observed_tabs
+                    .len()
+                    .saturating_add(windows_snapshot.iter().map(|(_, tabs)| tabs.len()).sum()),
+            )
+            .map_err(|error| anyhow::anyhow!("reserve observed tab identities: {error}"))?;
+        for tab in &observed_tabs {
+            anyhow::ensure!(
+                observed_tab_identities.insert(Arc::as_ptr(tab) as usize),
+                "registered tab map aliases one exact tab identity"
+            );
+        }
+        for (_, tabs) in &windows_snapshot {
+            for tab in tabs {
+                if observed_tab_identities.insert(Arc::as_ptr(tab) as usize) {
+                    observed_tabs.push(Arc::clone(tab));
+                }
+            }
+        }
+        observed_tabs.sort_unstable_by_key(|tab| Arc::as_ptr(tab) as usize);
+
+        let mut parent_windows: HashMap<usize, Option<WindowId>> = HashMap::new();
+        parent_windows
+            .try_reserve(observed_tabs.len())
+            .map_err(|error| anyhow::anyhow!("reserve tab parent index: {error}"))?;
+        for tab in &observed_tabs {
+            parent_windows.insert(Arc::as_ptr(tab) as usize, None);
+        }
+        for (window_id, tabs) in &windows_snapshot {
+            for tab in tabs {
+                let identity = Arc::as_ptr(tab) as usize;
+                let parent = parent_windows.get_mut(&identity).ok_or_else(|| {
+                    anyhow::anyhow!("window {window_id} contains an unobserved tab")
+                })?;
+                anyhow::ensure!(
+                    parent.is_none(),
+                    "tab {} is attached to more than one window",
+                    tab.tab_id
+                );
+                *parent = Some(*window_id);
+            }
+        }
+
+        for (&tab_identity, states) in &desired_by_tab {
+            let tab = &states[0].tab;
+            anyhow::ensure!(
+                observed_tabs
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, tab)),
+                "desired floating tab {} is not owned by this mux",
+                tab.tab_id
+            );
+            anyhow::ensure!(
+                parent_windows
+                    .get(&tab_identity)
+                    .copied()
+                    .flatten()
+                    .is_some(),
+                "desired floating tab {} is not attached to exactly one window",
+                tab.tab_id
+            );
+            anyhow::ensure!(
+                states.iter().filter(|state| state.focused).count() <= 1,
+                "desired tab {} has more than one focused floating pane",
+                tab.tab_id
+            );
+        }
+
+        let mut observed = Vec::new();
+        observed
+            .try_reserve_exact(observed_tabs.len())
+            .map_err(|error| anyhow::anyhow!("reserve observed floating tabs: {error}"))?;
+        for tab in observed_tabs {
+            let inner = tab.inner.lock();
+            if let Some(states) = desired_by_tab.get(&(Arc::as_ptr(&tab) as usize)) {
+                for state in states {
+                    anyhow::ensure!(
+                        inner.clamp_floating_rect(state.rect) == state.rect,
+                        "floating pane {} rectangle is outside local tab {} geometry",
+                        state.pane_id,
+                        tab.tab_id
+                    );
+                }
+            }
+            observed.push(ObservedDomainFloatingTab {
+                parent_window_id: parent_windows
+                    .get(&(Arc::as_ptr(&tab) as usize))
+                    .copied()
+                    .flatten(),
+                panes: inner.snapshot_panes_callback_free(),
+                non_floating_panes: inner.snapshot_non_floating_panes_callback_free(),
+                floating_panes: inner.floating_panes.clone(),
+                floating_focus: inner.floating_focus,
+                zoomed_pane: inner.zoomed.as_ref().map(Arc::clone),
+                size: inner.size,
+                tab,
+            });
+        }
+
+        let mut structural_ids = HashMap::new();
+        let structural_count = observed.iter().try_fold(0usize, |count, tab| {
+            count
+                .checked_add(tab.panes.len())
+                .ok_or_else(|| anyhow::anyhow!("structural pane census count overflow"))
+        })?;
+        structural_ids
+            .try_reserve(structural_count)
+            .map_err(|error| anyhow::anyhow!("reserve structural pane identities: {error}"))?;
+        for tab in &observed {
+            for pane in &tab.panes {
+                let identity = pane_identity(pane);
+                if structural_ids.contains_key(&identity) {
+                    continue;
+                }
+                let pane_id = observe_pane_id_for_mutation(pane)?;
+                structural_ids.insert(identity, pane_id);
+            }
+        }
+
+        let mut owner_counts: HashMap<PaneIdentity, (usize, usize)> = HashMap::new();
+        owner_counts
+            .try_reserve(structural_count)
+            .map_err(|error| anyhow::anyhow!("reserve structural owner census: {error}"))?;
+        for tab in &observed {
+            for pane in &tab.non_floating_panes {
+                let identity = pane_identity(pane);
+                owner_counts.entry(identity).or_default().0 += 1;
+            }
+            for floating in &tab.floating_panes {
+                let identity = pane_identity(&floating.pane);
+                let observed_id = structural_ids.get(&identity).copied().ok_or_else(|| {
+                    anyhow::anyhow!("floating pane is absent from its tab's structural census")
+                })?;
+                anyhow::ensure!(
+                    observed_id == floating.pane_id,
+                    "floating pane stored id {} disagrees with exact pane id {observed_id}",
+                    floating.pane_id
+                );
+                owner_counts.entry(identity).or_default().1 += 1;
+            }
+        }
+
+        for (&identity, &(non_floating, floating)) in &owner_counts {
+            let pane_id = structural_ids[&identity];
+            let Some(&live_index) = live_by_id.get(&pane_id) else {
+                anyhow::bail!("structurally owned pane {pane_id} is not registered");
+            };
+            let (_, live_pane, _, registered_domain_id) = &live_registrations[live_index];
+            anyhow::ensure!(
+                pane_identity(live_pane) == identity,
+                "structurally owned pane id {pane_id} resolves to another exact registration"
+            );
+            let authoritative = authoritative_by_identity.contains_key(&identity);
+            let desired_floating = desired_by_identity.contains_key(&identity);
+            if *registered_domain_id != domain_id {
+                anyhow::ensure!(
+                    non_floating.saturating_add(floating) == 1,
+                    "foreign-domain pane {pane_id} has multiple structural owners"
+                );
+            } else if desired_floating {
+                anyhow::ensure!(
+                    non_floating == 0 && floating <= 1,
+                    "desired floating pane {pane_id} is also tiled or multiply owned"
+                );
+            } else if authoritative {
+                anyhow::ensure!(
+                    non_floating == 1 && floating <= 1,
+                    "authoritative tiled pane {pane_id} lacks one exact tiled owner or has duplicate floats"
+                );
+            } else {
+                anyhow::ensure!(
+                    non_floating == 0 && floating <= 1,
+                    "stale domain pane {pane_id} remains tiled or multiply owned"
+                );
+            }
+        }
+
+        for (&identity, (pane_id, _)) in &authoritative_by_identity {
+            let (non_floating, floating) = owner_counts.get(&identity).copied().unwrap_or_default();
+            if desired_by_identity.contains_key(&identity) {
+                anyhow::ensure!(
+                    non_floating == 0 && floating <= 1,
+                    "desired floating pane {pane_id} has an incompatible current owner"
+                );
+            } else {
+                anyhow::ensure!(
+                    non_floating == 1,
+                    "authoritative tiled pane {pane_id} is missing from the prepared tiled topology"
+                );
+            }
+        }
+
+        let mut prepared_tabs = Vec::new();
+        prepared_tabs
+            .try_reserve_exact(observed.len())
+            .map_err(|error| anyhow::anyhow!("reserve floating tab replacements: {error}"))?;
+        let mut changed_tab_ids = Vec::new();
+        changed_tab_ids
+            .try_reserve_exact(observed.len())
+            .map_err(|error| anyhow::anyhow!("reserve changed floating tabs: {error}"))?;
+        let mut invalidated_window_ids = HashSet::new();
+        invalidated_window_ids
+            .try_reserve(observed.len())
+            .map_err(|error| anyhow::anyhow!("reserve invalidated floating windows: {error}"))?;
+
+        for tab in &observed {
+            let states = desired_by_tab
+                .get(&(Arc::as_ptr(&tab.tab) as usize))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(tab.floating_panes.len().saturating_add(states.len()))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "reserve floating replacement for tab {}: {error}",
+                        tab.tab.tab_id
+                    )
+                })?;
+            let mut foreign_focus = None;
+            for floating in &tab.floating_panes {
+                let identity = pane_identity(&floating.pane);
+                let pane_id = structural_ids[&identity];
+                let live_index = live_by_id[&pane_id];
+                let registered_domain_id = live_registrations[live_index].3;
+                if registered_domain_id == domain_id {
+                    continue;
+                }
+                if tab.floating_focus == Some(floating.pane_id) {
+                    anyhow::ensure!(
+                        floating.visible,
+                        "foreign hidden floating pane {} is focused",
+                        floating.pane_id
+                    );
+                    foreign_focus = Some(floating.pane_id);
+                }
+                replacement.push(floating.clone());
+            }
+            if let Some(focused) = tab.floating_focus {
+                anyhow::ensure!(
+                    tab.floating_panes
+                        .iter()
+                        .any(|floating| floating.pane_id == focused),
+                    "tab {} floating focus names absent pane {focused}",
+                    tab.tab.tab_id
+                );
+            }
+            let desired_focus = states
+                .iter()
+                .find(|state| state.focused)
+                .map(|state| state.pane_id);
+            anyhow::ensure!(
+                desired_focus.is_none() || tab.zoomed_pane.is_none(),
+                "tab {} cannot focus a floating pane while a tiled pane is zoomed",
+                tab.tab.tab_id
+            );
+            anyhow::ensure!(
+                foreign_focus.is_none() || tab.zoomed_pane.is_none(),
+                "tab {} has foreign floating focus while a tiled pane is zoomed",
+                tab.tab.tab_id
+            );
+            anyhow::ensure!(
+                foreign_focus.is_none() || desired_focus.is_none(),
+                "tab {} cannot preserve foreign floating focus while applying domain focus",
+                tab.tab.tab_id
+            );
+            for state in states {
+                replacement.push(FloatingPane {
+                    pane: Arc::clone(&state.pane),
+                    pane_id: state.pane_id,
+                    rect: state.rect,
+                    z_order: state.z_order,
+                    visible: state.visible,
+                    pinned: state.pinned,
+                    opacity: state.opacity,
+                });
+            }
+            let floating_focus = desired_focus.or(foreign_focus);
+            let changed = tab.floating_focus != floating_focus
+                || !floating_pane_vectors_eq(&tab.floating_panes, &replacement);
+            if changed {
+                changed_tab_ids.push(tab.tab.tab_id);
+                if let Some(window_id) = tab.parent_window_id {
+                    invalidated_window_ids.insert(window_id);
+                }
+            }
+            prepared_tabs.push(PreparedDomainFloatingTab {
+                replacement: changed.then_some(replacement),
+                floating_focus,
+                changed,
+            });
+        }
+        changed_tab_ids.sort_unstable();
+        let mut invalidated_window_ids = invalidated_window_ids.into_iter().collect::<Vec<_>>();
+        invalidated_window_ids.sort_unstable();
+
+        let mut stale_registrations = live_registrations
+            .iter()
+            .filter(|(_, pane, _, registered_domain_id)| {
+                *registered_domain_id == domain_id
+                    && !authoritative_by_identity.contains_key(&pane_identity(pane))
+            })
+            .map(|(pane_id, pane, registration, _)| {
+                (*pane_id, Arc::clone(pane), registration.clone())
+            })
+            .collect::<Vec<_>>();
+        stale_registrations.sort_unstable_by_key(|(pane_id, _, _)| *pane_id);
+        let registered_pane_ids = prepared_new
+            .iter()
+            .map(|prepared| prepared.pane_id)
+            .collect::<Vec<_>>();
+        let retired_pane_ids = stale_registrations
+            .iter()
+            .map(|(pane_id, _, _)| *pane_id)
+            .collect::<Vec<_>>();
+
+        if prepared_tabs.iter().all(|tab| !tab.changed)
+            && prepared_new.is_empty()
+            && stale_registrations.is_empty()
+        {
+            return Ok(DomainFloatingPaneReconcileReceipt::default());
+        }
+
+        let mut structural_notifications = Vec::new();
+        structural_notifications
+            .try_reserve_exact(
+                invalidated_window_ids
+                    .len()
+                    .checked_add(changed_tab_ids.len())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("floating topology notification count overflow")
+                    })?,
+            )
+            .map_err(|error| anyhow::anyhow!("reserve floating topology notifications: {error}"))?;
+        structural_notifications.extend(
+            invalidated_window_ids
+                .iter()
+                .copied()
+                .map(MuxNotification::WindowInvalidated),
+        );
+        structural_notifications.extend(
+            changed_tab_ids
+                .iter()
+                .copied()
+                .map(MuxNotification::TabResized),
+        );
+
+        let mut lifecycle_ids = Vec::new();
+        lifecycle_ids
+            .try_reserve_exact(prepared_new.len().saturating_add(stale_registrations.len()))
+            .map_err(|error| anyhow::anyhow!("reserve floating lifecycle ids: {error}"))?;
+        lifecycle_ids.extend(prepared_new.iter().map(|prepared| prepared.pane_id));
+        lifecycle_ids.extend(stale_registrations.iter().map(|(pane_id, _, _)| *pane_id));
+
+        let mut structural_envelopes = Vec::new();
+        structural_envelopes
+            .try_reserve_exact(structural_notifications.len())
+            .map_err(|error| anyhow::anyhow!("reserve floating topology envelopes: {error}"))?;
+        let mut published_new = Vec::new();
+        published_new
+            .try_reserve_exact(prepared_new.len())
+            .map_err(|error| anyhow::anyhow!("reserve published floating panes: {error}"))?;
+        let mut removed_components = Vec::new();
+        removed_components
+            .try_reserve_exact(stale_registrations.len())
+            .map_err(|error| anyhow::anyhow!("reserve retired floating panes: {error}"))?;
+        let mut removed_registrations = Vec::new();
+        removed_registrations
+            .try_reserve_exact(stale_registrations.len())
+            .map_err(|error| anyhow::anyhow!("reserve removed floating registrations: {error}"))?;
+        let mut new_lifecycle_tickets = Vec::new();
+        new_lifecycle_tickets
+            .try_reserve_exact(prepared_new.len())
+            .map_err(|error| anyhow::anyhow!("reserve new floating lifecycle tickets: {error}"))?;
+        let mut output_batches = Vec::new();
+        output_batches
+            .try_reserve_exact(stale_registrations.len())
+            .map_err(|error| anyhow::anyhow!("reserve retired floating output batches: {error}"))?;
+        let mut lifecycle_notifications = Vec::new();
+        lifecycle_notifications
+            .try_reserve_exact(lifecycle_ids.len())
+            .map_err(|error| anyhow::anyhow!("reserve floating lifecycle payloads: {error}"))?;
+        let mut tab_guards = Vec::new();
+        tab_guards
+            .try_reserve_exact(observed.len())
+            .map_err(|error| anyhow::anyhow!("reserve floating tab lock guards: {error}"))?;
+
+        let (
+            published_new,
+            new_lifecycle_tickets,
+            removed_registrations,
+            output_batches,
+            structural_envelopes,
+        ) = {
+            let _domain_registration = self.domain_registration.lock();
+            anyhow::ensure!(
+                !self.retired_domain_ids.lock().contains(&domain_id)
+                    && self
+                        .domains
+                        .read()
+                        .get(&domain_id)
+                        .is_some_and(|domain| Arc::ptr_eq(domain, &expected_domain)),
+                "domain {domain_id} retired or changed identity before floating reconciliation"
+            );
+
+            let _registration = self.pane_registration.lock();
+            let registered_tabs = self.tabs.read();
+            anyhow::ensure!(
+                registered_tabs.len() == registered_tabs_snapshot.len()
+                    && registered_tabs_snapshot.iter().all(|(tab_id, expected)| {
+                        registered_tabs
+                            .get(tab_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, expected))
+                    }),
+                "registered tab set changed during floating reconciliation"
+            );
+            let windows = self.windows.read();
+            anyhow::ensure!(
+                windows.len() == windows_snapshot.len()
+                    && windows_snapshot.iter().all(|(window_id, expected_tabs)| {
+                        windows.get(window_id).is_some_and(|window| {
+                            window.len() == expected_tabs.len()
+                                && window
+                                    .iter()
+                                    .zip(expected_tabs)
+                                    .all(|(current, expected)| Arc::ptr_eq(current, expected))
+                        })
+                    }),
+                "window tab topology changed during floating reconciliation"
+            );
+
+            tab_guards.extend(observed.iter().map(|tab| tab.tab.inner.lock()));
+            for (guard, expected) in tab_guards.iter().zip(&observed) {
+                let current = guard.snapshot_panes_callback_free();
+                let current_non_floating = guard.snapshot_non_floating_panes_callback_free();
+                anyhow::ensure!(
+                    guard.size == expected.size
+                        && guard.floating_focus == expected.floating_focus
+                        && floating_pane_vectors_eq(
+                            &guard.floating_panes,
+                            &expected.floating_panes
+                        )
+                        && current.len() == expected.panes.len()
+                        && current
+                            .iter()
+                            .zip(&expected.panes)
+                            .all(|(current, expected)| Arc::ptr_eq(current, expected))
+                        && current_non_floating.len() == expected.non_floating_panes.len()
+                        && current_non_floating
+                            .iter()
+                            .zip(&expected.non_floating_panes)
+                            .all(|(current, expected)| Arc::ptr_eq(current, expected))
+                        && match (&guard.zoomed, &expected.zoomed_pane) {
+                            (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+                            (None, None) => true,
+                            _ => false,
+                        },
+                    "tab {} changed during floating reconciliation",
+                    expected.tab.tab_id
+                );
+            }
+
+            for prepared in &prepared_new {
+                anyhow::ensure!(
+                    prepared.preparation_claim.is_authoritative_locked(),
+                    "new floating pane {} preparation was cancelled",
+                    prepared.pane_id
+                );
+            }
+
+            let mut panes = self.panes.write();
+            anyhow::ensure!(
+                panes
+                    .values()
+                    .filter(|registered| registered.domain_id == domain_id)
+                    .count()
+                    == live_registrations
+                        .iter()
+                        .filter(|(_, _, _, registered_domain_id)| {
+                            *registered_domain_id == domain_id
+                        })
+                        .count(),
+                "domain pane registration set changed during floating reconciliation"
+            );
+            for (pane_id, pane, registration, registered_domain_id) in &live_registrations {
+                if *registered_domain_id == domain_id
+                    || structural_ids.contains_key(&pane_identity(pane))
+                {
+                    anyhow::ensure!(
+                        panes.get(pane_id).is_some_and(|current| {
+                            current.domain_id == *registered_domain_id
+                                && Arc::ptr_eq(&current.pane, pane)
+                                && registration.matches_live_registration(current)
+                        }),
+                        "pane {pane_id} registration changed during floating reconciliation"
+                    );
+                }
+            }
+            for prepared in &prepared_new {
+                anyhow::ensure!(
+                    !panes.contains_key(&prepared.pane_id)
+                        && !self.retiring_pane_ids.lock().contains(&prepared.pane_id)
+                        && !self
+                            .pane_retirements
+                            .has_in_flight_retirement(prepared.pane_id),
+                    "new floating pane id {} became unavailable before commit",
+                    prepared.pane_id
+                );
+            }
+            panes.try_reserve(prepared_new.len()).map_err(|error| {
+                anyhow::anyhow!("reserve domain floating pane registry: {error}")
+            })?;
+
+            let mut retiring = self.retiring_pane_ids.lock();
+            anyhow::ensure!(
+                stale_registrations
+                    .iter()
+                    .all(|(pane_id, _, _)| !retiring.contains(pane_id)),
+                "a stale floating pane began retiring before reconciliation"
+            );
+            retiring
+                .try_reserve(stale_registrations.len())
+                .map_err(|error| anyhow::anyhow!("reserve retired floating pane ids: {error}"))?;
+
+            let lifecycle_enqueue = (!lifecycle_ids.is_empty())
+                .then(|| self.prepare_pane_lifecycle_batch_enqueue(&lifecycle_ids))
+                .transpose()?;
+            let total_revisions = structural_notifications
+                .len()
+                .checked_add(lifecycle_ids.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("floating reconciliation revision count overflow")
+                })?;
+            let mut topology = self.topology.lock();
+            let first_revision = topology
+                .reserve_revisions(total_revisions)
+                .map_err(anyhow::Error::new)?;
+            let mut revision_offset = 0u64;
+            for notification in structural_notifications {
+                structural_envelopes.push(MuxNotificationEnvelope {
+                    notification,
+                    topology: crate::MuxTopologyStamp::Revision(crate::TopologyRevision::new(
+                        first_revision
+                            .get()
+                            .checked_add(revision_offset)
+                            .expect("reserved floating topology range cannot overflow"),
+                    )),
+                });
+                revision_offset += 1;
+            }
+
+            for (pane_id, pane, registration) in &stale_registrations {
+                let registered = panes
+                    .remove(pane_id)
+                    .expect("stale floating pane registration was revalidated");
+                debug_assert!(Arc::ptr_eq(&registered.pane, pane));
+                debug_assert!(registration.matches_live_registration(&registered));
+                let removed_pane = Arc::clone(&registered.pane);
+                let generation = Arc::clone(&registered.generation);
+                if let Some(batch) =
+                    self.take_pending_pane_output_batch_locked(*pane_id, &generation)
+                {
+                    output_batches.push(batch);
+                }
+                drop(registered);
+                let inserted = retiring.insert(*pane_id);
+                debug_assert!(inserted);
+                removed_components.push((*pane_id, removed_pane, generation));
+            }
+
+            for prepared in &mut prepared_new {
+                let commit_guard = prepared
+                    .registration_reservation
+                    .take()
+                    .expect("prepared floating publication retains its registration reservation")
+                    .commit()
+                    .expect("validated floating registration reservation must commit");
+                let registration = PaneRegistrationHandle::new(
+                    &prepared.pane,
+                    &prepared.preparation_claim.generation,
+                );
+                let prior = panes.insert(
+                    prepared.pane_id,
+                    crate::LivePaneRegistration {
+                        pane: Arc::clone(&prepared.pane),
+                        generation: Arc::clone(&prepared.preparation_claim.generation),
+                        domain_id,
+                    },
+                );
+                debug_assert!(prior.is_none());
+                let finalized = commit_guard.finalize();
+                debug_assert!(registration.same_registration(&finalized));
+                let retired = prepared.preparation_claim.retire_locked();
+                debug_assert!(retired);
+                published_new.push((
+                    Arc::clone(&prepared.pane),
+                    registration,
+                    prepared.reader_start_gate.take(),
+                ));
+            }
+
+            for ((guard, prepared), expected) in
+                tab_guards.iter_mut().zip(&mut prepared_tabs).zip(&observed)
+            {
+                if !prepared.changed {
+                    continue;
+                }
+                guard.floating_panes = prepared
+                    .replacement
+                    .take()
+                    .expect("changed floating tab retains its prepared replacement");
+                guard.floating_focus = prepared.floating_focus;
+                debug_assert_eq!(guard.size, expected.size);
+            }
+
+            for (pane, registration, reader_start_gate) in &mut published_new {
+                debug_assert!(registration.is_same_pane(pane));
+                lifecycle_notifications.push(crate::PreparedPaneLifecycleBatchNotification {
+                    notification: crate::PaneLifecycleNotification::Added(registration.pane_id()),
+                    topology: crate::MuxTopologyStamp::Revision(crate::TopologyRevision::new(
+                        first_revision
+                            .get()
+                            .checked_add(revision_offset)
+                            .expect("reserved floating topology range cannot overflow"),
+                    )),
+                    reader_start_gate: reader_start_gate.take(),
+                    cleanup_complete: None,
+                    removal_follow_up: crate::PaneRemovalFollowUp::None,
+                });
+                revision_offset += 1;
+            }
+            for (pane_id, _, generation) in &removed_components {
+                lifecycle_notifications.push(crate::PreparedPaneLifecycleBatchNotification {
+                    notification: crate::PaneLifecycleNotification::Removed(*pane_id),
+                    topology: crate::MuxTopologyStamp::Revision(crate::TopologyRevision::new(
+                        first_revision
+                            .get()
+                            .checked_add(revision_offset)
+                            .expect("reserved floating topology range cannot overflow"),
+                    )),
+                    reader_start_gate: None,
+                    cleanup_complete: Some(Arc::clone(&generation.cleanup_complete)),
+                    removal_follow_up: crate::PaneRemovalFollowUp::None,
+                });
+                revision_offset += 1;
+            }
+            debug_assert_eq!(
+                revision_offset,
+                u64::try_from(total_revisions).unwrap_or(u64::MAX)
+            );
+            let lifecycle_tickets = lifecycle_enqueue
+                .map(|enqueue| enqueue.enqueue(lifecycle_notifications))
+                .unwrap_or_default();
+            let mut tickets = lifecycle_tickets.into_iter();
+            for _ in &published_new {
+                new_lifecycle_tickets.push(
+                    tickets
+                        .next()
+                        .expect("each new floating registration retains one lifecycle ticket"),
+                );
+            }
+            for ((pane_id, pane, generation), ticket) in removed_components.into_iter().zip(tickets)
+            {
+                removed_registrations.push(crate::RemovedPaneRegistration {
+                    pane_id,
+                    pane,
+                    generation,
+                    lifecycle_notification: ticket,
+                });
+            }
+            debug_assert_eq!(removed_registrations.len(), stale_registrations.len());
+
+            drop(topology);
+            drop(retiring);
+            drop(panes);
+            drop(tab_guards);
+            drop(windows);
+            drop(registered_tabs);
+            drop(_registration);
+            drop(_domain_registration);
+
+            (
+                published_new,
+                new_lifecycle_tickets,
+                removed_registrations,
+                output_batches,
+                structural_envelopes,
+            )
+        };
+
+        self.recompute_pane_count();
+        for batch in output_batches {
+            metrics::histogram!("mux.notifications.pane_output.removal_forced_seal_rate")
+                .record(1.0);
+            batch.seal();
+        }
+        self.discard_removed_pane_states(&retired_pane_ids);
+
+        let new_count = published_new.len();
+        for (pane, registration, _) in &published_new {
+            self.notify_pane_registration_did_bind(pane, registration);
+        }
+        for envelope in structural_envelopes {
+            self.dispatch_notification_envelope(envelope);
+        }
+
+        debug_assert_eq!(new_lifecycle_tickets.len(), new_count);
+        for added in new_lifecycle_tickets {
+            self.complete_pane_lifecycle_notification(added);
+        }
+        for removed in removed_registrations {
+            self.finish_pane_removal(removed, false);
+        }
+
+        Ok(DomainFloatingPaneReconcileReceipt {
+            changed_tab_ids,
+            invalidated_window_ids,
+            registered_pane_ids,
+            retired_pane_ids,
+        })
+    }
+}
+
 impl TabInner {
     fn new(size: &TerminalSize) -> Self {
         Self {
@@ -5143,6 +6144,35 @@ impl TabInner {
             let right_key = (right.z_order, u8::from(right.is_focused));
             left_key.cmp(&right_key)
         });
+        panes
+    }
+
+    /// Clone only structural tiled/stack pane identities without invoking a
+    /// `Pane` trait method. Unlike `snapshot_panes_callback_free`, this census
+    /// deliberately excludes floating and zoom carriers so reconciliation can
+    /// detect a single exact pane that is simultaneously tiled and floating.
+    /// Zoom is a view of a tiled pane rather than a second structural owner.
+    fn snapshot_non_floating_panes_callback_free(&self) -> Vec<Arc<dyn Pane>> {
+        let mut seen = HashSet::new();
+        let mut panes = Vec::new();
+
+        if let Some(tree) = &self.pane {
+            let mut tree_panes = Vec::new();
+            collect_raw_tree_panes(tree, &mut tree_panes);
+            for pane in tree_panes {
+                if seen.insert(pane_identity(&pane)) {
+                    panes.push(pane);
+                }
+            }
+        }
+        for stack in self.pane_stacks.values() {
+            for pane in stack.panes() {
+                if seen.insert(pane_identity(pane)) {
+                    panes.push(Arc::clone(pane));
+                }
+            }
+        }
+
         panes
     }
 
