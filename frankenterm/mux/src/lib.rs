@@ -5161,7 +5161,7 @@ impl Mux {
         registration
             .try_with_current(|current| {
                 anyhow::ensure!(
-                    Arc::ptr_eq(current.pane, pane),
+                    current.is_same_pane(pane),
                     "pane {pane_id} was replaced before exact focus"
                 );
                 self.focus_exact_pane_and_containing_tab_registered(pane_id, pane)
