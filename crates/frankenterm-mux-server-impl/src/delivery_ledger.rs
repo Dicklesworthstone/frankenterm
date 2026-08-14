@@ -2013,9 +2013,11 @@ pub fn notification_effects(notification: &MuxNotification) -> NotificationEffec
         MuxNotification::FloatingPaneSpawnCommitted(spawn) => NotificationEffects {
             state_keys: [
                 Some(NotificationStateKey::TabGeometry(spawn.tab_id())),
-                spawn.focused().then_some(
-                    NotificationStateKey::ResolvedWindowFocusForPane(spawn.pane_id()),
-                ),
+                spawn
+                    .focused()
+                    .then_some(NotificationStateKey::ResolvedWindowFocusForPane(
+                        spawn.pane_id(),
+                    )),
             ],
             render_key: Some(NotificationRenderKey::TabMembers(spawn.tab_id())),
             topology: NotificationTopologyEffect::FloatingPaneSpawned {
@@ -2023,11 +2025,9 @@ pub fn notification_effects(notification: &MuxNotification) -> NotificationEffec
                 tab_id: spawn.tab_id(),
                 window_id: spawn.window_id(),
             },
-            auxiliary_snapshot: spawn
-                .focused()
-                .then_some(AuxiliarySnapshotKey::ActiveWindowTabForPane(
-                    spawn.pane_id(),
-                )),
+            auxiliary_snapshot: spawn.focused().then_some(
+                AuxiliarySnapshotKey::ActiveWindowTabForPane(spawn.pane_id()),
+            ),
             admission: NotificationAdmissionContract::PostMutationJournalThenTopologyResync,
             ..effects(lifecycle_contract(
                 FullQueueContract::JournalThenResyncAuthoritativeState,

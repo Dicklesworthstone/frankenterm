@@ -1,20 +1,20 @@
 use crate::client::{
-    with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
-    RpcGenerationScope,
+    Client, RpcConsumerKind, RpcGenerationAbortGuard, RpcGenerationScope,
+    with_mux_rpc_bootstrap_timeout,
 };
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::client::ClientId;
 use mux::connui::{ConnectionUI, ConnectionUIParams};
-use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState};
-use mux::pane::{reserve_pane_ids, Pane, PaneId};
+use mux::domain::{Domain, DomainId, DomainState, alloc_domain_id};
+use mux::pane::{Pane, PaneId, reserve_pane_ids};
 use mux::tab::{
-    prepare_pane_tree_from_arena_with_scratch, PaneArena, PaneArenaNode,
-    PaneArenaPreparationScratch, PaneEntry, PaneNode, PreparedPaneTree, SplitRequest, Tab, TabId,
+    PaneArena, PaneArenaNode, PaneArenaPreparationScratch, PaneEntry, PaneNode, PreparedPaneTree,
+    SplitRequest, Tab, TabId, prepare_pane_tree_from_arena_with_scratch,
 };
 use mux::window::WindowId;
 use mux::{
@@ -584,17 +584,15 @@ fn ensure_pane_arena_append_order_is_sound(
             );
         }
         for (index, tab) in window.iter().enumerate() {
-            let attached_remote_tab =
-                local_to_remote_tab
-                    .get(&tab.tab_id())
-                    .copied()
-                    .ok_or_else(|| {
-                        anyhow!(
+            let attached_remote_tab = local_to_remote_tab.get(&tab.tab_id()).copied().ok_or_else(
+                || {
+                    anyhow!(
                         "ordered pane arena mapped window {remote_window_id} contains unmapped or \
                          foreign local tab {}",
                         tab.tab_id()
                     )
-                    })?;
+                },
+            )?;
             if desired_remote_tabs[index] != attached_remote_tab {
                 bail!(
                     "ordered pane arena window {remote_window_id} requires an atomic existing-window \
@@ -4131,10 +4129,11 @@ mod tests {
             inner.remote_to_local_pane_id(&mux, 61),
             Some(pane.pane_id())
         );
-        assert!(pane
-            .downcast_ref::<ClientPane>()
-            .expect("resolved pane should be a client pane")
-            .is_alt_screen_active());
+        assert!(
+            pane.downcast_ref::<ClientPane>()
+                .expect("resolved pane should be a client pane")
+                .is_alt_screen_active()
+        );
     }
 
     #[test]

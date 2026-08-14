@@ -1,16 +1,16 @@
 use crate::domain::{ClientDomain, ClientDomainConfig, ClientInner};
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
+use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
-use asupersync::Cx;
-use async_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
+use async_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
-use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
+use config::{SshDomain, TlsDomainClient, UnixDomain, UnixTarget, configuration};
 use filedescriptor::FileDescriptor;
-use futures::future::{ready, select, Either};
+use futures::future::{Either, ready, select};
 use futures::pin_mut;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
@@ -22,9 +22,9 @@ use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use portable_pty::Child;
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
 use std::convert::TryFrom;
-use std::future::{poll_fn, Future};
+use std::future::{Future, poll_fn};
 use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
@@ -182,9 +182,7 @@ impl std::fmt::Display for RpcRetirementStage {
 /// the operation even though no matching reply reached this client.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RpcTransportError {
-    #[error(
-        "mux client RPC transport unavailable for attempt {attempt_id} ({request}) at {stage}"
-    )]
+    #[error("mux client RPC transport unavailable for attempt {attempt_id} ({request}) at {stage}")]
     Unavailable {
         attempt_id: NonZeroU64,
         request: &'static str,
@@ -9407,9 +9405,11 @@ mod tests {
             .expect("register pending readiness participant");
         let error = asupersync_block_on(client.publish_rpc_transport_ready(&rpc, &guard))
             .expect_err("readiness must fail before bootstrap establishes protocol authority");
-        assert!(error
-            .to_string()
-            .contains("before codec negotiation and client registration are established"));
+        assert!(
+            error
+                .to_string()
+                .contains("before codec negotiation and client registration are established")
+        );
         assert_eq!(
             client
                 .rpc_transport
@@ -9854,8 +9854,10 @@ mod tests {
         let reader_abort = rpc_transport
             .reader_abort_for(generation)
             .expect("test reader has generation abort authority");
-        assert!(rpc_transport
-            .request_generation_abort(&reader_abort, "ready-operation cancellation race",));
+        assert!(
+            rpc_transport
+                .request_generation_abort(&reader_abort, "ready-operation cancellation race",)
+        );
 
         let error =
             asupersync_block_on(rpc_transport.complete_before_reader_stop(
@@ -9903,9 +9905,11 @@ mod tests {
             .reader_abort_for(successor_generation)
             .expect("successor has fresh reader abort authority");
 
-        assert!(!authority
-            .rpc_transport
-            .request_generation_abort(&first_abort, "stale first-generation cancellation",));
+        assert!(
+            !authority
+                .rpc_transport
+                .request_generation_abort(&first_abort, "stale first-generation cancellation",)
+        );
         assert!(first_abort.cause().is_none());
         assert!(successor_abort.cause().is_none());
         assert_eq!(
@@ -10148,8 +10152,10 @@ mod tests {
         let reader_abort = rpc_transport
             .reader_abort_for(generation)
             .expect("test reader has generation abort authority");
-        assert!(rpc_transport
-            .request_generation_abort(&reader_abort, "test exact-generation predicate split",));
+        assert!(
+            rpc_transport
+                .request_generation_abort(&reader_abort, "test exact-generation predicate split",)
+        );
 
         assert!(
             rpc_transport.reader_abort_for(generation).is_err(),
@@ -10166,12 +10172,16 @@ mod tests {
         let generation =
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
-        assert!(authority
-            .register_participant()
-            .expect("register first readiness participant"));
-        assert!(authority
-            .register_participant()
-            .expect("register duplicate readiness participant"));
+        assert!(
+            authority
+                .register_participant()
+                .expect("register first readiness participant")
+        );
+        assert!(
+            authority
+                .register_participant()
+                .expect("register duplicate readiness participant")
+        );
 
         assert!(
             !authority.release_participant(true),
@@ -10194,9 +10204,11 @@ mod tests {
         let generation =
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
-        assert!(authority
-            .register_participant()
-            .expect("register readiness participant"));
+        assert!(
+            authority
+                .register_participant()
+                .expect("register readiness participant")
+        );
         assert!(
             authority.release_participant(true),
             "the last cancelled participant must commit one abort"
@@ -10204,15 +10216,19 @@ mod tests {
         let error = authority
             .mark_ready()
             .expect_err("publication cannot race past a committed last-participant abort");
-        assert!(error
-            .to_string()
-            .contains("lost all readiness participants"));
+        assert!(
+            error
+                .to_string()
+                .contains("lost all readiness participants")
+        );
         let error = authority
             .register_participant()
             .expect_err("a late participant cannot resurrect aborted authority");
-        assert!(error
-            .to_string()
-            .contains("already committed readiness abort"));
+        assert!(
+            error
+                .to_string()
+                .contains("already committed readiness abort")
+        );
     }
 
     #[test]
@@ -10221,9 +10237,11 @@ mod tests {
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
         for _ in 0..MAX_RPC_READINESS_PARTICIPANTS {
-            assert!(authority
-                .register_participant()
-                .expect("participant below the bound must register"));
+            assert!(
+                authority
+                    .register_participant()
+                    .expect("participant below the bound must register")
+            );
         }
         let error = authority
             .register_participant()
@@ -10741,9 +10759,11 @@ mod tests {
             .try_recv()
             .expect("retirement must complete the queued publication")
             .expect_err("a retired readiness publication must fail");
-        assert!(retired
-            .to_string()
-            .contains("retired before reader admission"));
+        assert!(
+            retired
+                .to_string()
+                .contains("retired before reader admission")
+        );
         assert_eq!(stale_authority.state.lock().queued_publications, 0);
         successor
             .activate_rpc_transport()
@@ -11415,10 +11435,12 @@ mod tests {
             .set_stage(first_serial, RpcRetirementStage::AwaitingResponse)
             .expect("track the first request as emitted");
         first.fail_all("first transport disconnected");
-        assert!(first_rx
-            .try_recv()
-            .expect("first waiter must retire")
-            .is_err());
+        assert!(
+            first_rx
+                .try_recv()
+                .expect("first waiter must retire")
+                .is_err()
+        );
         first_probe.assert_balanced();
 
         let (_sender, receiver) = unbounded();
@@ -11495,17 +11517,21 @@ mod tests {
         first
             .complete(first_serial, Pdu::Pong(Pong {}))
             .expect("first connection reply should enqueue");
-        assert!(first_rx
-            .try_recv()
-            .expect("first connection completion")
-            .is_ok());
+        assert!(
+            first_rx
+                .try_recv()
+                .expect("first connection completion")
+                .is_ok()
+        );
         assert_eq!(probe.pending(), 1.0);
 
         drop(second);
-        assert!(second_rx
-            .try_recv()
-            .expect("PendingReplies::drop must wake the live waiter")
-            .is_err());
+        assert!(
+            second_rx
+                .try_recv()
+                .expect("PendingReplies::drop must wake the live waiter")
+                .is_err()
+        );
         assert_eq!(probe.pending(), 0.0);
         assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
         assert_eq!(RpcMetricProbe::counter(&probe.transport_failed_live), 1);
@@ -11619,10 +11645,12 @@ mod tests {
         );
 
         pending.fail_all("wire serial space exhausted");
-        assert!(max_rx
-            .try_recv()
-            .expect("the maximum-serial waiter must retire exactly once")
-            .is_err());
+        assert!(
+            max_rx
+                .try_recv()
+                .expect("the maximum-serial waiter must retire exactly once")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 
@@ -11651,10 +11679,12 @@ mod tests {
                 pending_request: "Ping",
             } if serial == original_serial
         ));
-        assert!(collision_rx
-            .try_recv()
-            .expect("collision should wake the caller")
-            .is_err());
+        assert!(
+            collision_rx
+                .try_recv()
+                .expect("collision should wake the caller")
+                .is_err()
+        );
         assert_eq!(pending.map.len(), 1);
         assert_eq!(
             pending
@@ -12118,10 +12148,12 @@ mod tests {
                 header_len
             );
             pending.fail_after_decode_error(&error);
-            assert!(completion_rx
-                .try_recv()
-                .expect("terminal cleanup wakes the pending caller exactly once")
-                .is_err());
+            assert!(
+                completion_rx
+                    .try_recv()
+                    .expect("terminal cleanup wakes the pending caller exactly once")
+                    .is_err()
+            );
             assert!(matches!(
                 completion_rx.try_recv(),
                 Err(async_channel::TryRecvError::Empty) | Err(async_channel::TryRecvError::Closed)
@@ -12179,10 +12211,12 @@ mod tests {
             header_len
         );
         pending.fail_after_decode_error(&error);
-        assert!(completion_rx
-            .try_recv()
-            .expect("terminal cleanup wakes the pending caller")
-            .is_err());
+        assert!(
+            completion_rx
+                .try_recv()
+                .expect("terminal cleanup wakes the pending caller")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 
@@ -12317,10 +12351,12 @@ mod tests {
             );
 
             pending.fail_after_decode_error(&error);
-            assert!(completion_rx
-                .try_recv()
-                .expect("terminal teardown must retire the pending caller")
-                .is_err());
+            assert!(
+                completion_rx
+                    .try_recv()
+                    .expect("terminal teardown must retire the pending caller")
+                    .is_err()
+            );
             probe.assert_balanced();
         }
     }
@@ -12982,10 +13018,12 @@ mod tests {
 
             pending.fail_after_decode_error(&error);
             if let Some(completion_rx) = completion_rx {
-                assert!(completion_rx
-                    .try_recv()
-                    .expect("live waiter must be woken by terminal teardown")
-                    .is_err());
+                assert!(
+                    completion_rx
+                        .try_recv()
+                        .expect("live waiter must be woken by terminal teardown")
+                        .is_err()
+                );
             }
             assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 0);
             probe.assert_balanced();
@@ -13064,10 +13102,12 @@ mod tests {
         );
 
         pending.fail_after_decode_error(&error);
-        assert!(completion_rx
-            .try_recv()
-            .expect("retirement must wake the live response waiter")
-            .is_err());
+        assert!(
+            completion_rx
+                .try_recv()
+                .expect("retirement must wake the live response waiter")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 
@@ -13096,10 +13136,12 @@ mod tests {
             duplicate_error,
             PendingRpcError::UnmatchedSerial { serial, .. } if serial == completed_serial
         ));
-        assert!(duplicate_witness_rx
-            .try_recv()
-            .expect("duplicate reply must wake every other live waiter")
-            .is_err());
+        assert!(
+            duplicate_witness_rx
+                .try_recv()
+                .expect("duplicate reply must wake every other live waiter")
+                .is_err()
+        );
         duplicate_probe.assert_balanced();
 
         let (mut full_pending, full_probe) = pending_replies_for_test();
@@ -13125,14 +13167,18 @@ mod tests {
             full_error,
             PendingRpcError::ReplyChannelFull { serial, .. } if serial == full_serial
         ));
-        assert!(full_rx
-            .try_recv()
-            .expect("prefilled reply must remain intact")
-            .is_ok());
-        assert!(full_witness_rx
-            .try_recv()
-            .expect("full reply channel must wake every other live waiter")
-            .is_err());
+        assert!(
+            full_rx
+                .try_recv()
+                .expect("prefilled reply must remain intact")
+                .is_ok()
+        );
+        assert!(
+            full_witness_rx
+                .try_recv()
+                .expect("full reply channel must wake every other live waiter")
+                .is_err()
+        );
         full_probe.assert_balanced();
     }
 
@@ -13174,10 +13220,12 @@ mod tests {
             0.0,
             "header rejection must retire the transport and clear every waiter"
         );
-        assert!(live_rx
-            .try_recv()
-            .expect("transport teardown must wake the admitted waiter")
-            .is_err());
+        assert!(
+            live_rx
+                .try_recv()
+                .expect("transport teardown must wake the admitted waiter")
+                .is_err()
+        );
         probe.assert_balanced();
     }
 
@@ -14311,10 +14359,12 @@ mod tests {
             session_incarnation,
             snapshot_revision: TopologyRevision::new(snapshot_revision),
         };
-        assert!(coordinator
-            .commit(authority)
-            .expect("initial coherent snapshot should commit")
-            .is_empty());
+        assert!(
+            coordinator
+                .commit(authority)
+                .expect("initial coherent snapshot should commit")
+                .is_empty()
+        );
         (coordinator, authority)
     }
 
@@ -14912,10 +14962,12 @@ mod tests {
                     .expect("snapshot should await its exact commit"),
                 ClientTopologyResponseAction::AwaitCommit
             ));
-            assert!(coordinator
-                .commit(authority)
-                .expect("snapshot should establish its connection-scoped stream")
-                .is_empty());
+            assert!(
+                coordinator
+                    .commit(authority)
+                    .expect("snapshot should establish its connection-scoped stream")
+                    .is_empty()
+            );
             (coordinator, authority)
         };
         let (mut old_topology, old_authority) = establish(1, &old_snapshot);
@@ -15005,10 +15057,12 @@ mod tests {
             }
             _ => unreachable!("same-ID helper always returns a coherent response"),
         };
-        assert!(old_topology
-            .commit(late_old_authority)
-            .expect("retired coordinator may settle only its own snapshot")
-            .is_empty());
+        assert!(
+            old_topology
+                .commit(late_old_authority)
+                .expect("retired coordinator may settle only its own snapshot")
+                .is_empty()
+        );
         assert_eq!(
             new_state(&new_topology),
             before_stale_delivery,
@@ -15025,9 +15079,11 @@ mod tests {
                 },
             })))
             .expect_err("an old-session event must not target reused successor identifiers");
-        assert!(stale_event_error
-            .to_string()
-            .contains("wrong established stream identity"));
+        assert!(
+            stale_event_error
+                .to_string()
+                .contains("wrong established stream identity")
+        );
         assert_eq!(
             new_state(&new_topology),
             before_stale_delivery,
@@ -15222,9 +15278,12 @@ mod tests {
             .expect("live generation has exact reader abort authority");
         assert!(authority.generation_is_current());
 
-        assert!(authority
-            .rpc_transport
-            .request_generation_abort(&reader_abort, "test cancellation before reader teardown",));
+        assert!(
+            authority.rpc_transport.request_generation_abort(
+                &reader_abort,
+                "test cancellation before reader teardown",
+            )
+        );
         assert!(
             authority.generation_is_current(),
             "identity authority must remain current so final detach can resolve its owner"
