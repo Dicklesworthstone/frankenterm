@@ -537,14 +537,16 @@ mod tests {
         assert!(report.message.contains("not recorded"));
     }
 
+    /// GH #78: an external CLI version without a parseable commit is
+    /// informational only; the message says so explicitly.
     #[test]
-    fn compatibility_local_version_without_commit_disables_vendored() {
+    fn compatibility_local_version_without_commit_message_is_informational() {
         let meta = meta_with(Some("abcdef12"), true);
         let local = WeztermVersion::parse("wezterm 20240203");
         let report = compatibility_report_with(meta, Some(&local));
-        assert_eq!(report.status, VendoredCompatibilityStatus::Incompatible);
-        assert!(!report.allow_vendored);
-        assert!(report.message.contains("unable to parse commit"));
+        assert_eq!(report.status, VendoredCompatibilityStatus::Compatible);
+        assert!(report.allow_vendored);
+        assert!(report.message.contains("no parseable commit"));
     }
 
     #[test]
@@ -566,11 +568,14 @@ mod tests {
         let report = compatibility_report_with(meta, Some(&local));
         let json = serde_json::to_value(&report).expect("report should serialize");
         assert_eq!(json["status"], "incompatible");
+        // GH #78: the mismatch is reported for observability but no longer
+        // vetoes the vendored backend.
+        assert_eq!(json["allow_vendored"], true);
         assert!(
             json["recommendation"]
                 .as_str()
                 .unwrap()
-                .contains("Update WezTerm")
+                .contains("unrelated to the vendored backend")
         );
         assert_eq!(json["local_commit"], "deadbeef");
         assert_eq!(json["vendored_commit"], "abcdef12");
