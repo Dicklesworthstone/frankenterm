@@ -3387,17 +3387,20 @@ impl Tab {
         PaneRegistrationHandle,
     )> {
         let pane = Arc::clone(unpublished.pane());
-        let target = target_registration
-            .operation_guard(mux)
-            .ok_or_else(|| anyhow::anyhow!("floating-pane target registration retired"))?;
+        anyhow::ensure!(
+            target_registration
+                .owner()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, mux)),
+            "floating-pane target belongs to another mux registration"
+        );
 
         let mut preparation_claim = mux
             .claim_pane_preparation(&pane)?
             .ok_or_else(|| anyhow::anyhow!("unpublished floating pane is already registered"))?;
         anyhow::ensure!(
-            target.pane_id() != preparation_claim.pane_id,
+            target_registration.pane_id() != preparation_claim.pane_id,
             "cannot attach floating pane {} onto itself",
-            target.pane_id()
+            target_registration.pane_id()
         );
         let prepared = mux.prepare_claimed_pane_registration(
             &pane,
@@ -3475,7 +3478,7 @@ impl Tab {
                         "pane id {pane_id} has multiple exact structural owners before floating spawn"
                     );
                 }
-                target_owners += usize::from(target.is_same_pane(observed));
+                target_owners += usize::from(target_registration.is_same_pane(observed));
                 spawned_owners += usize::from(Arc::ptr_eq(&pane, observed));
                 anyhow::ensure!(
                     pane_id != spawned_id,
@@ -3489,7 +3492,10 @@ impl Tab {
                     .iter()
                     .zip(&observed_snapshots)
                     .any(|(tab, panes)| {
-                        Arc::ptr_eq(tab, self) && panes.iter().any(|pane| target.is_same_pane(pane))
+                        Arc::ptr_eq(tab, self)
+                            && panes
+                                .iter()
+                                .any(|pane| target_registration.is_same_pane(pane))
                     }),
             "floating-pane target must have exactly one structural owner in the admitted tab"
         );
@@ -3577,7 +3583,7 @@ impl Tab {
                 tab_guards[destination_index]
                     .snapshot_panes_callback_free()
                     .iter()
-                    .filter(|pane| target.is_same_pane(pane))
+                    .filter(|pane| target_registration.is_same_pane(pane))
                     .count()
                     == 1,
                 "floating-pane target left or duplicated inside the destination tab"
@@ -3598,8 +3604,10 @@ impl Tab {
             let mut panes = mux.panes.write();
             anyhow::ensure!(
                 panes
-                    .get(&target.pane_id())
-                    .is_some_and(|registered| target.matches_live_registration(registered)),
+                    .get(&target_registration.pane_id())
+                    .is_some_and(|registered| {
+                        target_registration.matches_live_registration(registered)
+                    }),
                 "floating-pane target registration retired before commit"
             );
             anyhow::ensure!(
@@ -3624,13 +3632,13 @@ impl Tab {
             };
             let target_is_active = inner
                 .raw_active_pane_retained_id()
-                .is_some_and(|active| target.is_same_pane(&active));
+                .is_some_and(|active| target_registration.is_same_pane(&active));
             let client_focus_is_current = client_info.as_ref().is_none_or(|info| {
                 match info.focused_pane_registration() {
                     Some(focused) => focused.same_registration(target_registration),
                     None => info
                         .focused_pane_id
-                        .is_none_or(|pane_id| pane_id == target.pane_id()),
+                        .is_none_or(|pane_id| pane_id == target_registration.pane_id()),
                 }
             });
             // Zoom is an explicit exclusive-view state. Preserve it and attach
