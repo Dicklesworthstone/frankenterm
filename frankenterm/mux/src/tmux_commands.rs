@@ -1356,6 +1356,21 @@ impl TmuxDomainState {
                     TmuxTopologyBarrierEvent::Barrier
                 }
             }
+            MuxNotification::WindowTopologyChanged(change) => {
+                let local_window_id = self
+                    .gui_window
+                    .lock()
+                    .as_ref()
+                    .map(|window| window.window_id);
+                if local_window_id.is_some_and(|window_id| change.affects_window(window_id)) {
+                    let window_id = local_window_id.expect("checked local window identity");
+                    TmuxTopologyBarrierEvent::Intent(TmuxNotificationIntent::WindowInvalidated(
+                        window_id,
+                    ))
+                } else {
+                    TmuxTopologyBarrierEvent::Barrier
+                }
+            }
             _ => TmuxTopologyBarrierEvent::Barrier,
         };
 

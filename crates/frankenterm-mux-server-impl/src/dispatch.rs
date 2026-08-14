@@ -1748,6 +1748,10 @@ fn queue_reserved_retained_notification(
         RetainedTopologyNotification::WindowOrderChanged {
             legacy_resync_tab_id,
             ..
+        }
+        | RetainedTopologyNotification::WindowTopologyChanged {
+            legacy_resync_tab_id,
+            ..
         } => queue_reserved_pdu(
             item_tx,
             terminal,
@@ -1824,6 +1828,10 @@ enum RetainedTopologyNotification {
         window_id: usize,
         legacy_resync_tab_id: usize,
         ordered_window: Option<codec::OrderedWindowStateV1>,
+    },
+    WindowTopologyChanged {
+        legacy_resync_tab_id: usize,
+        ordered_windows: Option<Vec<codec::OrderedWindowStateV1>>,
     },
 }
 
@@ -2098,6 +2106,7 @@ enum DeferredTopologyOwner {
     Prepared(PreparedTopologyNotification),
     Event(RetainedTopologyEvent),
     OrderedWindow(codec::OrderedWindowStateV1),
+    OrderedWindows(Vec<codec::OrderedWindowStateV1>),
     Item(Item),
 }
 
@@ -2165,6 +2174,7 @@ impl PreparedOrderedFenceResponse {
                 DeferredTopologyOwner::Prepared(notification) => drop(notification),
                 DeferredTopologyOwner::Event(event) => drop(event),
                 DeferredTopologyOwner::OrderedWindow(window) => drop(window),
+                DeferredTopologyOwner::OrderedWindows(windows) => drop(windows),
                 DeferredTopologyOwner::Item(item) => drop(item),
             }
         }
@@ -3535,6 +3545,29 @@ impl TopologyStreamCoordinator {
                     ServerEmissionAuthority::Ordinary,
                 )
             }
+            RetainedTopologyNotification::WindowTopologyChanged {
+                legacy_resync_tab_id,
+                ordered_windows,
+            } => {
+                if let Some(ordered_windows) = ordered_windows {
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::OrderedWindows(ordered_windows),
+                    );
+                }
+                try_queue_reserved_pdu_with_emission_authority(
+                    &self.item_tx,
+                    &self.terminal,
+                    Box::new(DecodedPdu {
+                        pdu: Pdu::TabResized(codec::TabResized {
+                            tab_id: legacy_resync_tab_id,
+                        }),
+                        serial: 0,
+                    }),
+                    reservation,
+                    ServerEmissionAuthority::Ordinary,
+                )
+            }
         };
         match result {
             Ok(()) => Ok(()),
@@ -3672,6 +3705,27 @@ impl TopologyStreamCoordinator {
                 )
             }
             (
+                Some(authority),
+                RetainedTopologyNotification::WindowTopologyChanged {
+                    ordered_windows: Some(windows),
+                    ..
+                },
+            ) if authority
+                .negotiated
+                .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1) =>
+            {
+                (
+                    Pdu::WindowOrderEventV1(codec::WindowOrderEventV1 {
+                        protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+                        stream_id: authority.stream_id,
+                        session_incarnation: authority.session_incarnation,
+                        topology_revision: revision,
+                        windows,
+                    }),
+                    ServerEmissionAuthority::OrderedStreamEvent,
+                )
+            }
+            (
                 Some(_),
                 RetainedTopologyNotification::WindowOrderChanged {
                     ordered_window: None,
@@ -3680,6 +3734,17 @@ impl TopologyStreamCoordinator {
             ) => {
                 anyhow::bail!(
                     "ordered-window authority reached an event without preconverted PDU90 state"
+                );
+            }
+            (
+                Some(_),
+                RetainedTopologyNotification::WindowTopologyChanged {
+                    ordered_windows: None,
+                    ..
+                },
+            ) => {
+                anyhow::bail!(
+                    "ordered-window authority reached a transaction without preconverted PDU90 state"
                 );
             }
             (_, notification) => (
@@ -3708,7 +3773,8 @@ impl TopologyStreamCoordinator {
     ) -> anyhow::Result<()> {
         let notification_is_topology = match &event.notification {
             RetainedTopologyNotification::Ordinary(notification) => notification.is_topology(),
-            RetainedTopologyNotification::WindowOrderChanged { .. } => true,
+            RetainedTopologyNotification::WindowOrderChanged { .. }
+            | RetainedTopologyNotification::WindowTopologyChanged { .. } => true,
         };
         if !notification_is_topology {
             defer_topology_owner(retired_owners, DeferredTopologyOwner::Event(event));
@@ -3719,6 +3785,7 @@ impl TopologyStreamCoordinator {
             (
                 Some(authority),
                 RetainedTopologyNotification::WindowOrderChanged { .. }
+                    | RetainedTopologyNotification::WindowTopologyChanged { .. }
             ) if !authority
                 .negotiated
                 .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1)
@@ -3729,6 +3796,9 @@ impl TopologyStreamCoordinator {
                 Some(_),
                 RetainedTopologyNotification::WindowOrderChanged {
                     ordered_window: None,
+                    ..
+                } | RetainedTopologyNotification::WindowTopologyChanged {
+                    ordered_windows: None,
                     ..
                 }
             )
@@ -3769,6 +3839,27 @@ impl TopologyStreamCoordinator {
                 )
             }
             (
+                Some(authority),
+                RetainedTopologyNotification::WindowTopologyChanged {
+                    ordered_windows: Some(windows),
+                    ..
+                },
+            ) if authority
+                .negotiated
+                .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1) =>
+            {
+                (
+                    Pdu::WindowOrderEventV1(codec::WindowOrderEventV1 {
+                        protocol_version: codec::ORDERED_WINDOW_PROTOCOL_VERSION,
+                        stream_id: authority.stream_id,
+                        session_incarnation: authority.session_incarnation,
+                        topology_revision: revision,
+                        windows,
+                    }),
+                    ServerEmissionAuthority::OrderedStreamEvent,
+                )
+            }
+            (
                 None,
                 RetainedTopologyNotification::WindowOrderChanged {
                     window_id,
@@ -3787,6 +3878,30 @@ impl TopologyStreamCoordinator {
                         stream_id: self.stream_id,
                         revision,
                         event: TopologyEventKind::WindowInvalidated { window_id },
+                    }),
+                    ServerEmissionAuthority::Ordinary,
+                )
+            }
+            (
+                None,
+                RetainedTopologyNotification::WindowTopologyChanged {
+                    legacy_resync_tab_id,
+                    ordered_windows,
+                },
+            ) => {
+                if let Some(ordered_windows) = ordered_windows {
+                    defer_topology_owner(
+                        retired_owners,
+                        DeferredTopologyOwner::OrderedWindows(ordered_windows),
+                    );
+                }
+                (
+                    Pdu::TopologyEvent(TopologyEvent {
+                        stream_id: self.stream_id,
+                        revision,
+                        event: TopologyEventKind::TabResized {
+                            tab_id: legacy_resync_tab_id,
+                        },
                     }),
                     ServerEmissionAuthority::Ordinary,
                 )
@@ -3869,6 +3984,9 @@ impl TopologyStreamCoordinator {
         let notification = match notification {
             MuxNotification::WindowOrderChanged { window, .. } => {
                 return self.on_window_order_topology_notification(window, revision);
+            }
+            MuxNotification::WindowTopologyChanged(change) => {
+                return self.on_window_topology_notification(change, revision);
             }
             notification => notification,
         };
@@ -3987,6 +4105,114 @@ impl TopologyStreamCoordinator {
             // phase that won the race. Release its Vec only after leaving the
             // coordinator critical section; no legacy/coherent buffer pays
             // ordered-state accounting or allocator work.
+            drop(notification);
+            drop(retired_owners);
+            return accepted;
+        }
+        let accepted = self.admit_prepared_topology_notification(
+            &mut state,
+            notification,
+            revision,
+            &mut retired_owners,
+        );
+        drop(state);
+        drop(retired_owners);
+        accepted
+    }
+
+    fn on_window_topology_notification(
+        &self,
+        change: mux::FrozenWindowTopologyChange,
+        revision: TopologyRevision,
+    ) -> bool {
+        let legacy_resync_tab_id = change.legacy_resync_tab_id();
+        let mut retired_owners = Vec::with_capacity(2);
+        let state = self.state.lock();
+        let ordered_generation = OrderedDeliveryGeneration::capture(&state.phase);
+
+        let Some(ordered_generation) = ordered_generation else {
+            let notification = PreparedTopologyNotification {
+                notification: RetainedTopologyNotification::WindowTopologyChanged {
+                    legacy_resync_tab_id,
+                    ordered_windows: None,
+                },
+                dynamic_bytes: 0,
+            };
+            let mut state = state;
+            let accepted = self.admit_prepared_topology_notification(
+                &mut state,
+                notification,
+                revision,
+                &mut retired_owners,
+            );
+            drop(state);
+            drop(change);
+            drop(retired_owners);
+            return accepted;
+        };
+
+        if !change.removed_windows().is_empty() {
+            drop(state);
+            log::error!(
+                "ordered-window stream cannot encode atomic window retirement; failing closed"
+            );
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            return false;
+        }
+
+        drop(state);
+        let mut ordered_windows = Vec::new();
+        if let Err(error) = ordered_windows.try_reserve_exact(change.windows().len()) {
+            log::error!("failed to reserve frozen window transaction conversion: {error}");
+            self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+            return false;
+        }
+        for window in change.windows() {
+            match frozen_window_order_to_codec(window) {
+                Ok(window) => ordered_windows.push(window),
+                Err(err) => {
+                    log::error!("failed to prepare frozen window transaction: {err:#}");
+                    self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    return false;
+                }
+            }
+        }
+        drop(change);
+        let notification = match prepared_window_topology_notification(
+            legacy_resync_tab_id,
+            Some(ordered_windows),
+        ) {
+            Ok(notification) => notification,
+            Err(err) => {
+                log::error!("failed to account frozen window transaction: {err:#}");
+                self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                return false;
+            }
+        };
+
+        let mut state = self.state.lock();
+        if !ordered_generation.is_current(&state.phase) {
+            metrics::counter!(
+                "mux.dispatch.ordered_event.preparation.total",
+                "outcome" => "generation_changed"
+            )
+            .increment(1);
+        }
+        if OrderedDeliveryGeneration::capture(&state.phase).is_none() {
+            let fallback = PreparedTopologyNotification {
+                notification: RetainedTopologyNotification::WindowTopologyChanged {
+                    legacy_resync_tab_id,
+                    ordered_windows: None,
+                },
+                dynamic_bytes: 0,
+            };
+            let accepted = self.admit_prepared_topology_notification(
+                &mut state,
+                fallback,
+                revision,
+                &mut retired_owners,
+            );
+            drop(state);
             drop(notification);
             drop(retired_owners);
             return accepted;
@@ -4301,7 +4527,9 @@ fn try_retained_topology_event(
 ) -> Result<RetainedTopologyEvent, RetainedTopologyEventRejection> {
     if matches!(
         &notification.notification,
-        RetainedTopologyNotification::Ordinary(MuxNotification::WindowOrderChanged { .. })
+        RetainedTopologyNotification::Ordinary(
+            MuxNotification::WindowOrderChanged { .. } | MuxNotification::WindowTopologyChanged(_)
+        )
     ) {
         return Err(RetainedTopologyEventRejection {
             error: anyhow::anyhow!(
@@ -4349,6 +4577,9 @@ fn prepare_retained_topology_notification(
             let legacy_resync_tab_id = window.active_tab_id().unwrap_or(0);
             return prepared_window_order_notification(window_id, legacy_resync_tab_id, None);
         }
+        MuxNotification::WindowTopologyChanged(change) => {
+            return prepared_window_topology_notification(change.legacy_resync_tab_id(), None);
+        }
         notification => {
             let dynamic_bytes = match &notification {
                 MuxNotification::WindowWorkspaceChanged { workspace, .. } => workspace.capacity(),
@@ -4373,6 +4604,9 @@ fn prepare_retained_topology_notification(
                 | MuxNotification::TabResized(_) => 0,
                 MuxNotification::WindowOrderChanged { .. } => {
                     unreachable!("window-order notifications are converted by the outer match")
+                }
+                MuxNotification::WindowTopologyChanged(_) => {
+                    unreachable!("window topology transactions are converted by the outer match")
                 }
                 MuxNotification::PaneOutput(_)
                 | MuxNotification::SynchronizedOutput { .. }
@@ -4418,12 +4652,52 @@ fn prepared_window_order_notification(
     })
 }
 
+fn prepared_window_topology_notification(
+    legacy_resync_tab_id: usize,
+    ordered_windows: Option<Vec<codec::OrderedWindowStateV1>>,
+) -> anyhow::Result<PreparedTopologyNotification> {
+    let dynamic_bytes = ordered_windows.as_ref().map_or(Ok(0), |windows| {
+        windows.iter().try_fold(
+            windows
+                .capacity()
+                .checked_mul(std::mem::size_of::<codec::OrderedWindowStateV1>())
+                .context("counting retained ordered-window transaction vector")?,
+            |bytes, window| {
+                bytes
+                    .checked_add(
+                        window
+                            .ordered_tab_ids
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<codec::RemoteTabId>())
+                            .context("counting retained ordered-window transaction tabs")?,
+                    )
+                    .context("counting retained ordered-window transaction bytes")
+            },
+        )
+    })?;
+    Ok(PreparedTopologyNotification {
+        notification: RetainedTopologyNotification::WindowTopologyChanged {
+            legacy_resync_tab_id,
+            ordered_windows,
+        },
+        dynamic_bytes,
+    })
+}
+
 fn into_topology_event_kind(
     notification: RetainedTopologyNotification,
 ) -> anyhow::Result<TopologyEventKind> {
     let notification = match notification {
         RetainedTopologyNotification::WindowOrderChanged { window_id, .. } => {
             return Ok(TopologyEventKind::WindowInvalidated { window_id });
+        }
+        RetainedTopologyNotification::WindowTopologyChanged {
+            legacy_resync_tab_id,
+            ..
+        } => {
+            return Ok(TopologyEventKind::TabResized {
+                tab_id: legacy_resync_tab_id,
+            });
         }
         RetainedTopologyNotification::Ordinary(notification) => notification,
     };
@@ -4442,6 +4716,9 @@ fn into_topology_event_kind(
         MuxNotification::WindowInvalidated(window_id) => {
             TopologyEventKind::WindowInvalidated { window_id }
         }
+        MuxNotification::WindowTopologyChanged(change) => TopologyEventKind::TabResized {
+            tab_id: change.legacy_resync_tab_id(),
+        },
         // Production preparation converts this variant before the
         // coordinator lock. Preserve a fail-safe fallback for any internal
         // caller that deliberately constructs an ordinary retained value.
@@ -6462,6 +6739,17 @@ where
                                 &terminal,
                             )?);
                         }
+                        MuxNotification::WindowTopologyChanged(change) => {
+                            pending_outbound = Some(prepare_unilateral_pdu(
+                                Pdu::TabResized(codec::TabResized {
+                                    tab_id: change.legacy_resync_tab_id(),
+                                }),
+                                reservation,
+                                &item_rx,
+                                &mut deferred_item,
+                                &terminal,
+                            )?);
+                        }
                         MuxNotification::WindowWorkspaceChanged {
                             window_id,
                             workspace,
@@ -7083,6 +7371,57 @@ mod tests {
             terminal_rx.is_empty(),
             "preflight rejection must return the owner before admission without changing terminal state"
         );
+    }
+
+    #[test]
+    fn frozen_window_transaction_reaches_legacy_client_as_one_stamped_resync() {
+        let (coordinator, item_rx, terminal_rx, _, stream_id) = bound_topology_coordinator();
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register frozen-transaction test tab");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        let captured = Arc::new(Mutex::new(None));
+        let captured_for_subscriber = Arc::clone(&captured);
+        mux.subscribe_with_topology(move |envelope| {
+            if matches!(
+                &envelope.notification,
+                MuxNotification::WindowTopologyChanged(_)
+            ) {
+                *captured_for_subscriber.lock() = Some(envelope);
+            }
+            true
+        })
+        .expect("subscribe to exact frozen transaction");
+
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("publish one created-and-attached window transaction");
+        let envelope = captured
+            .lock()
+            .take()
+            .expect("mux must publish the frozen transaction");
+        let MuxTopologyStamp::Revision(revision) = envelope.topology else {
+            panic!("frozen transaction must carry live topology authority");
+        };
+        assert!(coordinator.on_notification(&mux, envelope));
+
+        let emitted = take_written_pdu(&item_rx);
+        assert_eq!(emitted.serial, 0);
+        let Pdu::TopologyEvent(event) = emitted.pdu else {
+            panic!("legacy stream must receive one stamped topology event");
+        };
+        assert_eq!(event.stream_id, stream_id);
+        assert_eq!(event.revision, revision);
+        assert!(matches!(
+            event.event,
+            TopologyEventKind::TabResized { tab_id } if tab_id == tab.tab_id()
+        ));
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+        assert_outbound_live_counters_zero(&coordinator);
+
+        drop(window);
     }
 
     fn assert_outbound_budget_live_counters_zero(budget: &OutboundBudget) {

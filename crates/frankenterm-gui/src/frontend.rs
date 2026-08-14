@@ -93,6 +93,19 @@ impl GuiFrontEnd {
                     })
                     .detach();
                 }
+                MuxNotification::WindowTopologyChanged(change)
+                    if !change.created_windows().is_empty()
+                        || !change.removed_windows().is_empty() =>
+                {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        if let Some(fe) = crate::frontend::try_front_end()
+                            && !fe.is_switching_workspace()
+                        {
+                            fe.reconcile_workspace();
+                        }
+                    })
+                    .detach();
+                }
                 MuxNotification::PaneFocused(pane_id) => {
                     promise::spawn::spawn_into_main_thread(async move {
                         if let Some(mux) = Mux::try_get()
@@ -118,6 +131,7 @@ impl GuiFrontEnd {
                 MuxNotification::TabResized(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}
                 MuxNotification::WindowInvalidated(_)
+                | MuxNotification::WindowTopologyChanged(_)
                 | MuxNotification::WindowOrderChanged { .. } => {}
                 MuxNotification::PaneOutput(_) => {}
                 MuxNotification::SynchronizedOutput { .. } => {}

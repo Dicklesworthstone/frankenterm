@@ -63,8 +63,8 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{
-    FrozenWindowOrder, PrepareWindowOrderError, Window, WindowId, WindowOrderRevision,
-    WindowOrderSnapshotError, MAX_TABS_PER_ORDERED_WINDOW,
+    FrozenWindowOrder, PrepareWindowOrderError, PreparedWindowState, Window, WindowId,
+    WindowOrderRevision, WindowOrderSnapshotError, MAX_TABS_PER_ORDERED_WINDOW,
 };
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
@@ -656,6 +656,141 @@ fn validate_reorder_window_tabs_request(
     Ok(())
 }
 
+/// Immutable result of one mux-owned window topology transaction.
+#[derive(Clone, Debug)]
+pub struct FrozenWindowTopologyChange {
+    windows: Arc<[FrozenWindowOrder]>,
+    attached_tabs: Arc<[(TabId, WindowId)]>,
+    created_windows: Arc<[WindowId]>,
+    removed_windows: Arc<[WindowId]>,
+}
+
+impl FrozenWindowTopologyChange {
+    fn from_prepared(
+        mut windows: Vec<FrozenWindowOrder>,
+        mut attached_tabs: Vec<(TabId, WindowId)>,
+        mut created_windows: Vec<WindowId>,
+        mut removed_windows: Vec<WindowId>,
+    ) -> anyhow::Result<Self> {
+        windows.sort_unstable_by_key(FrozenWindowOrder::window_id);
+        anyhow::ensure!(
+            windows
+                .windows(2)
+                .all(|pair| pair[0].window_id() != pair[1].window_id()),
+            "a frozen window topology change cannot contain one window twice"
+        );
+        let frozen_tab_count = windows.iter().try_fold(0usize, |count, window| {
+            count
+                .checked_add(window.ordered_tabs().len())
+                .context("counting frozen window transaction tabs")
+        })?;
+        let mut frozen_tab_ids = HashSet::new();
+        frozen_tab_ids
+            .try_reserve(frozen_tab_count)
+            .map_err(|error| anyhow!("reserve frozen window tab identities: {error}"))?;
+        for window in &windows {
+            for tab in window.ordered_tabs() {
+                anyhow::ensure!(
+                    frozen_tab_ids.insert(tab.tab_id()),
+                    "a frozen window topology change cannot retain tab id {} in multiple windows",
+                    tab.tab_id(),
+                );
+            }
+        }
+        attached_tabs.sort_unstable();
+        anyhow::ensure!(
+            attached_tabs.windows(2).all(|pair| pair[0].0 != pair[1].0),
+            "a frozen window topology change cannot attach one tab twice"
+        );
+        for &(tab_id, window_id) in &attached_tabs {
+            let window = windows
+                .binary_search_by_key(&window_id, FrozenWindowOrder::window_id)
+                .ok()
+                .and_then(|index| windows.get(index))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "a frozen window topology change attaches tab {tab_id} to absent window {window_id}"
+                    )
+                })?;
+            anyhow::ensure!(
+                window
+                    .ordered_tabs()
+                    .iter()
+                    .any(|tab| tab.tab_id() == tab_id),
+                "a frozen window topology change attaches tab {tab_id} without retaining it in window {window_id}"
+            );
+        }
+        removed_windows.sort_unstable();
+        created_windows.sort_unstable();
+        anyhow::ensure!(
+            created_windows.windows(2).all(|pair| pair[0] != pair[1]),
+            "a frozen window topology change cannot create one window twice"
+        );
+        anyhow::ensure!(
+            removed_windows.windows(2).all(|pair| pair[0] != pair[1]),
+            "a frozen window topology change cannot remove one window twice"
+        );
+        anyhow::ensure!(
+            removed_windows
+                .iter()
+                .all(|removed| windows.iter().all(|window| window.window_id() != *removed)),
+            "a frozen window topology change cannot both retain and remove one window"
+        );
+        anyhow::ensure!(
+            created_windows
+                .iter()
+                .all(|created| removed_windows.binary_search(created).is_err()),
+            "a frozen window topology change cannot both create and remove one window"
+        );
+        anyhow::ensure!(
+            created_windows.iter().all(|created| windows
+                .binary_search_by_key(created, FrozenWindowOrder::window_id)
+                .is_ok()),
+            "a frozen window topology change must retain every created window"
+        );
+        Ok(Self {
+            windows: Arc::from(windows),
+            attached_tabs: Arc::from(attached_tabs),
+            created_windows: Arc::from(created_windows),
+            removed_windows: Arc::from(removed_windows),
+        })
+    }
+
+    pub fn windows(&self) -> &[FrozenWindowOrder] {
+        &self.windows
+    }
+
+    /// Return whether this transaction changed or retired `window_id`.
+    ///
+    /// Retired windows are deliberately affected but absent from
+    /// [`Self::windows`], which contains only frozen post-commit survivors.
+    pub fn affects_window(&self, window_id: WindowId) -> bool {
+        self.windows
+            .binary_search_by_key(&window_id, FrozenWindowOrder::window_id)
+            .is_ok()
+            || self.removed_windows.binary_search(&window_id).is_ok()
+    }
+
+    pub fn attached_tabs(&self) -> &[(TabId, WindowId)] {
+        &self.attached_tabs
+    }
+
+    pub fn removed_windows(&self) -> &[WindowId] {
+        &self.removed_windows
+    }
+
+    pub fn created_windows(&self) -> &[WindowId] {
+        &self.created_windows
+    }
+
+    pub fn legacy_resync_tab_id(&self) -> TabId {
+        self.windows
+            .iter()
+            .find_map(FrozenWindowOrder::active_tab_id)
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum MuxNotification {
     PaneOutput(PaneId),
@@ -676,6 +811,13 @@ pub enum MuxNotification {
     WindowCreated(WindowId),
     WindowRemoved(WindowId),
     WindowInvalidated(WindowId),
+    /// One allocation-prepared mutation of one or more exact mux windows.
+    ///
+    /// Every included window was committed under the same window-map lock and
+    /// the enclosing envelope's single topology revision.  The windows are in
+    /// ascending `WindowId` order, so delayed consumers never need to re-read
+    /// mutable mux state or infer which half of a cross-window move they saw.
+    WindowTopologyChanged(FrozenWindowTopologyChange),
     /// One frozen, pointer-preserving pure-window reorder. The enclosing
     /// envelope carries the single topology revision reserved by the same
     /// transaction; delayed subscribers must consume this state directly and
@@ -752,6 +894,7 @@ impl MuxNotification {
                 | Self::WindowCreated(_)
                 | Self::WindowRemoved(_)
                 | Self::WindowInvalidated(_)
+                | Self::WindowTopologyChanged(_)
                 | Self::WindowOrderChanged { .. }
                 | Self::WindowWorkspaceChanged { .. }
                 | Self::Empty
@@ -1856,7 +1999,8 @@ mod pane_registration_handle {
         }
 
         pub fn focus_pane_and_containing_tab(&self) -> anyhow::Result<()> {
-            self.owner.focus_exact_pane_and_containing_tab(self.pane)
+            self.owner
+                .focus_exact_pane_and_containing_tab_registered(self.pane_id, self.pane)
         }
 
         /// Focus this exact pane and attribute focus to an exact client
@@ -5004,8 +5148,32 @@ impl Mux {
             .ok_or_else(|| anyhow!("pane registration {pane_id} is no longer current"))?
     }
 
-    fn focus_exact_pane_and_containing_tab(&self, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
+    /// Focus one exact pane instance and the exact tab that currently owns it.
+    ///
+    /// This identity-preserving form is intended for callers that already
+    /// resolved an `Arc<dyn Pane>` and must not be redirected to a same-id
+    /// successor before the focus operation reaches mux authority.
+    pub fn focus_exact_pane_and_containing_tab(&self, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
         let pane_id = pane.pane_id();
+        let registration = self
+            .capture_current_pane(pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} is not registered"))?;
+        registration
+            .try_with_current(|current| {
+                anyhow::ensure!(
+                    Arc::ptr_eq(current.pane, pane),
+                    "pane {pane_id} was replaced before exact focus"
+                );
+                self.focus_exact_pane_and_containing_tab_registered(pane_id, pane)
+            })
+            .ok_or_else(|| anyhow!("pane registration {pane_id} is no longer current"))?
+    }
+
+    fn focus_exact_pane_and_containing_tab_registered(
+        &self,
+        pane_id: PaneId,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<()> {
         let (window_id, tab) = {
             let windows = self.windows.read();
             windows
@@ -5023,21 +5191,7 @@ impl Mux {
                 .ok_or_else(|| anyhow!("can't find exact pane {pane_id} in the mux topology"))?
         };
 
-        {
-            let mut win = self
-                .get_window_mut(window_id)
-                .ok_or_else(|| anyhow::anyhow!("window_id {window_id} not found"))?;
-            let tab_idx = win
-                .iter()
-                .position(|candidate| Arc::ptr_eq(candidate, &tab))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "exact containing tab {} is no longer in window {window_id}",
-                        tab.tab_id(),
-                    )
-                })?;
-            win.save_and_then_set_active(tab_idx);
-        }
+        self.activate_tab_exact_in_window(window_id, &tab, true)?;
 
         // Focus/activate the pane locally
         anyhow::ensure!(
@@ -5541,6 +5695,124 @@ impl Mux {
         pending
             .queue
             .push_back(PendingWindowAction::Notification { envelope, activity });
+    }
+
+    /// Commit one allocation-prepared mutation spanning one or more windows.
+    ///
+    /// Lock order is `windows -> topology -> pending_window_notifications`.
+    /// Callers already hold the window-map write guard.  Every fallible
+    /// allocation and revision check completes before the first window field
+    /// changes; the post-reservation suffix contains only exact lookups,
+    /// swaps, scalar assignments, and pushes into pre-reserved capacity.
+    fn commit_prepared_window_states_locked(
+        &self,
+        windows: &mut HashMap<WindowId, Window>,
+        mut prepared: Vec<(WindowId, PreparedWindowState)>,
+        attached_tabs: Vec<(TabId, WindowId)>,
+        mut created_windows: Vec<WindowId>,
+        mut removed_windows: Vec<WindowId>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!prepared.is_empty(), "window transaction is empty");
+        prepared.sort_unstable_by_key(|(window_id, _)| *window_id);
+        anyhow::ensure!(
+            prepared.windows(2).all(|pair| pair[0].0 != pair[1].0),
+            "window transaction names one window more than once"
+        );
+        for (window_id, state) in &prepared {
+            anyhow::ensure!(
+                windows.contains_key(window_id),
+                "window {window_id} left the mux before prepared commit"
+            );
+            anyhow::ensure!(
+                state.frozen().window_id() == *window_id,
+                "prepared window state identity mismatch"
+            );
+        }
+        removed_windows.sort_unstable();
+        created_windows.sort_unstable();
+        anyhow::ensure!(
+            created_windows.windows(2).all(|pair| pair[0] != pair[1]),
+            "window transaction creates one window twice"
+        );
+        anyhow::ensure!(
+            removed_windows.windows(2).all(|pair| pair[0] != pair[1]),
+            "window transaction removes one window twice"
+        );
+        anyhow::ensure!(
+            removed_windows.iter().all(|window_id| prepared
+                .iter()
+                .any(|(prepared_id, _)| prepared_id == window_id)),
+            "removed windows must retain one prepared final state"
+        );
+        anyhow::ensure!(
+            created_windows.iter().all(|window_id| prepared
+                .iter()
+                .any(|(prepared_id, _)| prepared_id == window_id)),
+            "created windows must retain one prepared final state"
+        );
+
+        let mut frozen_states = Vec::new();
+        frozen_states
+            .try_reserve_exact(prepared.len())
+            .map_err(|error| anyhow!("reserve frozen window states: {error}"))?;
+        frozen_states.extend(prepared.iter().filter_map(|(window_id, state)| {
+            removed_windows
+                .binary_search(window_id)
+                .is_err()
+                .then(|| state.frozen().clone())
+        }));
+        let frozen = FrozenWindowTopologyChange::from_prepared(
+            frozen_states,
+            attached_tabs,
+            created_windows.clone(),
+            removed_windows.clone(),
+        )?;
+        let mut focus_lost = Vec::new();
+        focus_lost
+            .try_reserve_exact(prepared.len())
+            .map_err(|error| anyhow!("reserve window focus callbacks: {error}"))?;
+        let mut topology = self.topology.lock();
+        let mut pending = self.pending_window_notifications.lock();
+        anyhow::ensure!(
+            std::ptr::eq(pending.owner.as_ptr(), self as *const Self),
+            "window topology transactions require the exact owner to be bound"
+        );
+        pending
+            .queue
+            .try_reserve(prepared.len().saturating_add(1))
+            .map_err(|error| anyhow!("reserve frozen window transaction delivery: {error}"))?;
+        let revision = topology.reserve_revision().map_err(anyhow::Error::new)?;
+
+        for (window_id, state) in prepared {
+            let window = windows
+                .get_mut(&window_id)
+                .expect("prepared window presence was validated under the same write guard");
+            let (_committed, lost) = window.commit_prepared_state(state);
+            if let Some(pane) = lost {
+                focus_lost.push(pane);
+            }
+        }
+        for window_id in removed_windows {
+            let removed = windows.remove(&window_id);
+            debug_assert!(removed.is_some());
+            self.provisional_windows.lock().remove(&window_id);
+        }
+        for window_id in created_windows {
+            self.provisional_windows.lock().remove(&window_id);
+        }
+        for pane in focus_lost {
+            pending
+                .queue
+                .push_back(PendingWindowAction::FocusLost(pane));
+        }
+        pending.queue.push_back(PendingWindowAction::Notification {
+            envelope: MuxNotificationEnvelope {
+                notification: MuxNotification::WindowTopologyChanged(frozen),
+                topology: MuxTopologyStamp::Revision(revision),
+            },
+            activity: None,
+        });
+        Ok(())
     }
 
     fn flush_window_notifications(&self) {
@@ -7459,25 +7731,35 @@ impl Mux {
             }
             let mut windows = self.windows.write();
             let retired_identities = HashSet::from([Arc::as_ptr(&tab) as usize]);
-            if !Self::preflight_exact_tab_detach_locked(
+            let prepared_windows = match Self::prepare_exact_tab_detach_locked(
                 &windows,
                 &retired_identities,
                 None,
                 "tab retirement",
             ) {
-                return None;
-            }
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!("refusing tab retirement before structural commit: {error:#}");
+                    return None;
+                }
+            };
             let result = tab.with_pane_snapshot_callback_free(|pane_snapshot| {
                 let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
+                if !prepared_windows.is_empty() {
+                    if let Err(error) = self.commit_prepared_window_states_locked(
+                        &mut windows,
+                        prepared_windows,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ) {
+                        log::error!("refusing tab retirement window commit: {error:#}");
+                        return None;
+                    }
+                }
                 tabs.remove(&tab_id);
-                self.take_tab_pane_candidates_for_removal_locked(pane_candidates)
-            });
-            // Keep tab-map authority until every old exact parentage edge has
-            // retired. Otherwise the same Arc<Tab> can be repurposed and
-            // reattached between registry retirement and this window sweep.
-            for window in windows.values_mut() {
-                window.remove_tabs_by_exact_identity_set(&retired_identities);
-            }
+                Some(self.take_tab_pane_candidates_for_removal_locked(pane_candidates))
+            })?;
             result
         };
         self.finish_taken_tab_pane_state(&removed_panes, output_batches);
@@ -7620,45 +7902,30 @@ impl Mux {
         self.discard_removed_pane_states(&pane_ids);
     }
 
-    /// Check that an exact-parentage sweep can reserve every affected
-    /// ordered-window revision before any tab or pane registry is changed.
-    /// The caller holds `windows` for writing, so a successful preflight stays
-    /// valid through the subsequent infallible detach operations.
-    fn preflight_exact_tab_detach_locked(
+    /// Allocation-prepare the complete exact-parentage sweep before any tab,
+    /// pane, or window registry changes.
+    fn prepare_exact_tab_detach_locked(
         windows: &HashMap<WindowId, Window>,
         removals: &HashSet<usize>,
         excluded_window: Option<WindowId>,
         operation: &'static str,
-    ) -> bool {
-        windows.iter().all(|(window_id, window)| {
-            excluded_window == Some(*window_id)
-                || Self::window_can_detach_exact_tabs(*window_id, window, removals, operation)
-        })
-    }
-
-    /// Return false only when this window both contains a doomed exact tab
-    /// identity and cannot reserve the single revision used by its batched
-    /// removal. Merely inspecting an exhausted but unaffected window must not
-    /// block unrelated retirement.
-    fn window_can_detach_exact_tabs(
-        window_id: WindowId,
-        window: &Window,
-        removals: &HashSet<usize>,
-        operation: &'static str,
-    ) -> bool {
-        let affected = window
-            .iter()
-            .any(|tab| removals.contains(&(Arc::as_ptr(tab) as usize)));
-        if !affected {
-            return true;
+    ) -> anyhow::Result<Vec<(WindowId, PreparedWindowState)>> {
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(windows.len())
+            .map_err(|error| anyhow!("reserve {operation} window transaction: {error}"))?;
+        for (&window_id, window) in windows {
+            if excluded_window == Some(window_id) {
+                continue;
+            }
+            if let Some(state) = window
+                .prepare_remove_exact_identity_set(removals)
+                .with_context(|| format!("prepare {operation} in window {window_id}"))?
+            {
+                prepared.push((window_id, state));
+            }
         }
-        if let Err(err) = window.next_order_revision() {
-            log::error!(
-                "refusing {operation} in window {window_id} before structural commit: {err}"
-            );
-            return false;
-        }
-        true
+        Ok(prepared)
     }
 
     /// Atomically validate a delayed pane witness against an exact tab and
@@ -7682,23 +7949,38 @@ impl Mux {
             }
             let mut windows = self.windows.write();
             let retired_identities = HashSet::from([Arc::as_ptr(expected) as usize]);
-            if !Self::preflight_exact_tab_detach_locked(
+            let prepared_windows = match Self::prepare_exact_tab_detach_locked(
                 &windows,
                 &retired_identities,
                 None,
                 "witnessed tab retirement",
             ) {
-                return None;
-            }
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!(
+                        "refusing witnessed tab retirement before structural commit: {error:#}"
+                    );
+                    return None;
+                }
+            };
             let result = expected.with_exact_pane_operation(operation, |pane_snapshot| {
                 let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
+                if !prepared_windows.is_empty() {
+                    if let Err(error) = self.commit_prepared_window_states_locked(
+                        &mut windows,
+                        prepared_windows,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ) {
+                        log::error!("refusing witnessed tab retirement window commit: {error:#}");
+                        return None;
+                    }
+                }
                 tabs.remove(&tab_id);
-                self.take_tab_pane_candidates_for_removal_locked(pane_candidates)
+                Some(self.take_tab_pane_candidates_for_removal_locked(pane_candidates))
             })?;
-            for window in windows.values_mut() {
-                window.remove_tabs_by_exact_identity_set(&retired_identities);
-            }
-            result
+            result?
         };
         self.finish_taken_tab_pane_state(&removed_panes, output_batches);
         Some((Arc::clone(expected), removed_panes))
@@ -7765,27 +8047,49 @@ impl Mux {
             }
             let mut windows = self.windows.write();
             let retired_identities = HashSet::from([Arc::as_ptr(expected) as usize]);
-            if !Self::preflight_exact_tab_detach_locked(
+            let prepared_windows = match Self::prepare_exact_tab_detach_locked(
                 &windows,
                 &retired_identities,
                 None,
                 "empty-tab retirement",
             ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!(
+                        "refusing empty-tab retirement before structural commit: {error:#}"
+                    );
+                    return None;
+                }
+            };
+            let mut removed_windows = Vec::new();
+            if let Err(error) = removed_windows.try_reserve_exact(prepared_windows.len()) {
+                log::error!(
+                    "refusing empty-tab retirement before commit: cannot reserve window-retirement payload: {error}"
+                );
                 return None;
             }
-            let tab = expected
-                .with_structurally_empty(|| tabs.remove(&tab_id))
-                .flatten()?;
-            let provisional_windows = self.provisional_windows.lock();
-            windows.retain(|window_id, window| {
-                let detached = window.remove_tabs_by_exact_identity_set(&retired_identities);
-                let remove =
-                    detached && window.is_empty() && !provisional_windows.contains(window_id);
-                if remove {
-                    self.queue_window_notification(MuxNotification::WindowRemoved(*window_id));
+            {
+                let provisional = self.provisional_windows.lock();
+                removed_windows.extend(prepared_windows.iter().filter_map(|(window_id, state)| {
+                    (state.frozen().ordered_tabs().is_empty() && !provisional.contains(window_id))
+                        .then_some(*window_id)
+                }));
+            }
+            let tab = expected.with_structurally_empty(|| {
+                if !prepared_windows.is_empty() {
+                    if let Err(error) = self.commit_prepared_window_states_locked(
+                        &mut windows,
+                        prepared_windows,
+                        Vec::new(),
+                        Vec::new(),
+                        removed_windows,
+                    ) {
+                        log::error!("refusing empty-tab retirement window commit: {error:#}");
+                        return None;
+                    }
                 }
-                !remove
-            });
+                tabs.remove(&tab_id)
+            })??;
             tab
         };
         self.flush_window_notifications();
@@ -7842,28 +8146,71 @@ impl Mux {
                 .iter()
                 .map(|tab| Arc::as_ptr(tab) as usize)
                 .collect::<HashSet<_>>();
-            if !Self::preflight_exact_tab_detach_locked(
+            let mut prepared_windows = match Self::prepare_exact_tab_detach_locked(
                 &windows,
                 &retired_identities,
-                Some(window_id),
-                "window duplicate-parent retirement",
+                None,
+                "window retirement",
             ) {
-                return None;
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!(
+                        "refusing window {window_id} retirement before structural commit: {error:#}"
+                    );
+                    return None;
+                }
+            };
+            let was_provisional = self.provisional_windows.lock().contains(&window_id);
+            if was_provisional {
+                prepared_windows.retain(|(prepared_id, _)| *prepared_id != window_id);
+            } else if !prepared_windows
+                .iter()
+                .any(|(prepared_id, _)| *prepared_id == window_id)
+            {
+                let retirement = windows
+                    .get(&window_id)
+                    .expect("validated window remains present")
+                    .prepare_retirement_marker()
+                    .map_err(|error| {
+                        log::error!(
+                            "refusing empty window {window_id} retirement before commit: {error:#}"
+                        );
+                    })
+                    .ok()?;
+                prepared_windows.push((window_id, retirement));
             }
 
             let removed_tabs = Tab::with_pane_snapshots_callback_free(
                 &retired_tabs,
                 expected,
                 |pane_snapshots| {
-                    windows
-                        .remove(&window_id)
-                        .expect("validated window remains present under the write guard");
-                    let was_provisional = self.provisional_windows.lock().remove(&window_id);
-                    if !was_provisional {
-                        // Preserve the established parent-before-child
-                        // topology stream: the window ceases to exist before
-                        // its panes, and its revision is reserved first.
-                        self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
+                    if !prepared_windows.is_empty() {
+                        let removed_windows = if was_provisional {
+                            Vec::new()
+                        } else {
+                            let mut removed = Vec::new();
+                            if removed.try_reserve_exact(1).is_err() {
+                                return None;
+                            }
+                            removed.push(window_id);
+                            removed
+                        };
+                        if let Err(error) = self.commit_prepared_window_states_locked(
+                            &mut windows,
+                            prepared_windows,
+                            Vec::new(),
+                            Vec::new(),
+                            removed_windows,
+                        ) {
+                            log::error!("refusing window retirement commit: {error:#}");
+                            return None;
+                        }
+                    }
+                    if was_provisional {
+                        windows
+                            .remove(&window_id)
+                            .expect("validated provisional window remains present");
+                        self.provisional_windows.lock().remove(&window_id);
                     }
                     for tab in &retired_tabs {
                         tabs.remove(&tab.tab_id());
@@ -7871,29 +8218,23 @@ impl Mux {
 
                     let pane_candidate_batches =
                         self.resolve_tab_pane_candidate_batches_locked(&pane_snapshots);
-                    pane_snapshots
-                        .into_iter()
-                        .zip(pane_candidate_batches)
-                        .map(|(structural_panes, pane_candidates)| {
-                            let (removed_panes, output_batches) =
-                                self.take_tab_pane_candidates_for_removal_locked(pane_candidates);
-                            RemovedTabRegistration {
-                                structural_panes,
-                                removed_panes,
-                                output_batches,
-                            }
-                        })
-                        .collect::<Vec<_>>()
+                    Some(
+                        pane_snapshots
+                            .into_iter()
+                            .zip(pane_candidate_batches)
+                            .map(|(structural_panes, pane_candidates)| {
+                                let (removed_panes, output_batches) = self
+                                    .take_tab_pane_candidates_for_removal_locked(pane_candidates);
+                                RemovedTabRegistration {
+                                    structural_panes,
+                                    removed_panes,
+                                    output_batches,
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 },
-            )?;
-
-            // Tab topology locks are now released, but map authority remains
-            // held while malformed duplicate parentage is reconciled. Window
-            // removal may inspect an active tab, so this preserves the global
-            // `tabs -> windows -> Tab::inner` lock order without self-deadlock.
-            for survivor in windows.values_mut() {
-                survivor.remove_tabs_by_exact_identity_set(&retired_identities);
-            }
+            )??;
             removed_tabs
         };
 
@@ -8001,33 +8342,54 @@ impl Mux {
     }
 
     fn remove_window_if_empty_internal(&self, window_id: WindowId) -> bool {
-        let (removed, was_provisional) = {
+        let removed = {
             let mut windows = self.windows.write();
-            let mut provisional_windows = self.provisional_windows.lock();
-            let outcome = if provisional_windows.contains(&window_id) {
+            if self.provisional_windows.lock().contains(&window_id) {
                 // Only the exact MuxWindowBuilder cancellation/publication
                 // transaction may retire an unpublished window. An activity
                 // count is an admission hint, not a topology lock; a prune
                 // admitted just before new_empty_window can otherwise reap
                 // the newly published provisional window.
-                (false, true)
-            } else if windows
-                .get(&window_id)
-                .is_some_and(|window| window.is_empty())
+                false
+            } else if let Some(window) = windows.get(&window_id).filter(|window| window.is_empty())
             {
-                let removed = windows.remove(&window_id).is_some();
-                let was_provisional = provisional_windows.remove(&window_id);
-                (removed, was_provisional)
+                let state = match window.prepare_retirement_marker() {
+                    Ok(state) => state,
+                    Err(error) => {
+                        log::error!(
+                            "refusing empty window {window_id} retirement before commit: {error:#}"
+                        );
+                        return false;
+                    }
+                };
+                let mut prepared = Vec::new();
+                let mut removed_windows = Vec::new();
+                if prepared.try_reserve_exact(1).is_err()
+                    || removed_windows.try_reserve_exact(1).is_err()
+                {
+                    log::error!("refusing empty window {window_id} retirement: allocation failed");
+                    return false;
+                }
+                prepared.push((window_id, state));
+                removed_windows.push(window_id);
+                match self.commit_prepared_window_states_locked(
+                    &mut windows,
+                    prepared,
+                    Vec::new(),
+                    Vec::new(),
+                    removed_windows,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::error!("refusing empty window {window_id} retirement: {error:#}");
+                        false
+                    }
+                }
             } else {
-                (false, false)
-            };
-            if outcome.0 && !outcome.1 {
-                self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
+                false
             }
-            outcome
         };
         if removed {
-            debug_assert!(!was_provisional);
             self.recompute_pane_count();
             self.flush_window_notifications();
         }
@@ -8257,20 +8619,36 @@ impl Mux {
                 .collect::<HashSet<_>>();
             let mut windows = self.windows.write();
             let provisional_windows = self.provisional_windows.lock();
-            let mut dead_windows = Vec::new();
-            for (window_id, window) in windows.iter_mut() {
-                if Self::window_can_detach_exact_tabs(
-                    *window_id,
-                    window,
-                    &stale_identities,
-                    "stale-parent prune",
-                ) {
-                    window.remove_tabs_by_exact_identity_set(&stale_identities);
+            let prepared = match Self::prepare_exact_tab_detach_locked(
+                &windows,
+                &stale_identities,
+                None,
+                "stale-parent prune",
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!("refusing stale-parent prune before commit: {error:#}");
+                    Vec::new()
                 }
-                if window.is_empty() && !provisional_windows.contains(window_id) {
-                    dead_windows.push(*window_id);
+            };
+            if !prepared.is_empty() {
+                if let Err(error) = self.commit_prepared_window_states_locked(
+                    &mut windows,
+                    prepared,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ) {
+                    log::error!("refusing stale-parent prune window commit: {error:#}");
                 }
             }
+            let dead_windows = windows
+                .iter()
+                .filter_map(|(window_id, window)| {
+                    (window.is_empty() && !provisional_windows.contains(window_id))
+                        .then_some(*window_id)
+                })
+                .collect::<Vec<_>>();
             dead_windows
         };
         self.flush_window_notifications();
@@ -8516,6 +8894,97 @@ impl Mux {
         window.get_active().map(Arc::clone)
     }
 
+    /// Change one window's active tab through the frozen topology stream.
+    ///
+    /// Invalid indices and either revision-counter exhaustion fail before the
+    /// active identity, last-active identity, focus callbacks, or notification
+    /// queue changes.
+    pub fn activate_tab_at_index(
+        &self,
+        window_id: WindowId,
+        tab_index: usize,
+        save_last_active: bool,
+    ) -> anyhow::Result<bool> {
+        let changed = {
+            let mut windows = self.windows.write();
+            let window = windows
+                .get(&window_id)
+                .ok_or_else(|| anyhow!("activate_tab_at_index: no such window {window_id}"))?;
+            let Some(state) = window.prepare_set_active(tab_index, save_last_active)? else {
+                return Ok(false);
+            };
+            let mut prepared = Vec::new();
+            prepared
+                .try_reserve_exact(1)
+                .map_err(|error| anyhow!("reserve active-tab transaction: {error}"))?;
+            prepared.push((window_id, state));
+            self.commit_prepared_window_states_locked(
+                &mut windows,
+                prepared,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )?;
+            true
+        };
+        self.flush_window_notifications();
+        Ok(changed)
+    }
+
+    /// Activate one exact registered tab in one exact window.
+    ///
+    /// Unlike an index captured through `get_window`, the tab identity is
+    /// resolved while the tab-registry read guard and window-map write guard
+    /// are both held. A concurrent reorder or same-id tab replacement can
+    /// therefore only make this operation fail; it can never redirect focus
+    /// to a different tab.
+    pub fn activate_tab_exact_in_window(
+        &self,
+        window_id: WindowId,
+        expected: &Arc<Tab>,
+        save_last_active: bool,
+    ) -> anyhow::Result<bool> {
+        let tab_id = expected.tab_id();
+        let changed = {
+            let tabs = self.tabs.read();
+            anyhow::ensure!(
+                tabs.get(&tab_id)
+                    .is_some_and(|registered| Arc::ptr_eq(registered, expected)),
+                "activate exact tab: tab {tab_id} is not the current registered instance"
+            );
+            let mut windows = self.windows.write();
+            let window = windows
+                .get(&window_id)
+                .ok_or_else(|| anyhow!("activate exact tab: no such window {window_id}"))?;
+            let tab_index = window
+                .iter()
+                .position(|candidate| Arc::ptr_eq(candidate, expected))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "activate exact tab: tab {tab_id} is not attached to window {window_id}"
+                    )
+                })?;
+            let Some(state) = window.prepare_set_active(tab_index, save_last_active)? else {
+                return Ok(false);
+            };
+            let mut prepared = Vec::new();
+            prepared
+                .try_reserve_exact(1)
+                .map_err(|error| anyhow!("reserve exact active-tab transaction: {error}"))?;
+            prepared.push((window_id, state));
+            self.commit_prepared_window_states_locked(
+                &mut windows,
+                prepared,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )?;
+            true
+        };
+        self.flush_window_notifications();
+        Ok(changed)
+    }
+
     pub fn window_can_close_without_prompting(&self, window_id: WindowId) -> Option<bool> {
         let tabs = {
             let window = self.get_window(window_id)?;
@@ -8584,13 +9053,13 @@ impl Mux {
             let existing_parent = windows.iter().find_map(|(candidate_id, candidate)| {
                 candidate
                     .iter()
-                    .any(|existing| Arc::ptr_eq(existing, tab))
+                    .any(|existing| Arc::ptr_eq(existing, tab) || existing.tab_id() == tab_id)
                     .then_some(*candidate_id)
             });
             if let Some(existing_parent) = existing_parent {
                 return Err(anyhow!(
-                    "add_tab_to_window: exact tab {tab_id} is already attached to window \
-                     {existing_parent}"
+                    "add_tab_to_window: tab id {tab_id} or its exact instance is already attached \
+                     to window {existing_parent}"
                 ));
             }
             let window = windows
@@ -8600,8 +9069,31 @@ impl Mux {
                 window.idx_by_id(tab_id).is_none(),
                 "add_tab_to_window: window {window_id} already contains tab id {tab_id}"
             );
-            window.insert(window.len(), tab)?;
-            self.queue_window_notification(MuxNotification::TabAddedToWindow { tab_id, window_id });
+            let prepared_state = window.prepare_insert(window.len(), tab)?;
+            let mut prepared = Vec::new();
+            prepared
+                .try_reserve_exact(1)
+                .map_err(|error| anyhow!("reserve tab attachment transaction: {error}"))?;
+            prepared.push((window_id, prepared_state));
+            let mut attached_tabs = Vec::new();
+            attached_tabs
+                .try_reserve_exact(1)
+                .map_err(|error| anyhow!("reserve tab attachment payload: {error}"))?;
+            attached_tabs.push((tab_id, window_id));
+            let mut created_windows = Vec::new();
+            if self.provisional_windows.lock().contains(&window_id) {
+                created_windows
+                    .try_reserve_exact(1)
+                    .map_err(|error| anyhow!("reserve window creation payload: {error}"))?;
+                created_windows.push(window_id);
+            }
+            self.commit_prepared_window_states_locked(
+                &mut windows,
+                prepared,
+                attached_tabs,
+                created_windows,
+                Vec::new(),
+            )?;
         }
         self.recompute_pane_count();
         self.flush_window_notifications();
@@ -8646,26 +9138,29 @@ impl Mux {
             .get(&tab_id)
             .map(Arc::clone)
             .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} not found in mux"))?;
-        let source_windows = self
-            .windows
-            .read()
-            .iter()
-            .filter_map(|(window_id, window)| {
-                window
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
-                    .then_some(*window_id)
-            })
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            source_windows.len() == 1,
-            "move_tab_between_windows: exact tab {tab_id} has {} parents; expected exactly one",
-            source_windows.len(),
-        );
-        let src_window = source_windows[0];
-
-        let changed = {
+        let (changed, src_window) = {
             let mut windows = self.windows.write();
+            let mut exact_parent_count = 0usize;
+            let mut numeric_parent_count = 0usize;
+            let mut src_window = None;
+            for (window_id, window) in windows.iter() {
+                for candidate in window.iter() {
+                    if Arc::ptr_eq(candidate, &tab) {
+                        exact_parent_count = exact_parent_count.saturating_add(1);
+                        src_window = Some(*window_id);
+                    }
+                    if candidate.tab_id() == tab_id {
+                        numeric_parent_count = numeric_parent_count.saturating_add(1);
+                    }
+                }
+            }
+            anyhow::ensure!(
+                exact_parent_count == 1 && numeric_parent_count == 1,
+                "move_tab_between_windows: tab {tab_id} has {exact_parent_count} exact and \
+                 {numeric_parent_count} numeric parents; expected one unambiguous owner"
+            );
+            let src_window = src_window
+                .expect("one exact parent was validated while holding the window-map write guard");
             let source = windows.get(&src_window).ok_or_else(|| {
                 anyhow!("move_tab_between_windows: source window {src_window} not found")
             })?;
@@ -8735,47 +9230,64 @@ impl Mux {
 
             let changed = if src_window == dst_window && source_index == pos {
                 false
-            } else if src_window == dst_window {
-                let reordered = windows
-                    .get_mut(&src_window)
-                    .expect("source window presence checked above")
-                    .reorder_tab_if_same(&tab, source_index, pos)?;
-                if !reordered {
-                    return Err(anyhow!(
-                        "move_tab_between_windows: exact tab {tab_id} left source window \
-                         {src_window}"
-                    ));
-                }
-                true
             } else {
-                // All fallible validation is complete while both window
-                // vectors remain unchanged. The write lock prevents either
-                // length or membership from changing between detach and the
-                // prevalidated insertion.
-                let removed = windows
-                    .get_mut(&src_window)
-                    .expect("source window presence checked above")
-                    .remove_tab_if_same(&tab);
-                if !removed {
-                    return Err(anyhow!(
-                        "move_tab_between_windows: exact tab {tab_id} left source window \
-                         {src_window}"
-                    ));
+                let mut prepared = Vec::new();
+                prepared
+                    .try_reserve_exact(if src_window == dst_window { 1 } else { 2 })
+                    .map_err(|error| anyhow!("reserve tab move transaction: {error}"))?;
+                let mut attached_tabs = Vec::new();
+                if src_window == dst_window {
+                    let state = windows
+                        .get(&src_window)
+                        .expect("source window presence checked above")
+                        .prepare_reorder_exact(&tab, source_index, pos)?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "move_tab_between_windows: exact tab {tab_id} left source window \
+                                 {src_window}"
+                            )
+                        })?;
+                    prepared.push((src_window, state));
+                } else {
+                    let source_state = windows
+                        .get(&src_window)
+                        .expect("source window presence checked above")
+                        .prepare_remove_exact(&tab)?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "move_tab_between_windows: exact tab {tab_id} left source window \
+                                 {src_window}"
+                            )
+                        })?;
+                    let destination_state = windows
+                        .get(&dst_window)
+                        .expect("destination window presence checked above")
+                        .prepare_insert(pos, &tab)?;
+                    prepared.push((src_window, source_state));
+                    prepared.push((dst_window, destination_state));
+                    attached_tabs.try_reserve_exact(1).map_err(|error| {
+                        anyhow!("reserve cross-window attachment payload: {error}")
+                    })?;
+                    attached_tabs.push((tab_id, dst_window));
                 }
-                let dst = windows
-                    .get_mut(&dst_window)
-                    .expect("destination window presence checked above");
-                dst.insert(pos, &tab)
-                    .expect("destination index and membership were validated before detach");
+                let mut created_windows = Vec::new();
+                if src_window != dst_window && self.provisional_windows.lock().contains(&dst_window)
+                {
+                    created_windows.try_reserve_exact(1).map_err(|error| {
+                        anyhow!("reserve destination-window creation payload: {error}")
+                    })?;
+                    created_windows.push(dst_window);
+                }
+                self.commit_prepared_window_states_locked(
+                    &mut windows,
+                    prepared,
+                    attached_tabs,
+                    created_windows,
+                    Vec::new(),
+                )?;
                 true
             };
-            if changed {
-                self.queue_window_notification(MuxNotification::TabAddedToWindow {
-                    tab_id,
-                    window_id: dst_window,
-                });
-            }
-            changed
+            (changed, src_window)
         };
         drop(tabs);
 
@@ -9555,11 +10067,12 @@ impl Mux {
             pane.set_config(config);
         }
 
-        let mut window = self
-            .get_window_mut(window_id)
-            .ok_or_else(|| anyhow!("no such window!?"))?;
-        if let Some(idx) = window.idx_by_id(tab.tab_id()) {
-            window.save_and_then_set_active(idx);
+        let tab_index = self
+            .get_window(window_id)
+            .ok_or_else(|| anyhow!("no such window!?"))?
+            .idx_by_id(tab.tab_id());
+        if let Some(tab_index) = tab_index {
+            self.activate_tab_at_index(window_id, tab_index, true)?;
         }
 
         Ok((tab, pane, window_id))
@@ -13138,15 +13651,12 @@ mod tests {
             .expect("origin tab window attachment");
         drop(window);
 
-        {
-            let mut window = mux
-                .get_window_mut(window_id)
-                .expect("origin window remains registered");
-            assert!(window.remove_tab_if_same(&origin_tab));
-            window
-                .push(&replacement_tab)
-                .expect("replacement contents fit in origin window");
-        }
+        let holding_window = mux.new_empty_window(None, None);
+        let holding_window_id = *holding_window;
+        mux.move_tab_between_windows(origin_tab.tab_id(), holding_window_id, None)
+            .expect("move the origin tab without retiring its registration");
+        mux.add_tab_to_window(&replacement_tab, window_id)
+            .expect("replacement contents fit in origin window");
 
         assert!(
             !mux.kill_window_if_contains_exact_tab(window_id, &origin_tab, &origin_witness),
@@ -13160,13 +13670,14 @@ mod tests {
         assert_eq!(origin_kills.load(Ordering::SeqCst), 0);
         assert_eq!(replacement_kills.load(Ordering::SeqCst), 0);
 
-        mux.add_tab_to_window(&origin_tab, window_id)
-            .expect("origin tab may be reattached to its still-live window");
+        mux.move_tab_between_windows(origin_tab.tab_id(), window_id, None)
+            .expect("origin tab may be moved back to its still-live window");
         assert!(mux.kill_window_if_contains_exact_tab(window_id, &origin_tab, &origin_witness));
         assert!(mux.get_window(window_id).is_none());
         assert_eq!(origin_kills.load(Ordering::SeqCst), 1);
         assert_eq!(replacement_kills.load(Ordering::SeqCst), 1);
 
+        drop(holding_window);
         Mux::shutdown();
     }
 
@@ -13504,7 +14015,11 @@ mod tests {
         let observed_for_subscriber = Arc::clone(&observed);
         mux.subscribe_with_topology(move |envelope| {
             let kind = match envelope.notification {
-                MuxNotification::WindowRemoved(id) if id == window_id => Some("window"),
+                MuxNotification::WindowTopologyChanged(change)
+                    if change.removed_windows().binary_search(&window_id).is_ok() =>
+                {
+                    Some("window")
+                }
                 MuxNotification::PaneRemoved(208) => Some("pane"),
                 _ => None,
             };
@@ -15603,9 +16118,9 @@ mod tests {
         mux.subscribe_with_topology(move |envelope| {
             match envelope {
                 MuxNotificationEnvelope {
-                    notification: MuxNotification::WindowRemoved(id),
+                    notification: MuxNotification::WindowTopologyChanged(change),
                     topology: MuxTopologyStamp::Revision(revision),
-                } if id == window_id => {
+                } if change.removed_windows().binary_search(&window_id).is_ok() => {
                     removal_revisions_for_subscriber.lock().push(revision);
                 }
                 _ => {}
@@ -15635,12 +16150,18 @@ mod tests {
             window_was_removed,
             "the window registry mutation precedes the detachable-domain callback",
         );
-        let removal_revision = removal_revision
-            .expect("WindowRemoved must be published before the detachable callback starts");
+        let removal_revision = removal_revision.expect(
+            "the frozen window-retirement transaction must be published before the detachable callback starts",
+        );
+        assert_eq!(
+            removal_revisions.lock().as_slice(),
+            &[removal_revision],
+            "last-window retirement must publish exactly one frozen removal transaction",
+        );
         assert!(
             removal_revision > before && removal_revision <= during_callback,
-            "WindowRemoved revision {} must be reserved after the pre-removal snapshot {} and \
-             before the callback-visible authority {}",
+            "the frozen retirement revision {} must be reserved after the pre-removal snapshot \
+             {} and before the callback-visible authority {}",
             removal_revision.get(),
             before.get(),
             during_callback.get(),
@@ -17283,17 +17804,16 @@ mod tests {
         let mux_for_subscriber = Arc::clone(&mux);
         mux.subscribe(move |notification| {
             match notification {
-                MuxNotification::WindowInvalidated(id) if id == window_id => {
-                    events_for_subscriber.lock().push("invalidated");
+                MuxNotification::WindowTopologyChanged(change)
+                    if change.affects_window(window_id) =>
+                {
+                    events_for_subscriber.lock().push("topology");
                     if !did_reenter_for_subscriber.swap(true, Ordering::SeqCst) {
                         let mut window = mux_for_subscriber
-                            .get_window_mut(id)
+                            .get_window_mut(window_id)
                             .expect("subscriber must re-enter after the map lock is released");
                         window.set_workspace("reentrant-workspace");
                     }
-                }
-                MuxNotification::TabAddedToWindow { window_id: id, .. } if id == window_id => {
-                    events_for_subscriber.lock().push("tab-added")
                 }
                 MuxNotification::WindowWorkspaceChanged {
                     window_id: id,
@@ -17315,7 +17835,7 @@ mod tests {
 
         assert_eq!(
             &*events.lock(),
-            &["invalidated", "tab-added", "workspace-changed"],
+            &["topology", "workspace-changed"],
             "a reentrant event appends behind notifications already admitted at the mutation point",
         );
         assert_eq!(
@@ -17404,14 +17924,10 @@ mod tests {
         origin
             .subscribe(move |notification| {
                 match notification {
-                    MuxNotification::WindowInvalidated(id) if id == window_id => {
-                        origin_events_for_subscriber.lock().push("invalidated");
-                    }
-                    MuxNotification::TabAddedToWindow { window_id: id, .. } if id == window_id => {
-                        origin_events_for_subscriber.lock().push("tab-added");
-                    }
-                    MuxNotification::WindowCreated(id) if id == window_id => {
-                        origin_events_for_subscriber.lock().push("created");
+                    MuxNotification::WindowTopologyChanged(change)
+                        if change.affects_window(window_id) =>
+                    {
+                        origin_events_for_subscriber.lock().push("topology");
                     }
                     _ => {}
                 }
@@ -17426,6 +17942,7 @@ mod tests {
                 if matches!(
                     notification,
                     MuxNotification::WindowInvalidated(_)
+                        | MuxNotification::WindowTopologyChanged(_)
                         | MuxNotification::TabAddedToWindow { .. }
                         | MuxNotification::WindowCreated(_)
                 ) {
@@ -17445,10 +17962,7 @@ mod tests {
             .expect("origin window should accept the tab");
         drop(window_builder);
 
-        assert_eq!(
-            &*origin_events.lock(),
-            &["invalidated", "tab-added", "created"],
-        );
+        assert_eq!(&*origin_events.lock(), &["topology"],);
         assert_eq!(replacement_events.load(Ordering::SeqCst), 0);
         Mux::shutdown();
     }
@@ -17483,14 +17997,15 @@ mod tests {
             .expect("second tab should enter the window");
 
         let mux_for_thread = Arc::clone(&mux);
+        let first_tab_for_thread = Arc::clone(&first_tab);
         std::thread::spawn(move || {
-            mux_for_thread
-                .get_window_mut(window_id)
-                .expect("test window should remain registered")
-                .remove_by_idx(0);
+            assert!(
+                mux_for_thread.remove_tab_local_only_if_same(&first_tab_for_thread),
+                "exact test tab should retire through the mux transaction"
+            );
         })
         .join()
-        .expect("off-main active-tab removal should not panic");
+        .expect("off-main mux-owned active-tab removal should not panic");
 
         let (later_pane, later_focus) = KillCountingPane::new_with_focus_counter(453, test_size());
         first_tab
@@ -17542,7 +18057,9 @@ mod tests {
         let removed_events_for_subscriber = Arc::clone(&removed_events);
         mux.subscribe(move |notification| {
             match notification {
-                MuxNotification::WindowCreated(id) if id == window_id => {
+                MuxNotification::WindowTopologyChanged(change)
+                    if change.created_windows().binary_search(&window_id).is_ok() =>
+                {
                     created_events_for_subscriber.fetch_add(1, Ordering::SeqCst);
                 }
                 MuxNotification::WindowRemoved(id) if id == window_id => {
@@ -17569,7 +18086,7 @@ mod tests {
         assert_eq!(
             created_events.load(Ordering::SeqCst),
             1,
-            "a surviving window must publish exactly one WindowCreated event",
+            "a surviving window must publish exactly one frozen creation transaction",
         );
         assert_eq!(
             removed_events.load(Ordering::SeqCst),
@@ -17595,8 +18112,50 @@ mod tests {
         mux.add_tab_to_window(&tab, src_window_id)
             .expect("tab should start in source window");
 
+        let move_events = Arc::new(Mutex::new(Vec::new()));
+        let move_events_for_subscriber = Arc::clone(&move_events);
+        mux.subscribe_with_topology(move |envelope| {
+            if matches!(
+                &envelope.notification,
+                MuxNotification::WindowTopologyChanged(_)
+            ) {
+                move_events_for_subscriber.lock().push(envelope);
+            }
+            true
+        })
+        .expect("cross-window transaction subscriber");
+
         mux.move_tab_between_windows(tab_id, dst_window_id, Some(0))
             .expect("metadata move should succeed");
+
+        let events = move_events.lock();
+        assert_eq!(
+            events.len(),
+            1,
+            "a cross-window move must publish one frozen transaction"
+        );
+        let envelope = &events[0];
+        assert!(matches!(envelope.topology, MuxTopologyStamp::Revision(_)));
+        let MuxNotification::WindowTopologyChanged(change) = &envelope.notification else {
+            unreachable!("subscriber retained only frozen window transactions");
+        };
+        assert_eq!(
+            change
+                .windows()
+                .iter()
+                .map(FrozenWindowOrder::window_id)
+                .collect::<Vec<_>>(),
+            {
+                let mut ids = vec![src_window_id, dst_window_id];
+                ids.sort_unstable();
+                ids
+            },
+            "both post-commit windows must share one deterministic payload",
+        );
+        assert_eq!(change.attached_tabs(), &[(tab_id, dst_window_id)]);
+        assert_eq!(change.created_windows(), &[dst_window_id]);
+        assert!(change.removed_windows().is_empty());
+        drop(events);
 
         assert_eq!(mux.window_containing_tab(tab_id), Some(dst_window_id));
         assert!(
@@ -17657,10 +18216,8 @@ mod tests {
         mux.subscribe(move |notification| {
             if matches!(
                 notification,
-                MuxNotification::TabAddedToWindow {
-                    tab_id,
-                    window_id: notified_window,
-                } if tab_id == active_id && notified_window == window_id
+                MuxNotification::WindowTopologyChanged(change)
+                    if change.affects_window(window_id)
             ) {
                 move_events_for_subscriber.fetch_add(1, Ordering::SeqCst);
             }
@@ -18595,6 +19152,19 @@ mod tests {
         mux.get_window_mut(destination_id)
             .expect("destination window")
             .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+        let source_revision_before = mux
+            .get_window(source_id)
+            .expect("source window")
+            .order_revision();
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowTopologyChanged(_)) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe after setup");
 
         let attach_error = mux
             .add_tab_to_window(&unattached_tab, destination_id)
@@ -18626,9 +19196,374 @@ mod tests {
             .get_active()
             .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab)));
         assert_eq!(destination.order_revision().get(), u64::MAX - 1);
+        assert_eq!(source.order_revision(), source_revision_before);
+        assert_eq!(
+            events.load(Ordering::SeqCst),
+            0,
+            "destination exhaustion must publish no partial transaction",
+        );
         drop(destination);
         drop(source);
         assert!(mux.window_containing_tab(unattached_tab.tab_id()).is_none());
+        drop(destination_builder);
+        drop(source_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exhausted_source_rejects_cross_window_move_before_destination_attach() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source_builder = mux.new_empty_window(Some("source-exhaustion".to_string()), None);
+        let source_id = *source_builder;
+        let destination_builder = mux.new_empty_window(Some("source-exhaustion".to_string()), None);
+        let destination_id = *destination_builder;
+        let source_tab = Arc::new(Tab::new(&test_size()));
+        let destination_tab = Arc::new(Tab::new(&test_size()));
+        for tab in [&source_tab, &destination_tab] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+        }
+        mux.add_tab_to_window(&source_tab, source_id)
+            .expect("attach source tab");
+        mux.add_tab_to_window(&destination_tab, destination_id)
+            .expect("attach destination tab");
+        mux.get_window_mut(source_id)
+            .expect("source window")
+            .set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+        let destination_revision_before = mux
+            .get_window(destination_id)
+            .expect("destination window")
+            .order_revision();
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowTopologyChanged(_)) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe after setup");
+
+        let error = mux
+            .move_tab_between_windows(source_tab.tab_id(), destination_id, None)
+            .expect_err("an exhausted source must reject before destination attachment");
+        assert!(
+            format!("{error:#}").contains("source window"),
+            "unexpected exhausted-source error: {error:#}",
+        );
+
+        let source = mux.get_window(source_id).expect("source window survives");
+        let destination = mux
+            .get_window(destination_id)
+            .expect("destination window survives");
+        assert_eq!(source.order_revision().get(), u64::MAX - 1);
+        assert_eq!(destination.order_revision(), destination_revision_before);
+        assert_eq!(source.len(), 1);
+        assert_eq!(destination.len(), 1);
+        assert!(source
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab)));
+        assert!(destination
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab)));
+        assert_eq!(
+            events.load(Ordering::SeqCst),
+            0,
+            "source exhaustion must publish no partial transaction",
+        );
+
+        drop(destination);
+        drop(source);
+        drop(destination_builder);
+        drop(source_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn full_destination_rejects_cross_window_move_before_source_detach() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source_builder = mux.new_empty_window(Some("full-destination".to_string()), None);
+        let source_id = *source_builder;
+        let source_tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&source_tab)
+            .expect("register exact source tab");
+        mux.add_tab_to_window(&source_tab, source_id)
+            .expect("attach source tab");
+
+        // Build the capacity boundary ownerlessly so fixture construction does
+        // not publish 4,096 irrelevant topology events. The public mux move
+        // still sees the exact same bounded Window representation.
+        let mut destination = Window::new(Some("full-destination".to_string()), None);
+        for _ in 0..MAX_TABS_PER_ORDERED_WINDOW {
+            destination
+                .push(&Arc::new(Tab::new(&test_size())))
+                .expect("fill destination exactly to its bounded capacity");
+        }
+        let destination_id = destination.window_id();
+        mux.windows.write().insert(destination_id, destination);
+        let source_before = mux
+            .window_order_snapshot(source_id)
+            .expect("valid source")
+            .expect("registered source");
+        let destination_before = mux
+            .window_order_snapshot(destination_id)
+            .expect("valid destination")
+            .expect("registered destination");
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowTopologyChanged(_)) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe after setup");
+
+        let error = mux
+            .move_tab_between_windows(source_tab.tab_id(), destination_id, None)
+            .expect_err("full destination must reject before source detach");
+        assert!(
+            format!("{error:#}").contains("ordered-window limit"),
+            "unexpected full-destination error: {error:#}",
+        );
+        let source_after = mux
+            .window_order_snapshot(source_id)
+            .expect("valid source")
+            .expect("registered source");
+        let destination_after = mux
+            .window_order_snapshot(destination_id)
+            .expect("valid destination")
+            .expect("registered destination");
+        assert_eq!(
+            source_after.order_revision(),
+            source_before.order_revision()
+        );
+        assert_eq!(source_after.active_tab_id(), source_before.active_tab_id());
+        assert_eq!(
+            source_after.ordered_tab_ids().collect::<Vec<_>>(),
+            source_before.ordered_tab_ids().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            destination_after.order_revision(),
+            destination_before.order_revision()
+        );
+        assert_eq!(
+            destination_after.ordered_tabs().len(),
+            MAX_TABS_PER_ORDERED_WINDOW
+        );
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+
+        mux.windows.write().remove(&destination_id);
+        drop(source_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn global_topology_exhaustion_rejects_active_selection_without_window_mutation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(Some("topology-exhaustion".to_string()), None);
+        let window_id = *window_builder;
+        let first = Arc::new(Tab::new(&test_size()));
+        let second = Arc::new(Tab::new(&test_size()));
+        for tab in [&first, &second] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+            mux.add_tab_to_window(tab, window_id)
+                .expect("attach exact tab");
+        }
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid window")
+            .expect("registered window");
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowTopologyChanged(_)) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe after setup");
+        mux.topology.lock().revision = TopologyRevision(u64::MAX - 1);
+
+        let error = mux
+            .activate_tab_at_index(window_id, 1, true)
+            .expect_err("terminal topology revision must reject active selection");
+        assert!(format!("{error:#}").contains("topology revision space is exhausted"));
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid window")
+            .expect("registered window");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(after.active_tab_id(), before.active_tab_id());
+        assert_eq!(
+            after.ordered_tab_ids().collect::<Vec<_>>(),
+            before.ordered_tab_ids().collect::<Vec<_>>(),
+        );
+        assert_eq!(mux.topology.lock().revision, TopologyRevision(u64::MAX - 1));
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exact_tab_activation_cannot_be_redirected_by_a_reorder_or_stale_registration() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(Some("exact-activation".to_string()), None);
+        let window_id = *window_builder;
+        let first = Arc::new(Tab::new(&test_size()));
+        let intended = Arc::new(Tab::new(&test_size()));
+        let third = Arc::new(Tab::new(&test_size()));
+        for tab in [&first, &intended, &third] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+            mux.add_tab_to_window(tab, window_id)
+                .expect("attach exact tab");
+        }
+
+        mux.move_tab_between_windows(intended.tab_id(), window_id, Some(0))
+            .expect("reorder the intended tab away from its observed index");
+        assert!(
+            mux.activate_tab_exact_in_window(window_id, &intended, true)
+                .expect("activate the exact tab after reorder"),
+            "the reordered exact tab should become active",
+        );
+        assert!(
+            mux.get_active_tab_for_window(window_id)
+                .is_some_and(|active| Arc::ptr_eq(&active, &intended)),
+            "exact activation must follow the tab identity rather than its prior index",
+        );
+
+        let topology_events = Arc::new(AtomicUsize::new(0));
+        let topology_events_for_subscriber = Arc::clone(&topology_events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowTopologyChanged(_)) {
+                topology_events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe after successful activation");
+        let removed = mux
+            .tabs
+            .write()
+            .remove(&intended.tab_id())
+            .expect("remove exact registration for stale-identity probe");
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid window")
+            .expect("registered window");
+        let error = mux
+            .activate_tab_exact_in_window(window_id, &intended, true)
+            .expect_err("an unregistered exact tab must be rejected");
+        assert!(format!("{error:#}").contains("not the current registered instance"));
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid window")
+            .expect("registered window");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(after.active_tab_id(), before.active_tab_id());
+        assert_eq!(topology_events.load(Ordering::SeqCst), 0);
+        mux.tabs.write().insert(intended.tab_id(), removed);
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn global_topology_exhaustion_rejects_add_move_and_remove_without_partial_state() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source_builder = mux.new_empty_window(Some("global-exhaustion".to_string()), None);
+        let source_id = *source_builder;
+        let destination_builder = mux.new_empty_window(Some("global-exhaustion".to_string()), None);
+        let destination_id = *destination_builder;
+        let source_tab = Arc::new(Tab::new(&test_size()));
+        let destination_tab = Arc::new(Tab::new(&test_size()));
+        let unattached_tab = Arc::new(Tab::new(&test_size()));
+        for tab in [&source_tab, &destination_tab, &unattached_tab] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+        }
+        mux.add_tab_to_window(&source_tab, source_id)
+            .expect("attach source tab");
+        mux.add_tab_to_window(&destination_tab, destination_id)
+            .expect("attach destination tab");
+        let source_before = mux
+            .window_order_snapshot(source_id)
+            .expect("valid source")
+            .expect("registered source");
+        let destination_before = mux
+            .window_order_snapshot(destination_id)
+            .expect("valid destination")
+            .expect("registered destination");
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowTopologyChanged(_)) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe after setup");
+        mux.topology.lock().revision = TopologyRevision(u64::MAX - 1);
+
+        assert!(
+            mux.move_tab_between_windows(source_tab.tab_id(), destination_id, None)
+                .is_err(),
+            "global exhaustion must reject a cross-window move",
+        );
+        assert!(
+            mux.add_tab_to_window(&unattached_tab, destination_id)
+                .is_err(),
+            "global exhaustion must reject a new attachment",
+        );
+        assert!(
+            !mux.remove_tab_local_only_if_same(&source_tab),
+            "global exhaustion must reject exact tab retirement",
+        );
+
+        let source_after = mux
+            .window_order_snapshot(source_id)
+            .expect("valid source")
+            .expect("registered source");
+        let destination_after = mux
+            .window_order_snapshot(destination_id)
+            .expect("valid destination")
+            .expect("registered destination");
+        for (before, after) in [
+            (&source_before, &source_after),
+            (&destination_before, &destination_after),
+        ] {
+            assert_eq!(after.order_revision(), before.order_revision());
+            assert_eq!(after.active_tab_id(), before.active_tab_id());
+            assert_eq!(
+                after.ordered_tab_ids().collect::<Vec<_>>(),
+                before.ordered_tab_ids().collect::<Vec<_>>(),
+            );
+        }
+        assert!(mux
+            .get_tab(source_tab.tab_id())
+            .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
+        assert!(mux.window_containing_tab(unattached_tab.tab_id()).is_none());
+        assert_eq!(mux.topology.lock().revision, TopologyRevision(u64::MAX - 1));
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+
         drop(destination_builder);
         drop(source_builder);
         Mux::shutdown();

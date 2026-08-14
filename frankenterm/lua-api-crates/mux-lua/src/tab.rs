@@ -140,17 +140,14 @@ impl UserData for MuxTab {
                 mux.resolve_pane_id(pane.pane_id()).ok_or_else(|| {
                     mlua::Error::external(format!("pane {} not found", pane.pane_id()))
                 })?;
-            {
-                let mut window = mux.get_window_mut(window_id).ok_or_else(|| {
-                    mlua::Error::external(format!("window {window_id} not found"))
-                })?;
-                let tab_idx = window.idx_by_id(tab_id).ok_or_else(|| {
-                    mlua::Error::external(format!(
-                        "tab {tab_id} isn't really in window {window_id}!?"
-                    ))
-                })?;
-                window.save_and_then_set_active(tab_idx);
+            if tab_id != tab.tab_id() {
+                return Err(mlua::Error::external(format!(
+                    "active pane resolved to tab {tab_id}, not exact tab {}",
+                    tab.tab_id()
+                )));
             }
+            mux.activate_tab_exact_in_window(window_id, &tab, true)
+                .map_err(mlua::Error::external)?;
             Ok(())
         });
     }

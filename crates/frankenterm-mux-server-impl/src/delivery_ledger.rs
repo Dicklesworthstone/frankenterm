@@ -1675,6 +1675,7 @@ pub enum NotificationTopologyEffect<'a> {
     WindowCreated(WindowId),
     WindowRemoved(WindowId),
     WindowLayout(WindowId),
+    WindowTopologyTransaction,
     WindowWorkspace(WindowId),
     ResolvedWindowTitleForPane(PaneId),
     ResolvedTabTitleForPane(PaneId),
@@ -2057,6 +2058,11 @@ pub fn notification_effects(notification: &MuxNotification) -> NotificationEffec
         MuxNotification::WindowInvalidated(window_id) => NotificationEffects {
             state_keys: [Some(NotificationStateKey::WindowLayout(*window_id)), None],
             topology: NotificationTopologyEffect::WindowLayout(*window_id),
+            ..effects(state_contract())
+        },
+        MuxNotification::WindowTopologyChanged(_) => NotificationEffects {
+            topology: NotificationTopologyEffect::WindowTopologyTransaction,
+            admission: NotificationAdmissionContract::PostMutationJournalThenTopologyResync,
             ..effects(state_contract())
         },
         MuxNotification::WindowOrderChanged { window, .. } => {

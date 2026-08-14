@@ -501,7 +501,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
         // This has the consequence of creating the window
         // at the initial size instead of populating it
         // from the size specified in the remote mux.
-        // We use the TabAddedToWindow mux notification
+        // We use the frozen WindowTopologyChanged attachment payload
         // to detect and adjust the size later on.
         let position = None;
         let builder = mux.new_empty_window(workspace.clone(), position);
@@ -714,17 +714,14 @@ async fn async_run_terminal_gui(
                     window_id,
                 )
                 .await?;
-            let tab_id = tab.tab_id();
-            let mut window = mux
-                .get_window_mut(window_id)
-                .ok_or_else(|| anyhow!("failed to get mux window id {window_id}"))?;
-            let tab_idx = window.idx_by_id(tab_id).ok_or_else(|| {
-                anyhow!(
-                    "domain `{}` spawned tab {tab_id}, but window {window_id} does not contain it",
-                    domain.domain_name()
-                )
-            })?;
-            window.set_active_without_saving(tab_idx);
+            mux.activate_tab_exact_in_window(window_id, &tab, false)
+                .with_context(|| {
+                    format!(
+                        "domain `{}` spawned tab {}, but window {window_id} does not contain the exact registered tab",
+                        domain.domain_name(),
+                        tab.tab_id()
+                    )
+                })?;
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }

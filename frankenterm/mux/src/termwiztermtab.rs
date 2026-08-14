@@ -720,15 +720,12 @@ pub fn run<T: Send + 'static, F: Send + 'static + FnOnce(TermWizTerminal) -> any
                 return Err(error);
             }
 
-            let Some(mut window) = mux.get_window_mut(window_id) else {
+            if let Err(error) = mux.activate_tab_exact_in_window(window_id, &tab, true) {
                 if let Some(builder) = window_builder.take() {
                     builder.cancel();
                 }
-                return Err(anyhow::anyhow!("invalid window id {}", window_id));
-            };
-            let tab_idx = window.len().saturating_sub(1);
-            window.save_and_then_set_active(tab_idx);
-            drop(window);
+                return Err(error);
+            }
 
             // Publish a newly-created window only after its tab is fully
             // attached. Existing-window runs have no builder.

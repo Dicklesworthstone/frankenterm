@@ -4022,6 +4022,45 @@ impl TermWindow {
                 MuxNotification::SynchronizedOutput { pane_id, event } => {
                     self.mux_synchronized_output_event(pane_id, event);
                 }
+                MuxNotification::WindowTopologyChanged(change) => {
+                    if !change.affects_window(self.mux_window_id) {
+                        return Ok(());
+                    }
+                    let mut size = self.terminal_size;
+                    for &(tab_id, window_id) in change.attached_tabs() {
+                        if window_id != self.mux_window_id {
+                            continue;
+                        }
+                        if let Some(tab) = notification_owner.get_tab(tab_id) {
+                            let tab_size = tab.get_size();
+                            size.rows = size.rows.max(tab_size.rows);
+                            size.cols = size.cols.max(tab_size.cols);
+                        }
+                    }
+                    if size.rows != self.terminal_size.rows
+                        || size.cols != self.terminal_size.cols
+                        || size.pixel_width != self.terminal_size.pixel_width
+                        || size.pixel_height != self.terminal_size.pixel_height
+                    {
+                        self.set_window_size(size, window)?;
+                    } else {
+                        for &(tab_id, window_id) in change.attached_tabs() {
+                            if window_id != self.mux_window_id {
+                                continue;
+                            }
+                            if let Some(tab) = notification_owner.get_tab(tab_id)
+                                && tab.get_size().dpi == 0
+                            {
+                                log::debug!("fixup dpi in newly attached tab");
+                                tab.resize(self.terminal_size);
+                            }
+                        }
+                    }
+                    self.prune_tab_state_to_live_window();
+                    self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
+                    window.invalidate();
+                    self.update_title_post_status();
+                }
                 MuxNotification::WindowInvalidated(_)
                 | MuxNotification::WindowOrderChanged { .. } => {
                     self.prune_tab_state_to_live_window();
@@ -4459,6 +4498,15 @@ impl TermWindow {
             }
             MuxNotification::WindowOrderChanged { ref window, .. } => {
                 if window.window_id() != mux_window_id {
+                    return true;
+                }
+            }
+            MuxNotification::WindowTopologyChanged(ref change) => {
+                if change.removed_windows().binary_search(&mux_window_id).is_ok() {
+                    dead.store(true, Ordering::Relaxed);
+                    return false;
+                }
+                if !change.affects_window(mux_window_id) {
                     return true;
                 }
             }
@@ -5379,8 +5427,8 @@ impl TermWindow {
 
     fn activate_tab(&mut self, tab_idx: isize) -> anyhow::Result<()> {
         let mux = self.mux_or_err("activate tab")?;
-        let mut window = mux
-            .get_window_mut(self.mux_window_id)
+        let window = mux
+            .get_window(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
 
         // This logic is coupled with the CliSubCommand::ActivateTab
@@ -5394,9 +5442,8 @@ impl TermWindow {
         };
 
         if tab_idx < max {
-            window.save_and_then_set_active(tab_idx);
-
             drop(window);
+            mux.activate_tab_at_index(self.mux_window_id, tab_idx, true)?;
 
             if let Some(tab) = self.get_active_pane_or_overlay() {
                 tab.focus_changed(true);

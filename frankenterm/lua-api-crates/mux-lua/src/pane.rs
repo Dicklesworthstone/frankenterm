@@ -411,24 +411,8 @@ impl UserData for MuxPane {
         methods.add_method("activate", move |_lua, this, ()| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;
-            let (_domain_id, window_id, tab_id) = mux
-                .resolve_pane_id(this.0)
-                .ok_or_else(|| mlua::Error::external(format!("pane {} not found", this.0)))?;
-            {
-                let mut window = mux.get_window_mut(window_id).ok_or_else(|| {
-                    mlua::Error::external(format!("window {window_id} not found"))
-                })?;
-                let tab_idx = window.idx_by_id(tab_id).ok_or_else(|| {
-                    mlua::Error::external(format!(
-                        "tab {tab_id} isn't really in window {window_id}!?"
-                    ))
-                })?;
-                window.save_and_then_set_active(tab_idx);
-            }
-            let tab = mux
-                .get_tab(tab_id)
-                .ok_or_else(|| mlua::Error::external(format!("tab {tab_id} not found")))?;
-            tab.set_active_pane(&pane);
+            mux.focus_exact_pane_and_containing_tab(&pane)
+                .map_err(mlua::Error::external)?;
             Ok(())
         });
 
