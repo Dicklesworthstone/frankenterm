@@ -3876,7 +3876,7 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Bead:**
   `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.2.4`
 - **Baseline revision:** `12779f1e1b63a4ffdf1a27ede0f3b251f8fc546d`
-- **Candidate revision:** `37622eca89ccf1ae5df7eade2a490f2b7ca27802`
+- **Candidate revision:** `7aa2364701f622236ee86f778e76cebb8e8b4886`
 - **Target identity:** strict-remote `hz1`, `hz2`, `vmi1149989`, and
   `vmi1227854` Linux compile/test workers for source proof only; no M4/M5
   macOS, 64-core/128-thread `trj` Threadripper, display, LAN, thermal, or
@@ -3892,8 +3892,16 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   retained 1K/4K/16K counters each observed exactly one hash probe, and the
   deliberate panic control passed by preserving both mapping directions.
   Strict package Clippy passed without warnings under
-  `j-29976432671195272`. The exact final parent-index stress retry remained
-  pending at this ledger cut and is not counted
+  `j-29976432671195272`. The exact final parent-index stress retry passed under
+  `j-29976432671195274` with 5 passed, 0 failed, and 794 filtered; its
+  1K/4K/16K cases again observed exactly one parent-index probe. The first
+  exact committed-source formatting proof, `j-29976432671195285`, correctly
+  failed with 0 passed, 1 failed, and 0 filtered after identifying seven mux
+  rustfmt differences. Those differences drove candidate `7aa236470`; its
+  clean-baseline formatting retry `j-29976432671195288` then reached a strict
+  remote worker but exceeded RCH's 3,600-second SSH ceiling (`RCH-E104`) during
+  the cold build. It produced no test result, used no local fallback, and is
+  retained only as negative evidence rather than counted as format proof
 - **Broad command/artifact:** the complete mux library passed remotely under
   `j-29976432671195277` with 799 passed, 0 failed, and 0 ignored. A broad
   client-library run under `j-29976432671195276` produced 209 passed, 2
@@ -3903,7 +3911,13 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   pending. Exact proof of the repaired registry fixture passed under
   `j-29976432671195279` with 1 passed and 0 failed. The first isolated
   real-stream retry failed before the test because its strict-remote worker
-  exhausted disk space. No local Cargo substitute ran. Earlier attempted
+  exhausted disk space; a second isolated retry, `j-29976432671195286`, passed
+  with 1 passed, 0 failed, and 211 filtered in 0.06 seconds. A complete client
+  rerun, `j-29976432671195289`, then passed with 211 passed, 0 failed, and 1
+  explicitly ignored. Fresh-eyes review separately found that the warning test
+  installed an unbounded process-global logger across the parallel suite; the
+  bounded exact-warning repair at `58f048e8b` has its own proof bead and is not
+  part of this candidate. No local Cargo substitute ran. Earlier attempted
   filters that selected zero tests and earlier RCH one-hour timeout results are
   also not counted
 - **Samples/statistics:** no wall-time samples, distributions, confidence
