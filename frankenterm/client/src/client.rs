@@ -13537,7 +13537,9 @@ mod tests {
         );
         assert!(
             logs.contains(&expected_warning),
-            "expected exact in-window negotiation warning {expected_warning:?}, got logs: {logs}"
+            "expected exact in-window negotiation warning {:?}, got logs: {}",
+            expected_warning,
+            logs,
         );
 
         server_release_tx
