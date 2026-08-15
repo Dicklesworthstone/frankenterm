@@ -5618,6 +5618,7 @@ impl Mux {
         self.enqueue_window_notification_entry(notification, None);
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue_window_focus_lost(self: &Arc<Self>, pane: Arc<dyn Pane>) {
         self.bind_window_notification_owner();
         let mut pending = self.pending_window_notifications.lock();
@@ -17769,11 +17770,11 @@ mod tests {
         let observed_for_subscriber = Arc::clone(&observed);
         let mux_for_subscriber = Arc::clone(&mux);
         mux.subscribe(move |notification| {
-            if let MuxNotification::WindowTopologyChanged(change) = notification
-                && change.affects_window(window_id)
-            {
-                assert!(mux_for_subscriber.get_window(window_id).is_some());
-                observed_for_subscriber.store(true, Ordering::Relaxed);
+            if let MuxNotification::WindowTopologyChanged(change) = notification {
+                if change.affects_window(window_id) {
+                    assert!(mux_for_subscriber.get_window(window_id).is_some());
+                    observed_for_subscriber.store(true, Ordering::Relaxed);
+                }
             }
             true
         })
