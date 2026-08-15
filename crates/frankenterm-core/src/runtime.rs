@@ -2586,7 +2586,7 @@ impl PendingCaptureResyncs {
                         },
                     );
                 } else {
-                    self.storage_audit.insert(pane_id);
+                    self.require_storage_audit(pane_id);
                 }
             }
         }
