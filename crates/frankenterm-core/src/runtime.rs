@@ -13106,9 +13106,21 @@ mod tests {
                 vec![(pane_id, 0), (pane_id, 1), (pane_id, 2)]
             );
             let expected_payloads = [
-                ("polling delta", crate::recording::RecorderSegmentKind::Delta, false),
-                ("streaming gap", crate::recording::RecorderSegmentKind::Gap, true),
-                ("native delta", crate::recording::RecorderSegmentKind::Delta, false),
+                (
+                    "polling delta",
+                    crate::recording::RecorderSegmentKind::Delta,
+                    false,
+                ),
+                (
+                    "streaming gap",
+                    crate::recording::RecorderSegmentKind::Gap,
+                    true,
+                ),
+                (
+                    "native delta",
+                    crate::recording::RecorderSegmentKind::Delta,
+                    false,
+                ),
             ];
             for (event, (expected_text, expected_kind, expected_gap)) in
                 replay_events.iter().zip(expected_payloads)
