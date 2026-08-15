@@ -4054,6 +4054,41 @@ struct RemovedWindowRegistration {
     removed_tabs: Vec<RemovedTabRegistration>,
 }
 
+/// Exact structural parent of one registered tab.
+///
+/// The weak reference proves that a recycled numeric [`TabId`] cannot inherit
+/// the prior tab generation's window.  Entries are committed under the same
+/// window-map write guard as the ordered membership vectors, so readers never
+/// need to scan unrelated windows to resolve a parent.
+#[derive(Clone)]
+struct TabParentRegistration {
+    tab: Weak<Tab>,
+    window_id: WindowId,
+}
+
+impl TabParentRegistration {
+    fn new(tab: &Arc<Tab>, window_id: WindowId) -> Self {
+        Self {
+            tab: Arc::downgrade(tab),
+            window_id,
+        }
+    }
+
+    fn matches(&self, tab: &Arc<Tab>, window_id: WindowId) -> bool {
+        self.window_id == window_id
+            && self
+                .tab
+                .upgrade()
+                .is_some_and(|registered| Arc::ptr_eq(&registered, tab))
+    }
+
+    fn is_same_tab(&self, tab: &Arc<Tab>) -> bool {
+        self.tab
+            .upgrade()
+            .is_some_and(|registered| Arc::ptr_eq(&registered, tab))
+    }
+}
+
 /// Discriminant key for the high-rate Alert variants we dedupe per pane.
 ///
 /// `CurrentWorkingDirectoryChanged` (OSC 7) re-emits on every shell prompt
@@ -4200,6 +4235,7 @@ impl Drop for WindowNotificationDispatch {
 pub struct Mux {
     topology: Mutex<MuxTopologyAuthority>,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
+    tab_parents: RwLock<HashMap<TabId, TabParentRegistration>>,
     panes: RwLock<HashMap<PaneId, LivePaneRegistration>>,
     pane_retirements: Arc<PaneRetirementTracker>,
     pane_preparations: Mutex<HashMap<PaneId, PanePreparation>>,
@@ -4901,6 +4937,7 @@ impl Mux {
         Self {
             topology: Mutex::new(MuxTopologyAuthority::new()),
             tabs: RwLock::new(HashMap::new()),
+            tab_parents: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             pane_retirements: Arc::new(PaneRetirementTracker::default()),
             pane_preparations: Mutex::new(HashMap::new()),
@@ -5700,12 +5737,13 @@ impl Mux {
 
     /// Commit one allocation-prepared mutation spanning one or more windows.
     ///
-    /// Lock order is `windows -> topology -> pending_window_notifications ->
-    /// provisional_windows` when created/removed window receipts require the
-    /// final lock. Callers already hold the window-map write guard. A caller
-    /// retaining `provisional_windows` may commit a state-only transaction only
-    /// when both receipt lists are empty. Every fallible allocation and
-    /// revision check completes before the first window field changes; the
+    /// Lock order is `windows -> tab_parents -> topology ->
+    /// pending_window_notifications -> provisional_windows` when
+    /// created/removed window receipts require the final lock. Callers already
+    /// hold the window-map write guard. A caller retaining
+    /// `provisional_windows` may commit a state-only transaction only when both
+    /// receipt lists are empty. Every fallible allocation and revision check
+    /// completes before the first window or parent-index field changes; the
     /// post-reservation suffix contains only exact lookups, swaps, scalar
     /// assignments, and pushes into pre-reserved capacity.
     fn commit_prepared_window_states_locked(
@@ -5762,6 +5800,90 @@ impl Mux {
             "created windows must retain one prepared final state"
         );
 
+        let prior_tab_count = prepared.iter().try_fold(0usize, |count, (window_id, _)| {
+            count
+                .checked_add(
+                    windows
+                        .get(window_id)
+                        .expect("prepared window presence validated above")
+                        .len(),
+                )
+                .ok_or_else(|| anyhow!("prior window tab count overflow"))
+        })?;
+        let final_tab_count = prepared
+            .iter()
+            .try_fold(0usize, |count, (window_id, state)| {
+                if removed_windows.binary_search(window_id).is_ok() {
+                    Ok(count)
+                } else {
+                    count
+                        .checked_add(state.frozen().ordered_tabs().len())
+                        .ok_or_else(|| anyhow!("final window tab count overflow"))
+                }
+            })?;
+        let mut prior_tabs = Vec::new();
+        prior_tabs
+            .try_reserve_exact(prior_tab_count)
+            .map_err(|error| anyhow!("reserve prior tab-parent transaction: {error}"))?;
+        for (window_id, _) in &prepared {
+            prior_tabs.extend(
+                windows
+                    .get(window_id)
+                    .expect("prepared window presence validated above")
+                    .iter()
+                    .map(|tab| (*window_id, Arc::clone(tab))),
+            );
+        }
+        let mut final_tab_ids = HashSet::new();
+        final_tab_ids
+            .try_reserve(final_tab_count)
+            .map_err(|error| anyhow!("reserve final tab-parent identities: {error}"))?;
+        for (window_id, state) in &prepared {
+            if removed_windows.binary_search(window_id).is_ok() {
+                continue;
+            }
+            for tab in state.frozen().ordered_tabs() {
+                anyhow::ensure!(
+                    final_tab_ids.insert(tab.tab_id()),
+                    "window transaction gives tab {} more than one final parent",
+                    tab.tab_id()
+                );
+            }
+        }
+
+        let mut tab_parents = self.tab_parents.write();
+        tab_parents
+            .try_reserve(final_tab_count)
+            .map_err(|error| anyhow!("reserve tab-parent index transaction: {error}"))?;
+        for (window_id, tab) in &prior_tabs {
+            anyhow::ensure!(
+                tab_parents
+                    .get(&tab.tab_id())
+                    .is_some_and(|parent| parent.matches(tab, *window_id)),
+                "tab {} parent index does not match exact membership in window {window_id}",
+                tab.tab_id()
+            );
+        }
+        for (window_id, state) in &prepared {
+            if removed_windows.binary_search(window_id).is_ok() {
+                continue;
+            }
+            for tab in state.frozen().ordered_tabs() {
+                if let Some(parent) = tab_parents.get(&tab.tab_id()) {
+                    anyhow::ensure!(
+                        parent.is_same_tab(tab)
+                            && prepared
+                                .binary_search_by_key(&parent.window_id, |(prepared_id, _)| {
+                                    *prepared_id
+                                })
+                                .is_ok(),
+                        "tab {} already has a different or untouched window parent",
+                        tab.tab_id()
+                    );
+                }
+            }
+        }
+
         let mut frozen_states = Vec::new();
         frozen_states
             .try_reserve_exact(prepared.len())
@@ -5801,6 +5923,18 @@ impl Mux {
             let (_committed, lost) = window.commit_prepared_state(state);
             if let Some(pane) = lost {
                 focus_lost.push(pane);
+            }
+        }
+        for (window_id, tab) in prior_tabs {
+            let removed = tab_parents.remove(&tab.tab_id());
+            debug_assert!(removed.is_some_and(|parent| parent.matches(&tab, window_id)));
+        }
+        for state in frozen.windows() {
+            let window_id = state.window_id();
+            for tab in state.ordered_tabs() {
+                let replaced =
+                    tab_parents.insert(tab.tab_id(), TabParentRegistration::new(tab, window_id));
+                debug_assert!(replaced.is_none());
             }
         }
         if !removed_windows.is_empty() || !created_windows.is_empty() {
@@ -7751,11 +7885,11 @@ impl Mux {
                 return None;
             }
             let mut windows = self.windows.write();
-            let retired_identities = HashSet::from([Arc::as_ptr(&tab) as usize]);
-            let prepared_windows = match Self::prepare_exact_tab_detach_locked(
+            let prepared_windows = match self.prepare_exact_tab_detach_locked(
                 &windows,
-                &retired_identities,
+                std::slice::from_ref(&tab),
                 None,
+                false,
                 "tab retirement",
             ) {
                 Ok(prepared) => prepared,
@@ -7940,26 +8074,65 @@ impl Mux {
     /// Allocation-prepare the complete exact-parentage sweep before any tab,
     /// pane, or window registry changes.
     fn prepare_exact_tab_detach_locked(
+        &self,
         windows: &HashMap<WindowId, Window>,
-        removals: &HashSet<usize>,
+        removals: &[Arc<Tab>],
         excluded_window: Option<WindowId>,
+        allow_same_id_successor: bool,
         operation: &'static str,
     ) -> anyhow::Result<Vec<(WindowId, PreparedWindowState)>> {
-        let mut prepared = Vec::new();
-        prepared
-            .try_reserve_exact(windows.len())
-            .map_err(|error| anyhow!("reserve {operation} window transaction: {error}"))?;
-        for (&window_id, window) in windows {
-            if excluded_window == Some(window_id) {
+        #[cfg(test)]
+        self.validate_tab_parent_index_matches_windows_locked(windows)
+            .with_context(|| format!("validate tab-parent index before {operation}"))?;
+
+        let parents = self.tab_parents.read();
+        let mut removals_by_window: HashMap<WindowId, HashSet<usize>> = HashMap::new();
+        removals_by_window
+            .try_reserve(removals.len())
+            .map_err(|error| anyhow!("reserve {operation} indexed parents: {error}"))?;
+        for tab in removals {
+            let Some(parent) = parents.get(&tab.tab_id()) else {
+                continue;
+            };
+            if !parent.is_same_tab(tab) {
+                anyhow::ensure!(
+                    allow_same_id_successor,
+                    "{operation}: tab {} parent index names a different exact generation",
+                    tab.tab_id()
+                );
                 continue;
             }
+            if excluded_window == Some(parent.window_id) {
+                continue;
+            }
+            let identities = removals_by_window.entry(parent.window_id).or_default();
+            identities
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve {operation} tab identity: {error}"))?;
+            identities.insert(Arc::as_ptr(tab) as usize);
+        }
+        drop(parents);
+
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(removals_by_window.len())
+            .map_err(|error| anyhow!("reserve {operation} window transaction: {error}"))?;
+        for (window_id, removals) in removals_by_window {
+            let window = windows.get(&window_id).ok_or_else(|| {
+                anyhow!("{operation}: indexed parent window {window_id} is absent")
+            })?;
             if let Some(state) = window
-                .prepare_remove_exact_identity_set(removals)
+                .prepare_remove_exact_identity_set(&removals)
                 .with_context(|| format!("prepare {operation} in window {window_id}"))?
             {
                 prepared.push((window_id, state));
+            } else {
+                anyhow::bail!(
+                    "{operation}: indexed exact tab membership is absent from window {window_id}"
+                );
             }
         }
+        prepared.sort_unstable_by_key(|(window_id, _)| *window_id);
         Ok(prepared)
     }
 
@@ -7983,11 +8156,11 @@ impl Mux {
                 return None;
             }
             let mut windows = self.windows.write();
-            let retired_identities = HashSet::from([Arc::as_ptr(expected) as usize]);
-            let prepared_windows = match Self::prepare_exact_tab_detach_locked(
+            let prepared_windows = match self.prepare_exact_tab_detach_locked(
                 &windows,
-                &retired_identities,
+                std::slice::from_ref(expected),
                 None,
+                false,
                 "witnessed tab retirement",
             ) {
                 Ok(prepared) => prepared,
@@ -8095,11 +8268,11 @@ impl Mux {
                 return None;
             }
             let mut windows = self.windows.write();
-            let retired_identities = HashSet::from([Arc::as_ptr(expected) as usize]);
-            let prepared_windows = match Self::prepare_exact_tab_detach_locked(
+            let prepared_windows = match self.prepare_exact_tab_detach_locked(
                 &windows,
-                &retired_identities,
+                std::slice::from_ref(expected),
                 None,
+                false,
                 "empty-tab retirement",
             ) {
                 Ok(prepared) => prepared,
@@ -8191,14 +8364,11 @@ impl Mux {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let retired_identities = retired_tabs
-                .iter()
-                .map(|tab| Arc::as_ptr(tab) as usize)
-                .collect::<HashSet<_>>();
-            let mut prepared_windows = match Self::prepare_exact_tab_detach_locked(
+            let mut prepared_windows = match self.prepare_exact_tab_detach_locked(
                 &windows,
-                &retired_identities,
+                &retired_tabs,
                 None,
+                false,
                 "window retirement",
             ) {
                 Ok(prepared) => prepared,
@@ -8665,20 +8835,21 @@ impl Mux {
         // same-ID exact re-registration from being stripped after callbacks.
         let dead_windows = {
             let tabs = self.tabs.read();
-            let stale_identities = stale_window_tabs
+            let stale_tabs = stale_window_tabs
                 .iter()
                 .filter(|stale| {
                     tabs.get(&stale.tab_id())
                         .is_none_or(|current| !Arc::ptr_eq(current, stale))
                 })
-                .map(|stale| Arc::as_ptr(stale) as usize)
-                .collect::<HashSet<_>>();
+                .cloned()
+                .collect::<Vec<_>>();
             let mut windows = self.windows.write();
             let provisional_windows = self.provisional_windows.lock();
-            let prepared = match Self::prepare_exact_tab_detach_locked(
+            let prepared = match self.prepare_exact_tab_detach_locked(
                 &windows,
-                &stale_identities,
+                &stale_tabs,
                 None,
+                true,
                 "stale-parent prune",
             ) {
                 Ok(prepared) => prepared,
@@ -9118,16 +9289,17 @@ impl Mux {
                 "add_tab_to_window: tab {tab_id} is not the exact registered tab instance"
             );
             let mut windows = self.windows.write();
-            let existing_parent = windows.iter().find_map(|(candidate_id, candidate)| {
-                candidate
-                    .iter()
-                    .any(|existing| Arc::ptr_eq(existing, tab) || existing.tab_id() == tab_id)
-                    .then_some(*candidate_id)
-            });
+            let existing_parent = self.tab_parents.read().get(&tab_id).cloned();
             if let Some(existing_parent) = existing_parent {
+                let existing_window = existing_parent.window_id;
+                let identity = if existing_parent.is_same_tab(tab) {
+                    "exact instance"
+                } else {
+                    "different same-id instance"
+                };
                 return Err(anyhow!(
-                    "add_tab_to_window: tab id {tab_id} or its exact instance is already attached \
-                     to window {existing_parent}"
+                    "add_tab_to_window: tab {tab_id} ({identity}) is already attached to window \
+                     {existing_window}"
                 ));
             }
             let window = windows
@@ -9169,14 +9341,53 @@ impl Mux {
     }
 
     pub fn window_containing_tab(&self, tab_id: TabId) -> Option<WindowId> {
-        for w in self.windows.read().values() {
-            for t in w.iter() {
-                if t.tab_id() == tab_id {
-                    return Some(w.window_id());
-                }
+        let parent = self.tab_parents.read().get(&tab_id).cloned()?;
+        let tab = self.tabs.read().get(&tab_id).cloned()?;
+        parent.is_same_tab(&tab).then_some(parent.window_id)
+    }
+
+    #[cfg(test)]
+    fn assert_tab_parent_index_matches_windows(&self) {
+        let windows = self.windows.read();
+        self.validate_tab_parent_index_matches_windows_locked(&windows)
+            .expect("tab-parent index must match exact window membership");
+    }
+
+    #[cfg(test)]
+    fn validate_tab_parent_index_matches_windows_locked(
+        &self,
+        windows: &HashMap<WindowId, Window>,
+    ) -> anyhow::Result<()> {
+        let parents = self.tab_parents.read();
+        let mut observed = HashMap::new();
+        observed
+            .try_reserve(parents.len())
+            .map_err(|error| anyhow!("reserve tab-parent validation: {error}"))?;
+        for (window_id, window) in windows.iter() {
+            for tab in window.iter() {
+                let prior = observed.insert(tab.tab_id(), (*window_id, Arc::clone(tab)));
+                anyhow::ensure!(
+                    prior.is_none(),
+                    "tab {} has multiple window parents",
+                    tab.tab_id()
+                );
             }
         }
-        None
+        anyhow::ensure!(
+            parents.len() == observed.len(),
+            "tab-parent index cardinality {} differs from window membership {}",
+            parents.len(),
+            observed.len(),
+        );
+        for (tab_id, (window_id, tab)) in observed {
+            anyhow::ensure!(
+                parents
+                    .get(&tab_id)
+                    .is_some_and(|parent| parent.matches(&tab, window_id)),
+                "tab {tab_id} lacks its exact indexed parent {window_id}"
+            );
+        }
+        Ok(())
     }
 
     /// Move a tab from whichever window currently contains it into
@@ -9208,27 +9419,18 @@ impl Mux {
             .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} not found in mux"))?;
         let (changed, src_window) = {
             let mut windows = self.windows.write();
-            let mut exact_parent_count = 0usize;
-            let mut numeric_parent_count = 0usize;
-            let mut src_window = None;
-            for (window_id, window) in windows.iter() {
-                for candidate in window.iter() {
-                    if Arc::ptr_eq(candidate, &tab) {
-                        exact_parent_count = exact_parent_count.saturating_add(1);
-                        src_window = Some(*window_id);
-                    }
-                    if candidate.tab_id() == tab_id {
-                        numeric_parent_count = numeric_parent_count.saturating_add(1);
-                    }
-                }
-            }
+            let src_window = self
+                .tab_parents
+                .read()
+                .get(&tab_id)
+                .filter(|parent| parent.is_same_tab(&tab))
+                .map(|parent| parent.window_id);
             anyhow::ensure!(
-                exact_parent_count == 1 && numeric_parent_count == 1,
-                "move_tab_between_windows: tab {tab_id} has {exact_parent_count} exact and \
-                 {numeric_parent_count} numeric parents; expected one unambiguous owner"
+                src_window.is_some(),
+                "move_tab_between_windows: tab {tab_id} has no exact indexed window parent"
             );
             let src_window = src_window
-                .expect("one exact parent was validated while holding the window-map write guard");
+                .expect("one exact indexed parent was validated while holding the window map");
             let source = windows.get(&src_window).ok_or_else(|| {
                 anyhow!("move_tab_between_windows: source window {src_window} not found")
             })?;
@@ -18266,6 +18468,7 @@ mod tests {
         let tab_id = tab.tab_id();
         mux.add_tab_to_window(&tab, src_window_id)
             .expect("tab should start in source window");
+        mux.assert_tab_parent_index_matches_windows();
 
         let move_events = Arc::new(Mutex::new(Vec::new()));
         let move_events_for_subscriber = Arc::clone(&move_events);
@@ -18282,6 +18485,7 @@ mod tests {
 
         mux.move_tab_between_windows(tab_id, dst_window_id, Some(0))
             .expect("metadata move should succeed");
+        mux.assert_tab_parent_index_matches_windows();
 
         let events = move_events.lock();
         assert_eq!(
@@ -19783,6 +19987,7 @@ mod tests {
             .get_tab(source_tab.tab_id())
             .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
         assert!(mux.window_containing_tab(unattached_tab.tab_id()).is_none());
+        mux.assert_tab_parent_index_matches_windows();
         assert_eq!(mux.topology.lock().revision, TopologyRevision(u64::MAX - 1));
         assert_eq!(events.load(Ordering::SeqCst), 0);
 
@@ -19826,8 +20031,9 @@ mod tests {
         );
 
         // Construct legacy-corrupt multi-parent topology through the
-        // low-level Window surface, then verify the public move refuses to
-        // choose a HashMap-order-dependent source or mutate either parent.
+        // test-only low-level Window surface. The indexed source remains the
+        // original exact parent, and destination validation must refuse the
+        // duplicate without scanning for a HashMap-order-dependent source.
         mux.get_window_mut(dst_window_id)
             .expect("destination should remain registered")
             .push(&tab)
@@ -19838,9 +20044,14 @@ mod tests {
         assert!(
             move_error
                 .to_string()
-                .contains("has 2 exact and 2 numeric parents"),
+                .contains("already contains exact tab"),
             "unexpected ambiguous-parent error: {:#}",
             move_error
+        );
+        assert_eq!(
+            mux.window_containing_tab(tab.tab_id()),
+            Some(src_window_id),
+            "corrupt unindexed membership must not replace exact parent authority",
         );
         for window_id in [src_window_id, dst_window_id] {
             assert!(
@@ -19883,6 +20094,9 @@ mod tests {
         assert!(Arc::ptr_eq(&removed, &local_only_tab));
         assert!(mux.get_tab(local_only_tab_id).is_none());
         assert!(mux.get_pane(501).is_none());
+        assert!(mux.window_containing_tab(local_only_tab_id).is_none());
+        assert!(!mux.tab_parents.read().contains_key(&local_only_tab_id));
+        mux.assert_tab_parent_index_matches_windows();
         assert_eq!(
             local_only_kills.load(Ordering::SeqCst),
             0,
@@ -19893,6 +20107,9 @@ mod tests {
             .remove_tab(normal_tab_id)
             .expect("normal tab should be removed");
         assert!(Arc::ptr_eq(&normal_removed, &normal_tab));
+        assert!(mux.window_containing_tab(normal_tab_id).is_none());
+        assert!(!mux.tab_parents.read().contains_key(&normal_tab_id));
+        mux.assert_tab_parent_index_matches_windows();
         assert_eq!(
             normal_kills.load(Ordering::SeqCst),
             1,
@@ -19921,6 +20138,9 @@ mod tests {
         assert!(mux.remove_tab_local_only_if_same(&tab));
         assert!(mux.get_tab(tab_id).is_none());
         assert!(mux.get_pane(503).is_none());
+        assert!(mux.window_containing_tab(tab_id).is_none());
+        assert!(!mux.tab_parents.read().contains_key(&tab_id));
+        mux.assert_tab_parent_index_matches_windows();
         assert_eq!(
             kills.load(Ordering::SeqCst),
             0,
