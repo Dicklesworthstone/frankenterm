@@ -19836,7 +19836,9 @@ mod tests {
             .move_tab_between_windows(tab.tab_id(), dst_window_id, None)
             .expect_err("move must reject ambiguous multi-parent topology");
         assert!(
-            move_error.to_string().contains("has 2 exact and 2 numeric parents"),
+            move_error
+                .to_string()
+                .contains("has 2 exact and 2 numeric parents"),
             "unexpected ambiguous-parent error: {:#}",
             move_error
         );
