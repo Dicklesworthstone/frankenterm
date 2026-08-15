@@ -74,8 +74,7 @@ fn spawn_noop_process() -> bool {
 
     #[cfg(not(windows))]
     {
-        Command::new("sh")
-            .args(["-c", "true"])
+        Command::new("true")
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
