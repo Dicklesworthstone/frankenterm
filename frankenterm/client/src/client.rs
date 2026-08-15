@@ -9480,7 +9480,7 @@ mod tests {
             }
         }
 
-        for gap in [5, 6, 7, 15, 16, 17, 18, 19, 21, 93, u64::MAX] {
+        for gap in [5, 6, 7, 15, 16, 17, 18, 19, 21, 95, u64::MAX] {
             assert_eq!(
                 Pdu::wire_spec_for_ident(gap),
                 None,
