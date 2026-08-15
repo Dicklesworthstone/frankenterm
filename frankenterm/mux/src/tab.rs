@@ -3508,9 +3508,22 @@ impl Tab {
         // happen outside every mux/tab lock. The final combined lock cut below
         // proves these exact pointer snapshots did not change.
         let mut observed_tabs = mux.tabs.read().values().cloned().collect::<Vec<_>>();
+        let windows = mux.windows.read();
+        let window_tab_count = windows.values().try_fold(0usize, |count, window| {
+            count
+                .checked_add(window.len())
+                .ok_or_else(|| anyhow::anyhow!("observed window tab count overflow"))
+        })?;
+        let observed_tab_capacity = observed_tabs
+            .len()
+            .checked_add(window_tab_count)
+            .ok_or_else(|| anyhow::anyhow!("observed tab capacity overflow"))?;
+        observed_tabs
+            .try_reserve(window_tab_count)
+            .map_err(|error| anyhow::anyhow!("reserve observed window tabs: {error}"))?;
         let mut observed_tab_identities = HashSet::new();
         observed_tab_identities
-            .try_reserve(observed_tabs.len())
+            .try_reserve(observed_tab_capacity)
             .map_err(|error| anyhow::anyhow!("reserve observed tab identities: {error}"))?;
         for tab in &observed_tabs {
             anyhow::ensure!(
@@ -3518,16 +3531,12 @@ impl Tab {
                 "floating-pane admission observed a duplicate registered tab identity"
             );
         }
-        for tab in mux
-            .windows
-            .read()
-            .values()
-            .flat_map(|window| window.iter().cloned())
-        {
+        for tab in windows.values().flat_map(|window| window.iter().cloned()) {
             if observed_tab_identities.insert(Arc::as_ptr(&tab) as usize) {
                 observed_tabs.push(tab);
             }
         }
+        drop(windows);
         observed_tabs.sort_unstable_by_key(|tab| Arc::as_ptr(tab) as usize);
         anyhow::ensure!(
             observed_tabs
@@ -3536,11 +3545,20 @@ impl Tab {
             "floating-pane admission observed duplicate exact tab identities"
         );
 
-        let observed_snapshots = observed_tabs
-            .iter()
-            .map(|tab| tab.snapshot_panes_callback_free())
-            .collect::<Vec<_>>();
-        let observed_pane_count = observed_snapshots.iter().map(Vec::len).sum();
+        let mut observed_snapshots = Vec::new();
+        observed_snapshots
+            .try_reserve_exact(observed_tabs.len())
+            .map_err(|error| anyhow::anyhow!("reserve observed pane snapshots: {error}"))?;
+        observed_snapshots.extend(
+            observed_tabs
+                .iter()
+                .map(|tab| tab.snapshot_panes_callback_free()),
+        );
+        let observed_pane_count = observed_snapshots.iter().try_fold(0usize, |count, panes| {
+            count
+                .checked_add(panes.len())
+                .ok_or_else(|| anyhow::anyhow!("observed pane count overflow"))
+        })?;
         let mut numeric_owners = HashMap::new();
         numeric_owners
             .try_reserve(observed_pane_count)
@@ -4881,13 +4899,20 @@ impl Mux {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let window_tab_count = windows_snapshot
+            .iter()
+            .try_fold(0usize, |count, (_, tabs)| {
+                count
+                    .checked_add(tabs.len())
+                    .ok_or_else(|| anyhow::anyhow!("observed window tab count overflow"))
+            })?;
+        let observed_tab_capacity = observed_tabs
+            .len()
+            .checked_add(window_tab_count)
+            .ok_or_else(|| anyhow::anyhow!("observed tab capacity overflow"))?;
         let mut observed_tab_identities = HashSet::new();
         observed_tab_identities
-            .try_reserve(
-                observed_tabs
-                    .len()
-                    .saturating_add(windows_snapshot.iter().map(|(_, tabs)| tabs.len()).sum()),
-            )
+            .try_reserve(observed_tab_capacity)
             .map_err(|error| anyhow::anyhow!("reserve observed tab identities: {error}"))?;
         for tab in &observed_tabs {
             anyhow::ensure!(
@@ -4929,10 +4954,10 @@ impl Mux {
         for (&tab_identity, states) in &desired_by_tab {
             let tab = &states[0].tab;
             anyhow::ensure!(
-                observed_tabs
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, tab)),
-                "desired floating tab {} is not owned by this mux",
+                registered_tabs_snapshot
+                    .get(&tab.tab_id)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, tab)),
+                "desired floating tab {} is not an exact live mux registration",
                 tab.tab_id
             );
             anyhow::ensure!(
@@ -5210,6 +5235,11 @@ impl Mux {
             .iter()
             .map(|(pane_id, _, _)| *pane_id)
             .collect::<Vec<_>>();
+        let mut retired_pane_id_set = HashSet::new();
+        retired_pane_id_set
+            .try_reserve(retired_pane_ids.len())
+            .map_err(|error| anyhow::anyhow!("reserve retired floating pane state set: {error}"))?;
+        retired_pane_id_set.extend(retired_pane_ids.iter().copied());
 
         if prepared_tabs.iter().all(|tab| !tab.changed)
             && prepared_new.is_empty()
@@ -5419,6 +5449,11 @@ impl Mux {
                 .try_reserve(stale_registrations.len())
                 .map_err(|error| anyhow::anyhow!("reserve retired floating pane ids: {error}"))?;
 
+            // Pane-output producers already hold this queue while consulting
+            // topology and lifecycle state. Retain it before either of those
+            // locks so reconciliation cannot form an output/lifecycle or
+            // output/topology AB/BA cycle under concurrent terminal output.
+            let mut pending_output = self.pending_pane_output.lock();
             let lifecycle_enqueue = (!lifecycle_ids.is_empty())
                 .then(|| self.prepare_pane_lifecycle_batch_enqueue(&lifecycle_ids))
                 .transpose()?;
@@ -5454,10 +5489,14 @@ impl Mux {
                 debug_assert!(registration.matches_live_registration(&registered));
                 let removed_pane = Arc::clone(&registered.pane);
                 let generation = Arc::clone(&registered.generation);
-                if let Some(batch) =
-                    self.take_pending_pane_output_batch_locked(*pane_id, &generation)
-                {
-                    output_batches.push(batch);
+                let output_is_current = pending_output
+                    .queued
+                    .get(pane_id)
+                    .is_some_and(|batch| Arc::ptr_eq(&batch.generation, &generation));
+                if output_is_current {
+                    if let Some(batch) = pending_output.queued.remove(pane_id) {
+                        output_batches.push(batch);
+                    }
                 }
                 drop(registered);
                 let inserted = retiring.insert(*pane_id);
@@ -5568,6 +5607,7 @@ impl Mux {
             debug_assert_eq!(removed_registrations.len(), stale_registrations.len());
 
             drop(topology);
+            drop(pending_output);
             drop(retiring);
             drop(panes);
             drop(tab_guards);
@@ -5591,7 +5631,7 @@ impl Mux {
                 .record(1.0);
             batch.seal();
         }
-        self.discard_removed_pane_states(&retired_pane_ids);
+        self.discard_removed_pane_states_set(&retired_pane_id_set);
 
         let new_count = published_new.len();
         for envelope in structural_envelopes {

@@ -7382,7 +7382,7 @@ mod tests {
             .expect("register frozen-transaction test tab");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
-        let captured = Arc::new(Mutex::new(None));
+        let captured = Arc::new(ParkingMutex::new(None));
         let captured_for_subscriber = Arc::clone(&captured);
         mux.subscribe_with_topology(move |envelope| {
             if matches!(

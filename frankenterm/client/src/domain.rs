@@ -3620,7 +3620,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_arena_publication_rollback_cancels_populated_provisional_windows() {
+    fn pane_arena_publication_rollback_removes_emptied_published_windows() {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
@@ -3657,7 +3657,7 @@ mod tests {
 
         assert!(
             mux.get_window(window_id).is_none(),
-            "rollback must cancel the now-empty provisional window without publishing it"
+            "compensating rollback must remove the already-published window it emptied"
         );
         assert!(
             mux.get_tab(tab.tab_id()).is_none(),

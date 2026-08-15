@@ -5700,11 +5700,14 @@ impl Mux {
 
     /// Commit one allocation-prepared mutation spanning one or more windows.
     ///
-    /// Lock order is `windows -> topology -> pending_window_notifications`.
-    /// Callers already hold the window-map write guard.  Every fallible
-    /// allocation and revision check completes before the first window field
-    /// changes; the post-reservation suffix contains only exact lookups,
-    /// swaps, scalar assignments, and pushes into pre-reserved capacity.
+    /// Lock order is `windows -> topology -> pending_window_notifications ->
+    /// provisional_windows` when created/removed window receipts require the
+    /// final lock. Callers already hold the window-map write guard. A caller
+    /// retaining `provisional_windows` may commit a state-only transaction only
+    /// when both receipt lists are empty. Every fallible allocation and
+    /// revision check completes before the first window field changes; the
+    /// post-reservation suffix contains only exact lookups, swaps, scalar
+    /// assignments, and pushes into pre-reserved capacity.
     fn commit_prepared_window_states_locked(
         &self,
         windows: &mut HashMap<WindowId, Window>,
@@ -5763,12 +5766,12 @@ impl Mux {
         frozen_states
             .try_reserve_exact(prepared.len())
             .map_err(|error| anyhow!("reserve frozen window states: {error}"))?;
-        frozen_states.extend(prepared.iter().filter_map(|(window_id, state)| {
-            removed_windows
-                .binary_search(window_id)
-                .is_err()
-                .then(|| state.frozen().clone())
-        }));
+        frozen_states.extend(
+            prepared
+                .iter()
+                .filter(|(window_id, _)| removed_windows.binary_search(window_id).is_err())
+                .map(|(_, state)| state.frozen().clone()),
+        );
         let frozen = FrozenWindowTopologyChange::from_prepared(
             frozen_states,
             attached_tabs,
@@ -5800,13 +5803,16 @@ impl Mux {
                 focus_lost.push(pane);
             }
         }
-        for window_id in removed_windows {
-            let removed = windows.remove(&window_id);
-            debug_assert!(removed.is_some());
-            self.provisional_windows.lock().remove(&window_id);
-        }
-        for window_id in created_windows {
-            self.provisional_windows.lock().remove(&window_id);
+        if !removed_windows.is_empty() || !created_windows.is_empty() {
+            let mut provisional = self.provisional_windows.lock();
+            for window_id in removed_windows {
+                let removed = windows.remove(&window_id);
+                debug_assert!(removed.is_some());
+                provisional.remove(&window_id);
+            }
+            for window_id in created_windows {
+                provisional.remove(&window_id);
+            }
         }
         for pane in focus_lost {
             pending
@@ -6707,6 +6713,13 @@ impl Mux {
             return;
         }
         let pane_ids = pane_ids.iter().copied().collect::<HashSet<_>>();
+        self.discard_removed_pane_states_set(&pane_ids);
+    }
+
+    fn discard_removed_pane_states_set(&self, pane_ids: &HashSet<PaneId>) {
+        if pane_ids.is_empty() {
+            return;
+        }
         self.last_high_rate_alert
             .lock()
             .retain(|(pane_id, _), _| !pane_ids.contains(pane_id));
@@ -7751,6 +7764,20 @@ impl Mux {
                     return None;
                 }
             };
+            let mut removed_windows = Vec::new();
+            if let Err(error) = removed_windows.try_reserve_exact(prepared_windows.len()) {
+                log::error!(
+                    "refusing tab retirement before structural commit: cannot reserve exact empty-window receipts: {error}"
+                );
+                return None;
+            }
+            {
+                let provisional = self.provisional_windows.lock();
+                removed_windows.extend(prepared_windows.iter().filter_map(|(window_id, state)| {
+                    (state.frozen().ordered_tabs().is_empty() && !provisional.contains(window_id))
+                        .then_some(*window_id)
+                }));
+            }
             let result = tab.with_pane_snapshot_callback_free(|pane_snapshot| {
                 let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
                 if !prepared_windows.is_empty() {
@@ -7759,7 +7786,7 @@ impl Mux {
                         prepared_windows,
                         Vec::new(),
                         Vec::new(),
-                        Vec::new(),
+                        removed_windows,
                     ) {
                         log::error!("refusing tab retirement window commit: {error:#}");
                         return None;
@@ -7971,6 +7998,20 @@ impl Mux {
                     return None;
                 }
             };
+            let mut removed_windows = Vec::new();
+            if let Err(error) = removed_windows.try_reserve_exact(prepared_windows.len()) {
+                log::error!(
+                    "refusing witnessed tab retirement before structural commit: cannot reserve exact empty-window receipts: {error}"
+                );
+                return None;
+            }
+            {
+                let provisional = self.provisional_windows.lock();
+                removed_windows.extend(prepared_windows.iter().filter_map(|(window_id, state)| {
+                    (state.frozen().ordered_tabs().is_empty() && !provisional.contains(window_id))
+                        .then_some(*window_id)
+                }));
+            }
             let result = expected.with_exact_pane_operation(operation, |pane_snapshot| {
                 let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
                 if !prepared_windows.is_empty() {
@@ -7979,7 +8020,7 @@ impl Mux {
                         prepared_windows,
                         Vec::new(),
                         Vec::new(),
-                        Vec::new(),
+                        removed_windows,
                     ) {
                         log::error!("refusing witnessed tab retirement window commit: {error:#}");
                         return None;
@@ -8474,9 +8515,10 @@ impl Mux {
             return false;
         };
         // The delayed-operation lease authorizes only the frozen structural
-        // commit above. Release it before attaching retirement cleanup so the
-        // PaneRemoved lifecycle can complete before the later prune pass; the
-        // retired-ID fence still prevents same-ID reuse through subscriber
+        // commit above, which already included exact affected-window cleanup.
+        // Release it before attaching pane-retirement cleanup so PaneRemoved
+        // lifecycle delivery cannot unnecessarily retain the operation lease;
+        // the retired-ID fence still prevents same-ID reuse through subscriber
         // cleanup.
         drop(operation);
         self.flush_window_notifications();
@@ -8490,7 +8532,6 @@ impl Mux {
             self.finish_pane_removal(removed, true);
         }
         self.recompute_pane_count();
-        self.prune_dead_windows();
         true
     }
 
@@ -8529,15 +8570,17 @@ impl Mux {
     /// Exact Arc identity prevents an exhausted/reused numeric tab ID from
     /// removing a replacement. This is the populated counterpart to
     /// [`Mux::remove_empty_tab_local_only_if_same`] for transactions that own
-    /// the staged tab from registration through publication.
+    /// the staged tab from registration through publication. An empty
+    /// provisional parent remains under its exact [`MuxWindowBuilder`]'s
+    /// authority and is retired when that transaction calls
+    /// [`MuxWindowBuilder::cancel`]; a general prune must not publish or reap
+    /// another transaction's provisional window. Once attachment has
+    /// published that window, the exact detach receipt may synchronously
+    /// retire it if this rollback left it empty. The receipt also avoids an
+    /// unrelated O(all windows) maintenance sweep on this rollback path.
     pub fn remove_tab_local_only_if_same(&self, expected: &Arc<Tab>) -> bool {
-        let removed = self
-            .remove_tab_internal_if_same_with_pane_disposition(expected, false)
-            .is_some();
-        if removed {
-            self.prune_dead_windows();
-        }
-        removed
+        self.remove_tab_internal_if_same_with_pane_disposition(expected, false)
+            .is_some()
     }
 
     /// Roll back an exact, still-empty local tab registration without risking
@@ -12700,6 +12743,70 @@ mod tests {
     }
 
     #[test]
+    fn domain_floating_reconcile_rejects_window_retained_stale_tab() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (tiled, tiled_kills) = KillCountingPane::new(209, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &tiled);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain)
+            .expect("register authoritative floating test domain");
+        let (floating, floating_kills) = KillCountingPane::new(210, test_size());
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("valid test window")
+            .expect("attached test window");
+
+        let removed = mux
+            .tabs
+            .write()
+            .remove(&tab.tab_id())
+            .expect("seed a stale exact tab retained only by its window");
+        assert!(Arc::ptr_eq(&removed, &tab));
+
+        let error = mux
+            .reconcile_domain_floating_panes(
+                1,
+                vec![Arc::clone(&tiled), Arc::clone(&floating)],
+                vec![DomainFloatingPaneState {
+                    tab: Arc::clone(&tab),
+                    pane: Arc::clone(&floating),
+                    pane_id: 210,
+                    rect: FloatingPaneRect {
+                        left: 1,
+                        top: 1,
+                        width: 20,
+                        height: 8,
+                    },
+                    z_order: 0,
+                    visible: true,
+                    pinned: false,
+                    opacity: 1.0,
+                    focused: false,
+                }],
+            )
+            .expect_err("a window-retained stale tab must not gain floating owner authority");
+
+        assert!(
+            error
+                .to_string()
+                .contains("is not an exact live mux registration"),
+            "unexpected error: {:#}",
+            error,
+        );
+        assert!(mux.get_pane(210).is_none());
+        assert!(tab.iter_floating_panes().is_empty());
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("valid test window after rejection")
+            .expect("stale tab remains window-owned after rejection");
+        assert_eq!(after.order_revision(), before.order_revision());
+        assert_eq!(after.active_tab_id(), before.active_tab_id());
+        assert_eq!(tiled_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(floating_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn domain_floating_reconcile_preserves_foreign_slots_and_replays_wire_order() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
@@ -14011,6 +14118,32 @@ mod tests {
             window.order_revision().get() == u64::MAX - 1
                 && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
         }));
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn stale_parent_prune_commits_while_retaining_provisional_census_guard() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&tab).expect("stale tab registration");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("stale tab window attachment");
+        drop(window);
+        assert!(mux.remove_tab_registration_if_same(tab.tab_id(), &tab));
+
+        mux.prune_dead_windows();
+
+        assert!(mux.get_tab(tab.tab_id()).is_none());
+        assert!(
+            mux.get_window(window_id).is_none(),
+            "stale-parent pruning must detach the stale tab and retire its emptied window",
+        );
 
         Mux::shutdown();
     }
@@ -19770,7 +19903,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_tab_local_only_if_same_rolls_back_populated_provisional_tab() {
+    fn remove_tab_local_only_if_same_prunes_published_window_before_stale_builder_cancel() {
         let _guard = global_test_lock();
         Mux::shutdown();
 
@@ -19793,7 +19926,7 @@ mod tests {
         );
         assert!(
             mux.get_window(window_id).is_none(),
-            "exact tab rollback must prune the now-empty published window",
+            "exact tab rollback must synchronously prune the published window it emptied",
         );
         assert!(
             !mux.remove_tab_local_only_if_same(&tab),
@@ -19801,7 +19934,10 @@ mod tests {
         );
 
         window.cancel();
-        assert!(mux.get_window(window_id).is_none());
+        assert!(
+            mux.get_window(window_id).is_none(),
+            "the stale builder must remain inert after exact published-window cleanup",
+        );
         Mux::shutdown();
     }
 
