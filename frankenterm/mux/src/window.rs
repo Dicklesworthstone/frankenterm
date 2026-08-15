@@ -158,6 +158,9 @@ pub(crate) struct PreparedWindowOrder {
 /// and only then calls `commit_prepared_state`.  Consequently the commit is a
 /// bounded sequence of swaps and scalar assignments: no callback, allocation,
 /// revision reservation, or validation can fail after the first field changes.
+/// `membership_changed` is set only by these private constructors, allowing a
+/// membership-preserving active/reorder commit to bypass the mux parent-index
+/// write cut without comparing or rewriting every tab.
 pub(crate) struct PreparedWindowState {
     window_id: WindowId,
     prior_revision: WindowOrderRevision,
@@ -167,12 +170,17 @@ pub(crate) struct PreparedWindowState {
     last_active: Option<TabId>,
     tab_stacks: TabStackState,
     focus_lost: Option<Arc<dyn Pane>>,
+    membership_changed: bool,
     frozen: FrozenWindowOrder,
 }
 
 impl PreparedWindowState {
     pub(crate) fn frozen(&self) -> &FrozenWindowOrder {
         &self.frozen
+    }
+
+    pub(crate) const fn membership_changed(&self) -> bool {
+        self.membership_changed
     }
 }
 
@@ -317,6 +325,7 @@ impl Window {
         last_active: Option<TabId>,
         tab_stacks: TabStackState,
         focus_lost: Option<Arc<dyn Pane>>,
+        membership_changed: bool,
     ) -> anyhow::Result<PreparedWindowState> {
         anyhow::ensure!(
             self.tabs.len() <= MAX_TABS_PER_ORDERED_WINDOW,
@@ -332,11 +341,11 @@ impl Window {
             self.active,
             self.tabs.len(),
         );
-        let mut current_seen = HashSet::new();
-        current_seen.try_reserve(self.tabs.len())?;
+        let mut seen = HashMap::new();
+        seen.try_reserve(self.tabs.len())?;
         for tab in &self.tabs {
             anyhow::ensure!(
-                current_seen.insert(tab.tab_id()),
+                seen.insert(tab.tab_id(), Arc::as_ptr(tab) as usize).is_none(),
                 "window {} currently contains duplicate tab id {}",
                 self.id,
                 tab.tab_id(),
@@ -355,14 +364,35 @@ impl Window {
             self.id,
             tabs.len(),
         );
-        let mut seen = HashSet::new();
-        seen.try_reserve(tabs.len())?;
-        for tab in &tabs {
+        if membership_changed {
+            seen.clear();
+            seen.try_reserve(tabs.len())?;
+            for tab in &tabs {
+                anyhow::ensure!(
+                    seen.insert(tab.tab_id(), Arc::as_ptr(tab) as usize).is_none(),
+                    "window {} replacement contains duplicate tab id {}",
+                    self.id,
+                    tab.tab_id(),
+                );
+            }
+        } else {
             anyhow::ensure!(
-                seen.insert(tab.tab_id()),
-                "window {} replacement contains duplicate tab id {}",
+                tabs.len() == self.tabs.len(),
+                "window {} membership-preserving replacement changed an exact tab identity",
                 self.id,
-                tab.tab_id(),
+            );
+            for tab in &tabs {
+                anyhow::ensure!(
+                    seen.remove(&tab.tab_id()) == Some(Arc::as_ptr(tab) as usize),
+                    "window {} membership-preserving replacement changed exact tab {}",
+                    self.id,
+                    tab.tab_id(),
+                );
+            }
+            anyhow::ensure!(
+                seen.is_empty(),
+                "window {} membership-preserving replacement omitted a current tab",
+                self.id,
             );
         }
         let next_revision = self.next_order_revision()?;
@@ -377,6 +407,7 @@ impl Window {
             last_active,
             tab_stacks,
             focus_lost,
+            membership_changed,
             frozen: FrozenWindowOrder {
                 window_id: self.id,
                 order_revision: next_revision,
@@ -414,6 +445,7 @@ impl Window {
             self.last_active,
             self.tab_stacks.clone(),
             None,
+            true,
         )
     }
 
@@ -461,6 +493,7 @@ impl Window {
             self.last_active,
             self.tab_stacks.clone(),
             None,
+            false,
         )
         .map(Some)
     }
@@ -472,24 +505,23 @@ impl Window {
         let Some(index) = self.tabs.iter().position(|tab| Arc::ptr_eq(tab, expected)) else {
             return Ok(None);
         };
-        self.prepare_remove_indices(&HashSet::from([index]))
-            .map(Some)
+        let mut removals = HashSet::new();
+        removals.try_reserve(1)?;
+        removals.insert(index);
+        self.prepare_remove_indices(&removals).map(Some)
     }
 
     pub(crate) fn prepare_remove_exact_identity_set(
         &self,
         removals: &HashSet<usize>,
     ) -> anyhow::Result<Option<PreparedWindowState>> {
-        let indices = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, tab)| {
-                removals
-                    .contains(&(Arc::as_ptr(tab) as usize))
-                    .then_some(index)
-            })
-            .collect::<HashSet<_>>();
+        let mut indices = HashSet::new();
+        indices.try_reserve(removals.len().min(self.tabs.len()))?;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if removals.contains(&(Arc::as_ptr(tab) as usize)) {
+                indices.insert(index);
+            }
+        }
         if indices.is_empty() {
             return Ok(None);
         }
@@ -500,6 +532,11 @@ impl Window {
         &self,
         removals: &HashSet<usize>,
     ) -> anyhow::Result<PreparedWindowState> {
+        anyhow::ensure!(
+            removals.iter().all(|index| *index < self.tabs.len()),
+            "window {} removal contains an out-of-range tab index",
+            self.id,
+        );
         let prior_active = self.get_active().cloned();
         let prior_active_pane = prior_active
             .as_ref()
@@ -556,6 +593,7 @@ impl Window {
             last_active,
             tab_stacks,
             active_changed.then_some(prior_active_pane).flatten(),
+            true,
         )
     }
 
@@ -587,6 +625,7 @@ impl Window {
             last_active,
             self.tab_stacks.clone(),
             focus_lost,
+            false,
         )
         .map(Some)
     }
@@ -601,6 +640,7 @@ impl Window {
             self.last_active,
             self.tab_stacks.clone(),
             None,
+            false,
         )
     }
 
@@ -816,6 +856,30 @@ impl Window {
     pub(crate) fn set_order_revision_for_test(&mut self, revision: WindowOrderRevision) {
         assert_ne!(revision.get(), u64::MAX);
         self.order_revision = revision;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_tabs_for_scale_test(&mut self, tabs: &[Arc<Tab>]) -> anyhow::Result<()> {
+        anyhow::ensure!(self.tabs.is_empty(), "scale-test window is not empty");
+        anyhow::ensure!(
+            tabs.len() <= MAX_TABS_PER_ORDERED_WINDOW,
+            "scale-test tab count {} exceeds ordered-window limit {}",
+            tabs.len(),
+            MAX_TABS_PER_ORDERED_WINDOW,
+        );
+        let mut seen = HashSet::new();
+        seen.try_reserve(tabs.len())?;
+        for tab in tabs {
+            anyhow::ensure!(
+                seen.insert(tab.tab_id()),
+                "scale-test window contains duplicate tab id {}",
+                tab.tab_id(),
+            );
+        }
+        self.tabs.try_reserve_exact(tabs.len())?;
+        self.tabs.extend(tabs.iter().cloned());
+        self.active = 0;
+        Ok(())
     }
 
     fn ensure_tab_isnt_already_in_window(&self, tab: &Arc<Tab>) -> anyhow::Result<()> {
@@ -2697,6 +2761,41 @@ mod tests {
         );
         assert_eq!(window.get_active().map(Arc::as_ptr), active_before);
         assert_eq!(window.order_revision().get(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn membership_preserving_prepare_rejects_duplicate_exact_tab_without_mutation() {
+        let first = test_tab();
+        let second = test_tab();
+        let mut window = Window::new(None, None);
+        window.push(&first).expect("append first tab");
+        window.push(&second).expect("append second tab");
+        let revision_before = window.order_revision();
+        let pointers_before = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
+
+        let error = match window.prepare_complete_state(
+            vec![Arc::clone(&first), Arc::clone(&first)],
+            0,
+            window.last_active,
+            window.tab_stacks.clone(),
+            None,
+            false,
+        ) {
+            Ok(_) => panic!("duplicate exact tab must not pass membership-preserving admission"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("membership-preserving replacement changed exact tab"),
+            "unexpected membership-preserving error: {error:#}",
+            error = error,
+        );
+        assert_eq!(window.order_revision(), revision_before);
+        assert_eq!(
+            window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            pointers_before,
+        );
     }
 
     #[test]

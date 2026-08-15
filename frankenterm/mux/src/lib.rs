@@ -4236,6 +4236,10 @@ pub struct Mux {
     topology: Mutex<MuxTopologyAuthority>,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     tab_parents: RwLock<HashMap<TabId, TabParentRegistration>>,
+    #[cfg(test)]
+    tab_parent_lookup_probes: AtomicUsize,
+    #[cfg(test)]
+    tab_parent_write_cuts: AtomicUsize,
     panes: RwLock<HashMap<PaneId, LivePaneRegistration>>,
     pane_retirements: Arc<PaneRetirementTracker>,
     pane_preparations: Mutex<HashMap<PaneId, PanePreparation>>,
@@ -4938,6 +4942,10 @@ impl Mux {
             topology: Mutex::new(MuxTopologyAuthority::new()),
             tabs: RwLock::new(HashMap::new()),
             tab_parents: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            tab_parent_lookup_probes: AtomicUsize::new(0),
+            #[cfg(test)]
+            tab_parent_write_cuts: AtomicUsize::new(0),
             panes: RwLock::new(HashMap::new()),
             pane_retirements: Arc::new(PaneRetirementTracker::default()),
             pane_preparations: Mutex::new(HashMap::new()),
@@ -5782,106 +5790,111 @@ impl Mux {
         );
         anyhow::ensure!(
             removed_windows.iter().all(|window_id| prepared
-                .iter()
-                .any(|(prepared_id, _)| prepared_id == window_id)),
+                .binary_search_by_key(window_id, |(prepared_id, _)| *prepared_id)
+                .is_ok()),
             "removed windows must retain one prepared final state"
         );
         anyhow::ensure!(
             removed_windows.iter().all(|window_id| prepared
-                .iter()
-                .find(|(prepared_id, _)| prepared_id == window_id)
+                .binary_search_by_key(window_id, |(prepared_id, _)| *prepared_id)
+                .ok()
+                .and_then(|index| prepared.get(index))
                 .is_some_and(|(_, state)| state.frozen().ordered_tabs().is_empty())),
             "removed windows must have an empty prepared final state"
         );
         anyhow::ensure!(
             created_windows.iter().all(|window_id| prepared
-                .iter()
-                .any(|(prepared_id, _)| prepared_id == window_id)),
+                .binary_search_by_key(window_id, |(prepared_id, _)| *prepared_id)
+                .is_ok()),
             "created windows must retain one prepared final state"
         );
+        let parentage_changed = !removed_windows.is_empty()
+            || prepared.iter().any(|(_, state)| state.membership_changed());
+        anyhow::ensure!(
+            parentage_changed || attached_tabs.is_empty(),
+            "membership-preserving window transaction cannot publish tab attachments"
+        );
+        let mut prepared_window_ids = HashSet::new();
+        if parentage_changed {
+            prepared_window_ids
+                .try_reserve(prepared.len())
+                .map_err(|error| anyhow!("reserve prepared window identities: {error}"))?;
+            for (window_id, _) in &prepared {
+                debug_assert!(prepared_window_ids.insert(*window_id));
+            }
+        }
 
-        let prior_tab_count = prepared.iter().try_fold(0usize, |count, (window_id, _)| {
-            count
-                .checked_add(
-                    windows
-                        .get(window_id)
-                        .expect("prepared window presence validated above")
-                        .len(),
-                )
-                .ok_or_else(|| anyhow!("prior window tab count overflow"))
-        })?;
-        let final_tab_count = prepared
-            .iter()
-            .try_fold(0usize, |count, (window_id, state)| {
-                if removed_windows.binary_search(window_id).is_ok() {
-                    Ok(count)
-                } else {
-                    count
-                        .checked_add(state.frozen().ordered_tabs().len())
-                        .ok_or_else(|| anyhow!("final window tab count overflow"))
-                }
+        let (prior_tab_count, final_tab_count) = if parentage_changed {
+            let prior = prepared.iter().try_fold(0usize, |count, (window_id, _)| {
+                count
+                    .checked_add(
+                        windows
+                            .get(window_id)
+                            .expect("prepared window presence validated above")
+                            .len(),
+                    )
+                    .ok_or_else(|| anyhow!("prior window tab count overflow"))
             })?;
+            let final_count = prepared
+                .iter()
+                .try_fold(0usize, |count, (window_id, state)| {
+                    if removed_windows.binary_search(window_id).is_ok() {
+                        Ok(count)
+                    } else {
+                        count
+                            .checked_add(state.frozen().ordered_tabs().len())
+                            .ok_or_else(|| anyhow!("final window tab count overflow"))
+                    }
+                })?;
+            (prior, final_count)
+        } else {
+            (0, 0)
+        };
         let mut prior_tabs = Vec::new();
         prior_tabs
             .try_reserve_exact(prior_tab_count)
             .map_err(|error| anyhow!("reserve prior tab-parent transaction: {error}"))?;
-        for (window_id, _) in &prepared {
-            prior_tabs.extend(
-                windows
-                    .get(window_id)
-                    .expect("prepared window presence validated above")
-                    .iter()
-                    .map(|tab| (*window_id, Arc::clone(tab))),
-            );
-        }
+        let mut prior_tab_memberships = HashSet::new();
+        prior_tab_memberships
+            .try_reserve(prior_tab_count)
+            .map_err(|error| anyhow!("reserve exact prior tab memberships: {error}"))?;
         let mut final_tab_ids = HashSet::new();
         final_tab_ids
             .try_reserve(final_tab_count)
             .map_err(|error| anyhow!("reserve final tab-parent identities: {error}"))?;
-        for (window_id, state) in &prepared {
-            if removed_windows.binary_search(window_id).is_ok() {
-                continue;
-            }
-            for tab in state.frozen().ordered_tabs() {
-                anyhow::ensure!(
-                    final_tab_ids.insert(tab.tab_id()),
-                    "window transaction gives tab {} more than one final parent",
-                    tab.tab_id()
+        let mut final_tab_memberships = HashSet::new();
+        final_tab_memberships
+            .try_reserve(final_tab_count)
+            .map_err(|error| anyhow!("reserve exact final tab memberships: {error}"))?;
+        if parentage_changed {
+            for (window_id, _) in &prepared {
+                prior_tabs.extend(
+                    windows
+                        .get(window_id)
+                        .expect("prepared window presence validated above")
+                        .iter()
+                        .map(|tab| (*window_id, Arc::clone(tab))),
                 );
             }
-        }
-
-        let mut tab_parents = self.tab_parents.write();
-        tab_parents
-            .try_reserve(final_tab_count)
-            .map_err(|error| anyhow!("reserve tab-parent index transaction: {error}"))?;
-        for (window_id, tab) in &prior_tabs {
-            anyhow::ensure!(
-                tab_parents
-                    .get(&tab.tab_id())
-                    .is_some_and(|parent| parent.matches(tab, *window_id)),
-                "tab {} parent index does not match exact membership in window {window_id}",
-                tab.tab_id()
-            );
-        }
-        for (window_id, state) in &prepared {
-            if removed_windows.binary_search(window_id).is_ok() {
-                continue;
+            for (window_id, tab) in &prior_tabs {
+                anyhow::ensure!(
+                    prior_tab_memberships.insert((*window_id, Arc::as_ptr(tab) as usize)),
+                    "window {window_id} contains exact tab {} more than once",
+                    tab.tab_id(),
+                );
             }
-            for tab in state.frozen().ordered_tabs() {
-                if let Some(parent) = tab_parents.get(&tab.tab_id()) {
+            for (window_id, state) in &prepared {
+                if removed_windows.binary_search(window_id).is_ok() {
+                    continue;
+                }
+                for tab in state.frozen().ordered_tabs() {
                     anyhow::ensure!(
-                        parent.is_same_tab(tab)
-                            && prepared
-                                .binary_search_by_key(&parent.window_id, |(prepared_id, _)| {
-                                    *prepared_id
-                                })
-                                .is_ok()
-                            && windows.get(&parent.window_id).is_some_and(|window| {
-                                window.iter().any(|candidate| Arc::ptr_eq(candidate, tab))
-                            }),
-                        "tab {} already has a different or untouched window parent",
+                        final_tab_ids.insert(tab.tab_id()),
+                        "window transaction gives tab {} more than one final parent",
                         tab.tab_id()
+                    );
+                    debug_assert!(
+                        final_tab_memberships.insert((*window_id, Arc::as_ptr(tab) as usize))
                     );
                 }
             }
@@ -5907,6 +5920,44 @@ impl Mux {
         focus_lost
             .try_reserve_exact(prepared.len())
             .map_err(|error| anyhow!("reserve window focus callbacks: {error}"))?;
+
+        #[cfg(test)]
+        if parentage_changed {
+            self.tab_parent_write_cuts.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut tab_parents = parentage_changed.then(|| self.tab_parents.write());
+        if let Some(tab_parents) = tab_parents.as_mut() {
+            let parent_index_growth = final_tab_count.saturating_sub(prior_tab_count);
+            tab_parents
+                .try_reserve(parent_index_growth)
+                .map_err(|error| anyhow!("reserve tab-parent index transaction: {error}"))?;
+            for (window_id, tab) in &prior_tabs {
+                anyhow::ensure!(
+                    tab_parents
+                        .get(&tab.tab_id())
+                        .is_some_and(|parent| parent.matches(tab, *window_id)),
+                    "tab {} parent index does not match exact membership in window {window_id}",
+                    tab.tab_id()
+                );
+            }
+            for (window_id, state) in &prepared {
+                if removed_windows.binary_search(window_id).is_ok() {
+                    continue;
+                }
+                for tab in state.frozen().ordered_tabs() {
+                    if let Some(parent) = tab_parents.get(&tab.tab_id()) {
+                        anyhow::ensure!(
+                            parent.is_same_tab(tab)
+                                && prepared_window_ids.contains(&parent.window_id)
+                                && prior_tab_memberships
+                                    .contains(&(parent.window_id, Arc::as_ptr(tab) as usize)),
+                            "tab {} already has a different or untouched window parent",
+                            tab.tab_id()
+                        );
+                    }
+                }
+            }
+        }
         let mut topology = self.topology.lock();
         let mut pending = self.pending_window_notifications.lock();
         anyhow::ensure!(
@@ -5928,16 +5979,22 @@ impl Mux {
                 focus_lost.push(pane);
             }
         }
-        for (window_id, tab) in prior_tabs {
-            let removed = tab_parents.remove(&tab.tab_id());
-            debug_assert!(removed.is_some_and(|parent| parent.matches(&tab, window_id)));
-        }
-        for state in frozen.windows() {
-            let window_id = state.window_id();
-            for tab in state.ordered_tabs() {
-                let replaced =
-                    tab_parents.insert(tab.tab_id(), TabParentRegistration::new(tab, window_id));
-                debug_assert!(replaced.is_none());
+        if let Some(tab_parents) = tab_parents.as_mut() {
+            for (window_id, tab) in &prior_tabs {
+                if !final_tab_memberships.contains(&(*window_id, Arc::as_ptr(tab) as usize)) {
+                    let removed = tab_parents.remove(&tab.tab_id());
+                    debug_assert!(removed.is_some_and(|parent| parent.matches(tab, *window_id)));
+                }
+            }
+            for state in frozen.windows() {
+                let window_id = state.window_id();
+                for tab in state.ordered_tabs() {
+                    if !prior_tab_memberships.contains(&(window_id, Arc::as_ptr(tab) as usize)) {
+                        let replaced = tab_parents
+                            .insert(tab.tab_id(), TabParentRegistration::new(tab, window_id));
+                        debug_assert!(replaced.is_none());
+                    }
+                }
             }
         }
         if !removed_windows.is_empty() || !created_windows.is_empty() {
@@ -9344,9 +9401,17 @@ impl Mux {
     }
 
     pub fn window_containing_tab(&self, tab_id: TabId) -> Option<WindowId> {
-        let parent = self.tab_parents.read().get(&tab_id).cloned()?;
-        let tab = self.tabs.read().get(&tab_id).cloned()?;
-        parent.is_same_tab(&tab).then_some(parent.window_id)
+        #[cfg(test)]
+        self.tab_parent_lookup_probes
+            .fetch_add(1, Ordering::Relaxed);
+        // Keep the parent guard through the weak-generation upgrade. Membership
+        // commits hold this index's write guard across both the window-vector
+        // and parent-entry swaps, so the result is one linearizable cut. Do not
+        // also lock the tab registry here: Tab methods can resolve their window
+        // while holding Tab::inner, whereas retirement takes tabs before inner.
+        let parents = self.tab_parents.read();
+        let parent = parents.get(&tab_id)?;
+        parent.tab.upgrade().map(|_| parent.window_id)
     }
 
     #[cfg(test)]
@@ -20067,6 +20132,343 @@ mod tests {
 
         drop(dst_window);
         drop(src_window);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn missing_tab_parent_index_rejects_move_without_window_mutation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source = mux.new_empty_window(Some("missing-parent-source".to_string()), None);
+        let source_id = *source;
+        let destination =
+            mux.new_empty_window(Some("missing-parent-destination".to_string()), None);
+        let destination_id = *destination;
+        let (tab, _kills) = tab_with_kill_counter(&mux, 457);
+        mux.add_tab_to_window(&tab, source_id)
+            .expect("tab should acquire its source parent");
+        let source_before = mux
+            .window_order_snapshot(source_id)
+            .expect("valid source")
+            .expect("registered source");
+        let destination_before = mux
+            .window_order_snapshot(destination_id)
+            .expect("valid destination")
+            .expect("registered destination");
+
+        let removed = mux.tab_parents.write().remove(&tab.tab_id());
+        assert!(removed.is_some_and(|parent| parent.matches(&tab, source_id)));
+        let error = mux
+            .move_tab_between_windows(tab.tab_id(), destination_id, None)
+            .expect_err("missing exact parent authority must reject a move");
+        assert!(
+            error.to_string().contains("no exact indexed window parent"),
+            "unexpected missing-parent error: {error:#}",
+            error = error,
+        );
+        for (before, window_id) in [
+            (&source_before, source_id),
+            (&destination_before, destination_id),
+        ] {
+            let after = mux
+                .window_order_snapshot(window_id)
+                .expect("valid window")
+                .expect("registered window");
+            assert_eq!(after.order_revision(), before.order_revision());
+            assert_eq!(after.active_tab_id(), before.active_tab_id());
+            assert_eq!(
+                after.ordered_tab_ids().collect::<Vec<_>>(),
+                before.ordered_tab_ids().collect::<Vec<_>>(),
+            );
+        }
+        assert!(
+            mux.tab_parents
+                .write()
+                .insert(tab.tab_id(), TabParentRegistration::new(&tab, source_id),)
+                .is_none()
+        );
+        mux.assert_tab_parent_index_matches_windows();
+
+        drop(destination);
+        drop(source);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn indexed_tab_parent_resolution_has_constant_work_at_large_session_counts() {
+        for count in [1_024usize, 4_096, 16_384] {
+            let mux = Mux::new(None);
+            let mut expected = Vec::new();
+            expected
+                .try_reserve_exact(count)
+                .expect("reserve indexed parent scale fixture");
+            {
+                let mut tabs = mux.tabs.write();
+                let mut windows = mux.windows.write();
+                let mut parents = mux.tab_parents.write();
+                tabs.try_reserve(count).expect("reserve scale tab registry");
+                windows
+                    .try_reserve(count)
+                    .expect("reserve scale window registry");
+                parents
+                    .try_reserve(count)
+                    .expect("reserve scale parent index");
+                for _ in 0..count {
+                    let tab = Arc::new(Tab::new(&test_size()));
+                    let tab_id = tab.tab_id();
+                    let mut window = Window::new(Some("parent-scale".to_string()), None);
+                    let window_id = window.window_id();
+                    window.push(&tab).expect("seed exact window membership");
+                    assert!(tabs.insert(tab_id, Arc::clone(&tab)).is_none());
+                    assert!(windows.insert(window_id, window).is_none());
+                    assert!(
+                        parents
+                            .insert(tab_id, TabParentRegistration::new(&tab, window_id))
+                            .is_none()
+                    );
+                    expected.push((tab_id, window_id));
+                }
+            }
+            mux.assert_tab_parent_index_matches_windows();
+
+            let probes_before = mux.tab_parent_lookup_probes.load(Ordering::Relaxed);
+            for &(tab_id, window_id) in &expected {
+                assert_eq!(mux.window_containing_tab(tab_id), Some(window_id));
+            }
+            let probes = mux
+                .tab_parent_lookup_probes
+                .load(Ordering::Relaxed)
+                .saturating_sub(probes_before);
+            assert_eq!(
+                probes,
+                count,
+                "each successful parent resolution must use exactly one indexed probe",
+            );
+            eprintln!(
+                "mux_tab_parent_lookup_work tab_count={count} lookups={count} hash_probes={probes}"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_preserving_commits_skip_parent_index_writes_at_large_tab_counts() {
+        for count in [1_024usize, 4_096, 16_384] {
+            let mux = Arc::new(Mux::new(None));
+            mux.bind_window_notification_owner();
+            let window_count = count.div_ceil(MAX_TABS_PER_ORDERED_WINDOW);
+            let mut seeded_windows = Vec::new();
+            seeded_windows
+                .try_reserve_exact(window_count)
+                .expect("reserve membership-preserving scale windows");
+            let mut remaining = count;
+            while remaining != 0 {
+                let window_tab_count = remaining.min(MAX_TABS_PER_ORDERED_WINDOW);
+                let mut window = Window::new(Some("parent-write-scale".to_string()), None);
+                let mut tabs = Vec::new();
+                tabs.try_reserve_exact(window_tab_count)
+                    .expect("reserve membership-preserving scale tabs");
+                for _ in 0..window_tab_count {
+                    tabs.push(Arc::new(Tab::new(&test_size())));
+                }
+                window
+                    .seed_tabs_for_scale_test(&tabs)
+                    .expect("seed membership-preserving scale window");
+                seeded_windows.push(window);
+                remaining -= window_tab_count;
+            }
+            let target_window_id = seeded_windows[0].window_id();
+            let target_tab_count = seeded_windows[0].len();
+            {
+                let mut registered_tabs = mux.tabs.write();
+                let mut windows = mux.windows.write();
+                let mut parents = mux.tab_parents.write();
+                registered_tabs
+                    .try_reserve(count)
+                    .expect("reserve scale tab registry");
+                windows
+                    .try_reserve(window_count)
+                    .expect("reserve scale window registry");
+                parents
+                    .try_reserve(count)
+                    .expect("reserve scale parent index");
+                for window in &seeded_windows {
+                    for tab in window.iter() {
+                        assert!(
+                            registered_tabs
+                                .insert(tab.tab_id(), Arc::clone(tab))
+                                .is_none()
+                        );
+                        assert!(
+                            parents
+                                .insert(
+                                    tab.tab_id(),
+                                    TabParentRegistration::new(tab, window.window_id()),
+                                )
+                                .is_none()
+                        );
+                    }
+                }
+                for window in seeded_windows {
+                    assert!(windows.insert(window.window_id(), window).is_none());
+                }
+            }
+            mux.assert_tab_parent_index_matches_windows();
+
+            let reorder_tab_id = mux
+                .get_window(target_window_id)
+                .and_then(|window| window.get_by_idx(0).map(|tab| tab.tab_id()))
+                .expect("target window retains its first tab");
+            let writes_before = mux.tab_parent_write_cuts.load(Ordering::Relaxed);
+            assert!(
+                mux.activate_tab_at_index(target_window_id, target_tab_count - 1, false)
+                    .expect("large membership-preserving activation must commit")
+            );
+            mux.move_tab_between_windows(
+                reorder_tab_id,
+                target_window_id,
+                Some(target_tab_count - 1),
+            )
+            .expect("large same-window reorder must commit");
+            let parent_write_cuts = mux
+                .tab_parent_write_cuts
+                .load(Ordering::Relaxed)
+                .saturating_sub(writes_before);
+            assert_eq!(
+                parent_write_cuts, 0,
+                "active-only and same-window reorder commits must not acquire the parent-index write cut",
+            );
+            mux.assert_tab_parent_index_matches_windows();
+            eprintln!(
+                "mux_membership_preserving_work tab_count={count} parent_index_write_cuts={parent_write_cuts}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_parent_index_matches_window_model_across_mutation_sequence() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let windows = (0..4)
+            .map(|ordinal| mux.new_empty_window(Some(format!("parent-model-{ordinal}")), None))
+            .collect::<Vec<_>>();
+        let window_ids = windows.iter().map(|window| **window).collect::<Vec<_>>();
+        let tabs = (0..32)
+            .map(|ordinal| {
+                let tab = Arc::new(Tab::new(&test_size()));
+                mux.add_tab_no_panes(&tab).expect("register model tab");
+                mux.add_tab_to_window(&tab, window_ids[ordinal % window_ids.len()])
+                    .expect("attach model tab");
+                tab
+            })
+            .collect::<Vec<_>>();
+        let mut expected_parent = tabs
+            .iter()
+            .enumerate()
+            .map(|(ordinal, tab)| (tab.tab_id(), window_ids[ordinal % window_ids.len()]))
+            .collect::<HashMap<_, _>>();
+
+        for step in 0..256usize {
+            let tab = &tabs[(step.saturating_mul(17).saturating_add(3)) % tabs.len()];
+            let destination =
+                window_ids[(step.saturating_mul(13).saturating_add(1)) % window_ids.len()];
+            mux.move_tab_between_windows(tab.tab_id(), destination, None)
+                .expect("model move must preserve exact parent authority");
+            expected_parent.insert(tab.tab_id(), destination);
+            mux.assert_tab_parent_index_matches_windows();
+            for candidate in &tabs {
+                assert_eq!(
+                    mux.window_containing_tab(candidate.tab_id()),
+                    expected_parent.get(&candidate.tab_id()).copied(),
+                    "parent model diverged after step {step} for tab {}",
+                    candidate.tab_id(),
+                );
+            }
+        }
+
+        drop(windows);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn stale_tab_parent_index_cannot_authorize_transfer_from_absent_membership() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source = mux.new_empty_window(Some("stale-parent-source".to_string()), None);
+        let source_id = *source;
+        let destination = mux.new_empty_window(Some("stale-parent-destination".to_string()), None);
+        let destination_id = *destination;
+        let (tab, _kills) = tab_with_kill_counter(&mux, 455);
+        mux.add_tab_to_window(&tab, source_id)
+            .expect("tab should acquire its source parent");
+
+        // Seed a legacy-corrupt cut: exact indexed authority still names the
+        // source, but the source membership has disappeared. Merely including
+        // that window in a prepared transaction must not launder the stale
+        // index into a valid destination attachment.
+        mux.get_window_mut(source_id)
+            .expect("source remains registered")
+            .remove_by_id(tab.tab_id());
+        let destination_before = mux
+            .window_order_snapshot(destination_id)
+            .expect("valid destination")
+            .expect("registered destination");
+        let error = {
+            let mut windows = mux.windows.write();
+            let source_state = windows
+                .get(&source_id)
+                .expect("source remains registered")
+                .prepare_retirement_marker()
+                .expect("prepare empty source state");
+            let destination_state = windows
+                .get(&destination_id)
+                .expect("destination remains registered")
+                .prepare_insert(0, &tab)
+                .expect("prepare destination insertion");
+            mux.commit_prepared_window_states_locked(
+                &mut windows,
+                vec![
+                    (source_id, source_state),
+                    (destination_id, destination_state),
+                ],
+                vec![(tab.tab_id(), destination_id)],
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("stale indexed membership must fail before commit")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("different or untouched window parent"),
+            "unexpected stale-parent error: {error:#}",
+            error = error,
+        );
+        let destination_after = mux
+            .window_order_snapshot(destination_id)
+            .expect("valid destination")
+            .expect("registered destination");
+        assert_eq!(
+            destination_after.ordered_tab_ids().collect::<Vec<_>>(),
+            destination_before.ordered_tab_ids().collect::<Vec<_>>(),
+            "failed stale-parent admission must leave the destination unchanged",
+        );
+        assert_eq!(
+            mux.window_containing_tab(tab.tab_id()),
+            Some(source_id),
+            "the failed transaction must not rewrite indexed authority",
+        );
+
+        drop(destination);
+        drop(source);
         Mux::shutdown();
     }
 
