@@ -12389,6 +12389,11 @@ mod tests {
 
             let event_bus = Arc::new(EventBus::new(16));
             let mut event_subscriber = event_bus.subscribe();
+            let replay_sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+            let replay_adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
+                replay_sink.clone(),
+                crate::replay_capture::CaptureConfig::default(),
+            ));
             let wezterm: WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
             let runtime = ObservationRuntime::new(
                 RuntimeConfig::default(),
@@ -12396,6 +12401,7 @@ mod tests {
                 Arc::new(RwLock::new(PatternEngine::new())),
             )
             .with_event_bus(Arc::clone(&event_bus))
+            .with_replay_capture_adapter(replay_adapter)
             .with_wezterm_handle(wezterm);
 
             let predecessor = runtime
@@ -12608,6 +12614,27 @@ mod tests {
                 event,
                 Event::GapDetected { pane_id: id, .. } if *id == pane_id
             )));
+
+            let replay_events = replay_sink.recorder_events();
+            assert_eq!(
+                replay_events.len(),
+                1,
+                "stale events on either queue must produce no replay egress"
+            );
+            assert_eq!(replay_events[0].pane_id, pane_id);
+            assert_eq!(replay_events[0].sequence, 0);
+            let crate::recording::RecorderEventPayload::EgressOutput {
+                text,
+                segment_kind,
+                is_gap,
+                ..
+            } = &replay_events[0].payload
+            else {
+                panic!("the exact successor resync must produce replay egress output");
+            };
+            assert_eq!(text, "successor snapshot");
+            assert_eq!(*segment_kind, crate::recording::RecorderSegmentKind::Gap);
+            assert!(*is_gap);
 
             storage.shutdown().await.expect("shutdown test storage");
         });
@@ -12866,6 +12893,244 @@ mod tests {
         let events = sink.recorder_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 7);
+    }
+
+    #[test]
+    fn replay_egress_keeps_persistence_authority_in_flight_until_sink_returns() {
+        struct BlockingCaptureSink {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl crate::replay_capture::CaptureSink for BlockingCaptureSink {
+            fn on_event(
+                &self,
+                _event: crate::recording::RecorderEvent,
+                _merge_key: crate::recording::RecorderMergeKey,
+            ) {
+                self.entered.send(()).expect("announce blocked replay sink");
+                self.release
+                    .lock()
+                    .expect("lock replay sink release")
+                    .recv()
+                    .expect("release blocked replay sink");
+            }
+        }
+
+        let authority = CaptureAuthority::new();
+        let pane = authority.activate_pane(9).expect("capture pane");
+        let lease = authority
+            .issue_source(pane, CaptureSourceKind::Polling)
+            .expect("capture source");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
+            Arc::new(BlockingCaptureSink {
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            }),
+            crate::replay_capture::CaptureConfig::default(),
+        ));
+        let captured = CapturedSegment {
+            pane_id: 9,
+            seq: 0,
+            content: "guarded replay egress".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 1_700_000_000_000,
+        };
+        let authority_for_worker = authority.clone();
+        let lease_for_worker = lease.clone();
+        let worker = std::thread::spawn(move || {
+            let persistence_guard = authority_for_worker
+                .try_acquire_persistence(lease_for_worker.stamp(), 9)
+                .expect("persistence guard");
+            record_authorized_replay_egress(&adapter, &captured, 0, &persistence_guard)
+                .expect("record guarded replay egress");
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replay sink must be reached");
+        assert!(
+            !authority
+                .retire_pane_if_drained(pane)
+                .expect("begin capture retirement"),
+            "replay egress must remain part of the exact persistence drain"
+        );
+        release_tx.send(()).expect("release replay sink");
+        worker.join().expect("join replay egress worker");
+        assert!(
+            authority
+                .retire_pane_if_drained(pane)
+                .expect("finish capture retirement"),
+            "retirement completes once replay egress releases its persistence guard"
+        );
+    }
+
+    #[test]
+    fn all_capture_source_kinds_share_one_authorized_replay_egress_boundary() {
+        run_async_test_isolated(|| async {
+            let pane_id = 91;
+            let revision = DiscoveryRevision(30);
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.expect("test storage");
+            storage
+                .upsert_pane(test_pane_record(pane_id))
+                .await
+                .expect("persist test pane");
+
+            let replay_sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+            let replay_adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
+                replay_sink.clone(),
+                crate::replay_capture::CaptureConfig::default(),
+            ));
+            let wezterm: WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_replay_capture_adapter(replay_adapter)
+            .with_wezterm_handle(wezterm);
+
+            let pane = runtime
+                .capture_authority
+                .activate_pane(pane_id)
+                .expect("capture pane");
+            let polling = runtime
+                .capture_authority
+                .issue_source(pane, CaptureSourceKind::Polling)
+                .expect("polling source");
+            let streaming = runtime
+                .capture_authority
+                .issue_source(pane, CaptureSourceKind::VendoredStreaming)
+                .expect("streaming source");
+            let native = runtime
+                .capture_authority
+                .issue_source(pane, CaptureSourceKind::NativePush)
+                .expect("native source");
+            runtime.capture_metadata.write().await.insert(
+                pane.pane_incarnation(),
+                CapturePaneMetadata {
+                    pane_uuid: "all-source-kinds".to_string(),
+                    discovery_generation: 4,
+                    discovery_revision: revision,
+                },
+            );
+            let (_publication_tx, publication_rx) = watch::channel(DiscoveryCapturePublication {
+                epoch: 1,
+                observed_panes: Arc::new(HashMap::from([(
+                    pane_id,
+                    ObservedCapturePane {
+                        info: make_pane(pane_id, "all-source-kinds"),
+                        generation: 4,
+                        pane_uuid: "all-source-kinds".to_string(),
+                        revision,
+                        requires_storage_resync: false,
+                    },
+                )])),
+                transitioning_pane_ids: Arc::new(HashSet::new()),
+                transitions: Arc::new(HashMap::new()),
+            });
+
+            let source_events = [
+                (
+                    CaptureSourceKind::Polling,
+                    test_capture_event_from_segment_for_lease(
+                        CapturedSegment {
+                            pane_id,
+                            seq: 0,
+                            content: "polling delta".to_string(),
+                            kind: CapturedSegmentKind::Delta,
+                            captured_at: 1_700_000_000_000,
+                        },
+                        &polling,
+                    ),
+                ),
+                (
+                    CaptureSourceKind::VendoredStreaming,
+                    test_capture_event_from_segment_for_lease(
+                        CapturedSegment {
+                            pane_id,
+                            seq: 1,
+                            content: "streaming gap".to_string(),
+                            kind: CapturedSegmentKind::Gap {
+                                reason: "streaming_resync".to_string(),
+                            },
+                            captured_at: 1_700_000_000_001,
+                        },
+                        &streaming,
+                    ),
+                ),
+                (
+                    CaptureSourceKind::NativePush,
+                    test_capture_event_from_segment_for_lease(
+                        CapturedSegment {
+                            pane_id,
+                            seq: 2,
+                            content: "native delta".to_string(),
+                            kind: CapturedSegmentKind::Delta,
+                            captured_at: 1_700_000_000_002,
+                        },
+                        &native,
+                    ),
+                ),
+            ];
+            let (ingress_tx, ingress_rx) = mpsc::channel(source_events.len());
+            for (expected_source, event) in source_events {
+                assert_eq!(event.stamp().source_kind(), expected_source);
+                ingress_tx
+                    .try_send(event)
+                    .expect("queue authorized source event");
+            }
+            drop(ingress_tx);
+
+            let (ring_tx, ring_rx) = spsc_channel(4);
+            let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+            let persistence = runtime.spawn_persistence_task(
+                ring_rx,
+                Arc::clone(&runtime.cursors),
+                publication_rx,
+                Arc::new(StdMutex::new(LruCache::new(4))),
+            );
+            relay.await.expect("capture relay task");
+            persistence.await.expect("capture persistence task");
+
+            let replay_events = replay_sink.recorder_events();
+            assert_eq!(replay_events.len(), 3);
+            assert_eq!(
+                replay_events
+                    .iter()
+                    .map(|event| (event.pane_id, event.sequence))
+                    .collect::<Vec<_>>(),
+                vec![(pane_id, 0), (pane_id, 1), (pane_id, 2)]
+            );
+            let expected_payloads = [
+                ("polling delta", crate::recording::RecorderSegmentKind::Delta, false),
+                ("streaming gap", crate::recording::RecorderSegmentKind::Gap, true),
+                ("native delta", crate::recording::RecorderSegmentKind::Delta, false),
+            ];
+            for (event, (expected_text, expected_kind, expected_gap)) in
+                replay_events.iter().zip(expected_payloads)
+            {
+                let crate::recording::RecorderEventPayload::EgressOutput {
+                    text,
+                    segment_kind,
+                    is_gap,
+                    ..
+                } = &event.payload
+                else {
+                    panic!("capture source must produce replay egress output");
+                };
+                assert_eq!(text, expected_text);
+                assert_eq!(*segment_kind, expected_kind);
+                assert_eq!(*is_gap, expected_gap);
+            }
+            assert_eq!(runtime.metrics.segments_persisted(), 3);
+            assert_eq!(runtime.metrics.capture_authority_rejections(), 0);
+
+            storage.shutdown().await.expect("shutdown test storage");
+        });
     }
 
     #[test]
