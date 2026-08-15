@@ -8097,15 +8097,16 @@ mod tests {
             .level(log::Level::Info)
             .args(format_args!("Codec compat window: server=info"))
             .build();
-        logger.log(&info);
+        log::Log::log(&logger, &info);
         let unrelated_warning = log::Record::builder()
             .level(log::Level::Warn)
             .args(format_args!("unrelated warning"))
             .build();
-        logger.log(&unrelated_warning);
+        log::Log::log(&logger, &unrelated_warning);
 
         for index in 0..=MAX_CAPTURED_COMPAT_WARNINGS {
-            logger.log(
+            log::Log::log(
+                &logger,
                 &log::Record::builder()
                     .level(log::Level::Warn)
                     .args(format_args!("Codec compat window: server={}", index))
