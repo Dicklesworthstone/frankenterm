@@ -6022,6 +6022,33 @@ fn save_checkpoint_authoritatively_sync(
         let total_changes_before: i64 =
             tx.query_row("SELECT total_changes()", [], |row| row.get(0))?;
 
+        // Derive the exact v44 trigger contribution from the same transaction
+        // snapshot before any source-row mutation can dirty the usability row.
+        // A checkpoint against a reconciled (`state <> 'dirty'`) existing
+        // session advances the selection generation and dirties that row (two
+        // writes). Reopening a clean or acknowledged session then advances the
+        // generation once more when the final mux_sessions update clears those
+        // fields. An absent canonical usability row fails closed here.
+        let recovery_usability_trigger_changes = if new_session.is_some() {
+            2_i64
+        } else {
+            tx.query_row(
+                "SELECT
+                     CASE WHEN usability.state <> 'dirty' THEN 2 ELSE 0 END
+                     + CASE
+                         WHEN session.shutdown_clean IS NOT 0
+                           OR session.recovery_acknowledged_at IS NOT NULL
+                         THEN 1 ELSE 0
+                       END
+                 FROM mux_sessions AS session
+                 INNER JOIN session_recovery_usability AS usability
+                    ON usability.session_id = session.session_id
+                 WHERE session.session_id = ?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+
         if let Some(metadata) = new_session {
             let inserted_session = tx.execute(
                 "INSERT INTO mux_sessions
@@ -6142,13 +6169,11 @@ fn save_checkpoint_authoritatively_sync(
         // SQLite's connection-wide total_changes() includes them. Schema v40
         // performs exactly one canonical retained-size summary write for every
         // session/checkpoint/pane source-row mutation below, so the base DML
-        // witness is twice the source-row count. Creating a session also fires
-        // the canonical v44 recovery-usability trigger, which advances the
-        // singleton mutation generation and inserts the session's dirty row.
-        // Subsequent checkpoint/pane writes see that dirty row and coalesce, so
-        // those two writes occur exactly once, only on the new-session path.
-        // The trigger allowlist above and current-schema exact-body validation
-        // make both components authoritative.
+        // witness is twice the source-row count. The canonical v44 contribution
+        // was captured above: two writes for session creation or for dirtying a
+        // reconciled existing session, plus one when reopening a clean or
+        // acknowledged session. The trigger allowlist above and current-schema
+        // exact-body validation make both components authoritative.
         // Avoid re-reading every just-written JSON payload here: that doubled
         // large-session I/O and allocation while the SQLite writer lock was held.
         let total_changes_after: i64 =
@@ -6157,9 +6182,7 @@ fn save_checkpoint_authoritatively_sync(
             .pane_count_sql
             .checked_add(3)
             .and_then(|source_changes| source_changes.checked_mul(2))
-            .and_then(|base_changes| {
-                base_changes.checked_add(if new_session.is_some() { 2 } else { 0 })
-            })
+            .and_then(|base_changes| base_changes.checked_add(recovery_usability_trigger_changes))
             .ok_or_else(|| snapshot_integer_overflow("snapshot expected DML count overflow"))?;
         if total_changes_after.checked_sub(total_changes_before) != Some(expected_changes) {
             return Err(snapshot_integer_overflow(
@@ -9831,6 +9854,77 @@ mod tests {
                 )
                 .unwrap();
         assert_eq!(owner_tuple, (None, None, None, None, 2));
+    }
+
+    #[test]
+    fn checkpoint_after_reconciled_clean_session_accepts_exact_v44_trigger_writes() {
+        let (_tmp, db_path) = setup_test_db();
+        let pane = make_test_pane(1, 24, 80);
+        let (topology, _) = TopologySnapshot::from_panes(std::slice::from_ref(&pane), 100);
+        let pane_state = PaneStateSnapshot::from_pane_info(&pane, 100, false);
+        let prepared = prepare_snapshot_persistence(&topology, &[pane_state], None).unwrap();
+        let new_session = NewSessionMetadata {
+            ft_version: crate::VERSION.to_string(),
+            host_id: None,
+        };
+
+        let first = save_checkpoint_authoritatively_sync(
+            db_path.as_str(),
+            "reconciled-clean-session",
+            100,
+            SnapshotTrigger::Manual.as_db_str(),
+            &prepared,
+            Some(&new_session),
+            None,
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        conn.execute(
+            "UPDATE session_recovery_usability
+             SET state = 'usable', validated_checkpoint_id = ?1
+             WHERE session_id = 'reconciled-clean-session'",
+            [first.checkpoint_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_sessions
+             SET shutdown_clean = 1,
+                 clean_checkpoint_id = ?1,
+                 recovery_acknowledged_at = 100
+             WHERE session_id = 'reconciled-clean-session'",
+            [first.checkpoint_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        save_checkpoint_authoritatively_sync(
+            db_path.as_str(),
+            "reconciled-clean-session",
+            101,
+            SnapshotTrigger::Manual.as_db_str(),
+            &prepared,
+            None,
+            None,
+        )
+        .expect("canonical checkpoint and reopen triggers must satisfy the exact DML witness");
+
+        let recovered: (String, Option<i64>, i64, i64) = Connection::open(db_path.as_str())
+            .unwrap()
+            .query_row(
+                "SELECT usability.state, session.recovery_acknowledged_at,
+                        session.shutdown_clean,
+                        (SELECT COUNT(*) FROM session_checkpoints
+                         WHERE session_id = session.session_id)
+                 FROM mux_sessions AS session
+                 INNER JOIN session_recovery_usability AS usability
+                    ON usability.session_id = session.session_id
+                 WHERE session.session_id = 'reconciled-clean-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(recovered, ("dirty".to_string(), None, 0, 2));
     }
 
     #[test]
