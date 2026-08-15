@@ -1697,6 +1697,7 @@ impl PaneRegistry {
     ///
     /// External mutation would bypass lifecycle and metadata revision
     /// authority, so production consumers use the classified registry APIs.
+    #[cfg(test)]
     pub(crate) fn get_entry_mut(&mut self, pane_id: u64) -> Option<&mut PaneEntry> {
         self.entries.get_mut(&pane_id)
     }
