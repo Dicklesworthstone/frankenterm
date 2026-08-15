@@ -13275,7 +13275,7 @@ mod tests {
             })
         );
         assert!(
-            storage_resyncs.get(&pane_id).is_none(),
+            !storage_resyncs.contains_key(&pane_id),
             "positive same-incarnation continuity must not be downgraded to an unproven audit"
         );
     }
