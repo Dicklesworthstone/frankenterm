@@ -5876,7 +5876,10 @@ impl Mux {
                                 .binary_search_by_key(&parent.window_id, |(prepared_id, _)| {
                                     *prepared_id
                                 })
-                                .is_ok(),
+                                .is_ok()
+                            && windows.get(&parent.window_id).is_some_and(|window| {
+                                window.iter().any(|candidate| Arc::ptr_eq(candidate, tab))
+                            }),
                         "tab {} already has a different or untouched window parent",
                         tab.tab_id()
                     );
