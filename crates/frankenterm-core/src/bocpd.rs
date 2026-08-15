@@ -822,6 +822,25 @@ impl BocpdManager {
         self.panes.remove(&pane_id);
     }
 
+    /// Hysteretically release hash-table capacity after pane churn.
+    ///
+    /// This intentionally requires four-times live sparsity and capacity above
+    /// twice the retained floor, then keeps two-times live slack. Close/open
+    /// storms therefore do not shrink and regrow—or retry a no-op shrink—on
+    /// every pane.
+    pub(crate) fn shrink_pane_capacity_if_sparse(&mut self, minimum_capacity: usize) {
+        let capacity = self.panes.capacity();
+        let sparse_threshold = self
+            .panes
+            .len()
+            .saturating_mul(4)
+            .max(minimum_capacity.saturating_mul(2));
+        if capacity > sparse_threshold {
+            self.panes
+                .shrink_to(self.panes.len().saturating_mul(2).max(minimum_capacity));
+        }
+    }
+
     /// Feed features for a pane. Returns a change-point event if detected.
     pub fn observe(&mut self, pane_id: u64, features: OutputFeatures) -> Option<PaneChangePoint> {
         self.telemetry.observations = self.telemetry.observations.saturating_add(1);
@@ -866,6 +885,11 @@ impl BocpdManager {
     #[must_use]
     pub fn pane_count(&self) -> usize {
         self.panes.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pane_capacity(&self) -> usize {
+        self.panes.capacity()
     }
 
     /// Total change-points across all panes.

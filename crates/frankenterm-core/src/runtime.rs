@@ -430,6 +430,234 @@ struct CachedSemanticZoneSnapshot {
 
 type CapturePaneCacheKey = (u64, PaneIncarnation);
 
+/// Capacity-one wakeup for persistence-side incarnation retirement.
+///
+/// The payload timestamps the oldest unswept retirement.  Further
+/// retirements coalesce while this wake is queued; the capture authority's
+/// exact active-identity snapshot remains the source of truth.
+#[derive(Debug, Clone, Copy)]
+struct CaptureRetirementWake {
+    queued_at: Instant,
+}
+
+struct CaptureRetirementPublisher {
+    tx: SpscProducer<CaptureRetirementWake>,
+    metrics: Arc<RuntimeMetrics>,
+    backlog_gate: Arc<StdMutex<()>>,
+}
+
+enum PersistenceInput {
+    Capture(CaptureEvent),
+    Retirement(CaptureRetirementWake),
+}
+
+async fn recv_persistence_input(
+    capture_rx: &SpscConsumer<CaptureEvent>,
+    retirement_rx: &SpscConsumer<CaptureRetirementWake>,
+    capture_open: &mut bool,
+    retirement_open: &mut bool,
+) -> Option<PersistenceInput> {
+    loop {
+        match (*capture_open, *retirement_open) {
+            (true, true) => {
+                let input = crate::runtime_async::select! {
+                    wake = retirement_rx.recv() => wake.map(PersistenceInput::Retirement),
+                    event = capture_rx.recv() => event.map(PersistenceInput::Capture),
+                };
+                if let Some(input) = input {
+                    return Some(input);
+                }
+                let capture_closed = capture_rx.is_closed();
+                let retirement_closed = retirement_rx.is_closed();
+                if !capture_closed && !retirement_closed {
+                    // SPSC receive uses `None` for both closed-and-drained and
+                    // capability cancellation. Neither channel closing proves
+                    // this was cancellation, so terminate rather than spin.
+                    return None;
+                }
+                // `is_closed` reports producer closure, not queue drainage.
+                // The other branch may still contain buffered data even when
+                // an empty closed lane wins the biased select with `None`.
+                *capture_open = !(capture_closed && capture_rx.depth() == 0);
+                *retirement_open = !(retirement_closed && retirement_rx.depth() == 0);
+            }
+            (true, false) => match capture_rx.recv().await {
+                Some(event) => return Some(PersistenceInput::Capture(event)),
+                None => *capture_open = false,
+            },
+            (false, true) => match retirement_rx.recv().await {
+                Some(wake) => return Some(PersistenceInput::Retirement(wake)),
+                None => *retirement_open = false,
+            },
+            (false, false) => return None,
+        }
+    }
+}
+
+impl CaptureRetirementPublisher {
+    fn publish(&self) -> bool {
+        let wake = CaptureRetirementWake {
+            queued_at: Instant::now(),
+        };
+        // Serialize the queue mutation with backlog sampling. The persistence
+        // consumer pops outside this gate, then samples under it; whichever
+        // side acquires the gate last therefore records the actual queue
+        // depth rather than a stale pre-race guess.
+        let _backlog_guard = self
+            .backlog_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = match self.tx.try_send(wake) {
+            Ok(()) => {
+                self.metrics.capture_retirement_wakes.increment();
+                true
+            }
+            Err(_) if !self.tx.is_closed() => {
+                self.metrics.capture_retirement_wakes_coalesced.increment();
+                true
+            }
+            Err(_) => false,
+        };
+        self.metrics
+            .capture_retirement_backlog
+            .store(self.tx.depth(), Ordering::Relaxed);
+        result
+    }
+}
+
+fn record_retirement_backlog(
+    metrics: &RuntimeMetrics,
+    retirement_rx: &SpscConsumer<CaptureRetirementWake>,
+    backlog_gate: &StdMutex<()>,
+) {
+    let _backlog_guard = backlog_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    metrics
+        .capture_retirement_backlog
+        .store(retirement_rx.depth(), Ordering::Relaxed);
+}
+
+struct PersistenceIncarnationState {
+    // These maps are mutated only by the persistence task. Shared cursor,
+    // detection-context, and activity teardown deliberately remains owned by
+    // the capture coordinator: it can see pending discovery publications and
+    // therefore protect a same-ID successor during its pre-activation setup.
+    semantic_zone_cache: HashMap<CapturePaneCacheKey, CachedSemanticZoneSnapshot>,
+    latest_incarnation_by_pane: HashMap<u64, PaneIncarnation>,
+    bocpd_manager: crate::bocpd::BocpdManager,
+    bocpd_last_capture_at: HashMap<u64, i64>,
+    bocpd_owner_by_pane: HashMap<u64, PaneIncarnation>,
+}
+
+impl PersistenceIncarnationState {
+    fn new() -> Self {
+        Self {
+            semantic_zone_cache: HashMap::new(),
+            latest_incarnation_by_pane: HashMap::new(),
+            bocpd_manager: crate::bocpd::BocpdManager::new(crate::bocpd::BocpdConfig::default()),
+            bocpd_last_capture_at: HashMap::new(),
+            bocpd_owner_by_pane: HashMap::new(),
+        }
+    }
+
+    fn prepare_event_incarnation(&mut self, pane_id: u64, pane_incarnation: PaneIncarnation) {
+        let previous = self
+            .latest_incarnation_by_pane
+            .insert(pane_id, pane_incarnation);
+        if previous != Some(pane_incarnation) {
+            self.semantic_zone_cache
+                .retain(|(cached_pane_id, cached_incarnation), _| {
+                    *cached_pane_id != pane_id || *cached_incarnation == pane_incarnation
+                });
+            if self
+                .bocpd_owner_by_pane
+                .get(&pane_id)
+                .is_some_and(|owner| *owner != pane_incarnation)
+            {
+                self.bocpd_manager.unregister_pane(pane_id);
+                self.bocpd_last_capture_at.remove(&pane_id);
+                self.bocpd_owner_by_pane.remove(&pane_id);
+            }
+        }
+    }
+
+    fn observe_bocpd(
+        &mut self,
+        segment: &CapturedSegment,
+        pane_incarnation: PaneIncarnation,
+        reset_pane_state: bool,
+    ) -> Option<Detection> {
+        if self
+            .bocpd_owner_by_pane
+            .get(&segment.pane_id)
+            .is_some_and(|owner| *owner != pane_incarnation)
+        {
+            self.bocpd_manager.unregister_pane(segment.pane_id);
+            self.bocpd_last_capture_at.remove(&segment.pane_id);
+        }
+        self.bocpd_owner_by_pane
+            .insert(segment.pane_id, pane_incarnation);
+        observe_bocpd_segment_for_runtime(
+            &mut self.bocpd_manager,
+            &mut self.bocpd_last_capture_at,
+            segment,
+            reset_pane_state,
+        )
+    }
+
+    fn retire_inactive(
+        &mut self,
+        authority: &CaptureAuthority,
+    ) -> std::result::Result<usize, crate::capture_authority::CaptureAuthorityError> {
+        let active = authority.active_pane_identities()?;
+        let mut removed = 0_usize;
+        self.semantic_zone_cache
+            .retain(|(pane_id, pane_incarnation), _| match active.get(pane_id) {
+                Some(identity) if identity.pane_incarnation() == *pane_incarnation => true,
+                _ => {
+                    removed = removed.saturating_add(1);
+                    false
+                }
+            });
+        self.latest_incarnation_by_pane
+            .retain(|pane_id, pane_incarnation| match active.get(pane_id) {
+                Some(identity) if identity.pane_incarnation() == *pane_incarnation => true,
+                _ => {
+                    removed = removed.saturating_add(1);
+                    false
+                }
+            });
+
+        let bocpd_manager = &mut self.bocpd_manager;
+        let bocpd_last_capture_at = &mut self.bocpd_last_capture_at;
+        self.bocpd_owner_by_pane
+            .retain(|pane_id, pane_incarnation| {
+                if active
+                    .get(pane_id)
+                    .is_some_and(|identity| identity.pane_incarnation() == *pane_incarnation)
+                {
+                    true
+                } else {
+                    bocpd_manager.unregister_pane(*pane_id);
+                    removed = removed.saturating_add(usize::from(
+                        bocpd_last_capture_at.remove(pane_id).is_some(),
+                    ));
+                    removed = removed.saturating_add(1);
+                    false
+                }
+            });
+
+        shrink_runtime_pane_map_if_sparse(&mut self.semantic_zone_cache);
+        shrink_runtime_pane_map_if_sparse(&mut self.latest_incarnation_by_pane);
+        shrink_runtime_pane_map_if_sparse(&mut self.bocpd_last_capture_at);
+        shrink_runtime_pane_map_if_sparse(&mut self.bocpd_owner_by_pane);
+        self.bocpd_manager
+            .shrink_pane_capacity_if_sparse(RUNTIME_PANE_STATE_MIN_RETAINED_CAPACITY);
+        Ok(removed)
+    }
+}
+
 async fn semantic_zone_type_for_captured_segment(
     runtime_cx: &RuntimeLoopCx,
     wezterm_handle: &WeztermHandle,
@@ -1740,6 +1968,23 @@ impl Default for DiscoveryCapturePublication {
     }
 }
 
+fn terminal_retired_pane_ids(
+    retired_state_candidates: &HashMap<u64, Instant>,
+    publication: &DiscoveryCapturePublication,
+) -> Vec<u64> {
+    let mut terminal = retired_state_candidates
+        .keys()
+        .copied()
+        .filter(|pane_id| {
+            !publication.observed_panes.contains_key(pane_id)
+                && !publication.transitioning_pane_ids.contains(pane_id)
+                && !publication.transitions.contains_key(pane_id)
+        })
+        .collect::<Vec<_>>();
+    terminal.sort_unstable();
+    terminal
+}
+
 /// Build the strongest capture view that can be justified from a fresh mux
 /// listing without mutating the registry or awaiting storage.
 ///
@@ -2549,6 +2794,7 @@ async fn retire_or_quarantine_capture_binding(
     authority: &CaptureAuthority,
     capture_metadata: &Arc<RwLock<HashMap<PaneIncarnation, CapturePaneMetadata>>>,
     backpressure: &BackpressureMetrics,
+    retirement_publisher: &CaptureRetirementPublisher,
     draining_bindings: &mut HashMap<u64, ActiveCaptureBinding>,
     draining_since: &mut HashMap<u64, Instant>,
     binding: ActiveCaptureBinding,
@@ -2567,6 +2813,12 @@ async fn retire_or_quarantine_capture_binding(
             // authority drain proves no predecessor producer can recreate the
             // entry after this cleanup; a successor therefore starts at zero.
             let _ = backpressure.cleanup_pane(pane_id);
+            if !retirement_publisher.publish() {
+                error!(
+                    pane_id,
+                    context, "Persistence retirement lane closed after exact capture drain"
+                );
+            }
             true
         }
         Ok(false) => {
@@ -3124,6 +3376,18 @@ pub struct RuntimeMetrics {
     events_recorded: ShardedCounter,
     /// Count of queued capture events rejected by incarnation/source fencing.
     capture_authority_rejections: ShardedCounter,
+    /// Retirement wakeups admitted to the capacity-one persistence lane.
+    capture_retirement_wakes: ShardedCounter,
+    /// Retirement wakeups coalesced behind an already queued authoritative sweep.
+    capture_retirement_wakes_coalesced: ShardedCounter,
+    /// Authoritative persistence retirement sweeps completed.
+    capture_retirement_sweeps: ShardedCounter,
+    /// Exact incarnation-owned persistence entries removed by retirement sweeps.
+    capture_retirement_entries_removed: ShardedCounter,
+    /// Current bounded retirement wake backlog (zero or one).
+    capture_retirement_backlog: AtomicUsize,
+    /// Maximum age in milliseconds of the oldest coalesced retirement wake.
+    capture_retirement_latency_max_ms: ShardedMax,
     /// Timestamp when runtime started (epoch ms)
     started_at: ShardedGauge,
     /// Last DB write timestamp (epoch ms)
@@ -3193,12 +3457,35 @@ pub struct RuntimeMetrics {
     backpressure: Arc<BackpressureMetrics>,
 }
 
+/// Aggregate, bounded-cardinality telemetry for persistence-state retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureRetirementTelemetrySnapshot {
+    /// Wakeups admitted to the capacity-one lane.
+    pub wakes: u64,
+    /// Wakeups coalesced behind an already pending sweep.
+    pub wakes_coalesced: u64,
+    /// Authoritative active-incarnation sweeps completed.
+    pub sweeps: u64,
+    /// Exact incarnation-owned map entries removed.
+    pub entries_removed: u64,
+    /// Current wake backlog, bounded to zero or one.
+    pub backlog: usize,
+    /// Maximum observed oldest-wake age in milliseconds.
+    pub max_latency_ms: u64,
+}
+
 impl Default for RuntimeMetrics {
     fn default() -> Self {
         Self {
             segments_persisted: ShardedCounter::new(),
             events_recorded: ShardedCounter::new(),
             capture_authority_rejections: ShardedCounter::new(),
+            capture_retirement_wakes: ShardedCounter::new(),
+            capture_retirement_wakes_coalesced: ShardedCounter::new(),
+            capture_retirement_sweeps: ShardedCounter::new(),
+            capture_retirement_entries_removed: ShardedCounter::new(),
+            capture_retirement_backlog: AtomicUsize::new(0),
+            capture_retirement_latency_max_ms: ShardedMax::new(),
             started_at: ShardedGauge::new(),
             last_db_write_at: ShardedGauge::new(),
             ingest_lag_sum_ms: ShardedCounter::new(),
@@ -3528,6 +3815,48 @@ impl RuntimeMetrics {
     /// Get queued capture events rejected before semantic side effects.
     pub fn capture_authority_rejections(&self) -> u64 {
         self.capture_authority_rejections.get()
+    }
+
+    /// Retirement wakeups admitted to the bounded persistence lane.
+    pub fn capture_retirement_wakes(&self) -> u64 {
+        self.capture_retirement_wakes.get()
+    }
+
+    /// Retirement wakeups folded into an already pending authoritative sweep.
+    pub fn capture_retirement_wakes_coalesced(&self) -> u64 {
+        self.capture_retirement_wakes_coalesced.get()
+    }
+
+    /// Number of completed authoritative persistence retirement sweeps.
+    pub fn capture_retirement_sweeps(&self) -> u64 {
+        self.capture_retirement_sweeps.get()
+    }
+
+    /// Number of exact incarnation-owned entries removed by retirement sweeps.
+    pub fn capture_retirement_entries_removed(&self) -> u64 {
+        self.capture_retirement_entries_removed.get()
+    }
+
+    /// Current retirement wake backlog. This lane is capacity one.
+    pub fn capture_retirement_backlog(&self) -> usize {
+        self.capture_retirement_backlog.load(Ordering::Relaxed)
+    }
+
+    /// Maximum observed age of the oldest coalesced retirement wake.
+    pub fn capture_retirement_latency_max_ms(&self) -> u64 {
+        self.capture_retirement_latency_max_ms.get()
+    }
+
+    /// Take one machine-readable aggregate retirement telemetry snapshot.
+    pub fn capture_retirement_snapshot(&self) -> CaptureRetirementTelemetrySnapshot {
+        CaptureRetirementTelemetrySnapshot {
+            wakes: self.capture_retirement_wakes(),
+            wakes_coalesced: self.capture_retirement_wakes_coalesced(),
+            sweeps: self.capture_retirement_sweeps(),
+            entries_removed: self.capture_retirement_entries_removed(),
+            backlog: self.capture_retirement_backlog(),
+            max_latency_ms: self.capture_retirement_latency_max_ms(),
+        }
     }
 
     pub fn native_output_input_events(&self) -> u64 {
@@ -3873,6 +4202,17 @@ impl ObservationRuntime {
         // consumed by the persistence task.
         let (capture_ring_tx, capture_ring_rx) =
             spsc_channel::<CaptureEvent>(self.config.channel_buffer);
+        // Retirement notifications are capacity-one and coalescing: the wake
+        // only prompts persistence to snapshot capture authority, which is the
+        // exact lossless state. A storm therefore consumes constant memory.
+        let (capture_retirement_tx, capture_retirement_rx) =
+            spsc_channel::<CaptureRetirementWake>(1);
+        let capture_retirement_backlog_gate = Arc::new(StdMutex::new(()));
+        let capture_retirement_publisher = CaptureRetirementPublisher {
+            tx: capture_retirement_tx,
+            metrics: Arc::clone(&self.metrics),
+            backlog_gate: Arc::clone(&capture_retirement_backlog_gate),
+        };
         // Discovery publishes immutable, revision-stamped pending and ready
         // views around its fallible identity work. Cursor/checkpoint setup is
         // deliberately deferred to capture after exact predecessor drain. A
@@ -3907,6 +4247,7 @@ impl ObservationRuntime {
             capture_ingress_tx.clone(),
             discovery_publication_rx.clone(),
             Arc::clone(&capture_checkpoints),
+            capture_retirement_publisher,
         );
 
         // Spawn the native event listener only when configuration explicitly
@@ -3939,6 +4280,8 @@ impl ObservationRuntime {
             Arc::clone(&self.cursors),
             discovery_publication_rx,
             capture_checkpoints,
+            capture_retirement_rx,
+            capture_retirement_backlog_gate,
         );
 
         // Spawn maintenance task
@@ -5824,6 +6167,7 @@ impl ObservationRuntime {
         capture_tx: mpsc::Sender<CaptureEvent>,
         discovery_publication_rx: watch::Receiver<DiscoveryCapturePublication>,
         capture_checkpoints: CaptureCheckpointCache,
+        retirement_publisher: CaptureRetirementPublisher,
     ) -> JoinHandle<()> {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
@@ -6171,6 +6515,7 @@ impl ObservationRuntime {
                                     &capture_authority,
                                     &capture_metadata,
                                     &backpressure,
+                                    &retirement_publisher,
                                     &mut draining_bindings,
                                     &mut draining_since,
                                     binding,
@@ -6202,6 +6547,7 @@ impl ObservationRuntime {
                                         &capture_authority,
                                         &capture_metadata,
                                         &backpressure,
+                                        &retirement_publisher,
                                         &mut draining_bindings,
                                         &mut draining_since,
                                         binding,
@@ -6229,6 +6575,7 @@ impl ObservationRuntime {
                                     &capture_authority,
                                     &capture_metadata,
                                     &backpressure,
+                                    &retirement_publisher,
                                     &mut draining_bindings,
                                     &mut draining_since,
                                     binding,
@@ -6261,6 +6608,12 @@ impl ObservationRuntime {
                                     .await
                                     .remove(&binding.identity.pane_incarnation());
                                 let _ = backpressure.cleanup_pane(pane_id);
+                                if !retirement_publisher.publish() {
+                                    error!(
+                                        pane_id,
+                                        "Persistence retirement lane closed after quarantined capture drain"
+                                    );
+                                }
                                 retired_state_candidates
                                     .entry(pane_id)
                                     .or_insert_with(Instant::now);
@@ -6339,6 +6692,7 @@ impl ObservationRuntime {
                             &capture_authority,
                             &capture_metadata,
                             &backpressure,
+                            &retirement_publisher,
                             &mut draining_bindings,
                             &mut draining_since,
                             binding,
@@ -6548,6 +6902,7 @@ impl ObservationRuntime {
                                         &capture_authority,
                                         &capture_metadata,
                                         &backpressure,
+                                        &retirement_publisher,
                                         &mut draining_bindings,
                                         &mut draining_since,
                                         binding,
@@ -6593,6 +6948,7 @@ impl ObservationRuntime {
                                                 &capture_authority,
                                                 &capture_metadata,
                                                 &backpressure,
+                                                &retirement_publisher,
                                                 &mut draining_bindings,
                                                 &mut draining_since,
                                                 binding,
@@ -6624,6 +6980,7 @@ impl ObservationRuntime {
                                         &capture_authority,
                                         &capture_metadata,
                                         &backpressure,
+                                        &retirement_publisher,
                                         &mut draining_bindings,
                                         &mut draining_since,
                                         binding,
@@ -6651,6 +7008,7 @@ impl ObservationRuntime {
                                         &capture_authority,
                                         &capture_metadata,
                                         &backpressure,
+                                        &retirement_publisher,
                                         &mut draining_bindings,
                                         &mut draining_since,
                                         binding,
@@ -6684,17 +7042,8 @@ impl ObservationRuntime {
                     // so a same-ID successor published during drain cannot lose
                     // its state.
                     let terminal_publication = discovery_publication_rx.borrow_and_clone();
-                    let terminal_candidates = retired_state_candidates
-                        .keys()
-                        .copied()
-                        .filter(|pane_id| {
-                            !terminal_publication.observed_panes.contains_key(pane_id)
-                                && !terminal_publication
-                                    .transitioning_pane_ids
-                                    .contains(pane_id)
-                                && !terminal_publication.transitions.contains_key(pane_id)
-                        })
-                        .collect::<Vec<_>>();
+                    let terminal_candidates =
+                        terminal_retired_pane_ids(&retired_state_candidates, &terminal_publication);
                     if !terminal_candidates.is_empty() {
                         remove_runtime_pane_state_for_panes(
                             &terminal_candidates,
@@ -7771,6 +8120,8 @@ impl ObservationRuntime {
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
         discovery_publication_rx: watch::Receiver<DiscoveryCapturePublication>,
         capture_checkpoints: CaptureCheckpointCache,
+        retirement_rx: SpscConsumer<CaptureRetirementWake>,
+        retirement_backlog_gate: Arc<StdMutex<()>>,
     ) -> JoinHandle<()> {
         let storage = self.storage.clone();
         let pattern_engine = Arc::clone(&self.pattern_engine);
@@ -7793,15 +8144,55 @@ impl ObservationRuntime {
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let max_persist_segment_bytes = tuning.ingest.max_persist_segment_bytes;
-            let mut semantic_zone_cache =
-                HashMap::<CapturePaneCacheKey, CachedSemanticZoneSnapshot>::new();
-            let mut latest_incarnation_by_pane = HashMap::<u64, PaneIncarnation>::new();
-            let mut bocpd_manager =
-                crate::bocpd::BocpdManager::new(crate::bocpd::BocpdConfig::default());
-            let mut bocpd_last_capture_at = HashMap::<u64, i64>::new();
+            let mut incarnation_state = PersistenceIncarnationState::new();
+            let mut capture_open = true;
+            let mut retirement_open = true;
 
-            // Process events until producer is closed and the ring is drained.
-            while let Some(mut event) = capture_rx.recv().await {
+            // Process data and retirement wakeups until both bounded producers
+            // close and their queues drain. Retirement is left-biased when
+            // both are ready so closed panes release memory promptly.
+            while let Some(input) = recv_persistence_input(
+                &capture_rx,
+                &retirement_rx,
+                &mut capture_open,
+                &mut retirement_open,
+            )
+            .await
+            {
+                let mut event = match input {
+                    PersistenceInput::Capture(event) => event,
+                    PersistenceInput::Retirement(wake) => {
+                        let removed = match incarnation_state.retire_inactive(&capture_authority) {
+                            Ok(removed) => removed,
+                            Err(error) => {
+                                error!(
+                                    error = %error,
+                                    "Capture authority snapshot failed during persistence retirement"
+                                );
+                                shutdown_flag.store(true, Ordering::SeqCst);
+                                record_retirement_backlog(
+                                    &metrics,
+                                    &retirement_rx,
+                                    &retirement_backlog_gate,
+                                );
+                                continue;
+                            }
+                        };
+                        metrics.capture_retirement_sweeps.increment();
+                        metrics
+                            .capture_retirement_entries_removed
+                            .add(u64::try_from(removed).unwrap_or(u64::MAX));
+                        metrics.capture_retirement_latency_max_ms.observe(
+                            u64::try_from(wake.queued_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        );
+                        record_retirement_backlog(
+                            &metrics,
+                            &retirement_rx,
+                            &retirement_backlog_gate,
+                        );
+                        continue;
+                    }
+                };
                 let mut resync_decision = event.take_resync_decision();
                 let stamp = event.stamp();
                 let (persistence_guard, capture_pane_metadata) =
@@ -7861,18 +8252,7 @@ impl ObservationRuntime {
                     }
                 }
                 let pane_id = event.segment.pane_id;
-                if let Some(previous_incarnation) =
-                    latest_incarnation_by_pane.insert(pane_id, pane_incarnation)
-                    && previous_incarnation != pane_incarnation
-                {
-                    semantic_zone_cache.retain(|(cached_pane_id, cached_incarnation), _| {
-                        *cached_pane_id != pane_id || *cached_incarnation == pane_incarnation
-                    });
-                    bocpd_manager.unregister_pane(pane_id);
-                    bocpd_last_capture_at.remove(&pane_id);
-                    let mut contexts = detection_contexts.write().await;
-                    contexts.remove(&pane_id);
-                }
+                incarnation_state.prepare_event_incarnation(pane_id, pane_incarnation);
                 let bounded_segment =
                     bounded_segment_for_persistence(&event.segment, max_persist_segment_bytes);
                 let captured_at = bounded_segment.captured_at;
@@ -7880,7 +8260,7 @@ impl ObservationRuntime {
                 let zone_type = semantic_zone_type_for_captured_segment(
                     &loop_cx,
                     &wezterm_handle,
-                    &mut semantic_zone_cache,
+                    &mut incarnation_state.semantic_zone_cache,
                     semantic_zone_cache_ttl,
                     &bounded_segment,
                     pane_incarnation,
@@ -8053,10 +8433,9 @@ impl ObservationRuntime {
                             detections
                         };
 
-                        if let Some(detection) = observe_bocpd_segment_for_runtime(
-                            &mut bocpd_manager,
-                            &mut bocpd_last_capture_at,
+                        if let Some(detection) = incarnation_state.observe_bocpd(
                             &bounded_segment,
+                            pane_incarnation,
                             persisted.gap.is_some(),
                         ) {
                             detections.push(detection);
@@ -8371,9 +8750,11 @@ async fn handle_native_event(
             // Discovery first withdraws the pane from capture publication;
             // capture reconciliation removes semantic runtime state only after
             // the exact predecessor authority has drained. Drop attribution is
-            // safe to clear eagerly: a concurrent late drop recreates its entry,
-            // and the coordinator's terminal cleanup clears it again.
-            let _ = backpressure.cleanup_pane(pane_id);
+            // generation-scoped despite its numeric pane-ID key, so it follows
+            // that same exact-drain boundary: a delayed predecessor destroy
+            // must never clear attribution already recorded by a same-ID
+            // successor. `retire_or_quarantine_capture_binding` and terminal
+            // capture cleanup own the lossless removal.
             // [ft-pp7jk] Publish Event::PaneDisappeared so downstream
             // subscribers (workflow runners, policy engines, any future
             // long-lived subsystem that accumulates per-pane state)
@@ -8717,10 +9098,13 @@ struct RuntimePaneStateRemoval {
 
 const RUNTIME_PANE_STATE_MIN_RETAINED_CAPACITY: usize = 64;
 
-fn shrink_runtime_pane_map_if_sparse<V>(map: &mut HashMap<u64, V>) {
+fn shrink_runtime_pane_map_if_sparse<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
     let capacity = map.capacity();
-    let sparse_threshold = map.len().saturating_mul(4);
-    if capacity > RUNTIME_PANE_STATE_MIN_RETAINED_CAPACITY && capacity > sparse_threshold {
+    let sparse_threshold = map
+        .len()
+        .saturating_mul(4)
+        .max(RUNTIME_PANE_STATE_MIN_RETAINED_CAPACITY.saturating_mul(2));
+    if capacity > sparse_threshold {
         let retained_capacity = map
             .len()
             .saturating_mul(2)
@@ -11089,6 +11473,421 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retirement_wakeup_is_capacity_one_and_losslessly_coalesced() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let (tx, rx) = spsc_channel(1);
+        let backlog_gate = Arc::new(StdMutex::new(()));
+        let publisher = CaptureRetirementPublisher {
+            tx,
+            metrics: Arc::clone(&metrics),
+            backlog_gate: Arc::clone(&backlog_gate),
+        };
+
+        for _ in 0..200 {
+            assert!(publisher.publish());
+        }
+
+        assert_eq!(rx.depth(), 1);
+        assert_eq!(metrics.capture_retirement_backlog(), 1);
+        assert_eq!(metrics.capture_retirement_wakes(), 1);
+        assert_eq!(metrics.capture_retirement_wakes_coalesced(), 199);
+
+        rx.try_recv().expect("consume coalesced wake");
+        record_retirement_backlog(&metrics, &rx, &backlog_gate);
+        assert_eq!(metrics.capture_retirement_backlog(), 0);
+        assert!(publisher.publish());
+        assert_eq!(metrics.capture_retirement_backlog(), 1);
+        rx.try_recv().expect("consume replacement wake");
+        record_retirement_backlog(&metrics, &rx, &backlog_gate);
+        assert_eq!(metrics.capture_retirement_backlog(), 0);
+        assert_eq!(metrics.capture_retirement_wakes(), 2);
+    }
+
+    #[test]
+    fn retirement_receiver_prioritizes_control_and_drains_capacity_one_and_two() {
+        run_async_test(async {
+            for capacity in [1_usize, 2] {
+                let lease = test_capture_lease(
+                    u64::try_from(capacity).expect("bounded capacity"),
+                    CaptureSourceKind::Polling,
+                );
+                let event = test_capture_event_from_segment_for_lease(
+                    CapturedSegment {
+                        pane_id: u64::try_from(capacity).expect("bounded capacity"),
+                        seq: 0,
+                        content: "queued data".to_string(),
+                        kind: CapturedSegmentKind::Delta,
+                        captured_at: 1_700_000_000_000,
+                    },
+                    &lease,
+                );
+                let (capture_tx, capture_rx) = spsc_channel(capacity);
+                let (retirement_tx, retirement_rx) = spsc_channel(1);
+                capture_tx.try_send(event).expect("queue capture");
+                retirement_tx
+                    .try_send(CaptureRetirementWake {
+                        queued_at: Instant::now(),
+                    })
+                    .expect("queue retirement");
+                drop(capture_tx);
+                drop(retirement_tx);
+
+                let mut capture_open = true;
+                let mut retirement_open = true;
+                assert!(matches!(
+                    recv_persistence_input(
+                        &capture_rx,
+                        &retirement_rx,
+                        &mut capture_open,
+                        &mut retirement_open,
+                    )
+                    .await,
+                    Some(PersistenceInput::Retirement(_))
+                ));
+                assert!(matches!(
+                    recv_persistence_input(
+                        &capture_rx,
+                        &retirement_rx,
+                        &mut capture_open,
+                        &mut retirement_open,
+                    )
+                    .await,
+                    Some(PersistenceInput::Capture(_))
+                ));
+                assert!(
+                    recv_persistence_input(
+                        &capture_rx,
+                        &retirement_rx,
+                        &mut capture_open,
+                        &mut retirement_open,
+                    )
+                    .await
+                    .is_none(),
+                    "closed producers terminate only after both bounded queues drain"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn retirement_receiver_exits_promptly_on_capability_cancellation() {
+        run_async_test(async {
+            let (_capture_tx, capture_rx) = spsc_channel::<CaptureEvent>(1);
+            let (_retirement_tx, retirement_rx) = spsc_channel::<CaptureRetirementWake>(1);
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("test persistence receiver cancellation"),
+            );
+            let _cx_guard = crate::cx::Cx::set_current(Some(cx));
+            let mut capture_open = true;
+            let mut retirement_open = true;
+
+            assert!(
+                recv_persistence_input(
+                    &capture_rx,
+                    &retirement_rx,
+                    &mut capture_open,
+                    &mut retirement_open,
+                )
+                .await
+                .is_none(),
+                "cancellation with both channels open must terminate instead of spinning"
+            );
+        });
+    }
+
+    #[test]
+    fn exact_retirement_sweep_preserves_same_id_successor_state() {
+        run_async_test(async {
+            let pane_id = 7;
+            let authority = CaptureAuthority::new();
+            let predecessor = authority.activate_pane(pane_id).expect("predecessor");
+            let predecessor_lease = authority
+                .issue_source(predecessor, CaptureSourceKind::Polling)
+                .expect("predecessor source");
+            let held = predecessor_lease
+                .try_acquire_persistence(predecessor_lease.stamp(), pane_id)
+                .expect("held persistence guard");
+            let mut state = PersistenceIncarnationState::new();
+            state
+                .latest_incarnation_by_pane
+                .insert(pane_id, predecessor.pane_incarnation());
+            state.semantic_zone_cache.insert(
+                (pane_id, predecessor.pane_incarnation()),
+                CachedSemanticZoneSnapshot {
+                    refreshed_at: Instant::now(),
+                    snapshot: None,
+                },
+            );
+            let segment = CapturedSegment {
+                pane_id,
+                seq: 0,
+                content: "predecessor output".to_string(),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 1_700_000_000_000,
+            };
+            let _ = state.observe_bocpd(&segment, predecessor.pane_incarnation(), false);
+
+            assert!(
+                !authority
+                    .retire_pane_if_drained(predecessor)
+                    .expect("held predecessor remains draining")
+            );
+            assert_eq!(
+                authority
+                    .active_pane_identities()
+                    .expect("active snapshot")
+                    .get(&pane_id),
+                Some(&predecessor),
+                "authority cannot publish retirement before the exact guard drains"
+            );
+
+            drop(held);
+            assert!(
+                authority
+                    .retire_pane_if_drained(predecessor)
+                    .expect("retire predecessor after drain")
+            );
+            let successor = authority.activate_pane(pane_id).expect("successor");
+            state.prepare_event_incarnation(pane_id, successor.pane_incarnation());
+            state.semantic_zone_cache.insert(
+                (pane_id, successor.pane_incarnation()),
+                CachedSemanticZoneSnapshot {
+                    refreshed_at: Instant::now(),
+                    snapshot: None,
+                },
+            );
+            let successor_segment = CapturedSegment {
+                content: "successor output".to_string(),
+                ..segment
+            };
+            let _ = state.observe_bocpd(&successor_segment, successor.pane_incarnation(), false);
+
+            let removed = state
+                .retire_inactive(&authority)
+                .expect("successor retirement sweep");
+            assert_eq!(
+                removed, 0,
+                "delayed retirement cannot remove successor state"
+            );
+            assert_eq!(state.semantic_zone_cache.len(), 1);
+            assert!(
+                state
+                    .semantic_zone_cache
+                    .contains_key(&(pane_id, successor.pane_incarnation()))
+            );
+            assert_eq!(
+                state.latest_incarnation_by_pane.get(&pane_id),
+                Some(&successor.pane_incarnation())
+            );
+            assert_eq!(state.bocpd_manager.pane_count(), 1);
+            assert_eq!(
+                state.bocpd_owner_by_pane.get(&pane_id),
+                Some(&successor.pane_incarnation())
+            );
+        });
+    }
+
+    #[test]
+    fn retirement_terminal_teardown_preserves_every_published_successor_phase() {
+        let retired = HashMap::from([
+            (1_u64, Instant::now()),
+            (2_u64, Instant::now()),
+            (3_u64, Instant::now()),
+            (4_u64, Instant::now()),
+        ]);
+        let observed_info = make_pane(2, "successor");
+        let publication = DiscoveryCapturePublication {
+            epoch: 1,
+            observed_panes: Arc::new(HashMap::from([(
+                2,
+                ObservedCapturePane {
+                    info: observed_info,
+                    generation: 2,
+                    pane_uuid: "successor-2".to_string(),
+                    revision: DiscoveryRevision(2),
+                    requires_storage_resync: false,
+                },
+            )])),
+            transitioning_pane_ids: Arc::new(HashSet::from([3])),
+            transitions: Arc::new(HashMap::from([(
+                4,
+                CaptureTransitionDescriptor {
+                    desired_revision: DiscoveryRevision(4),
+                    predecessor_revision: Some(DiscoveryRevision(1)),
+                },
+            )])),
+        };
+
+        assert_eq!(
+            terminal_retired_pane_ids(&retired, &publication),
+            vec![1],
+            "only a pane absent from every authoritative publication phase is terminal"
+        );
+    }
+
+    #[test]
+    fn retirement_churn_compacts_all_persistence_maps_hysteretically() {
+        run_async_test(async {
+            for churn in [2_u64, 20, 200, 600] {
+                let authority = CaptureAuthority::new();
+                let mut state = PersistenceIncarnationState::new();
+
+                for pane_id in 1..=churn {
+                    let identity = authority
+                        .activate_pane(pane_id)
+                        .expect("activate churn pane");
+                    state.prepare_event_incarnation(pane_id, identity.pane_incarnation());
+                    state.semantic_zone_cache.insert(
+                        (pane_id, identity.pane_incarnation()),
+                        CachedSemanticZoneSnapshot {
+                            refreshed_at: Instant::now(),
+                            snapshot: None,
+                        },
+                    );
+                    let segment = CapturedSegment {
+                        pane_id,
+                        seq: 0,
+                        content: "output".to_string(),
+                        kind: CapturedSegmentKind::Delta,
+                        captured_at: 1_700_000_000_000,
+                    };
+                    let _ = state.observe_bocpd(&segment, identity.pane_incarnation(), false);
+                    assert!(
+                        authority
+                            .retire_pane_if_drained(identity)
+                            .expect("retire churn pane")
+                    );
+                }
+
+                assert!(
+                    authority
+                        .active_pane_identities()
+                        .expect("empty active snapshot")
+                        .is_empty()
+                );
+                let removed = state
+                    .retire_inactive(&authority)
+                    .expect("churn retirement sweep");
+                assert!(removed >= usize::try_from(churn * 4).expect("bounded churn"));
+                assert!(state.semantic_zone_cache.is_empty());
+                assert!(state.latest_incarnation_by_pane.is_empty());
+                assert!(state.bocpd_owner_by_pane.is_empty());
+                assert!(state.bocpd_last_capture_at.is_empty());
+                assert!(state.semantic_zone_cache.capacity() <= 128);
+                assert!(state.latest_incarnation_by_pane.capacity() <= 128);
+                assert!(state.bocpd_owner_by_pane.capacity() <= 128);
+                assert!(state.bocpd_last_capture_at.capacity() <= 128);
+                assert!(state.bocpd_manager.pane_capacity() <= 128);
+                assert!(
+                    authority
+                        .retained_map_capacities()
+                        .expect("authority capacities")
+                        .0
+                        <= 128
+                );
+
+                let pane_ids = (1..=churn).collect::<Vec<_>>();
+                let cursors = Arc::new(RwLock::new(
+                    pane_ids
+                        .iter()
+                        .copied()
+                        .map(|pane_id| (pane_id, PaneCursor::from_seq(pane_id, 1)))
+                        .collect::<HashMap<_, _>>(),
+                ));
+                let contexts = Arc::new(RwLock::new(
+                    pane_ids
+                        .iter()
+                        .copied()
+                        .map(|pane_id| {
+                            let mut context = DetectionContext::new();
+                            context.pane_id = Some(pane_id);
+                            (pane_id, context)
+                        })
+                        .collect::<HashMap<_, _>>(),
+                ));
+                let activity = Arc::new(RwLock::new(
+                    pane_ids
+                        .iter()
+                        .copied()
+                        .map(|pane_id| {
+                            (
+                                pane_id,
+                                PaneActivityState {
+                                    last_seq: 1,
+                                    last_output_at_ms: 1,
+                                    generation: 1,
+                                    first_seen_at_ms: 1,
+                                },
+                            )
+                        })
+                        .collect::<HashMap<_, _>>(),
+                ));
+                remove_runtime_pane_state_for_panes(&pane_ids, &cursors, &contexts, &activity)
+                    .await;
+                let cursors = cursors.read().await;
+                let contexts = contexts.read().await;
+                let activity = activity.read().await;
+                assert!(cursors.is_empty());
+                assert!(contexts.is_empty());
+                assert!(activity.is_empty());
+                assert!(cursors.capacity() <= 128);
+                assert!(contexts.capacity() <= 128);
+                assert!(activity.capacity() <= 128);
+            }
+        });
+    }
+
+    #[test]
+    fn retirement_repeated_same_id_churn_never_accumulates_predecessor_state() {
+        run_async_test(async {
+            for churn in [2_u64, 20, 200, 600] {
+                let authority = CaptureAuthority::new();
+                let mut state = PersistenceIncarnationState::new();
+                let pane_id = 42;
+
+                for generation in 0..churn {
+                    let identity = authority.activate_pane(pane_id).expect("activate same ID");
+                    state.prepare_event_incarnation(pane_id, identity.pane_incarnation());
+                    state.semantic_zone_cache.insert(
+                        (pane_id, identity.pane_incarnation()),
+                        CachedSemanticZoneSnapshot {
+                            refreshed_at: Instant::now(),
+                            snapshot: None,
+                        },
+                    );
+                    let segment = CapturedSegment {
+                        pane_id,
+                        seq: generation,
+                        content: "same-id output".to_string(),
+                        kind: CapturedSegmentKind::Delta,
+                        captured_at: 1_700_000_000_000,
+                    };
+                    let _ = state.observe_bocpd(&segment, identity.pane_incarnation(), false);
+                    assert!(
+                        authority
+                            .retire_pane_if_drained(identity)
+                            .expect("retire same ID")
+                    );
+                    assert_eq!(state.semantic_zone_cache.len(), 1);
+                    assert_eq!(state.latest_incarnation_by_pane.len(), 1);
+                    assert_eq!(state.bocpd_owner_by_pane.len(), 1);
+                }
+
+                let removed = state
+                    .retire_inactive(&authority)
+                    .expect("same-ID retirement sweep");
+                assert!(removed >= 4);
+                assert!(state.semantic_zone_cache.is_empty());
+                assert!(state.latest_incarnation_by_pane.is_empty());
+                assert!(state.bocpd_owner_by_pane.is_empty());
+                assert!(state.bocpd_last_capture_at.is_empty());
+            }
+        });
+    }
+
     #[cfg(feature = "native-wezterm")]
     #[test]
     fn native_accept_settlement_truth_gives_terminal_authority_precedence() {
@@ -12065,7 +12864,7 @@ mod tests {
     }
 
     #[test]
-    fn held_binding_is_quarantined_without_blocking_unrelated_retirement() {
+    fn retirement_held_binding_is_quarantined_without_blocking_unrelated_drain() {
         run_async_test(async {
             let authority = CaptureAuthority::new();
             let first_identity = authority.activate_pane(1).expect("first pane");
@@ -12125,6 +12924,12 @@ mod tests {
             let backpressure = BackpressureMetrics::default();
             backpressure.record_segment_dropped(1);
             backpressure.record_segment_dropped(2);
+            let (retirement_tx, retirement_rx) = spsc_channel(1);
+            let retirement_publisher = CaptureRetirementPublisher {
+                tx: retirement_tx,
+                metrics: Arc::new(RuntimeMetrics::default()),
+                backlog_gate: Arc::new(StdMutex::new(())),
+            };
             let mut draining = HashMap::new();
             let mut draining_since = HashMap::new();
 
@@ -12133,6 +12938,7 @@ mod tests {
                     &authority,
                     &metadata,
                     &backpressure,
+                    &retirement_publisher,
                     &mut draining,
                     &mut draining_since,
                     first_binding,
@@ -12142,6 +12948,11 @@ mod tests {
             );
             assert!(draining.contains_key(&1));
             assert!(draining_since.contains_key(&1));
+            assert_eq!(
+                retirement_rx.depth(),
+                0,
+                "a non-drained binding cannot publish persistence retirement"
+            );
             assert_eq!(
                 backpressure.segments_dropped_for_pane(1),
                 1,
@@ -12160,6 +12971,7 @@ mod tests {
                     &authority,
                     &metadata,
                     &backpressure,
+                    &retirement_publisher,
                     &mut draining,
                     &mut draining_since,
                     second_binding,
@@ -12169,6 +12981,11 @@ mod tests {
             );
             assert!(!draining.contains_key(&2));
             assert!(!draining_since.contains_key(&2));
+            assert_eq!(
+                retirement_rx.depth(),
+                1,
+                "the first exact drain publishes one authoritative sweep wake"
+            );
             assert_eq!(backpressure.segments_dropped_for_pane(2), 0);
             assert!(
                 !metadata
@@ -12185,6 +13002,7 @@ mod tests {
                     &authority,
                     &metadata,
                     &backpressure,
+                    &retirement_publisher,
                     &mut draining,
                     &mut draining_since,
                     first_binding,
@@ -12375,7 +13193,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_predecessor_events_on_both_queues_have_zero_real_persistence_side_effects() {
+    fn retirement_queued_predecessor_events_have_zero_real_persistence_side_effects() {
         run_async_test_isolated(|| async {
             let pane_id = 77;
             let predecessor_revision = DiscoveryRevision(10);
@@ -12523,11 +13341,15 @@ mod tests {
                 }),
             );
             let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+            let (retirement_tx, retirement_rx) = spsc_channel(1);
+            drop(retirement_tx);
             let persistence = runtime.spawn_persistence_task(
                 ring_rx,
                 Arc::clone(&runtime.cursors),
                 publication_rx,
                 Arc::clone(&checkpoints),
+                retirement_rx,
+                Arc::new(StdMutex::new(())),
             );
             relay.await.expect("capture relay task");
             persistence.await.expect("capture persistence task");
@@ -13087,11 +13909,15 @@ mod tests {
 
             let (ring_tx, ring_rx) = spsc_channel(4);
             let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+            let (retirement_tx, retirement_rx) = spsc_channel(1);
+            drop(retirement_tx);
             let persistence = runtime.spawn_persistence_task(
                 ring_rx,
                 Arc::clone(&runtime.cursors),
                 publication_rx,
                 Arc::new(StdMutex::new(LruCache::new(4))),
+                retirement_rx,
+                Arc::new(StdMutex::new(())),
             );
             relay.await.expect("capture relay task");
             persistence.await.expect("capture persistence task");
@@ -15581,7 +16407,7 @@ mod tests {
     /// coordinator-owned runtime state until exact capture retirement.
     #[cfg(feature = "native-wezterm")]
     #[test]
-    fn ft_pp7jk_pane_destroyed_publishes_pane_disappeared_event() {
+    fn retirement_native_pane_destroyed_publishes_without_premature_state_cleanup() {
         run_async_test(async {
             let (_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -15645,8 +16471,8 @@ mod tests {
             );
             assert_eq!(
                 backpressure.panes_with_drops(),
-                0,
-                "native lifecycle input preserves prompt attribution cleanup"
+                1,
+                "native lifecycle input cannot clear generation-scoped attribution before exact drain"
             );
 
             let cx = crate::cx::for_testing();
@@ -15667,7 +16493,7 @@ mod tests {
     /// require the bus.
     #[cfg(feature = "native-wezterm")]
     #[test]
-    fn ft_pp7jk_pane_destroyed_without_bus_defers_capture_teardown() {
+    fn retirement_native_pane_destroyed_without_bus_defers_capture_teardown() {
         run_async_test(async {
             let (_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -15724,7 +16550,11 @@ mod tests {
             assert!(cursors.read().await.contains_key(&7));
             assert!(detection_contexts.read().await.contains_key(&7));
             assert!(pane_activity_tracker.read().await.contains_key(&7));
-            assert_eq!(backpressure.panes_with_drops(), 0);
+            assert_eq!(
+                backpressure.panes_with_drops(),
+                1,
+                "native destroy without lifecycle authority preserves attribution"
+            );
         });
     }
 
@@ -18233,11 +19063,15 @@ mod tests {
             let (ring_tx, ring_rx) = spsc_channel(4);
             let relay = runtime.spawn_capture_relay_task(capture_rx, ring_tx);
             let checkpoints: CaptureCheckpointCache = Arc::new(StdMutex::new(LruCache::new(4)));
+            let (retirement_tx, retirement_rx) = spsc_channel(1);
+            drop(retirement_tx);
             let persistence = runtime.spawn_persistence_task(
                 ring_rx,
                 Arc::clone(&runtime.cursors),
                 publication_rx,
                 checkpoints,
+                retirement_rx,
+                Arc::new(StdMutex::new(())),
             );
             relay.await.expect("capture relay task");
             persistence.await.expect("capture persistence task");

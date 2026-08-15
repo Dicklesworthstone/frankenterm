@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::hash::Hash;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,6 +21,21 @@ const LEASE_ADMITTING: u8 = 0;
 const LEASE_DRAINING: u8 = 1;
 const LEASE_REVOKED: u8 = 2;
 const CX_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const AUTHORITY_MAP_MIN_RETAINED_CAPACITY: usize = 64;
+
+fn shrink_authority_map_if_sparse<K: Eq + Hash, V>(map: &mut HashMap<K, V>) {
+    let sparse_threshold = map
+        .len()
+        .saturating_mul(4)
+        .max(AUTHORITY_MAP_MIN_RETAINED_CAPACITY.saturating_mul(2));
+    if map.capacity() > sparse_threshold {
+        map.shrink_to(
+            map.len()
+                .saturating_mul(2)
+                .max(AUTHORITY_MAP_MIN_RETAINED_CAPACITY),
+        );
+    }
+}
 
 /// Runtime-monotonic identity for one use of a numeric pane ID.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -766,6 +782,32 @@ impl CaptureAuthority {
         Self::default()
     }
 
+    /// Return one exact identity for every pane incarnation that is still
+    /// authoritative.
+    ///
+    /// The snapshot is taken under the same mutex that linearizes activation
+    /// and final retirement.  A caller that observes an identity absent from
+    /// this map therefore knows that admission was closed and every producer
+    /// and persistence guard for that exact incarnation drained before it was
+    /// removed.  This is the persistence cleanup authority; best-effort
+    /// lifecycle notifications are deliberately not involved.
+    pub(crate) fn active_pane_identities(
+        &self,
+    ) -> Result<HashMap<u64, ActivePaneIdentity>, CaptureAuthorityError> {
+        let state = self.lock_state()?;
+        Ok(state
+            .panes
+            .iter()
+            .map(|(pane_id, pane)| (*pane_id, pane.identity))
+            .collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_map_capacities(&self) -> Result<(usize, usize), CaptureAuthorityError> {
+        let state = self.lock_state()?;
+        Ok((state.panes.capacity(), state.desired_revisions.capacity()))
+    }
+
     /// Install a fresh incarnation for a currently inactive numeric pane ID.
     pub fn activate_pane(
         &self,
@@ -860,6 +902,7 @@ impl CaptureAuthority {
         }
         state.desired_view_epoch = Some(epoch);
         state.desired_revisions.clone_from(desired);
+        shrink_authority_map_if_sparse(&mut state.desired_revisions);
         Ok(())
     }
 
@@ -1076,6 +1119,7 @@ impl CaptureAuthority {
             revocation.finish()?;
         }
         state.panes.remove(&identity.global_pane_id);
+        shrink_authority_map_if_sparse(&mut state.panes);
         Ok(true)
     }
 
@@ -1198,6 +1242,7 @@ impl PaneRevocation {
             return Err(CaptureAuthorityError::AuthorityChanged);
         }
         state.panes.remove(&self.identity.global_pane_id);
+        shrink_authority_map_if_sparse(&mut state.panes);
         Ok(self.identity)
     }
 }
@@ -1215,6 +1260,48 @@ mod tests {
             .build()
             .expect("capture authority test runtime")
             .block_on(future);
+    }
+
+    #[test]
+    fn retirement_authority_maps_compact_hysteretically_after_unique_id_churn() {
+        let authority = CaptureAuthority::new();
+        let identities = (1_u64..=600)
+            .map(|pane_id| {
+                authority
+                    .activate_pane(pane_id)
+                    .expect("activate churn pane")
+            })
+            .collect::<Vec<_>>();
+        for identity in identities {
+            assert!(
+                authority
+                    .retire_pane_if_drained(identity)
+                    .expect("retire churn pane")
+            );
+        }
+
+        let revision = CaptureRevision::new(1).expect("nonzero revision");
+        let desired = (1_u64..=600)
+            .map(|pane_id| (pane_id, revision))
+            .collect::<HashMap<_, _>>();
+        authority
+            .install_desired_revisions(CaptureViewEpoch::new(1).expect("first epoch"), &desired)
+            .expect("install churn view");
+        authority
+            .install_desired_revisions(
+                CaptureViewEpoch::new(2).expect("second epoch"),
+                &HashMap::new(),
+            )
+            .expect("retire churn view");
+
+        let (pane_capacity, desired_capacity) = authority
+            .retained_map_capacities()
+            .expect("authority capacities");
+        assert!(pane_capacity <= 128, "pane capacity={pane_capacity}");
+        assert!(
+            desired_capacity <= 128,
+            "desired capacity={desired_capacity}"
+        );
     }
 
     #[test]
