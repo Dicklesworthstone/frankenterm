@@ -6141,9 +6141,14 @@ fn save_checkpoint_authoritatively_sync(
         // Direct execute counts deliberately exclude trigger side effects, while
         // SQLite's connection-wide total_changes() includes them. Schema v40
         // performs exactly one canonical retained-size summary write for every
-        // session/checkpoint/pane source-row mutation below, so the exact DML
-        // witness is twice the source-row count. The trigger allowlist above and
-        // current-schema exact-body validation make that multiplier authoritative.
+        // session/checkpoint/pane source-row mutation below, so the base DML
+        // witness is twice the source-row count. Creating a session also fires
+        // the canonical v44 recovery-usability trigger, which advances the
+        // singleton mutation generation and inserts the session's dirty row.
+        // Subsequent checkpoint/pane writes see that dirty row and coalesce, so
+        // those two writes occur exactly once, only on the new-session path.
+        // The trigger allowlist above and current-schema exact-body validation
+        // make both components authoritative.
         // Avoid re-reading every just-written JSON payload here: that doubled
         // large-session I/O and allocation while the SQLite writer lock was held.
         let total_changes_after: i64 =
@@ -6152,6 +6157,9 @@ fn save_checkpoint_authoritatively_sync(
             .pane_count_sql
             .checked_add(3)
             .and_then(|source_changes| source_changes.checked_mul(2))
+            .and_then(|base_changes| {
+                base_changes.checked_add(if new_session.is_some() { 2 } else { 0 })
+            })
             .ok_or_else(|| snapshot_integer_overflow("snapshot expected DML count overflow"))?;
         if total_changes_after.checked_sub(total_changes_before) != Some(expected_changes) {
             return Err(snapshot_integer_overflow(
