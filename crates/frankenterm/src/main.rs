@@ -37169,41 +37169,118 @@ struct DistributedSequenceScopeState {
 }
 
 #[cfg(feature = "distributed")]
+struct DistributedIngestShared {
+    aggregator: frankenterm_core::wire_protocol::Aggregator,
+    replay_guard: frankenterm_core::distributed::SessionReplayGuard,
+    active_sequence_scopes: std::collections::HashMap<String, DistributedSequenceScopeState>,
+    pane_seq_by_sender: std::collections::HashMap<(String, u64), u64>,
+    sequence_scope_gates:
+        std::collections::HashMap<String, frankenterm_core::runtime_async::OwnedMutex<()>>,
+}
+
+#[cfg(feature = "distributed")]
 struct DistributedIngestState {
-    aggregator: frankenterm_core::runtime_async::Mutex<frankenterm_core::wire_protocol::Aggregator>,
-    replay_guard:
-        frankenterm_core::runtime_async::Mutex<frankenterm_core::distributed::SessionReplayGuard>,
-    active_sequence_scopes: frankenterm_core::runtime_async::Mutex<
-        std::collections::HashMap<String, DistributedSequenceScopeState>,
-    >,
-    pane_seq_by_sender:
-        frankenterm_core::runtime_async::Mutex<std::collections::HashMap<(String, u64), u64>>,
+    shared: frankenterm_core::runtime_async::Mutex<DistributedIngestShared>,
+}
+
+#[cfg(feature = "distributed")]
+enum DistributedAdmissionOutcome {
+    ReplayRejected(frankenterm_core::distributed::DistributedSecurityError),
+    Admitted {
+        previous_replay_seq: Option<u64>,
+        previous_agent_session: Option<frankenterm_core::wire_protocol::AgentSessionSnapshot>,
+        ingest_result: Result<
+            frankenterm_core::wire_protocol::IngestResult,
+            frankenterm_core::wire_protocol::WireProtocolError,
+        >,
+    },
 }
 
 #[cfg(feature = "distributed")]
 impl DistributedIngestState {
     fn new(wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits) -> Self {
         Self {
-            aggregator: frankenterm_core::runtime_async::Mutex::new(
+            shared: frankenterm_core::runtime_async::Mutex::new(DistributedIngestShared {
                 // Distributed listener cleanup owns session lifetime so reconnect
                 // grace and stale pruning stay aligned across all state holders.
-                frankenterm_core::wire_protocol::Aggregator::with_limits_and_stale_after(
-                    4096,
-                    wire_limits,
-                    0,
-                ),
-            ),
-            replay_guard: frankenterm_core::runtime_async::Mutex::new(
-                frankenterm_core::distributed::SessionReplayGuard::new(8192),
-            ),
-            active_sequence_scopes: frankenterm_core::runtime_async::Mutex::new(
-                std::collections::HashMap::new(),
-            ),
-            pane_seq_by_sender: frankenterm_core::runtime_async::Mutex::new(
-                std::collections::HashMap::new(),
-            ),
+                aggregator:
+                    frankenterm_core::wire_protocol::Aggregator::with_limits_and_stale_after(
+                        4096,
+                        wire_limits,
+                        0,
+                    ),
+                replay_guard: frankenterm_core::distributed::SessionReplayGuard::new(8192),
+                active_sequence_scopes: std::collections::HashMap::new(),
+                pane_seq_by_sender: std::collections::HashMap::new(),
+                sequence_scope_gates: std::collections::HashMap::new(),
+            }),
         }
     }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_lock_sequence_scope(
+    ingest_state: &DistributedIngestState,
+    sequence_scope: &str,
+) -> frankenterm_core::runtime_async::OwnedMutexGuard<()> {
+    let gate = {
+        let mut shared = ingest_state.shared.lock().await;
+        shared
+            .sequence_scope_gates
+            .entry(sequence_scope.to_string())
+            .or_insert_with(|| frankenterm_core::runtime_async::OwnedMutex::new(()))
+            .clone()
+    };
+    gate.lock_owned().await
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_admit_envelope(
+    shared: &mut DistributedIngestShared,
+    replay_id: &str,
+    sequence_scope: &str,
+    envelope: frankenterm_core::wire_protocol::WireEnvelope,
+    activate_sequence_scope: bool,
+) -> DistributedAdmissionOutcome {
+    let previous_replay_seq = shared.replay_guard.session_last_seq(replay_id);
+    if let Err(error) = shared.replay_guard.validate(replay_id, envelope.seq) {
+        return DistributedAdmissionOutcome::ReplayRejected(error);
+    }
+
+    let previous_agent_session = shared.aggregator.agent_session_snapshot(sequence_scope);
+    let ingest_result = shared.aggregator.ingest_envelope(envelope);
+    if ingest_result.is_err() {
+        shared
+            .replay_guard
+            .restore_session(replay_id, previous_replay_seq);
+    } else if activate_sequence_scope {
+        distributed_mark_sequence_scope_active(shared, sequence_scope, replay_id);
+    }
+
+    DistributedAdmissionOutcome::Admitted {
+        previous_replay_seq,
+        previous_agent_session,
+        ingest_result,
+    }
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_mark_sequence_scope_active(
+    shared: &mut DistributedIngestShared,
+    sequence_scope: &str,
+    replay_id: &str,
+) {
+    let state = shared
+        .active_sequence_scopes
+        .entry(sequence_scope.to_string())
+        .or_insert_with(|| DistributedSequenceScopeState {
+            active_connections: 0,
+            replay_id: replay_id.to_string(),
+            inactive_since_ms: None,
+        });
+    state.active_connections = state.active_connections.saturating_add(1);
+    state.replay_id = replay_id.to_string();
+    state.inactive_since_ms = None;
 }
 
 #[cfg(feature = "distributed")]
@@ -37413,17 +37490,8 @@ async fn distributed_register_sequence_scope(
     )
     .await;
 
-    let mut active_scopes = ingest_state.active_sequence_scopes.lock().await;
-    let state = active_scopes
-        .entry(sequence_scope.to_string())
-        .or_insert_with(|| DistributedSequenceScopeState {
-            active_connections: 0,
-            replay_id: replay_id.to_string(),
-            inactive_since_ms: None,
-        });
-    state.active_connections = state.active_connections.saturating_add(1);
-    state.replay_id = replay_id.to_string();
-    state.inactive_since_ms = None;
+    let mut shared = ingest_state.shared.lock().await;
+    distributed_mark_sequence_scope_active(&mut shared, sequence_scope, replay_id);
 }
 
 #[cfg(feature = "distributed")]
@@ -37436,24 +37504,38 @@ async fn distributed_prune_stale_sequence_scopes(
         return 0;
     }
 
-    let mut active_scopes = ingest_state.active_sequence_scopes.lock().await;
-    let mut replay_guard = ingest_state.replay_guard.lock().await;
-    let mut aggregator = ingest_state.aggregator.lock().await;
-    let mut pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+    // These four indexes form one admission/retirement authority. Keeping them
+    // behind one mutex makes stale pruning atomic and, critically, avoids
+    // suspending a Send task while it owns a !Send asupersync mutex guard.
+    let mut shared = ingest_state.shared.lock().await;
 
     let mut stale_scopes = std::collections::HashSet::new();
     let mut stale_replay_ids = Vec::new();
 
-    active_scopes.retain(|sequence_scope, state| {
-        let is_stale = state.active_connections == 0
-            && state.inactive_since_ms.is_some_and(|inactive_since_ms| {
-                now_ms.saturating_sub(inactive_since_ms) >= stale_after_ms
-            });
-        if is_stale {
-            stale_scopes.insert(sequence_scope.clone());
-            stale_replay_ids.push(state.replay_id.clone());
-        }
-        !is_stale
+    shared
+        .active_sequence_scopes
+        .retain(|sequence_scope, state| {
+            let is_stale = state.active_connections == 0
+                && state.inactive_since_ms.is_some_and(|inactive_since_ms| {
+                    now_ms.saturating_sub(inactive_since_ms) >= stale_after_ms
+                });
+            if is_stale {
+                stale_scopes.insert(sequence_scope.clone());
+                stale_replay_ids.push(state.replay_id.clone());
+            }
+            !is_stale
+        });
+
+    // A cloned gate means an admission is holding or waiting for this scope.
+    // Keep that exact Arc even if its dormant session metadata was just
+    // retired, so a reconnect can never create a second independent gate.
+    let DistributedIngestShared {
+        active_sequence_scopes,
+        sequence_scope_gates,
+        ..
+    } = &mut *shared;
+    sequence_scope_gates.retain(|sequence_scope, gate| {
+        active_sequence_scopes.contains_key(sequence_scope) || gate.has_external_owner()
     });
 
     if stale_scopes.is_empty() {
@@ -37461,12 +37543,14 @@ async fn distributed_prune_stale_sequence_scopes(
     }
 
     for replay_id in &stale_replay_ids {
-        replay_guard.remove(replay_id);
+        shared.replay_guard.remove(replay_id);
     }
     for sequence_scope in &stale_scopes {
-        aggregator.remove_agent(sequence_scope);
+        shared.aggregator.remove_agent(sequence_scope);
     }
-    pane_seq_by_sender.retain(|(sequence_scope, _), _| !stale_scopes.contains(sequence_scope));
+    shared
+        .pane_seq_by_sender
+        .retain(|(sequence_scope, _), _| !stale_scopes.contains(sequence_scope));
 
     stale_scopes.len()
 }
@@ -37481,18 +37565,19 @@ async fn distributed_release_sequence_scopes(
     }
 
     let now_ms = now_ms_i64();
-    let mut active_scopes = ingest_state.active_sequence_scopes.lock().await;
-    for sequence_scope in sequence_scopes {
-        if let Some(state) = active_scopes.get_mut(sequence_scope) {
-            if state.active_connections > 1 {
-                state.active_connections -= 1;
-            } else {
-                state.active_connections = 0;
-                state.inactive_since_ms = Some(now_ms);
+    {
+        let mut shared = ingest_state.shared.lock().await;
+        for sequence_scope in sequence_scopes {
+            if let Some(state) = shared.active_sequence_scopes.get_mut(sequence_scope) {
+                if state.active_connections > 1 {
+                    state.active_connections -= 1;
+                } else {
+                    state.active_connections = 0;
+                    state.inactive_since_ms = Some(now_ms);
+                }
             }
         }
     }
-    drop(active_scopes);
 
     let _ = distributed_prune_stale_sequence_scopes(
         ingest_state,
@@ -37510,12 +37595,13 @@ async fn distributed_rollback_failed_persist(
     sequence_scope: &str,
     previous_agent_session: Option<frankenterm_core::wire_protocol::AgentSessionSnapshot>,
 ) {
-    let mut replay_guard = ingest_state.replay_guard.lock().await;
-    replay_guard.restore_session(replay_id, previous_replay_seq);
-    drop(replay_guard);
-
-    let mut aggregator = ingest_state.aggregator.lock().await;
-    aggregator.rollback_accepted(sequence_scope, previous_agent_session);
+    let mut shared = ingest_state.shared.lock().await;
+    shared
+        .replay_guard
+        .restore_session(replay_id, previous_replay_seq);
+    shared
+        .aggregator
+        .rollback_accepted(sequence_scope, previous_agent_session);
 }
 
 #[cfg(feature = "distributed")]
@@ -37776,15 +37862,17 @@ where
 }
 
 #[cfg(feature = "distributed")]
+// Network callers retain the exact sequence-scope OwnedMutexGuard from
+// admission through this await and any rollback. That ordering prevents an
+// older failed write from restoring replay, aggregator, or pane-sequence state
+// over a newer admission for the same scope.
 async fn distributed_persist_payload(
     sender: &str,
     sequence_scope: Option<&str>,
     payload: frankenterm_core::wire_protocol::WirePayload,
     storage: &Arc<frankenterm_core::runtime_async::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: &Arc<frankenterm_core::events::EventBus>,
-    pane_seq_by_sender: &frankenterm_core::runtime_async::Mutex<
-        std::collections::HashMap<(String, u64), u64>,
-    >,
+    ingest_state: &DistributedIngestState,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
@@ -37809,9 +37897,10 @@ async fn distributed_persist_payload(
             let previous_seq;
 
             {
-                let mut seq_guard = pane_seq_by_sender.lock().await;
-                previous_seq = seq_guard.get(&seq_key).copied();
-                let expected = seq_guard
+                let mut shared = ingest_state.shared.lock().await;
+                previous_seq = shared.pane_seq_by_sender.get(&seq_key).copied();
+                let expected = shared
+                    .pane_seq_by_sender
                     .get(&seq_key)
                     .map(|last_seen| last_seen.saturating_add(1))
                     .unwrap_or(0);
@@ -37830,7 +37919,7 @@ async fn distributed_persist_payload(
                             delta.seq,
                         ));
                     }
-                    seq_guard.insert(seq_key.clone(), delta.seq);
+                    shared.pane_seq_by_sender.insert(seq_key.clone(), delta.seq);
                 }
             }
 
@@ -37907,13 +37996,13 @@ async fn distributed_persist_payload(
             .await;
 
             if persist_result.is_err() && !drop_due_to_reorder {
-                let mut seq_guard = pane_seq_by_sender.lock().await;
+                let mut shared = ingest_state.shared.lock().await;
                 match previous_seq {
                     Some(previous_seq) => {
-                        seq_guard.insert(seq_key, previous_seq);
+                        shared.pane_seq_by_sender.insert(seq_key, previous_seq);
                     }
                     None => {
-                        seq_guard.remove(&seq_key);
+                        shared.pane_seq_by_sender.remove(&seq_key);
                     }
                 }
             }
@@ -38345,45 +38434,48 @@ async fn distributed_handle_connection<S>(
             }
         }
 
+        let sender = canonical_sender;
+        let replay_id = distributed_replay_session_key(&session_id, &sender);
+        let session_scope =
+            distributed_sender_session_scope(&session_id, &sender, wire_limits.max_sender_id_len);
+        envelope.sender = session_scope.clone();
+        // Preserve sender order all the way through durable persistence. An
+        // older failed write must finish rollback before a concurrent
+        // connection can admit a newer envelope for the same logical scope.
+        // Other scopes use different gates and remain fully concurrent.
+        let _sequence_scope_guard =
+            distributed_lock_sequence_scope(&ingest_state, &session_scope).await;
         let _ = distributed_prune_stale_sequence_scopes(
             &ingest_state,
             now_ms_i64(),
             DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS,
         )
         .await;
-
-        let replay_id = distributed_replay_session_key(&session_id, &canonical_sender);
-        let (previous_replay_seq, validation_err) = {
-            let mut replay_guard = ingest_state.replay_guard.lock().await;
-            let previous_replay_seq = replay_guard.session_last_seq(&replay_id);
-            let validation_err = replay_guard.validate(&replay_id, envelope.seq).err();
-            (previous_replay_seq, validation_err)
+        let activate_sequence_scope = !connection_sequence_scopes.contains(&session_scope);
+        let admission = {
+            let mut shared = ingest_state.shared.lock().await;
+            distributed_admit_envelope(
+                &mut shared,
+                &replay_id,
+                &session_scope,
+                envelope,
+                activate_sequence_scope,
+            )
         };
-
-        if let Some(err) = validation_err {
-            distributed_publish_security_error(&mut reader, err).await;
-            continue;
-        }
-
-        let sender = canonical_sender;
-        let session_scope =
-            distributed_sender_session_scope(&session_id, &sender, wire_limits.max_sender_id_len);
-        envelope.sender = session_scope.clone();
-        let (previous_agent_session, ingest_result) = {
-            let mut aggregator = ingest_state.aggregator.lock().await;
-            let previous_agent_session = aggregator.agent_session_snapshot(&session_scope);
-            let ingest_result = aggregator.ingest_envelope(envelope);
-            (previous_agent_session, ingest_result)
+        let (previous_replay_seq, previous_agent_session, ingest_result) = match admission {
+            DistributedAdmissionOutcome::ReplayRejected(err) => {
+                distributed_publish_security_error(&mut reader, err).await;
+                continue;
+            }
+            DistributedAdmissionOutcome::Admitted {
+                previous_replay_seq,
+                previous_agent_session,
+                ingest_result,
+            } => (previous_replay_seq, previous_agent_session, ingest_result),
         };
-        if matches!(
-            &ingest_result,
-            Err(frankenterm_core::wire_protocol::WireProtocolError::TooManyAgents { .. })
-        ) {
-            let mut replay_guard = ingest_state.replay_guard.lock().await;
-            replay_guard.remove(&replay_id);
-        }
-        if ingest_result.is_ok() && connection_sequence_scopes.insert(session_scope.clone()) {
-            distributed_register_sequence_scope(&ingest_state, &session_scope, &replay_id).await;
+        if ingest_result.is_ok() && activate_sequence_scope {
+            let inserted = connection_sequence_scopes.insert(session_scope.clone());
+            debug_assert!(inserted, "new sequence scope should insert exactly once");
         }
 
         match ingest_result {
@@ -38397,7 +38489,7 @@ async fn distributed_handle_connection<S>(
                     payload,
                     &storage,
                     &event_bus,
-                    &ingest_state.pane_seq_by_sender,
+                    &ingest_state,
                 )
                 .await
                 {
@@ -38985,47 +39077,46 @@ async fn distributed_ingest_test_connection(
             break;
         }
 
+        let sender = canonical_sender;
+        let replay_id = distributed_replay_session_key(session_id, &sender);
+        let session_scope =
+            distributed_sender_session_scope(session_id, &sender, wire_limits.max_sender_id_len);
+        envelope.sender = session_scope.clone();
+        let _sequence_scope_guard =
+            distributed_lock_sequence_scope(ingest_state, &session_scope).await;
         let _ = distributed_prune_stale_sequence_scopes(
             ingest_state,
             now_ms_i64(),
             DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS,
         )
         .await;
-
-        let replay_id = distributed_replay_session_key(session_id, &canonical_sender);
-        let (previous_replay_seq, validation_err) = {
-            let mut replay_guard = ingest_state.replay_guard.lock().await;
-            let previous_replay_seq = replay_guard.session_last_seq(&replay_id);
-            let validation_err = replay_guard.validate(&replay_id, envelope.seq).err();
-            (previous_replay_seq, validation_err)
+        let activate_sequence_scope = !connection_sequence_scopes.contains(&session_scope);
+        let admission = {
+            let mut shared = ingest_state.shared.lock().await;
+            distributed_admit_envelope(
+                &mut shared,
+                &replay_id,
+                &session_scope,
+                envelope,
+                activate_sequence_scope,
+            )
         };
-
-        if let Some(err) = validation_err {
-            result = Err(anyhow::anyhow!(
-                "scripted distributed replay rejected: {err}"
-            ));
-            break;
-        }
-
-        let sender = canonical_sender;
-        let session_scope =
-            distributed_sender_session_scope(session_id, &sender, wire_limits.max_sender_id_len);
-        envelope.sender = session_scope.clone();
-        let (previous_agent_session, ingest_result) = {
-            let mut aggregator = ingest_state.aggregator.lock().await;
-            let previous_agent_session = aggregator.agent_session_snapshot(&session_scope);
-            let ingest_result = aggregator.ingest_envelope(envelope);
-            (previous_agent_session, ingest_result)
+        let (previous_replay_seq, previous_agent_session, ingest_result) = match admission {
+            DistributedAdmissionOutcome::ReplayRejected(err) => {
+                result = Err(anyhow::anyhow!(
+                    "scripted distributed replay rejected: {err}"
+                ));
+                break;
+            }
+            DistributedAdmissionOutcome::Admitted {
+                previous_replay_seq,
+                previous_agent_session,
+                ingest_result,
+            } => (previous_replay_seq, previous_agent_session, ingest_result),
         };
-        if matches!(
-            &ingest_result,
-            Err(frankenterm_core::wire_protocol::WireProtocolError::TooManyAgents { .. })
-        ) {
-            let mut replay_guard = ingest_state.replay_guard.lock().await;
-            replay_guard.remove(&replay_id);
-        }
-        if ingest_result.is_ok() && connection_sequence_scopes.insert(session_scope.clone()) {
-            distributed_register_sequence_scope(ingest_state, &session_scope, &replay_id).await;
+        if ingest_result.is_ok() && activate_sequence_scope {
+            let inserted = connection_sequence_scopes.insert(session_scope.clone());
+            debug_assert!(inserted, "new sequence scope should insert exactly once");
         }
 
         match ingest_result {
@@ -39037,7 +39128,7 @@ async fn distributed_ingest_test_connection(
                     payload,
                     storage,
                     event_bus,
-                    &ingest_state.pane_seq_by_sender,
+                    ingest_state,
                 )
                 .await
                 {
@@ -87263,11 +87354,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-mapped";
             let source_pane_id = 17;
@@ -87360,11 +87449,9 @@ recorder_backend = "frankensqlite"
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
             let mut subscriber = event_bus.subscribe_detections();
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-detection-dedupe";
             let source_pane_id = 29;
@@ -87456,11 +87543,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-secretful";
             let source_pane_id = 23;
@@ -87540,11 +87625,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-gapper";
             let source_pane_id = 71_u64;
@@ -87576,11 +87659,11 @@ recorder_backend = "frankensqlite"
 
             // The gap must NOT have advanced (or created) the delta frontier.
             {
-                let guard = pane_seq_by_sender.lock().await;
+                let shared = pane_seq_by_sender.shared.lock().await;
                 assert!(
-                    guard.get(&seq_key).is_none(),
+                    shared.pane_seq_by_sender.get(&seq_key).is_none(),
                     "ft-6k5gh: a GapNotice must not seed/advance the delta frontier, got {:?}",
-                    guard.get(&seq_key)
+                    shared.pane_seq_by_sender.get(&seq_key)
                 );
             }
 
@@ -87611,11 +87694,11 @@ recorder_backend = "frankensqlite"
                 "ft-6k5gh: an over-i64 seq_after gap is rejected at persist, not silently applied"
             );
             {
-                let guard = pane_seq_by_sender.lock().await;
+                let shared = pane_seq_by_sender.shared.lock().await;
                 assert!(
-                    guard.get(&seq_key).is_none(),
+                    shared.pane_seq_by_sender.get(&seq_key).is_none(),
                     "ft-6k5gh: even a rejected over-range gap must not touch the frontier, got {:?}",
-                    guard.get(&seq_key)
+                    shared.pane_seq_by_sender.get(&seq_key)
                 );
             }
 
@@ -87643,9 +87726,9 @@ recorder_backend = "frankensqlite"
 
             // Frontier now reflects the accepted delta, and the content is stored.
             {
-                let guard = pane_seq_by_sender.lock().await;
+                let shared = pane_seq_by_sender.shared.lock().await;
                 assert_eq!(
-                    guard.get(&seq_key).copied(),
+                    shared.pane_seq_by_sender.get(&seq_key).copied(),
                     Some(0),
                     "ft-6k5gh: the seq-0 delta must be accepted and advance the frontier to 0"
                 );
@@ -87679,11 +87762,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let canonical_sender = "agent-mapped";
             let meta_sender = "Agent-Mapped";
@@ -87779,11 +87860,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-zero";
             let source_pane_id = 28_u64;
@@ -87845,11 +87924,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-initial-gap";
             let source_pane_id = 61_u64;
@@ -87952,7 +88029,7 @@ recorder_backend = "frankensqlite"
                 ),
                 &storage,
                 &event_bus,
-                &ingest_state.pane_seq_by_sender,
+                &ingest_state,
             )
             .await
             .unwrap();
@@ -87973,7 +88050,7 @@ recorder_backend = "frankensqlite"
                 ),
                 &storage,
                 &event_bus,
-                &ingest_state.pane_seq_by_sender,
+                &ingest_state,
             )
             .await
             .unwrap();
@@ -88023,11 +88100,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-order";
             let source_pane_id = 23;
@@ -88101,11 +88176,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
             let sender = "agent-gap-event";
             let source_pane_id = 41_u64;
             let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
@@ -88192,11 +88265,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-gap";
             let source_pane_id = 31_u64;
@@ -88272,11 +88343,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             let sender = "agent-gap-tracker";
             let source_pane_id = 51_u64;
@@ -88368,9 +88437,11 @@ recorder_backend = "frankensqlite"
             }
 
             {
-                let pane_seq_guard = pane_seq_by_sender.lock().await;
+                let shared = pane_seq_by_sender.shared.lock().await;
                 assert_eq!(
-                    pane_seq_guard.get(&(sender.to_string(), source_pane_id)),
+                    shared
+                        .pane_seq_by_sender
+                        .get(&(sender.to_string(), source_pane_id)),
                     Some(&1),
                     "accepted PaneDelta payloads, not explicit gaps, advance the sequence tracker"
                 );
@@ -88418,18 +88489,21 @@ recorder_backend = "frankensqlite"
             let envelope_seq = 1_u64;
 
             let previous_replay_seq = {
-                let mut replay_guard = ingest_state.replay_guard.lock().await;
-                let previous_replay_seq = replay_guard.session_last_seq(&replay_id);
-                replay_guard
+                let mut shared = ingest_state.shared.lock().await;
+                let previous_replay_seq = shared.replay_guard.session_last_seq(&replay_id);
+                shared
+                    .replay_guard
                     .validate(&replay_id, envelope_seq)
                     .expect("first replay-guard validation should pass");
                 previous_replay_seq
             };
 
             let previous_agent_session = {
-                let mut aggregator = ingest_state.aggregator.lock().await;
-                let previous_agent_session = aggregator.agent_session_snapshot(&sequence_scope);
-                let ingest_result = aggregator
+                let mut shared = ingest_state.shared.lock().await;
+                let previous_agent_session =
+                    shared.aggregator.agent_session_snapshot(&sequence_scope);
+                let ingest_result = shared
+                    .aggregator
                     .ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
                         envelope_seq,
                         &sequence_scope,
@@ -88465,7 +88539,7 @@ recorder_backend = "frankensqlite"
                 ),
                 &storage,
                 &event_bus,
-                &ingest_state.pane_seq_by_sender,
+                &ingest_state,
             )
             .await
             .expect_err("closed storage should fail distributed pane persistence");
@@ -88488,28 +88562,30 @@ recorder_backend = "frankensqlite"
             .await;
 
             {
-                let pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+                let shared = ingest_state.shared.lock().await;
                 assert!(
-                    pane_seq_by_sender.is_empty(),
+                    shared.pane_seq_by_sender.is_empty(),
                     "failed pane persistence must not advance sender pane ordering"
                 );
             }
 
             {
-                let mut replay_guard = ingest_state.replay_guard.lock().await;
-                replay_guard
+                let mut shared = ingest_state.shared.lock().await;
+                shared
+                    .replay_guard
                     .validate(&replay_id, envelope_seq)
                     .expect("rollback should make the same replay id+seq retryable");
             }
 
             {
-                let mut aggregator = ingest_state.aggregator.lock().await;
+                let mut shared = ingest_state.shared.lock().await;
                 assert_eq!(
-                    aggregator.agent_last_seq(&sequence_scope),
+                    shared.aggregator.agent_last_seq(&sequence_scope),
                     None,
                     "failed persistence must not leave accepted seq state behind"
                 );
-                let retry_result = aggregator
+                let retry_result = shared
+                    .aggregator
                     .ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
                         envelope_seq,
                         &sequence_scope,
@@ -88546,11 +88622,9 @@ recorder_backend = "frankensqlite"
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-            let pane_seq_by_sender =
-                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
-                    (String, u64),
-                    u64,
-                >::new());
+            let pane_seq_by_sender = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
 
             {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -88566,8 +88640,10 @@ recorder_backend = "frankensqlite"
             let source_pane_id = 81_u64;
 
             {
-                let mut pane_seq_guard = pane_seq_by_sender.lock().await;
-                pane_seq_guard.insert((sequence_scope.clone(), source_pane_id), 0);
+                let mut shared = pane_seq_by_sender.shared.lock().await;
+                shared
+                    .pane_seq_by_sender
+                    .insert((sequence_scope.clone(), source_pane_id), 0);
             }
 
             let persist_err = distributed_persist_payload(
@@ -88598,9 +88674,11 @@ recorder_backend = "frankensqlite"
             );
 
             {
-                let pane_seq_guard = pane_seq_by_sender.lock().await;
+                let shared = pane_seq_by_sender.shared.lock().await;
                 assert_eq!(
-                    pane_seq_guard.get(&(sequence_scope.clone(), source_pane_id)),
+                    shared
+                        .pane_seq_by_sender
+                        .get(&(sequence_scope.clone(), source_pane_id)),
                     Some(&0),
                     "failed gap persistence must restore the previous pane sequence tracker"
                 );
@@ -90955,8 +91033,9 @@ recorder_backend = "frankensqlite"
             distributed_register_sequence_scope(&ingest_state, &sequence_scope, &replay_id).await;
 
             {
-                let mut aggregator = ingest_state.aggregator.lock().await;
-                aggregator
+                let mut shared = ingest_state.shared.lock().await;
+                shared
+                    .aggregator
                     .ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
                         1,
                         &sequence_scope,
@@ -90973,39 +91052,43 @@ recorder_backend = "frankensqlite"
                     .expect("seed aggregator state for cleanup test");
             }
             {
-                let mut replay_guard = ingest_state.replay_guard.lock().await;
-                replay_guard
+                let mut shared = ingest_state.shared.lock().await;
+                shared
+                    .replay_guard
                     .validate(&replay_id, 1)
                     .expect("seed replay guard for cleanup test");
             }
 
             {
-                let mut pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
-                pane_seq_by_sender.insert((sequence_scope.clone(), 7), 3);
+                let mut shared = ingest_state.shared.lock().await;
+                shared
+                    .pane_seq_by_sender
+                    .insert((sequence_scope.clone(), 7), 3);
             }
 
             distributed_release_sequence_scopes(&ingest_state, &released_scopes).await;
 
             {
-                let aggregator = ingest_state.aggregator.lock().await;
-                assert_eq!(aggregator.agent_last_seq(&sequence_scope), Some(1));
+                let shared = ingest_state.shared.lock().await;
+                assert_eq!(shared.aggregator.agent_last_seq(&sequence_scope), Some(1));
             }
             {
-                let pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+                let shared = ingest_state.shared.lock().await;
                 assert_eq!(
-                    pane_seq_by_sender.get(&(sequence_scope.clone(), 7)),
+                    shared.pane_seq_by_sender.get(&(sequence_scope.clone(), 7)),
                     Some(&3)
                 );
             }
             {
-                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                let mut shared = ingest_state.shared.lock().await;
                 assert_eq!(
-                    replay_guard.validate(&replay_id, 1).expect_err(
+                    shared.replay_guard.validate(&replay_id, 1).expect_err(
                         "released-but-dormant session should still reject stale replay"
                     ),
                     frankenterm_core::distributed::DistributedSecurityError::ReplayDetected
                 );
-                replay_guard
+                shared
+                    .replay_guard
                     .validate(&replay_id, 2)
                     .expect("dormant session should still advance replay state");
             }
@@ -91013,13 +91096,13 @@ recorder_backend = "frankensqlite"
             distributed_release_sequence_scopes(&ingest_state, &released_scopes).await;
 
             {
-                let aggregator = ingest_state.aggregator.lock().await;
-                assert_eq!(aggregator.agent_last_seq(&sequence_scope), Some(1));
+                let shared = ingest_state.shared.lock().await;
+                assert_eq!(shared.aggregator.agent_last_seq(&sequence_scope), Some(1));
             }
             {
-                let pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+                let shared = ingest_state.shared.lock().await;
                 assert_eq!(
-                    pane_seq_by_sender.get(&(sequence_scope.clone(), 7)),
+                    shared.pane_seq_by_sender.get(&(sequence_scope.clone(), 7)),
                     Some(&3)
                 );
             }
@@ -91033,17 +91116,18 @@ recorder_backend = "frankensqlite"
             assert_eq!(pruned, 1);
 
             {
-                let aggregator = ingest_state.aggregator.lock().await;
-                assert_eq!(aggregator.agent_last_seq(&sequence_scope), None);
-                assert_eq!(aggregator.agent_count(), 0);
+                let shared = ingest_state.shared.lock().await;
+                assert_eq!(shared.aggregator.agent_last_seq(&sequence_scope), None);
+                assert_eq!(shared.aggregator.agent_count(), 0);
             }
             {
-                let pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
-                assert!(pane_seq_by_sender.is_empty());
+                let shared = ingest_state.shared.lock().await;
+                assert!(shared.pane_seq_by_sender.is_empty());
             }
             {
-                let mut replay_guard = ingest_state.replay_guard.lock().await;
-                replay_guard
+                let mut shared = ingest_state.shared.lock().await;
+                shared
+                    .replay_guard
                     .validate(&replay_id, 1)
                     .expect("stale-pruned replay state should accept a fresh session");
             }
@@ -91052,21 +91136,177 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
+    fn distributed_admission_activates_scope_in_same_state_cut() {
+        run_async_test(async {
+            let ingest_state = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
+            let replay_id = distributed_replay_session_key("session-admit", "agent-admit");
+            let sequence_scope = distributed_sender_session_scope(
+                "session-admit",
+                "agent-admit",
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
+
+            let admission = {
+                let mut shared = ingest_state.shared.lock().await;
+                let admission = distributed_admit_envelope(
+                    &mut shared,
+                    &replay_id,
+                    &sequence_scope,
+                    frankenterm_core::wire_protocol::WireEnvelope::new(
+                        1,
+                        &sequence_scope,
+                        frankenterm_core::wire_protocol::WirePayload::Gap(
+                            frankenterm_core::wire_protocol::GapNotice {
+                                pane_id: 7,
+                                seq_before: 0,
+                                seq_after: 1,
+                                reason: "atomic-admission".to_string(),
+                                detected_at_ms: now_ms_i64(),
+                            },
+                        ),
+                    ),
+                    true,
+                );
+
+                assert_eq!(shared.replay_guard.session_last_seq(&replay_id), Some(1));
+                assert_eq!(shared.aggregator.agent_last_seq(&sequence_scope), Some(1));
+                let scope_state = shared
+                    .active_sequence_scopes
+                    .get(&sequence_scope)
+                    .expect("successful admission must activate its sequence scope");
+                assert_eq!(scope_state.active_connections, 1);
+                assert_eq!(scope_state.replay_id, replay_id);
+                assert_eq!(scope_state.inactive_since_ms, None);
+                admission
+            };
+
+            assert!(matches!(
+                admission,
+                DistributedAdmissionOutcome::Admitted {
+                    previous_replay_seq: None,
+                    previous_agent_session: None,
+                    ingest_result: Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(_)),
+                }
+            ));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_scope_gate_orders_failed_persist_rollback_before_newer_admission() {
+        run_async_test(async {
+            use std::future::Future as _;
+            use std::task::Poll;
+
+            let ingest_state = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
+            let replay_id = distributed_replay_session_key("session-ordered", "agent-ordered");
+            let sequence_scope = distributed_sender_session_scope(
+                "session-ordered",
+                "agent-ordered",
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
+            let first_guard = distributed_lock_sequence_scope(&ingest_state, &sequence_scope).await;
+            let first_admission = {
+                let mut shared = ingest_state.shared.lock().await;
+                distributed_admit_envelope(
+                    &mut shared,
+                    &replay_id,
+                    &sequence_scope,
+                    frankenterm_core::wire_protocol::WireEnvelope::new(
+                        1,
+                        &sequence_scope,
+                        frankenterm_core::wire_protocol::WirePayload::Gap(
+                            frankenterm_core::wire_protocol::GapNotice {
+                                pane_id: 9,
+                                seq_before: 0,
+                                seq_after: 1,
+                                reason: "first-persist-fails".to_string(),
+                                detected_at_ms: now_ms_i64(),
+                            },
+                        ),
+                    ),
+                    false,
+                )
+            };
+            let DistributedAdmissionOutcome::Admitted {
+                previous_replay_seq,
+                previous_agent_session,
+                ingest_result: Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(_)),
+            } = first_admission
+            else {
+                panic!("first envelope should be admitted");
+            };
+
+            let mut second_admission = Box::pin(async {
+                let _second_guard =
+                    distributed_lock_sequence_scope(&ingest_state, &sequence_scope).await;
+                let mut shared = ingest_state.shared.lock().await;
+                distributed_admit_envelope(
+                    &mut shared,
+                    &replay_id,
+                    &sequence_scope,
+                    frankenterm_core::wire_protocol::WireEnvelope::new(
+                        2,
+                        &sequence_scope,
+                        frankenterm_core::wire_protocol::WirePayload::Gap(
+                            frankenterm_core::wire_protocol::GapNotice {
+                                pane_id: 9,
+                                seq_before: 1,
+                                seq_after: 2,
+                                reason: "second-waits-for-rollback".to_string(),
+                                detected_at_ms: now_ms_i64(),
+                            },
+                        ),
+                    ),
+                    false,
+                )
+            });
+            std::future::poll_fn(|cx| match second_admission.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("same-scope admission bypassed its held sequence gate"),
+            })
+            .await;
+
+            distributed_rollback_failed_persist(
+                &ingest_state,
+                &replay_id,
+                previous_replay_seq,
+                &sequence_scope,
+                previous_agent_session,
+            )
+            .await;
+            drop(first_guard);
+
+            assert!(matches!(
+                second_admission.await,
+                DistributedAdmissionOutcome::Admitted {
+                    previous_replay_seq: None,
+                    previous_agent_session: None,
+                    ingest_result: Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(_)),
+                }
+            ));
+            let shared = ingest_state.shared.lock().await;
+            assert_eq!(shared.replay_guard.session_last_seq(&replay_id), Some(2));
+            assert_eq!(shared.aggregator.agent_last_seq(&sequence_scope), Some(2));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
     fn distributed_capacity_reject_does_not_poison_replay_retry() {
         run_async_test(async {
             let ingest_state = DistributedIngestState {
-                aggregator: frankenterm_core::runtime_async::Mutex::new(
-                    frankenterm_core::wire_protocol::Aggregator::with_stale_after(1, 0),
-                ),
-                replay_guard: frankenterm_core::runtime_async::Mutex::new(
-                    frankenterm_core::distributed::SessionReplayGuard::new(8),
-                ),
-                active_sequence_scopes: frankenterm_core::runtime_async::Mutex::new(
-                    std::collections::HashMap::new(),
-                ),
-                pane_seq_by_sender: frankenterm_core::runtime_async::Mutex::new(
-                    std::collections::HashMap::new(),
-                ),
+                shared: frankenterm_core::runtime_async::Mutex::new(DistributedIngestShared {
+                    aggregator: frankenterm_core::wire_protocol::Aggregator::with_stale_after(1, 0),
+                    replay_guard: frankenterm_core::distributed::SessionReplayGuard::new(8),
+                    active_sequence_scopes: std::collections::HashMap::new(),
+                    pane_seq_by_sender: std::collections::HashMap::new(),
+                    sequence_scope_gates: std::collections::HashMap::new(),
+                }),
             };
             let occupied_scope = "occupied.scope";
             let replay_id = distributed_replay_session_key("session-capacity", "agent-capacity");
@@ -91077,8 +91317,9 @@ recorder_backend = "frankensqlite"
             );
 
             {
-                let mut aggregator = ingest_state.aggregator.lock().await;
-                aggregator
+                let mut shared = ingest_state.shared.lock().await;
+                shared
+                    .aggregator
                     .ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
                         1,
                         occupied_scope,
@@ -91096,45 +91337,65 @@ recorder_backend = "frankensqlite"
             }
 
             {
-                let mut replay_guard = ingest_state.replay_guard.lock().await;
-                replay_guard
+                let mut shared = ingest_state.shared.lock().await;
+                shared
+                    .replay_guard
                     .validate(&replay_id, 1)
                     .expect("first attempt should reserve replay state");
             }
 
-            let ingest_result = {
-                let mut aggregator = ingest_state.aggregator.lock().await;
-                aggregator.ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
-                    1,
+            let admission = {
+                let mut shared = ingest_state.shared.lock().await;
+                distributed_admit_envelope(
+                    &mut shared,
+                    &replay_id,
                     &session_scope,
-                    frankenterm_core::wire_protocol::WirePayload::Gap(
-                        frankenterm_core::wire_protocol::GapNotice {
-                            pane_id: 2,
-                            seq_before: 0,
-                            seq_after: 1,
-                            reason: "capacity".to_string(),
-                            detected_at_ms: now_ms_i64(),
-                        },
+                    frankenterm_core::wire_protocol::WireEnvelope::new(
+                        2,
+                        &session_scope,
+                        frankenterm_core::wire_protocol::WirePayload::Gap(
+                            frankenterm_core::wire_protocol::GapNotice {
+                                pane_id: 2,
+                                seq_before: 0,
+                                seq_after: 1,
+                                reason: "capacity".to_string(),
+                                detected_at_ms: now_ms_i64(),
+                            },
+                        ),
                     ),
-                ))
+                    false,
+                )
             };
 
+            let DistributedAdmissionOutcome::Admitted {
+                previous_replay_seq,
+                previous_agent_session,
+                ingest_result,
+            } = admission
+            else {
+                panic!("capacity attempt should pass replay validation");
+            };
+            assert_eq!(previous_replay_seq, Some(1));
+            assert!(previous_agent_session.is_none());
             assert!(matches!(
                 ingest_result,
                 Err(frankenterm_core::wire_protocol::WireProtocolError::TooManyAgents { .. })
             ));
 
             {
-                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                let mut shared = ingest_state.shared.lock().await;
                 assert_eq!(
-                    replay_guard
-                        .validate(&replay_id, 1)
-                        .expect_err("capacity rejection without rollback poisons replay retry"),
-                    frankenterm_core::distributed::DistributedSecurityError::ReplayDetected
+                    shared.replay_guard.session_last_seq(&replay_id),
+                    Some(1),
+                    "capacity rejection must restore the exact prior replay frontier"
                 );
-                replay_guard.remove(&replay_id);
-                replay_guard
-                    .validate(&replay_id, 1)
+                assert!(
+                    !shared.active_sequence_scopes.contains_key(&session_scope),
+                    "rejected admission must not publish an active sequence scope"
+                );
+                shared
+                    .replay_guard
+                    .validate(&replay_id, 2)
                     .expect("capacity rejection rollback should allow retrying the same seq");
             }
         });

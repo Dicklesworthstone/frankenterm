@@ -794,6 +794,83 @@ impl<T> DerefMut for MutexGuard<'_, T> {
     }
 }
 
+/// Opt-in mutex for operations that deliberately retain exclusion across an
+/// await point in a Send task.
+///
+/// Unlike the ordinary allocation-free [`Mutex`], this type stores its
+/// primitive behind an [`Arc`] so its guard can own the lock. Use it only for
+/// suspension-spanning critical sections.
+#[derive(Debug)]
+pub struct OwnedMutex<T> {
+    inner: Arc<asupersync::sync::Mutex<T>>,
+}
+
+impl<T> Clone for OwnedMutex<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> OwnedMutex<T> {
+    #[must_use]
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: Arc::new(asupersync::sync::Mutex::new(value)),
+        }
+    }
+
+    pub async fn lock_owned(&self) -> OwnedMutexGuard<T> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.lock_owned_with_cx(&cx)
+            .await
+            .expect("runtime_async owned mutex lock failed")
+    }
+
+    /// Cx-aware form of [`lock_owned`](Self::lock_owned).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockAcquireError`] with the exact project-level failure class
+    /// reported by the underlying owned lock acquisition.
+    pub async fn lock_owned_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<OwnedMutexGuard<T>, LockAcquireError> {
+        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.inner), cx)
+            .await
+            .map(|inner| OwnedMutexGuard { inner })
+            .map_err(|error| map_mutex_lock_error(cx, error))
+    }
+
+    /// Whether a cloned handle, waiter, or live guard references this mutex.
+    #[must_use]
+    pub fn has_external_owner(&self) -> bool {
+        Arc::strong_count(&self.inner) > 1
+    }
+}
+
+/// Send-capable guard returned by [`OwnedMutex::lock_owned`].
+#[must_use = "the owned mutex is released immediately if its guard is not held"]
+pub struct OwnedMutexGuard<T> {
+    inner: asupersync::sync::OwnedMutexGuard<T>,
+}
+
+impl<T> Deref for OwnedMutexGuard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.deref()
+    }
+}
+
+impl<T> DerefMut for OwnedMutexGuard<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.deref_mut()
+    }
+}
+
 #[derive(Debug)]
 pub struct RwLock<T> {
     inner: asupersync::sync::RwLock<T>,
@@ -15754,6 +15831,33 @@ mod tests {
                     .await
                     .expect("live explicit Cx must acquire mutex");
                 assert_eq!(*guard, 42);
+            });
+        }
+
+        /// The owned mutex path is the explicit suspension-spanning escape
+        /// hatch: its guard remains live across a yield in a Send task and
+        /// releases the same underlying mutex when dropped.
+        #[test]
+        fn mutex_owned_guard_spans_send_task_yield_and_releases() {
+            run_lab(0x10C5_10C5_C410_4009, || async move {
+                let mutex = OwnedMutex::new(41u32);
+                let cx = crate::cx::for_request();
+                let mut owned = mutex
+                    .lock_owned_with_cx(&cx)
+                    .await
+                    .expect("live explicit Cx must acquire owned mutex guard");
+                assert!(mutex.has_external_owner());
+                *owned = 42;
+                task::yield_now().await;
+                assert_eq!(*owned, 42);
+                drop(owned);
+                assert!(!mutex.has_external_owner());
+
+                let reacquired = mutex
+                    .lock_owned_with_cx(&cx)
+                    .await
+                    .expect("dropping owned guard must release mutex");
+                assert_eq!(*reacquired, 42);
             });
         }
 
