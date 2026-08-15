@@ -8038,6 +8038,7 @@ mod tests {
         records: StdMutex::new(Vec::new()),
     };
     static TEST_LOGGER_INIT: Once = Once::new();
+    const MAX_CAPTURED_COMPAT_WARNINGS: usize = 32;
     #[cfg(unix)]
     static TEST_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -8046,16 +8047,22 @@ mod tests {
     }
 
     impl log::Log for TestLogger {
-        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-            true
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
         }
 
         fn log(&self, record: &log::Record<'_>) {
-            self.records.lock().expect("test logger lock").push(format!(
-                "{} {}",
-                record.level(),
-                record.args()
-            ));
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let message = record.args().to_string();
+            if !message.contains("Codec compat window:") {
+                return;
+            }
+            let mut records = self.records.lock().expect("test logger lock");
+            if records.len() < MAX_CAPTURED_COMPAT_WARNINGS {
+                records.push(format!("{} {message}", record.level()));
+            }
         }
 
         fn flush(&self) {}
@@ -8064,7 +8071,7 @@ mod tests {
     fn reset_test_logger() {
         TEST_LOGGER_INIT.call_once(|| {
             log::set_logger(&TEST_LOGGER).expect("install test logger");
-            log::set_max_level(log::LevelFilter::Trace);
+            log::set_max_level(log::LevelFilter::Warn);
         });
         TEST_LOGGER
             .records
@@ -13522,10 +13529,15 @@ mod tests {
         assert!(!set_client_id.is_proxy);
 
         let logs = captured_logs().join("\n");
+        let expected_warning = format!(
+            "Codec compat window: server={}, client={}, agreed={}",
+            CODEC_VERSION + 1,
+            CODEC_VERSION,
+            CODEC_VERSION,
+        );
         assert!(
-            logs.contains("Codec compat window: server="),
-            "expected in-window negotiation warning, got logs: {}",
-            logs
+            logs.contains(&expected_warning),
+            "expected exact in-window negotiation warning {expected_warning:?}, got logs: {logs}"
         );
 
         server_release_tx
@@ -13567,7 +13579,6 @@ mod tests {
         // the 60s in-flight handshake timeout.
         let _wd = hang_watchdog(12, "delayed-handshake reader (readiness regression)", 98);
 
-        reset_test_logger();
         let socket_path = unique_handshake_socket_path();
         let listener = UnixListener::bind(&socket_path).expect("bind local UDS handshake server");
         let (server_release_tx, server_release_rx) = mpsc::channel::<()>();
@@ -13960,7 +13971,6 @@ mod tests {
     fn main_thread_pane_write_round_trips_ft_connect_fix() {
         let _wd = hang_watchdog(12, "remote pane write RPC round-trip", 96);
 
-        reset_test_logger();
         let socket_path = unique_handshake_socket_path();
         let listener = UnixListener::bind(&socket_path).expect("bind local UDS mux server");
         let server = std::thread::Builder::new()
