@@ -25,9 +25,125 @@ use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use wezterm_term::TerminalSize;
+
+/// One attachment-generation-scoped bijection between remote and local ids.
+///
+/// Keeping both directions behind the same mutex makes reverse lookups bounded
+/// without creating a second lock or a torn forward/reverse update window.
+/// Numeric local ids may be recycled by the mux, but the complete mapping is
+/// owned by one [`ClientInner`] generation and is discarded with it.
+struct ExactIdMappings<Remote, Local> {
+    remote_to_local: HashMap<Remote, Local>,
+    local_to_remote: HashMap<Local, Remote>,
+    #[cfg(test)]
+    reverse_lookup_probes: usize,
+}
+
+impl<Remote, Local> Default for ExactIdMappings<Remote, Local> {
+    fn default() -> Self {
+        Self {
+            remote_to_local: HashMap::new(),
+            local_to_remote: HashMap::new(),
+            #[cfg(test)]
+            reverse_lookup_probes: 0,
+        }
+    }
+}
+
+impl<Remote, Local> ExactIdMappings<Remote, Local>
+where
+    Remote: Copy + Eq + Hash,
+    Local: Copy + Eq + Hash,
+{
+    fn len(&self) -> usize {
+        self.remote_to_local.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remote_to_local.is_empty()
+    }
+
+    fn get(&self, remote: &Remote) -> Option<&Local> {
+        self.remote_to_local.get(remote)
+    }
+
+    fn get_remote(&mut self, local: &Local) -> Option<&Remote> {
+        #[cfg(test)]
+        {
+            self.reverse_lookup_probes = self.reverse_lookup_probes.saturating_add(1);
+        }
+        self.local_to_remote.get(local)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Remote, &Local)> {
+        self.remote_to_local.iter()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &Remote> {
+        self.remote_to_local.keys()
+    }
+
+    /// Insert one authoritative mapping while retaining a strict bijection.
+    ///
+    /// Reusing either side retires its previous opposite-side association in
+    /// the same critical section. This matches resync semantics: the newest
+    /// exact attachment generation owns the local identity.
+    fn insert(&mut self, remote: Remote, local: Local) -> Option<Local> {
+        let prior_local = self.remote_to_local.get(&remote).copied();
+        if prior_local == Some(local) {
+            debug_assert!(self.local_to_remote.get(&local) == Some(&remote));
+            return prior_local;
+        }
+
+        if let Some(old_local) = prior_local {
+            self.local_to_remote.remove(&old_local);
+        }
+        if let Some(old_remote) = self.local_to_remote.remove(&local) {
+            self.remote_to_local.remove(&old_remote);
+        }
+        self.remote_to_local.insert(remote, local);
+        self.local_to_remote.insert(local, remote);
+        prior_local
+    }
+
+    fn remove(&mut self, remote: &Remote) -> Option<Local> {
+        let local = self.remote_to_local.remove(remote)?;
+        let removed_remote = self.local_to_remote.remove(&local);
+        debug_assert!(removed_remote == Some(*remote));
+        Some(local)
+    }
+
+    fn retain(&mut self, mut retain: impl FnMut(&Remote, &Local) -> bool) {
+        self.remote_to_local
+            .retain(|remote, local| retain(remote, local));
+        let remote_to_local = &self.remote_to_local;
+        self.local_to_remote.retain(|local, remote| {
+            remote_to_local
+                .get(remote)
+                .is_some_and(|current| current == local)
+        });
+    }
+
+    fn extend(&mut self, mappings: impl IntoIterator<Item = (Remote, Local)>) {
+        for (remote, local) in mappings {
+            self.insert(remote, local);
+        }
+    }
+
+    #[cfg(test)]
+    fn insert_forward_alias_for_test(&mut self, remote: Remote, local: Local) {
+        self.remote_to_local.insert(remote, local);
+    }
+
+    #[cfg(test)]
+    fn reverse_lookup_probes(&self) -> usize {
+        self.reverse_lookup_probes
+    }
+}
 
 pub struct ClientInner {
     pub client: Client,
@@ -35,8 +151,8 @@ pub struct ClientInner {
     owner_client_id: Option<Arc<ClientId>>,
     pub local_echo_threshold_ms: Option<u64>,
     pub overlay_lag_indicator: bool,
-    remote_to_local_window: Mutex<HashMap<WindowId, WindowId>>,
-    remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
+    remote_to_local_window: Mutex<ExactIdMappings<WindowId, WindowId>>,
+    remote_to_local_tab: Mutex<ExactIdMappings<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
@@ -890,23 +1006,13 @@ impl ClientInner {
     }
 
     fn local_to_remote_tab(&self, local_tab_id: TabId) -> Option<TabId> {
-        let map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
-        for (remote, local) in map.iter() {
-            if *local == local_tab_id {
-                return Some(*remote);
-            }
-        }
-        None
+        let mut map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
+        map.get_remote(&local_tab_id).copied()
     }
 
     fn local_to_remote_window(&self, local_window_id: WindowId) -> Option<WindowId> {
-        let map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
-        for (remote, local) in map.iter() {
-            if *local == local_window_id {
-                return Some(*remote);
-            }
-        }
-        None
+        let mut map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
+        map.get_remote(&local_window_id).copied()
     }
 
     pub fn remote_to_local_pane_id(&self, mux: &Mux, remote_pane_id: PaneId) -> Option<PaneId> {
@@ -1066,8 +1172,8 @@ impl ClientInner {
             owner_client_id,
             local_echo_threshold_ms,
             overlay_lag_indicator,
-            remote_to_local_window: Mutex::new(HashMap::new()),
-            remote_to_local_tab: Mutex::new(HashMap::new()),
+            remote_to_local_window: Mutex::new(ExactIdMappings::default()),
+            remote_to_local_tab: Mutex::new(ExactIdMappings::default()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             spare_local_pane_ids: Mutex::new(Vec::new()),
             focused_remote_pane_id: Mutex::new(None),
@@ -3914,7 +4020,7 @@ mod tests {
             .remote_to_local_tab_id(51)
             .expect("first remote tab should map locally");
         lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
-            .insert(52, first_local_tab);
+            .insert_forward_alias_for_test(52, first_local_tab);
 
         let error = ClientDomain::process_pane_arena(&mux, Arc::clone(&inner), snapshot, None)
             .expect_err("aliased remote tab mappings must fail before mutation");
@@ -3944,9 +4050,10 @@ mod tests {
         let owner_window = owner
             .remote_to_local_window(41)
             .expect("owner window should map locally");
-        lock_or_recover(&foreign.remote_to_local_tab, "remote_to_local_tab").insert(51, owner_tab);
+        lock_or_recover(&foreign.remote_to_local_tab, "remote_to_local_tab")
+            .insert_forward_alias_for_test(51, owner_tab);
         lock_or_recover(&foreign.remote_to_local_window, "remote_to_local_window")
-            .insert(41, owner_window);
+            .insert_forward_alias_for_test(41, owner_window);
 
         let error = ClientDomain::process_pane_arena(&mux, Arc::clone(&foreign), snapshot, None)
             .expect_err("foreign live topology mappings must fail before mutation");
@@ -4078,7 +4185,7 @@ mod tests {
             .expect("foreign remote window should map locally");
         assert_ne!(owner_window_id, foreign_window_id);
         lock_or_recover(&owner.remote_to_local_window, "remote_to_local_window")
-            .insert(42, foreign_window_id);
+            .insert_forward_alias_for_test(42, foreign_window_id);
 
         let (trees, nodes, mut window_titles) = sample_remote_pane_arena(&[(51, 61)]).into_parts();
         window_titles.push(mux::tab::PaneArenaWindowTitle {
