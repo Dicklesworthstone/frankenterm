@@ -26,6 +26,8 @@ use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::hash::Hash;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use wezterm_term::TerminalSize;
@@ -40,7 +42,7 @@ struct ExactIdMappings<Remote, Local> {
     remote_to_local: HashMap<Remote, Local>,
     local_to_remote: HashMap<Local, Remote>,
     #[cfg(test)]
-    reverse_lookup_probes: usize,
+    reverse_lookup_probes: AtomicUsize,
 }
 
 impl<Remote, Local> Default for ExactIdMappings<Remote, Local> {
@@ -49,7 +51,7 @@ impl<Remote, Local> Default for ExactIdMappings<Remote, Local> {
             remote_to_local: HashMap::new(),
             local_to_remote: HashMap::new(),
             #[cfg(test)]
-            reverse_lookup_probes: 0,
+            reverse_lookup_probes: AtomicUsize::new(0),
         }
     }
 }
@@ -63,6 +65,7 @@ where
         self.remote_to_local.len()
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.remote_to_local.is_empty()
     }
@@ -71,10 +74,10 @@ where
         self.remote_to_local.get(remote)
     }
 
-    fn get_remote(&mut self, local: &Local) -> Option<&Remote> {
+    fn get_remote(&self, local: &Local) -> Option<&Remote> {
         #[cfg(test)]
         {
-            self.reverse_lookup_probes = self.reverse_lookup_probes.saturating_add(1);
+            self.reverse_lookup_probes.fetch_add(1, Ordering::Relaxed);
         }
         self.local_to_remote.get(local)
     }
@@ -95,10 +98,26 @@ where
     fn insert(&mut self, remote: Remote, local: Local) -> Option<Local> {
         let prior_local = self.remote_to_local.get(&remote).copied();
         if prior_local == Some(local) {
-            debug_assert!(self.local_to_remote.get(&local) == Some(&remote));
+            if self.local_to_remote.get(&local) != Some(&remote) {
+                // This is corruption repair, so reserve before changing the
+                // conflicting reverse edge. The forward cardinality cannot
+                // grow on an idempotent insert.
+                self.local_to_remote.reserve(1);
+                if let Some(old_remote) = self.local_to_remote.remove(&local) {
+                    self.remote_to_local.remove(&old_remote);
+                }
+                self.local_to_remote.insert(local, remote);
+            }
             return prior_local;
         }
 
+        // Under the maintained bijection, cardinality grows only when neither
+        // side is currently owned. Reserve both tables before the first
+        // semantic write so allocation cannot tear a recovered poisoned map.
+        if prior_local.is_none() && !self.local_to_remote.contains_key(&local) {
+            self.remote_to_local.reserve(1);
+            self.local_to_remote.reserve(1);
+        }
         if let Some(old_local) = prior_local {
             self.local_to_remote.remove(&old_local);
         }
@@ -118,14 +137,18 @@ where
     }
 
     fn retain(&mut self, mut retain: impl FnMut(&Remote, &Local) -> bool) {
-        self.remote_to_local
-            .retain(|remote, local| retain(remote, local));
-        let remote_to_local = &self.remote_to_local;
-        self.local_to_remote.retain(|local, remote| {
-            remote_to_local
-                .get(remote)
-                .is_some_and(|current| current == local)
-        });
+        // Evaluate caller policy completely before the first semantic write.
+        // HashMap::retain mutates incrementally, so a panicking predicate could
+        // otherwise poison the mutex after changing only the forward half.
+        let mut removals = Vec::with_capacity(self.remote_to_local.len());
+        for (remote, local) in &self.remote_to_local {
+            if !retain(remote, local) {
+                removals.push(*remote);
+            }
+        }
+        for remote in removals {
+            self.remove(&remote);
+        }
     }
 
     fn extend(&mut self, mappings: impl IntoIterator<Item = (Remote, Local)>) {
@@ -141,7 +164,7 @@ where
 
     #[cfg(test)]
     fn reverse_lookup_probes(&self) -> usize {
-        self.reverse_lookup_probes
+        self.reverse_lookup_probes.load(Ordering::Relaxed)
     }
 }
 
@@ -1006,12 +1029,12 @@ impl ClientInner {
     }
 
     fn local_to_remote_tab(&self, local_tab_id: TabId) -> Option<TabId> {
-        let mut map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
+        let map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
         map.get_remote(&local_tab_id).copied()
     }
 
     fn local_to_remote_window(&self, local_window_id: WindowId) -> Option<WindowId> {
-        let mut map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
+        let map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
         map.get_remote(&local_window_id).copied()
     }
 
@@ -3550,6 +3573,85 @@ mod tests {
             None,
             false,
         ))
+    }
+
+    #[test]
+    fn exact_id_reverse_lookup_work_is_q_linear_at_large_tab_counts() {
+        for count in [1_024usize, 4_096, 16_384] {
+            let mut mappings = ExactIdMappings::<TabId, TabId>::default();
+            for remote in 0..count {
+                assert_eq!(mappings.insert(remote, count + remote), None);
+            }
+            for local in count..count.saturating_mul(2) {
+                assert_eq!(mappings.get_remote(&local), Some(&(local - count)));
+            }
+            assert_eq!(
+                mappings.reverse_lookup_probes(),
+                count,
+                "one reverse lookup must perform one indexed probe regardless of map size",
+            );
+            eprintln!(
+                "client_reverse_mapping_work tab_count={count} lookups={count} hash_probes={}",
+                mappings.reverse_lookup_probes(),
+            );
+        }
+    }
+
+    #[test]
+    fn exact_id_mapping_reassignment_preserves_one_to_one_reverse_authority() {
+        let mut mappings = ExactIdMappings::<TabId, TabId>::default();
+        mappings.extend([(1, 101), (2, 102)]);
+
+        assert_eq!(mappings.insert(1, 103), Some(101));
+        assert_eq!(mappings.get(&1), Some(&103));
+        assert_eq!(mappings.get_remote(&101), None);
+        assert_eq!(mappings.get_remote(&103), Some(&1));
+
+        assert_eq!(mappings.insert(3, 102), None);
+        assert_eq!(mappings.get(&2), None);
+        assert_eq!(mappings.get(&3), Some(&102));
+        assert_eq!(mappings.get_remote(&102), Some(&3));
+
+        mappings.retain(|remote, _local| *remote != 1);
+        assert_eq!(mappings.get(&1), None);
+        assert_eq!(mappings.get_remote(&103), None);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings.remove(&3), Some(102));
+        assert_eq!(mappings.get_remote(&102), None);
+        assert!(mappings.is_empty());
+    }
+
+    #[test]
+    fn exact_id_idempotent_insert_repairs_a_torn_forward_alias() {
+        let mut mappings = ExactIdMappings::<TabId, TabId>::default();
+        mappings.insert(1, 101);
+        mappings.insert_forward_alias_for_test(2, 101);
+
+        assert_eq!(mappings.insert(2, 101), Some(101));
+        assert_eq!(mappings.get(&1), None);
+        assert_eq!(mappings.get(&2), Some(&101));
+        assert_eq!(mappings.get_remote(&101), Some(&2));
+        assert_eq!(mappings.len(), 1);
+    }
+
+    #[test]
+    fn exact_id_retain_predicate_panic_leaves_bijection_unchanged() {
+        let mut mappings = ExactIdMappings::<TabId, TabId>::default();
+        mappings.extend([(1, 101), (2, 102), (3, 103)]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mappings.retain(|remote, _local| {
+                assert_ne!(*remote, 2, "injected retain predicate panic");
+                *remote != 1
+            });
+        }));
+        assert!(result.is_err());
+        for remote in 1..=3 {
+            let local = 100 + remote;
+            assert_eq!(mappings.get(&remote), Some(&local));
+            assert_eq!(mappings.get_remote(&local), Some(&remote));
+        }
+        assert_eq!(mappings.len(), 3);
     }
 
     fn register_test_client_domain(mux: &Arc<Mux>, inner: &Arc<ClientInner>) -> Arc<ClientDomain> {
