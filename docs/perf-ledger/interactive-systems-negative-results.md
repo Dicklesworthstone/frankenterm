@@ -3945,6 +3945,67 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote the exact parent/reverse indexes as a performance improvement only after exact-committed-source gates and retained same-window 1K/4K/16K reconciliation plus long-session input, resize, zoom, and reopen runs on the intended M4/M5 Mac and 64-core/128-thread `trj` Threadripper/LAN target record lookup and transaction work, p50/p95/p99/p999 latency, resource envelopes, and deterministic state and visual equivalence.
 
+### IS-N132 — Exact capture retirement bounds retained state but does not prove target-class RSS
+
+- **Classification:** kept structural; performance promotion withheld for
+  missing target-hardware evidence
+- **Bead:**
+  `ft-interactive-systems-performance-4tenz.5.5.3.5.8.5.11`
+- **Baseline revision:** `ac60ec72bb0fd78ec4bf6281b28bce4f289b902e`
+- **Candidate revision:** `eeb68fbe09280b4632041712d82cf8c45cff80a0`
+- **Target identity:** strict-remote `vmi1149989` and `vmi1227854` Linux
+  compile/test workers for source proof only; no M4/M5 macOS, 64-core/128-thread
+  `trj` Threadripper, display, LAN, thermal, or production-session identity was
+  measured
+- **Workload identity:** deterministic capacity-one and capacity-two data/control
+  schedules; 200 coalesced retirement publications; q2, q20, q200, and q600
+  unique-ID and repeated-same-ID churn; held authority, successor-publication,
+  stale MPSC/SPSC, cancellation, and native-destroy controls; no retained real
+  long-running session workload
+- **Focused command/artifact:** final-source strict-remote job
+  `j-29976432671195426` selected 16 tests and passed all 16. Exact committed
+  clean-overlay job `j-29976432671195432` repeated the same 16/16 result with
+  0 failures and 30,993 filtered tests against candidate `eeb68fbe0`. Exact-SHA
+  formatting authority `j-29976432671195434` ran the named format proof, passed
+  1/1 with 0 filtered, and emitted `WORKSPACE_FORMAT_PROOF_SUCCESS`
+- **Broad command/artifact:** exact committed clean-overlay workspace check
+  `j-29976432671195431` passed `cargo check --workspace --all-targets --locked`.
+  Final-source warnings-denied Clippy `j-29976432671195429` passed
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`. The earlier
+  focused job `j-29976432671195419` failed 1/9 and exposed the distinction
+  between producer closure and queue drainage; the repaired receiver is in the
+  candidate. Jobs `j-29976432671195425`, `j-29976432671195428`, and
+  `j-29976432671195430` reached strict remote workers but exhausted RCH's
+  one-hour SSH ceiling and are retained only as negative infrastructure
+  evidence. The `hz1` Clippy attempt `j-29976432671195427` failed before source
+  linting on missing `xcb-util.pc`; the same exact command later passed on
+  `vmi1227854`. No local Cargo substitute ran
+- **Samples/statistics:** no latency, RSS, allocation, wall-time distribution,
+  confidence interval, or coefficient-of-variation measurements were
+  collected; retained values are deterministic state cardinalities, queue
+  depths, and hash-table capacity bounds only
+- **Equivalence:** exact-identity tests cover authority drain, same-numeric-ID
+  successor preservation, every discovery publication phase, capacity pressure,
+  stale-event rejection before storage/EventBus/pattern/workflow/replay side
+  effects, native-destroy ordering, cancellation, and shutdown drainage. Byte
+  replay, cursor/IME/accessibility behavior, rendered pixels, resize, zoom, and
+  production reconnect equivalence remain unproved
+- **Measured result:** no latency or RSS result. The implementation establishes
+  a capacity-one coalescing retirement lane and hysteretic retained-capacity
+  floors; deterministic churn returned persistence, BOCPD, authority, cursor,
+  detection-context, and activity state to O(active panes plus bounded slack)
+- **Rejected hypotheses:** best-effort EventBus lifecycle delivery is not exact
+  retirement authority; an unbounded control queue is not required for lossless
+  retirement; producer `is_closed` is not equivalent to a drained queue; raw
+  native destroy is not sufficient authority for numeric-ID cleanup; map counts
+  and retained capacities are not substitutes for target-class RSS or
+  user-visible latency measurements
+- **Decision:** kept durable correctness and bounded-state infrastructure. Exact
+  capture retirement removes process-lifetime incarnation state and prevents
+  stale recreation without claiming a measured user-visible performance win
+- **Primary retry condition:**
+  > Promote exact capture retirement as a performance improvement only after retained same-source long-session churn and close/reconnect runs on the intended M4/M5 Mac and 64-core/128-thread `trj` Threadripper/LAN target record p50/p95/p99/p999 keypress, retirement, and render latency, RSS/allocation/resource envelopes, and deterministic byte/state/visual/cursor/IME/accessibility/resize/zoom equivalence.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
