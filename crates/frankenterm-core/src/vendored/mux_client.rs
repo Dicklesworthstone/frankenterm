@@ -7891,13 +7891,17 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    DirectMuxError::RetentionLimitExceeded {
-                        resource: "pending unilateral render changes",
-                        requested_count: 2,
-                        requested_bytes,
-                        max_bytes,
-                        ..
-                    } if *requested_bytes == aggregate_bytes && *max_bytes == byte_limit
+                    DirectMuxError::InFlightScopeAbandoned(source)
+                        if matches!(
+                            source.as_ref(),
+                            DirectMuxError::RetentionLimitExceeded {
+                                resource: "pending unilateral render changes",
+                                requested_count: 2,
+                                requested_bytes,
+                                max_bytes,
+                                ..
+                            } if *requested_bytes == aggregate_bytes && *max_bytes == byte_limit
+                        )
                 ),
                 "unexpected shared-cap error: {error:?}"
             );
