@@ -429,7 +429,8 @@ After each pattern cluster:
   analyzer + this guide are the operator workflow.
 - `ft-kcdqp` — `FrankenSQLiteBackend`. Drops in alongside
   `RusqliteBackend` once the call-site migration is complete +
-  `frankensqlite` Phase 5+ ships.
+  the one-runtime dependency cohort and transaction-ownership prerequisites
+  are complete. The upstream release prerequisite is already satisfied.
 - `ft-s03ox` — backend-to-backend `.db` converter. Composes against
   the same trait surface as the migration; reference CLI ships at
   `crates/frankenterm-core/examples/storage_convert.rs`.

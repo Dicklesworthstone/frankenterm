@@ -698,8 +698,9 @@ pub mod storage_backend_cells;
 pub mod submit_idempotency_store;
 pub mod verified_submit;
 // br-ft-kcdqp: stub StorageBackend implementation under the
-// `frankensqlite-backend` feature. Compile-time scaffold awaiting
-// frankensqlite Phase 5+ release; readiness tracked by
+// `frankensqlite-backend` feature. Compile-time scaffold awaiting the
+// one-runtime dependency-cohort and transaction-ownership prerequisites;
+// upstream release readiness is tracked by
 // scripts/check_frankensqlite_readiness.py.
 #[cfg(feature = "frankensqlite-backend")]
 pub mod storage_backend_frankensqlite_stub;

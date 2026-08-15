@@ -387,8 +387,8 @@ impl TimeoutCalculator {
             if (b - a) < tol {
                 break;
             }
-            let x1 = b - golden * (b - a);
-            let x2 = a + golden * (b - a);
+            let x1 = golden.mul_add(-(b - a), b);
+            let x2 = golden.mul_add(b - a, a);
             let l1 = self.expected_loss(stats, x1);
             let l2 = self.expected_loss(stats, x2);
             if l1 < l2 {
@@ -541,7 +541,7 @@ fn standard_normal_cdf(x: f64) -> f64 {
     }
 
     // Use the polynomial approximation.
-    let sign = if x >= 0.0 { 1.0 } else { -1.0 };
+    let sign: f64 = if x >= 0.0 { 1.0 } else { -1.0 };
     let abs_x = x.abs();
 
     let t = 1.0 / 0.231_641_9f64.mul_add(abs_x, 1.0);
@@ -559,9 +559,9 @@ fn standard_normal_cdf(x: f64) -> f64 {
     );
 
     let pdf = (-abs_x * abs_x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
-    let cdf_positive = 1.0 - pdf * poly;
+    let cdf_positive = pdf.mul_add(-poly, 1.0);
 
-    0.5 + sign * (cdf_positive - 0.5)
+    sign.mul_add(cdf_positive - 0.5, 0.5)
 }
 
 /// Standard normal quantile (inverse CDF) via bisection on our CDF.

@@ -269,7 +269,7 @@ impl EValueMonitor {
         let lambda = self.compute_lambda(observed_rate, config);
 
         // E-value update: E_n = E_{n-1} × (1 + λ(X - p₀)).
-        let factor = 1.0 + lambda * (outcome - self.null_rate);
+        let factor = lambda.mul_add(outcome - self.null_rate, 1.0);
         // Ensure non-negative (martingale property).
         let factor = factor.max(0.0);
 

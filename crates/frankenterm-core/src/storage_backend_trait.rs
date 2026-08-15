@@ -6,9 +6,10 @@
 //!
 //! # Why this module exists
 //!
-//! `wa-2l27x.8` is "DEFERRED until frankensqlite Phase 5+ ships"
-//! per the bead body. Migration tasks 1, 3, 4, 5, 6 are all
-//! externally blocked on that precondition.
+//! `wa-2l27x.8` was originally deferred until a frankensqlite Phase 5+
+//! release. That upstream release prerequisite is now satisfied. The real
+//! backend remains deferred on FrankenTerm's one-runtime dependency cohort
+//! and transaction-ownership prerequisites.
 //!
 //! Migration task #2, however, is shippable today *regardless*
 //! of frankensqlite's eventual fate:
@@ -28,8 +29,8 @@
 //!   `rusqlite::Connection` to demonstrate the boundary fits the
 //!   current implementation.
 //! - A `cfg(test)` `MockBackend` for unit tests.
-//! - 6 unit tests proving the trait is dyn-safe and the mock
-//!   round-trips a basic op flow.
+//! - Inline tests proving the trait is dyn-safe and the mock round-trips the
+//!   supported operation flows.
 //!
 //! # Wired-pass scope (named follow-ups)
 //!
@@ -42,7 +43,8 @@
 //!   `storage.rs` itself is guarded against direct `Connection`
 //!   regressions by `storage_l1jgo_pool_regression`.
 //! - `wa-2l27x.8.cont.frankensqlite`: implement the trait against
-//!   frankensqlite. Blocked on frankensqlite Phase 5+ shipping.
+//!   `fsqlite`. Blocked on one-runtime dependency convergence and
+//!   transaction ownership.
 //! - `wa-2l27x.8.cont.benchmarks`: bench the two backends side by
 //!   side. Per the bead's task #4. Requires both impls.
 //! - `wa-2l27x.8.cont.migration_tool`: rusqlite → frankensqlite

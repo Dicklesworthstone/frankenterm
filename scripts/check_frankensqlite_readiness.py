@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """frankensqlite readiness checker (br-ft-kcdqp).
 
-Tracks whether the upstream frankensqlite project has shipped a
-Phase 5+ release that the FrankenSQLiteBackend implementation
-depends on. Without an external network call (which the operator
-may run from a sandboxed environment), this script reads the
-project's checked-in CHANGELOG / VERSION / Cargo.toml when the
-operator has it cloned alongside frankenterm and reports the
-phase number.
+Tracks whether the upstream frankensqlite project has shipped the Phase 5+
+release prerequisite for FrankenSQLiteBackend. Without an external network
+call, this script reads the project's checked-in CHANGELOG / VERSION /
+Cargo.toml when the operator has it cloned alongside frankenterm and reports
+the phase number.
 
-ft-kcdqp is blocked on "frankensqlite Phase 5+ shipping" per the
-bead's external-precondition list. This script eliminates the
-"is it time yet?" round-trip during weekly swarm sweeps.
+This checker covers only upstream release readiness. A `ready` result does not
+claim the backend is implemented or that its separate one-runtime dependency
+cohort and transaction-ownership prerequisites are satisfied.
 
 ## Usage
 
@@ -38,9 +36,9 @@ The script reports one of three states:
 - `ready` — checkout's CHANGELOG / VERSION / Cargo.toml shows a
   phase >= 5. Exit 0.
 
-The bead's wired-pass slice (FrankenSQLiteBackend impl) is
-unblocked when this script reports `ready` against the operator's
-checkout.
+The upstream-release prerequisite is satisfied when this script reports
+`ready` against the operator's checkout. The wired backend can proceed only
+after its other tracked prerequisites are satisfied as well.
 
 ## What the script reads
 
@@ -247,8 +245,8 @@ def build_report(path: Path | None) -> dict:
             "phase_source": source,
             "ready": True,
             "notes": (
-                f"frankensqlite phase {phase} (>=5) — FrankenSQLiteBackend "
-                "implementation is unblocked"
+                f"frankensqlite phase {phase} (>=5) — upstream release "
+                "prerequisite is satisfied; other backend prerequisites remain"
             ),
         }
     return {
@@ -260,8 +258,8 @@ def build_report(path: Path | None) -> dict:
         "phase_source": source,
         "ready": False,
         "notes": (
-            f"frankensqlite phase {phase} (<5) — FrankenSQLiteBackend "
-            "implementation remains blocked on Phase 5+ shipping"
+            f"frankensqlite phase {phase} (<5) — upstream release prerequisite "
+            "remains unsatisfied"
         ),
     }
 

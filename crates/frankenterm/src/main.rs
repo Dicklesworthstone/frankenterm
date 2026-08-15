@@ -37184,16 +37184,13 @@ struct DistributedIngestState {
 }
 
 #[cfg(feature = "distributed")]
-enum DistributedAdmissionOutcome {
-    ReplayRejected(frankenterm_core::distributed::DistributedSecurityError),
-    Admitted {
-        previous_replay_seq: Option<u64>,
-        previous_agent_session: Option<frankenterm_core::wire_protocol::AgentSessionSnapshot>,
-        ingest_result: Result<
-            frankenterm_core::wire_protocol::IngestResult,
-            frankenterm_core::wire_protocol::WireProtocolError,
-        >,
-    },
+struct DistributedAdmission {
+    previous_replay_seq: Option<u64>,
+    previous_agent_session: Option<frankenterm_core::wire_protocol::AgentSessionSnapshot>,
+    ingest_result: Result<
+        frankenterm_core::wire_protocol::IngestResult,
+        frankenterm_core::wire_protocol::WireProtocolError,
+    >,
 }
 
 #[cfg(feature = "distributed")]
@@ -37241,11 +37238,9 @@ fn distributed_admit_envelope(
     sequence_scope: &str,
     envelope: frankenterm_core::wire_protocol::WireEnvelope,
     activate_sequence_scope: bool,
-) -> DistributedAdmissionOutcome {
+) -> Result<DistributedAdmission, frankenterm_core::distributed::DistributedSecurityError> {
     let previous_replay_seq = shared.replay_guard.session_last_seq(replay_id);
-    if let Err(error) = shared.replay_guard.validate(replay_id, envelope.seq) {
-        return DistributedAdmissionOutcome::ReplayRejected(error);
-    }
+    shared.replay_guard.validate(replay_id, envelope.seq)?;
 
     let previous_agent_session = shared.aggregator.agent_session_snapshot(sequence_scope);
     let ingest_result = shared.aggregator.ingest_envelope(envelope);
@@ -37257,11 +37252,11 @@ fn distributed_admit_envelope(
         distributed_mark_sequence_scope_active(shared, sequence_scope, replay_id);
     }
 
-    DistributedAdmissionOutcome::Admitted {
+    Ok(DistributedAdmission {
         previous_replay_seq,
         previous_agent_session,
         ingest_result,
-    }
+    })
 }
 
 #[cfg(feature = "distributed")]
@@ -37585,6 +37580,26 @@ async fn distributed_release_sequence_scopes(
         DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS,
     )
     .await;
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_release_unowned_sequence_scope_gate(
+    ingest_state: &DistributedIngestState,
+    sequence_scope: Option<&str>,
+) {
+    let Some(sequence_scope) = sequence_scope else {
+        return;
+    };
+
+    let mut shared = ingest_state.shared.lock().await;
+    let should_remove = !shared.active_sequence_scopes.contains_key(sequence_scope)
+        && shared
+            .sequence_scope_gates
+            .get(sequence_scope)
+            .is_some_and(|gate| !gate.has_external_owner());
+    if should_remove {
+        shared.sequence_scope_gates.remove(sequence_scope);
+    }
 }
 
 #[cfg(feature = "distributed")]
@@ -38346,6 +38361,9 @@ async fn distributed_handle_connection<S>(
         max_bytes: wire_limits.max_message_size,
     };
     let mut connection_sequence_scopes = std::collections::HashSet::new();
+    // Authentication pins one sender per connection, so there is exactly one
+    // derived scope to retire even when every envelope is rejected.
+    let mut connection_sequence_gate = None;
     let mut pinned_connection_sender = normalized_handshake_agent.clone();
 
     loop {
@@ -38439,11 +38457,14 @@ async fn distributed_handle_connection<S>(
         let session_scope =
             distributed_sender_session_scope(&session_id, &sender, wire_limits.max_sender_id_len);
         envelope.sender = session_scope.clone();
+        if connection_sequence_gate.is_none() {
+            connection_sequence_gate = Some(session_scope.clone());
+        }
         // Preserve sender order all the way through durable persistence. An
         // older failed write must finish rollback before a concurrent
         // connection can admit a newer envelope for the same logical scope.
         // Other scopes use different gates and remain fully concurrent.
-        let _sequence_scope_guard =
+        let sequence_scope_guard =
             distributed_lock_sequence_scope(&ingest_state, &session_scope).await;
         let _ = distributed_prune_stale_sequence_scopes(
             &ingest_state,
@@ -38463,15 +38484,24 @@ async fn distributed_handle_connection<S>(
             )
         };
         let (previous_replay_seq, previous_agent_session, ingest_result) = match admission {
-            DistributedAdmissionOutcome::ReplayRejected(err) => {
+            Err(err) => {
+                // Rejection has no persistence or rollback transaction to
+                // serialize. Never retain this scope's gate while a slow peer
+                // backpressures the outbound error response.
+                drop(sequence_scope_guard);
+                distributed_release_unowned_sequence_scope_gate(
+                    &ingest_state,
+                    Some(&session_scope),
+                )
+                .await;
                 distributed_publish_security_error(&mut reader, err).await;
                 continue;
             }
-            DistributedAdmissionOutcome::Admitted {
+            Ok(DistributedAdmission {
                 previous_replay_seq,
                 previous_agent_session,
                 ingest_result,
-            } => (previous_replay_seq, previous_agent_session, ingest_result),
+            }) => (previous_replay_seq, previous_agent_session, ingest_result),
         };
         if ingest_result.is_ok() && activate_sequence_scope {
             let inserted = connection_sequence_scopes.insert(session_scope.clone());
@@ -38510,6 +38540,14 @@ async fn distributed_handle_connection<S>(
                 }
             }
             Err(err) => {
+                // In-memory ingest rejection likewise has no durable work
+                // guarded by this lease. Release before awaiting peer I/O.
+                drop(sequence_scope_guard);
+                distributed_release_unowned_sequence_scope_gate(
+                    &ingest_state,
+                    Some(&session_scope),
+                )
+                .await;
                 distributed_publish_wire_error(&mut reader, &err).await;
                 tracing::warn!(peer = %peer_addr, error = %err, "Distributed ingest rejected envelope");
             }
@@ -38517,6 +38555,11 @@ async fn distributed_handle_connection<S>(
     }
 
     distributed_release_sequence_scopes(&ingest_state, &connection_sequence_scopes).await;
+    distributed_release_unowned_sequence_scope_gate(
+        &ingest_state,
+        connection_sequence_gate.as_deref(),
+    )
+    .await;
 }
 
 #[cfg(feature = "distributed")]
@@ -39066,6 +39109,8 @@ async fn distributed_ingest_test_connection(
 ) -> anyhow::Result<()> {
     let expected_sender = distributed_normalize_identity(expected_sender);
     let mut connection_sequence_scopes = std::collections::HashSet::new();
+    // The scripted helper enforces the same one-sender connection invariant.
+    let mut connection_sequence_gate = None;
     let mut result = Ok(());
 
     for mut envelope in envelopes {
@@ -39082,6 +39127,9 @@ async fn distributed_ingest_test_connection(
         let session_scope =
             distributed_sender_session_scope(session_id, &sender, wire_limits.max_sender_id_len);
         envelope.sender = session_scope.clone();
+        if connection_sequence_gate.is_none() {
+            connection_sequence_gate = Some(session_scope.clone());
+        }
         let _sequence_scope_guard =
             distributed_lock_sequence_scope(ingest_state, &session_scope).await;
         let _ = distributed_prune_stale_sequence_scopes(
@@ -39102,17 +39150,17 @@ async fn distributed_ingest_test_connection(
             )
         };
         let (previous_replay_seq, previous_agent_session, ingest_result) = match admission {
-            DistributedAdmissionOutcome::ReplayRejected(err) => {
+            Err(err) => {
                 result = Err(anyhow::anyhow!(
                     "scripted distributed replay rejected: {err}"
                 ));
                 break;
             }
-            DistributedAdmissionOutcome::Admitted {
+            Ok(DistributedAdmission {
                 previous_replay_seq,
                 previous_agent_session,
                 ingest_result,
-            } => (previous_replay_seq, previous_agent_session, ingest_result),
+            }) => (previous_replay_seq, previous_agent_session, ingest_result),
         };
         if ingest_result.is_ok() && activate_sequence_scope {
             let inserted = connection_sequence_scopes.insert(session_scope.clone());
@@ -39154,6 +39202,11 @@ async fn distributed_ingest_test_connection(
     }
 
     distributed_release_sequence_scopes(ingest_state, &connection_sequence_scopes).await;
+    distributed_release_unowned_sequence_scope_gate(
+        ingest_state,
+        connection_sequence_gate.as_deref(),
+    )
+    .await;
     result
 }
 
@@ -87661,7 +87714,7 @@ recorder_backend = "frankensqlite"
             {
                 let shared = pane_seq_by_sender.shared.lock().await;
                 assert!(
-                    shared.pane_seq_by_sender.get(&seq_key).is_none(),
+                    !shared.pane_seq_by_sender.contains_key(&seq_key),
                     "ft-6k5gh: a GapNotice must not seed/advance the delta frontier, got {:?}",
                     shared.pane_seq_by_sender.get(&seq_key)
                 );
@@ -87696,7 +87749,7 @@ recorder_backend = "frankensqlite"
             {
                 let shared = pane_seq_by_sender.shared.lock().await;
                 assert!(
-                    shared.pane_seq_by_sender.get(&seq_key).is_none(),
+                    !shared.pane_seq_by_sender.contains_key(&seq_key),
                     "ft-6k5gh: even a rejected over-range gap must not touch the frontier, got {:?}",
                     shared.pane_seq_by_sender.get(&seq_key)
                 );
@@ -91136,6 +91189,75 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
+    fn distributed_replay_reject_release_prunes_unowned_scope_gate() {
+        run_async_test(async {
+            let ingest_state = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
+            let replay_id = distributed_replay_session_key("session-rejected", "agent-rejected");
+            let sequence_scope = distributed_sender_session_scope(
+                "session-rejected",
+                "agent-rejected",
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
+
+            let guard = distributed_lock_sequence_scope(&ingest_state, &sequence_scope).await;
+            {
+                let mut shared = ingest_state.shared.lock().await;
+                assert!(shared.sequence_scope_gates.contains_key(&sequence_scope));
+                assert!(shared.active_sequence_scopes.is_empty());
+                shared
+                    .replay_guard
+                    .validate(&replay_id, 1)
+                    .expect("seed replay frontier");
+                let rejection = distributed_admit_envelope(
+                    &mut shared,
+                    &replay_id,
+                    &sequence_scope,
+                    frankenterm_core::wire_protocol::WireEnvelope::new(
+                        1,
+                        &sequence_scope,
+                        frankenterm_core::wire_protocol::WirePayload::Gap(
+                            frankenterm_core::wire_protocol::GapNotice {
+                                pane_id: 1,
+                                seq_before: 0,
+                                seq_after: 1,
+                                reason: "duplicate-replay".to_string(),
+                                detected_at_ms: now_ms_i64(),
+                            },
+                        ),
+                    ),
+                    false,
+                );
+                assert!(rejection.is_err(), "duplicate sequence must be rejected");
+                assert!(
+                    shared.active_sequence_scopes.is_empty(),
+                    "replay rejection must not activate the sequence scope"
+                );
+            }
+
+            distributed_release_unowned_sequence_scope_gate(&ingest_state, Some(&sequence_scope))
+                .await;
+            {
+                let shared = ingest_state.shared.lock().await;
+                assert!(
+                    shared.sequence_scope_gates.contains_key(&sequence_scope),
+                    "cleanup must preserve a gate while its exact guard is live"
+                );
+            }
+            drop(guard);
+
+            distributed_release_unowned_sequence_scope_gate(&ingest_state, Some(&sequence_scope))
+                .await;
+
+            let shared = ingest_state.shared.lock().await;
+            assert!(shared.sequence_scope_gates.is_empty());
+            assert!(shared.active_sequence_scopes.is_empty());
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
     fn distributed_admission_activates_scope_in_same_state_cut() {
         run_async_test(async {
             let ingest_state = DistributedIngestState::new(
@@ -91184,11 +91306,11 @@ recorder_backend = "frankensqlite"
 
             assert!(matches!(
                 admission,
-                DistributedAdmissionOutcome::Admitted {
+                Ok(DistributedAdmission {
                     previous_replay_seq: None,
                     previous_agent_session: None,
                     ingest_result: Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(_)),
-                }
+                })
             ));
         });
     }
@@ -91232,11 +91354,11 @@ recorder_backend = "frankensqlite"
                     false,
                 )
             };
-            let DistributedAdmissionOutcome::Admitted {
+            let Ok(DistributedAdmission {
                 previous_replay_seq,
                 previous_agent_session,
                 ingest_result: Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(_)),
-            } = first_admission
+            }) = first_admission
             else {
                 panic!("first envelope should be admitted");
             };
@@ -91283,15 +91405,55 @@ recorder_backend = "frankensqlite"
 
             assert!(matches!(
                 second_admission.await,
-                DistributedAdmissionOutcome::Admitted {
+                Ok(DistributedAdmission {
                     previous_replay_seq: None,
                     previous_agent_session: None,
                     ingest_result: Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(_)),
-                }
+                })
             ));
             let shared = ingest_state.shared.lock().await;
             assert_eq!(shared.replay_guard.session_last_seq(&replay_id), Some(2));
             assert_eq!(shared.aggregator.agent_last_seq(&sequence_scope), Some(2));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_scope_gates_do_not_serialize_distinct_scopes() {
+        run_async_test(async {
+            use std::future::Future as _;
+            use std::task::Poll;
+
+            let ingest_state = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
+            let first_scope = distributed_sender_session_scope(
+                "session-independent-a",
+                "agent-independent-a",
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
+            let second_scope = distributed_sender_session_scope(
+                "session-independent-b",
+                "agent-independent-b",
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
+            assert_ne!(first_scope, second_scope);
+
+            let first_guard = distributed_lock_sequence_scope(&ingest_state, &first_scope).await;
+            let mut second_acquire = Box::pin(distributed_lock_sequence_scope(
+                &ingest_state,
+                &second_scope,
+            ));
+            let second_guard = std::future::poll_fn(|cx| match second_acquire.as_mut().poll(cx) {
+                Poll::Ready(guard) => Poll::Ready(guard),
+                Poll::Pending => {
+                    panic!("holding one sequence-scope gate serialized an unrelated scope")
+                }
+            })
+            .await;
+
+            drop(second_guard);
+            drop(first_guard);
         });
     }
 
@@ -91367,11 +91529,11 @@ recorder_backend = "frankensqlite"
                 )
             };
 
-            let DistributedAdmissionOutcome::Admitted {
+            let Ok(DistributedAdmission {
                 previous_replay_seq,
                 previous_agent_session,
                 ingest_result,
-            } = admission
+            }) = admission
             else {
                 panic!("capacity attempt should pass replay validation");
             };

@@ -6,29 +6,33 @@
 
 ## Why this exists
 
-`wa-2l27x.8`'s body says:
+`wa-2l27x.8` was originally filed with this release prerequisite:
 
 > Status: DEFERRED until frankensqlite Phase 5+ ships
 
-That's true for **5 of the 6 migration tasks** the bead names:
+That upstream prerequisite is now satisfied by the published `fsqlite`
+facade. The real backend is still deferred because FrankenTerm must first
+converge its dependency graph on one compatible Asupersync runtime and finish
+exclusive transaction ownership. The six migration tasks remain:
 
-1. Add frankensqlite as workspace dependency — needs frankensqlite to ship.
+1. Add `fsqlite` as a workspace dependency — needs the one-runtime cohort.
 2. **Create storage backend trait to abstract rusqlite vs frankensqlite — shippable today.**
-3. Implement frankensqlite backend behind feature flag — needs (1).
+3. Implement the `fsqlite` backend behind a feature flag — needs (1) and the
+   transaction-ownership prerequisite.
 4. Benchmark single-writer / concurrent-writer / checkpoint latency — needs (3).
 5. Migration tool: convert existing rusqlite `.db` to frankensqlite — needs (3).
 6. Gradual rollout — needs (3) + (5).
 
-Task #2 — the trait — is shippable **regardless of frankensqlite's eventual fate**:
+Task #2 — the trait — is useful independently of backend integration:
 
-- If frankensqlite ships → the trait is the boundary the swap rides on (the bead's stated goal).
-- If frankensqlite never ships → the trait improves storage.rs's testability via a mockable backend (a real win independent of any migration).
+- The trait is the boundary the eventual `fsqlite` integration rides on.
+- It also improves storage.rs's testability via a mockable backend.
 
 Either way, the work pays for itself.
 
 ## What the substrate ships
 
-[`crates/frankenterm-core/src/storage_backend_trait.rs`](../../crates/frankenterm-core/src/storage_backend_trait.rs) (~370 lines, 8 unit tests):
+[`crates/frankenterm-core/src/storage_backend_trait.rs`](../../crates/frankenterm-core/src/storage_backend_trait.rs), with an extensive inline test suite:
 
 - **`StorageBackend` trait** — names the operations storage.rs performs conceptually:
   - `execute(sql) -> Result<rows_affected, BackendError>` for DDL + DML.
@@ -41,30 +45,36 @@ Either way, the work pays for itself.
 - **`OpenConfig`** — common open-time knobs (read-only, WAL, page size hint).
 - **`BackendError`** — common error surface (Connect / Query / TxPoisoned / Schema / Other).
 - **`TransactionGuard`** — RAII transaction wrapper. Rolls back on `Drop` by default; explicit `commit()` required for durability.
+- **`RusqliteBackend`** — the wired persistent implementation and factory over
+  a real `rusqlite::Connection`; the remaining extraction work is threading
+  more of `storage.rs` through this boundary.
 - **`MockBackend`** — in-memory mock for testing. Records executed statements + tracks transaction state + answers `user_version` queries. Useful in storage.rs unit tests today, before any frankensqlite migration.
 
 ## What the substrate intentionally does NOT ship
 
-- **Refactor of storage.rs.** storage.rs is ~26K lines and uses `rusqlite::Connection` directly throughout. Threading the trait through every call site is a multi-week refactor filed as **`wa-2l27x.8.cont.extract`**.
-- **Real `RusqliteBackend` impl.** Out of scope for the substrate; the trait shape is the contract, the impl drops in under cont.extract.
-- **Real `FrankenSQLiteBackend` impl.** Externally blocked on frankensqlite Phase 5+ shipping. Filed as **`wa-2l27x.8.cont.frankensqlite`**.
+- **Refactor of storage.rs.** storage.rs is large and uses
+  `rusqlite::Connection` directly throughout. Threading the trait through every
+  call site is a multi-week refactor filed as **`wa-2l27x.8.cont.extract`**.
+- **Real `FrankenSQLiteBackend` impl.** Blocked on one-runtime dependency
+  convergence and exclusive transaction ownership. Filed as
+  **`wa-2l27x.8.cont.frankensqlite`**.
 - **Side-by-side benchmarks.** Per the bead's task #4, requires both impls. Filed as **`wa-2l27x.8.cont.benchmarks`**.
 - **rusqlite → frankensqlite migration tool.** Per the bead's task #5. Filed as **`wa-2l27x.8.cont.migration_tool`**.
 
 ## Migration roadmap
 
 ```
-wa-2l27x.8 (parent — DEFERRED status, but task #2 shippable today)
+wa-2l27x.8 (closed parent migration plan)
 ├── ✓ trait substrate (this bead — shipped)
-├── ○ wa-2l27x.8.cont.extract       — refactor storage.rs through the trait
-├── ○ wa-2l27x.8.cont.frankensqlite — frankensqlite backend impl (blocked: Phase 5+)
+├── ◐ wa-2l27x.8.cont.extract       — RusqliteBackend shipped; continue storage.rs adoption
+├── ○ wa-2l27x.8.cont.frankensqlite — fsqlite backend impl (blocked: runtime cohort + transaction ownership)
 ├── ○ wa-2l27x.8.cont.benchmarks    — bench rusqlite vs frankensqlite (blocked: cont.frankensqlite)
 └── ○ wa-2l27x.8.cont.migration_tool — .db converter (blocked: cont.frankensqlite)
 ```
 
-The substrate unblocks **cont.extract**: the refactor can begin
-today using rusqlite as the only impl, with the trait serving as
-the boundary that frankensqlite's eventual impl drops into.
+The substrate and concrete `RusqliteBackend` have begun **cont.extract**.
+Rusqlite remains the only wired persistent implementation; the trait is the
+boundary that the eventual `fsqlite` implementation will use.
 
 ## Why the trait shape is intentionally minimal
 
@@ -95,7 +105,7 @@ the ceiling.
 
 ## Tests
 
-8 unit tests in `storage_backend_trait::tests`:
+Representative tests in `storage_backend_trait::tests` include:
 
 | Test | Invariant |
 | ---- | --------- |
@@ -112,7 +122,10 @@ the ceiling.
 
 - `wa-2l27x` (parent epic — Crash-Resilient Session Persistence).
 - `wa-2l27x.7` (closed — E2E test suite, the prerequisite that the bead's `Depends on` cited).
-- `crates/frankenterm-core/src/storage.rs` — the ~26K-line current rusqlite-backed implementation. cont.extract refactors this through the trait.
+- `crates/frankenterm-core/src/storage.rs` — the current rusqlite-backed
+  implementation. `cont.extract` refactors this through the trait.
 - `crates/frankenterm-core/src/storage_targets.rs` — adjacent storage-layer module; not affected by this substrate.
-- frankensqlite project: github.com/Dicklesworthstone/frankensqlite — Phase 5+ is the external precondition for cont.frankensqlite.
+- frankensqlite project: github.com/Dicklesworthstone/frankensqlite — the
+  release prerequisite is satisfied; runtime-cohort and transaction-ownership
+  work still gate `cont.frankensqlite`.
 - ft-2okh0.5 (closed — crash-safe scrollback substrate, sibling crash-resilience work).

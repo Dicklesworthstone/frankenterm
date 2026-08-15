@@ -1,14 +1,13 @@
 //! `FrankenSQLiteBackend` stub (br-ft-kcdqp).
 //!
-//! Compile-time scaffold for the storage-backend trait
-//! implementation that ships once the upstream `frankensqlite`
-//! project releases Phase 5+. The bead's external precondition
-//! (frankensqlite Phase 5+) is monitored by
-//! [`scripts/check_frankensqlite_readiness.py`][readiness]; the
-//! stub here lets callers compile against `--features
-//! frankensqlite-backend` today + verify the dispatch wiring +
-//! exercise the fallback path before any real frankensqlite
-//! method bodies land.
+//! Compile-time scaffold for the storage-backend trait implementation. The
+//! upstream release prerequisite is satisfied, but wiring the published
+//! `fsqlite` facade remains blocked on FrankenTerm's one-runtime dependency
+//! cohort and transaction-ownership prerequisites. Upstream release readiness
+//! is monitored by [`scripts/check_frankensqlite_readiness.py`][readiness]; the
+//! stub here lets callers compile against `--features frankensqlite-backend`
+//! today, verify dispatch wiring, and exercise the fallback path before any
+//! real `fsqlite` method bodies land.
 //!
 //! [readiness]: ../../scripts/check_frankensqlite_readiness.py
 //!
@@ -22,8 +21,8 @@
 //!    (PR CI flows like `--all-features` succeed).
 //! 2. Downstream code that picks the backend via a `--backend`
 //!    flag or feature gate can write against the real type today,
-//!    swapping `Box<dyn StorageBackend>` constructors atomically
-//!    when Phase 5+ lands.
+//!    swapping `Box<dyn StorageBackend>` constructors atomically once the
+//!    dependency and transaction prerequisites are complete.
 //! 3. The stub's [`NOT_WIRED_HINT`] gives end users a single,
 //!    discoverable error message + remediation pointer when they
 //!    flip the feature on prematurely.
@@ -34,14 +33,15 @@
 //!
 //! ## What the wired-pass replaces
 //!
-//! When Phase 5+ ships, the wired-pass slice:
+//! Once the one-runtime dependency cohort and transaction-ownership
+//! prerequisites are complete, the wired-pass slice:
 //!
-//! 1. Adds `frankensqlite` as a `[dependencies]` entry behind
+//! 1. Adds `fsqlite` as a `[dependencies]` entry behind
 //!    `optional = true` + the `frankensqlite-backend` feature.
 //! 2. Replaces every `Err(BackendError::Other(NOT_WIRED_HINT))`
 //!    body with the real connection / query / transaction call.
-//! 3. Adds a `StorageBackendFactory` impl returning a
-//!    `FrankenSQLiteBackend` from a path + `OpenConfig`.
+//! 3. Updates the existing `StorageBackendFactory` impl so its path and
+//!    `OpenConfig` open a real `FrankenSQLiteBackend`.
 //! 4. Pushes a `frankensqlite_*` row into
 //!    `crates/frankenterm-core/benches/storage_backend_comparison.rs`'s
 //!    `backends_under_test()` (cc_1's harness at 33332b2be picks
@@ -61,10 +61,11 @@ use crate::storage_backend_trait::{
 /// Stable diagnostic hint for every stubbed operation. Carries
 /// the bead reference + the readiness checker so an operator
 /// who hits this error knows the next step.
-pub const NOT_WIRED_HINT: &str = "FrankenSQLiteBackend is a stub awaiting frankensqlite Phase 5+ release \
-     (ft-kcdqp). Run scripts/check_frankensqlite_readiness.py to verify \
-     upstream status; once it reports `ready`, the wired-pass slice fills in \
-     the method bodies.";
+pub const NOT_WIRED_HINT: &str = "FrankenSQLiteBackend is an unwired scaffold (ft-kcdqp). \
+     Upstream release readiness is satisfied, but the one-runtime dependency \
+     cohort and transaction-ownership prerequisites must complete before the \
+     fsqlite method bodies can be wired. Run \
+     scripts/check_frankensqlite_readiness.py to verify upstream status.";
 
 /// Stable backend identifier for telemetry + diagnostic surfaces.
 /// Returned by [`StorageBackend::backend_name`] so the existing
@@ -72,10 +73,10 @@ pub const NOT_WIRED_HINT: &str = "FrankenSQLiteBackend is a stub awaiting franke
 /// even on the stub.
 pub const BACKEND_NAME: &str = "frankensqlite";
 
-/// Stub implementation of [`StorageBackend`] over the future
-/// frankensqlite connection type. Construction always fails today
-/// (the stub does not actually open a database); when Phase 5+
-/// ships the wired-pass replaces every method body in this file.
+/// Stub implementation of [`StorageBackend`] over the future `fsqlite`
+/// connection type. Construction always fails today because the stub does not
+/// actually open a database. Once the dependency and transaction prerequisites
+/// are complete, the wired pass replaces every method body in this file.
 ///
 /// The struct is `pub` because downstream code that picks the
 /// backend at compile time (via `cfg(feature = "frankensqlite-
@@ -97,7 +98,7 @@ pub struct FrankenSQLiteBackend {
 impl FrankenSQLiteBackend {
     /// Construct a new backend over a database path. Returns
     /// `BackendError::Other(NOT_WIRED_HINT)` until the wired-pass
-    /// fills in the real `frankensqlite::Connection::open` call.
+    /// fills in the real `fsqlite` connection-open path.
     ///
     /// Signature mirrors [`crate::storage_backend_trait::RusqliteBackend::open`]
     /// so the migration tool at
@@ -249,7 +250,11 @@ mod tests {
         let err = backend
             .execute("CREATE TABLE foo (id INTEGER)")
             .unwrap_err();
-        assert!(err.to_string().contains("not yet wired") || err.to_string().contains("stub"));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(NOT_WIRED_HINT),
+            "execute error must preserve the canonical unwired diagnostic: {rendered}"
+        );
     }
 
     #[test]
