@@ -2571,23 +2571,23 @@ impl PendingCaptureResyncs {
             };
             if predecessor_revision == descriptor.desired_revision {
                 self.require_storage_audit(pane_id);
-            } else if self.storage_audit.contains(&pane_id) {
-                continue;
-            } else if let Some(exact) = self.exact.get_mut(&pane_id) {
-                *exact = ExactCaptureResync {
-                    predecessor_revision,
-                    preserve_durable_anchor: descriptor.preserve_durable_anchor,
-                };
-            } else if self.exact.len() < self.exact_capacity {
-                self.exact.insert(
-                    pane_id,
-                    ExactCaptureResync {
+            } else if !self.storage_audit.contains(&pane_id) {
+                if let Some(exact) = self.exact.get_mut(&pane_id) {
+                    *exact = ExactCaptureResync {
                         predecessor_revision,
                         preserve_durable_anchor: descriptor.preserve_durable_anchor,
-                    },
-                );
-            } else {
-                self.storage_audit.insert(pane_id);
+                    };
+                } else if self.exact.len() < self.exact_capacity {
+                    self.exact.insert(
+                        pane_id,
+                        ExactCaptureResync {
+                            predecessor_revision,
+                            preserve_durable_anchor: descriptor.preserve_durable_anchor,
+                        },
+                    );
+                } else {
+                    self.storage_audit.insert(pane_id);
+                }
             }
         }
     }
