@@ -1943,6 +1943,13 @@ struct ObservedCapturePane {
 struct CaptureTransitionDescriptor {
     desired_revision: DiscoveryRevision,
     predecessor_revision: Option<DiscoveryRevision>,
+    preserve_durable_anchor: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SuspendedCaptureContinuity {
+    lifecycle_revision: PaneLifecycleRevision,
+    predecessor_revision: DiscoveryRevision,
 }
 
 const PANE_METADATA_DEBOUNCE_TICKS: u8 = 2;
@@ -2262,6 +2269,67 @@ fn retain_observed_capture_bookkeeping(
     capture_setup_pending.retain(|pane_id, _| registry_observes_pane(registry, *pane_id));
 }
 
+/// Preserve exact capture continuity across a policy-only observation pause.
+///
+/// The pane remains in the registry while filtered, so its typed lifecycle
+/// revision is still authoritative.  A close, replacement, ambiguous identity,
+/// or exhausted revision invalidates this bounded per-pane witness.  The
+/// returned predecessor map is consumed by the transition allocator only for
+/// panes that became observed again in this exact tick.
+fn update_suspended_capture_continuity(
+    registry: &PaneRegistry,
+    diff: &crate::ingest::DiscoveryDiff,
+    discovery_revisions: &HashMap<u64, DiscoveryRevision>,
+    suspended: &mut HashMap<u64, SuspendedCaptureContinuity>,
+) -> HashMap<u64, DiscoveryRevision> {
+    let invalidated = diff
+        .closed_panes
+        .iter()
+        .chain(&diff.lifecycle_replacements)
+        .chain(&diff.ambiguous_lifecycle_panes)
+        .chain(&diff.revision_exhausted_panes)
+        .copied()
+        .collect::<HashSet<_>>();
+    for pane_id in &invalidated {
+        suspended.remove(pane_id);
+    }
+
+    for (&pane_id, &predecessor_revision) in discovery_revisions {
+        let Some(entry) = registry.get_entry(pane_id) else {
+            continue;
+        };
+        if !entry.should_observe() && !invalidated.contains(&pane_id) {
+            suspended.insert(
+                pane_id,
+                SuspendedCaptureContinuity {
+                    lifecycle_revision: entry.lifecycle_revision,
+                    predecessor_revision,
+                },
+            );
+        }
+    }
+
+    let mut resumed = HashMap::with_capacity(diff.re_observed_panes.len());
+    for &pane_id in &diff.re_observed_panes {
+        let Some(witness) = suspended.remove(&pane_id) else {
+            continue;
+        };
+        if registry
+            .get_entry(pane_id)
+            .is_some_and(|entry| entry.lifecycle_revision == witness.lifecycle_revision)
+        {
+            resumed.insert(pane_id, witness.predecessor_revision);
+        }
+    }
+
+    suspended.retain(|pane_id, witness| {
+        registry.get_entry(*pane_id).is_some_and(|entry| {
+            !entry.should_observe() && entry.lifecycle_revision == witness.lifecycle_revision
+        })
+    });
+    resumed
+}
+
 fn allocate_capture_transition_revisions(
     transitioning_pane_ids: &[u64],
     last_discovery_revision: &mut u64,
@@ -2269,11 +2337,17 @@ fn allocate_capture_transition_revisions(
     capture_transitions: &mut HashMap<u64, CaptureTransitionDescriptor>,
     unresolved_barrier_predecessors: &mut HashMap<u64, DiscoveryRevision>,
     storage_resync_revisions: &mut HashMap<u64, DiscoveryRevision>,
+    durable_anchor_predecessors: &HashMap<u64, DiscoveryRevision>,
 ) {
     for &pane_id in transitioning_pane_ids {
         let barrier_predecessor = unresolved_barrier_predecessors.get(&pane_id).copied();
-        let predecessor_revision =
-            barrier_predecessor.or_else(|| discovery_revisions.get(&pane_id).copied());
+        let durable_anchor_predecessor = barrier_predecessor
+            .is_none()
+            .then(|| durable_anchor_predecessors.get(&pane_id).copied())
+            .flatten();
+        let predecessor_revision = barrier_predecessor
+            .or(durable_anchor_predecessor)
+            .or_else(|| discovery_revisions.get(&pane_id).copied());
         match allocate_discovery_revision(last_discovery_revision) {
             Some(revision) => {
                 discovery_revisions.insert(pane_id, revision);
@@ -2282,6 +2356,7 @@ fn allocate_capture_transition_revisions(
                     CaptureTransitionDescriptor {
                         desired_revision: revision,
                         predecessor_revision,
+                        preserve_durable_anchor: durable_anchor_predecessor.is_some(),
                     },
                 );
                 if barrier_predecessor.is_some() {
@@ -2354,8 +2429,17 @@ fn capture_publication_identity_matches(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CaptureResyncRequirement {
-    Exact(DiscoveryRevision),
+    Exact {
+        predecessor_revision: DiscoveryRevision,
+        preserve_durable_anchor: bool,
+    },
     StorageAudit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactCaptureResync {
+    predecessor_revision: DiscoveryRevision,
+    preserve_durable_anchor: bool,
 }
 
 /// Bounded, lossless accounting for successor resync obligations.
@@ -2367,7 +2451,7 @@ enum CaptureResyncRequirement {
 /// that races an earlier discovery read without poisoning unrelated future
 /// panes with a process-lifetime global mode.
 struct PendingCaptureResyncs {
-    exact: HashMap<u64, DiscoveryRevision>,
+    exact: HashMap<u64, ExactCaptureResync>,
     storage_audit: HashSet<u64>,
     exact_capacity: usize,
 }
@@ -2392,11 +2476,22 @@ impl PendingCaptureResyncs {
             return true;
         }
         if let Some(existing) = self.exact.get_mut(&pane_id) {
-            *existing = revision;
+            if existing.predecessor_revision != revision {
+                *existing = ExactCaptureResync {
+                    predecessor_revision: revision,
+                    preserve_durable_anchor: false,
+                };
+            }
             return false;
         }
         if self.exact.len() < self.exact_capacity {
-            self.exact.insert(pane_id, revision);
+            self.exact.insert(
+                pane_id,
+                ExactCaptureResync {
+                    predecessor_revision: revision,
+                    preserve_durable_anchor: false,
+                },
+            );
             return false;
         }
         self.storage_audit.insert(pane_id);
@@ -2411,7 +2506,10 @@ impl PendingCaptureResyncs {
         self.exact
             .get(&pane_id)
             .copied()
-            .map(CaptureResyncRequirement::Exact)
+            .map(|exact| CaptureResyncRequirement::Exact {
+                predecessor_revision: exact.predecessor_revision,
+                preserve_durable_anchor: exact.preserve_durable_anchor,
+            })
             .or_else(|| {
                 (self.storage_audit.contains(&pane_id) || requires_storage_resync)
                     .then_some(CaptureResyncRequirement::StorageAudit)
@@ -2472,8 +2570,23 @@ impl PendingCaptureResyncs {
             };
             if predecessor_revision == descriptor.desired_revision {
                 self.require_storage_audit(pane_id);
+            } else if self.storage_audit.contains(&pane_id) {
+                continue;
+            } else if let Some(exact) = self.exact.get_mut(&pane_id) {
+                *exact = ExactCaptureResync {
+                    predecessor_revision,
+                    preserve_durable_anchor: descriptor.preserve_durable_anchor,
+                };
+            } else if self.exact.len() < self.exact_capacity {
+                self.exact.insert(
+                    pane_id,
+                    ExactCaptureResync {
+                        predecessor_revision,
+                        preserve_durable_anchor: descriptor.preserve_durable_anchor,
+                    },
+                );
             } else {
-                self.remember(pane_id, predecessor_revision);
+                self.storage_audit.insert(pane_id);
             }
         }
     }
@@ -5835,6 +5948,8 @@ impl ObservationRuntime {
             let mut discovery_revisions = HashMap::<u64, DiscoveryRevision>::new();
             let mut storage_resync_revisions = HashMap::<u64, DiscoveryRevision>::new();
             let mut capture_transitions = HashMap::<u64, CaptureTransitionDescriptor>::new();
+            let mut suspended_capture_continuity =
+                HashMap::<u64, SuspendedCaptureContinuity>::new();
             let mut last_capture_view = Arc::new(HashMap::<u64, ObservedCapturePane>::new());
             let mut unresolved_barrier_predecessors = HashMap::<u64, DiscoveryRevision>::new();
             let mut capture_setup_pending = HashMap::<u64, &'static str>::new();
@@ -6002,11 +6117,16 @@ impl ObservationRuntime {
                                     );
                                 }
                             }
-                            // Observation can end without a numeric pane close
-                            // (for example after a title/domain filter change).
-                            // Such panes are terminal for capture: stale
-                            // transition descriptors would otherwise retain
-                            // resync and teardown obligations forever.
+                            // Observation can end without a numeric pane close.
+                            // Retire active capture bookkeeping while retaining
+                            // only the typed lifecycle witness needed to resume
+                            // a durable anchor after a policy-only pause.
+                            let durable_anchor_predecessors = update_suspended_capture_continuity(
+                                &reg,
+                                &diff,
+                                &discovery_revisions,
+                                &mut suspended_capture_continuity,
+                            );
                             retain_observed_capture_bookkeeping(
                                 &reg,
                                 &mut discovery_revisions,
@@ -6055,12 +6175,17 @@ impl ObservationRuntime {
                                 &mut capture_transitions,
                                 &mut unresolved_barrier_predecessors,
                                 &mut storage_resync_revisions,
+                                &durable_anchor_predecessors,
                             );
-                            for pane_id in diff
-                                .lifecycle_replacements
-                                .iter()
-                                .chain(&diff.re_observed_panes)
-                            {
+                            for pane_id in &diff.lifecycle_replacements {
+                                if let Some(revision) = discovery_revisions.get(pane_id).copied() {
+                                    storage_resync_revisions.insert(*pane_id, revision);
+                                }
+                            }
+                            for pane_id in &diff.re_observed_panes {
+                                if durable_anchor_predecessors.contains_key(pane_id) {
+                                    continue;
+                                }
                                 if let Some(revision) = discovery_revisions.get(pane_id).copied() {
                                     storage_resync_revisions.insert(*pane_id, revision);
                                 }
@@ -7134,7 +7259,10 @@ impl ObservationRuntime {
                         }
                         if let Some(requirement) = resync_requirement {
                             let checkpoint_result = match requirement {
-                                CaptureResyncRequirement::Exact(predecessor_revision) => {
+                                CaptureResyncRequirement::Exact {
+                                    predecessor_revision,
+                                    ..
+                                } => {
                                     recover_capture_checkpoint(
                                         &loop_cx,
                                         &storage,
@@ -7170,11 +7298,18 @@ impl ObservationRuntime {
                                     continue;
                                 }
                             };
+                            let preserve_durable_anchor = matches!(
+                                requirement,
+                                CaptureResyncRequirement::Exact {
+                                    preserve_durable_anchor: true,
+                                    ..
+                                }
+                            );
                             if let Err(error) = reset_capture_state_from_checkpoint(
                                 pane_id,
                                 observed.revision,
                                 &checkpoint,
-                                false,
+                                preserve_durable_anchor,
                                 &cursors,
                                 &detection_contexts,
                                 &pane_activity_tracker,
@@ -12051,6 +12186,7 @@ mod tests {
                 CaptureTransitionDescriptor {
                     desired_revision: DiscoveryRevision(4),
                     predecessor_revision: Some(DiscoveryRevision(1)),
+                    preserve_durable_anchor: false,
                 },
             )])),
         };
@@ -13021,6 +13157,7 @@ mod tests {
             &mut transitions,
             &mut unresolved,
             &mut storage_resyncs,
+            &HashMap::new(),
         );
         let successor_revision = DiscoveryRevision(predecessor_revision.get() + 1);
         assert_eq!(revisions.get(&pane_id), Some(&successor_revision));
@@ -13030,6 +13167,7 @@ mod tests {
             Some(&CaptureTransitionDescriptor {
                 desired_revision: successor_revision,
                 predecessor_revision: Some(predecessor_revision),
+                preserve_durable_anchor: false,
             })
         );
         assert!(!unresolved.contains_key(&pane_id));
@@ -13043,7 +13181,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_transition_is_terminal_for_capture_bookkeeping() {
+    fn filter_pause_retires_active_bookkeeping_and_resumes_exact_continuity() {
         let pane_id = 42;
         let revision = DiscoveryRevision(7);
         let filter = PaneFilterConfig {
@@ -13062,16 +13200,28 @@ mod tests {
         let transition = CaptureTransitionDescriptor {
             desired_revision: revision,
             predecessor_revision: None,
+            preserve_durable_anchor: false,
         };
         let mut revisions = HashMap::from([(pane_id, revision)]);
         let mut storage_resyncs = HashMap::from([(pane_id, revision)]);
         let mut transitions = HashMap::from([(pane_id, transition)]);
         let mut setup = HashMap::from([(pane_id, "observation_started")]);
+        let mut suspended = HashMap::new();
 
         let diff = registry.discovery_tick(vec![make_pane(pane_id, "ignore-now")]);
         assert!(diff.lifecycle_replacements.is_empty());
         assert_eq!(diff.metadata_changes.len(), 1);
         assert!(!registry_observes_pane(&registry, pane_id));
+        let resumed =
+            update_suspended_capture_continuity(&registry, &diff, &revisions, &mut suspended);
+        assert!(resumed.is_empty());
+        assert_eq!(
+            suspended.get(&pane_id),
+            Some(&SuspendedCaptureContinuity {
+                lifecycle_revision: PaneLifecycleRevision::INITIAL,
+                predecessor_revision: revision,
+            })
+        );
         retain_observed_capture_bookkeeping(
             &registry,
             &mut revisions,
@@ -13089,6 +13239,108 @@ mod tests {
         assert!(
             transitioning.is_empty(),
             "an ignored pane cannot remain in a permanent capture transition"
+        );
+
+        let resumed_diff = registry.discovery_tick(vec![make_pane(pane_id, "observed-again")]);
+        assert_eq!(resumed_diff.re_observed_panes, vec![pane_id]);
+        assert!(resumed_diff.lifecycle_replacements.is_empty());
+        let durable_anchor_predecessors = update_suspended_capture_continuity(
+            &registry,
+            &resumed_diff,
+            &revisions,
+            &mut suspended,
+        );
+        assert_eq!(durable_anchor_predecessors.get(&pane_id), Some(&revision));
+        assert!(suspended.is_empty());
+
+        let mut last_revision = revision.get();
+        let mut unresolved = HashMap::new();
+        allocate_capture_transition_revisions(
+            &resumed_diff.re_observed_panes,
+            &mut last_revision,
+            &mut revisions,
+            &mut transitions,
+            &mut unresolved,
+            &mut storage_resyncs,
+            &durable_anchor_predecessors,
+        );
+        let successor_revision = DiscoveryRevision(revision.get() + 1);
+        assert_eq!(
+            transitions.get(&pane_id),
+            Some(&CaptureTransitionDescriptor {
+                desired_revision: successor_revision,
+                predecessor_revision: Some(revision),
+                preserve_durable_anchor: true,
+            })
+        );
+        assert!(
+            storage_resyncs.get(&pane_id).is_none(),
+            "positive same-incarnation continuity must not be downgraded to an unproven audit"
+        );
+    }
+
+    #[test]
+    fn hidden_lifecycle_replacement_invalidates_policy_resume_anchor() {
+        let pane_id = 42;
+        let predecessor_revision = DiscoveryRevision(7);
+        let filter = PaneFilterConfig {
+            include: Vec::new(),
+            exclude: vec![crate::config::PaneFilterRule {
+                id: "ignore-title".to_string(),
+                domain: None,
+                title: Some("ignore-".to_string()),
+                cwd: None,
+            }],
+        };
+        let mut registry = PaneRegistry::with_filter(filter);
+        let mut initial = make_pane(pane_id, "observed");
+        initial.domain_id = Some(1);
+        registry.discovery_tick(vec![initial]);
+
+        let mut paused = make_pane(pane_id, "ignore-now");
+        paused.domain_id = Some(1);
+        let pause_diff = registry.discovery_tick(vec![paused]);
+        let revisions = HashMap::from([(pane_id, predecessor_revision)]);
+        let mut suspended = HashMap::new();
+        assert!(
+            update_suspended_capture_continuity(
+                &registry,
+                &pause_diff,
+                &revisions,
+                &mut suspended,
+            )
+            .is_empty()
+        );
+        assert!(suspended.contains_key(&pane_id));
+
+        let mut replaced_while_hidden = make_pane(pane_id, "ignore-still");
+        replaced_while_hidden.domain_id = Some(2);
+        let replacement_diff = registry.discovery_tick(vec![replaced_while_hidden]);
+        assert_eq!(replacement_diff.lifecycle_replacements, vec![pane_id]);
+        assert!(
+            update_suspended_capture_continuity(
+                &registry,
+                &replacement_diff,
+                &HashMap::new(),
+                &mut suspended,
+            )
+            .is_empty()
+        );
+        assert!(suspended.is_empty());
+
+        let mut resumed = make_pane(pane_id, "observed-again");
+        resumed.domain_id = Some(2);
+        let resume_diff = registry.discovery_tick(vec![resumed]);
+        assert_eq!(resume_diff.re_observed_panes, vec![pane_id]);
+        assert!(
+            update_suspended_capture_continuity(
+                &registry,
+                &resume_diff,
+                &HashMap::new(),
+                &mut suspended,
+            )
+            .is_empty(),
+            "a replacement hidden behind policy must require an unproven storage audit"
         );
     }
 
@@ -13314,7 +13566,10 @@ mod tests {
         assert!(pending.remember(2, DiscoveryRevision(20)));
         assert_eq!(
             pending.requirement(1, false),
-            Some(CaptureResyncRequirement::Exact(DiscoveryRevision(10)))
+            Some(CaptureResyncRequirement::Exact {
+                predecessor_revision: DiscoveryRevision(10),
+                preserve_durable_anchor: false,
+            })
         );
         assert_eq!(
             pending.requirement(2, false),
@@ -13406,6 +13661,55 @@ mod tests {
     }
 
     #[test]
+    fn policy_resume_preserves_only_the_storage_proven_durable_anchor() {
+        run_async_test(async {
+            let pane_id = 42;
+            let successor_revision = DiscoveryRevision(31);
+            let cursors = Arc::new(RwLock::new(HashMap::from([(
+                pane_id,
+                PaneCursor::from_seq(pane_id, 8),
+            )])));
+            let contexts = Arc::new(RwLock::new(HashMap::from([(
+                pane_id,
+                DetectionContext::new(),
+            )])));
+            let activity = Arc::new(RwLock::new(HashMap::<u64, PaneActivityState>::new()));
+            let checkpoints = Arc::new(StdMutex::new(LruCache::new(4)));
+            let exact_predecessor = CaptureDurabilityCheckpoint {
+                revision: DiscoveryRevision(30),
+                next_seq: 8,
+                raw_tail: "shared prompt> ".to_string(),
+            };
+
+            reset_capture_state_from_checkpoint(
+                pane_id,
+                successor_revision,
+                &exact_predecessor,
+                true,
+                &cursors,
+                &contexts,
+                &activity,
+                &checkpoints,
+            )
+            .await
+            .expect("reset policy-resumed capture from exact predecessor");
+            let segment = cursors
+                .write()
+                .await
+                .get_mut(&pane_id)
+                .expect("resumed cursor")
+                .capture_generation_resync(
+                    "shared prompt> successor output",
+                    "capture_generation_resync",
+                );
+            assert_eq!(segment.content, "successor output");
+            let checkpoint = certain_capture_checkpoint(&checkpoints, pane_id, successor_revision)
+                .expect("policy-resumed successor checkpoint");
+            assert_eq!(checkpoint.raw_tail, "shared prompt> ");
+        });
+    }
+
+    #[test]
     fn ready_transition_descriptor_survives_watch_coalescing_without_rearming_completion() {
         let pane_id = 42;
         let predecessor_revision = DiscoveryRevision(10);
@@ -13413,6 +13717,7 @@ mod tests {
         let transition = CaptureTransitionDescriptor {
             desired_revision: successor_revision,
             predecessor_revision: Some(predecessor_revision),
+            preserve_durable_anchor: true,
         };
         let mut pending = PendingCaptureResyncs::new(1);
 
@@ -13449,7 +13754,10 @@ mod tests {
         pending.observe_ready_transitions(&ready_publication, &HashMap::new());
         assert_eq!(
             pending.requirement(pane_id, false),
-            Some(CaptureResyncRequirement::Exact(predecessor_revision)),
+            Some(CaptureResyncRequirement::Exact {
+                predecessor_revision,
+                preserve_durable_anchor: true,
+            }),
             "watch coalescing directly to ready must retain exact predecessor continuity"
         );
 
