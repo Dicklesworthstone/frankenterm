@@ -2341,10 +2341,11 @@ fn allocate_capture_transition_revisions(
 ) {
     for &pane_id in transitioning_pane_ids {
         let barrier_predecessor = unresolved_barrier_predecessors.get(&pane_id).copied();
-        let durable_anchor_predecessor = barrier_predecessor
-            .is_none()
-            .then(|| durable_anchor_predecessors.get(&pane_id).copied())
-            .flatten();
+        let durable_anchor_predecessor = if barrier_predecessor.is_none() {
+            durable_anchor_predecessors.get(&pane_id).copied()
+        } else {
+            None
+        };
         let predecessor_revision = barrier_predecessor
             .or(durable_anchor_predecessor)
             .or_else(|| discovery_revisions.get(&pane_id).copied());
