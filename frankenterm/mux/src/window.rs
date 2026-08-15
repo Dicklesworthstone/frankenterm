@@ -345,7 +345,8 @@ impl Window {
         seen.try_reserve(self.tabs.len())?;
         for tab in &self.tabs {
             anyhow::ensure!(
-                seen.insert(tab.tab_id(), Arc::as_ptr(tab) as usize).is_none(),
+                seen.insert(tab.tab_id(), Arc::as_ptr(tab) as usize)
+                    .is_none(),
                 "window {} currently contains duplicate tab id {}",
                 self.id,
                 tab.tab_id(),
@@ -369,7 +370,8 @@ impl Window {
             seen.try_reserve(tabs.len())?;
             for tab in &tabs {
                 anyhow::ensure!(
-                    seen.insert(tab.tab_id(), Arc::as_ptr(tab) as usize).is_none(),
+                    seen.insert(tab.tab_id(), Arc::as_ptr(tab) as usize)
+                        .is_none(),
                     "window {} replacement contains duplicate tab id {}",
                     self.id,
                     tab.tab_id(),

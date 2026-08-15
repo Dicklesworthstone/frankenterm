@@ -20184,12 +20184,11 @@ mod tests {
                 before.ordered_tab_ids().collect::<Vec<_>>(),
             );
         }
-        assert!(
-            mux.tab_parents
-                .write()
-                .insert(tab.tab_id(), TabParentRegistration::new(&tab, source_id),)
-                .is_none()
-        );
+        assert!(mux
+            .tab_parents
+            .write()
+            .insert(tab.tab_id(), TabParentRegistration::new(&tab, source_id),)
+            .is_none());
         mux.assert_tab_parent_index_matches_windows();
 
         drop(destination);
@@ -20224,11 +20223,9 @@ mod tests {
                     window.push(&tab).expect("seed exact window membership");
                     assert!(tabs.insert(tab_id, Arc::clone(&tab)).is_none());
                     assert!(windows.insert(window_id, window).is_none());
-                    assert!(
-                        parents
-                            .insert(tab_id, TabParentRegistration::new(&tab, window_id))
-                            .is_none()
-                    );
+                    assert!(parents
+                        .insert(tab_id, TabParentRegistration::new(&tab, window_id))
+                        .is_none());
                     expected.push((tab_id, window_id));
                 }
             }
@@ -20243,8 +20240,7 @@ mod tests {
                 .load(Ordering::Relaxed)
                 .saturating_sub(probes_before);
             assert_eq!(
-                probes,
-                count,
+                probes, count,
                 "each successful parent resolution must use exactly one indexed probe",
             );
             eprintln!(
@@ -20296,19 +20292,15 @@ mod tests {
                     .expect("reserve scale parent index");
                 for window in &seeded_windows {
                     for tab in window.iter() {
-                        assert!(
-                            registered_tabs
-                                .insert(tab.tab_id(), Arc::clone(tab))
-                                .is_none()
-                        );
-                        assert!(
-                            parents
-                                .insert(
-                                    tab.tab_id(),
-                                    TabParentRegistration::new(tab, window.window_id()),
-                                )
-                                .is_none()
-                        );
+                        assert!(registered_tabs
+                            .insert(tab.tab_id(), Arc::clone(tab))
+                            .is_none());
+                        assert!(parents
+                            .insert(
+                                tab.tab_id(),
+                                TabParentRegistration::new(tab, window.window_id()),
+                            )
+                            .is_none());
                     }
                 }
                 for window in seeded_windows {
@@ -20322,10 +20314,9 @@ mod tests {
                 .and_then(|window| window.get_by_idx(0).map(|tab| tab.tab_id()))
                 .expect("target window retains its first tab");
             let writes_before = mux.tab_parent_write_cuts.load(Ordering::Relaxed);
-            assert!(
-                mux.activate_tab_at_index(target_window_id, target_tab_count - 1, false)
-                    .expect("large membership-preserving activation must commit")
-            );
+            assert!(mux
+                .activate_tab_at_index(target_window_id, target_tab_count - 1, false)
+                .expect("large membership-preserving activation must commit"));
             mux.move_tab_between_windows(
                 reorder_tab_id,
                 target_window_id,
