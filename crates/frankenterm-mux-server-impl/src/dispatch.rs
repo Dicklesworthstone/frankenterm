@@ -8714,7 +8714,7 @@ mod tests {
             tmux_control_response_at(&mux, 14, 11, "send-keys -t %42 echo Space hi Enter C-c\n");
 
         assert!(response.outcome.is_ok());
-        assert!(response.output.is_empty());
+        assert_eq!(response.output.len(), 0);
         assert_eq!(pane.written_bytes(), b"echo hi\r\x03");
     }
 
@@ -9165,7 +9165,7 @@ mod tests {
         )
         .expect("terminal dispatch admission should be an explicit outcome");
         assert_eq!(rejected, RequestDispatchOutcome::Terminal);
-        assert!(rejected_mux.iter_clients().is_empty());
+        assert_eq!(rejected_mux.iter_clients().len(), 0);
         assert!(rejected_responses.lock().is_empty());
 
         let (coordinator, item_rx, _terminal_rx, _, _) = bound_topology_coordinator();
@@ -11797,7 +11797,7 @@ mod tests {
             OutboundService::Terminal
         );
         assert_eq!(pending.offset, 0);
-        assert!(stream.bytes.is_empty());
+        assert_eq!(stream.bytes.len(), 0);
         assert_eq!(stream.flush_calls.load(Ordering::Relaxed), 0);
         drop(pending);
 
@@ -11841,7 +11841,7 @@ mod tests {
             OutboundService::Terminal
         );
         assert_eq!(retired_batch.offset, 0);
-        assert!(stream.bytes.is_empty());
+        assert_eq!(stream.bytes.len(), 0);
         assert_eq!(stream.flush_calls.load(Ordering::Relaxed), 0);
         drop(retired_batch);
 

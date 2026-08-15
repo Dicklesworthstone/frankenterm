@@ -7353,8 +7353,8 @@ mod tests {
         };
         assert_eq!(snapshot.session_incarnation, expected_authority.0);
         assert_eq!(snapshot.snapshot_revision, expected_authority.1);
-        assert!(snapshot.panes.tabs.is_empty());
-        assert!(snapshot.panes.tab_titles.is_empty());
+        assert_eq!(snapshot.panes.tabs.len(), 0);
+        assert_eq!(snapshot.panes.tab_titles.len(), 0);
         assert!(snapshot.panes.window_titles.is_empty());
     }
 
@@ -8229,7 +8229,7 @@ mod tests {
         assert_eq!(snapshot.z_order, 71);
         assert!(snapshot.visible);
         assert!(!snapshot.pinned);
-        assert_eq!(snapshot.opacity, 1.0);
+        assert_eq!(snapshot.opacity.to_bits(), 1.0_f32.to_bits());
         assert!(snapshot.focused);
         assert!(snapshot.pane.is_active_pane);
         assert!(!snapshot.pane.is_zoomed_pane);
@@ -10627,7 +10627,7 @@ mod tests {
         drop(slot_three);
         assert_eq!(mux_client_set(&mux), HashSet::from([client_five]));
         drop(slot_two);
-        assert!(mux.iter_clients().is_empty());
+        assert_eq!(mux.iter_clients().len(), 0);
     }
 
     #[test]
@@ -12228,7 +12228,7 @@ mod tests {
         assert_eq!(prepared.surface.title, "tiered-pane");
         assert_eq!(prepared.surface.cursor_position.x, 4);
         assert_eq!(prepared.surface.dimensions.cols, 80);
-        assert!(prepared.semantic_zones.zones.is_empty());
+        assert_eq!(prepared.semantic_zones.zones.len(), 0);
         assert!(prepared.palette.is_some());
         assert_eq!(prepared.alerts.len(), 1);
 
@@ -13639,7 +13639,7 @@ mod tests {
             .expect("pane surface preparation should succeed")
             .expect("clearing tiered scrollback status should produce a response");
 
-        assert!(response.dirty_lines.is_empty());
+        assert_eq!(response.dirty_lines.len(), 0);
         assert_eq!(response.tiered_scrollback_status, None);
         assert_eq!(per_pane.baseline.tiered_scrollback_status, None);
     }
@@ -13726,7 +13726,7 @@ mod tests {
         let cursor_y = response.cursor_position.y;
         let (bonus_lines, _images) = response.bonus_lines.extract_data();
 
-        assert!(bonus_lines.is_empty());
+        assert_eq!(bonus_lines.len(), 0);
         assert_eq!(cursor_y, 99);
     }
 
@@ -13750,7 +13750,7 @@ mod tests {
 
         assert_eq!(bonus_lines.len(), 1);
         assert_eq!(bonus_lines[0].0, 0);
-        assert!(response.dirty_lines.is_empty());
+        assert_eq!(response.dirty_lines.len(), 0);
     }
 
     #[test]
