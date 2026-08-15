@@ -7888,16 +7888,19 @@ mod tests {
                 .get_pane_render_changes_batch(&[7], 1, Duration::from_secs(5))
                 .await
                 .expect_err("local plus global sidebands must share one byte cap");
-            assert!(matches!(
-                error,
-                DirectMuxError::RetentionLimitExceeded {
-                    resource: "pending unilateral render changes",
-                    requested_count: 2,
-                    requested_bytes,
-                    max_bytes,
-                    ..
-                } if requested_bytes == aggregate_bytes && max_bytes == byte_limit
-            ));
+            assert!(
+                matches!(
+                    &error,
+                    DirectMuxError::RetentionLimitExceeded {
+                        resource: "pending unilateral render changes",
+                        requested_count: 2,
+                        requested_bytes,
+                        max_bytes,
+                        ..
+                    } if *requested_bytes == aggregate_bytes && *max_bytes == byte_limit
+                ),
+                "unexpected shared-cap error: {error:?}"
+            );
             assert!(client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 1);
             assert!(client.outstanding_requests.is_empty());
@@ -13079,13 +13082,40 @@ mod tests {
     fn codec_overlap_is_retained_per_connection_for_ambient_and_explicit_cx() {
         run_async_test(async {
             let mut prior_connection_id = None;
+            let future_codec = CODEC_VERSION
+                .checked_add(2)
+                .expect("test codec version must leave future-version headroom");
             for (case_idx, explicit_cx, remote_max, remote_min, expected_agreed) in [
-                (0, false, 50, 46, 50),
-                (1, true, 50, 46, 50),
-                (2, false, 52, 51, 51),
-                (3, true, 52, 51, 51),
-                (4, false, 50, 0, 50),
-                (5, true, 50, 0, 50),
+                (
+                    0,
+                    false,
+                    CODEC_VERSION,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                    CODEC_VERSION,
+                ),
+                (
+                    1,
+                    true,
+                    CODEC_VERSION,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                    CODEC_VERSION,
+                ),
+                (
+                    2,
+                    false,
+                    future_codec,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                    CODEC_VERSION,
+                ),
+                (
+                    3,
+                    true,
+                    future_codec,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                    CODEC_VERSION,
+                ),
+                (4, false, CODEC_VERSION, 0, CODEC_VERSION),
+                (5, true, CODEC_VERSION, 0, CODEC_VERSION),
             ] {
                 let temp_dir = tempfile::tempdir().expect("tempdir");
                 let socket_path = temp_dir
