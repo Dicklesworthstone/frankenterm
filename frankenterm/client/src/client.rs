@@ -8117,11 +8117,9 @@ mod tests {
         let records = logger.records.lock().expect("test logger lock");
         assert_eq!(records.len(), MAX_CAPTURED_COMPAT_WARNINGS);
         assert!(records.iter().all(|record| record.starts_with("WARN ")));
-        assert!(
-            records
-                .last()
-                .is_some_and(|record| record.ends_with("server=31"))
-        );
+        assert!(records
+            .last()
+            .is_some_and(|record| record.ends_with("server=31")));
     }
 
     fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
