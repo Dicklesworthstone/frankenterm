@@ -12906,7 +12906,7 @@ mod tests {
             fn on_event(
                 &self,
                 _event: crate::recording::RecorderEvent,
-                _merge_key: crate::recording::RecorderMergeKey,
+                _merge_key: crate::event_id::RecorderMergeKey,
             ) {
                 self.entered.send(()).expect("announce blocked replay sink");
                 self.release
