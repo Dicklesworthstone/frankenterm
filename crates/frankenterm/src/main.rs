@@ -37477,7 +37477,7 @@ fn distributed_seq_gap_reason(sender: &str, expected: u64, actual: u64) -> Strin
     )
 }
 
-#[cfg(feature = "distributed")]
+#[cfg(all(feature = "distributed", test))]
 async fn distributed_register_sequence_scope(
     ingest_state: &DistributedIngestState,
     sequence_scope: &str,
