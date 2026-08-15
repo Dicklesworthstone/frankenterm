@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// Relocated from `wezterm.rs` per ft-zoxxq.2. The serde shape is
 /// preserved exactly — adding `#[serde(default)]` to every field keeps
 /// the on-the-wire JSON identical to the pre-rename payload.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSize {
     /// Number of rows (character cells)
     #[serde(default)]

@@ -18,7 +18,7 @@
 //! The runtime explicitly enforces that the observation loop never calls any
 //! send/act APIs - it is purely passive.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -69,8 +69,10 @@ use crate::fleet_scrollback_coordinator::{
 use crate::gc::{CacheCompactionStats, compact_u64_map};
 use crate::gc::{CacheGcSettings, should_vacuum};
 use crate::ingest::{
-    CapturedSegment, CapturedSegmentKind, PaneCursor, PaneRegistry, PersistedCapture,
-    bounded_segment_for_persistence, persist_authorized_captured_segment_with_zone_with_cx,
+    CapturedSegment, CapturedSegmentKind, PaneCursor, PaneLifecycleContinuity,
+    PaneLifecycleIdentity, PaneLifecycleRevision, PaneMetadataChange, PaneMetadataRevision,
+    PaneRegistry, PersistedCapture, bounded_segment_for_persistence,
+    persist_authorized_captured_segment_with_zone_with_cx,
 };
 use crate::lru_cache::LruCache;
 use crate::memory_budget::BudgetLevel;
@@ -87,7 +89,6 @@ use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::{ShardId, try_decode_sharded_pane_id};
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
-#[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
 use crate::storage::{MaintenanceRecord, SizeEvictionOutcome, StorageHandle, StoredEvent};
 #[cfg(all(feature = "vendored", unix))]
@@ -1110,7 +1111,7 @@ enum StreamingTaskReconcileAction {
 #[cfg(all(feature = "vendored", unix))]
 // The socket route table is immutable for the lifetime of the capture task,
 // and global pane id deterministically selects its shard-local route. Comparing
-// global id plus PaneEntry generation therefore avoids cloning PathBuf routes
+// global ID plus the pane lifecycle revision therefore avoids cloning PathBuf routes
 // for every active pane on every discovery tick.
 fn streaming_task_reconcile_action(
     active: &StreamingSubscriptionIdentity,
@@ -1931,7 +1932,8 @@ impl DiscoveryRevision {
 #[derive(Clone, Debug)]
 struct ObservedCapturePane {
     info: PaneInfo,
-    generation: u32,
+    lifecycle_identity: PaneLifecycleIdentity,
+    lifecycle_revision: PaneLifecycleRevision,
     pane_uuid: String,
     revision: DiscoveryRevision,
     requires_storage_resync: bool,
@@ -1941,6 +1943,147 @@ struct ObservedCapturePane {
 struct CaptureTransitionDescriptor {
     desired_revision: DiscoveryRevision,
     predecessor_revision: Option<DiscoveryRevision>,
+}
+
+const PANE_METADATA_DEBOUNCE_TICKS: u8 = 2;
+const PANE_METADATA_MAX_WRITES_PER_TICK: usize = 64;
+
+#[derive(Clone)]
+struct PendingPaneMetadataWrite {
+    lifecycle_revision: PaneLifecycleRevision,
+    metadata_revision: PaneMetadataRevision,
+    record: PaneRecord,
+    age_ticks: u8,
+}
+
+/// Capacity-bounded latest-wins metadata persistence owned by discovery.
+///
+/// One entry exists per currently tracked numeric pane ID. Repeated title,
+/// cwd, geometry, cursor, focus, or display-name updates replace the payload
+/// without resetting its debounce age, so continuous churn cannot postpone
+/// persistence forever and cannot enqueue one storage write per discovery tick.
+#[derive(Default)]
+struct PaneMetadataWriteQueue {
+    pending: HashMap<u64, PendingPaneMetadataWrite>,
+    coalesced_updates: u64,
+    committed_writes: u64,
+}
+
+impl PaneMetadataWriteQueue {
+    fn age_one_tick(&mut self) {
+        for pending in self.pending.values_mut() {
+            pending.age_ticks = pending.age_ticks.saturating_add(1);
+        }
+    }
+
+    fn stage(&mut self, change: PaneMetadataChange, record: PaneRecord) {
+        match self.pending.entry(change.pane_id) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                let current_revision = (
+                    occupied.get().lifecycle_revision,
+                    occupied.get().metadata_revision,
+                );
+                let incoming_revision = (change.lifecycle_revision, change.metadata_revision);
+                if incoming_revision < current_revision {
+                    return;
+                }
+                let age_ticks = occupied.get().age_ticks;
+                occupied.insert(PendingPaneMetadataWrite {
+                    lifecycle_revision: change.lifecycle_revision,
+                    metadata_revision: change.metadata_revision,
+                    record,
+                    age_ticks,
+                });
+                self.coalesced_updates = self.coalesced_updates.saturating_add(1);
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(PendingPaneMetadataWrite {
+                    lifecycle_revision: change.lifecycle_revision,
+                    metadata_revision: change.metadata_revision,
+                    record,
+                    age_ticks: 0,
+                });
+            }
+        }
+    }
+
+    fn remove(&mut self, pane_id: u64) {
+        if self.pending.remove(&pane_id).is_some() {
+            shrink_runtime_pane_map_if_sparse(&mut self.pending);
+        }
+    }
+
+    fn take_due(&mut self) -> Vec<(u64, PendingPaneMetadataWrite)> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        // Keep only the smallest bounded set while scanning. This avoids a
+        // qN temporary allocation and an O(N log N) full sort on every busy
+        // discovery tick. Successfully removed low IDs are not due again for
+        // two ticks, so the remaining IDs make deterministic forward progress.
+        let mut selected = BinaryHeap::with_capacity(PANE_METADATA_MAX_WRITES_PER_TICK);
+        for (&pane_id, pending) in &self.pending {
+            if pending.age_ticks < PANE_METADATA_DEBOUNCE_TICKS {
+                continue;
+            }
+            if selected.len() < PANE_METADATA_MAX_WRITES_PER_TICK {
+                selected.push(pane_id);
+            } else if selected.peek().is_some_and(|largest| pane_id < *largest) {
+                selected.pop();
+                selected.push(pane_id);
+            }
+        }
+        let mut pane_ids = selected.into_vec();
+        pane_ids.sort_unstable();
+        let due = pane_ids
+            .into_iter()
+            .filter_map(|pane_id| self.pending.remove(&pane_id).map(|write| (pane_id, write)))
+            .collect::<Vec<_>>();
+        shrink_runtime_pane_map_if_sparse(&mut self.pending);
+        due
+    }
+
+    fn take_all(&mut self) -> Vec<(u64, PendingPaneMetadataWrite)> {
+        let mut writes = self.pending.drain().collect::<Vec<_>>();
+        writes.sort_unstable_by_key(|(pane_id, _)| *pane_id);
+        shrink_runtime_pane_map_if_sparse(&mut self.pending);
+        writes
+    }
+
+    fn retry(&mut self, pane_id: u64, mut write: PendingPaneMetadataWrite) {
+        // A record-specific failure must not monopolize every bounded batch.
+        // Re-enter behind the debounce window so other due pane IDs progress;
+        // shutdown's `take_all` still includes this latest record immediately.
+        write.age_ticks = 0;
+        match self.pending.entry(pane_id) {
+            std::collections::hash_map::Entry::Occupied(occupied) => {
+                let current_revision = (
+                    occupied.get().lifecycle_revision,
+                    occupied.get().metadata_revision,
+                );
+                let retry_revision = (write.lifecycle_revision, write.metadata_revision);
+                if current_revision < retry_revision {
+                    let mut occupied = occupied;
+                    occupied.insert(write);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(write);
+            }
+        }
+    }
+
+    fn record_commit(&mut self) {
+        self.committed_writes = self.committed_writes.saturating_add(1);
+    }
+
+    fn telemetry(&self) -> (usize, u64, u64) {
+        (
+            self.pending.len(),
+            self.coalesced_updates,
+            self.committed_writes,
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1988,14 +2131,18 @@ fn terminal_retired_pane_ids(
 /// Build the strongest capture view that can be justified from a fresh mux
 /// listing without mutating the registry or awaiting storage.
 ///
-/// Existing panes are retained only when the generation-defining metadata
-/// still matches exactly. Missing IDs are terminally absent; new or changed
-/// IDs are marked as transitioning. Duplicate IDs are ambiguous and therefore
-/// excluded. Installing this view before stable-UUID I/O closes predecessor
-/// admission across that await.
+/// Existing panes are retained only when their authoritative lifecycle
+/// evidence still proves continuity. Mutable title, cwd, placement, geometry,
+/// cursor, focus, zoom, and display-name drift deliberately does not withdraw
+/// capture unless the current title/cwd/domain now fails the configured pane
+/// filter. Missing IDs and filter denials are terminally absent; new or
+/// identity-conflicting IDs are marked as transitioning. Duplicate IDs are
+/// ambiguous and therefore excluded. Installing this view before stable-UUID
+/// I/O closes predecessor admission across that await.
 fn conservative_capture_view_before_storage(
     previous: &HashMap<u64, ObservedCapturePane>,
     panes: &[PaneInfo],
+    pane_filter: &PaneFilterConfig,
 ) -> (Arc<HashMap<u64, ObservedCapturePane>>, Arc<HashSet<u64>>) {
     let mut listed = HashMap::<u64, &PaneInfo>::with_capacity(panes.len());
     let mut duplicate_ids = HashSet::new();
@@ -2015,12 +2162,31 @@ fn conservative_capture_view_before_storage(
             transitioning.insert(pane_id);
             continue;
         }
-        let previous_fingerprint = crate::ingest::PaneFingerprint::without_content(&observed.info);
-        let listed_fingerprint = crate::ingest::PaneFingerprint::without_content(listed_pane);
-        if previous_fingerprint.is_same_generation(&listed_fingerprint) {
-            retained.insert(pane_id, observed.clone());
-        } else {
-            transitioning.insert(pane_id);
+        if pane_filter.has_rules()
+            && pane_filter
+                .check_pane(
+                    &listed_pane.inferred_domain(),
+                    listed_pane.title.as_deref().unwrap_or(""),
+                    listed_pane.cwd.as_deref().unwrap_or(""),
+                )
+                .is_some()
+        {
+            // A filter denial is terminal observation authority, not a pane
+            // restart. Withdraw it before any stable-UUID/storage await, but
+            // do not manufacture a lifecycle transition or resync obligation.
+            continue;
+        }
+        let listed_identity = PaneLifecycleIdentity::from_pane_info(listed_pane);
+        match observed
+            .lifecycle_identity
+            .continuity_with(&listed_identity)
+        {
+            PaneLifecycleContinuity::Same => {
+                retained.insert(pane_id, observed.clone());
+            }
+            PaneLifecycleContinuity::Replaced | PaneLifecycleContinuity::Ambiguous => {
+                transitioning.insert(pane_id);
+            }
         }
     }
     for pane in panes {
@@ -2037,7 +2203,7 @@ fn conservative_capture_view_before_storage(
 /// Discovery may still fail while recovering stable UUIDs, before the registry
 /// consumes the listing. The watch publication has already withdrawn those
 /// panes at that point, so this side ledger must outlive the failed tick or a
-/// same-fingerprint reappearance could otherwise reuse the predecessor's
+/// same-looking reappearance could otherwise reuse the predecessor's
 /// capture revision.
 fn remember_withheld_barrier_predecessors(
     unresolved: &mut HashMap<u64, DiscoveryRevision>,
@@ -2158,7 +2324,8 @@ fn capture_publication_view(
             pane_id,
             ObservedCapturePane {
                 info: entry.info.clone(),
-                generation: entry.generation,
+                lifecycle_identity: entry.lifecycle_identity.clone(),
+                lifecycle_revision: entry.lifecycle_revision,
                 pane_uuid: entry.pane_uuid.clone(),
                 revision,
                 requires_storage_resync: storage_resync_revisions.get(&pane_id).copied()
@@ -2176,7 +2343,8 @@ fn capture_publication_identity_matches(
     left.len() == right.len()
         && left.iter().all(|(pane_id, left_pane)| {
             right.get(pane_id).is_some_and(|right_pane| {
-                left_pane.generation == right_pane.generation
+                left_pane.lifecycle_identity == right_pane.lifecycle_identity
+                    && left_pane.lifecycle_revision == right_pane.lifecycle_revision
                     && left_pane.pane_uuid == right_pane.pane_uuid
                     && left_pane.revision == right_pane.revision
                     && left_pane.requires_storage_resync == right_pane.requires_storage_resync
@@ -2437,7 +2605,7 @@ struct CapturePaneMetadata {
 }
 
 struct ActiveCaptureBinding {
-    generation: u32,
+    lifecycle_revision: PaneLifecycleRevision,
     pane_uuid: String,
     revision: DiscoveryRevision,
     identity: ActivePaneIdentity,
@@ -2489,7 +2657,7 @@ fn pending_capture_resync_disposition(
 
 impl ActiveCaptureBinding {
     fn matches_observed(&self, pane: &ObservedCapturePane) -> bool {
-        self.generation == pane.generation
+        self.lifecycle_revision == pane.lifecycle_revision
             && self.pane_uuid == pane.pane_uuid
             && self.revision == pane.revision
     }
@@ -2645,12 +2813,15 @@ async fn admit_capture_event_for_persistence(
             .observed_panes
             .get(&event.segment.pane_id)
             .is_some_and(|pane| {
-                (pane.pane_uuid.as_str(), pane.generation, pane.revision)
-                    == (
-                        metadata.pane_uuid.as_str(),
-                        metadata.discovery_generation,
-                        metadata.discovery_revision,
-                    )
+                (
+                    pane.pane_uuid.as_str(),
+                    pane.lifecycle_revision.get(),
+                    pane.revision,
+                ) == (
+                    metadata.pane_uuid.as_str(),
+                    metadata.discovery_generation,
+                    metadata.discovery_revision,
+                )
             })
     };
     if !is_current {
@@ -2726,7 +2897,7 @@ async fn activate_capture_binding(
     cx: &RuntimeLoopCx,
     authority: &CaptureAuthority,
     global_pane_id: u64,
-    generation: u32,
+    lifecycle_revision: PaneLifecycleRevision,
     capture_metadata: &Arc<RwLock<HashMap<PaneIncarnation, CapturePaneMetadata>>>,
     metadata: CapturePaneMetadata,
 ) -> Result<ActiveCaptureBinding> {
@@ -2758,7 +2929,7 @@ async fn activate_capture_binding(
     };
 
     Ok(ActiveCaptureBinding {
-        generation,
+        lifecycle_revision,
         pane_uuid,
         revision,
         identity,
@@ -3430,8 +3601,8 @@ pub struct RuntimeMetrics {
     capture_queue_depth: AtomicUsize,
     /// ft-u6zfw: crash-loop detector fed by observed agent/pane restarts so
     /// `HealthSnapshot` surfaces real crash loops instead of hardcoded healthy
-    /// zeros. Fed from the discovery tick's `new_generations` (panes that
-    /// respawned with a new generation) — the runtime's available restart
+    /// zeros. Fed from authoritative lifecycle replacements (panes that
+    /// respawned with a new lifecycle revision) — the runtime's available restart
     /// signal — so managed-agent crash loops become visible to `ft status` /
     /// robot health, which were previously invisible. A process-level
     /// watcher-restart source would need cross-process persistence (follow-up).
@@ -3527,10 +3698,10 @@ impl Default for RuntimeMetrics {
 }
 
 impl RuntimeMetrics {
-    /// ft-u6zfw: feed observed agent/pane restarts (panes that gained a new
-    /// generation this discovery tick) into the crash-loop detector. `now_secs`
-    /// is wall-clock epoch seconds. Recording each restart lets the detector's
-    /// windowed `is_crash_loop` + `restart_count` reflect real respawn storms.
+    /// ft-u6zfw: feed authoritative agent/pane lifecycle replacements into the
+    /// crash-loop detector. `now_secs` is wall-clock epoch seconds. Recording
+    /// each replacement lets the detector's windowed `is_crash_loop` +
+    /// `restart_count` reflect real respawn storms.
     pub fn record_observed_restarts(&self, restarts: usize, now_secs: u64) {
         if restarts == 0 {
             return;
@@ -3881,6 +4052,18 @@ impl RuntimeMetrics {
 
     pub fn native_output_max_batch_bytes(&self) -> u64 {
         self.native_output_max_batch_bytes.get()
+    }
+}
+
+fn record_discovery_lifecycle_health(
+    metrics: &RuntimeMetrics,
+    lifecycle_replacements: usize,
+    now_secs: u64,
+) {
+    if lifecycle_replacements == 0 {
+        metrics.note_clean_observation();
+    } else {
+        metrics.record_observed_restarts(lifecycle_replacements, now_secs);
     }
 }
 
@@ -5641,6 +5824,7 @@ impl ObservationRuntime {
         let wezterm = Arc::clone(&self.wezterm_handle);
         let replay_capture = self.replay_capture.clone();
         let capture_authority = self.capture_authority.clone();
+        let pane_filter = self.config.pane_filter.clone();
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
@@ -5654,6 +5838,7 @@ impl ObservationRuntime {
             let mut last_capture_view = Arc::new(HashMap::<u64, ObservedCapturePane>::new());
             let mut unresolved_barrier_predecessors = HashMap::<u64, DiscoveryRevision>::new();
             let mut capture_setup_pending = HashMap::<u64, &'static str>::new();
+            let mut metadata_writes = PaneMetadataWriteQueue::default();
 
             'discovery: loop {
                 if first_tick {
@@ -5716,6 +5901,7 @@ impl ObservationRuntime {
                             conservative_capture_view_before_storage(
                                 &previous_capture_view,
                                 &panes,
+                                &pane_filter,
                             );
                         if let Err(error) = publish_discovery_capture_view(
                             &discovery_publication_tx,
@@ -5778,7 +5964,8 @@ impl ObservationRuntime {
                                     .map(|pane_uuid| (record.pane_id, pane_uuid))
                             })
                             .collect::<HashMap<_, _>>();
-                        let (diff, new_entries, pending_capture_view) = {
+                        metadata_writes.age_one_tick();
+                        let (diff, new_entries, metadata_entries, pending_capture_view) = {
                             let mut reg = registry.write().await;
                             let diff = reg.discovery_tick(panes);
                             let (confirmed_terminal, forced_transitions) =
@@ -5828,6 +6015,7 @@ impl ObservationRuntime {
                                 &mut capture_setup_pending,
                             );
                             for pane_id in &diff.closed_panes {
+                                metadata_writes.remove(*pane_id);
                                 discovery_revisions.remove(pane_id);
                                 storage_resync_revisions.remove(pane_id);
                                 capture_transitions.remove(pane_id);
@@ -5841,10 +6029,14 @@ impl ObservationRuntime {
                             for pane_id in &diff.re_observed_panes {
                                 capture_setup_pending.insert(*pane_id, "observation_resumed");
                             }
+                            for pane_id in &diff.lifecycle_replacements {
+                                metadata_writes.remove(*pane_id);
+                                capture_setup_pending.insert(*pane_id, "lifecycle_replaced");
+                            }
                             let mut transitioning_pane_ids = diff
                                 .new_panes
                                 .iter()
-                                .chain(&diff.new_generations)
+                                .chain(&diff.lifecycle_replacements)
                                 .chain(&diff.re_observed_panes)
                                 .copied()
                                 .collect::<Vec<_>>();
@@ -5864,8 +6056,10 @@ impl ObservationRuntime {
                                 &mut unresolved_barrier_predecessors,
                                 &mut storage_resync_revisions,
                             );
-                            for pane_id in
-                                diff.new_generations.iter().chain(&diff.re_observed_panes)
+                            for pane_id in diff
+                                .lifecycle_replacements
+                                .iter()
+                                .chain(&diff.re_observed_panes)
                             {
                                 if let Some(revision) = discovery_revisions.get(pane_id).copied() {
                                     storage_resync_revisions.insert(*pane_id, revision);
@@ -5897,15 +6091,76 @@ impl ObservationRuntime {
                                         .map(|entry| (*pane_id, entry))
                                 })
                                 .collect();
-                            (diff, new_entries, pending_capture_view)
+                            let mut metadata_entries = diff
+                                .metadata_changes
+                                .iter()
+                                .filter_map(|change| {
+                                    reg.get_entry(change.pane_id).and_then(|entry| {
+                                        (entry.lifecycle_revision == change.lifecycle_revision
+                                            && entry.metadata_revision == change.metadata_revision)
+                                            .then(|| (*change, entry.to_pane_record()))
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            // An initially ignored pane never enters capture
+                            // setup, but its explicit observed=false decision
+                            // and reason are still durable operator metadata.
+                            // Stage it through the bounded queue; a later
+                            // re-admission will supersede this record and use
+                            // immediate capture setup as usual.
+                            for (pane_id, entry) in &new_entries {
+                                if entry.should_observe() {
+                                    continue;
+                                }
+                                metadata_entries.push((
+                                    PaneMetadataChange {
+                                        pane_id: *pane_id,
+                                        lifecycle_revision: entry.lifecycle_revision,
+                                        metadata_revision: entry.metadata_revision,
+                                        diff: Default::default(),
+                                    },
+                                    entry.to_pane_record(),
+                                ));
+                            }
+                            // Exhausting the metadata revision namespace is a
+                            // terminal fail-closed state. There is no successor
+                            // revision to allocate, but the latest ignored
+                            // record still must reach storage rather than leave
+                            // the durable row claiming capture is active. The
+                            // queue revalidates the exact saturated revision
+                            // before committing this one final record.
+                            for pane_id in &diff.revision_exhausted_panes {
+                                // `PaneRegistry` emits ordinary metadata or
+                                // terminal exhaustion for a pane, never both
+                                // in one tick. Rely on that disjoint contract
+                                // instead of scanning the growing metadata
+                                // vector for every saturated member.
+                                if let Some(entry) = reg.get_entry(*pane_id) {
+                                    metadata_entries.push((
+                                        PaneMetadataChange {
+                                            pane_id: *pane_id,
+                                            lifecycle_revision: entry.lifecycle_revision,
+                                            metadata_revision: entry.metadata_revision,
+                                            diff: Default::default(),
+                                        },
+                                        entry.to_pane_record(),
+                                    ));
+                                }
+                            }
+                            (diff, new_entries, metadata_entries, pending_capture_view)
                         };
 
+                        for (change, record) in metadata_entries {
+                            metadata_writes.stage(change, record);
+                        }
+
                         // Publish a transition-pending identity view before any
-                        // storage/cursor setup awaits.  Changed, closed, newly
-                        // observed, and replacement pane IDs are absent here,
+                        // storage/cursor setup awaits. Closed, newly observed,
+                        // and lifecycle-replacement pane IDs are absent here,
                         // so predecessor persistence admission closes before a
                         // poll can read a reused live mux pane and attribute it
-                        // to the old revision.
+                        // to the old revision. Metadata-only updates remain
+                        // admitted under the existing exact revision.
                         if let Some((pending_capture_view, transitioning_pane_ids)) =
                             pending_capture_view
                             && let Err(error) = publish_discovery_capture_view(
@@ -5983,13 +6238,13 @@ impl ObservationRuntime {
                             debug!(pane_id = pane_id, "Stopped observing pane (closed)");
                         }
 
-                        // Handle new generations (pane restarted)
-                        for pane_id in &diff.new_generations {
+                        // Handle authoritative lifecycle replacement.
+                        for pane_id in &diff.lifecycle_replacements {
                             // Do NOT reset cursor seq to 0, it causes DB constraint violations.
                             // We keep capturing monotonically on the same pane_id.
                             debug!(
                                 pane_id = pane_id,
-                                "Restarted observing pane (new generation)"
+                                "Restarted observing pane (lifecycle replacement)"
                             );
                         }
 
@@ -6028,6 +6283,7 @@ impl ObservationRuntime {
                                 );
                                 continue;
                             }
+                            metadata_writes.remove(pane_id);
                             if !entry.should_observe() {
                                 capture_setup_pending.remove(&pane_id);
                                 continue;
@@ -6055,6 +6311,37 @@ impl ObservationRuntime {
                                 ) {
                                     adapter.record_sequence_error("runtime.capture_started", error);
                                 }
+                            }
+                        }
+
+                        let mut metadata_committed_this_tick = 0_usize;
+                        for (pane_id, write) in metadata_writes.take_due() {
+                            let still_current = {
+                                let reg = registry.read().await;
+                                reg.get_entry(pane_id).is_some_and(|entry| {
+                                    entry.lifecycle_revision == write.lifecycle_revision
+                                        && entry.metadata_revision == write.metadata_revision
+                                })
+                            };
+                            if !still_current {
+                                continue;
+                            }
+                            if let Err(error) = storage
+                                .upsert_pane_with_cx(&loop_cx, write.record.clone())
+                                .await
+                            {
+                                warn!(
+                                    pane_id,
+                                    lifecycle_revision = write.lifecycle_revision.get(),
+                                    metadata_revision = write.metadata_revision.get(),
+                                    error = %error,
+                                    "Pane metadata persistence remains pending"
+                                );
+                                metadata_writes.retry(pane_id, write);
+                            } else {
+                                metadata_writes.record_commit();
+                                metadata_committed_this_tick =
+                                    metadata_committed_this_tick.saturating_add(1);
                             }
                         }
 
@@ -6087,14 +6374,25 @@ impl ObservationRuntime {
                         }
                         if !diff.new_panes.is_empty()
                             || !diff.closed_panes.is_empty()
-                            || !diff.new_generations.is_empty()
+                            || !diff.metadata_changes.is_empty()
+                            || !diff.lifecycle_replacements.is_empty()
                             || !diff.re_observed_panes.is_empty()
+                            || !diff.ambiguous_lifecycle_panes.is_empty()
+                            || !diff.revision_exhausted_panes.is_empty()
+                            || metadata_committed_this_tick > 0
                         {
+                            let (metadata_pending, metadata_coalesced, metadata_committed) =
+                                metadata_writes.telemetry();
                             debug!(
                                 new = diff.new_panes.len(),
                                 closed = diff.closed_panes.len(),
-                                restarted = diff.new_generations.len(),
+                                lifecycle_replaced = diff.lifecycle_replacements.len(),
                                 re_observed = diff.re_observed_panes.len(),
+                                metadata_changed = diff.metadata_changes.len(),
+                                metadata_pending,
+                                metadata_coalesced,
+                                metadata_committed,
+                                metadata_committed_this_tick,
                                 "Pane discovery tick"
                             );
                         }
@@ -6104,14 +6402,11 @@ impl ObservationRuntime {
                         let crash_now_secs = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |elapsed| elapsed.as_secs());
-                        if diff.new_generations.is_empty() {
-                            crash_metrics.note_clean_observation();
-                        } else {
-                            crash_metrics.record_observed_restarts(
-                                diff.new_generations.len(),
-                                crash_now_secs,
-                            );
-                        }
+                        record_discovery_lifecycle_health(
+                            &crash_metrics,
+                            diff.lifecycle_replacements.len(),
+                            crash_now_secs,
+                        );
 
                         let setup_excluded = capture_setup_pending
                             .keys()
@@ -6147,6 +6442,40 @@ impl ObservationRuntime {
                     Err(e) => {
                         heartbeats.record_discovery();
                         warn!(error = %e, "Failed to list panes");
+                    }
+                }
+            }
+
+            if shutdown_flag.load(Ordering::SeqCst) {
+                // The later StorageHandle flush cannot see discovery's
+                // in-memory debounce queue. Drain the latest record for each
+                // still-current pane while the graceful task-join timeout owns
+                // this cleanup. A fresh context avoids inheriting an already
+                // cancelled request; forced task cancellation still bounds it.
+                let shutdown_cx = crate::cx::for_request();
+                for (pane_id, write) in metadata_writes.take_all() {
+                    let still_current = {
+                        let reg = registry.read().await;
+                        reg.get_entry(pane_id).is_some_and(|entry| {
+                            entry.lifecycle_revision == write.lifecycle_revision
+                                && entry.metadata_revision == write.metadata_revision
+                        })
+                    };
+                    if !still_current {
+                        continue;
+                    }
+                    match storage
+                        .upsert_pane_with_cx(&shutdown_cx, write.record)
+                        .await
+                    {
+                        Ok(()) => metadata_writes.record_commit(),
+                        Err(error) => warn!(
+                            pane_id,
+                            lifecycle_revision = write.lifecycle_revision.get(),
+                            metadata_revision = write.metadata_revision.get(),
+                            error = %error,
+                            "Graceful shutdown could not persist latest pane metadata"
+                        ),
                     }
                 }
             }
@@ -6875,11 +7204,11 @@ impl ObservationRuntime {
                             &loop_cx,
                             &capture_authority,
                             pane_id,
-                            observed.generation,
+                            observed.lifecycle_revision,
                             &capture_metadata,
                             CapturePaneMetadata {
                                 pane_uuid: observed.pane_uuid.clone(),
-                                discovery_generation: observed.generation,
+                                discovery_generation: observed.lifecycle_revision.get(),
                                 discovery_revision: observed.revision,
                             },
                         )
@@ -7028,7 +7357,7 @@ impl ObservationRuntime {
                             Err(error) => {
                                 error!(
                                     pane_id,
-                                    generation = observed.generation,
+                                    generation = observed.lifecycle_revision.get(),
                                     error = %error,
                                     "Failed to activate capture pane authority"
                                 );
@@ -7082,7 +7411,11 @@ impl ObservationRuntime {
                                     observed_panes_cache.get(pane_id).and_then(|pane| {
                                         capture_bindings.get(pane_id).and_then(|binding| {
                                             binding.streaming_lease.as_ref().map(|lease| {
-                                                (*pane_id, pane.generation, lease.stamp())
+                                                (
+                                                    *pane_id,
+                                                    pane.lifecycle_revision.get(),
+                                                    lease.stamp(),
+                                                )
                                             })
                                         })
                                     });
@@ -7173,7 +7506,7 @@ impl ObservationRuntime {
                                 if !socket_path.exists() {
                                     debug!(
                                         pane_id,
-                                        generation = observed_pane.generation,
+                                        generation = observed_pane.lifecycle_revision.get(),
                                         local_pane_id,
                                         socket_shard = socket_shard.0,
                                         path = %socket_path.display(),
@@ -7187,7 +7520,7 @@ impl ObservationRuntime {
                                 else {
                                     error!(
                                         pane_id,
-                                        generation = observed_pane.generation,
+                                        generation = observed_pane.lifecycle_revision.get(),
                                         "Vendored streaming task token space exhausted; refusing to start an unidentifiable task"
                                     );
                                     continue;
@@ -7263,7 +7596,7 @@ impl ObservationRuntime {
                                     local_pane_id,
                                     socket_shard,
                                     socket_path,
-                                    generation: observed_pane.generation,
+                                    generation: observed_pane.lifecycle_revision.get(),
                                     capture_stamp: streaming_lease.stamp(),
                                 };
                                 let installed = capture_bindings
@@ -9410,10 +9743,10 @@ fn build_health_pane_snapshot(
 
     for pane_id in observed_ids {
         let current_seq = cursors.get(&pane_id).map_or(-1, PaneCursor::last_seq);
-        let (generation, first_seen_at_ms) =
+        let (lifecycle_revision, first_seen_at_ms) =
             registry.get_entry(pane_id).map_or((0, now_ms), |entry| {
                 (
-                    entry.generation,
+                    entry.lifecycle_revision.get(),
                     u64::try_from(entry.first_seen_at).unwrap_or(0),
                 )
             });
@@ -9427,14 +9760,14 @@ fn build_health_pane_snapshot(
             .or_insert(PaneActivityState {
                 last_seq: current_seq,
                 last_output_at_ms: now_ms,
-                generation,
+                generation: lifecycle_revision,
                 first_seen_at_ms,
             });
-        if state.generation != generation || state.first_seen_at_ms != first_seen_at_ms {
+        if state.generation != lifecycle_revision || state.first_seen_at_ms != first_seen_at_ms {
             *state = PaneActivityState {
                 last_seq: current_seq,
                 last_output_at_ms: now_ms,
-                generation,
+                generation: lifecycle_revision,
                 first_seen_at_ms,
             };
         } else if state.last_seq != current_seq {
@@ -11705,7 +12038,8 @@ mod tests {
                 2,
                 ObservedCapturePane {
                     info: observed_info,
-                    generation: 2,
+                    lifecycle_identity: test_lifecycle_identity(2),
+                    lifecycle_revision: PaneLifecycleRevision::new(2),
                     pane_uuid: "successor-2".to_string(),
                     revision: DiscoveryRevision(2),
                     requires_storage_resync: false,
@@ -12309,23 +12643,32 @@ mod tests {
 
     #[test]
     fn conservative_pre_storage_view_revokes_only_unproven_identities() {
+        let mut replaced_info = make_pane(3, "predecessor");
+        replaced_info.tty_name = Some("tty-predecessor".to_string());
         let retained_pane = ObservedCapturePane {
             info: make_pane(1, "retained"),
-            generation: 2,
+            lifecycle_identity: test_lifecycle_identity(1),
+            lifecycle_revision: PaneLifecycleRevision::new(2),
             pane_uuid: "retained-uuid".to_string(),
             revision: DiscoveryRevision(10),
             requires_storage_resync: false,
         };
         let closed_pane = ObservedCapturePane {
             info: make_pane(2, "closed"),
-            generation: 3,
+            lifecycle_identity: test_lifecycle_identity(2),
+            lifecycle_revision: PaneLifecycleRevision::new(3),
             pane_uuid: "closed-uuid".to_string(),
             revision: DiscoveryRevision(11),
             requires_storage_resync: false,
         };
         let replaced_pane = ObservedCapturePane {
-            info: make_pane(3, "predecessor"),
-            generation: 4,
+            info: replaced_info,
+            lifecycle_identity: PaneLifecycleIdentity {
+                pane_id: 3,
+                domain_id: None,
+                tty_name: Some("tty-predecessor".to_string()),
+            },
+            lifecycle_revision: PaneLifecycleRevision::new(4),
             pane_uuid: "predecessor-uuid".to_string(),
             revision: DiscoveryRevision(12),
             requires_storage_resync: false,
@@ -12335,13 +12678,15 @@ mod tests {
             (2, closed_pane),
             (3, replaced_pane),
         ]);
-        let panes = vec![
-            make_pane(1, "retained"),
-            make_pane(3, "successor"),
-            make_pane(4, "new"),
-        ];
+        let mut successor = make_pane(3, "successor");
+        successor.tty_name = Some("tty-successor".to_string());
+        let panes = vec![make_pane(1, "retained"), successor, make_pane(4, "new")];
 
-        let (view, transitioning) = conservative_capture_view_before_storage(&previous, &panes);
+        let (view, transitioning) = conservative_capture_view_before_storage(
+            &previous,
+            &panes,
+            &PaneFilterConfig::default(),
+        );
 
         assert_eq!(view.len(), 1);
         let retained = view.get(&1).expect("unchanged pane remains admissible");
@@ -12352,7 +12697,267 @@ mod tests {
     }
 
     #[test]
-    fn failed_uuid_lookup_cannot_re_admit_withheld_revision_after_same_fingerprint_return() {
+    fn post_list_barrier_withdraws_new_filter_denial_before_storage() {
+        let pane_id = 5;
+        let previous = HashMap::from([(
+            pane_id,
+            ObservedCapturePane {
+                info: make_pane(pane_id, "observed"),
+                lifecycle_identity: test_lifecycle_identity(pane_id),
+                lifecycle_revision: PaneLifecycleRevision::INITIAL,
+                pane_uuid: "filter-barrier-uuid".to_string(),
+                revision: DiscoveryRevision(9),
+                requires_storage_resync: false,
+            },
+        )]);
+        let filter = PaneFilterConfig {
+            include: Vec::new(),
+            exclude: vec![crate::config::PaneFilterRule {
+                id: "deny-secret-title".to_string(),
+                domain: None,
+                title: Some("secret".to_string()),
+                cwd: None,
+            }],
+        };
+        let listed = [make_pane(pane_id, "secret-agent")];
+
+        let (view, transitioning) =
+            conservative_capture_view_before_storage(&previous, &listed, &filter);
+
+        assert!(view.is_empty(), "filter denial must revoke admission now");
+        assert!(
+            transitioning.is_empty(),
+            "filter denial is not a lifecycle restart or resync"
+        );
+    }
+
+    #[test]
+    fn metadata_churn_preserves_capture_lease_cursor_and_resync_authority() {
+        let pane_id = 17;
+        let discovery_revision = DiscoveryRevision(1);
+        let mut registry = PaneRegistry::new();
+        let mut initial = make_pane(pane_id, "shell");
+        initial.domain_id = Some(3);
+        initial.tty_name = Some("/dev/pts/17".to_string());
+        registry.discovery_tick(vec![initial]);
+        *registry.get_cursor_mut(pane_id).unwrap() =
+            PaneCursor::from_seq(pane_id, 23).with_resume_anchor("persisted-tail");
+        registry.get_cursor_mut(pane_id).unwrap().last_snapshot = "durable-anchor".to_string();
+
+        let revisions = HashMap::from([(pane_id, discovery_revision)]);
+        let storage_resyncs = HashMap::new();
+        let first_view =
+            capture_publication_view(&registry, &revisions, &storage_resyncs, &HashSet::new());
+        let authority = CaptureAuthority::new();
+        let (tx, _rx) = watch::channel(DiscoveryCapturePublication::default());
+        let mut last_epoch = 0;
+        let mut last_view = Arc::new(HashMap::new());
+        publish_discovery_capture_view(
+            &tx,
+            &authority,
+            &mut last_epoch,
+            &mut last_view,
+            Arc::clone(&first_view),
+            Arc::new(HashSet::new()),
+            Arc::new(HashMap::new()),
+            "metadata-preservation-initial",
+        )
+        .expect("publish initial capture authority");
+        let capture_revision = CaptureRevision::new(discovery_revision.get()).unwrap();
+        let identity = authority
+            .activate_pane_for_revision(pane_id, capture_revision)
+            .expect("activate exact discovery revision");
+        let lease = authority
+            .issue_source(identity, CaptureSourceKind::Polling)
+            .expect("issue polling lease");
+        let original_stamp = lease.stamp();
+
+        let mut changed = make_pane(pane_id, "editor");
+        changed.domain_id = Some(3);
+        changed.domain_name = Some("renamed-domain".to_string());
+        changed.tty_name = Some("/dev/pts/17".to_string());
+        changed.cwd = Some("/different/project".to_string());
+        changed.window_id = 99;
+        changed.tab_id = 101;
+        changed.rows = Some(80);
+        changed.cols = Some(240);
+        changed.cursor_x = Some(9);
+        changed.cursor_y = Some(7);
+        changed.is_active = false;
+        changed.is_zoomed = true;
+        let diff = registry.discovery_tick(vec![changed]);
+        assert_eq!(diff.metadata_changes.len(), 1);
+        assert!(diff.lifecycle_replacements.is_empty());
+        assert!(diff.re_observed_panes.is_empty());
+
+        let second_view =
+            capture_publication_view(&registry, &revisions, &storage_resyncs, &HashSet::new());
+        assert!(capture_publication_identity_matches(
+            &first_view,
+            &second_view
+        ));
+        publish_discovery_capture_view(
+            &tx,
+            &authority,
+            &mut last_epoch,
+            &mut last_view,
+            second_view,
+            Arc::new(HashSet::new()),
+            Arc::new(HashMap::new()),
+            "metadata-preservation-update",
+        )
+        .expect("publish metadata-only update");
+
+        assert_eq!(lease.stamp(), original_stamp);
+        assert!(
+            lease.try_acquire_producer(original_stamp, pane_id).is_ok(),
+            "metadata-only publication must not revoke the existing source"
+        );
+        let cursor = registry.get_cursor(pane_id).unwrap();
+        assert_eq!(cursor.next_seq, 23);
+        assert_eq!(cursor.last_snapshot, "durable-anchor");
+        assert!(cursor.has_resume_anchor());
+        assert!(storage_resyncs.is_empty());
+
+        let metrics = RuntimeMetrics::default();
+        record_discovery_lifecycle_health(&metrics, diff.lifecycle_replacements.len(), 100);
+        let health = metrics.crash_loop_diagnostics();
+        assert_eq!(health.restart_count, 0);
+        assert_eq!(health.consecutive_crashes, 0);
+        assert!(!health.in_crash_loop);
+    }
+
+    #[test]
+    fn exact_lifecycle_replacement_increments_crash_health_once() {
+        let pane_id = 18;
+        let mut registry = PaneRegistry::new();
+        let mut predecessor = make_pane(pane_id, "shell");
+        predecessor.domain_id = Some(2);
+        predecessor.tty_name = Some("tty-predecessor".to_string());
+        registry.discovery_tick(vec![predecessor.clone()]);
+
+        let mut successor = predecessor;
+        successor.tty_name = Some("tty-successor".to_string());
+        let replacement = registry.discovery_tick(vec![successor.clone()]);
+        assert_eq!(replacement.lifecycle_replacements, vec![pane_id]);
+        let stable = registry.discovery_tick(vec![successor]);
+        assert!(stable.lifecycle_replacements.is_empty());
+
+        let metrics = RuntimeMetrics::default();
+        record_discovery_lifecycle_health(&metrics, replacement.lifecycle_replacements.len(), 100);
+        assert_eq!(metrics.crash_loop_diagnostics().restart_count, 1);
+        record_discovery_lifecycle_health(&metrics, stable.lifecycle_replacements.len(), 101);
+        assert_eq!(metrics.crash_loop_diagnostics().restart_count, 1);
+    }
+
+    #[test]
+    fn q_scale_metadata_churn_preserves_every_exact_source_lease() {
+        for pane_count in [2_u64, 20, 200, 600] {
+            let mut registry = PaneRegistry::new();
+            let initial = (0..pane_count)
+                .map(|pane_id| {
+                    let mut pane = make_pane(pane_id, "shell");
+                    pane.domain_id = Some(1);
+                    pane.tty_name = Some(format!("tty-{pane_id}"));
+                    pane
+                })
+                .collect::<Vec<_>>();
+            registry.discovery_tick(initial);
+            let revisions = (0..pane_count)
+                .map(|pane_id| (pane_id, DiscoveryRevision(pane_id + 1)))
+                .collect::<HashMap<_, _>>();
+            let first_view =
+                capture_publication_view(&registry, &revisions, &HashMap::new(), &HashSet::new());
+            let authority = CaptureAuthority::new();
+            let (tx, _rx) = watch::channel(DiscoveryCapturePublication::default());
+            let mut last_epoch = 0;
+            let mut last_view = Arc::new(HashMap::new());
+            publish_discovery_capture_view(
+                &tx,
+                &authority,
+                &mut last_epoch,
+                &mut last_view,
+                Arc::clone(&first_view),
+                Arc::new(HashSet::new()),
+                Arc::new(HashMap::new()),
+                "q-scale-metadata-initial",
+            )
+            .expect("publish q-scale initial view");
+            let leases = revisions
+                .iter()
+                .map(|(&pane_id, revision)| {
+                    let revision = CaptureRevision::new(revision.get()).unwrap();
+                    let identity = authority
+                        .activate_pane_for_revision(pane_id, revision)
+                        .expect("activate q-scale pane");
+                    authority
+                        .issue_source(identity, CaptureSourceKind::Polling)
+                        .expect("issue q-scale source")
+                })
+                .collect::<Vec<_>>();
+
+            let changed = (0..pane_count)
+                .map(|pane_id| {
+                    let mut pane = make_pane(pane_id, "editor");
+                    pane.domain_id = Some(1);
+                    pane.domain_name = Some("renamed-display".to_string());
+                    pane.tty_name = Some(format!("tty-{pane_id}"));
+                    pane.cwd = Some(format!("/workspace/{pane_id}"));
+                    pane.window_id = pane_id + 10;
+                    pane.tab_id = pane_id + 20;
+                    pane.rows = Some(80);
+                    pane.cols = Some(240);
+                    pane.is_zoomed = pane_id % 2 == 0;
+                    pane
+                })
+                .collect::<Vec<_>>();
+            let (conservative, transitioning) = conservative_capture_view_before_storage(
+                &first_view,
+                &changed,
+                &PaneFilterConfig::default(),
+            );
+            assert_eq!(conservative.len(), usize::try_from(pane_count).unwrap());
+            assert!(transitioning.is_empty());
+            let diff = registry.discovery_tick(changed);
+            assert_eq!(
+                diff.metadata_changes.len(),
+                usize::try_from(pane_count).unwrap()
+            );
+            assert!(diff.lifecycle_replacements.is_empty());
+            assert!(diff.re_observed_panes.is_empty());
+
+            let second_view =
+                capture_publication_view(&registry, &revisions, &HashMap::new(), &HashSet::new());
+            assert!(capture_publication_identity_matches(
+                &first_view,
+                &second_view
+            ));
+            publish_discovery_capture_view(
+                &tx,
+                &authority,
+                &mut last_epoch,
+                &mut last_view,
+                second_view,
+                Arc::new(HashSet::new()),
+                Arc::new(HashMap::new()),
+                "q-scale-metadata-update",
+            )
+            .expect("publish q-scale metadata view");
+            for lease in leases {
+                let stamp = lease.stamp();
+                assert!(
+                    lease
+                        .try_acquire_producer(stamp, stamp.global_pane_id())
+                        .is_ok(),
+                    "q{pane_count} metadata churn revoked pane {}",
+                    stamp.global_pane_id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_uuid_lookup_cannot_re_admit_withheld_revision_after_same_identity_return() {
         let pane_id = 42;
         let predecessor_revision = DiscoveryRevision(7);
         let predecessor_info = make_pane(pane_id, "stable");
@@ -12364,7 +12969,8 @@ mod tests {
             pane_id,
             ObservedCapturePane {
                 info: predecessor_info.clone(),
-                generation: 0,
+                lifecycle_identity: test_lifecycle_identity(pane_id),
+                lifecycle_revision: PaneLifecycleRevision::new(0),
                 pane_uuid: registry
                     .get_entry(pane_id)
                     .expect("initial pane")
@@ -12382,6 +12988,7 @@ mod tests {
         let (withheld_view, _) = conservative_capture_view_before_storage(
             &previous,
             std::slice::from_ref(&unrelated_new_pane),
+            &PaneFilterConfig::default(),
         );
         let mut unresolved = HashMap::new();
         remember_withheld_barrier_predecessors(&mut unresolved, &previous, &withheld_view);
@@ -12394,7 +13001,7 @@ mod tests {
             registry.discovery_tick(vec![predecessor_info, unrelated_new_pane.clone()]);
         assert!(
             !recovered_diff.new_panes.contains(&pane_id)
-                && !recovered_diff.new_generations.contains(&pane_id)
+                && !recovered_diff.lifecycle_replacements.contains(&pane_id)
                 && !recovered_diff.re_observed_panes.contains(&pane_id),
             "the registry deliberately has no native transition evidence for the ABA return"
         );
@@ -12462,7 +13069,8 @@ mod tests {
         let mut setup = HashMap::from([(pane_id, "observation_started")]);
 
         let diff = registry.discovery_tick(vec![make_pane(pane_id, "ignore-now")]);
-        assert!(diff.new_generations.contains(&pane_id));
+        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.metadata_changes.len(), 1);
         assert!(!registry_observes_pane(&registry, pane_id));
         retain_observed_capture_bookkeeping(
             &registry,
@@ -12476,7 +13084,7 @@ mod tests {
         assert!(transitions.is_empty());
         assert!(setup.is_empty());
 
-        let mut transitioning = diff.new_generations;
+        let mut transitioning = diff.lifecycle_replacements;
         transitioning.retain(|id| registry_observes_pane(&registry, *id));
         assert!(
             transitioning.is_empty(),
@@ -12827,7 +13435,8 @@ mod tests {
                 pane_id,
                 ObservedCapturePane {
                     info: make_pane(pane_id, "successor"),
-                    generation: 1,
+                    lifecycle_identity: test_lifecycle_identity(pane_id),
+                    lifecycle_revision: PaneLifecycleRevision::new(1),
                     pane_uuid: "successor-uuid".to_string(),
                     revision: successor_revision,
                     requires_storage_resync: false,
@@ -12880,7 +13489,7 @@ mod tests {
                 .expect("held first persistence guard");
             let revision = DiscoveryRevision(1);
             let first_binding = ActiveCaptureBinding {
-                generation: 0,
+                lifecycle_revision: PaneLifecycleRevision::new(0),
                 pane_uuid: "first".to_string(),
                 revision,
                 identity: first_identity,
@@ -12892,7 +13501,7 @@ mod tests {
                 streaming_lease: None,
             };
             let second_binding = ActiveCaptureBinding {
-                generation: 0,
+                lifecycle_revision: PaneLifecycleRevision::new(0),
                 pane_uuid: "second".to_string(),
                 revision,
                 identity: second_identity,
@@ -13043,7 +13652,8 @@ mod tests {
             )])));
             let predecessor_observed = ObservedCapturePane {
                 info: make_pane(pane_id, "predecessor"),
-                generation: 0,
+                lifecycle_identity: test_lifecycle_identity(pane_id),
+                lifecycle_revision: PaneLifecycleRevision::new(0),
                 pane_uuid: "predecessor-uuid".to_string(),
                 revision: predecessor_revision,
                 requires_storage_resync: false,
@@ -13071,7 +13681,8 @@ mod tests {
 
             let successor_observed = ObservedCapturePane {
                 info: make_pane(pane_id, "successor"),
-                generation: 1,
+                lifecycle_identity: test_lifecycle_identity(pane_id),
+                lifecycle_revision: PaneLifecycleRevision::new(1),
                 pane_uuid: "successor-uuid".to_string(),
                 revision: successor_revision,
                 requires_storage_resync: true,
@@ -13245,7 +13856,8 @@ mod tests {
                     pane_id,
                     ObservedCapturePane {
                         info: make_pane(pane_id, "predecessor"),
-                        generation: 0,
+                        lifecycle_identity: test_lifecycle_identity(pane_id),
+                        lifecycle_revision: PaneLifecycleRevision::new(0),
                         pane_uuid: "predecessor-uuid".to_string(),
                         revision: predecessor_revision,
                         requires_storage_resync: false,
@@ -13271,7 +13883,8 @@ mod tests {
                         pane_id,
                         ObservedCapturePane {
                             info: make_pane(pane_id, "successor"),
-                            generation: 1,
+                            lifecycle_identity: test_lifecycle_identity(pane_id),
+                            lifecycle_revision: PaneLifecycleRevision::new(1),
                             pane_uuid: "successor-uuid".to_string(),
                             revision: successor_revision,
                             requires_storage_resync: true,
@@ -13845,7 +14458,8 @@ mod tests {
                     pane_id,
                     ObservedCapturePane {
                         info: make_pane(pane_id, "all-source-kinds"),
-                        generation: 4,
+                        lifecycle_identity: test_lifecycle_identity(pane_id),
+                        lifecycle_revision: PaneLifecycleRevision::new(4),
                         pane_uuid: "all-source-kinds".to_string(),
                         revision,
                         requires_storage_resync: false,
@@ -15871,6 +16485,311 @@ mod tests {
             is_zoomed: false,
             extra: std::collections::HashMap::new(),
         }
+    }
+
+    fn test_lifecycle_identity(pane_id: u64) -> PaneLifecycleIdentity {
+        PaneLifecycleIdentity {
+            pane_id,
+            domain_id: None,
+            tty_name: None,
+        }
+    }
+
+    #[test]
+    fn metadata_write_queue_is_latest_wins_without_starvation() {
+        let pane_id = 77;
+        let lifecycle_revision = PaneLifecycleRevision::new(3);
+        let mut queue = PaneMetadataWriteQueue::default();
+        queue.stage(
+            PaneMetadataChange {
+                pane_id,
+                lifecycle_revision,
+                metadata_revision: PaneMetadataRevision::INITIAL,
+                diff: Default::default(),
+            },
+            test_pane_record(pane_id),
+        );
+        queue.age_one_tick();
+
+        let mut latest = test_pane_record(pane_id);
+        latest.title = Some("latest".to_string());
+        queue.stage(
+            PaneMetadataChange {
+                pane_id,
+                lifecycle_revision,
+                metadata_revision: PaneMetadataRevision::new(1),
+                diff: Default::default(),
+            },
+            latest,
+        );
+        queue.age_one_tick();
+
+        let due = queue.take_due();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, pane_id);
+        assert_eq!(due[0].1.metadata_revision.get(), 1);
+        assert_eq!(due[0].1.record.title.as_deref(), Some("latest"));
+        assert_eq!(queue.telemetry(), (0, 1, 0));
+    }
+
+    #[test]
+    fn metadata_write_queue_is_bounded_by_current_pane_ids() {
+        let mut queue = PaneMetadataWriteQueue::default();
+        for pane_count in [2_u64, 20, 200, 600] {
+            queue.pending.clear();
+            for pane_id in 0..pane_count {
+                queue.stage(
+                    PaneMetadataChange {
+                        pane_id,
+                        lifecycle_revision: PaneLifecycleRevision::INITIAL,
+                        metadata_revision: PaneMetadataRevision::new(1),
+                        diff: Default::default(),
+                    },
+                    test_pane_record(pane_id),
+                );
+                queue.stage(
+                    PaneMetadataChange {
+                        pane_id,
+                        lifecycle_revision: PaneLifecycleRevision::INITIAL,
+                        metadata_revision: PaneMetadataRevision::new(2),
+                        diff: Default::default(),
+                    },
+                    test_pane_record(pane_id),
+                );
+            }
+            assert_eq!(queue.pending.len(), usize::try_from(pane_count).unwrap());
+            queue.age_one_tick();
+            queue.age_one_tick();
+            let mut drained = 0usize;
+            let mut batches = 0usize;
+            while !queue.pending.is_empty() {
+                let due = queue.take_due();
+                assert!(!due.is_empty());
+                assert!(due.len() <= PANE_METADATA_MAX_WRITES_PER_TICK);
+                drained += due.len();
+                batches += 1;
+            }
+            assert_eq!(drained, usize::try_from(pane_count).unwrap());
+            assert_eq!(
+                batches,
+                usize::try_from(pane_count)
+                    .unwrap()
+                    .div_ceil(PANE_METADATA_MAX_WRITES_PER_TICK)
+            );
+            assert!(queue.pending.is_empty());
+            assert!(
+                queue.pending.capacity() <= 128,
+                "empty metadata queue retained excessive capacity after q{pane_count}: {}",
+                queue.pending.capacity()
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_write_retry_is_lossless_and_stale_stage_cannot_regress_latest() {
+        let pane_id = 91;
+        let mut queue = PaneMetadataWriteQueue::default();
+        let mut current = test_pane_record(pane_id);
+        current.title = Some("current".to_string());
+        queue.stage(
+            PaneMetadataChange {
+                pane_id,
+                lifecycle_revision: PaneLifecycleRevision::new(4),
+                metadata_revision: PaneMetadataRevision::new(8),
+                diff: Default::default(),
+            },
+            current,
+        );
+        queue.age_one_tick();
+        queue.age_one_tick();
+        let mut due = queue.take_due();
+        assert_eq!(due.len(), 1);
+        let (_, failed_write) = due.pop().unwrap();
+        queue.retry(pane_id, failed_write);
+
+        let mut stale = test_pane_record(pane_id);
+        stale.title = Some("stale".to_string());
+        queue.stage(
+            PaneMetadataChange {
+                pane_id,
+                lifecycle_revision: PaneLifecycleRevision::new(4),
+                metadata_revision: PaneMetadataRevision::new(7),
+                diff: Default::default(),
+            },
+            stale,
+        );
+
+        queue.age_one_tick();
+        queue.age_one_tick();
+        let due = queue.take_due();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.metadata_revision.get(), 8);
+        assert_eq!(due[0].1.record.title.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn metadata_write_retry_cannot_overwrite_a_new_lifecycle() {
+        let pane_id = 93;
+        let mut queue = PaneMetadataWriteQueue::default();
+        let mut predecessor = test_pane_record(pane_id);
+        predecessor.title = Some("predecessor".to_string());
+        queue.stage(
+            PaneMetadataChange {
+                pane_id,
+                lifecycle_revision: PaneLifecycleRevision::new(4),
+                metadata_revision: PaneMetadataRevision::new(99),
+                diff: Default::default(),
+            },
+            predecessor,
+        );
+        queue.age_one_tick();
+        queue.age_one_tick();
+        let (_, failed_predecessor) = queue.take_due().pop().expect("predecessor due");
+
+        let mut successor = test_pane_record(pane_id);
+        successor.title = Some("successor".to_string());
+        queue.stage(
+            PaneMetadataChange {
+                pane_id,
+                lifecycle_revision: PaneLifecycleRevision::new(5),
+                metadata_revision: PaneMetadataRevision::INITIAL,
+                diff: Default::default(),
+            },
+            successor,
+        );
+        queue.retry(pane_id, failed_predecessor);
+        queue.age_one_tick();
+        queue.age_one_tick();
+
+        let due = queue.take_due();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.lifecycle_revision.get(), 5);
+        assert_eq!(due[0].1.metadata_revision.get(), 0);
+        assert_eq!(due[0].1.record.title.as_deref(), Some("successor"));
+    }
+
+    #[test]
+    fn failed_low_id_metadata_write_cannot_starve_the_next_batch() {
+        let mut queue = PaneMetadataWriteQueue::default();
+        for pane_id in 0..=u64::try_from(PANE_METADATA_MAX_WRITES_PER_TICK).unwrap() {
+            queue.stage(
+                PaneMetadataChange {
+                    pane_id,
+                    lifecycle_revision: PaneLifecycleRevision::INITIAL,
+                    metadata_revision: PaneMetadataRevision::new(1),
+                    diff: Default::default(),
+                },
+                test_pane_record(pane_id),
+            );
+        }
+        queue.age_one_tick();
+        queue.age_one_tick();
+
+        let first = queue.take_due();
+        assert_eq!(first.len(), PANE_METADATA_MAX_WRITES_PER_TICK);
+        let failed_low = first
+            .into_iter()
+            .find_map(|(pane_id, write)| (pane_id == 0).then_some(write))
+            .expect("lowest pane was in first bounded batch");
+        queue.retry(0, failed_low);
+
+        let second = queue.take_due();
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].0,
+            u64::try_from(PANE_METADATA_MAX_WRITES_PER_TICK).unwrap(),
+            "the never-attempted higher pane must run before the failed low ID retries"
+        );
+    }
+
+    #[test]
+    fn metadata_write_shutdown_drain_includes_young_latest_records() {
+        let mut queue = PaneMetadataWriteQueue::default();
+        for pane_id in [9, 2, 7] {
+            let mut record = test_pane_record(pane_id);
+            record.title = Some(format!("latest-{pane_id}"));
+            queue.stage(
+                PaneMetadataChange {
+                    pane_id,
+                    lifecycle_revision: PaneLifecycleRevision::new(1),
+                    metadata_revision: PaneMetadataRevision::new(3),
+                    diff: Default::default(),
+                },
+                record,
+            );
+        }
+
+        assert!(queue.take_due().is_empty(), "young writes remain debounced");
+        let drained = queue.take_all();
+        assert_eq!(
+            drained
+                .iter()
+                .map(|(pane_id, _)| *pane_id)
+                .collect::<Vec<_>>(),
+            vec![2, 7, 9]
+        );
+        assert!(queue.pending.is_empty());
+    }
+
+    #[test]
+    fn metadata_write_cancellation_retries_and_persists_latest_record() {
+        run_async_test_isolated(|| async {
+            let pane_id = 92;
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.expect("test storage");
+            let mut queue = PaneMetadataWriteQueue::default();
+
+            for (metadata_revision, title) in [(1, "older"), (2, "latest")] {
+                let mut record = test_pane_record(pane_id);
+                record.title = Some(title.to_string());
+                queue.stage(
+                    PaneMetadataChange {
+                        pane_id,
+                        lifecycle_revision: PaneLifecycleRevision::new(5),
+                        metadata_revision: PaneMetadataRevision::new(metadata_revision),
+                        diff: Default::default(),
+                    },
+                    record,
+                );
+            }
+            queue.age_one_tick();
+            queue.age_one_tick();
+            let mut due = queue.take_due();
+            let (_, failed_write) = due.pop().expect("one coalesced write");
+
+            let cancelled = crate::cx::Cx::for_testing();
+            cancelled.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel metadata persistence test"),
+            );
+            assert!(
+                storage
+                    .upsert_pane_with_cx(&cancelled, failed_write.record.clone())
+                    .await
+                    .is_err()
+            );
+            queue.retry(pane_id, failed_write);
+
+            let fresh = crate::cx::Cx::for_testing();
+            queue.age_one_tick();
+            queue.age_one_tick();
+            let due = queue.take_due();
+            assert_eq!(due.len(), 1);
+            storage
+                .upsert_pane_with_cx(&fresh, due[0].1.record.clone())
+                .await
+                .expect("retry latest metadata with fresh authority");
+            queue.record_commit();
+
+            let stored = storage
+                .get_pane(pane_id)
+                .await
+                .expect("read latest pane")
+                .expect("pane persisted");
+            assert_eq!(stored.title.as_deref(), Some("latest"));
+            assert_eq!(queue.telemetry(), (0, 1, 1));
+            storage.shutdown().await.expect("shutdown test storage");
+        });
     }
 
     fn cursor_map_from_registry(registry: &PaneRegistry) -> HashMap<u64, PaneCursor> {
@@ -18980,7 +19899,8 @@ mod tests {
                         global_zero,
                         ObservedCapturePane {
                             info: make_pane(global_zero, "shard-zero"),
-                            generation: 2,
+                            lifecycle_identity: test_lifecycle_identity(global_zero),
+                            lifecycle_revision: PaneLifecycleRevision::new(2),
                             pane_uuid: "shard-zero-uuid".to_string(),
                             revision: revision_zero,
                             requires_storage_resync: false,
@@ -18990,7 +19910,8 @@ mod tests {
                         global_one,
                         ObservedCapturePane {
                             info: make_pane(global_one, "shard-one"),
-                            generation: 4,
+                            lifecycle_identity: test_lifecycle_identity(global_one),
+                            lifecycle_revision: PaneLifecycleRevision::new(4),
                             pane_uuid: "shard-one-uuid".to_string(),
                             revision: revision_one,
                             requires_storage_resync: false,

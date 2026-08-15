@@ -9,7 +9,7 @@
 use base64::Engine as _;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::config::{PaneFilterConfig, PaneFilterRule};
-use frankenterm_core::ingest::PaneFingerprint;
+use frankenterm_core::ingest::{PaneLifecycleContinuity, PaneLifecycleIdentity};
 use frankenterm_core::wezterm::PaneInfo;
 use serde::Deserialize;
 use std::hint::black_box;
@@ -187,26 +187,29 @@ fn bench_pane_filter(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_pane_fingerprint(c: &mut Criterion) {
-    let mut group = c.benchmark_group("watcher_fingerprint");
+fn bench_pane_lifecycle_identity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("watcher_lifecycle_identity");
 
-    let pane = test_pane(1);
+    let mut pane = test_pane(1);
+    pane.tty_name = Some("original-tty".to_string());
 
-    // Fingerprint without content (used for comparison)
-    group.bench_function("fingerprint_without_content", |b| {
-        b.iter(|| PaneFingerprint::without_content(&pane));
+    group.bench_function("identity_from_pane", |b| {
+        b.iter(|| PaneLifecycleIdentity::from_pane_info(&pane));
     });
 
-    // Fingerprint with typical content
-    let typical_content = "$ ls -la\ntotal 64\ndrwxr-xr-x  10 user  staff\n";
-    group.bench_function("fingerprint_with_content_small", |b| {
-        b.iter(|| PaneFingerprint::new(&pane, Some(typical_content)));
+    let identity = PaneLifecycleIdentity::from_pane_info(&pane);
+    group.bench_function("continuity_same", |b| {
+        b.iter(|| identity.continuity_with(black_box(&identity)));
     });
 
-    // Fingerprint with larger content
-    let large_content = typical_content.repeat(100);
-    group.bench_function("fingerprint_with_content_large", |b| {
-        b.iter(|| PaneFingerprint::new(&pane, Some(&large_content)));
+    let mut replacement = identity.clone();
+    replacement.tty_name = Some("replacement-tty".to_string());
+    group.bench_function("continuity_replaced", |b| {
+        b.iter(|| {
+            let continuity = identity.continuity_with(black_box(&replacement));
+            debug_assert_eq!(continuity, PaneLifecycleContinuity::Replaced);
+            continuity
+        });
     });
 
     group.finish();
@@ -217,18 +220,17 @@ fn bench_pane_check_combined(c: &mut Criterion) {
 
     let filter = typical_filter();
     let pane = test_pane(1);
-    let content = "$ cargo build\n   Compiling frankenterm-core v0.1.0\n    Finished dev\n";
 
-    // Combined operation: filter + fingerprint (what happens each poll tick)
+    // Combined operation: filter + lifecycle identity (what happens each poll tick)
     // Budget: < 100µs total
-    group.bench_function("filter_and_fingerprint", |b| {
+    group.bench_function("filter_and_lifecycle_identity", |b| {
         b.iter(|| {
             let _excluded = filter.check_pane(
                 pane.domain_name.as_deref().unwrap_or("local"),
                 pane.title.as_deref().unwrap_or(""),
                 pane.cwd.as_deref().unwrap_or(""),
             );
-            let _fp = PaneFingerprint::new(&pane, Some(content));
+            let _identity = PaneLifecycleIdentity::from_pane_info(&pane);
         });
     });
 
@@ -242,7 +244,7 @@ fn bench_pane_check_combined(c: &mut Criterion) {
                     pane.title.as_deref().unwrap_or(""),
                     pane.cwd.as_deref().unwrap_or(""),
                 );
-                let _fp = PaneFingerprint::without_content(pane);
+                let _identity = PaneLifecycleIdentity::from_pane_info(pane);
             }
         });
     });
@@ -260,7 +262,7 @@ fn bench_pane_check_combined(c: &mut Criterion) {
                         pane.title.as_deref().unwrap_or(""),
                         pane.cwd.as_deref().unwrap_or(""),
                     );
-                    let _fp = PaneFingerprint::without_content(pane);
+                    let _identity = PaneLifecycleIdentity::from_pane_info(pane);
                 }
             });
         },
@@ -307,7 +309,7 @@ criterion_group!(
     name = benches;
     config = bench_config();
     targets = bench_pane_filter,
-        bench_pane_fingerprint,
+        bench_pane_lifecycle_identity,
         bench_pane_check_combined,
         bench_native_event_latency_comparison
 );

@@ -57,7 +57,7 @@ fn telemetry_starts_at_zero() {
     assert_eq!(snap.discovery_ticks, 0);
     assert_eq!(snap.panes_discovered, 0);
     assert_eq!(snap.panes_closed, 0);
-    assert_eq!(snap.generation_changes, 0);
+    assert_eq!(snap.lifecycle_replacements, 0);
     assert_eq!(snap.metadata_changes, 0);
     assert_eq!(snap.panes_filtered, 0);
 }
@@ -68,7 +68,7 @@ fn snapshot_serde_roundtrip() {
         discovery_ticks: 42,
         panes_discovered: 10,
         panes_closed: 3,
-        generation_changes: 7,
+        lifecycle_replacements: 7,
         metadata_changes: 5,
         panes_filtered: 2,
     };
@@ -111,18 +111,22 @@ fn pane_close_counted() {
 }
 
 #[test]
-fn generation_change_counted() {
+fn lifecycle_replacement_counted() {
     let mut reg = PaneRegistry::new();
 
     // Discover pane
-    reg.discovery_tick(vec![make_pane(1, "bash")]);
+    let mut initial = make_pane(1, "bash");
+    initial.tty_name = Some("tty-a".to_string());
+    reg.discovery_tick(vec![initial]);
 
-    // Title change triggers generation change
-    reg.discovery_tick(vec![make_pane(1, "vim")]);
+    // A changed exact TTY witness is an authoritative replacement.
+    let mut replacement = make_pane(1, "vim");
+    replacement.tty_name = Some("tty-b".to_string());
+    reg.discovery_tick(vec![replacement]);
 
     let snap = reg.telemetry().snapshot();
     assert_eq!(snap.discovery_ticks, 2);
-    assert_eq!(snap.generation_changes, 1);
+    assert_eq!(snap.lifecycle_replacements, 1);
 }
 
 proptest! {
@@ -220,7 +224,7 @@ proptest! {
         ticks in 0u64..100,
         discovered in 0u64..1000,
         closed in 0u64..500,
-        gen_changes in 0u64..200,
+        lifecycle_replacements in 0u64..200,
         meta_changes in 0u64..200,
         filtered in 0u64..100,
     ) {
@@ -228,7 +232,7 @@ proptest! {
             discovery_ticks: ticks,
             panes_discovered: discovered,
             panes_closed: closed,
-            generation_changes: gen_changes,
+            lifecycle_replacements,
             metadata_changes: meta_changes,
             panes_filtered: filtered,
         };

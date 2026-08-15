@@ -125,7 +125,9 @@ fn watch_daemon_one_iteration_persists_two_panes_and_shuts_down_cleanly() {
             "both fixture panes must be reported as newly discovered"
         );
         assert!(
-            diff.closed_panes.is_empty() && diff.changed_panes.is_empty(),
+            diff.closed_panes.is_empty()
+                && diff.metadata_changes.is_empty()
+                && diff.lifecycle_replacements.is_empty(),
             "a fresh registry's first tick cannot have closed or changed panes, got {:?}",
             diff
         );

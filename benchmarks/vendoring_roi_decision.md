@@ -22,6 +22,11 @@ in `wezterm cli` I/O, which vendoring might address.
 These measure **filtering + fingerprinting** cost inside the watch loop (no
 WezTerm CLI I/O).
 
+> Historical evidence note (2026-08-15): these names and measurements describe
+> the pre-identity-split harness retained for provenance. The live benchmark now
+> measures `PaneLifecycleIdentity` construction/continuity and no longer hashes
+> mutable title, cwd, or terminal content as capture-incarnation authority.
+
 - `watcher_pane_filter/typical_filter_no_match`: ~258.35 µs
 - `watcher_pane_filter/typical_filter_match`: ~252.63 µs
 - `watcher_pane_filter/heavy_filter_no_match`: ~1.12 µs

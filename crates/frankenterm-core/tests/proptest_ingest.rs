@@ -2,7 +2,7 @@
 //!
 //! Validates:
 //! 1. generate_pane_uuid: format invariants (length, hex charset, non-determinism)
-//! 2. PaneFingerprint: construction, content_hash behavior, is_same_generation symmetry/reflexivity
+//! 2. PaneLifecycleIdentity: exact evidence, mutable-metadata exclusion, continuity classification
 //! 3. ObservationDecision: is_observed and ignore_reason correctness
 //! 4. PanePriorityOverride: serde JSON roundtrip
 //! 5. DiscoveryDiff: default emptiness, change_count arithmetic, non-empty detection
@@ -16,9 +16,10 @@ use proptest::prelude::*;
 use frankenterm_core::ingest::{
     AltScreenChange, CapturedSegmentKind, DiscoveryDiff, IngestTelemetrySnapshot,
     ObservationDecision, Osc133Marker, Osc133State, OutputCache, OutputCacheConfig, OverflowPolicy,
-    PaneCursor, PaneFingerprint, PanePriorityOverride, PersistedCapture, ShellState, StreamChannel,
-    StreamChannelConfig, StreamEvent, StreamIngester, StreamIngesterTelemetrySnapshot,
-    detect_alt_screen_changes, generate_pane_uuid,
+    PaneCursor, PaneLifecycleContinuity, PaneLifecycleIdentity, PaneLifecycleRevision,
+    PaneMetadataChange, PaneMetadataDiff, PaneMetadataRevision, PanePriorityOverride,
+    PersistedCapture, ShellState, StreamChannel, StreamChannelConfig, StreamEvent, StreamIngester,
+    StreamIngesterTelemetrySnapshot, detect_alt_screen_changes, generate_pane_uuid,
 };
 use frankenterm_core::storage::{Gap, Segment};
 use frankenterm_core::wezterm::PaneInfo;
@@ -72,6 +73,18 @@ fn arb_cwd() -> impl Strategy<Value = String> {
     "/[a-z]{1,8}(/[a-z]{1,8}){0,4}"
 }
 
+fn metadata_changes_for(pane_ids: Vec<u64>) -> Vec<PaneMetadataChange> {
+    pane_ids
+        .into_iter()
+        .map(|pane_id| PaneMetadataChange {
+            pane_id,
+            lifecycle_revision: PaneLifecycleRevision::new(0),
+            metadata_revision: PaneMetadataRevision::new(1),
+            diff: PaneMetadataDiff::default(),
+        })
+        .collect()
+}
+
 /// Arbitrary pane id.
 fn arb_pane_id() -> impl Strategy<Value = u64> {
     0u64..10_000
@@ -82,7 +95,7 @@ fn arb_timestamp() -> impl Strategy<Value = i64> {
     0i64..2_000_000_000_000
 }
 
-/// Arbitrary content string (for fingerprinting).
+/// Arbitrary captured terminal content.
 fn arb_content() -> impl Strategy<Value = String> {
     proptest::collection::vec("[ -~]{0,80}\n", 0..100).prop_map(|lines| lines.join(""))
 }
@@ -203,174 +216,86 @@ proptest! {
 }
 
 // =============================================================================
-// 2. PaneFingerprint
+// 2. PaneLifecycleIdentity
 // =============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    /// without_content always sets content_hash to 0.
     #[test]
-    fn fingerprint_without_content_hash_is_zero(
+    fn lifecycle_identity_carries_only_authoritative_fields(
+        pane_id in arb_pane_id(),
+        domain in arb_domain(),
+        title in arb_title(),
+        cwd in arb_cwd(),
+        domain_id in proptest::option::of(any::<u64>()),
+    ) {
+        let mut info = make_pane_info(pane_id, &domain, &title, &cwd);
+        info.domain_id = domain_id;
+        let expected_tty = format!("tty-{pane_id}");
+        info.tty_name = Some(expected_tty.clone());
+        let identity = PaneLifecycleIdentity::from_pane_info(&info);
+        prop_assert_eq!(identity.pane_id, pane_id);
+        prop_assert_eq!(identity.domain_id, domain_id);
+        prop_assert_eq!(identity.tty_name.as_deref(), Some(expected_tty.as_str()));
+    }
+
+    #[test]
+    fn lifecycle_continuity_is_reflexive(
         pane_id in arb_pane_id(),
         domain in arb_domain(),
         title in arb_title(),
         cwd in arb_cwd(),
     ) {
         let info = make_pane_info(pane_id, &domain, &title, &cwd);
-        let fp = PaneFingerprint::without_content(&info);
-        prop_assert_eq!(fp.content_hash, 0, "without_content should yield content_hash 0");
+        let identity = PaneLifecycleIdentity::from_pane_info(&info);
+        prop_assert_eq!(identity.continuity_with(&identity), PaneLifecycleContinuity::Same);
     }
 
-    /// Fingerprint with Some(content) may have non-zero content_hash (unless content hashes to 0, which is astronomically unlikely).
     #[test]
-    fn fingerprint_with_content_has_hash(
+    fn title_cwd_and_display_name_do_not_rotate_lifecycle(
         pane_id in arb_pane_id(),
-        domain in arb_domain(),
-        title in arb_title(),
-        cwd in arb_cwd(),
-        content in "hello world [a-z]{5,20}",
-    ) {
-        let info = make_pane_info(pane_id, &domain, &title, &cwd);
-        let fp = PaneFingerprint::new(&info, Some(&content));
-        // Non-empty content should generally produce a non-zero hash.
-        // While theoretically possible to be 0, it's astronomically unlikely.
-        prop_assert_ne!(fp.content_hash, 0, "non-empty content should yield non-zero hash");
-    }
-
-    /// is_same_generation is reflexive: fp.is_same_generation(&fp) is always true.
-    #[test]
-    fn fingerprint_same_generation_reflexive(
-        pane_id in arb_pane_id(),
-        domain in arb_domain(),
-        title in arb_title(),
-        cwd in arb_cwd(),
-    ) {
-        let info = make_pane_info(pane_id, &domain, &title, &cwd);
-        let fp = PaneFingerprint::without_content(&info);
-        prop_assert!(fp.is_same_generation(&fp), "reflexive: fp must match itself");
-    }
-
-    /// is_same_generation is symmetric: if a matches b, then b matches a.
-    #[test]
-    fn fingerprint_same_generation_symmetric(
-        pane_id in arb_pane_id(),
-        domain in arb_domain(),
-        title in arb_title(),
-        cwd in arb_cwd(),
-        content_a in arb_content(),
-        content_b in arb_content(),
-    ) {
-        let info = make_pane_info(pane_id, &domain, &title, &cwd);
-        // Same domain/title/cwd but different content should still be same generation.
-        let fp_a = PaneFingerprint::new(&info, Some(&content_a));
-        let fp_b = PaneFingerprint::new(&info, Some(&content_b));
-        let a_to_b = fp_a.is_same_generation(&fp_b);
-        let b_to_a = fp_b.is_same_generation(&fp_a);
-        prop_assert_eq!(a_to_b, b_to_a, "symmetry violated");
-    }
-
-    /// Different domains means different generation.
-    #[test]
-    fn fingerprint_different_domain_not_same_gen(
-        pane_id in arb_pane_id(),
-        domain_a in arb_domain(),
-        domain_b in arb_domain(),
-        title in arb_title(),
-        cwd in arb_cwd(),
-    ) {
-        prop_assume!(domain_a != domain_b);
-        let info_a = make_pane_info(pane_id, &domain_a, &title, &cwd);
-        let info_b = make_pane_info(pane_id, &domain_b, &title, &cwd);
-        let fp_a = PaneFingerprint::without_content(&info_a);
-        let fp_b = PaneFingerprint::without_content(&info_b);
-        prop_assert!(!fp_a.is_same_generation(&fp_b), "different domain should not be same generation");
-    }
-
-    /// Different titles means different generation.
-    #[test]
-    fn fingerprint_different_title_not_same_gen(
-        pane_id in arb_pane_id(),
-        domain in arb_domain(),
         title_a in "alpha[a-z]{3,10}",
         title_b in "beta[a-z]{3,10}",
-        cwd in arb_cwd(),
-    ) {
-        let info_a = make_pane_info(pane_id, &domain, &title_a, &cwd);
-        let info_b = make_pane_info(pane_id, &domain, &title_b, &cwd);
-        let fp_a = PaneFingerprint::without_content(&info_a);
-        let fp_b = PaneFingerprint::without_content(&info_b);
-        prop_assert!(!fp_a.is_same_generation(&fp_b), "different title should not be same generation");
-    }
-
-    /// Different cwd means different generation.
-    #[test]
-    fn fingerprint_different_cwd_not_same_gen(
-        pane_id in arb_pane_id(),
-        domain in arb_domain(),
-        title in arb_title(),
         cwd_a in "/alpha[a-z]{2,8}",
         cwd_b in "/beta[a-z]{2,8}",
+        domain_a in "display-a[a-z]{2,8}",
+        domain_b in "display-b[a-z]{2,8}",
     ) {
-        let info_a = make_pane_info(pane_id, &domain, &title, &cwd_a);
-        let info_b = make_pane_info(pane_id, &domain, &title, &cwd_b);
-        let fp_a = PaneFingerprint::without_content(&info_a);
-        let fp_b = PaneFingerprint::without_content(&info_b);
-        prop_assert!(!fp_a.is_same_generation(&fp_b), "different cwd should not be same generation");
+        let mut first = make_pane_info(pane_id, &domain_a, &title_a, &cwd_a);
+        first.domain_id = Some(7);
+        first.tty_name = Some("stable-tty".to_string());
+        let mut changed = make_pane_info(pane_id, &domain_b, &title_b, &cwd_b);
+        changed.domain_id = Some(7);
+        changed.tty_name = Some("stable-tty".to_string());
+        let first = PaneLifecycleIdentity::from_pane_info(&first);
+        let changed = PaneLifecycleIdentity::from_pane_info(&changed);
+        prop_assert_eq!(first.continuity_with(&changed), PaneLifecycleContinuity::Same);
     }
 
-    /// content_hash does NOT affect is_same_generation.
     #[test]
-    fn fingerprint_content_hash_ignored_for_generation(
-        domain in arb_domain(),
-        title in arb_title(),
-        cwd in arb_cwd(),
-        hash_a in any::<u64>(),
-        hash_b in any::<u64>(),
-    ) {
-        let fp_a = PaneFingerprint {
-            domain: domain.clone(),
-            initial_title: title.clone(),
-            initial_cwd: cwd.clone(),
-            content_hash: hash_a,
-        };
-        let fp_b = PaneFingerprint {
-            domain,
-            initial_title: title,
-            initial_cwd: cwd,
-            content_hash: hash_b,
-        };
-        prop_assert!(
-            fp_a.is_same_generation(&fp_b),
-            "content_hash should not affect is_same_generation"
-        );
-    }
-
-    /// Fingerprint domain is inferred from PaneInfo.domain_name.
-    #[test]
-    fn fingerprint_domain_from_pane_info(
+    fn exact_domain_or_tty_change_is_replacement(
         pane_id in arb_pane_id(),
-        domain in arb_domain(),
-        title in arb_title(),
-        cwd in arb_cwd(),
+        first_domain in 0u64..u64::MAX,
     ) {
-        let info = make_pane_info(pane_id, &domain, &title, &cwd);
-        let fp = PaneFingerprint::without_content(&info);
-        prop_assert_eq!(fp.domain.as_str(), domain.as_str(), "domain mismatch");
-    }
-
-    /// Fingerprint title and cwd come from PaneInfo.
-    #[test]
-    fn fingerprint_title_cwd_from_pane_info(
-        pane_id in arb_pane_id(),
-        domain in arb_domain(),
-        title in arb_title(),
-        cwd in arb_cwd(),
-    ) {
-        let info = make_pane_info(pane_id, &domain, &title, &cwd);
-        let fp = PaneFingerprint::without_content(&info);
-        prop_assert_eq!(fp.initial_title.as_str(), title.as_str(), "title mismatch");
-        prop_assert_eq!(fp.initial_cwd.as_str(), cwd.as_str(), "cwd mismatch");
+        let first = PaneLifecycleIdentity {
+            pane_id,
+            domain_id: Some(first_domain),
+            tty_name: Some("tty-a".to_string()),
+        };
+        let changed_domain = PaneLifecycleIdentity {
+            domain_id: Some(first_domain.saturating_add(1)),
+            ..first.clone()
+        };
+        prop_assume!(changed_domain.domain_id != first.domain_id);
+        prop_assert_eq!(first.continuity_with(&changed_domain), PaneLifecycleContinuity::Replaced);
+        let changed_tty = PaneLifecycleIdentity {
+            tty_name: Some("tty-b".to_string()),
+            ..first.clone()
+        };
+        prop_assert_eq!(first.continuity_with(&changed_tty), PaneLifecycleContinuity::Replaced);
+        let missing = PaneLifecycleIdentity { domain_id: None, tty_name: None, ..first.clone() };
+        prop_assert_eq!(first.continuity_with(&missing), PaneLifecycleContinuity::Ambiguous);
     }
 }
 
@@ -510,21 +435,27 @@ proptest! {
     fn discovery_diff_change_count_is_sum(
         new_panes in arb_pane_vec(),
         closed_panes in arb_pane_vec(),
-        changed_panes in arb_pane_vec(),
-        new_generations in arb_pane_vec(),
+        metadata_panes in arb_pane_vec(),
+        lifecycle_replacements in arb_pane_vec(),
         re_observed_panes in arb_pane_vec(),
+        ambiguous_lifecycle_panes in arb_pane_vec(),
+        revision_exhausted_panes in arb_pane_vec(),
     ) {
         let expected = new_panes.len()
             + closed_panes.len()
-            + changed_panes.len()
-            + new_generations.len()
-            + re_observed_panes.len();
+            + metadata_panes.len()
+            + lifecycle_replacements.len()
+            + re_observed_panes.len()
+            + ambiguous_lifecycle_panes.len()
+            + revision_exhausted_panes.len();
         let diff = DiscoveryDiff {
             new_panes,
             closed_panes,
-            changed_panes,
-            new_generations,
+            metadata_changes: metadata_changes_for(metadata_panes),
+            lifecycle_replacements,
             re_observed_panes,
+            ambiguous_lifecycle_panes,
+            revision_exhausted_panes,
         };
         prop_assert_eq!(diff.change_count(), expected, "change_count mismatch");
     }
@@ -533,15 +464,17 @@ proptest! {
     #[test]
     fn discovery_diff_non_empty_when_has_panes(
         panes in proptest::collection::vec(arb_pane_id(), 1..10),
-        which in 0u8..5,
+        which in 0u8..7,
     ) {
         let mut diff = DiscoveryDiff::default();
         match which {
             0 => diff.new_panes = panes,
             1 => diff.closed_panes = panes,
-            2 => diff.changed_panes = panes,
-            3 => diff.new_generations = panes,
-            _ => diff.re_observed_panes = panes,
+            2 => diff.metadata_changes = metadata_changes_for(panes),
+            3 => diff.lifecycle_replacements = panes,
+            4 => diff.re_observed_panes = panes,
+            5 => diff.ambiguous_lifecycle_panes = panes,
+            _ => diff.revision_exhausted_panes = panes,
         }
         prop_assert!(!diff.is_empty(), "diff with panes should not be empty");
     }
@@ -551,22 +484,28 @@ proptest! {
     fn discovery_diff_is_empty_iff_all_empty(
         new_panes in arb_pane_vec(),
         closed_panes in arb_pane_vec(),
-        changed_panes in arb_pane_vec(),
-        new_generations in arb_pane_vec(),
+        metadata_panes in arb_pane_vec(),
+        lifecycle_replacements in arb_pane_vec(),
         re_observed_panes in arb_pane_vec(),
+        ambiguous_lifecycle_panes in arb_pane_vec(),
+        revision_exhausted_panes in arb_pane_vec(),
     ) {
         let diff = DiscoveryDiff {
             new_panes: new_panes.clone(),
             closed_panes: closed_panes.clone(),
-            changed_panes: changed_panes.clone(),
-            new_generations: new_generations.clone(),
+            metadata_changes: metadata_changes_for(metadata_panes.clone()),
+            lifecycle_replacements: lifecycle_replacements.clone(),
             re_observed_panes: re_observed_panes.clone(),
+            ambiguous_lifecycle_panes: ambiguous_lifecycle_panes.clone(),
+            revision_exhausted_panes: revision_exhausted_panes.clone(),
         };
         let all_empty = new_panes.is_empty()
             && closed_panes.is_empty()
-            && changed_panes.is_empty()
-            && new_generations.is_empty()
-            && re_observed_panes.is_empty();
+            && metadata_panes.is_empty()
+            && lifecycle_replacements.is_empty()
+            && re_observed_panes.is_empty()
+            && ambiguous_lifecycle_panes.is_empty()
+            && revision_exhausted_panes.is_empty();
         prop_assert_eq!(diff.is_empty(), all_empty, "is_empty should match all-empty check");
     }
 }
@@ -787,7 +726,7 @@ proptest! {
             discovery_ticks: ticks,
             panes_discovered: discovered,
             panes_closed: closed,
-            generation_changes: 5,
+            lifecycle_replacements: 5,
             metadata_changes: 10,
             panes_filtered: 2,
         };
@@ -1114,19 +1053,29 @@ proptest! {
     fn in59_discovery_diff_count(
         new in arb_pane_vec(),
         closed in arb_pane_vec(),
-        changed in arb_pane_vec(),
-        gens in arb_pane_vec(),
+        metadata in arb_pane_vec(),
+        replacements in arb_pane_vec(),
         re_observed in arb_pane_vec(),
+        ambiguous in arb_pane_vec(),
+        exhausted in arb_pane_vec(),
     ) {
+        let metadata_len = metadata.len();
         let diff = DiscoveryDiff {
             new_panes: new.clone(),
             closed_panes: closed.clone(),
-            changed_panes: changed.clone(),
-            new_generations: gens.clone(),
+            metadata_changes: metadata_changes_for(metadata),
+            lifecycle_replacements: replacements.clone(),
             re_observed_panes: re_observed.clone(),
+            ambiguous_lifecycle_panes: ambiguous.clone(),
+            revision_exhausted_panes: exhausted.clone(),
         };
-        let expected =
-            new.len() + closed.len() + changed.len() + gens.len() + re_observed.len();
+        let expected = new.len()
+            + closed.len()
+            + metadata_len
+            + replacements.len()
+            + re_observed.len()
+            + ambiguous.len()
+            + exhausted.len();
         prop_assert_eq!(diff.change_count(), expected);
         let should_be_empty = expected == 0;
         prop_assert_eq!(diff.is_empty(), should_be_empty);

@@ -7,7 +7,7 @@
 //! The discovery system polls `wezterm cli list` to:
 //! - Track pane lifecycle (new/closed/changed)
 //! - Apply include/exclude filters for privacy and performance
-//! - Maintain stable pane identities via fingerprinting
+//! - Maintain stable lifecycle identities separately from mutable metadata
 //!
 //! # Delta Extraction
 //!
@@ -60,8 +60,8 @@ pub struct IngestTelemetry {
     panes_discovered: u64,
     /// Total panes closed (removed from registry)
     panes_closed: u64,
-    /// Total generation changes detected (fingerprint drift)
-    generation_changes: u64,
+    /// Total authoritative lifecycle replacements detected
+    lifecycle_replacements: u64,
     /// Total metadata-only changes detected
     metadata_changes: u64,
     /// Total panes filtered out by observation rules
@@ -84,12 +84,12 @@ impl IngestTelemetry {
         self.panes_closed = self
             .panes_closed
             .saturating_add(u64::try_from(diff.closed_panes.len()).unwrap_or(u64::MAX));
-        self.generation_changes = self
-            .generation_changes
-            .saturating_add(u64::try_from(diff.new_generations.len()).unwrap_or(u64::MAX));
+        self.lifecycle_replacements = self
+            .lifecycle_replacements
+            .saturating_add(u64::try_from(diff.lifecycle_replacements.len()).unwrap_or(u64::MAX));
         self.metadata_changes = self
             .metadata_changes
-            .saturating_add(u64::try_from(diff.changed_panes.len()).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(diff.metadata_changes.len()).unwrap_or(u64::MAX));
     }
 
     /// Record a pane being filtered out by observation rules.
@@ -104,7 +104,7 @@ impl IngestTelemetry {
             discovery_ticks: self.discovery_ticks,
             panes_discovered: self.panes_discovered,
             panes_closed: self.panes_closed,
-            generation_changes: self.generation_changes,
+            lifecycle_replacements: self.lifecycle_replacements,
             metadata_changes: self.metadata_changes,
             panes_filtered: self.panes_filtered,
         }
@@ -120,7 +120,7 @@ pub struct IngestTelemetrySnapshot {
     pub discovery_ticks: u64,
     pub panes_discovered: u64,
     pub panes_closed: u64,
-    pub generation_changes: u64,
+    pub lifecycle_replacements: u64,
     pub metadata_changes: u64,
     pub panes_filtered: u64,
 }
@@ -172,71 +172,210 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 // =============================================================================
-// Fingerprinting
+// Pane lifecycle identity and mutable metadata
 // =============================================================================
 
-/// A fingerprint uniquely identifies a pane "generation".
+/// Checked lifecycle revision for one continuously tracked numeric pane ID.
 ///
-/// A generation represents a logical session within a pane. When domain, title,
-/// or cwd change, we consider it a new generation (possibly a new shell session,
-/// connection to different host, or major context switch).
-///
-/// Components:
-/// - domain name (e.g., "local", "SSH:hostname")
-/// - title and cwd at the start of this generation
-/// - optional hash of initial content (first ~50 lines)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PaneFingerprint {
-    /// Domain name (e.g., "local", "SSH:hostname")
-    pub domain: String,
-    /// Title at the start of this generation
-    pub initial_title: String,
-    /// Working directory at the start of this generation
-    pub initial_cwd: String,
-    /// Hash of initial content (first ~50 lines), 0 if not captured
-    pub content_hash: u64,
+/// This revision changes only when authoritative membership evidence changes.
+/// Presentation metadata such as title, cwd, geometry, focus, and display name
+/// is deliberately excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PaneLifecycleRevision(u32);
+
+impl PaneLifecycleRevision {
+    pub(crate) const INITIAL: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    fn checked_next(self) -> Option<Self> {
+        self.get().checked_add(1).map(Self)
+    }
 }
 
-impl PaneFingerprint {
-    /// Create a fingerprint from pane info and initial content
+/// Checked revision for latest-wins mutable pane metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PaneMetadataRevision(u64);
+
+impl PaneMetadataRevision {
+    pub(crate) const INITIAL: Self = Self(0);
+
     #[must_use]
-    pub fn new(info: &PaneInfo, initial_content: Option<&str>) -> Self {
-        let domain = info.inferred_domain();
-        let initial_title = info.title.clone().unwrap_or_default();
-        let initial_cwd = info.cwd.clone().unwrap_or_default();
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
 
-        let content_hash = initial_content.map_or(0, |content| {
-            // Hash first ~50 lines to capture shell banner/prompt
-            let truncated: String = content.lines().take(50).collect::<Vec<_>>().join("\n");
-            hash_text(&truncated)
-        });
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 
+    fn checked_next(self) -> Option<Self> {
+        self.get().checked_add(1).map(Self)
+    }
+}
+
+/// Authoritative pane membership evidence available from the current backend.
+///
+/// Numeric pane ID is the mux's continuity authority while it remains present
+/// in consecutive coherent listings. Domain display name, title, cwd,
+/// workspace, geometry, cursor, focus, and zoom are intentionally absent.
+/// `domain_id` and `tty_name` strengthen replacement detection when supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PaneLifecycleIdentity {
+    pub pane_id: u64,
+    pub domain_id: Option<u64>,
+    pub tty_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneLifecycleContinuity {
+    Same,
+    Replaced,
+    Ambiguous,
+}
+
+impl PaneLifecycleIdentity {
+    #[must_use]
+    pub fn from_pane_info(info: &PaneInfo) -> Self {
         Self {
-            domain,
-            initial_title,
-            initial_cwd,
-            content_hash,
+            pane_id: info.pane_id,
+            domain_id: info.domain_id,
+            tty_name: info.tty_name.clone(),
         }
     }
 
-    /// Create a fingerprint without content (for quick identification)
+    /// Compare exact lifecycle evidence without consulting mutable display
+    /// metadata. Losing previously available exact evidence is ambiguous and
+    /// must not silently preserve capture admission.
     #[must_use]
-    pub fn without_content(info: &PaneInfo) -> Self {
-        Self::new(info, None)
-    }
-
-    /// Check if this fingerprint indicates the same pane generation
-    #[must_use]
-    pub fn is_same_generation(&self, other: &Self) -> bool {
-        // Domain must match exactly
-        if self.domain != other.domain {
-            return false;
+    pub fn continuity_with(&self, next: &Self) -> PaneLifecycleContinuity {
+        if self.pane_id != next.pane_id {
+            return PaneLifecycleContinuity::Replaced;
         }
-
-        // Title and cwd must be close (allow some drift)
-        // For now, just compare directly - future: fuzzy matching
-        self.initial_title == other.initial_title && self.initial_cwd == other.initial_cwd
+        if (self.domain_id.is_some() && next.domain_id.is_none())
+            || (self.tty_name.is_some() && next.tty_name.is_none())
+        {
+            return PaneLifecycleContinuity::Ambiguous;
+        }
+        if self
+            .domain_id
+            .zip(next.domain_id)
+            .is_some_and(|(left, right)| left != right)
+            || self
+                .tty_name
+                .as_deref()
+                .zip(next.tty_name.as_deref())
+                .is_some_and(|(left, right)| left != right)
+        {
+            return PaneLifecycleContinuity::Replaced;
+        }
+        PaneLifecycleContinuity::Same
     }
+
+    fn merge_available_evidence(&mut self, next: &Self) {
+        if self.domain_id.is_none() {
+            self.domain_id = next.domain_id;
+        }
+        if self.tty_name.is_none() {
+            self.tty_name.clone_from(&next.tty_name);
+        }
+    }
+}
+
+/// Field-level mutable metadata difference for one discovery observation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaneMetadataDiff(u16);
+
+impl PaneMetadataDiff {
+    const DOMAIN_DISPLAY_NAME: u16 = 1 << 0;
+    const WORKSPACE: u16 = 1 << 1;
+    const PLACEMENT: u16 = 1 << 2;
+    const SIZE: u16 = 1 << 3;
+    const TITLE: u16 = 1 << 4;
+    const CWD: u16 = 1 << 5;
+    const CURSOR: u16 = 1 << 6;
+    const LAYOUT: u16 = 1 << 7;
+    const ACTIVE_ZOOM: u16 = 1 << 8;
+    const EXTRA: u16 = 1 << 9;
+    const OBSERVATION: u16 = 1 << 10;
+    const IDENTITY_EVIDENCE: u16 = 1 << 11;
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    fn include_observation_change(&mut self) {
+        self.0 |= Self::OBSERVATION;
+    }
+
+    fn between(old: &PaneInfo, new: &PaneInfo) -> Self {
+        let mut bits = 0;
+        if old.domain_name != new.domain_name {
+            bits |= Self::DOMAIN_DISPLAY_NAME;
+        }
+        if old.workspace != new.workspace {
+            bits |= Self::WORKSPACE;
+        }
+        if old.window_id != new.window_id || old.tab_id != new.tab_id {
+            bits |= Self::PLACEMENT;
+        }
+        if old.size != new.size || old.rows != new.rows || old.cols != new.cols {
+            bits |= Self::SIZE;
+        }
+        if old.title != new.title {
+            bits |= Self::TITLE;
+        }
+        if old.cwd != new.cwd {
+            bits |= Self::CWD;
+        }
+        if old.cursor_x != new.cursor_x
+            || old.cursor_y != new.cursor_y
+            || old.cursor_visibility != new.cursor_visibility
+        {
+            bits |= Self::CURSOR;
+        }
+        if old.left_col != new.left_col || old.top_row != new.top_row {
+            bits |= Self::LAYOUT;
+        }
+        if old.is_active != new.is_active || old.is_zoomed != new.is_zoomed {
+            bits |= Self::ACTIVE_ZOOM;
+        }
+        if old.extra != new.extra {
+            bits |= Self::EXTRA;
+        }
+        if old.domain_id != new.domain_id || old.tty_name != new.tty_name {
+            // Newly available exact evidence strengthens the existing
+            // lifecycle identity without rotating it, but still needs a
+            // latest-wins persistence/UI refresh. Contradictions are handled
+            // by `PaneLifecycleIdentity::continuity_with` before this diff is
+            // committed.
+            bits |= Self::IDENTITY_EVIDENCE;
+        }
+        Self(bits)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneMetadataChange {
+    pub pane_id: u64,
+    pub lifecycle_revision: PaneLifecycleRevision,
+    pub metadata_revision: PaneMetadataRevision,
+    pub diff: PaneMetadataDiff,
 }
 
 // =============================================================================
@@ -303,13 +442,13 @@ pub struct PanePriorityOverride {
     pub expires_at: Option<i64>,
 }
 
-/// Extended pane state with fingerprint and observation tracking
+/// Extended pane state with lifecycle identity and observation tracking
 #[derive(Debug, Clone)]
 pub struct PaneEntry {
     /// Current pane info from WezTerm
     pub info: PaneInfo,
-    /// Stable fingerprint for this pane generation
-    pub fingerprint: PaneFingerprint,
+    /// Exact lifecycle evidence, separate from mutable presentation metadata.
+    pub lifecycle_identity: PaneLifecycleIdentity,
     /// Observation decision (observe vs ignore)
     pub observation: ObservationDecision,
     /// Stable pane UUID (persists across renames/moves within a session)
@@ -325,8 +464,10 @@ pub struct PaneEntry {
     pub decision_at: i64,
     /// Next sequence number to resume from if observation is later restored.
     pub resume_next_seq: u64,
-    /// Generation number (increments when fingerprint changes)
-    pub generation: u32,
+    /// Checked revision that changes only on authoritative replacement.
+    pub lifecycle_revision: PaneLifecycleRevision,
+    /// Checked latest-wins metadata revision.
+    pub metadata_revision: PaneMetadataRevision,
     /// Whether pane is in alternate screen buffer.
     ///
     /// DEPRECATED: This field was populated by Lua status updates which were removed
@@ -347,6 +488,17 @@ pub struct PaneEntry {
 }
 
 impl PaneEntry {
+    fn revision_namespace_is_exhausted(&self) -> bool {
+        (matches!(
+            self.observation.ignore_reason(),
+            Some("lifecycle_revision_exhausted")
+        ) && self.lifecycle_revision.get() == u32::MAX)
+            || (matches!(
+                self.observation.ignore_reason(),
+                Some("metadata_revision_exhausted")
+            ) && self.metadata_revision.get() == u64::MAX)
+    }
+
     /// Create a new pane entry
     ///
     /// Generates a per-runtime `pane_uuid` based on domain, pane_id, and creation time.
@@ -354,7 +506,7 @@ impl PaneEntry {
     #[must_use]
     pub fn new(
         info: PaneInfo,
-        fingerprint: PaneFingerprint,
+        lifecycle_identity: PaneLifecycleIdentity,
         observation: ObservationDecision,
         pane_arena: PaneArena,
     ) -> Self {
@@ -364,14 +516,15 @@ impl PaneEntry {
 
         Self {
             info,
-            fingerprint,
+            lifecycle_identity,
             observation,
             pane_uuid,
             first_seen_at: now,
             last_seen_at: now,
             decision_at: now,
             resume_next_seq: 0,
-            generation: 0,
+            lifecycle_revision: PaneLifecycleRevision::INITIAL,
+            metadata_revision: PaneMetadataRevision::INITIAL,
             is_alt_screen: false,
             last_status_at: None,
             priority_override: None,
@@ -383,7 +536,7 @@ impl PaneEntry {
     #[must_use]
     pub fn with_uuid(
         info: PaneInfo,
-        fingerprint: PaneFingerprint,
+        lifecycle_identity: PaneLifecycleIdentity,
         observation: ObservationDecision,
         pane_arena: PaneArena,
         pane_uuid: String,
@@ -391,14 +544,15 @@ impl PaneEntry {
         let now = epoch_ms();
         Self {
             info,
-            fingerprint,
+            lifecycle_identity,
             observation,
             pane_uuid,
             first_seen_at: now,
             last_seen_at: now,
             decision_at: now,
             resume_next_seq: 0,
-            generation: 0,
+            lifecycle_revision: PaneLifecycleRevision::INITIAL,
+            metadata_revision: PaneMetadataRevision::INITIAL,
             is_alt_screen: false,
             last_status_at: None,
             priority_override: None,
@@ -406,8 +560,11 @@ impl PaneEntry {
         }
     }
 
-    /// Update with new pane info (preserves fingerprint and first_seen)
-    pub fn update_info(&mut self, info: PaneInfo) {
+    /// Install registry-classified pane info while preserving first-seen time.
+    ///
+    /// This stays private so callers cannot bypass lifecycle continuity and
+    /// checked metadata-revision allocation in [`PaneRegistry::discovery_tick`].
+    fn update_info(&mut self, info: PaneInfo) {
         self.info = info;
         self.last_seen_at = epoch_ms();
     }
@@ -420,7 +577,7 @@ impl PaneEntry {
     pub fn estimated_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + pane_info_dynamic_bytes(&self.info)
-            + pane_fingerprint_dynamic_bytes(&self.fingerprint)
+            + pane_lifecycle_identity_dynamic_bytes(&self.lifecycle_identity)
             + observation_dynamic_bytes(&self.observation)
             + self.pane_uuid.len()
     }
@@ -491,8 +648,8 @@ fn pane_info_dynamic_bytes(info: &PaneInfo) -> usize {
             .sum::<usize>()
 }
 
-fn pane_fingerprint_dynamic_bytes(fingerprint: &PaneFingerprint) -> usize {
-    fingerprint.domain.len() + fingerprint.initial_title.len() + fingerprint.initial_cwd.len()
+fn pane_lifecycle_identity_dynamic_bytes(identity: &PaneLifecycleIdentity) -> usize {
+    option_string_len(identity.tty_name.as_ref())
 }
 
 fn observation_dynamic_bytes(observation: &ObservationDecision) -> usize {
@@ -513,10 +670,14 @@ pub struct DiscoveryDiff {
     pub new_panes: Vec<u64>,
     /// Panes that have closed (no longer in WezTerm list)
     pub closed_panes: Vec<u64>,
-    /// Panes with changed metadata (title, cwd, etc.)
-    pub changed_panes: Vec<u64>,
-    /// Panes whose fingerprint changed (new generation)
-    pub new_generations: Vec<u64>,
+    /// Checked latest-wins metadata changes, including title and cwd.
+    pub metadata_changes: Vec<PaneMetadataChange>,
+    /// Panes whose authoritative lifecycle evidence changed.
+    pub lifecycle_replacements: Vec<u64>,
+    /// Panes withheld because previously available lifecycle evidence vanished.
+    pub ambiguous_lifecycle_panes: Vec<u64>,
+    /// Panes withheld because a checked revision namespace was exhausted.
+    pub revision_exhausted_panes: Vec<u64>,
     /// Panes that flipped `Ignored` -> `Observed` on this tick (ft-0kdi9).
     ///
     /// An already-tracked pane can re-enter observation at any time, because
@@ -536,8 +697,10 @@ impl DiscoveryDiff {
     pub fn is_empty(&self) -> bool {
         self.new_panes.is_empty()
             && self.closed_panes.is_empty()
-            && self.changed_panes.is_empty()
-            && self.new_generations.is_empty()
+            && self.metadata_changes.is_empty()
+            && self.lifecycle_replacements.is_empty()
+            && self.ambiguous_lifecycle_panes.is_empty()
+            && self.revision_exhausted_panes.is_empty()
             && self.re_observed_panes.is_empty()
     }
 
@@ -546,8 +709,10 @@ impl DiscoveryDiff {
     pub fn change_count(&self) -> usize {
         self.new_panes.len()
             + self.closed_panes.len()
-            + self.changed_panes.len()
-            + self.new_generations.len()
+            + self.metadata_changes.len()
+            + self.lifecycle_replacements.len()
+            + self.ambiguous_lifecycle_panes.len()
+            + self.revision_exhausted_panes.len()
             + self.re_observed_panes.len()
     }
 }
@@ -1026,7 +1191,7 @@ impl PaneCursor {
 
 /// Pane registry for tracking discovered panes with lifecycle management
 pub struct PaneRegistry {
-    /// Extended pane entries with fingerprints and observation state
+    /// Extended pane entries with lifecycle identity and observation state
     entries: HashMap<u64, PaneEntry>,
     /// Reverse index: pane_uuid -> pane_id
     uuid_index: HashMap<String, u64>,
@@ -1102,18 +1267,40 @@ impl PaneRegistry {
         }
     }
 
-    /// Update the filter configuration
-    pub fn set_filter(&mut self, filter_config: PaneFilterConfig) {
+    /// Update the filter configuration and return exact metadata states
+    /// produced by observation-decision changes.
+    ///
+    /// Filter policy is mutable metadata, not lifecycle authority. Returning
+    /// these changes lets callers persist the new `observed`/`ignore_reason`
+    /// state without treating a policy transition as a pane restart.
+    pub fn set_filter(&mut self, filter_config: PaneFilterConfig) -> Vec<PaneMetadataChange> {
         self.filter_config = filter_config;
 
         let pane_ids: Vec<u64> = self.entries.keys().copied().collect();
+        let mut metadata_changes = Vec::new();
         for pane_id in pane_ids {
+            let before = self
+                .entries
+                .get(&pane_id)
+                .map(|entry| (entry.metadata_revision, entry.observation.clone()));
             self.re_evaluate_observation(pane_id);
             if let Some(entry) = self.entries.get(&pane_id) {
-                let tracked_bytes = entry.estimated_bytes();
-                let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
+                if before.is_some_and(|(revision, observation)| {
+                    revision != entry.metadata_revision || observation != entry.observation
+                }) {
+                    let mut diff = PaneMetadataDiff::default();
+                    diff.include_observation_change();
+                    metadata_changes.push(PaneMetadataChange {
+                        pane_id,
+                        lifecycle_revision: entry.lifecycle_revision,
+                        metadata_revision: entry.metadata_revision,
+                        diff,
+                    });
+                }
             }
         }
+        metadata_changes.sort_unstable_by_key(|change| change.pane_id);
+        metadata_changes
     }
 
     /// Update trauma-guard tuning and apply it to tracked panes.
@@ -1230,28 +1417,92 @@ impl PaneRegistry {
     /// Returns a diff describing what changed.
     pub fn discovery_tick(&mut self, panes: Vec<PaneInfo>) -> DiscoveryDiff {
         let mut diff = DiscoveryDiff::default();
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut seen: HashSet<u64> = HashSet::with_capacity(panes.len());
+        let mut duplicate_ids = HashSet::new();
+        for pane in &panes {
+            if !seen.insert(pane.pane_id) {
+                duplicate_ids.insert(pane.pane_id);
+            }
+        }
 
         for pane in panes {
             let pane_id = pane.pane_id;
-            seen.insert(pane_id);
-            let new_observation = self.decide_observation(&pane);
+            if duplicate_ids.contains(&pane_id) {
+                continue;
+            }
+            let mut new_observation = self.decide_observation(&pane);
 
             match self.entries.entry(pane_id) {
                 Entry::Occupied(mut occupied) => {
                     let entry = occupied.get_mut();
-                    let new_fingerprint = PaneFingerprint::without_content(&pane);
-
-                    if !entry.fingerprint.is_same_generation(&new_fingerprint) {
-                        diff.new_generations.push(pane_id);
-                        entry.fingerprint = new_fingerprint;
-                        entry.generation = entry.generation.saturating_add(1);
-                        entry.decision_at = epoch_ms();
-                    } else if Self::has_metadata_changed(&entry.info, &pane) {
-                        diff.changed_panes.push(pane_id);
+                    if entry.revision_namespace_is_exhausted() {
+                        // Checked revision exhaustion is a terminal state for
+                        // this tracked incarnation. Keep presence/accounting
+                        // fresh, but never manufacture an unversioned recovery
+                        // or restage the same terminal storage write forever.
+                        entry.update_info(pane);
+                        let tracked_bytes = entry.estimated_bytes();
+                        let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
+                        continue;
+                    }
+                    let next_identity = PaneLifecycleIdentity::from_pane_info(&pane);
+                    let mut metadata_diff = PaneMetadataDiff::between(&entry.info, &pane);
+                    let was_observed = entry.should_observe();
+                    let mut lifecycle_replaced = false;
+                    let mut lifecycle_revision_exhausted = false;
+                    match entry.lifecycle_identity.continuity_with(&next_identity) {
+                        PaneLifecycleContinuity::Same => {
+                            entry
+                                .lifecycle_identity
+                                .merge_available_evidence(&next_identity);
+                        }
+                        PaneLifecycleContinuity::Replaced => {
+                            if let Some(revision) = entry.lifecycle_revision.checked_next() {
+                                entry.lifecycle_identity = next_identity;
+                                entry.lifecycle_revision = revision;
+                                entry.metadata_revision = PaneMetadataRevision::INITIAL;
+                                diff.lifecycle_replacements.push(pane_id);
+                                lifecycle_replaced = true;
+                                entry.decision_at = epoch_ms();
+                            } else {
+                                diff.revision_exhausted_panes.push(pane_id);
+                                lifecycle_revision_exhausted = true;
+                                new_observation = ObservationDecision::Ignored {
+                                    reason: "lifecycle_revision_exhausted".to_string(),
+                                };
+                            }
+                        }
+                        PaneLifecycleContinuity::Ambiguous => {
+                            diff.ambiguous_lifecycle_panes.push(pane_id);
+                            new_observation = ObservationDecision::Ignored {
+                                reason: "lifecycle_identity_ambiguous".to_string(),
+                            };
+                        }
                     }
 
-                    let was_observed = entry.should_observe();
+                    if entry.observation != new_observation {
+                        metadata_diff.include_observation_change();
+                    }
+                    if !lifecycle_replaced
+                        && !lifecycle_revision_exhausted
+                        && !metadata_diff.is_empty()
+                    {
+                        if let Some(revision) = entry.metadata_revision.checked_next() {
+                            entry.metadata_revision = revision;
+                            diff.metadata_changes.push(PaneMetadataChange {
+                                pane_id,
+                                lifecycle_revision: entry.lifecycle_revision,
+                                metadata_revision: revision,
+                                diff: metadata_diff,
+                            });
+                        } else {
+                            diff.revision_exhausted_panes.push(pane_id);
+                            new_observation = ObservationDecision::Ignored {
+                                reason: "metadata_revision_exhausted".to_string(),
+                            };
+                        }
+                    }
+
                     let is_observed = new_observation.is_observed();
 
                     entry.update_info(pane);
@@ -1284,10 +1535,11 @@ impl PaneRegistry {
                 Entry::Vacant(vacant) => {
                     diff.new_panes.push(pane_id);
 
-                    let fingerprint = PaneFingerprint::without_content(&pane);
+                    let lifecycle_identity = PaneLifecycleIdentity::from_pane_info(&pane);
                     let pane_arena = self.pane_arenas.reserve(pane_id).arena();
 
-                    let entry = PaneEntry::new(pane, fingerprint, new_observation, pane_arena);
+                    let entry =
+                        PaneEntry::new(pane, lifecycle_identity, new_observation, pane_arena);
                     let tracked_bytes = entry.estimated_bytes();
                     let should_observe = entry.should_observe();
                     self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
@@ -1305,6 +1557,47 @@ impl PaneRegistry {
                     }
                 }
             }
+        }
+
+        let mut duplicate_ids = duplicate_ids.into_iter().collect::<Vec<_>>();
+        duplicate_ids.sort_unstable();
+        for pane_id in duplicate_ids {
+            diff.ambiguous_lifecycle_panes.push(pane_id);
+            let Some(entry) = self.entries.get_mut(&pane_id) else {
+                // A duplicate first sighting has no identity safe to retain.
+                // Do not create an entry from either arbitrary row; a later
+                // unique listing will be admitted as a new pane.
+                continue;
+            };
+            let was_observed = entry.should_observe();
+            let mut new_observation = ObservationDecision::Ignored {
+                reason: "duplicate_pane_identity".to_string(),
+            };
+            let mut metadata_diff = PaneMetadataDiff::default();
+            if entry.observation != new_observation {
+                metadata_diff.include_observation_change();
+                if let Some(revision) = entry.metadata_revision.checked_next() {
+                    entry.metadata_revision = revision;
+                    diff.metadata_changes.push(PaneMetadataChange {
+                        pane_id,
+                        lifecycle_revision: entry.lifecycle_revision,
+                        metadata_revision: revision,
+                        diff: metadata_diff,
+                    });
+                } else {
+                    diff.revision_exhausted_panes.push(pane_id);
+                    new_observation = ObservationDecision::Ignored {
+                        reason: "metadata_revision_exhausted".to_string(),
+                    };
+                }
+                entry.observation = new_observation;
+                entry.decision_at = epoch_ms();
+            }
+            if was_observed && let Some(cursor) = self.cursors.remove(&pane_id) {
+                entry.resume_next_seq = cursor.next_seq;
+            }
+            let tracked_bytes = entry.estimated_bytes();
+            let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
         }
 
         let mut closed_panes = std::mem::take(&mut self.closed_panes_scratch);
@@ -1346,14 +1639,6 @@ impl PaneRegistry {
             .map_or(ObservationDecision::Observed, |reason| {
                 ObservationDecision::Ignored { reason }
             })
-    }
-
-    /// Check if pane metadata (window/tab assignment) has changed.
-    ///
-    /// Note: Title and cwd changes are handled separately via `is_same_generation()`
-    /// which triggers a new generation rather than a metadata change.
-    fn has_metadata_changed(old: &PaneInfo, new: &PaneInfo) -> bool {
-        old.window_id != new.window_id || old.tab_id != new.tab_id
     }
 
     /// Get all tracked pane IDs
@@ -1408,8 +1693,11 @@ impl PaneRegistry {
         self.entries.get(&pane_id)
     }
 
-    /// Get mutable pane entry by ID
-    pub fn get_entry_mut(&mut self, pane_id: u64) -> Option<&mut PaneEntry> {
+    /// Get mutable pane entry by ID for crate-internal diagnostics and tests.
+    ///
+    /// External mutation would bypass lifecycle and metadata revision
+    /// authority, so production consumers use the classified registry APIs.
+    pub(crate) fn get_entry_mut(&mut self, pane_id: u64) -> Option<&mut PaneEntry> {
         self.entries.get_mut(&pane_id)
     }
 
@@ -1545,16 +1833,32 @@ impl PaneRegistry {
             return ObservationTransition::Unchanged;
         };
 
-        let was_observed = entry.should_observe();
-        let is_observed = new_decision.is_observed();
-
-        if entry.observation != new_decision {
-            entry.observation = new_decision;
-            entry.decision_at = epoch_ms();
+        if entry.revision_namespace_is_exhausted() {
+            // A filter refresh cannot allocate the missing checked revision;
+            // reviving capture here would bypass the exhaustion fence.
+            return ObservationTransition::Unchanged;
         }
 
+        let was_observed = entry.should_observe();
+        if entry.observation != new_decision {
+            if let Some(revision) = entry.metadata_revision.checked_next() {
+                entry.metadata_revision = revision;
+                entry.observation = new_decision;
+            } else {
+                // Admission metadata without a representable successor
+                // revision cannot be published safely. Retire capture and pin
+                // this incarnation in the same terminal state used by the
+                // discovery path.
+                entry.observation = ObservationDecision::Ignored {
+                    reason: "metadata_revision_exhausted".to_string(),
+                };
+            }
+            entry.decision_at = epoch_ms();
+        }
+        let is_observed = entry.should_observe();
+
         // Update cursor state
-        if is_observed && !was_observed {
+        let transition = if is_observed && !was_observed {
             // Now observed - resume monotonic sequencing instead of restarting at zero.
             self.cursors.insert(
                 pane_id,
@@ -1569,7 +1873,10 @@ impl PaneRegistry {
             ObservationTransition::Retired
         } else {
             ObservationTransition::Unchanged
-        }
+        };
+        let tracked_bytes = entry.estimated_bytes();
+        let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
+        transition
     }
 
     /// Adopt an existing stable UUID for a pane (e.g. recovered from storage).
@@ -3763,15 +4070,20 @@ mod tests {
             discovery_ticks: u64::MAX,
             panes_discovered: u64::MAX,
             panes_closed: u64::MAX,
-            generation_changes: u64::MAX,
+            lifecycle_replacements: u64::MAX,
             metadata_changes: u64::MAX,
             panes_filtered: u64::MAX,
         };
         let diff = DiscoveryDiff {
             new_panes: vec![1],
             closed_panes: vec![2],
-            changed_panes: vec![3],
-            new_generations: vec![4],
+            metadata_changes: vec![PaneMetadataChange {
+                pane_id: 3,
+                lifecycle_revision: PaneLifecycleRevision::INITIAL,
+                metadata_revision: PaneMetadataRevision::INITIAL,
+                diff: PaneMetadataDiff(PaneMetadataDiff::TITLE),
+            }],
+            lifecycle_replacements: vec![4],
             ..DiscoveryDiff::default()
         };
 
@@ -3782,7 +4094,7 @@ mod tests {
         assert_eq!(snapshot.discovery_ticks, u64::MAX);
         assert_eq!(snapshot.panes_discovered, u64::MAX);
         assert_eq!(snapshot.panes_closed, u64::MAX);
-        assert_eq!(snapshot.generation_changes, u64::MAX);
+        assert_eq!(snapshot.lifecycle_replacements, u64::MAX);
         assert_eq!(snapshot.metadata_changes, u64::MAX);
         assert_eq!(snapshot.panes_filtered, u64::MAX);
     }
@@ -5163,32 +5475,15 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_creation_and_comparison() {
+    fn lifecycle_identity_ignores_title_and_cwd() {
         let pane = make_pane(1, "vim", Some("/home/user"));
-
-        let fp1 = PaneFingerprint::without_content(&pane);
-        let fp2 = PaneFingerprint::without_content(&pane);
-
-        assert_eq!(fp1.initial_title, "vim");
-        assert_eq!(fp1.initial_cwd, "/home/user");
-        assert!(fp1.is_same_generation(&fp2));
-
-        // Different title = different generation
-        let pane2 = make_pane(1, "nano", Some("/home/user"));
-        let fp3 = PaneFingerprint::without_content(&pane2);
-        assert!(!fp1.is_same_generation(&fp3));
-    }
-
-    #[test]
-    fn fingerprint_with_content_hash() {
-        let pane = make_pane(1, "bash", Some("/tmp"));
-
-        let fp1 = PaneFingerprint::new(&pane, Some("$ echo hello"));
-        let fp2 = PaneFingerprint::new(&pane, Some("$ echo world"));
-
-        // Same generation (same title/cwd) but different content hashes
-        assert!(fp1.is_same_generation(&fp2));
-        assert_ne!(fp1.content_hash, fp2.content_hash);
+        let identity = PaneLifecycleIdentity::from_pane_info(&pane);
+        let changed = make_pane(1, "nano", Some("/tmp"));
+        let changed_identity = PaneLifecycleIdentity::from_pane_info(&changed);
+        assert_eq!(
+            identity.continuity_with(&changed_identity),
+            PaneLifecycleContinuity::Same
+        );
     }
 
     #[test]
@@ -5205,13 +5500,13 @@ mod tests {
     #[test]
     fn pane_entry_creation_and_update() {
         let pane = make_pane(1, "bash", Some("/home"));
-        let fp = PaneFingerprint::without_content(&pane);
+        let identity = PaneLifecycleIdentity::from_pane_info(&pane);
         let pane_arena = PaneArenaRegistry::new().reserve(1).arena();
-        let entry = PaneEntry::new(pane, fp, ObservationDecision::Observed, pane_arena);
+        let entry = PaneEntry::new(pane, identity, ObservationDecision::Observed, pane_arena);
 
         assert_eq!(entry.info.pane_id, 1);
         assert!(entry.should_observe());
-        assert_eq!(entry.generation, 0);
+        assert_eq!(entry.lifecycle_revision.get(), 0);
 
         let mut entry = entry;
         let new_pane = make_pane(1, "vim", Some("/home/projects"));
@@ -5235,8 +5530,8 @@ mod tests {
         assert!(diff.new_panes.contains(&1));
         assert!(diff.new_panes.contains(&2));
         assert!(diff.closed_panes.is_empty());
-        assert!(diff.changed_panes.is_empty());
-        assert!(diff.new_generations.is_empty());
+        assert!(diff.metadata_changes.is_empty());
+        assert!(diff.lifecycle_replacements.is_empty());
 
         // Registry now tracks both panes
         assert_eq!(registry.len(), 2);
@@ -5269,29 +5564,31 @@ mod tests {
     }
 
     #[test]
-    fn discovery_tick_detects_new_generation_on_title_change() {
+    fn discovery_tick_classifies_title_change_as_metadata() {
         let mut registry = PaneRegistry::new();
 
         // First tick: pane with title "bash"
         let panes = vec![make_pane(1, "bash", Some("/home"))];
         registry.discovery_tick(panes);
         let entry = registry.entries.get(&1).unwrap();
-        assert_eq!(entry.generation, 0);
+        assert_eq!(entry.lifecycle_revision.get(), 0);
+        assert_eq!(entry.metadata_revision.get(), 0);
 
         // Second tick: same pane, title changed to "vim"
-        // This triggers a new generation (fingerprint includes title)
         let panes = vec![make_pane(1, "vim", Some("/home"))];
         let diff = registry.discovery_tick(panes);
 
         assert!(diff.new_panes.is_empty());
         assert!(diff.closed_panes.is_empty());
-        assert!(diff.changed_panes.is_empty());
-        assert!(diff.new_generations.contains(&1));
+        assert_eq!(diff.metadata_changes.len(), 1);
+        assert_eq!(diff.metadata_changes[0].pane_id, 1);
+        assert!(diff.lifecycle_replacements.is_empty());
 
-        // Verify info was updated and generation incremented
+        // Mutable metadata advances without rotating lifecycle authority.
         let entry = registry.entries.get(&1).unwrap();
         assert_eq!(entry.info.title, Some("vim".to_string()));
-        assert_eq!(entry.generation, 1);
+        assert_eq!(entry.lifecycle_revision.get(), 0);
+        assert_eq!(entry.metadata_revision.get(), 1);
     }
 
     #[test]
@@ -5304,9 +5601,7 @@ mod tests {
         pane.tab_id = 1;
         registry.discovery_tick(vec![pane]);
 
-        // Second tick: same pane, same title/cwd but window/tab moved.
-        // Title stays "bash" so fingerprint is unchanged — this triggers
-        // changed_panes (metadata change), not new_generations.
+        // Second tick: same pane moved between window/tab placements.
         let mut pane = make_pane(1, "bash", Some("/home"));
         pane.window_id = 2;
         pane.tab_id = 2;
@@ -5314,14 +5609,318 @@ mod tests {
 
         assert!(diff.new_panes.is_empty());
         assert!(diff.closed_panes.is_empty());
-        assert!(diff.changed_panes.contains(&1));
-        assert!(diff.new_generations.is_empty());
+        assert_eq!(diff.metadata_changes.len(), 1);
+        assert_eq!(diff.metadata_changes[0].pane_id, 1);
+        assert!(diff.lifecycle_replacements.is_empty());
 
-        // Verify metadata was updated but generation stayed the same
+        // Verify metadata was updated but lifecycle stayed the same.
         let entry = registry.entries.get(&1).unwrap();
         assert_eq!(entry.info.title, Some("bash".to_string()));
         assert_eq!(entry.info.cwd, Some("/home".to_string()));
-        assert_eq!(entry.generation, 0);
+        assert_eq!(entry.lifecycle_revision.get(), 0);
+    }
+
+    #[test]
+    fn exact_lifecycle_evidence_replaces_once_and_display_name_never_does() {
+        let mut registry = PaneRegistry::new();
+        let mut initial = make_pane(7, "shell", Some("/home"));
+        initial.domain_id = Some(11);
+        initial.domain_name = Some("local-display-a".to_string());
+        initial.tty_name = Some("/dev/pts/7".to_string());
+        registry.discovery_tick(vec![initial.clone()]);
+
+        let mut display_only = initial.clone();
+        display_only.domain_name = Some("renamed-display".to_string());
+        let display_diff = registry.discovery_tick(vec![display_only.clone()]);
+        assert!(display_diff.lifecycle_replacements.is_empty());
+        assert_eq!(display_diff.metadata_changes.len(), 1);
+        assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 0);
+
+        let mut replacement = display_only;
+        replacement.domain_id = Some(12);
+        replacement.tty_name = Some("/dev/pts/8".to_string());
+        let replacement_diff = registry.discovery_tick(vec![replacement.clone()]);
+        assert_eq!(replacement_diff.lifecycle_replacements, vec![7]);
+        assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 1);
+
+        let stable_diff = registry.discovery_tick(vec![replacement]);
+        assert!(stable_diff.lifecycle_replacements.is_empty());
+        assert!(stable_diff.metadata_changes.is_empty());
+        assert_eq!(registry.get_entry(7).unwrap().lifecycle_revision.get(), 1);
+    }
+
+    #[test]
+    fn newly_available_exact_evidence_is_metadata_without_replacement() {
+        let mut registry = PaneRegistry::new();
+        let initial = make_pane(8, "shell", Some("/home"));
+        registry.discovery_tick(vec![initial.clone()]);
+
+        let mut enriched = initial;
+        enriched.domain_id = Some(44);
+        enriched.tty_name = Some("/dev/pts/8".to_string());
+        let diff = registry.discovery_tick(vec![enriched]);
+
+        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.metadata_changes.len(), 1);
+        assert_ne!(
+            diff.metadata_changes[0].diff.bits() & PaneMetadataDiff::IDENTITY_EVIDENCE,
+            0
+        );
+        let entry = registry.get_entry(8).unwrap();
+        assert_eq!(entry.lifecycle_revision.get(), 0);
+        assert_eq!(entry.metadata_revision.get(), 1);
+        assert_eq!(entry.lifecycle_identity.domain_id, Some(44));
+        assert_eq!(
+            entry.lifecycle_identity.tty_name.as_deref(),
+            Some("/dev/pts/8")
+        );
+    }
+
+    #[test]
+    fn losing_exact_lifecycle_evidence_fails_closed_without_rotation() {
+        let mut registry = PaneRegistry::new();
+        let mut exact = make_pane(9, "shell", Some("/home"));
+        exact.domain_id = Some(2);
+        exact.tty_name = Some("/dev/pts/9".to_string());
+        registry.discovery_tick(vec![exact.clone()]);
+
+        let mut ambiguous = exact;
+        ambiguous.domain_id = None;
+        ambiguous.tty_name = None;
+        let diff = registry.discovery_tick(vec![ambiguous]);
+
+        assert_eq!(diff.ambiguous_lifecycle_panes, vec![9]);
+        assert!(diff.lifecycle_replacements.is_empty());
+        let entry = registry.get_entry(9).unwrap();
+        assert_eq!(entry.lifecycle_revision.get(), 0);
+        assert!(!entry.should_observe());
+        assert_eq!(
+            entry.observation.ignore_reason(),
+            Some("lifecycle_identity_ambiguous")
+        );
+    }
+
+    #[test]
+    fn duplicate_numeric_ids_fail_closed_once_without_arbitrary_replacement() {
+        let pane_id = 13;
+        let mut registry = PaneRegistry::new();
+        let mut proven = make_pane(pane_id, "shell", Some("/home"));
+        proven.domain_id = Some(8);
+        proven.tty_name = Some("tty-proven".to_string());
+        registry.discovery_tick(vec![proven.clone()]);
+        registry.get_cursor_mut(pane_id).unwrap().next_seq = 7;
+
+        let mut contradictory = proven.clone();
+        contradictory.domain_id = Some(9);
+        contradictory.tty_name = Some("tty-contradictory".to_string());
+        let diff = registry.discovery_tick(vec![proven.clone(), contradictory]);
+
+        assert_eq!(diff.ambiguous_lifecycle_panes, vec![pane_id]);
+        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.metadata_changes.len(), 1);
+        let entry = registry.get_entry(pane_id).unwrap();
+        assert_eq!(entry.lifecycle_identity.domain_id, Some(8));
+        assert_eq!(
+            entry.lifecycle_identity.tty_name.as_deref(),
+            Some("tty-proven")
+        );
+        assert_eq!(entry.lifecycle_revision.get(), 0);
+        assert_eq!(entry.resume_next_seq, 7);
+        assert_eq!(
+            entry.observation.ignore_reason(),
+            Some("duplicate_pane_identity")
+        );
+        assert!(registry.get_cursor(pane_id).is_none());
+
+        let repeated = registry.discovery_tick(vec![proven.clone(), proven]);
+        assert_eq!(repeated.ambiguous_lifecycle_panes, vec![pane_id]);
+        assert!(repeated.lifecycle_replacements.is_empty());
+        assert!(repeated.metadata_changes.is_empty());
+        assert_eq!(
+            registry
+                .get_entry(pane_id)
+                .unwrap()
+                .lifecycle_revision
+                .get(),
+            0
+        );
+    }
+
+    #[test]
+    fn checked_revision_exhaustion_fails_closed() {
+        let mut lifecycle_registry = PaneRegistry::new();
+        let mut initial = make_pane(10, "shell", Some("/home"));
+        initial.tty_name = Some("tty-a".to_string());
+        lifecycle_registry.discovery_tick(vec![initial.clone()]);
+        lifecycle_registry
+            .entries
+            .get_mut(&10)
+            .unwrap()
+            .lifecycle_revision = PaneLifecycleRevision::new(u32::MAX);
+        let mut replacement = initial;
+        replacement.tty_name = Some("tty-b".to_string());
+        let lifecycle_diff = lifecycle_registry.discovery_tick(vec![replacement]);
+        assert_eq!(lifecycle_diff.revision_exhausted_panes, vec![10]);
+        assert!(lifecycle_diff.lifecycle_replacements.is_empty());
+        assert!(!lifecycle_registry.get_entry(10).unwrap().should_observe());
+        let lifecycle_repeat = lifecycle_registry.discovery_tick(vec![make_pane(
+            10,
+            "changed-again",
+            Some("/still-terminal"),
+        )]);
+        assert!(lifecycle_repeat.is_empty());
+
+        let mut metadata_registry = PaneRegistry::new();
+        metadata_registry.discovery_tick(vec![make_pane(11, "shell", Some("/home"))]);
+        metadata_registry
+            .entries
+            .get_mut(&11)
+            .unwrap()
+            .metadata_revision = PaneMetadataRevision(u64::MAX);
+        let metadata_diff =
+            metadata_registry.discovery_tick(vec![make_pane(11, "editor", Some("/tmp"))]);
+        assert_eq!(metadata_diff.revision_exhausted_panes, vec![11]);
+        assert!(metadata_diff.metadata_changes.is_empty());
+        assert!(!metadata_registry.get_entry(11).unwrap().should_observe());
+        let metadata_repeat = metadata_registry.discovery_tick(vec![make_pane(
+            11,
+            "changed-again",
+            Some("/still-terminal"),
+        )]);
+        assert!(metadata_repeat.is_empty());
+        let _ = metadata_registry.set_filter(PaneFilterConfig::default());
+        assert!(
+            !metadata_registry.get_entry(11).unwrap().should_observe(),
+            "filter refresh cannot bypass checked revision exhaustion"
+        );
+        assert!(metadata_registry.get_cursor(11).is_none());
+    }
+
+    #[test]
+    fn q600_revision_exhaustion_emits_once_per_member_without_duplicate_scan() {
+        let mut registry = PaneRegistry::new();
+        let initial = (0..600_u64)
+            .map(|pane_id| make_pane(pane_id, "shell", Some("/home")))
+            .collect::<Vec<_>>();
+        registry.discovery_tick(initial);
+        for pane_id in 0..600_u64 {
+            registry.get_entry_mut(pane_id).unwrap().metadata_revision =
+                PaneMetadataRevision::new(u64::MAX);
+        }
+
+        let changed = (0..600_u64)
+            .map(|pane_id| make_pane(pane_id, "editor", Some("/tmp")))
+            .collect::<Vec<_>>();
+        let exhausted = registry.discovery_tick(changed.clone());
+        assert_eq!(exhausted.revision_exhausted_panes.len(), 600);
+        assert_eq!(
+            exhausted.revision_exhausted_panes,
+            (0..600_u64).collect::<Vec<_>>()
+        );
+        assert!(exhausted.metadata_changes.is_empty());
+
+        let repeated = registry.discovery_tick(changed);
+        assert!(
+            repeated.is_empty(),
+            "terminal saturation is one-shot for every member"
+        );
+    }
+
+    #[test]
+    fn filter_rule_id_cannot_impersonate_revision_exhaustion() {
+        for (pane_id, rule_id) in [
+            (12, "metadata_revision_exhausted"),
+            (13, "lifecycle_revision_exhausted"),
+        ] {
+            let mut registry = PaneRegistry::with_filter(PaneFilterConfig {
+                include: Vec::new(),
+                exclude: vec![crate::config::PaneFilterRule {
+                    id: rule_id.to_string(),
+                    domain: None,
+                    title: Some("blocked".to_string()),
+                    cwd: None,
+                }],
+            });
+            registry.discovery_tick(vec![make_pane(pane_id, "blocked", Some("/home"))]);
+            let entry = registry.get_entry(pane_id).unwrap();
+            assert_eq!(entry.observation.ignore_reason(), Some(rule_id));
+            assert_eq!(entry.lifecycle_revision.get(), 0);
+            assert_eq!(entry.metadata_revision.get(), 0);
+
+            let _ = registry.set_filter(PaneFilterConfig::default());
+            assert!(registry.get_entry(pane_id).unwrap().should_observe());
+            assert!(registry.get_cursor(pane_id).is_some());
+        }
+    }
+
+    #[test]
+    fn metadata_churn_scales_with_changed_members_not_lifecycle() {
+        for pane_count in [2_u64, 20, 200, 600] {
+            let mut registry = PaneRegistry::new();
+            registry.discovery_tick(
+                (0..pane_count)
+                    .map(|pane_id| make_pane(pane_id, "shell", Some("/home")))
+                    .collect(),
+            );
+            let before = registry
+                .entries
+                .values()
+                .map(|entry| entry.lifecycle_revision)
+                .collect::<Vec<_>>();
+
+            let diff = registry.discovery_tick(
+                (0..pane_count)
+                    .map(|pane_id| {
+                        let mut pane = make_pane(pane_id, "editor", Some("/tmp"));
+                        pane.window_id = pane_id.saturating_add(10);
+                        pane.is_zoomed = pane_id % 2 == 0;
+                        pane
+                    })
+                    .collect(),
+            );
+
+            assert_eq!(
+                diff.metadata_changes.len(),
+                usize::try_from(pane_count).expect("fixture pane count fits usize")
+            );
+            assert!(diff.lifecycle_replacements.is_empty());
+            assert!(diff.revision_exhausted_panes.is_empty());
+            assert_eq!(
+                registry
+                    .entries
+                    .values()
+                    .map(|entry| entry.lifecycle_revision)
+                    .collect::<Vec<_>>(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn rapid_title_cwd_oscillation_never_rotates_lifecycle_or_cursor() {
+        let pane_id = 612;
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(pane_id, "alpha", Some("/alpha"))]);
+        registry.get_cursor_mut(pane_id).unwrap().next_seq = 41;
+
+        for tick in 1_u64..=128 {
+            let (title, cwd) = if tick % 2 == 0 {
+                ("alpha", "/alpha")
+            } else {
+                ("beta", "/beta")
+            };
+            let diff = registry.discovery_tick(vec![make_pane(pane_id, title, Some(cwd))]);
+            assert_eq!(diff.metadata_changes.len(), 1, "metadata tick {tick}");
+            assert!(
+                diff.lifecycle_replacements.is_empty(),
+                "lifecycle tick {tick}"
+            );
+            assert!(diff.re_observed_panes.is_empty(), "admission tick {tick}");
+            let entry = registry.get_entry(pane_id).unwrap();
+            assert_eq!(entry.lifecycle_revision.get(), 0);
+            assert_eq!(entry.metadata_revision.get(), tick);
+            assert_eq!(registry.get_cursor(pane_id).unwrap().next_seq, 41);
+        }
     }
 
     #[test]
@@ -5613,12 +6212,49 @@ mod tests {
             cwd: None,
         });
 
-        registry.set_filter(filter);
+        let changes = registry.set_filter(filter);
 
         assert!(registry.get_cursor(1).is_none());
         let entry = registry.entries.get(&1).unwrap();
         assert!(!entry.should_observe());
         assert_eq!(entry.observation.ignore_reason(), Some("exclude-bash"),);
+        assert_eq!(entry.metadata_revision.get(), 1);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].pane_id, 1);
+        assert_eq!(
+            changes[0].lifecycle_revision,
+            PaneLifecycleRevision::INITIAL
+        );
+        assert_eq!(changes[0].metadata_revision.get(), 1);
+        assert_ne!(changes[0].diff.bits() & PaneMetadataDiff::OBSERVATION, 0);
+
+        let repeated = registry.set_filter(PaneFilterConfig {
+            include: Vec::new(),
+            exclude: vec![PaneFilterRule {
+                id: "exclude-bash".to_string(),
+                domain: None,
+                title: Some("bash".to_string()),
+                cwd: None,
+            }],
+        });
+        assert!(repeated.is_empty(), "an identical policy state is a no-op");
+        assert_eq!(registry.get_entry(1).unwrap().metadata_revision.get(), 1);
+
+        let changed_reason = registry.set_filter(PaneFilterConfig {
+            include: Vec::new(),
+            exclude: vec![PaneFilterRule {
+                id: "exclude-shells".to_string(),
+                domain: None,
+                title: Some("bash".to_string()),
+                cwd: None,
+            }],
+        });
+        assert_eq!(changed_reason.len(), 1);
+        assert_eq!(changed_reason[0].metadata_revision.get(), 2);
+        assert_eq!(
+            registry.get_entry(1).unwrap().observation.ignore_reason(),
+            Some("exclude-shells")
+        );
     }
 
     #[test]
@@ -5637,10 +6273,10 @@ mod tests {
             cwd: None,
         });
 
-        registry.set_filter(exclude_bash);
+        let _ = registry.set_filter(exclude_bash);
         assert!(registry.get_cursor(1).is_none());
 
-        registry.set_filter(PaneFilterConfig::default());
+        let _ = registry.set_filter(PaneFilterConfig::default());
 
         let cursor = registry.get_cursor(1).unwrap();
         assert_eq!(cursor.next_seq, 7);
@@ -5718,10 +6354,11 @@ mod tests {
             "Ignored -> Observed must be reported so capture state can be rebuilt"
         );
         assert!(!diff.is_empty());
-        // The title is part of the pane fingerprint, so reverting it is also a
-        // new generation. That arm deliberately does not touch the cursor, which
-        // is why the resumption needs its own signal.
-        assert_eq!(diff.new_generations, vec![1]);
+        assert!(
+            diff.lifecycle_replacements.is_empty(),
+            "a filter-driven title change is not a pane/process restart"
+        );
+        assert_eq!(diff.metadata_changes.len(), 1);
         assert_eq!(diff.change_count(), 2);
         assert!(registry.entries.get(&1).unwrap().should_observe());
         assert_eq!(
@@ -5756,12 +6393,19 @@ mod tests {
             registry.re_evaluate_observation(1),
             ObservationTransition::Retired
         );
+        assert_eq!(registry.get_entry(1).unwrap().metadata_revision.get(), 1);
+        assert_eq!(
+            registry.pane_arena_stats(1).unwrap().tracked_bytes,
+            registry.get_entry(1).unwrap().estimated_bytes(),
+            "direct filter re-evaluation must refresh logical arena accounting"
+        );
 
         registry.filter_config = PaneFilterConfig::default();
         assert_eq!(
             registry.re_evaluate_observation(1),
             ObservationTransition::Resumed
         );
+        assert_eq!(registry.get_entry(1).unwrap().metadata_revision.get(), 2);
 
         assert_eq!(
             registry.re_evaluate_observation(404),
@@ -5771,11 +6415,50 @@ mod tests {
     }
 
     #[test]
+    fn filter_re_evaluation_exhaustion_retires_capture_without_unversioned_revive() {
+        use crate::config::{PaneFilterConfig, PaneFilterRule};
+
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(2, "shell", Some("/home"))]);
+        registry.get_entry_mut(2).unwrap().metadata_revision = PaneMetadataRevision::new(u64::MAX);
+
+        let filter = PaneFilterConfig {
+            include: Vec::new(),
+            exclude: vec![PaneFilterRule {
+                id: "exclude-shell".to_string(),
+                domain: None,
+                title: Some("shell".to_string()),
+                cwd: None,
+            }],
+        };
+        let changes = registry.set_filter(filter);
+
+        assert_eq!(
+            changes.len(),
+            1,
+            "the saturated terminal state still needs one durable publication"
+        );
+        assert_eq!(changes[0].metadata_revision.get(), u64::MAX);
+        let entry = registry.get_entry(2).unwrap();
+        assert_eq!(entry.metadata_revision.get(), u64::MAX);
+        assert_eq!(
+            entry.observation.ignore_reason(),
+            Some("metadata_revision_exhausted")
+        );
+        assert!(registry.get_cursor(2).is_none());
+        assert_eq!(
+            registry.re_evaluate_observation(2),
+            ObservationTransition::Unchanged,
+            "the terminal exhaustion fence cannot be revived"
+        );
+    }
+
+    #[test]
     fn pane_entry_to_pane_record_observed() {
         let pane = make_pane(1, "bash", Some("/home/user"));
-        let fp = PaneFingerprint::without_content(&pane);
+        let identity = PaneLifecycleIdentity::from_pane_info(&pane);
         let pane_arena = PaneArenaRegistry::new().reserve(1).arena();
-        let entry = PaneEntry::new(pane, fp, ObservationDecision::Observed, pane_arena);
+        let entry = PaneEntry::new(pane, identity, ObservationDecision::Observed, pane_arena);
 
         let record = entry.to_pane_record();
 
@@ -5791,11 +6474,11 @@ mod tests {
     #[test]
     fn pane_entry_to_pane_record_ignored() {
         let pane = make_pane(2, "vim", Some("/tmp"));
-        let fp = PaneFingerprint::without_content(&pane);
+        let identity = PaneLifecycleIdentity::from_pane_info(&pane);
         let pane_arena = PaneArenaRegistry::new().reserve(2).arena();
         let entry = PaneEntry::new(
             pane,
-            fp,
+            identity,
             ObservationDecision::Ignored {
                 reason: "exclude-vim".to_string(),
             },
@@ -6859,7 +7542,7 @@ mod tests {
         assert_eq!(diff.new_panes, vec![1]);
         let entry = reg.get_entry(1).expect("pane should be registered");
         assert_eq!(entry.pane_uuid.len(), 32);
-        assert_eq!(entry.generation, 0);
+        assert_eq!(entry.lifecycle_revision.get(), 0);
     }
 
     #[test]
@@ -6870,15 +7553,13 @@ mod tests {
 
         let uuid_before = reg.get_entry(1).unwrap().pane_uuid.clone();
 
-        // Change the title (triggers new generation, but UUID stays)
+        // Change the title; lifecycle identity and UUID stay stable.
         let mut changed = make_pane_info(1, 100, 10);
         changed.title = Some("vim".to_string());
         let diff = reg.discovery_tick(vec![changed]);
 
-        assert!(
-            diff.new_generations.contains(&1),
-            "should be new generation"
-        );
+        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.metadata_changes.len(), 1);
         assert!(diff.new_panes.is_empty(), "should not be new pane");
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
         assert_eq!(
@@ -6895,12 +7576,13 @@ mod tests {
 
         let uuid_before = reg.get_entry(1).unwrap().pane_uuid.clone();
 
-        // Change the cwd (triggers new generation, but UUID stays)
+        // Change the cwd; lifecycle identity and UUID stay stable.
         let mut changed = make_pane_info(1, 100, 10);
         changed.cwd = Some("/tmp".to_string());
         let diff = reg.discovery_tick(vec![changed]);
 
-        assert!(diff.new_generations.contains(&1));
+        assert!(diff.lifecycle_replacements.is_empty());
+        assert_eq!(diff.metadata_changes.len(), 1);
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
         assert_eq!(
             uuid_before, uuid_after,
@@ -6916,21 +7598,15 @@ mod tests {
 
         let uuid_before = reg.get_entry(1).unwrap().pane_uuid.clone();
 
-        // Move pane to different tab and window (metadata change, not generation)
+        // Move pane to different tab and window (metadata only).
         let mut moved = make_pane_info(1, 200, 20);
         moved.title = Some("bash".to_string());
         moved.cwd = Some("/home/user".to_string());
         let diff = reg.discovery_tick(vec![moved]);
 
-        // Should be changed_panes (metadata), not new_generations (same fingerprint)
-        assert!(
-            diff.changed_panes.contains(&1),
-            "should detect metadata change"
-        );
-        assert!(
-            diff.new_generations.is_empty(),
-            "same fingerprint = no new generation"
-        );
+        assert_eq!(diff.metadata_changes.len(), 1);
+        assert_eq!(diff.metadata_changes[0].pane_id, 1);
+        assert!(diff.lifecycle_replacements.is_empty());
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
         assert_eq!(
             uuid_before, uuid_after,
@@ -7011,24 +7687,33 @@ mod tests {
     }
 
     #[test]
-    fn registry_generation_increments_on_fingerprint_change() {
+    fn registry_lifecycle_revision_changes_only_with_exact_identity() {
         let mut reg = PaneRegistry::new();
         let pane = make_pane_info(1, 100, 10);
         reg.discovery_tick(vec![pane]);
-        assert_eq!(reg.get_entry(1).unwrap().generation, 0);
+        assert_eq!(reg.get_entry(1).unwrap().lifecycle_revision.get(), 0);
 
-        // Change title → new fingerprint → generation++
+        // Mutable title and cwd changes advance metadata only.
         let mut v2 = make_pane_info(1, 100, 10);
         v2.title = Some("vim".to_string());
         reg.discovery_tick(vec![v2]);
-        assert_eq!(reg.get_entry(1).unwrap().generation, 1);
+        assert_eq!(reg.get_entry(1).unwrap().lifecycle_revision.get(), 0);
+        assert_eq!(reg.get_entry(1).unwrap().metadata_revision.get(), 1);
 
-        // Change cwd → new fingerprint → generation++
         let mut v3 = make_pane_info(1, 100, 10);
         v3.title = Some("vim".to_string());
         v3.cwd = Some("/tmp".to_string());
         reg.discovery_tick(vec![v3]);
-        assert_eq!(reg.get_entry(1).unwrap().generation, 2);
+        assert_eq!(reg.get_entry(1).unwrap().lifecycle_revision.get(), 0);
+        assert_eq!(reg.get_entry(1).unwrap().metadata_revision.get(), 2);
+
+        // A changed exact TTY witness is an authoritative replacement.
+        let mut replacement = make_pane_info(1, 100, 10);
+        replacement.tty_name = Some("/dev/pts/replacement".to_string());
+        let diff = reg.discovery_tick(vec![replacement]);
+        assert_eq!(diff.lifecycle_replacements, vec![1]);
+        assert_eq!(reg.get_entry(1).unwrap().lifecycle_revision.get(), 1);
+        assert_eq!(reg.get_entry(1).unwrap().metadata_revision.get(), 0);
     }
 
     #[test]
@@ -7046,61 +7731,66 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_same_generation_when_unchanged() {
+    fn lifecycle_identity_same_when_unchanged() {
         let pane = make_pane_info(1, 100, 10);
-        let fp1 = PaneFingerprint::without_content(&pane);
-        let fp2 = PaneFingerprint::without_content(&pane);
-        assert!(fp1.is_same_generation(&fp2));
+        let left = PaneLifecycleIdentity::from_pane_info(&pane);
+        let right = PaneLifecycleIdentity::from_pane_info(&pane);
+        assert_eq!(left.continuity_with(&right), PaneLifecycleContinuity::Same);
     }
 
     #[test]
-    fn fingerprint_new_generation_on_title_change() {
+    fn lifecycle_identity_ignores_title_change() {
         let pane = make_pane_info(1, 100, 10);
-        let fp1 = PaneFingerprint::without_content(&pane);
+        let identity = PaneLifecycleIdentity::from_pane_info(&pane);
 
         let mut changed = make_pane_info(1, 100, 10);
         changed.title = Some("ssh session".to_string());
-        let fp2 = PaneFingerprint::without_content(&changed);
-
-        assert!(!fp1.is_same_generation(&fp2));
+        let changed_identity = PaneLifecycleIdentity::from_pane_info(&changed);
+        assert_eq!(
+            identity.continuity_with(&changed_identity),
+            PaneLifecycleContinuity::Same
+        );
     }
 
     #[test]
-    fn fingerprint_new_generation_on_cwd_change() {
+    fn lifecycle_identity_ignores_cwd_change() {
         let pane = make_pane_info(1, 100, 10);
-        let fp1 = PaneFingerprint::without_content(&pane);
+        let identity = PaneLifecycleIdentity::from_pane_info(&pane);
 
         let mut changed = make_pane_info(1, 100, 10);
         changed.cwd = Some("/var/log".to_string());
-        let fp2 = PaneFingerprint::without_content(&changed);
-
-        assert!(!fp1.is_same_generation(&fp2));
+        let changed_identity = PaneLifecycleIdentity::from_pane_info(&changed);
+        assert_eq!(
+            identity.continuity_with(&changed_identity),
+            PaneLifecycleContinuity::Same
+        );
     }
 
     #[test]
-    fn fingerprint_new_generation_on_domain_change() {
+    fn lifecycle_identity_ignores_domain_display_name_change() {
         let pane = make_pane_info(1, 100, 10);
-        let fp1 = PaneFingerprint::without_content(&pane);
+        let identity = PaneLifecycleIdentity::from_pane_info(&pane);
 
         let mut changed = make_pane_info(1, 100, 10);
         changed.domain_name = Some("SSH:remote.example.com".to_string());
-        let fp2 = PaneFingerprint::without_content(&changed);
-
-        assert!(!fp1.is_same_generation(&fp2));
+        let changed_identity = PaneLifecycleIdentity::from_pane_info(&changed);
+        assert_eq!(
+            identity.continuity_with(&changed_identity),
+            PaneLifecycleContinuity::Same
+        );
     }
 
     #[test]
-    fn fingerprint_ignores_tab_window_change() {
-        // Tab/window moves don't affect fingerprint (only metadata)
+    fn lifecycle_identity_ignores_tab_window_change() {
         let pane = make_pane_info(1, 100, 10);
-        let fp1 = PaneFingerprint::without_content(&pane);
+        let identity = PaneLifecycleIdentity::from_pane_info(&pane);
 
         let moved = make_pane_info(1, 200, 20);
-        let fp2 = PaneFingerprint::without_content(&moved);
+        let moved_identity = PaneLifecycleIdentity::from_pane_info(&moved);
 
-        assert!(
-            fp1.is_same_generation(&fp2),
-            "tab/window changes should not create new generation"
+        assert_eq!(
+            identity.continuity_with(&moved_identity),
+            PaneLifecycleContinuity::Same
         );
     }
 
@@ -8223,56 +8913,56 @@ mod tests {
     // Batch: DarkBadger wa-1u90p.7.1 — trait & edge coverage
     // =========================================================================
 
-    // --- PaneFingerprint ---
+    // --- PaneLifecycleIdentity ---
 
     #[test]
-    fn pane_fingerprint_debug_clone() {
-        let fp = PaneFingerprint {
-            domain: "local".to_string(),
-            initial_title: "zsh".to_string(),
-            initial_cwd: "/home/user".to_string(),
-            content_hash: 12345,
+    fn pane_lifecycle_identity_debug_clone() {
+        let identity = PaneLifecycleIdentity {
+            pane_id: 7,
+            domain_id: Some(2),
+            tty_name: Some("/dev/pts/7".to_string()),
         };
-        let cloned = fp.clone();
-        assert_eq!(cloned.domain, "local");
-        let dbg = format!("{:?}", fp);
-        assert!(dbg.contains("PaneFingerprint"));
+        let cloned = identity.clone();
+        assert_eq!(cloned.domain_id, Some(2));
+        let dbg = format!("{identity:?}");
+        assert!(dbg.contains("PaneLifecycleIdentity"));
     }
 
     #[test]
-    fn pane_fingerprint_hash_in_hashset() {
+    fn pane_lifecycle_identity_hash_in_hashset() {
         use std::collections::HashSet;
-        let fp1 = PaneFingerprint {
-            domain: "a".into(),
-            initial_title: "b".into(),
-            initial_cwd: "c".into(),
-            content_hash: 0,
+        let first = PaneLifecycleIdentity {
+            pane_id: 1,
+            domain_id: Some(2),
+            tty_name: Some("tty-a".into()),
         };
-        let fp2 = fp1.clone();
-        let fp3 = PaneFingerprint {
-            domain: "x".into(),
-            ..fp1.clone()
+        let duplicate = first.clone();
+        let replacement = PaneLifecycleIdentity {
+            tty_name: Some("tty-b".into()),
+            ..first.clone()
         };
         let mut set = HashSet::new();
-        set.insert(fp1);
-        set.insert(fp2); // duplicate
-        set.insert(fp3);
+        set.insert(first);
+        set.insert(duplicate);
+        set.insert(replacement);
         assert_eq!(set.len(), 2);
     }
 
     #[test]
-    fn pane_fingerprint_is_same_generation_domain_mismatch() {
-        let a = PaneFingerprint {
-            domain: "local".into(),
-            initial_title: "zsh".into(),
-            initial_cwd: "/home".into(),
-            content_hash: 0,
+    fn pane_lifecycle_identity_detects_exact_domain_mismatch() {
+        let first = PaneLifecycleIdentity {
+            pane_id: 1,
+            domain_id: Some(7),
+            tty_name: None,
         };
-        let b = PaneFingerprint {
-            domain: "SSH:remote.example.com".into(),
-            ..a.clone()
+        let replacement = PaneLifecycleIdentity {
+            domain_id: Some(8),
+            ..first.clone()
         };
-        assert!(!a.is_same_generation(&b));
+        assert_eq!(
+            first.continuity_with(&replacement),
+            PaneLifecycleContinuity::Replaced
+        );
     }
 
     // --- ObservationDecision ---
