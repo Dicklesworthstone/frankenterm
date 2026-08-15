@@ -8048,7 +8048,7 @@ mod tests {
 
     impl log::Log for TestLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Warn
+            metadata.level() == log::Level::Warn
         }
 
         fn log(&self, record: &log::Record<'_>) {
@@ -8086,6 +8086,41 @@ mod tests {
             .lock()
             .expect("test logger lock")
             .clone()
+    }
+
+    #[test]
+    fn compatibility_warning_capture_is_exact_and_bounded() {
+        let logger = TestLogger {
+            records: StdMutex::new(Vec::new()),
+        };
+        let info = log::Record::builder()
+            .level(log::Level::Info)
+            .args(format_args!("Codec compat window: server=info"))
+            .build();
+        logger.log(&info);
+        let unrelated_warning = log::Record::builder()
+            .level(log::Level::Warn)
+            .args(format_args!("unrelated warning"))
+            .build();
+        logger.log(&unrelated_warning);
+
+        for index in 0..=MAX_CAPTURED_COMPAT_WARNINGS {
+            logger.log(
+                &log::Record::builder()
+                    .level(log::Level::Warn)
+                    .args(format_args!("Codec compat window: server={}", index))
+                    .build(),
+            );
+        }
+
+        let records = logger.records.lock().expect("test logger lock");
+        assert_eq!(records.len(), MAX_CAPTURED_COMPAT_WARNINGS);
+        assert!(records.iter().all(|record| record.starts_with("WARN ")));
+        assert!(
+            records
+                .last()
+                .is_some_and(|record| record.ends_with("server=31"))
+        );
     }
 
     fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
