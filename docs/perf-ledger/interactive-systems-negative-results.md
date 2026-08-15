@@ -3869,6 +3869,68 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote the bulk health path as a performance improvement only after retained same-source 20/50/200-pane runs on the intended M4/M5 Mac and 64-core/128-thread `trj` Threadripper/LAN target record request count, health wall time, mux queue wait, interactive latency tails, resource envelopes, deterministic state equivalence, and resize/zoom visual equivalence while all exact-source release gates pass.
 
+### IS-N131 — Exact tab-parent indexes remove full scans but do not prove latency
+
+- **Classification:** kept structural; performance promotion withheld for
+  missing target-hardware evidence
+- **Bead:**
+  `ft-interactive-swarm-product-convergence-7xqz4.8.10.3.2.4`
+- **Baseline revision:** `12779f1e1b63a4ffdf1a27ede0f3b251f8fc546d`
+- **Candidate revision:** `37622eca89ccf1ae5df7eade2a490f2b7ca27802`
+- **Target identity:** strict-remote `hz1`, `hz2`, `vmi1149989`, and
+  `vmi1227854` Linux compile/test workers for source proof only; no M4/M5
+  macOS, 64-core/128-thread `trj` Threadripper, display, LAN, thermal, or
+  production-session identity was measured
+- **Workload identity:** deterministic 1K-, 4K-, and 16K-tab exact-parent and
+  reverse-map fixtures plus a four-window, 32-tab-per-window, 256-move model
+  sequence; duplicate-parent, missing-parent, exact-identity replacement,
+  removal, stale-generation, and panic-atomicity controls; no retained real
+  long-running session workload
+- **Focused command/artifact:** strict-remote window membership proof passed
+  under `j-29976432671195271` with 1 passed and 0 failed. Direct reverse-map
+  proof passed under `j-29976432671195273` with 4 passed and 0 failed; the
+  retained 1K/4K/16K counters each observed exactly one hash probe, and the
+  deliberate panic control passed by preserving both mapping directions.
+  Strict package Clippy passed without warnings under
+  `j-29976432671195272`. The exact final parent-index stress retry remained
+  pending at this ledger cut and is not counted
+- **Broad command/artifact:** the complete mux library passed remotely under
+  `j-29976432671195277` with 799 passed, 0 failed, and 0 ignored. A broad
+  client-library run under `j-29976432671195276` produced 209 passed, 2
+  failed, and 1 ignored and is therefore retained only as negative evidence:
+  one failure exposed an obsolete registry-gap fixture and was repaired; the
+  other was a real-stream handshake timeout whose isolated retry was still
+  pending. Exact proof of the repaired registry fixture passed under
+  `j-29976432671195279` with 1 passed and 0 failed. The first isolated
+  real-stream retry failed before the test because its strict-remote worker
+  exhausted disk space. No local Cargo substitute ran. Earlier attempted
+  filters that selected zero tests and earlier RCH one-hour timeout results are
+  also not counted
+- **Samples/statistics:** no wall-time samples, distributions, confidence
+  intervals, or coefficient-of-variation measurements were collected; the
+  retained values are deterministic operation counters only
+- **Equivalence:** model and exact-identity tests cover tab membership, active
+  tab/order preservation, reverse-map bijection, stale generation, duplicate
+  and missing parent rejection, rollback, and callback-free mutation cuts.
+  Reopen durability, byte/state replay, visual output, cursor, IME,
+  accessibility, resize, and zoom equivalence remain unproved
+- **Measured result:** no latency result. Exact parent and reverse lookups now
+  require one hash probe at each retained cardinality, and membership-preserving
+  active-tab/reorder operations perform zero parent-index writes. Full ordered
+  client reconciliation still lacks retained q-linear timing, and the frozen
+  window event still has work proportional to the tabs in that window
+- **Rejected hypotheses:** a passing structural counter is not a native input,
+  resize, zoom, or reopen measurement; an exact map lookup does not prove the
+  surrounding transaction is constant-time; a broad suite with any failure is
+  not green; a zero-test filter, timed-out RCH job, or disk-full worker is not
+  substitute evidence
+- **Decision:** kept durable infrastructure. Exact parent ownership and
+  bidirectional client mappings remove avoidable all-window scans and prevent
+  quadratic reverse lookup, but the change is not promoted as a user-visible
+  performance improvement
+- **Primary retry condition:**
+  > Promote the exact parent/reverse indexes as a performance improvement only after exact-committed-source gates and retained same-window 1K/4K/16K reconciliation plus long-session input, resize, zoom, and reopen runs on the intended M4/M5 Mac and 64-core/128-thread `trj` Threadripper/LAN target record lookup and transaction work, p50/p95/p99/p999 latency, resource envelopes, and deterministic state and visual equivalence.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
