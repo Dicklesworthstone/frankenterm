@@ -2595,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn ft_zkthg_drop_counter_is_monotonic_under_concurrent_reset() {
+    fn ft_zkthg_drop_counter_saturates_and_resets_deterministically() {
         let _guard = REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
