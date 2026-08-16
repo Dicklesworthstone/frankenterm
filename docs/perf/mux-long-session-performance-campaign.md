@@ -135,9 +135,11 @@ The important implementation points are:
    one unbounded FIFO. A single connection task arbitrates input, resize,
    line-fetch, resync, and other RPCs, encodes each PDU, and flushes it.
 5. `crates/frankenterm-mux-server-impl/src/dispatch.rs::dispatch` uses a bounded
-   dispatch item queue and services queued output/notifications before polling
-   socket readability. Continuous outbound work can therefore delay inbound
-   key decoding; this is a hypothesis until queue-age traces confirm it.
+   dispatch item queue, limits each outbound turn to 32 frames or 64 KiB,
+   probes readable input between turns, and alternates the preferred direction
+   when both sides are ready. That removes the former unbounded
+   output-before-read starvation shape. Residual queue age and p95/p99 key
+   latency remain measurement questions, not established wins.
 6. `SessionHandler::process_one` sends `SendKeyDown` to the generic mux
    main-thread queue. `LocalPane::key_down` holds the terminal mutex while
    encoding, writing, and flushing the PTY.
@@ -173,8 +175,9 @@ The production resize path is:
 NSView live resize
   -> WindowEvent::Resized
   -> TermWindow::resize
-  -> surface resize + coarse invalidation
+  -> surface resize
   -> TermWindow::apply_dimensions
+  -> sole whole-window coarse invalidation
   -> every tab's Tab::resize when the terminal grid changes
   -> pane resize intents / workers
   -> Terminal::resize
@@ -190,14 +193,15 @@ causes a remote PTY resize.
 
 The remaining high-value facts are:
 
-- `TermWindow::resize` and `apply_dimensions` both advance
-  `quad_generation` and mark all panes dirty during a native resize.
+- `apply_dimensions` is the sole whole-window resize invalidation authority;
+  the former duplicate `TermWindow::resize` dirty walk has been removed.
 - Even a same-grid sub-cell resize changes the global generation used by line
   quad keys, so visible line quads are rebuilt.
 - A grid change resizes every tab in the window, not only the active tab.
-- `Tab::apply_sizes_from_splits` creates scoped workers during the resize call,
-  and each `LocalPane` may also create a dedicated resize worker. Large tabs
-  can therefore create roughly one OS thread per pane.
+- `Tab::apply_sizes_from_splits` dispatches pane resize intents serially.
+  `LocalPane` may create one transient per-pane resize worker and coalesces to
+  an in-flight intent plus the newest pending replacement; the live path no
+  longer creates a scoped tab worker per pane.
 - Reflow labels viewport, near, and cold batches, but all cold work still
   completes synchronously before resize returns. The recorded
   “viewport-ready” timestamp is not a first-present boundary.
@@ -425,6 +429,16 @@ active identity but their terminal rows are not copied into each frame. A tab
 activation changes the authority and requires a new complete displayed-pane
 projection.
 
+Source coherence is deliberately **per pane**, not a claim that every terminal
+in a window was frozen at one global physical instant. Every field within one
+`PaneRenderSnapshot` belongs to that pane's one exact source generation and
+source sequence. Different panes may carry different source generations
+because the producer must not hold multiple terminal locks across a global
+cut. The per-window final cut instead fences the exact pane set, layout,
+window order, geometry, and GUI/cache generations simultaneously. A mutation
+recorded after a pane's source cut remains damage for a successor publication;
+it cannot be silently folded into the already captured pane projection.
+
 The contract has three nested values:
 
 ```text
@@ -514,6 +528,21 @@ domains; no one counter is reused as another domain's watermark.
 | synchronized-output visibility, focus, opacity, tab bar/status/scrollbar/background | mux notification plus `TermWindow` | frozen in the window projection; BSU-hidden content cannot leak through a newer independently sampled row set |
 | font set, font scale, shape rules, hyperlink-rule epoch, color scheme, renderer/device/atlas epochs | config/font/render owners | scalar immutable cache epochs; external caches are keyed by the complete snapshot identity and never by raw `PaneId` |
 | damage/settlement identity | terminal damage journal plus GUI `DamageGeneration` | records the exact source ranges and GUI generation represented; clearing occurs only after the same snapshot presents successfully |
+| resource counts and retained bytes | snapshot arena/admission owner | checked counts for rows/cells, unique strings/images, hidden tabs and metadata, immutable backing, and all retained generations; a candidate without a complete usage record is incomplete |
+| remote connection and delivery identity | client domain and render-delivery ledger | exact connection incarnation plus pane/delivery identity; reconnect always invalidates the prior scope even when numeric IDs and counters repeat |
+
+The test-only reference model makes this table mechanically auditable through
+the one-to-one `RequiredField` mapping:
+`WindowTopology`, `PaneIdentity`, `VisibleRowsAndCells`,
+`HyperlinksAndImages`, `Cursor`, `TerminalMetadata`, `SemanticZones`,
+`GuiOverlay`, `Prediction`, `ImeAccessibility`,
+`SynchronizedOutputAndCompositing`, `FontConfigAndCacheEpochs`,
+`DamageSettlement`, `ResourceUsage`, and `RemoteIdentity`. Its
+`FieldSet::COMPLETE` is exactly the set of those named variants, and a focused
+test removes each variant in turn and proves that publication is rejected.
+Adding a field class to this contract therefore requires extending both the
+owner map and the executable enum/test; an opaque bit with no owner-map entry
+is forbidden.
 
 #### Ownership, sharing, and lifetime
 
@@ -544,11 +573,19 @@ The candidate alone temporarily owns strong live-tab and live-pane allocations.
 A published snapshot owns no live `Tab`, live `Pane`, terminal lock, mux lock,
 retirement guard, GUI borrow, or mutable renderer cache reference. It owns only
 immutable projections, weak exact capabilities, and shared immutable backing.
-The candidate ends at rejection, cancellation, or atomic publication. The
-published value ends when superseded or invalidated and no frame retains it.
+The candidate ends at rejection, cancellation, deadline expiry, or atomic
+publication. The published value ends when superseded or invalidated and no
+frame retains it.
 Exactly one superseded value may remain render-held until presentation settles
 or is rejected; no timer or queued callback may extend it into a fourth
-generation. These rules apply independently per window publisher.
+generation. Every candidate has one finite configured capture deadline and a
+cancel token owned by the publisher. Expiry or cancellation drops its strong
+tab/pane allocations and aggregate-budget reservation without changing the
+publication generation or last-known-good value. The miniature executable
+model uses three logical ticks to prove this lifetime rule; `.6.3` must derive
+the production duration from measured capture distributions and expose expiry
+telemetry. These rules apply per window and under the session/process aggregate
+arena below.
 
 Scrollbar history summaries and offscreen scrollback are not copied into every
 frame. The snapshot carries the visible rows plus bounded metadata needed to
@@ -562,9 +599,11 @@ and extending its lifetime indefinitely.
 The live implementation must follow this order:
 
 1. **Admit.** On the GUI thread, capture the exact window authority and reserve
-   one bounded candidate slot. Reject when a candidate already exists, the
-   publisher is exhausted, the pane count exceeds the configured window cap,
-   or the peak three-generation envelope cannot be admitted.
+   one bounded candidate slot plus its session/process aggregate-arena
+   reservation and finite deadline. Reject when a candidate already exists,
+   the publisher is exhausted, the pane or hidden-tab metadata count exceeds
+   the configured window cap, the aggregate publisher/window cap is full, or
+   the peak three-generation envelope cannot be admitted.
 2. **Freeze GUI state.** Copy the small window/pane GUI projections and their
    generations once. Retain each exact tab and pane allocation once for capture
    and revalidation, never per row or cell, and drop it after publish or
@@ -632,7 +671,10 @@ even if shaping or submission stalls while terminal output continues.
 All limits are finite, configurable, observed, and checked with overflow-safe
 arithmetic before publication:
 
+- maximum active window publishers per session and process;
 - maximum panes and visible rows per window snapshot;
+- maximum hidden tabs and immutable hidden-tab title/status metadata bytes per
+  window, session, and process;
 - retained cell/line bytes and row-chunk overhead;
 - unique hyperlink count and UTF-8 bytes;
 - unique image references plus encoded/decoded resident bytes;
@@ -641,6 +683,16 @@ arithmetic before publication:
   including shared-backing accounting; and
 - short exact-registration validations and terminal/mux/GUI lock acquisitions
   per frame.
+
+One central snapshot arena owns the session/process totals for active
+publishers, distinct retained backing bytes, hidden tabs/metadata, and unique
+referenced resources. Admission first computes every per-window and aggregate
+successor with checked arithmetic, then reserves all counters as one token;
+partial reservation is forbidden. Rejection, cancellation, expiry, detach,
+and final retirement release that exact token. Shared immutable backing is
+charged once per arena identity, while backing retained by distinct
+generations or sessions is charged separately. A per-window budget can never
+be multiplied by an unbounded number of windows.
 
 The initial numeric memory caps must be frozen from measured visible-state
 distributions in `.6.3`; `.6.2` does not invent target claims without data.
@@ -675,9 +727,10 @@ frame receipt.
 
 The executable model asserts these invariants after every transition:
 
-1. a published value contains the complete required field set and is within
-   the retained-byte budget, while the candidate plus every distinct
-   published/render-held generation stays within the total peak budget;
+1. a published value contains every named `RequiredField` and is within the
+   per-window and session/process budgets, while the candidate plus every
+   distinct published/render-held generation stays within the total peak
+   budget and hidden-tab/metadata caps;
 2. its exact target equals the current session/window/tab/pane/topology/
    geometry/alternate-screen/overlay target, and its source never exceeds
    current authority;
@@ -689,24 +742,34 @@ The executable model asserts these invariants after every transition:
    cross the exhausted sentinel;
 7. content-build failure preserves the prior complete value, while geometry or
    identity change clears its eligibility; and
-8. reconnect changes the incarnation before counters restart.
+8. reconnect changes the incarnation before counters restart; and
+9. cancellation or deadline expiry releases the exact candidate allocation
+   and aggregate reservation without changing publication generation or the
+   last-known-good value.
 
 Deterministic tests cover explicit stale/incomplete/over-budget/equivocation,
-last-known-good, resize, pane replacement, cancellation, exhaustion, and
-reconnect cases. A bounded exhaustive model explores every length-five trace
-over begin-valid, begin-incomplete, begin-over-budget, commit, cancel, render
-acquire/release, content and image/hyperlink mutation, topology mutation,
-resize, alternate-screen switch, overlay and selection/IME mutation, pane
-replacement, reconnect, and detach. Focused tests prove the named state classes
-have explicit stale-publication semantics, every independently advanced
-miniature generation domain fails closed before its exhausted sentinel, and a
-newer publication
+last-known-good, resize, pane replacement, cancellation before and after the
+swap, deadline expiry/allocation release, exhaustion, detach, stale settlement,
+hidden-tab limits, and reconnect cases. A bounded exhaustive model explores
+every length-four trace over 34 events: valid, incomplete, unresolved-image,
+over-budget, tab-count, and metadata admission; commit; both cancellation
+phases; deadline tick; render acquire/release; all 19 independently mutable
+generation domains; image/hyperlink mutation; reconnect; and detach. It keeps
+the event path and prints a concrete counterexample trace on failure. Focused
+tests prove the named state classes have explicit stale-publication semantics,
+every required field rejects when absent, every independently advanced
+miniature generation domain fails closed before its exhausted sentinel,
+session/process reservations are bounded and reusable, and a newer publication
 supersedes an older in-flight frame and that only the current exact generation
 can settle.
-The event exploration models concurrent mutation/publish/read as every bounded
-interleaving; `.6.3` must bind it to real types and add thread-scheduled stress,
-pane-reuse, and memory-fault tests. `.6.4` owns the multi-consumer
-damage/overflow model.
+In addition to sequential trace exploration, a thread-scheduled mutex-backed
+sanity test races a writer replacing a complete `Arc<Published>` with a reader
+and proves only that this miniature whole-value handoff exposes an old or new
+value, never a mixed field set. It is not evidence about a production atomic
+pointer, capture/revalidation race, settlement race, or memory ordering.
+`.6.3` must bind the model to the chosen production publication primitive and
+add production-scale stress, pane-reuse, cancellation, settlement, and
+memory-fault tests. `.6.4` owns the multi-consumer damage/overflow model.
 
 #### Migration sequence and non-claims
 
@@ -1801,7 +1864,7 @@ independent of an earlier bead's status:
 | Resource-cockpit schema/target receipt | Live schema/partial; target not proven | Resource DTOs, validators, `ft-rz0eb.4` conformance, and `docs/attestations/proofs/resource-cockpit-target-class.json`. The tracked target summary observed Darwin arm64, 14 CPUs, and 64 GiB instead of Linux x86_64, at least 64 CPUs, and 256 GiB. | The summary and attestation correctly say `skipped_not_proven`; target conformance was not run. `.4.3` reuses schema/unavailable semantics; `ft-7h5da.10.4.3`, `.4.7`, `.4.8`, then `ft-tf6g3.1` own target evidence and release promotion. |
 | Resource pressure soak | Proxy/partial | `ft-p3457.4` generates before/during/after snapshots and validates a pressure receipt declaring `live_pane_mutation:false`. | Its cited summary exists only as untracked output and is not durable authority. Reuse fields/monotonicity in `.4.3`/`.4.6`; `.4.5` creates real pressure. |
 | Dirty-row/resize SLO | Proxy/partial | Dirty-row state, line-quad cache, audit documents, and RQ-S1 deterministic core traces/timings. | No presented GUI resize/zoom/raster/compositor/display path. Reuse thresholds/traces in campaign `.8`; renderer proof leaves own native presented qualification. |
-| Input-to-photon SLO | Proxy/blocked | RQ-S8 headless macOS GPU-readback measured about 33 ms steady state and 351.65 ms cold path, both over target. | It omits real `NSEvent`, mux, PTY, transport, window-server presentation, and photons; no target Wayland run. Preserve as a negative control; `ft-tf6g3.8` and campaign input-latency leaves own end-to-end proof. |
+| Input-to-photon SLO | Proxy/blocked | RQ-S2 headless macOS GPU-readback measured about 33 ms steady state and 351.65 ms cold path, both over target. | It omits real `NSEvent`, mux, PTY, transport, window-server presentation, and photons; no target Wayland run. Preserve as a negative control; `ft-tf6g3.8` and campaign input-latency leaves own end-to-end proof. |
 | Idle-GPU SLO | Proxy/blocked | RQ-S9 scheduler/predicate checks cover pacing decisions. | No production GPU counters or current native idle-window measurement. `ft-tf6g3.9`, `ft-96uy6`, and `ft-1l5n2` own counters and compositor evidence. |
 | Visual SSIM corpus | Proxy/partial | Deterministic static golden comparisons. | A self-consistent golden does not show that live native resize/zoom produced it. Reuse comparison machinery; `ft-interactive-swarm-product-convergence-7xqz4.9.1` owns the real corpus and `.8.10` consumes it. |
 
