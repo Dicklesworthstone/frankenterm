@@ -52,6 +52,9 @@ use crate::redactor::{REDACTED_MARKER, Redactor};
 // ft-jyywz (audit_chain_export_dropped_count), shipped at dc5b42a8c.
 static REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+static REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Failure to reserve a collision-free per-pane identity for replay capture.
 ///
 /// `u64::MAX` is permanently reserved as the terminal sentinel. Once a pane
@@ -2543,12 +2546,18 @@ mod tests {
 
     #[test]
     fn ft_zkthg_drop_counter_starts_at_zero_after_reset() {
+        let _guard = REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_replay_capture_policy_decision_drop_count_for_test();
         assert_eq!(replay_capture_policy_decision_drop_count(), 0);
     }
 
     #[test]
     fn ft_zkthg_clean_capture_decision_does_not_bump_drop_counter() {
+        let _guard = REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_replay_capture_policy_decision_drop_count_for_test();
         let baseline = replay_capture_policy_decision_drop_count();
 
@@ -2587,6 +2596,9 @@ mod tests {
 
     #[test]
     fn ft_zkthg_drop_counter_is_monotonic_under_concurrent_reset() {
+        let _guard = REPLAY_CAPTURE_POLICY_DECISION_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Without a way to force serde_json::to_value(&DecisionEvent) to
         // fail (the type is composed of primitives + String + structured
         // serializable variants — Serialize is effectively infallible),
