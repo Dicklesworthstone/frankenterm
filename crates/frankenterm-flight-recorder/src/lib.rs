@@ -22,7 +22,7 @@ use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
@@ -557,6 +557,7 @@ pub struct RecorderAccountingSnapshot {
 /// Deterministically ordered, fixed-bounded set of frozen raw events.
 #[derive(Debug)]
 pub struct FrozenBatch {
+    recorder_identity: Weak<FlightRecorder>,
     epoch_id: RecorderEpochId,
     events: Vec<RawInteractionEvent>,
     accounting: RecorderAccountingSnapshot,
@@ -880,6 +881,7 @@ struct RecorderWorkspace {
 /// Cross-layer bounded flight recorder.
 #[derive(Debug)]
 pub struct FlightRecorder {
+    identity: Weak<FlightRecorder>,
     config: RecorderConfig,
     shards: Vec<RecorderShard>,
     next_trace_sequence: AtomicU64,
@@ -963,7 +965,8 @@ impl FlightRecorder {
             )?;
         }
 
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|identity| Self {
+            identity: identity.clone(),
             config,
             shards,
             next_trace_sequence: AtomicU64::new(1),
@@ -1241,6 +1244,7 @@ impl FlightRecorder {
         let serialization_workspace = std::mem::take(&mut workspace.serialization_workspace);
         self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
         Ok(FrozenBatch {
+            recorder_identity: self.identity.clone(),
             epoch_id: self.config.epoch_id,
             events,
             accounting,

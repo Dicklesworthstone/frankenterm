@@ -4189,14 +4189,19 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   lock, unbounded queue, or dynamic dispatch. The Linux adapter preallocates a
   bounded builder shard set off-path, uses `try_lock`, and performs only a
   marker-mode `user_events` write after recorder admission has returned. Payload
-  preparation and marker accounting are bound to the exact local recorder
-  epoch; cross-epoch payloads fail before adapter invocation or accounting.
+  preparation is bound to the exact local recorder epoch, and terminal marker
+  authority is bound to the exact originating recorder instance plus its frozen
+  batch. Cross-epoch payloads fail before adapter invocation or accounting;
+  same-epoch batches from a different recorder cannot finalize authority.
 - **Cost boundary:** the safe dynamic Linux API has higher encoding cost than
   its static counterpart, whose registration contract requires first-party
   unsafe code. Reusable builders are prewarmed and sharded to remove steady-state
-  allocation and lock waiting, but the target tracing syscall can still perturb
-  diagnostic-mode latency. The overhead matrix must measure that cost; no
-  ordinary recorder mode enables the adapter.
+  allocation and lock waiting. Linux builder routing reuses the recorder's
+  explicit non-`Send` producer shard, preventing every stage of one trace/span
+  from collapsing onto one mutex when the builder count covers the producer
+  count. The target tracing syscall can still perturb diagnostic-mode latency.
+  The overhead matrix must measure that cost; no ordinary recorder mode enables
+  the adapter.
 - **Decision:** preserve platform acceptance as a useful correlation signal,
   but mark every production adapter emission `loss_unknown`. Exact marker
   authority is available only to a reconciled adapter whose retained artifact
@@ -4250,6 +4255,32 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   final two IDs unique and the cursor permanently exhausted afterward.
 - **Primary retry condition:**
   > If trace allocation ever becomes shared, introduce one explicit synchronized allocator authority and prove uniqueness under contention; never regain sharing by cloning a cursor.
+
+### IS-N140 — Caller-supplied event counts are not recorder authority
+
+- **Classification:** certification-authority rejection; terminal API repaired
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.2.4`
+- **Rejected inference:** a platform-marker emitter can prove that it attempted
+  one marker for every recorded event by comparing its attempts with a raw
+  `u64` supplied by its caller.
+- **Counterexample:** a caller that missed one or more marker payloads could pass
+  `marker_attempted` back as `recorded_events`; the equal integers would mint
+  `ExactEveryRecordedEvent` even though the recorder retained more events.
+  Matching only `RecorderEpochId` is also insufficient because a caller can
+  construct two recorder instances with the same nonzero epoch value.
+- **Decision:** live marker snapshots are always diagnostic and inexact.
+  Terminal `finish` accepts only the opaque `FrozenBatch` minted by the exact
+  originating recorder allocation, verifies exact internal accounting and the
+  retained-event cardinality, and then seals marker admission. A weak
+  allocation identity preserves exact-instance comparison without retaining a
+  strong recorder or adding another heap allocation. Wrong-recorder batches
+  fail without sealing, so a correct retry remains possible.
+- **Planted negatives:** a same-epoch batch from a distinct recorder is rejected
+  as `WrongRecorder`; exact adapter delivery paired with exhausted internal
+  accounting remains marker-inexact; only the exact frozen batch with matching
+  recorded cardinality can produce terminal exact marker authority.
+- **Primary retry condition:**
+  > Any future distributed marker reconciliation must bind an authenticated recorder-instance and frozen-batch digest, not a caller-provided count or reusable numeric epoch alone, before it can upgrade marker-assisted certification.
 
 ## Open hypothesis register
 

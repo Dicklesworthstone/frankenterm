@@ -8,6 +8,7 @@
 //! adapters report their own acceptance and delivery authority, and ambiguity
 //! cannot strengthen the internal recorder evidence.
 
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
 use std::sync::{Arc, Mutex, TryLockError};
@@ -15,14 +16,15 @@ use std::sync::{Arc, Mutex, TryLockError};
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
 use crossbeam_utils::CachePadded;
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
-    PlatformMarkerAccountingV1, PlatformMarkerAuthorityV1, RecorderEpochId, RecorderMode,
+    PlatformMarkerAccountingV1, PlatformMarkerAuthorityV1, RecorderAccountingAuthority,
+    RecorderEpochId, RecorderMode,
 };
 use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceId, InteractionTracePath, InteractionTraceStage,
 };
 use thiserror::Error;
 
-use crate::{EventFields, FlightRecorder, ProducerHandle, RecordOutcome, TraceToken};
+use crate::{EventFields, FlightRecorder, FrozenBatch, ProducerHandle, RecordOutcome, TraceToken};
 
 /// Static Linux `user_events` name for a keypress stage.
 pub const KEYPRESS_STAGE_MARKER_NAME: &str = "frankenterm_keypress_stage";
@@ -48,11 +50,17 @@ pub struct PlatformMarkerPayload {
     span_id: u64,
     stage: InteractionTraceStage,
     stage_code: u32,
+    // Local routing hint only; platform marker payloads still emit the four
+    // frozen trace/span identity words below. Reusing the explicitly registered
+    // recorder shard keeps each non-Send producer on one Linux builder and
+    // avoids forcing every producer for one trace/span onto the same mutex.
+    producer_shard_index: usize,
 }
 
 impl PlatformMarkerPayload {
     fn from_recorded_event(
         local_epoch_id: RecorderEpochId,
+        producer: &ProducerHandle,
         token: TraceToken,
         fields: &EventFields,
     ) -> Result<Self, MarkerPayloadError> {
@@ -77,6 +85,7 @@ impl PlatformMarkerPayload {
             span_id: fields.span_id,
             stage,
             stage_code,
+            producer_shard_index: producer.shard_index(),
         })
     }
 
@@ -147,8 +156,12 @@ impl FlightRecorder {
         {
             return Ok((outcome, None));
         }
-        let payload =
-            PlatformMarkerPayload::from_recorded_event(self.config().epoch_id(), token, fields)?;
+        let payload = PlatformMarkerPayload::from_recorded_event(
+            self.config().epoch_id(),
+            producer,
+            token,
+            fields,
+        )?;
         Ok((outcome, Some(payload)))
     }
 }
@@ -376,23 +389,30 @@ fn prepare_linux_marker_event(
 }
 
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
+fn linux_marker_builder_index(
+    payload: PlatformMarkerPayload,
+    builder_count: usize,
+) -> Option<usize> {
+    if !builder_count.is_power_of_two() {
+        return None;
+    }
+    Some(payload.producer_shard_index & (builder_count - 1))
+}
+
+#[cfg(all(feature = "platform-markers", target_os = "linux"))]
 impl PlatformMarkerAdapter for LinuxUserEventsMarkerAdapter {
     fn emit(&self, payload: PlatformMarkerPayload) -> PlatformMarkerAdapterOutcome {
         if !self.event_set.enabled() {
             return PlatformMarkerAdapterOutcome::Unavailable(MarkerUnavailableReason::Disabled);
         }
 
-        let mixed_identity = payload.trace_id().run_id.epoch_nonce_hi
-            ^ payload.trace_id().run_id.epoch_nonce_lo.rotate_left(17)
-            ^ payload.trace_id().sequence.rotate_left(31)
-            ^ payload.span_id().rotate_left(47)
-            ^ u64::from(payload.stage_code()).rotate_left(7);
-        let folded_identity =
-            u32::try_from((mixed_identity ^ (mixed_identity >> 32)) & u64::from(u32::MAX))
-                .unwrap_or(0);
-        let builder_index =
-            usize::try_from(folded_identity).unwrap_or(0) & (self.builders.len() - 1);
-        let mut builder = match self.builders[builder_index].try_lock() {
+        let Some(builder_index) = linux_marker_builder_index(payload, self.builders.len()) else {
+            return PlatformMarkerAdapterOutcome::Dropped(MarkerDropReason::EmissionRejected);
+        };
+        let Some(builder) = self.builders.get(builder_index) else {
+            return PlatformMarkerAdapterOutcome::Dropped(MarkerDropReason::EmissionRejected);
+        };
+        let mut builder = match builder.try_lock() {
             Ok(builder) => builder,
             Err(TryLockError::WouldBlock) => {
                 return PlatformMarkerAdapterOutcome::Dropped(MarkerDropReason::QueueFull);
@@ -514,13 +534,20 @@ pub struct PlatformMarkerSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformMarkerFinishOutcome {
     Ready(PlatformMarkerSnapshot),
-    Draining { in_flight_operations: u64 },
+    Draining {
+        in_flight_operations: u64,
+    },
+    WrongRecorder {
+        expected: RecorderEpochId,
+        actual: RecorderEpochId,
+    },
 }
 
 /// Separate marker controller for the explicit marker-enabled certification
-/// mode. It owns no recorder reference and has no locks or queues.
+/// mode. It owns only a weak exact-recorder identity and has no locks or queues.
 #[derive(Debug)]
 pub struct PlatformMarkerEmitter<A> {
+    recorder_identity: Weak<FlightRecorder>,
     epoch_id: RecorderEpochId,
     mode: RecorderMode,
     adapter: A,
@@ -542,6 +569,7 @@ where
     pub fn for_recorder(recorder: &FlightRecorder, adapter: A) -> Self {
         let config = recorder.config();
         Self {
+            recorder_identity: recorder.identity.clone(),
             epoch_id: config.epoch_id(),
             mode: config.mode(),
             adapter,
@@ -610,11 +638,19 @@ where
         }
     }
 
-    /// Read a fail-closed diagnostic view against an internal recorded-event
-    /// count. Exact authority is impossible until [`Self::finish`] has sealed
-    /// admission and every admitted adapter call has returned.
+    /// Read the live marker counters. Exact authority is impossible until
+    /// [`Self::finish`] has sealed admission, every admitted adapter call has
+    /// returned, and the exact originating recorder's frozen batch supplies
+    /// the authoritative recorded-event count.
     #[must_use]
-    pub fn snapshot(&self, recorded_events: u64) -> PlatformMarkerSnapshot {
+    pub fn snapshot(&self) -> PlatformMarkerSnapshot {
+        self.snapshot_with_internal_authority(None)
+    }
+
+    fn snapshot_with_internal_authority(
+        &self,
+        internal_recorded_events: Option<u64>,
+    ) -> PlatformMarkerSnapshot {
         if self.mode != RecorderMode::CertificationWithMarkers {
             return PlatformMarkerSnapshot {
                 authority: PlatformMarkerAuthorityV1::NotRequested,
@@ -644,7 +680,7 @@ where
         let exact = finalized
             && !accounting_exhausted
             && !accounting.loss_unknown
-            && accounting.attempted == recorded_events
+            && internal_recorded_events == Some(accounting.attempted)
             && accounting.emitted == accounting.attempted
             && accounting.unavailable == 0
             && accounting.dropped == 0;
@@ -663,9 +699,25 @@ where
     /// every callback admitted before the seal has returned. Repeated calls
     /// while draining or after completion are harmless and nonblocking.
     #[must_use]
-    pub fn finish(&self, recorded_events: u64) -> PlatformMarkerFinishOutcome {
+    pub fn finish(&self, batch: &FrozenBatch) -> PlatformMarkerFinishOutcome {
+        if !Weak::ptr_eq(&self.recorder_identity, &batch.recorder_identity) {
+            return PlatformMarkerFinishOutcome::WrongRecorder {
+                expected: self.epoch_id,
+                actual: batch.epoch_id(),
+            };
+        }
+        let internal_accounting = batch.accounting();
+        let retained_event_count_matches = u64::try_from(batch.len())
+            .is_ok_and(|retained_events| retained_events == internal_accounting.event.recorded);
+        let internal_recorded_events = (internal_accounting.authority
+            == RecorderAccountingAuthority::Exact
+            && retained_event_count_matches)
+            .then_some(internal_accounting.event.recorded);
+
         if self.mode != RecorderMode::CertificationWithMarkers {
-            return PlatformMarkerFinishOutcome::Ready(self.snapshot(recorded_events));
+            return PlatformMarkerFinishOutcome::Ready(
+                self.snapshot_with_internal_authority(internal_recorded_events),
+            );
         }
         let observed = self
             .admission
@@ -676,7 +728,9 @@ where
                 in_flight_operations,
             };
         }
-        PlatformMarkerFinishOutcome::Ready(self.snapshot(recorded_events))
+        PlatformMarkerFinishOutcome::Ready(
+            self.snapshot_with_internal_authority(internal_recorded_events),
+        )
     }
 
     fn mark_accounting_exhausted(&self) {
@@ -800,13 +854,23 @@ mod tests {
     }
 
     fn test_recorder(mode: RecorderMode) -> Arc<FlightRecorder> {
+        test_recorder_for_epoch(
+            mode,
+            RecorderEpochId::new(1, 2).expect("test epoch is valid"),
+        )
+    }
+
+    fn test_recorder_for_epoch(
+        mode: RecorderMode,
+        epoch_id: RecorderEpochId,
+    ) -> Arc<FlightRecorder> {
         let sampler = if mode == RecorderMode::Off {
             RecorderSamplerConfigV1::off()
         } else {
             RecorderSamplerConfigV1::certification()
         };
         let config = RecorderConfig::new(
-            RecorderEpochId::new(1, 2).expect("test epoch is valid"),
+            epoch_id,
             InteractionTraceRunId::new(3, 4).expect("test run is valid"),
             mode,
             sampler,
@@ -909,17 +973,26 @@ mod tests {
         )
     }
 
+    fn freeze_recorder(recorder: &FlightRecorder) -> FrozenBatch {
+        recorder
+            .try_freeze()
+            .unwrap_or_else(|outcome| panic!("test recorder did not freeze: {outcome:?}"))
+    }
+
     fn finish_ready<A>(
         emitter: &PlatformMarkerEmitter<A>,
-        recorded_events: u64,
+        batch: &FrozenBatch,
     ) -> PlatformMarkerSnapshot
     where
         A: PlatformMarkerAdapter,
     {
-        match emitter.finish(recorded_events) {
+        match emitter.finish(batch) {
             PlatformMarkerFinishOutcome::Ready(snapshot) => snapshot,
             draining @ PlatformMarkerFinishOutcome::Draining { .. } => {
                 panic!("test marker emitter did not finish: {draining:?}")
+            }
+            wrong_recorder @ PlatformMarkerFinishOutcome::WrongRecorder { .. } => {
+                panic!("test marker emitter received the wrong batch: {wrong_recorder:?}")
             }
         }
     }
@@ -956,6 +1029,7 @@ mod tests {
                         span_id: payload.span_id(),
                         stage,
                         stage_code: marker_stage_code(stage),
+                        producer_shard_index: payload.producer_shard_index,
                     }
                     .static_name(),
                     KEYPRESS_STAGE_MARKER_NAME | RESIZE_ZOOM_STAGE_MARKER_NAME
@@ -990,7 +1064,7 @@ mod tests {
             assert_eq!(emitter.emit(payload), PlatformMarkerOutcome::NotRequested);
             assert_eq!(calls.load(Ordering::Relaxed), 0);
             assert_eq!(
-                emitter.snapshot(1),
+                emitter.snapshot(),
                 PlatformMarkerSnapshot {
                     authority: PlatformMarkerAuthorityV1::NotRequested,
                     accounting: PlatformMarkerAccountingV1::default(),
@@ -1050,7 +1124,8 @@ mod tests {
             PlatformMarkerOutcome::WrongEpoch
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
-        let snapshot = finish_ready(&emitter, 1);
+        let batch = freeze_recorder(&recorder);
+        let snapshot = finish_ready(&emitter, &batch);
         assert_eq!(snapshot.accounting.attempted, 0);
         assert_eq!(snapshot.authority, PlatformMarkerAuthorityV1::Inexact);
     }
@@ -1073,10 +1148,32 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(
-            emitter.snapshot(1).authority,
+            emitter.snapshot().authority,
             PlatformMarkerAuthorityV1::Inexact
         );
-        let exact = finish_ready(&emitter, 1);
+
+        let foreign_recorder = test_recorder(RecorderMode::CertificationWithMarkers);
+        let foreign_batch = freeze_recorder(&foreign_recorder);
+        assert_eq!(
+            emitter.finish(&foreign_batch),
+            PlatformMarkerFinishOutcome::WrongRecorder {
+                expected: recorder.config().epoch_id(),
+                actual: foreign_recorder.config().epoch_id(),
+            }
+        );
+        assert_eq!(
+            recorder.config().epoch_id(),
+            foreign_recorder.config().epoch_id(),
+            "the negative must prove exact recorder identity, not only epoch mismatch"
+        );
+        assert_eq!(
+            emitter.snapshot().authority,
+            PlatformMarkerAuthorityV1::Inexact,
+            "a wrong-recorder finish must not seal marker admission"
+        );
+
+        let batch = freeze_recorder(&recorder);
+        let exact = finish_ready(&emitter, &batch);
         assert_eq!(
             exact.authority,
             PlatformMarkerAuthorityV1::ExactEveryRecordedEvent
@@ -1085,9 +1182,41 @@ mod tests {
         assert_eq!(exact.accounting.emitted, 1);
         assert!(!exact.accounting.loss_unknown);
         assert_eq!(
-            emitter.snapshot(2).authority,
-            PlatformMarkerAuthorityV1::Inexact
+            emitter.snapshot().authority,
+            PlatformMarkerAuthorityV1::Inexact,
+            "live snapshots never inherit terminal internal authority"
         );
+    }
+
+    #[test]
+    fn exact_marker_delivery_cannot_override_exhausted_internal_authority() {
+        let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
+        let payload = recorded_payload(&recorder);
+        let (emitter, _) = emitter(
+            &recorder,
+            PlatformMarkerAdapterOutcome::Emitted {
+                delivery: MarkerDeliveryAuthority::Exact,
+            },
+        );
+        assert!(matches!(
+            emitter.emit(payload),
+            PlatformMarkerOutcome::Emitted {
+                delivery: MarkerDeliveryAuthority::Exact
+            }
+        ));
+        recorder
+            .accounting_authority
+            .store(crate::AUTHORITY_EXHAUSTED, Ordering::Release);
+        let batch = freeze_recorder(&recorder);
+        assert_eq!(
+            batch.accounting().authority,
+            RecorderAccountingAuthority::Exhausted
+        );
+
+        let snapshot = finish_ready(&emitter, &batch);
+        assert_eq!(snapshot.authority, PlatformMarkerAuthorityV1::Inexact);
+        assert!(!snapshot.accounting_exhausted);
+        assert!(!snapshot.accounting.loss_unknown);
     }
 
     #[test]
@@ -1106,9 +1235,6 @@ mod tests {
                 delivery: MarkerDeliveryAuthority::ExternalLossUnknown
             }
         ));
-        let lossy_snapshot = finish_ready(&lossy, 1);
-        assert_eq!(lossy_snapshot.authority, PlatformMarkerAuthorityV1::Inexact);
-        assert!(lossy_snapshot.accounting.loss_unknown);
 
         let (unavailable, _) = emitter(
             &recorder,
@@ -1118,9 +1244,6 @@ mod tests {
             unavailable.emit(payload),
             PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::PermissionDenied)
         );
-        let unavailable_snapshot = finish_ready(&unavailable, 1);
-        assert_eq!(unavailable_snapshot.accounting.unavailable, 1);
-        assert_eq!(unavailable_snapshot.accounting.emitted, 0);
 
         let (dropped, _) = emitter(
             &recorder,
@@ -1130,9 +1253,6 @@ mod tests {
             dropped.emit(payload),
             PlatformMarkerOutcome::Dropped(MarkerDropReason::QueueFull)
         );
-        let dropped_snapshot = finish_ready(&dropped, 1);
-        assert_eq!(dropped_snapshot.accounting.dropped, 1);
-        assert_eq!(dropped_snapshot.accounting.unavailable, 0);
 
         let unsupported = PlatformMarkerEmitter::for_recorder(
             &recorder,
@@ -1142,7 +1262,21 @@ mod tests {
             unsupported.emit(payload),
             PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::UnsupportedPlatform)
         );
-        let unsupported_snapshot = finish_ready(&unsupported, 1);
+
+        let batch = freeze_recorder(&recorder);
+        let lossy_snapshot = finish_ready(&lossy, &batch);
+        assert_eq!(lossy_snapshot.authority, PlatformMarkerAuthorityV1::Inexact);
+        assert!(lossy_snapshot.accounting.loss_unknown);
+
+        let unavailable_snapshot = finish_ready(&unavailable, &batch);
+        assert_eq!(unavailable_snapshot.accounting.unavailable, 1);
+        assert_eq!(unavailable_snapshot.accounting.emitted, 0);
+
+        let dropped_snapshot = finish_ready(&dropped, &batch);
+        assert_eq!(dropped_snapshot.accounting.dropped, 1);
+        assert_eq!(dropped_snapshot.accounting.unavailable, 0);
+
+        let unsupported_snapshot = finish_ready(&unsupported, &batch);
         assert_eq!(unsupported_snapshot.accounting.attempted, 1);
         assert_eq!(unsupported_snapshot.accounting.unavailable, 1);
         assert_eq!(
@@ -1167,7 +1301,8 @@ mod tests {
             PlatformMarkerOutcome::AccountingExhausted { .. }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
-        let snapshot = finish_ready(&emitter, u64::MAX);
+        let batch = freeze_recorder(&recorder);
+        let snapshot = finish_ready(&emitter, &batch);
         assert!(snapshot.accounting_exhausted);
         assert!(snapshot.accounting.loss_unknown);
         assert_eq!(snapshot.authority, PlatformMarkerAuthorityV1::Inexact);
@@ -1190,7 +1325,8 @@ mod tests {
         let worker = thread::spawn(move || worker_emitter.emit(payload));
         entered.wait();
 
-        let live = emitter.snapshot(1);
+        let batch = freeze_recorder(&recorder);
+        let live = emitter.snapshot();
         assert_eq!(live.authority, PlatformMarkerAuthorityV1::Inexact);
         assert_eq!(live.accounting.attempted, 1);
         assert_eq!(live.accounting.emitted, 0);
@@ -1200,7 +1336,7 @@ mod tests {
             "an in-flight diagnostic snapshot remains structurally coherent"
         );
         assert_eq!(
-            emitter.finish(1),
+            emitter.finish(&batch),
             PlatformMarkerFinishOutcome::Draining {
                 in_flight_operations: 1
             }
@@ -1212,7 +1348,7 @@ mod tests {
             PlatformMarkerOutcome::Emitted { .. }
         ));
         assert_eq!(
-            finish_ready(&emitter, 1).authority,
+            finish_ready(&emitter, &batch).authority,
             PlatformMarkerAuthorityV1::ExactEveryRecordedEvent
         );
     }
@@ -1270,5 +1406,21 @@ mod tests {
             linux_marker_shard_count(257).unwrap_err(),
             MarkerUnavailableReason::RegistrationFailed
         );
+
+        let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
+        let payload = recorded_payload(&recorder);
+        let adjacent_producer = PlatformMarkerPayload {
+            producer_shard_index: payload.producer_shard_index + 1,
+            ..payload
+        };
+        assert_eq!(payload.identity_words(), adjacent_producer.identity_words());
+        assert_ne!(
+            linux_marker_builder_index(payload, 128),
+            linux_marker_builder_index(adjacent_producer, 128),
+            "concurrent producers for one trace/span must not be forced onto one builder"
+        );
+        assert_eq!(linux_marker_builder_index(payload, 1), Some(0));
+        assert_eq!(linux_marker_builder_index(payload, 0), None);
+        assert_eq!(linux_marker_builder_index(payload, 3), None);
     }
 }

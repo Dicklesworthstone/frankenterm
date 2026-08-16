@@ -1001,7 +1001,10 @@ fn unavailable_platform_marker_stays_outside_internal_recorder_authority() {
         emitter.emit(payload),
         PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::PermissionDenied)
     );
-    let PlatformMarkerFinishOutcome::Ready(marker_snapshot) = emitter.finish(1) else {
+    let frozen = recorder
+        .try_freeze()
+        .expect("internal recorder still freezes");
+    let PlatformMarkerFinishOutcome::Ready(marker_snapshot) = emitter.finish(&frozen) else {
         panic!("synchronous unavailable adapter must finish without draining");
     };
     assert_eq!(
@@ -1011,9 +1014,6 @@ fn unavailable_platform_marker_stays_outside_internal_recorder_authority() {
     assert_eq!(marker_snapshot.accounting.attempted, 1);
     assert_eq!(marker_snapshot.accounting.unavailable, 1);
 
-    let frozen = recorder
-        .try_freeze()
-        .expect("internal recorder still freezes");
     assert_eq!(frozen.len(), 1);
     assert_eq!(frozen.accounting().event.recorded, 1);
     assert_eq!(
