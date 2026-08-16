@@ -400,6 +400,338 @@ on every subsequent query. The dormant transactional server path instead
 closes before ambiguous identity. None of these is the bounded epoch/resync
 transition required to call sparse multi-consumer damage complete.
 
+### 2.2.2 Immutable coherent `RenderSnapshot` contract (2026-08-15)
+
+This section is the normative architecture artifact for
+`ft-interactive-systems-performance-4tenz.6.2`. It defines the state boundary
+that `.6.3` must implement. The executable publication model lives in
+`frankenterm/mux/src/renderable.rs` tests. Neither artifact is a live snapshot
+producer, renderer cutover, or performance result.
+
+#### Decision and scope
+
+The unit of local presentation is one immutable **per-window** snapshot, not a
+set of independently sampled pane lines. A frame may render an older complete
+snapshot or no terminal content, but it must never combine fields from
+different source, topology, geometry, overlay, prediction, or renderer-cache
+generations. One frame acquires the snapshot once and carries that exact value
+through shaping, glyph lookup, atlas lookup, quad construction, submit, and
+presentation settlement. No per-cell, per-glyph, or per-quad mux capability
+lookup is permitted.
+
+“Per-window” means the exact active tab's displayed tiled, floating, zoomed,
+and GUI-overlay pane set. Hidden tabs are represented by their frozen order and
+active identity but their terminal rows are not copied into each frame. A tab
+activation changes the authority and requires a new complete displayed-pane
+projection.
+
+The contract has three nested values:
+
+```text
+WindowRenderSnapshot
+  authority: RenderAuthority
+  geometry: WindowRenderGeometry
+  gui: GuiRenderState
+  panes: Arc<[PaneRenderSnapshot]>
+  cache_epochs: RenderCacheEpochs
+  damage: SnapshotDamageIdentity
+  usage: SnapshotResourceUsage
+
+PaneRenderSnapshot
+  authority: ExactPaneAuthority
+  terminal: ImmutableTerminalProjection
+  gui: PaneGuiProjection
+  prediction: PredictionProjection
+
+ImmutableTerminalProjection
+  source_generation + source_sequence
+  dimensions + visible stable-row interval
+  Arc<[immutable Line/row chunk]>
+  cursor + palette + title + alternate-screen identity
+  semantic zones + hyperlinks + image references
+```
+
+The sketch is descriptive, not a license to add a parallel type with only the
+easy fields. Publication is legal only when every required component below is
+present and belongs to the same capture transaction.
+
+#### Exact identity and generation algebra
+
+`RenderAuthority` is the product of:
+
+- `MuxSessionIncarnation` and one non-exhausted `TopologyRevision`;
+- the exact frozen window authority: `WindowId`, `WindowOrderRevision`, ordered
+  weak exact tab identities, and exact active tab;
+- the exact tab allocation held strongly only by the candidate through final
+  validation, plus its tiled/floating/zoom/layout generation;
+- one `PaneRegistrationHandle` for each pane; the candidate temporarily holds
+  the exact pane allocation through capture and final revalidation, while the
+  published snapshot retains only the weak exact registration capability and
+  its immutable terminal projection;
+- the remote render-connection incarnation for a `ClientPane`;
+- window pixel size, DPI, terminal cell geometry, font/scale/config generation,
+  viewport, alternate-screen, and overlay generations; and
+- a publication generation scoped to that exact window incarnation.
+
+Numeric pane, tab, and window IDs are diagnostic fields only. They cannot be
+cache or publication authority by themselves. Process-local snapshots retain
+weak exact tab/pane-registration identity plus immutable projections;
+serializable remote snapshots use the existing connection, pane, delivery, and
+snapshot incarnations. Reconnect creates a new identity scope even when numeric
+IDs and source counters repeat.
+
+Every new contract generation is a `u64` with checked successor semantics;
+`u64::MAX` is the exhausted sentinel and is never published. Existing terminal
+`SequenceNo` remains a captured source field until `.6.4` supplies its bounded
+epoch/resync replacement, and its `usize::MAX` saturation can never mint a new
+generation. Exhaustion is terminal for that publisher: clear presentation
+eligibility, retain no apparently current snapshot, emit a finite content-free
+diagnostic, and require a new owning incarnation or an explicit full
+resynchronization protocol. Wrapping, saturating, resetting inside one
+incarnation, or comparing raw counters across incarnations is forbidden.
+
+`source_sequence` names terminal content, `TopologyRevision` names mux
+structure, `WindowOrderRevision` names order/active membership,
+`geometry_generation` names resize/zoom/DPI/cell geometry,
+`overlay_generation` names selection/IME/highlight/internal-overlay state, and
+`publication_generation` names the atomic immutable result. They are distinct
+domains; no one counter is reused as another domain's watermark.
+
+#### Required field and owner map
+
+| State required for a frame | Authoritative capture owner | Immutable representation and rule |
+|---|---|---|
+| mux session, window, tab order, active tab, zoom, tiled/floating pane layout | `Mux`, `Window`, `Tab` | one mux-owned callback-free candidate capture with exact strong tab identities and one topology fence; publication retains weak exact identities plus immutable copied/shared layout, with no later ambient registry lookup during render |
+| pane identity and lifecycle | mux pane registry | one weak exact `PaneRegistrationHandle` plus a temporary strong pane allocation during capture; a short final-cut registration guard revalidates them, then the published snapshot reads only its immutable projection and cannot keep the live pane or its retirement fence alive |
+| visible rows and every `Cell` attribute | local `Terminal` mutex or remote `RenderablePane` cache | immutable row chunks covering the exact visible stable interval; no mutable renderer appdata is shared back into terminal authority |
+| hyperlinks and terminal images | the same terminal/cache projection as the rows | references captured in the same source generation; remote image payload/handle batching remains `.6.7.1`, so unresolved images make the candidate incomplete |
+| cursor position, shape, visibility, color, blink eligibility | terminal plus GUI blink state | terminal cursor and deterministic GUI phase are both frozen; wall-clock reads happen before capture or become a later generation |
+| terminal dimensions, stable-row bounds, reverse video, palette, title, alternate screen | terminal/cache projection | sampled in the same pane critical section as rows and source fence; no separate `Pane` calls after row capture |
+| semantic zones and command metadata | pane terminal semantic state | captured under the same source generation; lazy text expansion is outside the frame and cannot mutate the snapshot |
+| viewport/scroll position, selection, bell, hover/highlight, mouse coordinates, pane overlay | `TermWindow::PaneState` and window GUI state | cloned into `PaneGuiProjection` under one GUI-thread capture; every mutation advances the overlay/viewport generation |
+| predictive echo cells, serials, confidence display cue, reconciliation boundary | remote `RenderablePane` | a bounded immutable overlay captured with the authoritative cached-row generation; prediction never mutates snapshot rows |
+| IME composition/caret geometry and accessibility-visible text/geometry | window/input/accessibility state | included or explicitly empty with its generation; accessibility is correctness-critical and cannot be deferred as cosmetic state |
+| synchronized-output visibility, focus, opacity, tab bar/status/scrollbar/background | mux notification plus `TermWindow` | frozen in the window projection; BSU-hidden content cannot leak through a newer independently sampled row set |
+| font set, font scale, shape rules, hyperlink-rule epoch, color scheme, renderer/device/atlas epochs | config/font/render owners | scalar immutable cache epochs; external caches are keyed by the complete snapshot identity and never by raw `PaneId` |
+| damage/settlement identity | terminal damage journal plus GUI `DamageGeneration` | records the exact source ranges and GUI generation represented; clearing occurs only after the same snapshot presents successfully |
+
+#### Ownership, sharing, and lifetime
+
+Copy/share policy is part of the correctness contract, not an implementation
+afterthought:
+
+- bounded scalar identities, geometry, cursor, palette, visibility, opacity,
+  damage ranges, and cache epochs are copied into the candidate;
+- immutable window topology and tab-bar metadata are shared as one
+  generation-qualified `Arc` and reused across frames until topology or order
+  changes; it contains weak exact tab identities and immutable metadata, not
+  strong live-tab owners, and a frame does not clone every hidden tab allocation
+  on every paint;
+- visible terminal rows are immutable generation-qualified chunks shared by
+  `Arc`; a mutation creates or replaces only affected chunks and never mutates
+  backing already reachable from a candidate, published snapshot, or frame;
+- hyperlink strings, semantic metadata, and image backing may be shared only
+  through immutable exact-generation handles. Their unique backing is counted
+  once within one snapshot and again when distinct retained generations do not
+  share it;
+- selection, IME, accessibility, prediction, and other small volatile overlays
+  are bounded value copies so a later GUI mutation cannot rewrite an older
+  snapshot; and
+- glyph, shape, atlas, and quad caches remain external. The snapshot carries
+  their epochs and complete authority keys, not mutable cache entries.
+
+The candidate alone temporarily owns strong live-tab and live-pane allocations.
+A published snapshot owns no live `Tab`, live `Pane`, terminal lock, mux lock,
+retirement guard, GUI borrow, or mutable renderer cache reference. It owns only
+immutable projections, weak exact capabilities, and shared immutable backing.
+The candidate ends at rejection, cancellation, or atomic publication. The
+published value ends when superseded or invalidated and no frame retains it.
+Exactly one superseded value may remain render-held until presentation settles
+or is rejected; no timer or queued callback may extend it into a fourth
+generation. These rules apply independently per window publisher.
+
+Scrollbar history summaries and offscreen scrollback are not copied into every
+frame. The snapshot carries the visible rows plus bounded metadata needed to
+render scroll position. A scroll that changes the visible interval creates a
+new geometry/viewport generation. Accessibility requests for offscreen text
+use their own bounded exact-generation snapshot rather than borrowing a frame
+and extending its lifetime indefinitely.
+
+#### Capture and publication protocol
+
+The live implementation must follow this order:
+
+1. **Admit.** On the GUI thread, capture the exact window authority and reserve
+   one bounded candidate slot. Reject when a candidate already exists, the
+   publisher is exhausted, the pane count exceeds the configured window cap,
+   or the peak three-generation envelope cannot be admitted.
+2. **Freeze GUI state.** Copy the small window/pane GUI projections and their
+   generations once. Retain each exact tab and pane allocation once for capture
+   and revalidation, never per row or cell, and drop it after publish or
+   rejection. Do not hold a pane-retirement lease across later capture or
+   render work. Sort any multi-pane lock acquisition by stable exact identity.
+3. **Freeze each terminal projection.** Under one short pane critical section,
+   apply implicit hyperlink rules or consume a pre-normalized immutable line
+   generation, capture rows and all terminal-owned metadata, then release the
+   terminal/cache lock. No shaping, glyph lookup, atlas work, quad allocation,
+   Lua callback, subscriber callback, RPC, image decode, or filesystem work is
+   allowed in this section.
+4. **Complete outside locks.** Assemble immutable `Arc`-owned row chunks,
+   deduplicate counted image/hyperlink backing by exact identity, compute usage,
+   and prepare the complete candidate. Fallible allocation happens here.
+5. **Revalidate.** In one callback-free final cut, prove the mux/window/tab/pane
+   identities remain exact and every captured generation still belongs to the
+   candidate. Registration guards, if required by the live mux API, are
+   acquired only for this bounded final cut and released before publication
+   callbacks or render work. A content mutation racing after the source cut is
+   handled by the damage journal, but a known stale/incomplete candidate is
+   never newly published. Resize, zoom, DPI, alternate-screen, viewport,
+   selection/IME, overlay, reconnect, or pane replacement invalidates the
+   candidate.
+6. **Publish.** Reserve the checked publication successor and atomically swap
+   one `Arc<WindowRenderSnapshot>`. Publication cannot allocate, invoke a pane,
+   notify a subscriber, or otherwise fail after the swap begins. An identical
+   identity/source/content digest is a no-op; the same identity and source with
+   a different digest is equivocation and fails closed.
+7. **Render and settle.** Acquire the `Arc` once. Shape/rasterize/build quads
+   outside terminal/mux locks, using caches keyed by complete authority and
+   cache epochs. Settle damage only when the same publication and damage
+   generation reaches the existing successful presentation boundary.
+
+Cancellation before publication drops the candidate and its temporary exact
+tab/pane allocations without advancing publication generation or changing the
+last-known-good value.
+Cancellation after the atomic swap cannot revoke the published value; it may
+only suppress downstream optional work. Pane close/replacement tombstones all
+exact-identity caches, clears publication eligibility, and prevents a delayed
+candidate from attaching to a same-numbered successor. An already acquired
+frame may finish reading its immutable projection, but its exact-identity
+settlement must fail; retirement never waits for that frame.
+
+#### Last-known-good policy
+
+A prior complete snapshot remains eligible while a newer **content-only**
+candidate is being built or fails allocation/budget validation. This preserves
+the last coherent frame rather than presenting a partial update. It is not
+eligible after window/tab/pane identity, geometry, viewport, alternate-screen,
+selection/IME/overlay, synchronized-output visibility, font/config, or device
+generation changes. Those transitions show the existing bounded placeholder
+or retain the prior submitted GPU frame without relabeling it current, then
+request a full snapshot. Exhaustion and tombstone also clear eligibility.
+
+The publisher retains at most one eligible snapshot, one admitted candidate,
+and one render-held prior generation. Queued repaint requests coalesce and
+share the published `Arc`; they do not clone rows or acquire distinct snapshot
+generations. Publishing a newer value supersedes an older in-flight frame, and
+the presentation gate discards that frame. A second concurrent render acquire
+is rejected until the single render-held slot settles. This bounds the peak
+even if shaping or submission stalls while terminal output continues.
+
+#### Resource and lock budgets
+
+All limits are finite, configurable, observed, and checked with overflow-safe
+arithmetic before publication:
+
+- maximum panes and visible rows per window snapshot;
+- retained cell/line bytes and row-chunk overhead;
+- unique hyperlink count and UTF-8 bytes;
+- unique image references plus encoded/decoded resident bytes;
+- semantic-zone, selection, prediction, IME, and accessibility payload counts;
+- one published, one candidate, and at most one render-held prior snapshot,
+  including shared-backing accounting; and
+- short exact-registration validations and terminal/mux/GUI lock acquisitions
+  per frame.
+
+The initial numeric memory caps must be frozen from measured visible-state
+distributions in `.6.3`; `.6.2` does not invent target claims without data.
+The non-negotiable structural caps are three distinct snapshot generations per
+window, one candidate and one render acquire per publisher, one terminal
+capture and at most one short-lived final-cut registration guard per pane, and
+O(panes + visible rows + unique referenced resources) work. A guard is never
+retained by the candidate, published snapshot, or render-held generation.
+O(cells) authority acquisitions, multiple render-held generations, retirement
+delayed by render work, and unbounded retry queues are reject conditions.
+
+Lock **time** is telemetry, not a safe mid-critical-section timeout. The
+producer records wait/hold p50/p95/p99/max, rows/bytes copied or shared, pane
+count, and cause. `.6.3` must freeze a p99 hold-time gate before promotion and
+retain a full-lock reference A/B. Exceeding the observational gate rejects the
+optimization or triggers a coherent full fallback; it never aborts halfway
+through terminal mutation and publishes a partial snapshot.
+
+#### Relationship to remote delivery
+
+The codec's `ExactRenderSnapshotManifestV1` is an immutable, bounded remote row
+delivery protocol. It is not the local per-window frame snapshot: its authority
+is per connection/pane/delivery and its projection does not contain GUI-owned
+selection, IME, window layout, font/cache, or device state. `.6.5` may derive
+wire deltas/manifests from the same pane terminal projection and damage journal,
+but it must mint remote delivery identity and receiver bounds independently.
+The local GUI must then compose received rows, prediction, and GUI state into a
+new local window snapshot; it must not treat a wire manifest as a presented
+frame receipt.
+
+#### Formal invariants and retained model coverage
+
+The executable model asserts these invariants after every transition:
+
+1. a published value contains the complete required field set and is within
+   the retained-byte budget, while the candidate plus every distinct
+   published/render-held generation stays within the total peak budget;
+2. its exact target equals the current session/window/tab/pane/topology/
+   geometry/alternate-screen/overlay target, and its source never exceeds
+   current authority;
+3. detached or exhausted publishers expose no eligible snapshot;
+4. incomplete, over-budget, stale, canceled, and same-source/different-digest
+   candidates cause zero publication mutation;
+5. identical replay is a no-op and does not consume a generation;
+6. successful publication generations strictly advance and never reach or
+   cross the exhausted sentinel;
+7. content-build failure preserves the prior complete value, while geometry or
+   identity change clears its eligibility; and
+8. reconnect changes the incarnation before counters restart.
+
+Deterministic tests cover explicit stale/incomplete/over-budget/equivocation,
+last-known-good, resize, pane replacement, cancellation, exhaustion, and
+reconnect cases. A bounded exhaustive model explores every length-five trace
+over begin-valid, begin-incomplete, begin-over-budget, commit, cancel, render
+acquire/release, content and image/hyperlink mutation, topology mutation,
+resize, alternate-screen switch, overlay and selection/IME mutation, pane
+replacement, reconnect, and detach. Focused tests prove the named state classes
+have explicit stale-publication semantics, every independently advanced
+miniature generation domain fails closed before its exhausted sentinel, and a
+newer publication
+supersedes an older in-flight frame and that only the current exact generation
+can settle.
+The event exploration models concurrent mutation/publish/read as every bounded
+interleaving; `.6.3` must bind it to real types and add thread-scheduled stress,
+pane-reuse, and memory-fault tests. `.6.4` owns the multi-consumer
+damage/overflow model.
+
+#### Migration sequence and non-claims
+
+1. Add callback-free mux/window/tab candidate capture returning exact strong
+   authority and publish only its weak exact identities plus immutable state.
+2. Add one local-pane terminal projection method that captures every
+   terminal-owned field under one guard; add the remote-cache equivalent.
+3. Add GUI window composition and the bounded atomic publisher behind one
+   experiment gate, while retaining the current full-lock renderer as oracle.
+4. Make `LineRender` consume only the immutable snapshot and remove ambient
+   pane/topology/state lookups from the shaped-line loop.
+5. Key and tombstone line/shape/glyph/quad/image caches by exact snapshot
+   identity and cache epochs; eliminate mutable line-appdata writeback.
+6. After differential state/pixel/IME/accessibility proof and measured keep
+   gates, remove the old live path rather than retaining two divergent modes.
+7. Reuse the terminal projection and damage protocol for `.6.5` remote sparse
+   delivery without conflating local publication with application ACK.
+
+This contract and its tests prove only that the proposed state machine is
+internally coherent. They do not prove that production publishes a snapshot,
+that terminal-lock duration fell, that resize/zoom improved, that remote bytes
+fell, or that M4/M5/Threadripper behavior improved. Those claims require the
+live call graph and retained native evidence owned by `.6.3`, `.6.5`, `.6.8`,
+and `.6.9`.
+
 ### 2.3 Long-session risk model
 
 Long sessions change the workload:

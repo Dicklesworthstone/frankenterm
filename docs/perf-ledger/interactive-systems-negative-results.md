@@ -4111,6 +4111,27 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote a renderer substrate to production only after current-source call-graph proof names its live producer and consumer, strict nonlaunching gates exercise the exact path with nonzero tests, and authorized same-source M4/M5/Threadripper workloads establish byte/state/visual equivalence plus a retained latency and resource win without touching an operator session.
 
+### IS-N135 — A coherent snapshot contract is not a live short-lock renderer
+
+- **Classification:** architecture/model-only non-claim; production and native
+  proof deliberately absent
+- **Bead:** `ft-interactive-systems-performance-4tenz.6.2`
+- **Rejected inference:** a complete `RenderSnapshot` schema, publication state
+  machine, exhaustive bounded model, or existing immutable wire snapshot proves
+  that production paint releases the terminal mutex before shaping or that
+  resize, zoom, input, memory, or remote delivery improved.
+- **Negative evidence:** production local paint still consumes
+  `LocalPane::with_lines_mut_and_apply_hyperlinks`; the `.6.2` state model is
+  test-only by design; and `ExactRenderSnapshotManifestV1` is a per-pane wire
+  delivery artifact that lacks GUI window layout, selection, IME, prediction,
+  font/cache, device, and presentation authority.
+- **Decision:** retain the normative exact-identity, complete-field, bounded
+  memory, last-known-good, cancellation, tombstone, and exhaustion contract as
+  the implementation oracle for `.6.3` and `.6.5`. Report zero production or
+  target-hardware improvement from this tranche.
+- **Primary retry condition:**
+  > Promote the contract to a live performance claim only after the current renderer acquires one exact per-window immutable snapshot, performs shaping/glyph/atlas/quad work outside terminal and mux locks, passes state/pixel/IME/accessibility equivalence, and wins the frozen same-source native latency/resource gates without operator-session interaction.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
