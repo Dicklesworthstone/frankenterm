@@ -5,9 +5,9 @@
 ## Summary
 
 - **Updated:** GitHub Actions, direct Cargo registry dependencies, and `Cargo.lock`
-- **Corrected:** workspace MSRV `1.85 -> 1.95` to match the immutable
-  FrankenSearch revision already pinned in `Cargo.lock`; this changes no
-  dependency identity
+- **Corrected:** workspace MSRV `1.85 -> 1.95` to match the resolved graph's
+  declared maximum: `sysinfo 0.39.5`, pulled by Asupersync 0.3.10; this changes
+  no dependency identity
 - **Deferred:** Asupersync 0.4.4 and FrankenSQLite 0.3.1 until the single-runtime
   dependency cohort and storage-transaction prerequisites below are satisfied
 - **Failed:** no code migration currently known failed

@@ -6,10 +6,10 @@
 > Author: DarkMill (claude-code, opus-4.6)
 > Date: 2026-02-22
 
-> **Current pin correction (2026-08-16):** the FrankenTerm-pinned revision
-> `4a75fd706917df915e644b00248540786df438f2` requires Rust 1.95. The 1.85
-> figure below describes the repository snapshot analyzed in February and is
-> not the current FrankenTerm workspace floor.
+> **Current workspace correction (2026-08-16):** the 1.85 figure below
+> describes the FrankenSearch repository snapshot analyzed in February; it is
+> not the current FrankenTerm workspace floor. FrankenTerm's resolved graph
+> now requires Rust 1.95 through `sysinfo 0.39.5`, pulled by Asupersync 0.3.10.
 
 ---
 

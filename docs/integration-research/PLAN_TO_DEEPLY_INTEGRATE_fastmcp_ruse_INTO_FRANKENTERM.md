@@ -35,7 +35,7 @@
   Any future runtime update must migrate FastMCP, FastAPI, and FrankenSearch as
   one compatible cohort rather than admitting split runtime versions.
 
-- **Nightly Rust toolchain**: fastmcp_rust requires nightly (`rust-toolchain.toml` specifies nightly, MSRV 1.85). FrankenTerm uses edition 2024 with `rust-version = "1.95"`, the minimum required by its pinned FrankenSearch revision, so this remains compatible. The nightly requirement must be documented in FrankenTerm's build prerequisites and CI configuration.
+- **Nightly Rust toolchain**: fastmcp_rust requires nightly (`rust-toolchain.toml` specifies nightly, MSRV 1.85). FrankenTerm uses edition 2024 with `rust-version = "1.95"`, the declared maximum in its resolved graph (`sysinfo 0.39.5` through Asupersync 0.3.10), so this remains compatible. The nightly requirement must be documented in FrankenTerm's build prerequisites and CI configuration.
 
 - **Feature-gated behind `mcp-server`**: All fastmcp integration lives behind the existing `mcp-server` feature flag (defined in `crates/frankenterm-core/Cargo.toml` as `mcp-server = ["dep:fastmcp", "dep:toon_rust"]`). The default build compiles without MCP support. A new `mcp-client` feature will be added for the client-side capability.
 

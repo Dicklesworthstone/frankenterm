@@ -2192,9 +2192,9 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   `j-29959181985382549` rejected the recorder candidate because
   `try_update` was stabilized in Rust 1.95 while the workspace contract at the
   time was Rust 1.85. The workspace now correctly declares Rust 1.95 because
-  its immutable FrankenSearch pin requires that floor, so the original
-  compiler rejection remains historical negative evidence rather than the
-  current API constraint. Reverting only to `fetch_update` would have
+  the resolved graph includes `sysinfo 0.39.5` through Asupersync 0.3.10, so
+  the original compiler rejection remains historical negative evidence rather
+  than the current API constraint. Reverting only to `fetch_update` would have
   satisfied the former minimum but retained a warning denied by the pinned
   nightly. The explicit checked-CAS implementation remains the admitted
   behavior because it already carries the required sticky-exhaustion and
