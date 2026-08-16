@@ -18,9 +18,9 @@ workspace = true
 crossbeam-queue.workspace = true
 crossbeam-utils.workspace = true
 frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest = "1.11.0"
-serde_json.workspace = true
 static_assertions = "1.1.0"

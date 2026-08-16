@@ -6,7 +6,7 @@
 //! that a display callback measures photons, or that clocks on different
 //! hosts can be subtracted.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -699,88 +699,12 @@ pub struct InteractionTraceV2 {
 
 impl InteractionTraceV2 {
     pub fn validate_structure(&self) -> Result<(), TraceContractError> {
-        validate_schema(&self.schema_version)?;
-        validate_trace_id(self.trace_id)?;
-        if self.events.is_empty() {
-            return Err(TraceContractError::EmptyTrace);
-        }
-        if self.events.len() > MAX_INTERACTION_TRACE_EVENTS {
-            return Err(TraceContractError::TooManyEvents {
-                actual: self.events.len(),
-                maximum: MAX_INTERACTION_TRACE_EVENTS,
-            });
-        }
-
-        let mut spans = BTreeSet::new();
-        let mut seen_stages = BTreeSet::new();
-        let mut last_start_by_clock = BTreeMap::new();
-        let mut trace_topology = None;
-
-        for (index, event) in self.events.iter().enumerate() {
-            validate_schema(&event.schema_version)?;
-            if event.trace_id != self.trace_id {
-                return Err(TraceContractError::EventTraceIdMismatch {
-                    expected: self.trace_id,
-                    actual: event.trace_id,
-                });
-            }
-            let expected_ordinal = index as u64;
-            if event.event_ordinal != expected_ordinal {
-                return Err(TraceContractError::EventOrdinalNotContiguous {
-                    expected: expected_ordinal,
-                    actual: event.event_ordinal,
-                });
-            }
-            if event.stage.path() != self.path {
-                return Err(TraceContractError::TracePathMismatch {
-                    expected: self.path,
-                    actual: event.stage.path(),
-                });
-            }
-            if let Some(expected) = trace_topology {
-                if event.topology != expected {
-                    return Err(TraceContractError::TraceTopologyChanged {
-                        expected,
-                        actual: event.topology,
-                        event_ordinal: event.event_ordinal,
-                    });
-                }
-            } else {
-                trace_topology = Some(event.topology);
-            }
-            let Some(expected_stage) = u8::try_from(index)
-                .ok()
-                .and_then(|ordinal| InteractionTraceStage::from_ordinal(self.path, ordinal))
-            else {
-                return Err(TraceContractError::UnexpectedStage { stage: event.stage });
-            };
-            if event.stage != expected_stage {
-                if seen_stages.contains(&event.stage) {
-                    return Err(TraceContractError::DuplicateStage { stage: event.stage });
-                }
-                return Err(TraceContractError::StageOutOfOrder {
-                    expected: expected_stage,
-                    actual: event.stage,
-                });
-            }
-            if !seen_stages.insert(event.stage) {
-                return Err(TraceContractError::DuplicateStage { stage: event.stage });
-            }
-            validate_event(event, &spans)?;
-            if let Some(previous_start_ns) = last_start_by_clock
-                .insert(event.started_at.clock_domain, event.started_at.monotonic_ns)
-                && event.started_at.monotonic_ns < previous_start_ns
-            {
-                return Err(TraceContractError::CrossEventClockRegression {
-                    clock_domain: event.started_at.clock_domain,
-                    previous_start_ns,
-                    actual_start_ns: event.started_at.monotonic_ns,
-                    event_ordinal: event.event_ordinal,
-                });
-            }
-            spans.insert(event.span_id);
-        }
-        Ok(())
+        validate_interaction_trace_structure(
+            &self.schema_version,
+            self.trace_id,
+            self.path,
+            &self.events,
+        )
     }
 
     /// Qualify a trace for its declared (still bounded) claim class.
@@ -849,6 +773,103 @@ impl InteractionTraceV2 {
             .started_at;
         from_timestamp.duration_until(to_timestamp)
     }
+}
+
+/// Validate a borrowed trace without transferring or cloning its bounded
+/// event storage. Operational recorders use this surface so recoverable unwind
+/// cannot strand or drop their pre-reserved conversion workspace.
+pub fn validate_interaction_trace_structure(
+    schema_version: &str,
+    trace_id: InteractionTraceId,
+    path: InteractionTracePath,
+    events: &[InteractionTraceEventV2],
+) -> Result<(), TraceContractError> {
+    validate_schema(schema_version)?;
+    validate_trace_id(trace_id)?;
+    if events.is_empty() {
+        return Err(TraceContractError::EmptyTrace);
+    }
+    if events.len() > MAX_INTERACTION_TRACE_EVENTS {
+        return Err(TraceContractError::TooManyEvents {
+            actual: events.len(),
+            maximum: MAX_INTERACTION_TRACE_EVENTS,
+        });
+    }
+
+    let mut trace_topology = None;
+
+    for (index, event) in events.iter().enumerate() {
+        validate_schema(&event.schema_version)?;
+        if event.trace_id != trace_id {
+            return Err(TraceContractError::EventTraceIdMismatch {
+                expected: trace_id,
+                actual: event.trace_id,
+            });
+        }
+        let expected_ordinal =
+            u64::try_from(index).map_err(|_| TraceContractError::TooManyEvents {
+                actual: events.len(),
+                maximum: MAX_INTERACTION_TRACE_EVENTS,
+            })?;
+        if event.event_ordinal != expected_ordinal {
+            return Err(TraceContractError::EventOrdinalNotContiguous {
+                expected: expected_ordinal,
+                actual: event.event_ordinal,
+            });
+        }
+        if event.stage.path() != path {
+            return Err(TraceContractError::TracePathMismatch {
+                expected: path,
+                actual: event.stage.path(),
+            });
+        }
+        if let Some(expected) = trace_topology {
+            if event.topology != expected {
+                return Err(TraceContractError::TraceTopologyChanged {
+                    expected,
+                    actual: event.topology,
+                    event_ordinal: event.event_ordinal,
+                });
+            }
+        } else {
+            trace_topology = Some(event.topology);
+        }
+        let Some(expected_stage) = u8::try_from(index)
+            .ok()
+            .and_then(|ordinal| InteractionTraceStage::from_ordinal(path, ordinal))
+        else {
+            return Err(TraceContractError::UnexpectedStage { stage: event.stage });
+        };
+        if event.stage != expected_stage {
+            if events[..index]
+                .iter()
+                .any(|prior| prior.stage == event.stage)
+            {
+                return Err(TraceContractError::DuplicateStage { stage: event.stage });
+            }
+            return Err(TraceContractError::StageOutOfOrder {
+                expected: expected_stage,
+                actual: event.stage,
+            });
+        }
+        validate_event(event, |span_id| {
+            events[..index].iter().any(|prior| prior.span_id == span_id)
+        })?;
+        if let Some(previous) = events[..index]
+            .iter()
+            .rev()
+            .find(|prior| prior.started_at.clock_domain == event.started_at.clock_domain)
+            && event.started_at.monotonic_ns < previous.started_at.monotonic_ns
+        {
+            return Err(TraceContractError::CrossEventClockRegression {
+                clock_domain: event.started_at.clock_domain,
+                previous_start_ns: previous.started_at.monotonic_ns,
+                actual_start_ns: event.started_at.monotonic_ns,
+                event_ordinal: event.event_ordinal,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Run envelope used to reject duplicate or regressing trace IDs and process
@@ -920,14 +941,17 @@ fn validate_trace_id(trace_id: InteractionTraceId) -> Result<(), TraceContractEr
     Ok(())
 }
 
-fn validate_event(
+fn validate_event<F>(
     event: &InteractionTraceEventV2,
-    prior_spans: &BTreeSet<u64>,
-) -> Result<(), TraceContractError> {
+    prior_span_exists: F,
+) -> Result<(), TraceContractError>
+where
+    F: Fn(u64) -> bool,
+{
     if event.span_id == 0 {
         return Err(TraceContractError::ReservedSpanId);
     }
-    if prior_spans.contains(&event.span_id) {
+    if prior_span_exists(event.span_id) {
         return Err(TraceContractError::DuplicateSpanId {
             span_id: event.span_id,
         });
@@ -938,7 +962,7 @@ fn validate_event(
         });
     }
     if let Some(parent_span_id) = event.parent_span_id
-        && !prior_spans.contains(&parent_span_id)
+        && !prior_span_exists(parent_span_id)
     {
         return Err(TraceContractError::UnknownParentSpan { parent_span_id });
     }
@@ -2216,9 +2240,9 @@ mod tests {
             detector_id: 1,
             calibration_id: 1,
         });
-        let spans = (1..=12).collect();
+        let spans = (1..=12).collect::<BTreeSet<_>>();
         assert!(matches!(
-            validate_event(&event, &spans),
+            validate_event(&event, |span_id| spans.contains(&span_id)),
             Err(TraceContractError::ObservationBoundaryTooStrong { .. })
         ));
     }

@@ -8,11 +8,14 @@
 //! marker emission, dynamic dispatch, or arbitrary callback.
 //!
 //! Close and semantic conversion are explicitly off-path. A read-mostly
-//! recorder-wide close flag and shard-local in-flight words establish the
+//! recorder-wide lifecycle word and shard-local in-flight words establish the
 //! close cut without forcing every producer to write the same cache line.
-//! Once the close flag is visible, no new operation can enter, and freezing
-//! waits for every shard-local admitted count to reach zero before draining.
+//! Once `Closing` is visible, no new operation can enter, and freezing waits
+//! for every shard-local admitted count to reach zero before draining and
+//! publishing `Closed`.
 
+use std::cmp::Ordering as CmpOrdering;
+use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::rc::Rc;
@@ -24,7 +27,7 @@ use crossbeam_utils::CachePadded;
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
     CONVERSION_WORKSPACE_EVENTS, MAX_RAW_EVENT_BYTES, RecorderAccountingAuthority,
     RecorderCapacityV1, RecorderContractError, RecorderEpochId, RecorderEventAccountingV1,
-    RecorderMode, RecorderSamplerConfigV1, RecorderTraceAccountingV1,
+    RecorderLifecycleState, RecorderMode, RecorderSamplerConfigV1, RecorderTraceAccountingV1,
     SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION, SampledTraceContextV1,
 };
 use frankenterm_core_audit_types::interaction_trace_v2::{
@@ -34,12 +37,17 @@ use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceObservationBoundary, InteractionTracePath, InteractionTracePhysicalDetector,
     InteractionTraceProducer, InteractionTraceRunId, InteractionTraceSamplingLoss,
     InteractionTraceStage, InteractionTraceStageOutcome, InteractionTraceTimestamp,
-    InteractionTraceTopology,
+    InteractionTraceTopology, TraceContractError, validate_interaction_trace_structure,
 };
 use thiserror::Error;
 
 const AUTHORITY_EXACT: u8 = 0;
 const AUTHORITY_EXHAUSTED: u8 = 1;
+const LIFECYCLE_ACTIVE: u8 = 0;
+const LIFECYCLE_CLOSING: u8 = 1;
+const LIFECYCLE_CLOSED: u8 = 2;
+const ADMISSION_SEALED: u64 = 1 << 63;
+const IN_FLIGHT_MASK: u64 = ADMISSION_SEALED - 1;
 const COUNTER_EXHAUSTED: u64 = u64::MAX;
 const LAST_EXACT_COUNTER_VALUE: u64 = u64::MAX - 1;
 const DEFAULT_SERIALIZATION_WORKSPACE_BYTES: usize = 64 * 1024;
@@ -118,7 +126,12 @@ impl RecorderConfig {
                 .ok_or(RecorderError::CapacityArithmeticOverflow)?,
         )
         .map_err(|_| RecorderError::CapacityArithmeticOverflow)?;
-        let conversion_event_bytes = u32::from(raw_event_bytes);
+        let conversion_event_bytes = u32::try_from(
+            size_of::<InteractionTraceEventV2>()
+                .checked_add(INTERACTION_TRACE_V2_SCHEMA_VERSION.len())
+                .ok_or(RecorderError::CapacityArithmeticOverflow)?,
+        )
+        .map_err(|_| RecorderError::CapacityArithmeticOverflow)?;
         let serialization_workspace_bytes = u64::try_from(DEFAULT_SERIALIZATION_WORKSPACE_BYTES)
             .map_err(|_| RecorderError::CapacityArithmeticOverflow)?;
 
@@ -388,9 +401,8 @@ pub enum TraceAdmission {
     },
     InvalidRemoteContext,
     /// The call linearized after the close cut and is therefore outside the
-    /// closed epoch's event-attempt accounting. Admitted pre-cut operations
-    /// are allowed to finish, so this implementation's frozen `closing`
-    /// counter remains zero by construction.
+    /// closed epoch's trace-admission accounting. Admitted pre-cut operations
+    /// are still allowed to finish.
     Closing,
     WrongRecorder,
 }
@@ -405,7 +417,13 @@ pub enum RecordOutcome {
     QueueFull {
         accounting_authority: RecorderAccountingAuthority,
     },
-    Closing,
+    Closing {
+        accounting_authority: RecorderAccountingAuthority,
+    },
+    /// The call lost the per-shard admission race and therefore belongs to no
+    /// longer-mutable recorder epoch. It is deliberately absent from the
+    /// frozen epoch's counters.
+    OutsideEpoch,
     WrongRecorder,
     EpochMismatch {
         accounting_authority: RecorderAccountingAuthority,
@@ -420,8 +438,64 @@ pub enum RecordOutcome {
 pub enum CloseOutcome {
     Ready,
     Draining { in_flight_operations: u64 },
-    AlreadyFrozen,
+    AlreadyClosed,
     WorkspacePoisoned,
+    WorkspaceCapacityInsufficient { required: usize, available: usize },
+    QueueCardinalityOverflow,
+}
+
+/// Caller-supplied finite boundary for one off-path close attempt.
+///
+/// The recorder does not query a clock. The caller supplies monotonic samples,
+/// while `max_poll_attempts` independently guarantees termination if that
+/// clock stalls or is faulty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseBudget {
+    deadline_monotonic_ns: u64,
+    max_poll_attempts: u32,
+}
+
+impl CloseBudget {
+    pub fn new(deadline_monotonic_ns: u64, max_poll_attempts: u32) -> Result<Self, RecorderError> {
+        if deadline_monotonic_ns == 0 || max_poll_attempts == 0 {
+            return Err(RecorderError::InvalidCloseBudget);
+        }
+        Ok(Self {
+            deadline_monotonic_ns,
+            max_poll_attempts,
+        })
+    }
+
+    #[must_use]
+    pub const fn deadline_monotonic_ns(self) -> u64 {
+        self.deadline_monotonic_ns
+    }
+
+    #[must_use]
+    pub const fn max_poll_attempts(self) -> u32 {
+        self.max_poll_attempts
+    }
+}
+
+/// Why a bounded close attempt stopped before it could freeze the queues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncompleteCloseReason {
+    DeadlineReached,
+    PollBudgetExhausted,
+    ClockRegressed,
+}
+
+/// Complete, retryable-incomplete, or structural result of one bounded close.
+#[derive(Debug)]
+pub enum BoundedCloseOutcome {
+    Completed(FrozenBatch),
+    Incomplete {
+        reason: IncompleteCloseReason,
+        in_flight_operations: u64,
+        poll_attempts: u32,
+        last_observed_monotonic_ns: u64,
+    },
+    Failed(CloseOutcome),
 }
 
 /// Bounded semantic export result.
@@ -430,6 +504,44 @@ pub enum ExportOutcome {
     Completed { exported_events: usize },
     DestinationCapacityInsufficient { required: usize, available: usize },
     InvalidRawEvent { index: usize },
+}
+
+/// Retryable result of canonical JSONL validation and writing.
+#[derive(Debug)]
+pub enum ExportWriteOutcome {
+    Completed {
+        exported_events: usize,
+        exported_bytes: u64,
+    },
+    InvalidRawEvent {
+        index: usize,
+    },
+    InvalidTrace {
+        trace_id: InteractionTraceId,
+        error: TraceContractError,
+    },
+    SerializationWorkspaceExhausted {
+        index: usize,
+        capacity: usize,
+    },
+    SerializationFailed {
+        index: usize,
+        category: SerializationErrorCategory,
+    },
+    WriterFailed {
+        index: usize,
+        exported_bytes: u64,
+        error_kind: io::ErrorKind,
+    },
+}
+
+/// Closed, content-free classification of an unexpected serializer failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerializationErrorCategory {
+    Io,
+    Syntax,
+    Data,
+    Eof,
 }
 
 /// Exact or exhausted aggregate counter snapshot.
@@ -446,6 +558,8 @@ pub struct FrozenBatch {
     epoch_id: RecorderEpochId,
     events: Vec<RawInteractionEvent>,
     accounting: RecorderAccountingSnapshot,
+    conversion_workspace: Vec<InteractionTraceEventV2>,
+    serialization_workspace: Vec<u8>,
 }
 
 impl FrozenBatch {
@@ -469,6 +583,14 @@ impl FrozenBatch {
         self.accounting
     }
 
+    #[must_use]
+    pub fn workspace_capacities(&self) -> (usize, usize) {
+        (
+            self.conversion_workspace.capacity(),
+            self.serialization_workspace.capacity(),
+        )
+    }
+
     /// Convert into the canonical DTO without transmutation or layout claims.
     /// Conversion is off-path and may allocate the schema string in each DTO.
     pub fn export_into(&self, destination: &mut Vec<InteractionTraceEventV2>) -> ExportOutcome {
@@ -490,6 +612,195 @@ impl FrozenBatch {
         ExportOutcome::Completed {
             exported_events: self.events.len(),
         }
+    }
+
+    /// Validate the complete frozen authority and write canonical JSONL.
+    ///
+    /// The raw batch remains owned by `self` on every result. Callers can
+    /// retry with a fresh writer after either serialization or destination
+    /// failure without reconstructing or re-draining the recorder.
+    pub fn write_json_lines<W: Write>(&mut self, writer: &mut W) -> ExportWriteOutcome {
+        if let Err(outcome) = self.validate_traces() {
+            return outcome;
+        }
+
+        let mut exported_bytes = 0_u64;
+        for (index, raw) in self.events.iter().copied().enumerate() {
+            let event = match raw.decode() {
+                Ok(event) => event,
+                Err(_) => return ExportWriteOutcome::InvalidRawEvent { index },
+            };
+            self.serialization_workspace.clear();
+            let serialization_capacity = self.serialization_workspace.capacity();
+            let (serialization_result, workspace_exhausted) = {
+                let mut bounded = BoundedVecWriter::new(&mut self.serialization_workspace);
+                let result = serde_json::to_writer(&mut bounded, &event);
+                (result, bounded.exhausted())
+            };
+            if let Err(error) = serialization_result {
+                if workspace_exhausted {
+                    return ExportWriteOutcome::SerializationWorkspaceExhausted {
+                        index,
+                        capacity: serialization_capacity,
+                    };
+                }
+                return ExportWriteOutcome::SerializationFailed {
+                    index,
+                    category: classify_serialization_error(&error),
+                };
+            }
+            if self.serialization_workspace.len() == serialization_capacity {
+                return ExportWriteOutcome::SerializationWorkspaceExhausted {
+                    index,
+                    capacity: serialization_capacity,
+                };
+            }
+            self.serialization_workspace.push(b'\n');
+            let mut counting_writer = CountingWriter::new(writer, exported_bytes);
+            if let Err(error) = counting_writer.write_all(&self.serialization_workspace) {
+                return ExportWriteOutcome::WriterFailed {
+                    index,
+                    exported_bytes: counting_writer.exported_bytes(),
+                    error_kind: error.kind(),
+                };
+            }
+            exported_bytes = counting_writer.exported_bytes();
+        }
+        ExportWriteOutcome::Completed {
+            exported_events: self.events.len(),
+            exported_bytes,
+        }
+    }
+
+    fn validate_traces(&mut self) -> Result<(), ExportWriteOutcome> {
+        let mut group_start = 0_usize;
+        while group_start < self.events.len() {
+            let first_raw = self.events[group_start];
+            let trace_id = first_raw
+                .trace_id()
+                .ok_or(ExportWriteOutcome::InvalidRawEvent { index: group_start })?;
+            let path = decode_path(first_raw.path)
+                .map_err(|_| ExportWriteOutcome::InvalidRawEvent { index: group_start })?;
+            let mut group_end = group_start;
+            self.conversion_workspace.clear();
+            while group_end < self.events.len()
+                && self.events[group_end].same_trace_identity(first_raw)
+            {
+                if self.conversion_workspace.len() == self.conversion_workspace.capacity() {
+                    return Err(ExportWriteOutcome::InvalidTrace {
+                        trace_id,
+                        error: TraceContractError::TooManyEvents {
+                            actual: self.conversion_workspace.len() + 1,
+                            maximum: self.conversion_workspace.capacity(),
+                        },
+                    });
+                }
+                let event = self.events[group_end]
+                    .decode()
+                    .map_err(|_| ExportWriteOutcome::InvalidRawEvent { index: group_end })?;
+                self.conversion_workspace.push(event);
+                group_end += 1;
+            }
+
+            if let Err(error) = validate_interaction_trace_structure(
+                INTERACTION_TRACE_V2_SCHEMA_VERSION,
+                trace_id,
+                path,
+                &self.conversion_workspace,
+            ) {
+                return Err(ExportWriteOutcome::InvalidTrace { trace_id, error });
+            }
+            group_start = group_end;
+        }
+        self.conversion_workspace.clear();
+        Ok(())
+    }
+}
+
+struct BoundedVecWriter<'a> {
+    destination: &'a mut Vec<u8>,
+    exhausted: bool,
+}
+
+impl<'a> BoundedVecWriter<'a> {
+    fn new(destination: &'a mut Vec<u8>) -> Self {
+        Self {
+            destination,
+            exhausted: false,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
+impl Write for BoundedVecWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let available = self
+            .destination
+            .capacity()
+            .saturating_sub(self.destination.len());
+        if buffer.len() > available {
+            self.exhausted = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "bounded recorder serialization workspace exhausted",
+            ));
+        }
+        self.destination.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn classify_serialization_error(error: &serde_json::Error) -> SerializationErrorCategory {
+    match error.classify() {
+        serde_json::error::Category::Io => SerializationErrorCategory::Io,
+        serde_json::error::Category::Syntax => SerializationErrorCategory::Syntax,
+        serde_json::error::Category::Data => SerializationErrorCategory::Data,
+        serde_json::error::Category::Eof => SerializationErrorCategory::Eof,
+    }
+}
+
+struct CountingWriter<'a, W> {
+    destination: &'a mut W,
+    exported_bytes: u64,
+}
+
+impl<'a, W> CountingWriter<'a, W> {
+    fn new(destination: &'a mut W, exported_bytes: u64) -> Self {
+        Self {
+            destination,
+            exported_bytes,
+        }
+    }
+
+    fn exported_bytes(&self) -> u64 {
+        self.exported_bytes
+    }
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.destination.write(buffer)?;
+        let written_u64 = u64::try_from(written).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "writer byte count exceeds u64")
+        })?;
+        self.exported_bytes = self
+            .exported_bytes
+            .checked_add(written_u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "writer byte count overflow")
+            })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.destination.flush()
     }
 }
 
@@ -560,7 +871,7 @@ struct ShardCounters {
 #[derive(Debug)]
 struct RecorderWorkspace {
     frozen_events: Option<Vec<RawInteractionEvent>>,
-    conversion_workspace: Vec<RawInteractionEvent>,
+    conversion_workspace: Vec<InteractionTraceEventV2>,
     serialization_workspace: Vec<u8>,
 }
 
@@ -570,7 +881,7 @@ pub struct FlightRecorder {
     config: RecorderConfig,
     shards: Vec<RecorderShard>,
     next_trace_sequence: AtomicU64,
-    closing: AtomicBool,
+    lifecycle: AtomicU8,
     accounting_authority: AtomicU8,
     workspace: Mutex<RecorderWorkspace>,
 }
@@ -654,7 +965,7 @@ impl FlightRecorder {
             config,
             shards,
             next_trace_sequence: AtomicU64::new(1),
-            closing: AtomicBool::new(false),
+            lifecycle: AtomicU8::new(LIFECYCLE_ACTIVE),
             accounting_authority: AtomicU8::new(AUTHORITY_EXACT),
             workspace: Mutex::new(RecorderWorkspace {
                 frozen_events: Some(frozen_events),
@@ -670,8 +981,8 @@ impl FlightRecorder {
     }
 
     #[must_use]
-    pub fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::SeqCst)
+    pub fn lifecycle_state(&self) -> RecorderLifecycleState {
+        decode_lifecycle(self.lifecycle.load(Ordering::Acquire))
     }
 
     /// Explicitly claim one producer shard. This operation is off the record
@@ -690,7 +1001,7 @@ impl FlightRecorder {
                 _not_send_or_sync: PhantomData,
             });
         }
-        if self.is_closing() {
+        if self.lifecycle_state() != RecorderLifecycleState::Active {
             return Err(RecorderError::Closing);
         }
         let shard = self
@@ -704,7 +1015,7 @@ impl FlightRecorder {
             .producer_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| RecorderError::ShardAlreadyClaimed { shard_index })?;
-        if self.is_closing() {
+        if self.lifecycle_state() != RecorderLifecycleState::Active {
             shard.producer_claimed.store(false, Ordering::Release);
             return Err(RecorderError::Closing);
         }
@@ -803,8 +1114,26 @@ impl FlightRecorder {
         let Some(shard) = self.shard_for_handle(producer) else {
             return RecordOutcome::WrongRecorder;
         };
-        let Some(_admission) = self.try_enter(shard) else {
-            return RecordOutcome::Closing;
+        let Some(admission) = self.claim_active_admission(shard) else {
+            return RecordOutcome::OutsideEpoch;
+        };
+        self.record_after_admission(shard, admission, token, fields)
+    }
+
+    fn record_after_admission(
+        &self,
+        shard: &RecorderShard,
+        admission: AdmissionGuard<'_>,
+        token: TraceToken,
+        fields: &EventFields,
+    ) -> RecordOutcome {
+        let _admission = match self.finish_event_admission(shard, admission) {
+            Ok(admission) => admission,
+            Err(accounting_authority) => {
+                return RecordOutcome::Closing {
+                    accounting_authority,
+                };
+            }
         };
         if token.local_epoch_id != self.config.epoch_id || token.context.validate().is_err() {
             return RecordOutcome::EpochMismatch {
@@ -833,10 +1162,29 @@ impl FlightRecorder {
         }
     }
 
-    /// Set the linearizable close bit. Repeated calls are harmless.
+    /// Linearize the one-way `Active -> Closing` admission cut. Repeated calls
+    /// while draining are harmless; a fully frozen recorder remains `Closed`.
     #[must_use]
     pub fn begin_close(&self) -> CloseOutcome {
-        self.closing.store(true, Ordering::SeqCst);
+        let observed = match self.lifecycle.compare_exchange(
+            LIFECYCLE_ACTIVE,
+            LIFECYCLE_CLOSING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(previous) | Err(previous) => previous,
+        };
+        self.finish_begin_close(observed)
+    }
+
+    fn finish_begin_close(&self, observed: u8) -> CloseOutcome {
+        if observed != LIFECYCLE_ACTIVE && observed != LIFECYCLE_CLOSING {
+            return CloseOutcome::AlreadyClosed;
+        }
+        self.seal_admissions();
+        if self.lifecycle.load(Ordering::SeqCst) == LIFECYCLE_CLOSED {
+            return CloseOutcome::AlreadyClosed;
+        }
         let in_flight_operations = self.in_flight_operations();
         if in_flight_operations == 0 {
             CloseOutcome::Ready
@@ -851,7 +1199,9 @@ impl FlightRecorder {
     /// admitted hot operation has left. Queue drain, sort, and mutex use are
     /// deliberately off-path.
     pub fn try_freeze(&self) -> Result<FrozenBatch, CloseOutcome> {
-        let _ = self.begin_close();
+        if self.begin_close() == CloseOutcome::AlreadyClosed {
+            return Err(CloseOutcome::AlreadyClosed);
+        }
         let in_flight_operations = self.in_flight_operations();
         if in_flight_operations != 0 {
             return Err(CloseOutcome::Draining {
@@ -862,20 +1212,111 @@ impl FlightRecorder {
         let Ok(mut workspace) = self.workspace.lock() else {
             return Err(CloseOutcome::WorkspacePoisoned);
         };
-        let Some(mut events) = workspace.frozen_events.take() else {
-            return Err(CloseOutcome::AlreadyFrozen);
+        let Some(events) = workspace.frozen_events.as_ref() else {
+            return Err(CloseOutcome::AlreadyClosed);
         };
+        let queued_events = self
+            .checked_queued_events()
+            .ok_or(CloseOutcome::QueueCardinalityOverflow)?;
+        let available = events.capacity().saturating_sub(events.len());
+        if queued_events > available {
+            return Err(CloseOutcome::WorkspaceCapacityInsufficient {
+                required: queued_events,
+                available,
+            });
+        }
+        let mut events = workspace
+            .frozen_events
+            .take()
+            .ok_or(CloseOutcome::AlreadyClosed)?;
         for shard in &self.shards {
             while let Some(event) = shard.queue.pop() {
                 events.push(event);
             }
         }
         events.sort_unstable();
+        let conversion_workspace = std::mem::take(&mut workspace.conversion_workspace);
+        let serialization_workspace = std::mem::take(&mut workspace.serialization_workspace);
+        self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
         Ok(FrozenBatch {
             epoch_id: self.config.epoch_id,
             events,
             accounting,
+            conversion_workspace,
+            serialization_workspace,
         })
+    }
+
+    /// Attempt a complete close without waiting past either caller authority:
+    /// the monotonic deadline or the independent poll bound.
+    ///
+    /// The callback is invoked only after a draining result has released every
+    /// recorder lock. A timeout leaves the recorder in `Closing`; the caller
+    /// retains the recorder and can retry once admitted operations finish.
+    /// This method performs no hidden sleep, I/O, or blocking `Drop` work.
+    pub fn close_with_budget<F>(
+        &self,
+        budget: CloseBudget,
+        mut monotonic_now: F,
+    ) -> BoundedCloseOutcome
+    where
+        F: FnMut() -> u64,
+    {
+        let mut poll_attempts = 0_u32;
+        let mut previous_observation = None;
+        loop {
+            match self.try_freeze() {
+                Ok(batch) => return BoundedCloseOutcome::Completed(batch),
+                Err(CloseOutcome::Draining { .. }) => {
+                    let observed = monotonic_now();
+                    poll_attempts += 1;
+                    if previous_observation.is_some_and(|previous| observed < previous) {
+                        return self.finish_bounded_close_boundary(
+                            IncompleteCloseReason::ClockRegressed,
+                            poll_attempts,
+                            observed,
+                        );
+                    }
+                    previous_observation = Some(observed);
+                    if observed >= budget.deadline_monotonic_ns {
+                        return self.finish_bounded_close_boundary(
+                            IncompleteCloseReason::DeadlineReached,
+                            poll_attempts,
+                            observed,
+                        );
+                    }
+                    if poll_attempts >= budget.max_poll_attempts {
+                        return self.finish_bounded_close_boundary(
+                            IncompleteCloseReason::PollBudgetExhausted,
+                            poll_attempts,
+                            observed,
+                        );
+                    }
+                    std::hint::spin_loop();
+                }
+                Err(outcome) => return BoundedCloseOutcome::Failed(outcome),
+            }
+        }
+    }
+
+    fn finish_bounded_close_boundary(
+        &self,
+        reason: IncompleteCloseReason,
+        poll_attempts: u32,
+        last_observed_monotonic_ns: u64,
+    ) -> BoundedCloseOutcome {
+        match self.try_freeze() {
+            Ok(batch) => BoundedCloseOutcome::Completed(batch),
+            Err(CloseOutcome::Draining {
+                in_flight_operations,
+            }) => BoundedCloseOutcome::Incomplete {
+                reason,
+                in_flight_operations,
+                poll_attempts,
+                last_observed_monotonic_ns,
+            },
+            Err(outcome) => BoundedCloseOutcome::Failed(outcome),
+        }
     }
 
     #[must_use]
@@ -913,7 +1354,7 @@ impl FlightRecorder {
 
     #[must_use]
     pub fn queued_events(&self) -> usize {
-        self.shards.iter().map(|shard| shard.queue.len()).sum()
+        self.checked_queued_events().unwrap_or(usize::MAX)
     }
 
     #[must_use]
@@ -943,13 +1384,13 @@ impl FlightRecorder {
         self.shards.get(producer.shard_index)
     }
 
-    fn try_enter<'a>(&self, shard: &'a RecorderShard) -> Option<AdmissionGuard<'a>> {
-        if self.closing.load(Ordering::Relaxed) {
+    fn claim_active_admission<'a>(&self, shard: &'a RecorderShard) -> Option<AdmissionGuard<'a>> {
+        if self.lifecycle.load(Ordering::Relaxed) != LIFECYCLE_ACTIVE {
             return None;
         }
         let mut observed = shard.counters.in_flight.load(Ordering::Relaxed);
         loop {
-            if observed == u64::MAX {
+            if observed & ADMISSION_SEALED != 0 || observed & IN_FLIGHT_MASK == IN_FLIGHT_MASK {
                 return None;
             }
             match shard.counters.in_flight.compare_exchange_weak(
@@ -962,19 +1403,52 @@ impl FlightRecorder {
                 Err(actual) => observed = actual,
             }
         }
-        if self.closing.load(Ordering::SeqCst) {
-            shard.counters.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
         Some(AdmissionGuard {
             in_flight: &shard.counters.in_flight,
         })
     }
 
+    fn try_enter<'a>(&self, shard: &'a RecorderShard) -> Option<AdmissionGuard<'a>> {
+        let admission = self.claim_active_admission(shard)?;
+        if self.lifecycle.load(Ordering::SeqCst) != LIFECYCLE_ACTIVE {
+            return None;
+        }
+        Some(admission)
+    }
+
+    fn finish_event_admission<'a>(
+        &self,
+        shard: &RecorderShard,
+        admission: AdmissionGuard<'a>,
+    ) -> Result<AdmissionGuard<'a>, RecorderAccountingAuthority> {
+        if self.lifecycle.load(Ordering::SeqCst) == LIFECYCLE_ACTIVE {
+            Ok(admission)
+        } else {
+            let authority = self.increment(&shard.counters.closing);
+            drop(admission);
+            Err(authority)
+        }
+    }
+
+    fn seal_admissions(&self) {
+        for shard in &self.shards {
+            shard
+                .counters
+                .in_flight
+                .fetch_or(ADMISSION_SEALED, Ordering::SeqCst);
+        }
+    }
+
     fn in_flight_operations(&self) -> u64 {
         self.shards.iter().fold(0_u64, |total, shard| {
-            total.saturating_add(shard.counters.in_flight.load(Ordering::SeqCst))
+            total.saturating_add(shard.counters.in_flight.load(Ordering::SeqCst) & IN_FLIGHT_MASK)
         })
+    }
+
+    fn checked_queued_events(&self) -> Option<usize> {
+        self.shards
+            .iter()
+            .try_fold(0_usize, |total, shard| total.checked_add(shard.queue.len()))
     }
 
     fn allocate_trace_id(&self) -> Option<InteractionTraceId> {
@@ -1051,7 +1525,7 @@ impl Drop for AdmissionGuard<'_> {
 
 /// Private fixed-size numeric queue payload. Its semantic size is bounded;
 /// Rust layout, byte layout, and transmutation are deliberately not API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RawInteractionEvent {
     trace_run_hi: u64,
     trace_run_lo: u64,
@@ -1096,6 +1570,17 @@ struct RawInteractionEvent {
 }
 
 impl RawInteractionEvent {
+    fn trace_id(self) -> Option<InteractionTraceId> {
+        let run_id = InteractionTraceRunId::new(self.trace_run_hi, self.trace_run_lo)?;
+        InteractionTraceId::new(run_id, self.trace_sequence)
+    }
+
+    fn same_trace_identity(self, other: Self) -> bool {
+        self.trace_run_hi == other.trace_run_hi
+            && self.trace_run_lo == other.trace_run_lo
+            && self.trace_sequence == other.trace_sequence
+    }
+
     fn encode(token: TraceToken, fields: &EventFields, dropped_events: u64) -> Self {
         let (correlation_kind, correlation_first, correlation_second) =
             encode_correlation(fields.correlation);
@@ -1159,10 +1644,7 @@ impl RawInteractionEvent {
         let path = decode_path(self.path)?;
         let stage = InteractionTraceStage::from_ordinal(path, self.stage_ordinal)
             .ok_or(RecorderError::InvalidRawEvent)?;
-        let run_id = InteractionTraceRunId::new(self.trace_run_hi, self.trace_run_lo)
-            .ok_or(RecorderError::InvalidRawEvent)?;
-        let trace_id = InteractionTraceId::new(run_id, self.trace_sequence)
-            .ok_or(RecorderError::InvalidRawEvent)?;
+        let trace_id = self.trace_id().ok_or(RecorderError::InvalidRawEvent)?;
         let producer = InteractionTraceProducer {
             host_id: self.producer_host_id,
             process_id: self.producer_process_id,
@@ -1227,6 +1709,133 @@ impl RawInteractionEvent {
         };
         Ok(event)
     }
+
+    fn canonical_cmp(&self, other: &Self) -> CmpOrdering {
+        (
+            (self.trace_run_hi, self.trace_run_lo, self.trace_sequence),
+            self.event_ordinal,
+            (
+                self.producer_host_id,
+                self.producer_process_id,
+                self.producer_process_generation,
+                self.producer_thread_id,
+                flag(self.flags, 1),
+                self.producer_connection_generation,
+            ),
+            (
+                (
+                    self.started_clock_host_id,
+                    self.started_clock_process_generation,
+                    self.started_clock_id,
+                    self.started_monotonic_ns,
+                    flag(self.flags, 2),
+                    self.started_wall_time_unix_ns,
+                ),
+                (
+                    self.completed_clock_host_id,
+                    self.completed_clock_process_generation,
+                    self.completed_clock_id,
+                    self.completed_monotonic_ns,
+                    flag(self.flags, 3),
+                    self.completed_wall_time_unix_ns,
+                ),
+            ),
+        )
+            .cmp(&(
+                (other.trace_run_hi, other.trace_run_lo, other.trace_sequence),
+                other.event_ordinal,
+                (
+                    other.producer_host_id,
+                    other.producer_process_id,
+                    other.producer_process_generation,
+                    other.producer_thread_id,
+                    flag(other.flags, 1),
+                    other.producer_connection_generation,
+                ),
+                (
+                    (
+                        other.started_clock_host_id,
+                        other.started_clock_process_generation,
+                        other.started_clock_id,
+                        other.started_monotonic_ns,
+                        flag(other.flags, 2),
+                        other.started_wall_time_unix_ns,
+                    ),
+                    (
+                        other.completed_clock_host_id,
+                        other.completed_clock_process_generation,
+                        other.completed_clock_id,
+                        other.completed_monotonic_ns,
+                        flag(other.flags, 3),
+                        other.completed_wall_time_unix_ns,
+                    ),
+                ),
+            ))
+            .then_with(|| self.canonical_tie_break_cmp(other))
+    }
+
+    fn canonical_tie_break_cmp(&self, other: &Self) -> CmpOrdering {
+        (
+            (self.span_id, flag(self.flags, 0), self.parent_span_id),
+            (self.window_id, self.tab_id, self.pane_id),
+            (
+                self.correlation_kind,
+                self.correlation_first,
+                self.correlation_second,
+            ),
+            self.counters,
+            (
+                self.terminal_generation,
+                self.snapshot_generation,
+                self.frame_generation,
+            ),
+            (self.dropped_events, self.unavailable_mask),
+            (self.detector_id, self.calibration_id),
+            (
+                self.flags,
+                self.path,
+                self.stage_ordinal,
+                self.stage_outcome,
+                self.observation_boundary,
+            ),
+        )
+            .cmp(&(
+                (other.span_id, flag(other.flags, 0), other.parent_span_id),
+                (other.window_id, other.tab_id, other.pane_id),
+                (
+                    other.correlation_kind,
+                    other.correlation_first,
+                    other.correlation_second,
+                ),
+                other.counters,
+                (
+                    other.terminal_generation,
+                    other.snapshot_generation,
+                    other.frame_generation,
+                ),
+                (other.dropped_events, other.unavailable_mask),
+                (other.detector_id, other.calibration_id),
+                (
+                    other.flags,
+                    other.path,
+                    other.stage_ordinal,
+                    other.stage_outcome,
+                    other.observation_boundary,
+                ),
+            ))
+    }
+}
+
+impl Ord for RawInteractionEvent {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.canonical_cmp(other)
+    }
+}
+
+impl PartialOrd for RawInteractionEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1239,6 +1848,8 @@ pub enum RecorderError {
     RawEventTooLarge { actual: usize, maximum: usize },
     #[error("recorder capacity arithmetic overflow")]
     CapacityArithmeticOverflow,
+    #[error("close budget requires a nonzero deadline and poll bound")]
+    InvalidCloseBudget,
     #[error("recorder allocation failed for {0}")]
     AllocationFailed(&'static str),
     #[error(
@@ -1266,6 +1877,18 @@ pub enum RecorderError {
     InvalidRawEvent,
     #[error(transparent)]
     Contract(#[from] RecorderContractError),
+}
+
+fn decode_lifecycle(encoded: u8) -> RecorderLifecycleState {
+    match encoded {
+        LIFECYCLE_ACTIVE => RecorderLifecycleState::Active,
+        LIFECYCLE_CLOSING => RecorderLifecycleState::Closing,
+        LIFECYCLE_CLOSED => RecorderLifecycleState::Closed,
+        // The lifecycle word is private and only receives the three constants
+        // above. If memory corruption nevertheless produces another value,
+        // fail closed instead of reopening admission.
+        _ => RecorderLifecycleState::Closed,
+    }
 }
 
 fn validate_correlation(correlation: InteractionTraceCorrelation) -> Result<(), RecorderError> {
@@ -1556,8 +2179,13 @@ fn flag(flags: u16, bit: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::{Layout, handle_alloc_error};
+    use std::io::{self, BufRead, BufReader};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::process::{Command, Stdio};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     use frankenterm_core_audit_types::interaction_trace_v2::InteractionTraceV2;
     use proptest::prelude::*;
@@ -1566,6 +2194,9 @@ mod tests {
     use super::*;
 
     const TEST_BYTE_CEILING: u64 = 32 * 1024 * 1024;
+    const FATAL_SUBPROCESS_MODE: &str = "FT_FLIGHT_RECORDER_FATAL_SUBPROCESS_MODE";
+    const FATAL_CHILD_READY: &str = "FT_FLIGHT_RECORDER_FATAL_CHILD_READY";
+    const FATAL_EXPORT_COMPLETED: &str = "FT_FLIGHT_RECORDER_FATAL_EXPORT_COMPLETED";
 
     fn epoch(nonce: u64) -> RecorderEpochId {
         RecorderEpochId::new(nonce, nonce.rotate_left(17)).expect("test epoch must be nonzero")
@@ -1659,12 +2290,141 @@ mod tests {
         }
     }
 
+    fn frozen_two_event_prefix() -> FrozenBatch {
+        let recorder = FlightRecorder::new(config(1, 2)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        for ordinal in 0..2 {
+            assert!(matches!(
+                recorder.record(
+                    &producer,
+                    token,
+                    &fields_for(1, stage(InteractionTracePath::Keypress, ordinal))
+                ),
+                RecordOutcome::Recorded { .. }
+            ));
+        }
+        recorder.try_freeze().expect("two-event prefix freezes")
+    }
+
+    fn recorder_with_unfrozen_event() -> (Arc<FlightRecorder>, ProducerHandle) {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        assert!(matches!(
+            recorder.record(
+                &producer,
+                token,
+                &fields_for(1, stage(InteractionTracePath::Keypress, 0))
+            ),
+            RecordOutcome::Recorded { .. }
+        ));
+        (recorder, producer)
+    }
+
+    #[derive(Debug)]
+    struct FailAfterWriter {
+        limit: usize,
+        written: Vec<u8>,
+    }
+
+    struct PanicWriter;
+
+    impl Write for PanicWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            panic!("injected recoverable writer panic")
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct LockCheckingWriter {
+        recorder: Arc<FlightRecorder>,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for LockCheckingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            assert!(
+                self.recorder.workspace.try_lock().is_ok(),
+                "external writer callback ran while the recorder workspace was locked"
+            );
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl FailAfterWriter {
+        fn new(limit: usize) -> Self {
+            Self {
+                limit,
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for FailAfterWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let remaining = self.limit.saturating_sub(self.written.len());
+            if remaining == 0 {
+                return Err(io::Error::other("injected byte-boundary failure"));
+            }
+            let accepted = remaining.min(buffer.len());
+            self.written.extend_from_slice(&buffer[..accepted]);
+            Ok(accepted)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn raw_event_is_private_copy_numeric_and_within_frozen_size_bound() {
         assert_impl_all!(RawInteractionEvent: Copy, Send, Sync);
         assert!(size_of::<RawInteractionEvent>() <= usize::from(MAX_RAW_EVENT_BYTES));
         assert!(!std::any::type_name::<RawInteractionEvent>().contains("String"));
         assert!(!std::any::type_name::<RawInteractionEvent>().contains("Vec"));
+    }
+
+    #[test]
+    fn raw_event_canonical_order_prioritizes_producer_then_clock_before_ties() {
+        let recorder = FlightRecorder::new(config(1, 4)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        let event_stage = stage(InteractionTracePath::Keypress, 0);
+
+        let mut first_producer = fields_for(1, event_stage);
+        first_producer.span_id = 999;
+        let mut second_producer = fields_for(2, event_stage);
+        second_producer.span_id = 1;
+        let first_raw = RawInteractionEvent::encode(token, &first_producer, 0);
+        let second_raw = RawInteractionEvent::encode(token, &second_producer, 0);
+        assert_eq!(first_raw.cmp(&second_raw), CmpOrdering::Less);
+
+        let mut first_clock = fields_for(1, event_stage);
+        first_clock.span_id = 999;
+        let mut second_clock = fields_for(1, event_stage);
+        second_clock.span_id = 1;
+        second_clock.clock.started_at.monotonic_ns += 1;
+        second_clock.clock.completed_at.monotonic_ns += 1;
+        let first_raw = RawInteractionEvent::encode(token, &first_clock, 0);
+        let second_raw = RawInteractionEvent::encode(token, &second_clock, 0);
+        assert_eq!(first_raw.cmp(&second_raw), CmpOrdering::Less);
+
+        let mut tie_break_first = fields_for(1, event_stage);
+        tie_break_first.span_id = 1;
+        let mut tie_break_second = tie_break_first;
+        tie_break_second.span_id = 2;
+        let first_raw = RawInteractionEvent::encode(token, &tie_break_first, 0);
+        let second_raw = RawInteractionEvent::encode(token, &tie_break_second, 0);
+        assert_eq!(first_raw.cmp(&second_raw), CmpOrdering::Less);
     }
 
     #[test]
@@ -1814,7 +2574,7 @@ mod tests {
         let producer = recorder
             .register_producer(999)
             .expect("off registration is a no-op handle");
-        let before_closing = recorder.closing.load(Ordering::Relaxed);
+        let before_lifecycle = recorder.lifecycle.load(Ordering::Relaxed);
         let before_sequence = recorder.next_trace_sequence.load(Ordering::Relaxed);
         let before_accounting = recorder.accounting_snapshot();
         assert_eq!(
@@ -1839,7 +2599,7 @@ mod tests {
             ),
             RecordOutcome::Off
         );
-        assert_eq!(recorder.closing.load(Ordering::Relaxed), before_closing);
+        assert_eq!(recorder.lifecycle.load(Ordering::Relaxed), before_lifecycle);
         assert_eq!(
             recorder.next_trace_sequence.load(Ordering::Relaxed),
             before_sequence
@@ -1933,6 +2693,260 @@ mod tests {
             }
         );
         assert!(destination.is_empty());
+    }
+
+    #[test]
+    fn canonical_jsonl_writer_failure_at_every_byte_boundary_is_retryable() {
+        let recorder = FlightRecorder::new(config(1, 2)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        assert!(matches!(
+            recorder.record(
+                &producer,
+                token,
+                &fields_for(1, stage(InteractionTracePath::Keypress, 0))
+            ),
+            RecordOutcome::Recorded { .. }
+        ));
+        let mut frozen = recorder.try_freeze().expect("batch freezes");
+        assert_eq!(
+            frozen.workspace_capacities(),
+            (
+                usize::from(CONVERSION_WORKSPACE_EVENTS),
+                DEFAULT_SERIALIZATION_WORKSPACE_BYTES
+            )
+        );
+
+        let mut canonical = Vec::new();
+        let completed = frozen.write_json_lines(&mut canonical);
+        assert!(matches!(
+            completed,
+            ExportWriteOutcome::Completed {
+                exported_events: 1,
+                exported_bytes,
+            } if exported_bytes == u64::try_from(canonical.len()).expect("test output fits u64")
+        ));
+        assert_eq!(canonical.last(), Some(&b'\n'));
+
+        for boundary in 0..canonical.len() {
+            let mut failing = FailAfterWriter::new(boundary);
+            assert!(matches!(
+                frozen.write_json_lines(&mut failing),
+                ExportWriteOutcome::WriterFailed {
+                    index: 0,
+                    exported_bytes,
+                    ..
+                } if exported_bytes == u64::try_from(boundary).expect("test boundary fits u64")
+            ));
+            assert_eq!(failing.written, canonical[..boundary]);
+            assert_eq!(frozen.len(), 1);
+
+            let mut retry = Vec::new();
+            assert!(matches!(
+                frozen.write_json_lines(&mut retry),
+                ExportWriteOutcome::Completed {
+                    exported_events: 1,
+                    ..
+                }
+            ));
+            assert_eq!(retry, canonical);
+        }
+    }
+
+    #[test]
+    fn serialization_workspace_exhaustion_retains_frozen_batch() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        assert!(matches!(
+            recorder.record(
+                &producer,
+                token,
+                &fields_for(1, stage(InteractionTracePath::Keypress, 0))
+            ),
+            RecordOutcome::Recorded { .. }
+        ));
+        let mut frozen = recorder.try_freeze().expect("batch freezes");
+        frozen.serialization_workspace = Vec::with_capacity(1);
+        assert!(matches!(
+            frozen.write_json_lines(&mut Vec::new()),
+            ExportWriteOutcome::SerializationWorkspaceExhausted {
+                index: 0,
+                capacity: 1,
+            }
+        ));
+        assert_eq!(frozen.len(), 1);
+    }
+
+    #[test]
+    fn recoverable_writer_panic_retains_raw_batch_and_workspaces_for_retry() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        assert!(matches!(
+            recorder.record(
+                &producer,
+                token,
+                &fields_for(1, stage(InteractionTracePath::Keypress, 0))
+            ),
+            RecordOutcome::Recorded { .. }
+        ));
+        let mut frozen = recorder.try_freeze().expect("batch freezes");
+        let capacities = frozen.workspace_capacities();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = frozen.write_json_lines(&mut PanicWriter);
+        }));
+        assert!(panic.is_err());
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(frozen.workspace_capacities(), capacities);
+
+        let mut retry = Vec::new();
+        assert!(matches!(
+            frozen.write_json_lines(&mut retry),
+            ExportWriteOutcome::Completed {
+                exported_events: 1,
+                ..
+            }
+        ));
+        assert!(!retry.is_empty());
+    }
+
+    #[test]
+    fn external_writer_callback_runs_without_recorder_locks() {
+        let (recorder, producer) = recorder_with_unfrozen_event();
+        let mut frozen = recorder.try_freeze().expect("batch freezes");
+        drop(producer);
+        let mut writer = LockCheckingWriter {
+            recorder,
+            bytes: Vec::new(),
+        };
+        assert!(matches!(
+            frozen.write_json_lines(&mut writer),
+            ExportWriteOutcome::Completed {
+                exported_events: 1,
+                ..
+            }
+        ));
+        assert!(!writer.bytes.is_empty());
+    }
+
+    #[test]
+    fn canonical_export_rejects_duplicate_missing_topology_and_clock_faults_before_write() {
+        let mut duplicate = frozen_two_event_prefix();
+        duplicate.events[1].span_id = duplicate.events[0].span_id;
+        let mut destination = vec![0x5a];
+        assert!(matches!(
+            duplicate.write_json_lines(&mut destination),
+            ExportWriteOutcome::InvalidTrace {
+                error: TraceContractError::DuplicateSpanId { .. },
+                ..
+            }
+        ));
+        assert_eq!(destination, [0x5a]);
+
+        let mut missing = frozen_two_event_prefix();
+        missing.events[1].event_ordinal = 2;
+        missing.events[1].stage_ordinal = 2;
+        let mut destination = vec![0x5a];
+        assert!(matches!(
+            missing.write_json_lines(&mut destination),
+            ExportWriteOutcome::InvalidTrace {
+                error: TraceContractError::EventOrdinalNotContiguous {
+                    expected: 1,
+                    actual: 2,
+                },
+                ..
+            }
+        ));
+        assert_eq!(destination, [0x5a]);
+
+        let mut topology = frozen_two_event_prefix();
+        topology.events[1].pane_id += 1;
+        let mut destination = vec![0x5a];
+        assert!(matches!(
+            topology.write_json_lines(&mut destination),
+            ExportWriteOutcome::InvalidTrace {
+                error: TraceContractError::TraceTopologyChanged { .. },
+                ..
+            }
+        ));
+        assert_eq!(destination, [0x5a]);
+
+        let mut clock = frozen_two_event_prefix();
+        clock.events[1].started_monotonic_ns = 50;
+        clock.events[1].completed_monotonic_ns = 51;
+        let mut destination = vec![0x5a];
+        assert!(matches!(
+            clock.write_json_lines(&mut destination),
+            ExportWriteOutcome::InvalidTrace {
+                error: TraceContractError::CrossEventClockRegression { .. },
+                ..
+            }
+        ));
+        assert_eq!(destination, [0x5a]);
+    }
+
+    #[test]
+    fn canonical_bytes_ignore_shard_placement_and_publication_interleaving() {
+        fn freeze_permutation(reverse: bool) -> FrozenBatch {
+            let recorder = FlightRecorder::new(config(2, 4)).expect("recorder allocates");
+            let first = recorder.register_producer(0).expect("first shard claimed");
+            let second = recorder.register_producer(1).expect("second shard claimed");
+            let context = SampledTraceContextV1 {
+                schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+                trace_id: InteractionTraceId::new(run(99), 7).expect("trace id is valid"),
+                path: InteractionTracePath::Keypress,
+                origin_recorder_epoch_id: epoch(98),
+                sampler_algorithm: RecorderSamplerConfigV1::certification().algorithm,
+            };
+            let first_token = match recorder.admit_remote_trace(&first, context) {
+                TraceAdmission::Admitted { token, .. } => token,
+                other => panic!("first remote trace was not admitted: {other:?}"),
+            };
+            let second_token = match recorder.admit_remote_trace(&second, context) {
+                TraceAdmission::Admitted { token, .. } => token,
+                other => panic!("second remote trace was not admitted: {other:?}"),
+            };
+            let first_event = fields_for(1, stage(InteractionTracePath::Keypress, 0));
+            let second_event = fields_for(1, stage(InteractionTracePath::Keypress, 1));
+            let outcomes = if reverse {
+                [
+                    recorder.record(&first, first_token, &second_event),
+                    recorder.record(&second, second_token, &first_event),
+                ]
+            } else {
+                [
+                    recorder.record(&first, first_token, &first_event),
+                    recorder.record(&second, second_token, &second_event),
+                ]
+            };
+            assert!(
+                outcomes
+                    .into_iter()
+                    .all(|outcome| matches!(outcome, RecordOutcome::Recorded { .. }))
+            );
+            recorder.try_freeze().expect("permutation freezes")
+        }
+
+        let mut forward = freeze_permutation(false);
+        let mut reverse = freeze_permutation(true);
+        let mut forward_bytes = Vec::new();
+        let mut reverse_bytes = Vec::new();
+        assert!(matches!(
+            forward.write_json_lines(&mut forward_bytes),
+            ExportWriteOutcome::Completed {
+                exported_events: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            reverse.write_json_lines(&mut reverse_bytes),
+            ExportWriteOutcome::Completed {
+                exported_events: 2,
+                ..
+            }
+        ));
+        assert_eq!(forward_bytes, reverse_bytes);
     }
 
     #[test]
@@ -2053,7 +3067,7 @@ mod tests {
         assert_eq!(recorder.begin_close(), CloseOutcome::Ready);
         assert_eq!(
             recorder.record(&producer, token, &event),
-            RecordOutcome::Closing
+            RecordOutcome::OutsideEpoch
         );
         assert_eq!(recorder.accounting_snapshot(), before_close);
     }
@@ -2147,6 +3161,7 @@ mod tests {
     #[test]
     fn close_cut_waits_for_admitted_operations_and_rejects_post_cut_work() {
         let recorder = FlightRecorder::new(config(1, 2)).expect("recorder allocates");
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Active);
         let producer = recorder.register_producer(0).expect("producer registers");
         let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
         let guard = recorder
@@ -2158,13 +3173,14 @@ mod tests {
                 in_flight_operations: 1,
             }
         );
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closing);
         assert_eq!(
             recorder.record(
                 &producer,
                 token,
                 &fields_for(1, stage(InteractionTracePath::Keypress, 0))
             ),
-            RecordOutcome::Closing
+            RecordOutcome::OutsideEpoch
         );
         assert!(matches!(
             recorder.try_freeze(),
@@ -2176,10 +3192,330 @@ mod tests {
         let frozen = recorder.try_freeze().expect("freeze succeeds after drain");
         assert!(frozen.is_empty());
         assert_eq!(frozen.accounting().event.closing, 0);
+        assert_eq!(
+            frozen.accounting().event.checked_sampled_event_attempts(),
+            Ok(0)
+        );
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closed);
         assert!(matches!(
             recorder.try_freeze(),
-            Err(CloseOutcome::AlreadyFrozen)
+            Err(CloseOutcome::AlreadyClosed)
         ));
+    }
+
+    #[test]
+    fn sealed_admission_word_closes_the_stale_active_read_window() {
+        let recorder = FlightRecorder::new(config(1, 2)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        let shard = &recorder.shards[0];
+
+        let stale_lifecycle = recorder.lifecycle.load(Ordering::Relaxed);
+        let stale_admission_word = shard.counters.in_flight.load(Ordering::Relaxed);
+        assert_eq!(stale_lifecycle, LIFECYCLE_ACTIVE);
+        assert_eq!(stale_admission_word, 0);
+        assert_eq!(recorder.begin_close(), CloseOutcome::Ready);
+
+        let rejected = shard.counters.in_flight.compare_exchange(
+            stale_admission_word,
+            stale_admission_word + 1,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        );
+        assert_eq!(rejected, Err(ADMISSION_SEALED));
+        assert_eq!(recorder.in_flight_operations(), 0);
+        assert_eq!(
+            recorder.record(
+                &producer,
+                token,
+                &fields_for(1, stage(InteractionTracePath::Keypress, 0))
+            ),
+            RecordOutcome::OutsideEpoch
+        );
+        let frozen = recorder
+            .try_freeze()
+            .expect("sealed empty recorder freezes");
+        assert!(frozen.is_empty());
+        assert_eq!(frozen.accounting().event.closing, 0);
+    }
+
+    #[test]
+    fn descheduled_first_closer_cannot_report_ready_after_peer_closed() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let observed = recorder
+            .lifecycle
+            .compare_exchange(
+                LIFECYCLE_ACTIVE,
+                LIFECYCLE_CLOSING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .expect("first closer installs Closing");
+        let frozen = recorder
+            .try_freeze()
+            .expect("peer closer completes the empty freeze");
+        assert!(frozen.is_empty());
+        assert_eq!(
+            recorder.finish_begin_close(observed),
+            CloseOutcome::AlreadyClosed
+        );
+    }
+
+    #[test]
+    fn freeze_preflight_failure_preserves_queue_and_closing_state() {
+        let recorder = FlightRecorder::new(config(1, 2)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        assert!(matches!(
+            recorder.record(
+                &producer,
+                token,
+                &fields_for(1, stage(InteractionTracePath::Keypress, 0))
+            ),
+            RecordOutcome::Recorded { .. }
+        ));
+        {
+            let mut workspace = recorder.workspace.lock().expect("workspace locks");
+            workspace.frozen_events = Some(Vec::new());
+        }
+
+        assert!(matches!(
+            recorder.try_freeze(),
+            Err(CloseOutcome::WorkspaceCapacityInsufficient {
+                required: 1,
+                available: 0,
+            })
+        ));
+        assert_eq!(recorder.queued_events(), 1);
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closing);
+
+        {
+            let mut workspace = recorder.workspace.lock().expect("workspace locks");
+            workspace.frozen_events = Some(Vec::with_capacity(2));
+        }
+        let frozen = recorder
+            .try_freeze()
+            .expect("restored workspace freezes without data loss");
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(recorder.queued_events(), 0);
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closed);
+    }
+
+    #[test]
+    fn bounded_close_immediate_completion_does_not_query_clock() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let budget = CloseBudget::new(10, 1).expect("budget is valid");
+        let BoundedCloseOutcome::Completed(frozen) = recorder.close_with_budget(budget, || {
+            panic!("a quiescent close must not query the caller clock")
+        }) else {
+            panic!("quiescent close must complete");
+        };
+        assert!(frozen.is_empty());
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closed);
+    }
+
+    #[test]
+    fn bounded_close_deadline_is_typed_retryable_and_lock_free() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let guard = recorder
+            .try_enter(&recorder.shards[0])
+            .expect("operation enters before close");
+        let mut observations = [1_u64, 2, 5].into_iter();
+        let outcome =
+            recorder.close_with_budget(CloseBudget::new(5, 10).expect("budget is valid"), || {
+                assert!(
+                    recorder.workspace.try_lock().is_ok(),
+                    "caller clock runs without the recorder workspace lock"
+                );
+                observations.next().expect("scripted clock has a sample")
+            });
+        assert!(matches!(
+            outcome,
+            BoundedCloseOutcome::Incomplete {
+                reason: IncompleteCloseReason::DeadlineReached,
+                in_flight_operations: 1,
+                poll_attempts: 3,
+                last_observed_monotonic_ns: 5,
+            }
+        ));
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closing);
+
+        drop(guard);
+        let BoundedCloseOutcome::Completed(frozen) = recorder.close_with_budget(
+            CloseBudget::new(6, 1).expect("retry budget is valid"),
+            || panic!("quiescent retry must not query the clock"),
+        ) else {
+            panic!("quiescent retry must complete");
+        };
+        assert!(frozen.is_empty());
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closed);
+    }
+
+    #[test]
+    fn bounded_close_rechecks_quiescence_once_at_the_budget_boundary() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let mut guard = Some(
+            recorder
+                .try_enter(&recorder.shards[0])
+                .expect("operation enters before close"),
+        );
+        let outcome =
+            recorder.close_with_budget(CloseBudget::new(1, 1).expect("budget is valid"), || {
+                drop(guard.take());
+                1
+            });
+        let BoundedCloseOutcome::Completed(frozen) = outcome else {
+            panic!("final zero-wait boundary recheck must complete");
+        };
+        assert!(frozen.is_empty());
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closed);
+    }
+
+    #[test]
+    fn bounded_close_poll_cap_terminates_a_stalled_clock() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let guard = recorder
+            .try_enter(&recorder.shards[0])
+            .expect("operation enters before close");
+        let outcome =
+            recorder.close_with_budget(CloseBudget::new(100, 2).expect("budget is valid"), || 1);
+        assert!(matches!(
+            outcome,
+            BoundedCloseOutcome::Incomplete {
+                reason: IncompleteCloseReason::PollBudgetExhausted,
+                in_flight_operations: 1,
+                poll_attempts: 2,
+                last_observed_monotonic_ns: 1,
+            }
+        ));
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closing);
+        drop(guard);
+    }
+
+    #[test]
+    fn bounded_close_rejects_clock_regression_and_zero_budget_terms() {
+        assert!(matches!(
+            CloseBudget::new(0, 1),
+            Err(RecorderError::InvalidCloseBudget)
+        ));
+        assert!(matches!(
+            CloseBudget::new(1, 0),
+            Err(RecorderError::InvalidCloseBudget)
+        ));
+
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let guard = recorder
+            .try_enter(&recorder.shards[0])
+            .expect("operation enters before close");
+        let mut observations = [5_u64, 4].into_iter();
+        let outcome = recorder
+            .close_with_budget(CloseBudget::new(100, 10).expect("budget is valid"), || {
+                observations.next().expect("scripted clock has a sample")
+            });
+        assert!(matches!(
+            outcome,
+            BoundedCloseOutcome::Incomplete {
+                reason: IncompleteCloseReason::ClockRegressed,
+                in_flight_operations: 1,
+                poll_attempts: 2,
+                last_observed_monotonic_ns: 4,
+            }
+        ));
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closing);
+        drop(guard);
+    }
+
+    #[test]
+    fn recoverable_close_clock_panic_leaves_retryable_closing_authority() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let guard = recorder
+            .try_enter(&recorder.shards[0])
+            .expect("operation enters before close");
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = recorder
+                .close_with_budget(CloseBudget::new(10, 1).expect("budget is valid"), || {
+                    panic!("injected recoverable clock panic")
+                });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closing);
+        assert!(recorder.workspace.try_lock().is_ok());
+        drop(guard);
+        assert!(matches!(
+            recorder.close_with_budget(
+                CloseBudget::new(10, 1).expect("budget is valid"),
+                || panic!("quiescent retry must not query the clock"),
+            ),
+            BoundedCloseOutcome::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn fatal_abort_allocation_failure_and_forced_termination_are_nonexporting_controls() {
+        if let Ok(mode) = std::env::var(FATAL_SUBPROCESS_MODE) {
+            let (_recorder, _producer) = recorder_with_unfrozen_event();
+            match mode.as_str() {
+                "abort" => std::process::abort(),
+                "allocation_failure" => handle_alloc_error(Layout::new::<u8>()),
+                "forced_termination" => {
+                    println!("{FATAL_CHILD_READY}");
+                    io::stdout().flush().expect("child ready marker flushes");
+                    thread::sleep(Duration::from_secs(60));
+                    println!("{FATAL_EXPORT_COMPLETED}");
+                    return;
+                }
+                other => panic!("unexpected fatal subprocess mode: {other}"),
+            }
+        }
+
+        let current_executable = std::env::current_exe().expect("test executable resolves");
+        for mode in ["abort", "allocation_failure"] {
+            let output = Command::new(&current_executable)
+                .arg("tests::fatal_abort_allocation_failure_and_forced_termination_are_nonexporting_controls")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(FATAL_SUBPROCESS_MODE, mode)
+                .output()
+                .expect("fatal negative-control child launches");
+            assert!(
+                !output.status.success(),
+                "{mode} child unexpectedly succeeded"
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(FATAL_EXPORT_COMPLETED));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(FATAL_EXPORT_COMPLETED));
+        }
+
+        let mut child = Command::new(&current_executable)
+            .arg("tests::fatal_abort_allocation_failure_and_forced_termination_are_nonexporting_controls")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(FATAL_SUBPROCESS_MODE, "forced_termination")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("forced-termination child launches");
+        let stdout = child.stdout.take().expect("child stdout is piped");
+        let mut stdout = BufReader::new(stdout);
+        let mut child_output = String::new();
+        let mut ready = false;
+        for _ in 0..16 {
+            let mut line = String::new();
+            let read = stdout
+                .read_line(&mut line)
+                .expect("child ready marker is readable");
+            if read == 0 {
+                break;
+            }
+            child_output.push_str(&line);
+            if line.contains(FATAL_CHILD_READY) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "child did not emit its ready marker: {child_output}");
+        assert!(!child_output.contains(FATAL_EXPORT_COMPLETED));
+        child.kill().expect("forced-termination child is killed");
+        let status = child.wait().expect("forced-termination child is reaped");
+        assert!(!status.success());
     }
 
     #[test]
@@ -2195,14 +3531,14 @@ mod tests {
                 .register_producer(0)
                 .expect("worker claims its shard");
             let token = admitted_local(&worker_recorder, &producer, InteractionTracePath::Keypress);
-            let guard = worker_recorder
-                .try_enter(&worker_recorder.shards[0])
-                .expect("worker operation enters before close");
+            let admission = worker_recorder
+                .claim_active_admission(&worker_recorder.shards[0])
+                .expect("worker claims event admission before close");
             worker_entered.wait();
             worker_release.wait();
-            drop(guard);
-            worker_recorder.record(
-                &producer,
+            worker_recorder.record_after_admission(
+                &worker_recorder.shards[0],
+                admission,
                 token,
                 &fields_for(1, stage(InteractionTracePath::Keypress, 0)),
             )
@@ -2216,17 +3552,61 @@ mod tests {
             }
         );
         release.wait();
-        assert_eq!(
+        assert!(matches!(
             worker.join().expect("worker exits without panic"),
-            RecordOutcome::Closing
-        );
+            RecordOutcome::Closing {
+                accounting_authority: RecorderAccountingAuthority::Exact
+            }
+        ));
         let frozen = recorder.try_freeze().expect("quiescent recorder freezes");
         assert!(frozen.is_empty());
         assert_eq!(frozen.accounting().trace.sampled_in, 1);
-        assert_eq!(frozen.accounting().event.closing, 0);
+        assert_eq!(frozen.accounting().event.closing, 1);
         assert_eq!(
             frozen.accounting().event.checked_sampled_event_attempts(),
-            Ok(0)
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn closing_counter_exhaustion_is_sticky_nonqualifying_authority() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        let admission = recorder
+            .claim_active_admission(&recorder.shards[0])
+            .expect("event admission is claimed before close");
+        recorder.shards[0]
+            .counters
+            .closing
+            .store(LAST_EXACT_COUNTER_VALUE, Ordering::Release);
+        assert!(matches!(
+            recorder.begin_close(),
+            CloseOutcome::Draining {
+                in_flight_operations: 1,
+            }
+        ));
+        assert!(matches!(
+            recorder.record_after_admission(
+                &recorder.shards[0],
+                admission,
+                token,
+                &fields_for(1, stage(InteractionTracePath::Keypress, 0)),
+            ),
+            RecordOutcome::Closing {
+                accounting_authority: RecorderAccountingAuthority::Exhausted,
+            }
+        ));
+        let frozen = recorder
+            .try_freeze()
+            .expect("exhausted recorder still freezes");
+        assert_eq!(
+            frozen.accounting().authority,
+            RecorderAccountingAuthority::Exhausted
+        );
+        assert_eq!(
+            recorder.current_authority(),
+            RecorderAccountingAuthority::Exhausted
         );
     }
 
