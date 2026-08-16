@@ -19,6 +19,18 @@ pub const INTERACTION_TRACE_V2_SCHEMA_VERSION: &str = "ft.interaction-trace.v2";
 pub const MAX_INTERACTION_TRACE_EVENTS: usize = 256;
 /// One retained run may contain at most this many independently identified traces.
 pub const MAX_INTERACTION_TRACES_PER_RUN: usize = 65_536;
+/// Maximum JSON document accepted by the single-trace decoder.
+///
+/// This bound is checked before Serde can allocate the event vector. It is
+/// deliberately larger than the canonical encoding of the maximum event
+/// inventory so future numeric fields do not silently invalidate old readers.
+pub const MAX_INTERACTION_TRACE_JSON_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum JSON document accepted by the aggregate-run decoder.
+///
+/// Large recorder exports should normally use the streaming JSONL surface.
+/// This finite ceiling prevents the convenience run envelope from becoming an
+/// unbounded allocation path.
+pub const MAX_INTERACTION_TRACE_RUN_JSON_BYTES: usize = 64 * 1024 * 1024;
 
 /// Process-epoch identity.  The pair is an opaque 128-bit nonce, never a host
 /// name, command, pane title, or input-content hash.
@@ -74,7 +86,18 @@ impl InteractionTraceId {
 }
 
 /// Fail-stop allocator for per-run trace IDs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The allocator deliberately implements neither `Clone` nor `Copy`: duplicating
+/// its cursor would permit two owners to issue the same supposedly unique trace
+/// ID.
+///
+/// ```compile_fail
+/// use frankenterm_core_audit_types::interaction_trace_v2::InteractionTraceIdAllocator;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<InteractionTraceIdAllocator>();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct InteractionTraceIdAllocator {
     run_id: InteractionTraceRunId,
     next_sequence: u64,
@@ -698,6 +721,15 @@ pub struct InteractionTraceV2 {
 }
 
 impl InteractionTraceV2 {
+    /// Decode one bounded, closed-shape trace document.
+    ///
+    /// The byte ceiling is enforced before Serde allocation. Semantic
+    /// qualification remains explicit through [`Self::validate_structure`] or
+    /// [`Self::validate_qualifying`].
+    pub fn decode_json_bounded(raw: &[u8]) -> Result<Self, InteractionTraceDecodeError> {
+        decode_json_bounded(raw, MAX_INTERACTION_TRACE_JSON_BYTES)
+    }
+
     pub fn validate_structure(&self) -> Result<(), TraceContractError> {
         validate_interaction_trace_structure(
             &self.schema_version,
@@ -883,6 +915,14 @@ pub struct InteractionTraceRunV2 {
 }
 
 impl InteractionTraceRunV2 {
+    /// Decode one bounded, closed-shape aggregate run document.
+    ///
+    /// High-volume exports should prefer streaming JSONL; this convenience
+    /// envelope is intentionally finite before allocation begins.
+    pub fn decode_json_bounded(raw: &[u8]) -> Result<Self, InteractionTraceDecodeError> {
+        decode_json_bounded(raw, MAX_INTERACTION_TRACE_RUN_JSON_BYTES)
+    }
+
     pub fn validate_structure(&self) -> Result<(), TraceContractError> {
         validate_schema(&self.schema_version)?;
         if !self.run_id.is_valid() {
@@ -919,6 +959,58 @@ impl InteractionTraceRunV2 {
         }
         Ok(())
     }
+}
+
+/// Stable bounded-decoder failure for interaction trace envelopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractionTraceDecodeError {
+    /// Raw bytes exceeded the ceiling before deserialization began.
+    PayloadTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    /// Serde rejected malformed JSON, a duplicate/unknown field, or a wrong type.
+    InvalidJson,
+    /// A valid first JSON value was followed by non-whitespace data.
+    TrailingData,
+}
+
+impl fmt::Display for InteractionTraceDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge {
+                actual_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "interaction trace document is {actual_bytes} bytes (maximum {max_bytes})"
+            ),
+            Self::InvalidJson => formatter.write_str("invalid interaction trace JSON"),
+            Self::TrailingData => formatter.write_str("interaction trace JSON has trailing data"),
+        }
+    }
+}
+
+impl std::error::Error for InteractionTraceDecodeError {}
+
+fn decode_json_bounded<T>(raw: &[u8], max_bytes: usize) -> Result<T, InteractionTraceDecodeError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if raw.len() > max_bytes {
+        return Err(InteractionTraceDecodeError::PayloadTooLarge {
+            actual_bytes: raw.len(),
+            max_bytes,
+        });
+    }
+
+    let mut decoder = serde_json::Deserializer::from_slice(raw);
+    let value =
+        T::deserialize(&mut decoder).map_err(|_| InteractionTraceDecodeError::InvalidJson)?;
+    decoder
+        .end()
+        .map_err(|_| InteractionTraceDecodeError::TrailingData)?;
+    Ok(value)
 }
 
 fn validate_schema(schema_version: &str) -> Result<(), TraceContractError> {
@@ -1902,6 +1994,55 @@ mod tests {
                     RendererResizeTraceStage::DisplayCompletion
                 ),
             })
+        );
+    }
+
+    #[test]
+    fn bounded_decoders_reject_oversize_trailing_and_unknown_input_before_authority() {
+        let trace = keypress_trace(1);
+        let encoded = serde_json::to_vec(&trace).expect("trace encodes");
+        assert_eq!(
+            InteractionTraceV2::decode_json_bounded(&encoded).expect("bounded trace decodes"),
+            trace
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(b" null");
+        assert!(matches!(
+            InteractionTraceV2::decode_json_bounded(&trailing),
+            Err(InteractionTraceDecodeError::TrailingData)
+        ));
+
+        let mut unknown = serde_json::to_value(&trace).expect("trace converts to JSON value");
+        unknown
+            .as_object_mut()
+            .expect("trace JSON is an object")
+            .insert("pane_text".to_owned(), serde_json::json!("secret"));
+        assert!(matches!(
+            InteractionTraceV2::decode_json_bounded(
+                &serde_json::to_vec(&unknown).expect("unknown-field fixture encodes")
+            ),
+            Err(InteractionTraceDecodeError::InvalidJson)
+        ));
+
+        let oversized = vec![b' '; MAX_INTERACTION_TRACE_JSON_BYTES + 1];
+        assert_eq!(
+            InteractionTraceV2::decode_json_bounded(&oversized),
+            Err(InteractionTraceDecodeError::PayloadTooLarge {
+                actual_bytes: MAX_INTERACTION_TRACE_JSON_BYTES + 1,
+                max_bytes: MAX_INTERACTION_TRACE_JSON_BYTES,
+            })
+        );
+
+        let run = InteractionTraceRunV2 {
+            schema_version: INTERACTION_TRACE_V2_SCHEMA_VERSION.to_owned(),
+            run_id: run_id(),
+            traces: vec![trace],
+        };
+        let encoded_run = serde_json::to_vec(&run).expect("run encodes");
+        assert_eq!(
+            InteractionTraceRunV2::decode_json_bounded(&encoded_run).expect("bounded run decodes"),
+            run
         );
     }
 

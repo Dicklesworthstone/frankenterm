@@ -4206,6 +4206,51 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote macOS or Linux markers to exact marker-assisted authority only after a bounded off-path reconciliation manifest matches every numeric trace/span/stage identity against the sealed recorder epoch, reports platform buffer and consumer loss, rejects duplicates and foreign epochs, and retains same-source target-host evidence without touching an operator session.
 
+### IS-N138 — A post-deserialization event-count check is not a memory bound
+
+- **Classification:** hostile-input and evidence-import rejection; bounded
+  decoder repaired
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.2.5`
+- **Rejected inference:** `MAX_INTERACTION_TRACE_EVENTS` and
+  `MAX_INTERACTION_TRACES_PER_RUN` make direct Serde decoding of trace JSON
+  memory-bounded.
+- **Counterexample:** the prior derived `Deserialize` surface allocated the
+  schema string and event/run vectors before `validate_structure` could grade
+  their cardinality. An oversized document could therefore consume memory
+  without ever reaching the advertised semantic limit.
+- **Decision:** retain derived DTO deserialization for trusted in-memory use,
+  but make evidence-import callers use `decode_json_bounded`. The decoder
+  checks a finite byte ceiling before Serde allocation, rejects duplicate and
+  unknown fields through the closed DTO shape, rejects any trailing document,
+  and returns only fixed, content-free failure categories. High-volume export
+  remains streaming JSONL rather than a monolithic run envelope.
+- **Planted negative:** a maximum-plus-one byte slice fails as
+  `PayloadTooLarge` before parsing; an unknown `pane_text` field carrying a
+  seeded secret and a second trailing JSON value both fail without echoing the
+  attacker-controlled content. Removing only the planted fault restores the
+  canonical trace.
+- **Primary retry condition:**
+  > Raise either decoder ceiling only from retained maximum-shape corpus measurements that include allocator overhead and import concurrency; do not infer safety from semantic vector-length validation alone.
+
+### IS-N139 — A fail-stop ID allocator cannot be clonable
+
+- **Classification:** identity-authority rejection; API repaired
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.2.5`
+- **Rejected inference:** a trace-ID allocator remains unique and fail-stop merely
+  because each individual value refuses reserved sequences and wraparound.
+- **Counterexample:** deriving `Clone` or `Copy` duplicates the allocator cursor.
+  Two owners can then allocate the same run/sequence pair even though neither
+  local cursor ever wraps.
+- **Decision:** `InteractionTraceIdAllocator` is deliberately neither `Clone`
+  nor `Copy`. Its compile-fail contract rejects reintroducing either capability,
+  while the public gauntlet exercises `MAX-2`, `MAX-1`, and sticky exhaustion.
+- **Planted negative:** the compile-fail example asks the type system to satisfy
+  `InteractionTraceIdAllocator: Clone`; compilation must fail. Runtime coverage
+  independently proves that removing only the attempted duplication leaves the
+  final two IDs unique and the cursor permanently exhausted afterward.
+- **Primary retry condition:**
+  > If trace allocation ever becomes shared, introduce one explicit synchronized allocator authority and prove uniqueness under contention; never regain sharing by cloning a cursor.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
