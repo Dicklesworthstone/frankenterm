@@ -3,8 +3,15 @@
 > **Bead**: ft-2vuw7.16 (META Synthesis)
 > **Author**: DarkMill (claude-code, opus-4.6)
 > **Date**: 2026-02-22
-> **Status**: Active
+> **Status**: Historical synthesis; superseded as live dependency and runtime
+> authority by `Cargo.toml`, `Cargo.lock`, `AGENTS.md`, and `UPGRADE_LOG.md`
 > **Prerequisite**: All 24 per-project PLAN_TO_DEEPLY_INTEGRATE docs (ft-2vuw7.{1..14,21..30}.3)
+> **Canonical-status index**: `docs/NON_CANONICAL_ANALYSES.md`
+
+> **Current runtime correction (2026-08-16):** FrankenTerm uses the canonical
+> `runtime_async` surface over one published Asupersync 0.3.10 package. The
+> 0.2-era pin, `runtime_compat`, and separate `cx.rs` bridge descriptions in
+> the original February synthesis are no longer live architecture.
 
 ---
 
@@ -13,7 +20,9 @@
 This document synthesizes 24 individual deep-integration plans into a unified architecture and phased execution strategy for integrating the entire `/dp` ecosystem into FrankenTerm. Of 24 sibling projects analyzed:
 
 - **4 skip integration** (no runtime value): rust_proxy, automated_plan_reviser_pro, agentic_coding_flywheel_setup, franken_redis (deferred — pure session cache, no clear FT need yet)
-- **3 deepen existing gates**: frankensearch, franken_agent_detection, frankensqlite
+- **2 deepen existing gates**: frankensearch, franken_agent_detection
+- **1 planned storage backend**: FrankenSQLite remains absent from the live
+  dependency graph and requires a default-off actor adapter
 - **2 in-process library imports**: fastapi_rust (web framework), fastmcp_ruse (MCP framework)
 - **8 subprocess CLI bridges**: beads_rust, coding_agent_session_search, coding_agent_usage_tracker, cross_agent_session_resumer, destructive_command_guard, rano, ultimate_bug_scanner, vibe_cockpit
 - **3 component extractions**: storage_ballast_helper (disk monitoring), remote_compilation_helper (command classification + circuit breaker), franken_mermaid (diagram rendering)
@@ -61,7 +70,7 @@ This document synthesizes 24 individual deep-integration plans into a unified ar
 │  CRDT │ Merkle │ Persistent │ Bloom │ XOR │ Interval │ etc.   │
 ├─────────────────────────────────────────────────────────────────┤
 │                    RUNTIME LAYER                                 │
-│  asupersync (Cx) │ runtime_compat │ pool │ circuit_breaker     │
+│  asupersync (Cx) │ runtime_async │ pool │ circuit_breaker      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,7 +85,10 @@ These projects share the asupersync runtime and are tightly coupled:
 | fastapi_rust | `fastapi-rust` | `web` (existing) | `web/` directory (20+ sub-modules) |
 | fastmcp_ruse | `fastmcp-rust` | `mcp-server` (existing), `mcp-client` (new) | `mcp_bridge.rs`, `mcp_tools.rs`, `mcp_resources.rs`, `mcp_middleware.rs`, `mcp_client.rs`, `mcp_proxy.rs`, `mcp_error.rs` |
 
-**Critical shared dependency**: asupersync 0.2.0 at commit `c7c15f6`. Both fastapi_rust and fastmcp_ruse depend on it. FrankenTerm already has `runtime_compat.rs` and `cx.rs` bridging asupersync.
+**Critical shared dependency**: one published Asupersync 0.3.10 package shared
+by FrankenTerm, FastAPI, FastMCP, and the current FrankenSearch pin.
+FrankenTerm exposes it through the canonical `runtime_async` surface; direct
+runtime imports and split Asupersync versions are forbidden.
 
 #### Category B: Component Extraction (Library Import, Subset)
 
@@ -104,15 +116,16 @@ External tools invoked via `std::process::Command` with JSON output parsing:
 | ultimate_bug_scanner | `ubs` | `code-scanning` (new) | `code_scanner.rs` | No |
 | vibe_cockpit | (collector) | `vc-export` (new) | `vc_export.rs`, `robot_envelope.rs` | No |
 
-#### Category D: Deepen Existing Feature Gates
+#### Category D: Existing Feature Gates and Planned Storage Backend
 
-Already integrated; extend with richer capabilities:
+Frankensearch and agent detection are integrated. FrankenSQLite is a planned
+backend, not the engine behind the currently rusqlite-backed recorder:
 
 | Project | Feature Gate | Existing Module | Enhancement |
 |---------|-------------|----------------|-------------|
 | frankensearch | `frankensearch` | `search_bridge.rs` | Recorder content search, real-time indexing, daemon health |
 | franken_agent_detection | `agent-detection` | `agent_detection.rs` | Per-pane identity, session indexing, health reports |
-| frankensqlite | (core dep) | `recorder_storage.rs` | Enhanced error taxonomy, health/lag telemetry |
+| FrankenSQLite | `frankensqlite-backend` (empty scaffold) | none; `recorder_storage.rs` uses rusqlite | Repair transaction ownership, then add a default-off actor adapter and equivalence proof |
 
 #### Category E: Hybrid / Multi-Phase
 
@@ -196,9 +209,9 @@ All subprocess bridges (standalone, no deps)
 
 | Work Item | Status | Module |
 |-----------|--------|--------|
-| asupersync runtime_compat | Complete | `runtime_compat.rs` |
-| asupersync Cx adapter | Complete | `cx.rs` |
-| frankensqlite recorder storage | Complete | `recorder_storage.rs` |
+| Asupersync canonical runtime surface | Complete | `runtime_async.rs` |
+| Cx capability context | Complete | `cx.rs` |
+| rusqlite recorder storage | Complete | `recorder_storage.rs` |
 | process_triage CLI adapter | Complete | `process_triage.rs` |
 | cass subprocess wrapper | Complete | `cass.rs` |
 | caut subprocess wrapper | Complete | `caut.rs` |
@@ -301,7 +314,7 @@ The existing `web.rs` (84KB) is refactored into a `web/` directory:
 | 5.2 | Real-time pane indexing | frankensearch | `search_bridge.rs` |
 | 5.3 | Per-pane agent identity | franken_agent_detection | `agent_detection.rs` |
 | 5.4 | Session indexing for search | franken_agent_detection | `agent_correlator.rs` |
-| 5.5 | Enhanced error taxonomy | frankensqlite | `recorder_storage.rs` |
+| 5.5 | Enhanced error taxonomy | rusqlite-backed recorder | `recorder_storage.rs` |
 | 5.6 | Process triage embedded mode | process_triage | `process_triage.rs` |
 
 ---
@@ -361,12 +374,14 @@ pub struct RobotEnvelope<T> {
 ### 5.4 asupersync Shared Runtime Contract
 
 Projects using asupersync (fastapi_rust, fastmcp_ruse, process_triage) share:
-- `Cx` capability context from `cx.rs`
-- `runtime_compat.rs` bridging layer
+- `Cx` capability context through the canonical `runtime_async` surface
+- project-curated runtime, synchronization, channel, and time helpers
 - Cancellation propagation via `Cx::cancelled()`
 - Timeout enforcement via `Cx::with_timeout()`
 
-**Version pin**: asupersync 0.2.0 at `/dp/asupersync` commit `c7c15f6`
+**Current version contract**: one registry-sourced Asupersync 0.3.10 package;
+the next runtime family must migrate FastAPI, FastMCP, and FrankenSearch as one
+compatible stable-release cohort.
 
 ---
 
@@ -432,8 +447,8 @@ All new modules go in `crates/frankenterm-core/src/`:
 ### 7.1 Hard Dependencies (Must Complete Before)
 
 ```
-Wave 0 (runtime_compat, cx) ──→ Wave 4A (fastmcp_ruse)
-Wave 0 (runtime_compat, cx) ──→ Wave 4B (fastapi_rust)
+Wave 0 (runtime_async, Cx) ───→ Wave 4A (fastmcp_ruse)
+Wave 0 (runtime_async, Cx) ───→ Wave 4B (fastapi_rust)
 Wave 3.1 (casr_types) ────────→ Wave 3.2 (session_resume)
 Wave 3.1 (casr_types) ────────→ Wave 3.3 (recorder_casr_export)
 Wave 4A.1 (mcp_error) ────────→ Wave 4A.2-7 (all mcp_* modules)
@@ -542,7 +557,7 @@ Rollback: revert individual enhancement PRs. Each is a small, isolated change.
 
 | # | Project | Decision | New Modules | Feature Gate | Wave | Tests |
 |---|---------|----------|-------------|-------------|------|-------|
-| 1 | frankensqlite | Deepen (core) | 0 | — | 0/5 | 15+ |
+| 1 | FrankenSQLite | Planned default-off backend | 0 (not wired) | `frankensqlite-backend` scaffold | future | 15+ |
 | 2 | franken_redis | Skip (deferred) | 0 | — | — | 0 |
 | 3 | frankentui | Deepen (rollout) | 0 | `ftui` | 0 | — |
 | 4 | franken_mermaid | Extract | 2 | `diagram-viz` | 2 | 60+ |

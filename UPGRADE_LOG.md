@@ -89,5 +89,10 @@ The remaining crates known to be behind latest are transitive-only in this lockf
 - **Runtime boundary:** `fsqlite 0.3.1` requires `asupersync >=0.4.3,<0.5` and exposes runtime types publicly. Adding it before the coordinated 0.4.x migration would create the forbidden split runtime universe.
 - **Concurrency/API boundary:** the direct `fsqlite::Connection` is deliberately `!Send + !Sync`, while FrankenTerm's synchronous object-safe `StorageBackend` is `Send + Sync`. A reviewed `AsyncConnection` worker/actor adapter is the plausible canary, but it cannot make the current transaction guard exclusive: `ft-ig9lh` must first ensure one owner retains a transaction from begin through commit or rollback.
 - **Supported-envelope boundary:** upstream documents verification for at most eight concurrent writers and does not support ten or more implicit-autocommit writers. Adoption therefore cannot justify a 128-core scaling claim. Default features also include native, io_uring, JSON, FTS5, and RTree; the canary must use an explicit minimal reviewed feature set.
-- **Sequencing:** finish the exact 0.3.10 proof; obtain a FastAPI revision compatible with 0.4.4 and review the already-ready FastMCP/FrankenSearch repins as one graph change; move the Asupersync pair together to 0.4.4 with one resolved family; repair transaction ownership under `ft-ig9lh`; then implement the default-off Fsqlite canary under `ft-kcdqp`.
+- **Sequencing:** finish the exact 0.3.10 proof; obtain new stable FastMCP and
+  FastAPI releases compatible with one 0.4.x runtime family; review and pin
+  those releases together with the stable FrankenSearch target; move the
+  Asupersync pair to 0.4.4 with one resolved family; repair transaction
+  ownership under `ft-ig9lh`; then implement the default-off Fsqlite canary
+  under `ft-kcdqp`.
 - **Safety/rollback:** use isolated temporary databases only, retain rusqlite as the rollback backend, require schema/FTS/type equivalence plus explicit close, worker reaping, cancellation, commit-race, no-late-write, rollback, reopen, and crash proof, and do not promote or claim performance without retained Apple Silicon and Threadripper A/B evidence.

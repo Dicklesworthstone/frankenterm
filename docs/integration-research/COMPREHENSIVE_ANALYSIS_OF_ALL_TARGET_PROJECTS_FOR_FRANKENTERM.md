@@ -4,6 +4,12 @@
 > **Author**: DarkMill (claude-code, opus-4.6)
 > **Date**: 2026-02-22
 > **Prerequisite**: All 24 per-project COMPREHENSIVE_ANALYSIS docs
+> **Canonical-status index**: `docs/NON_CANONICAL_ANALYSES.md`
+
+> **Status correction (2026-08-16):** this is a point-in-time synthesis, not
+> live dependency or runtime authority. FrankenTerm now uses the canonical
+> `runtime_async` surface over one published Asupersync 0.3.10 package.
+> `Cargo.toml`, `Cargo.lock`, `AGENTS.md`, and `UPGRADE_LOG.md` are current.
 
 ---
 
@@ -77,11 +83,11 @@ Each project scored 1-5 across these dimensions:
 ### Cluster 1: Core Runtime (asupersync shared)
 
 ```
-fastapi_rust ←──── asupersync 0.2.0 ────→ fastmcp_ruse
+fastapi_rust ←──── asupersync 0.3.10 ───→ fastmcp_ruse
                          ↑
                    process_triage
                          ↑
-              runtime_compat.rs + cx.rs (already in FT)
+                  runtime_async (canonical FT surface)
 ```
 
 **Shared contracts**: `Cx` capability context, cancellation tokens, timeout propagation.
@@ -124,16 +130,18 @@ vibe_cockpit ──→ session telemetry export
 **Shared primitives**: Pressure/tier enums (Green/Yellow/Red/Black), metric snapshots.
 **Synergy**: All feed into backpressure system. Combined, they provide holistic resource awareness.
 
-### Cluster 5: Already Integrated
+### Cluster 5: Integrated Surfaces and Planned Storage
 
 ```
 frankensearch ──→ search_bridge.rs (feature: frankensearch)
 franken_agent_detection ──→ agent_detection.rs (feature: agent-detection)
-frankensqlite ──→ recorder_storage.rs (core dep)
+FrankenSQLite ──→ planned default-off actor backend (not currently installed)
 frankentui ──→ tui/ (feature: ftui, rollout)
 ```
 
-**Status**: Foundation complete. Deepening = incremental enhancements.
+**Status**: Search and agent detection are integrated. The recorder remains
+rusqlite-backed; FrankenSQLite adoption is separate architecture work after
+transaction-ownership and one-runtime dependency gates pass.
 
 ---
 
@@ -175,7 +183,7 @@ No two projects produce incompatible APIs or compete for the same module namespa
 |---------|----------|-----------|
 | MCP server ownership | fastmcp_ruse vs existing mcp.rs | Strangler fig migration (settled) |
 | Web server ownership | fastapi_rust vs existing web.rs | Extract-and-replace (settled) |
-| Runtime conflict | asupersync vs tokio | runtime_compat bridge (built) |
+| Runtime split | direct runtime imports or incompatible Asupersync versions | `runtime_async` policy plus one-version dependency gate |
 | Provider enum duplication | caut, cass, casr, fad | Unify in shared_types or provider_registry module |
 | Feature gate explosion | 12 new gates | Minimal inter-gate deps; CI matrix validates |
 | Binary availability | 8 subprocess bridges | Fail-open design; no hard deps |
@@ -184,9 +192,9 @@ No two projects produce incompatible APIs or compete for the same module namespa
 
 | Dependency | Used By | Risk |
 |-----------|---------|------|
-| asupersync 0.2.0 | fastapi_rust, fastmcp_ruse, process_triage, cx.rs | Version drift if upstream moves fast |
+| Asupersync 0.3.10 | FastAPI, FastMCP, FrankenSearch, FrankenTerm | The next family requires a coordinated stable-release cohort migration |
 | serde 1.x | All projects | Stable, minimal risk |
-| rusqlite | frankensqlite, recorder_storage | Stable, minimal risk |
+| rusqlite | recorder_storage | Current storage engine; migration requires retained equivalence proof |
 | tantivy | frankensearch | Major version changes require reindex |
 
 ---
@@ -197,7 +205,10 @@ Ranked by combined strategic value when multiple integrations activate together:
 
 ### Tier 1: Transformative (Score ≥ 4.0)
 
-1. **frankensqlite** (4.80) — Core storage foundation. Already deeply integrated. Minimal remaining work.
+1. **FrankenSQLite** (4.80 potential score) — High-value storage candidate,
+   but not currently installed. Integration requires an actor adapter,
+   exclusive transaction ownership, schema/FTS equivalence, and the one-runtime
+   dependency cohort.
 
 2. **frankensearch** (4.20) — Production search replacing DIY. Already feature-gated. Deepening adds recorder content search.
 
@@ -247,7 +258,7 @@ Ranked by combined strategic value when multiple integrations activate together:
 
 | Project | `#![forbid(unsafe)]` | Rust Edition | Async Runtime | FrankenTerm Compatible |
 |---------|---------------------|-------------|---------------|----------------------|
-| frankensqlite | Yes | 2024 | asupersync | Direct workspace dep |
+| FrankenSQLite | Yes | 2024 | Asupersync | Not yet compatible in-tree; requires actor adapter and runtime-cohort migration |
 | franken_redis | Yes | 2024 | tokio | Needs runtime bridge |
 | frankentui | Yes | 2024 | — (sync) | Already in rollout |
 | franken_mermaid | Yes | 2024 | — (sync) | Direct import |

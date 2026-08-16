@@ -61,9 +61,10 @@ Three observations:
    actively retiring. The ledger has become a static tribute to a
    migration that is over. Removing it costs three small refactors
    in those consumer files.
-3. **Asupersync coupling already exists 87 files deep.** The pin is
-   workspace-wide (`asupersync = "0.3.1"` + git override at
-   commit `0f04de1c…787e807`). If asupersync breaks at that pin,
+3. **Asupersync coupling already existed 87 files deep at rename-audit time.**
+   The workspace-wide pin then was `asupersync = "0.3.1"` plus a git override
+   at commit `0f04de1c…787e807`; the current graph uses the published 0.3.10
+   release. If Asupersync had broken at that audited pin,
    the 87 files importing `runtime_compat::*` don't break in a way
    that the wrapper can absorb — they break because the wrappers
    themselves stop compiling. The wrapper insulates against

@@ -101,7 +101,7 @@ Unjoined threads can outlive the subsystem that spawned them, continuing to cons
 
 T2_3=$(br create --title "Enforce TcpStream shutdown" --type task --priority 2 --description "
 # Background
-\`TcpStream\` without \`shutdown()\` found in \`distributed.rs\`, \`metrics.rs\`, \`runtime_compat.rs\`.
+\`TcpStream\` without \`shutdown()\` found in \`distributed.rs\`, \`metrics.rs\`, \`runtime_async.rs\`.
 
 # Justification
 Relying solely on \`Drop\` for sockets can lead to lingering TIME_WAIT states or un-flushed buffers. Explicit \`shutdown(Shutdown::Both)\` ensures the TCP connection is terminated cleanly at the protocol level before the file descriptor is closed.
@@ -184,7 +184,7 @@ Regex compilation is expensive. It should happen exactly once per pattern.
 
 # Implementation Notes
 - Find the \`Regex::new\` calls.
-- Wrap them in \`std::sync::LazyLock\` (since the project uses Rust 2024 / 1.85+) to ensure they are compiled statically at first use.
+- Wrap them in \`std::sync::LazyLock\` (the project uses Rust 2024 / 1.95+) to ensure they are compiled statically at first use.
 ")
 
 T4_2=$(br create --title "Guard division and modulo operations against zero" --type task --priority 2 --description "
