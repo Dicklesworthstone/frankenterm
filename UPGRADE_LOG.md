@@ -8,9 +8,11 @@
 - **Corrected:** workspace MSRV `1.85 -> 1.95` to match the immutable
   FrankenSearch revision already pinned in `Cargo.lock`; this changes no
   dependency identity
-- **Skipped:** no direct dependency update intentionally skipped
+- **Deferred:** Asupersync 0.4.4 and FrankenSQLite 0.3.1 until the single-runtime
+  dependency cohort and storage-transaction prerequisites below are satisfied
 - **Failed:** no code migration currently known failed
-- **Needs attention:** final remote `rch` workspace proof and coordinated Asupersync ecosystem convergence; see Proof and the targeted campaign below
+- **Needs attention:** coordinated Asupersync ecosystem convergence; exact
+  committed-source proof authority is retained in `ft-ifgm7` and `ft-s1u2p`
 
 ## Discovery
 
@@ -51,25 +53,36 @@ The remaining crates known to be behind latest are transitive-only in this lockf
 - `lua-src` `550.0.0` (latest `550.1.1`)
 - `luajit-src` `210.6.6+707c12b` (latest `210.7.2+b925b3e`)
 
-## Proof
+## 2026-06-14 baseline proof
 
 - **Local format:** `cargo fmt --check` passed after final formatting fixes.
 - **Local scoped clippy diagnostic:** `RUSTFLAGS='-A deprecated' cargo clippy -p frankenterm-core -p frankenterm-core-replay --lib --tests -- -D warnings` passed. This is local diagnosis only, not remote proof.
 - **Audit:** `cargo audit --no-fetch` completed with only the already tolerated unmaintained warnings for `paste` and `rustls-pemfile`.
-- **Remote workspace check:** `j-29884604911452538` passed earlier on `vmi1149989`, but it predates later lint/format fixes and is not final proof for the current tree.
-- **Remote workspace clippy:** current final proof is unavailable. Runs exposed and drove fixes, but the latest full retry was cancelled by RCH stuck detection (`j-29884604911452568`, exit `130`) and the following retry failed closed before running with `no admissible workers: health_below_fallback=1,hard_preflight=3,active_project_exclusion=1`.
-- **Remote fmt:** unavailable because RCH classifies `cargo fmt --check` as a non-compilation command and refuses local fallback under `RCH_REQUIRE_REMOTE=1`.
+- **Remote workspace check:** `j-29884604911452538` passed on `vmi1149989`,
+  but it predates later lint/format fixes and is not proof for a current source
+  identity.
+- **Remote workspace Clippy:** the final retry in that baseline campaign was
+  cancelled by RCH stuck detection (`j-29884604911452568`, exit `130`), and
+  the following retry failed closed before running with `no admissible
+  workers: health_below_fallback=1,hard_preflight=3,active_project_exclusion=1`.
+- **Remote format:** RCH classified plain `cargo fmt --check` as a
+  non-compilation command. Current source identity instead uses the dedicated
+  `workspace_format_proof` test under the clean-baseline RCH contract.
 
-## Needs Attention
+## Current proof authority
 
-- Re-run remote `rch` workspace `cargo check --workspace --all-targets` and `cargo clippy --workspace --all-targets -- -D warnings` after RCH admission clears.
-- Current RCH status during this update showed another active FrankenTerm build (`29884604911452571`) on `vmi1149989`; do not count local Cargo output as proof.
+- Do not infer current-tree proof from the historical jobs above. The closing
+  comments for `ft-ifgm7` and `ft-s1u2p` must identify an exact committed SHA
+  and retain strict-remote workspace check, warnings-denied Clippy, and the
+  named clean-baseline formatting proof. Local Cargo output never counts.
 
 ## 2026-08-12 targeted runtime and storage campaign
 
 ### asupersync and asupersync-macros: 0.3.5 -> 0.3.10
 
-- **Status:** updated in `Cargo.toml` and `Cargo.lock`; focused strict-remote semantic proof is green, while workspace check, Clippy, and exact formatting proof remain in progress under `ft-ifgm7`.
+- **Status:** updated in `Cargo.toml` and `Cargo.lock`; focused strict-remote
+  semantic proof is retained under `ft-ifgm7`; its closing evidence must also
+  be the authority for workspace check, Clippy, and exact formatting proof.
 - **Why 0.3.10:** it is the newest release accepted by the pinned FastMCP, FastAPI, and current FrankenSearch dependency graph. It is a completed compatibility waypoint, not the latest upstream runtime.
 - **Latest-stable boundary (re-audited 2026-08-16):** official crates.io and tagged-release evidence identify `asupersync 0.4.4` and `asupersync-macros 0.4.4` as latest stable. Adopting them now would resolve incompatible 0.3.x and 0.4.x runtime/type universes because FrankenTerm's pinned FastMCP and FastAPI revisions still require 0.3.x and its pinned FrankenSearch revision explicitly requires `<0.4`. Current upstream FastMCP now requires exact 0.4.4 and current FrankenSearch requires `>=0.4.4,<0.5`, but current upstream FastAPI still declares `asupersync = "0.3.9"` and remains the final ecosystem constraint. Repinning only the ready consumers cannot solve that graph. Coordinated convergence remains tracked by `ft-wc3uc`; a split runtime graph or relaxed-constraint bypass is not acceptable.
 - **Stable ecosystem gate:** the latest stable FastMCP v0.3.2 and FastAPI v0.3.0 tags still require the Asupersync 0.3 family, and FrankenTerm's pinned revisions are ahead of those tags. Downgrading to the tags would discard fixes without removing the blocker. Conversely, stable FrankenSearch v1.6.0 requires `>=0.4.3,<0.5`, so repinning it alone would create the same forbidden split graph. Wait for new stable FastMCP and FastAPI releases that accept one 0.4.x family, then migrate the runtime pair and all three consumers as one reviewed cohort.

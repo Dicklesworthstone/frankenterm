@@ -7,8 +7,9 @@
 
 > **Current dependency correction (2026-08-16):** this plan predates the
 > shipped FastMCP integration and must not be used as live version authority.
-> FrankenTerm currently pins FastMCP 0.3.1, FastAPI 0.3.0, and Asupersync
-> 0.3.10. `Cargo.toml`, `Cargo.lock`, and `UPGRADE_LOG.md` are authoritative.
+> FrankenTerm currently resolves FastMCP 0.3.2 from its pinned git revision,
+> FastAPI 0.3.0, and Asupersync 0.3.10. `Cargo.toml`, `Cargo.lock`, and
+> `UPGRADE_LOG.md` are authoritative.
 
 ---
 
