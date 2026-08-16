@@ -674,7 +674,7 @@ mod tests {
             max_hidden_tab_metadata_bytes: u8,
             candidate_lifetime_ticks: u8,
             arena: SessionSnapshotBudget,
-            publisher_id: u16,
+            publisher: ExactPublisherIdentity,
             attached: bool,
             exhausted: bool,
             pending: Option<Candidate>,
@@ -686,7 +686,7 @@ mod tests {
             fn new(retained_byte_budget: u8) -> Self {
                 let mut arena =
                     SessionSnapshotBudget::new(1, usize::from(retained_byte_budget), 9, 12, 1);
-                let publisher_id = arena
+                let publisher = arena
                     .register_publisher()
                     .expect("the single-window model must register its publisher");
                 Self {
@@ -698,7 +698,7 @@ mod tests {
                     max_hidden_tab_metadata_bytes: 4,
                     candidate_lifetime_ticks: CANDIDATE_LIFETIME_TICKS,
                     arena,
-                    publisher_id,
+                    publisher,
                     attached: true,
                     exhausted: false,
                     pending: None,
@@ -755,7 +755,7 @@ mod tests {
                     && hidden_tab_metadata_bytes <= self.max_hidden_tab_metadata_bytes
                 {
                     let Some(reservation) = self.arena.try_admit(
-                        self.publisher_id,
+                        &self.publisher,
                         usize::from(retained_bytes),
                         usize::from(hidden_tab_count),
                         usize::from(hidden_tab_metadata_bytes),
@@ -1106,8 +1106,8 @@ mod tests {
                 hidden_tabs: u8,
                 hidden_tab_metadata_bytes: u8,
             ) -> bool {
-                reservation.arena_id == self.arena.arena_id
-                    && reservation.publisher_id == self.publisher_id
+                reservation.arena == self.arena.arena
+                    && &reservation.publisher == &self.publisher
                     && reservation.retained_bytes == usize::from(retained_bytes)
                     && reservation.hidden_tabs == usize::from(hidden_tabs)
                     && reservation.hidden_tab_metadata_bytes
@@ -1223,19 +1223,77 @@ mod tests {
             }
         }
 
+        #[derive(Debug)]
+        struct ArenaAllocation {
+            display_id: u16,
+        }
+
+        #[derive(Clone, Debug)]
+        struct ExactArenaIdentity(Arc<ArenaAllocation>);
+
+        impl PartialEq for ExactArenaIdentity {
+            fn eq(&self, other: &Self) -> bool {
+                Arc::ptr_eq(&self.0, &other.0)
+            }
+        }
+
+        impl Eq for ExactArenaIdentity {}
+
+        impl ExactArenaIdentity {
+            fn new(display_id: u16) -> Self {
+                Self(Arc::new(ArenaAllocation { display_id }))
+            }
+
+            fn display_id(&self) -> u16 {
+                self.0.display_id
+            }
+        }
+
+        #[derive(Debug)]
+        struct PublisherAllocation {
+            display_id: u16,
+        }
+
+        #[derive(Clone, Debug)]
+        struct ExactPublisherIdentity {
+            arena: ExactArenaIdentity,
+            allocation: Arc<PublisherAllocation>,
+        }
+
+        impl PartialEq for ExactPublisherIdentity {
+            fn eq(&self, other: &Self) -> bool {
+                self.arena == other.arena && Arc::ptr_eq(&self.allocation, &other.allocation)
+            }
+        }
+
+        impl Eq for ExactPublisherIdentity {}
+
+        impl ExactPublisherIdentity {
+            fn new(arena: ExactArenaIdentity, display_id: u16) -> Self {
+                Self {
+                    arena,
+                    allocation: Arc::new(PublisherAllocation { display_id }),
+                }
+            }
+
+            fn display_id(&self) -> u16 {
+                self.allocation.display_id
+            }
+        }
+
         #[derive(Clone, Debug, Eq, PartialEq)]
         struct WindowReservation {
-            arena_id: u16,
-            publisher_id: u16,
+            arena: ExactArenaIdentity,
+            publisher: ExactPublisherIdentity,
             token_id: u16,
             retained_bytes: usize,
             hidden_tabs: usize,
             hidden_tab_metadata_bytes: usize,
         }
 
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[derive(Clone, Debug, Eq, PartialEq)]
         struct ReservationAccounting {
-            publisher_id: u16,
+            publisher: ExactPublisherIdentity,
             retained_bytes: usize,
             hidden_tabs: usize,
             hidden_tab_metadata_bytes: usize,
@@ -1243,14 +1301,14 @@ mod tests {
 
         #[derive(Clone, Debug, Eq, PartialEq)]
         struct SessionSnapshotBudget {
-            arena_id: u16,
+            arena: ExactArenaIdentity,
             max_publishers: usize,
             max_retained_bytes: usize,
             max_hidden_tabs: usize,
             max_hidden_tab_metadata_bytes: usize,
             next_publisher_id: u16,
             next_token_id: u16,
-            publishers: BTreeSet<u16>,
+            publishers: BTreeMap<u16, ExactPublisherIdentity>,
             live: BTreeMap<u16, ReservationAccounting>,
             retained_bytes: usize,
             hidden_tabs: usize,
@@ -1263,17 +1321,17 @@ mod tests {
                 max_retained_bytes: usize,
                 max_hidden_tabs: usize,
                 max_hidden_tab_metadata_bytes: usize,
-                arena_id: u16,
+                arena_display_id: u16,
             ) -> Self {
                 Self {
-                    arena_id,
+                    arena: ExactArenaIdentity::new(arena_display_id),
                     max_publishers,
                     max_retained_bytes,
                     max_hidden_tabs,
                     max_hidden_tab_metadata_bytes,
                     next_publisher_id: 1,
                     next_token_id: 1,
-                    publishers: BTreeSet::new(),
+                    publishers: BTreeMap::new(),
                     live: BTreeMap::new(),
                     retained_bytes: 0,
                     hidden_tabs: 0,
@@ -1281,26 +1339,50 @@ mod tests {
                 }
             }
 
-            fn register_publisher(&mut self) -> Option<u16> {
+            fn register_publisher(&mut self) -> Option<ExactPublisherIdentity> {
                 if self.publishers.len() >= self.max_publishers {
                     return None;
                 }
-                let publisher_id = self.next_publisher_id;
+                let display_id = self.next_publisher_id;
                 self.next_publisher_id = self.next_publisher_id.checked_add(1)?;
-                if !self.publishers.insert(publisher_id) {
+                if self.publishers.contains_key(&display_id) {
                     return None;
                 }
-                Some(publisher_id)
+                let publisher = ExactPublisherIdentity::new(self.arena.clone(), display_id);
+                self.publishers.insert(display_id, publisher.clone());
+                Some(publisher)
+            }
+
+            fn unregister_publisher(
+                &mut self,
+                publisher: &ExactPublisherIdentity,
+            ) -> Result<(), &'static str> {
+                if publisher.arena != self.arena
+                    || self.publishers.get(&publisher.display_id()) != Some(publisher)
+                {
+                    return Err("publisher belongs to another arena or is stale");
+                }
+                if self
+                    .live
+                    .values()
+                    .any(|reservation| &reservation.publisher == publisher)
+                {
+                    return Err("publisher still owns live generation reservations");
+                }
+                self.publishers.remove(&publisher.display_id());
+                Ok(())
             }
 
             fn try_admit(
                 &mut self,
-                publisher_id: u16,
+                publisher: &ExactPublisherIdentity,
                 retained_bytes: usize,
                 hidden_tabs: usize,
                 hidden_tab_metadata_bytes: usize,
             ) -> Option<WindowReservation> {
-                if !self.publishers.contains(&publisher_id) {
+                if publisher.arena != self.arena
+                    || self.publishers.get(&publisher.display_id()) != Some(publisher)
+                {
                     return None;
                 }
                 let aggregate_bytes = self.retained_bytes.checked_add(retained_bytes)?;
@@ -1317,7 +1399,7 @@ mod tests {
                 let token_id = self.next_token_id;
                 self.next_token_id = self.next_token_id.checked_add(1)?;
                 let accounting = ReservationAccounting {
-                    publisher_id,
+                    publisher: publisher.clone(),
                     retained_bytes,
                     hidden_tabs,
                     hidden_tab_metadata_bytes,
@@ -1330,8 +1412,8 @@ mod tests {
                 self.hidden_tabs = aggregate_tabs;
                 self.hidden_tab_metadata_bytes = aggregate_metadata;
                 Some(WindowReservation {
-                    arena_id: self.arena_id,
-                    publisher_id,
+                    arena: self.arena.clone(),
+                    publisher: publisher.clone(),
                     token_id,
                     retained_bytes,
                     hidden_tabs,
@@ -1340,11 +1422,11 @@ mod tests {
             }
 
             fn release(&mut self, reservation: WindowReservation) -> Result<(), &'static str> {
-                if reservation.arena_id != self.arena_id {
+                if reservation.arena != self.arena {
                     return Err("reservation belongs to another arena");
                 }
                 let expected = ReservationAccounting {
-                    publisher_id: reservation.publisher_id,
+                    publisher: reservation.publisher.clone(),
                     retained_bytes: reservation.retained_bytes,
                     hidden_tabs: reservation.hidden_tabs,
                     hidden_tab_metadata_bytes: reservation.hidden_tab_metadata_bytes,
@@ -1395,11 +1477,9 @@ mod tests {
                 {
                     return Err("arena exceeded a configured aggregate cap".into());
                 }
-                if self
-                    .live
-                    .values()
-                    .any(|item| !self.publishers.contains(&item.publisher_id))
-                {
+                if self.live.values().any(|item| {
+                    self.publishers.get(&item.publisher.display_id()) != Some(&item.publisher)
+                }) {
                     return Err("arena retained a token for an unknown publisher".into());
                 }
                 Ok(())
@@ -1565,6 +1645,7 @@ mod tests {
             assert_eq!(
                 model
                     .published
+                    .as_ref()
                     .map(|snapshot| snapshot.publication_generation),
                 Some(2)
             );
@@ -1644,23 +1725,30 @@ mod tests {
             let second_publisher = session.register_publisher().expect("second publisher");
             assert!(session.register_publisher().is_none());
             let first = session
-                .try_admit(first_publisher, 4, 2, 3)
+                .try_admit(&first_publisher, 4, 2, 3)
                 .expect("first reservation");
             let duplicate = first.clone();
             let cross_arena = first.clone();
             let second = session
-                .try_admit(second_publisher, 6, 3, 4)
+                .try_admit(&second_publisher, 6, 3, 4)
                 .expect("second reservation");
+            assert!(session.unregister_publisher(&first_publisher).is_err());
             let full = session.clone();
-            assert!(session.try_admit(first_publisher, 1, 1, 0).is_none());
+            assert!(session.try_admit(&first_publisher, 1, 1, 0).is_none());
             assert_eq!(session, full);
             session.release(first).expect("first release");
             assert!(session.release(duplicate).is_err());
-            let mut foreign = SessionSnapshotBudget::new(1, 12, 5, 7, 42);
-            let _ = foreign.register_publisher().expect("foreign publisher");
+            let mut foreign = SessionSnapshotBudget::new(1, 12, 5, 7, 41);
+            let foreign_publisher = foreign.register_publisher().expect("foreign publisher");
+            assert_eq!(foreign.arena.display_id(), session.arena.display_id());
+            assert_ne!(foreign.arena, session.arena);
+            assert_eq!(foreign_publisher.display_id(), first_publisher.display_id());
+            assert_ne!(foreign_publisher, first_publisher);
+            assert!(session.try_admit(&foreign_publisher, 1, 0, 0).is_none());
+            assert!(session.unregister_publisher(&foreign_publisher).is_err());
             assert!(foreign.release(cross_arena).is_err());
             let replacement = session
-                .try_admit(first_publisher, 4, 2, 3)
+                .try_admit(&first_publisher, 4, 2, 3)
                 .expect("released aggregate capacity must be reusable");
             session.release(second).expect("second release");
             session.release(replacement).expect("replacement release");
@@ -1671,6 +1759,18 @@ mod tests {
             assert_eq!(session.retained_bytes, 0);
             assert_eq!(session.hidden_tabs, 0);
             assert_eq!(session.hidden_tab_metadata_bytes, 0);
+            session
+                .unregister_publisher(&first_publisher)
+                .expect("first publisher retirement");
+            session
+                .unregister_publisher(&second_publisher)
+                .expect("second publisher retirement");
+            assert!(session.unregister_publisher(&first_publisher).is_err());
+            assert!(session.try_admit(&first_publisher, 1, 0, 0).is_none());
+            let replacement_publisher = session
+                .register_publisher()
+                .expect("retired publisher capacity must be reusable");
+            assert_ne!(replacement_publisher, first_publisher);
 
             let mut lifecycle = PublicationModel::new(12);
             lifecycle.arena.max_hidden_tabs = 5;
