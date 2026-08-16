@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
 use std::sync::{Arc, Mutex, TryLockError};
 
+#[cfg(all(feature = "platform-markers", target_os = "linux"))]
+use crossbeam_utils::CachePadded;
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
     PlatformMarkerAccountingV1, PlatformMarkerAuthorityV1, RecorderEpochId, RecorderMode,
 };
@@ -254,7 +256,10 @@ const LINUX_ERRNO_EOPNOTSUPP: i32 = 95;
 pub struct LinuxUserEventsMarkerAdapter {
     _provider: eventheader_dynamic::Provider,
     event_set: Arc<eventheader_dynamic::EventSet>,
-    builders: Box<[Mutex<eventheader_dynamic::EventBuilder>]>,
+    // Keep independent shard admission words off the same cache line. Without
+    // padding, a many-core host can pay coherence traffic even when emitters
+    // hash to different builders and never contend on the same mutex.
+    builders: Box<[CachePadded<Mutex<eventheader_dynamic::EventBuilder>>]>,
 }
 
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
@@ -296,7 +301,7 @@ impl LinuxUserEventsMarkerAdapter {
                 LINUX_MARKER_BUILDER_DATA_CAPACITY,
             );
             prepare_linux_marker_event(&mut builder, RESIZE_ZOOM_STAGE_MARKER_NAME, 0, [0; 4]);
-            Mutex::new(builder)
+            CachePadded::new(Mutex::new(builder))
         }));
 
         Ok(Self {
@@ -913,7 +918,9 @@ mod tests {
     {
         match emitter.finish(recorded_events) {
             PlatformMarkerFinishOutcome::Ready(snapshot) => snapshot,
-            other => panic!("test marker emitter did not finish: {other:?}"),
+            draining @ PlatformMarkerFinishOutcome::Draining { .. } => {
+                panic!("test marker emitter did not finish: {draining:?}")
+            }
         }
     }
 
