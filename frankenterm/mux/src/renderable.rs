@@ -407,19 +407,98 @@ mod tests {
     /// the identity, last-known-good, cancellation, budget, and exhaustion
     /// rules without pretending that a dormant buffer is a production path.
     mod render_snapshot_publication_model {
-        const COMPLETE_FIELDS: u16 = 0b1_1111_1111_1111;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::{Arc, Barrier, Mutex};
+
         const PUBLICATION_EXHAUSTED: u8 = 7;
+        const CANDIDATE_LIFETIME_TICKS: u8 = 3;
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[repr(u8)]
+        enum RequiredField {
+            WindowTopology,
+            PaneIdentity,
+            VisibleRowsAndCells,
+            HyperlinksAndImages,
+            Cursor,
+            TerminalMetadata,
+            SemanticZones,
+            GuiOverlay,
+            Prediction,
+            ImeAccessibility,
+            SynchronizedOutputAndCompositing,
+            FontConfigAndCacheEpochs,
+            DamageSettlement,
+            ResourceUsage,
+            RemoteIdentity,
+        }
+
+        const REQUIRED_FIELDS: [RequiredField; 15] = [
+            RequiredField::WindowTopology,
+            RequiredField::PaneIdentity,
+            RequiredField::VisibleRowsAndCells,
+            RequiredField::HyperlinksAndImages,
+            RequiredField::Cursor,
+            RequiredField::TerminalMetadata,
+            RequiredField::SemanticZones,
+            RequiredField::GuiOverlay,
+            RequiredField::Prediction,
+            RequiredField::ImeAccessibility,
+            RequiredField::SynchronizedOutputAndCompositing,
+            RequiredField::FontConfigAndCacheEpochs,
+            RequiredField::DamageSettlement,
+            RequiredField::ResourceUsage,
+            RequiredField::RemoteIdentity,
+        ];
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct FieldSet(u32);
+
+        impl FieldSet {
+            const COMPLETE: Self = Self((1 << REQUIRED_FIELDS.len()) - 1);
+
+            const fn bit(field: RequiredField) -> u32 {
+                1 << field as u8
+            }
+
+            const fn without(self, field: RequiredField) -> Self {
+                Self(self.0 & !Self::bit(field))
+            }
+
+            fn missing(self) -> Vec<RequiredField> {
+                REQUIRED_FIELDS
+                    .iter()
+                    .copied()
+                    .filter(|field| self.0 & Self::bit(*field) == 0)
+                    .collect()
+            }
+
+            const fn is_complete(self) -> bool {
+                self.0 == Self::COMPLETE.0
+            }
+        }
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         struct ExactTarget {
             session: u8,
             window_incarnation: u8,
+            window_order_generation: u8,
             tab_incarnation: u8,
             pane_incarnation: u8,
             topology_generation: u8,
             geometry_generation: u8,
+            viewport_generation: u8,
             alternate_screen_generation: u8,
             overlay_generation: u8,
+            selection_ime_generation: u8,
+            prediction_generation: u8,
+            synchronized_output_generation: u8,
+            font_config_generation: u8,
+            renderer_cache_generation: u8,
+            device_generation: u8,
+            damage_generation: u8,
+            remote_connection_incarnation: u8,
+            remote_delivery_generation: u8,
         }
 
         impl ExactTarget {
@@ -427,33 +506,52 @@ mod tests {
                 Self {
                     session: 1,
                     window_incarnation: 1,
+                    window_order_generation: 1,
                     tab_incarnation: 1,
                     pane_incarnation: 1,
                     topology_generation: 1,
                     geometry_generation: 1,
+                    viewport_generation: 1,
                     alternate_screen_generation: 1,
                     overlay_generation: 1,
+                    selection_ime_generation: 1,
+                    prediction_generation: 1,
+                    synchronized_output_generation: 1,
+                    font_config_generation: 1,
+                    renderer_cache_generation: 1,
+                    device_generation: 1,
+                    damage_generation: 1,
+                    remote_connection_incarnation: 1,
+                    remote_delivery_generation: 1,
                 }
             }
         }
 
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[derive(Clone, Debug)]
         struct Candidate {
             target: ExactTarget,
             source_generation: u8,
-            complete_fields: u16,
+            fields: FieldSet,
             retained_bytes: u8,
+            hidden_tab_count: u8,
+            hidden_tab_metadata_bytes: u8,
+            age_ticks: u8,
             digest: u8,
+            strong_capture: Arc<()>,
+            reservation: WindowReservation,
         }
 
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[derive(Clone, Debug, Eq, PartialEq)]
         struct Published {
             target: ExactTarget,
             source_generation: u8,
             publication_generation: u8,
-            complete_fields: u16,
+            fields: FieldSet,
             retained_bytes: u8,
+            hidden_tab_count: u8,
+            hidden_tab_metadata_bytes: u8,
             digest: u8,
+            reservation: WindowReservation,
         }
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -465,52 +563,118 @@ mod tests {
         }
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum GenerationDomain {
+            Source,
+            WindowIncarnation,
+            WindowOrder,
+            TabIncarnation,
+            PaneIncarnation,
+            Topology,
+            Geometry,
+            Viewport,
+            AlternateScreen,
+            Overlay,
+            SelectionIme,
+            Prediction,
+            SynchronizedOutput,
+            FontConfig,
+            RendererCache,
+            Device,
+            Damage,
+            RemoteConnection,
+            RemoteDelivery,
+        }
+
+        const GENERATION_DOMAINS: [GenerationDomain; 19] = [
+            GenerationDomain::Source,
+            GenerationDomain::WindowIncarnation,
+            GenerationDomain::WindowOrder,
+            GenerationDomain::TabIncarnation,
+            GenerationDomain::PaneIncarnation,
+            GenerationDomain::Topology,
+            GenerationDomain::Geometry,
+            GenerationDomain::Viewport,
+            GenerationDomain::AlternateScreen,
+            GenerationDomain::Overlay,
+            GenerationDomain::SelectionIme,
+            GenerationDomain::Prediction,
+            GenerationDomain::SynchronizedOutput,
+            GenerationDomain::FontConfig,
+            GenerationDomain::RendererCache,
+            GenerationDomain::Device,
+            GenerationDomain::Damage,
+            GenerationDomain::RemoteConnection,
+            GenerationDomain::RemoteDelivery,
+        ];
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum Event {
             BeginValid,
             BeginIncomplete,
+            BeginUnresolvedImage,
             BeginOverBudget,
+            BeginTooManyTabs,
+            BeginTabMetadataOverBudget,
             Commit,
-            Cancel,
+            CancelBeforePublication,
+            CancelAfterPublication,
+            Tick,
             AcquireRender,
             ReleaseRender,
-            ContentMutation,
+            Advance(GenerationDomain),
             ImageHyperlinkMutation,
-            TopologyMutation,
-            Resize,
-            AlternateScreenSwitch,
-            OverlayMutation,
-            SelectionImeMutation,
-            PaneReplacement,
             Reconnect,
             Detach,
         }
 
-        const EVENTS: [Event; 17] = [
+        const EVENTS: [Event; 34] = [
             Event::BeginValid,
             Event::BeginIncomplete,
+            Event::BeginUnresolvedImage,
             Event::BeginOverBudget,
+            Event::BeginTooManyTabs,
+            Event::BeginTabMetadataOverBudget,
             Event::Commit,
-            Event::Cancel,
+            Event::CancelBeforePublication,
+            Event::CancelAfterPublication,
+            Event::Tick,
             Event::AcquireRender,
             Event::ReleaseRender,
-            Event::ContentMutation,
+            Event::Advance(GenerationDomain::Source),
             Event::ImageHyperlinkMutation,
-            Event::TopologyMutation,
-            Event::Resize,
-            Event::AlternateScreenSwitch,
-            Event::OverlayMutation,
-            Event::SelectionImeMutation,
-            Event::PaneReplacement,
+            Event::Advance(GenerationDomain::WindowIncarnation),
+            Event::Advance(GenerationDomain::WindowOrder),
+            Event::Advance(GenerationDomain::TabIncarnation),
+            Event::Advance(GenerationDomain::PaneIncarnation),
+            Event::Advance(GenerationDomain::Topology),
+            Event::Advance(GenerationDomain::Geometry),
+            Event::Advance(GenerationDomain::Viewport),
+            Event::Advance(GenerationDomain::AlternateScreen),
+            Event::Advance(GenerationDomain::Overlay),
+            Event::Advance(GenerationDomain::SelectionIme),
+            Event::Advance(GenerationDomain::Prediction),
+            Event::Advance(GenerationDomain::SynchronizedOutput),
+            Event::Advance(GenerationDomain::FontConfig),
+            Event::Advance(GenerationDomain::RendererCache),
+            Event::Advance(GenerationDomain::Device),
+            Event::Advance(GenerationDomain::Damage),
+            Event::Advance(GenerationDomain::RemoteConnection),
+            Event::Advance(GenerationDomain::RemoteDelivery),
             Event::Reconnect,
             Event::Detach,
         ];
 
-        #[derive(Clone, Debug, Eq, PartialEq)]
+        #[derive(Clone, Debug)]
         struct PublicationModel {
             target: ExactTarget,
             source_generation: u8,
             publication_generation: u8,
             retained_byte_budget: u8,
+            max_hidden_tabs: u8,
+            max_hidden_tab_metadata_bytes: u8,
+            candidate_lifetime_ticks: u8,
+            arena: SessionSnapshotBudget,
+            publisher_id: u16,
             attached: bool,
             exhausted: bool,
             pending: Option<Candidate>,
@@ -520,11 +684,21 @@ mod tests {
 
         impl PublicationModel {
             fn new(retained_byte_budget: u8) -> Self {
+                let mut arena =
+                    SessionSnapshotBudget::new(1, usize::from(retained_byte_budget), 9, 12, 1);
+                let publisher_id = arena
+                    .register_publisher()
+                    .expect("the single-window model must register its publisher");
                 Self {
                     target: ExactTarget::initial(),
                     source_generation: 0,
                     publication_generation: 0,
                     retained_byte_budget,
+                    max_hidden_tabs: 3,
+                    max_hidden_tab_metadata_bytes: 4,
+                    candidate_lifetime_ticks: CANDIDATE_LIFETIME_TICKS,
+                    arena,
+                    publisher_id,
                     attached: true,
                     exhausted: false,
                     pending: None,
@@ -535,21 +709,29 @@ mod tests {
 
             fn fail_exhausted(&mut self) {
                 self.exhausted = true;
-                self.pending = None;
-                self.published = None;
+                self.drop_candidate();
+                self.replace_published(None);
             }
 
-            fn retained_generation_bytes(&self, candidate_bytes: Option<u8>) -> usize {
-                let candidate =
-                    candidate_bytes.or_else(|| self.pending.map(|pending| pending.retained_bytes));
-                let mut total = candidate.map_or(0, usize::from);
-                if let Some(published) = self.published {
+            fn drop_candidate(&mut self) {
+                if let Some(candidate) = self.pending.take() {
+                    self.arena
+                        .release(candidate.reservation)
+                        .expect("a pending candidate must own one live reservation");
+                }
+            }
+
+            fn retained_generation_bytes(&self) -> usize {
+                let mut total = self
+                    .pending
+                    .as_ref()
+                    .map_or(0, |pending| usize::from(pending.retained_bytes));
+                if let Some(published) = &self.published {
                     total += usize::from(published.retained_bytes);
                 }
-                if let Some(rendering) = self.rendering {
-                    let shares_published = self.published.is_some_and(|published| {
-                        published.target == rendering.target
-                            && published.publication_generation == rendering.publication_generation
+                if let Some(rendering) = &self.rendering {
+                    let shares_published = self.published.as_ref().is_some_and(|published| {
+                        published.reservation.token_id == rendering.reservation.token_id
                     });
                     if !shares_published {
                         total += usize::from(rendering.retained_bytes);
@@ -558,21 +740,45 @@ mod tests {
                 total
             }
 
-            fn begin(&mut self, complete_fields: u16, retained_bytes: u8, digest: u8) {
+            fn begin(
+                &mut self,
+                fields: FieldSet,
+                retained_bytes: u8,
+                hidden_tab_count: u8,
+                hidden_tab_metadata_bytes: u8,
+                digest: u8,
+            ) {
                 if self.pending.is_none()
                     && !self.exhausted
                     && self.attached
-                    && self.retained_generation_bytes(Some(retained_bytes))
-                        <= usize::from(self.retained_byte_budget)
+                    && hidden_tab_count <= self.max_hidden_tabs
+                    && hidden_tab_metadata_bytes <= self.max_hidden_tab_metadata_bytes
                 {
+                    let Some(reservation) = self.arena.try_admit(
+                        self.publisher_id,
+                        usize::from(retained_bytes),
+                        usize::from(hidden_tab_count),
+                        usize::from(hidden_tab_metadata_bytes),
+                    ) else {
+                        return;
+                    };
                     self.pending = Some(Candidate {
                         target: self.target,
                         source_generation: self.source_generation,
-                        complete_fields,
+                        fields,
                         retained_bytes,
+                        hidden_tab_count,
+                        hidden_tab_metadata_bytes,
+                        age_ticks: 0,
                         digest,
+                        strong_capture: Arc::new(()),
+                        reservation,
                     });
                 }
+            }
+
+            fn begin_complete(&mut self, retained_bytes: u8, digest: u8) {
+                self.begin(FieldSet::COMPLETE, retained_bytes, 2, 2, digest);
             }
 
             fn commit(&mut self) -> CommitOutcome {
@@ -585,123 +791,199 @@ mod tests {
                 if !self.attached
                     || candidate.target != self.target
                     || candidate.source_generation != self.source_generation
-                    || candidate.complete_fields != COMPLETE_FIELDS
+                    || !candidate.fields.is_complete()
                     || candidate.retained_bytes > self.retained_byte_budget
+                    || candidate.hidden_tab_count > self.max_hidden_tabs
+                    || candidate.hidden_tab_metadata_bytes > self.max_hidden_tab_metadata_bytes
                 {
+                    self.arena
+                        .release(candidate.reservation)
+                        .expect("a rejected candidate must release its reservation");
                     return CommitOutcome::Rejected;
                 }
-                if let Some(published) = self.published {
+                if let Some(published) = &self.published {
                     if published.target == candidate.target
                         && published.source_generation == candidate.source_generation
                     {
                         if published.digest == candidate.digest {
+                            self.arena
+                                .release(candidate.reservation)
+                                .expect("a no-op candidate must release its reservation");
                             return CommitOutcome::NoChange(published.publication_generation);
                         }
+                        self.arena
+                            .release(candidate.reservation)
+                            .expect("an equivocating candidate must release its reservation");
                         return CommitOutcome::Rejected;
                     }
                 }
 
                 let Some(next) = self.publication_generation.checked_add(1) else {
+                    self.arena
+                        .release(candidate.reservation)
+                        .expect("an overflowed candidate must release its reservation");
                     self.fail_exhausted();
                     return CommitOutcome::Exhausted;
                 };
                 if next == PUBLICATION_EXHAUSTED {
+                    self.arena
+                        .release(candidate.reservation)
+                        .expect("an exhausted candidate must release its reservation");
                     self.fail_exhausted();
                     return CommitOutcome::Exhausted;
                 }
                 self.publication_generation = next;
-                self.published = Some(Published {
+                let published = Published {
                     target: candidate.target,
                     source_generation: candidate.source_generation,
                     publication_generation: next,
-                    complete_fields: candidate.complete_fields,
+                    fields: candidate.fields,
                     retained_bytes: candidate.retained_bytes,
+                    hidden_tab_count: candidate.hidden_tab_count,
+                    hidden_tab_metadata_bytes: candidate.hidden_tab_metadata_bytes,
                     digest: candidate.digest,
-                });
+                    reservation: candidate.reservation,
+                };
+                self.replace_published(Some(published));
                 CommitOutcome::Published(next)
             }
 
-            fn content_mutation(&mut self) {
-                let Some(next) = self
-                    .source_generation
-                    .checked_add(1)
-                    .filter(|next| *next != u8::MAX)
-                else {
-                    self.fail_exhausted();
-                    return;
-                };
-                self.source_generation = next;
+            fn replace_published(&mut self, replacement: Option<Published>) {
+                if let Some(previous) = self.published.take() {
+                    let retained_by_render = self.rendering.as_ref().is_some_and(|rendering| {
+                        rendering.reservation.token_id == previous.reservation.token_id
+                    });
+                    if !retained_by_render {
+                        self.arena
+                            .release(previous.reservation)
+                            .expect("superseded publication must release its reservation");
+                    }
+                }
+                self.published = replacement;
             }
 
-            fn topology_mutation(&mut self) {
-                let Some(next) = self
-                    .target
-                    .topology_generation
-                    .checked_add(1)
-                    .filter(|next| *next != u8::MAX)
-                else {
-                    self.fail_exhausted();
-                    return;
-                };
-                self.target.topology_generation = next;
-                self.published = None;
+            fn checked_generation_successor(current: u8) -> Option<u8> {
+                current.checked_add(1).filter(|next| *next != u8::MAX)
             }
 
-            fn resize(&mut self) {
-                let Some(next) = self
-                    .target
-                    .geometry_generation
-                    .checked_add(1)
-                    .filter(|next| *next != u8::MAX)
-                else {
+            fn advance(&mut self, domain: GenerationDomain) {
+                let current = match domain {
+                    GenerationDomain::Source => self.source_generation,
+                    GenerationDomain::WindowIncarnation => self.target.window_incarnation,
+                    GenerationDomain::WindowOrder => self.target.window_order_generation,
+                    GenerationDomain::TabIncarnation => self.target.tab_incarnation,
+                    GenerationDomain::PaneIncarnation => self.target.pane_incarnation,
+                    GenerationDomain::Topology => self.target.topology_generation,
+                    GenerationDomain::Geometry => self.target.geometry_generation,
+                    GenerationDomain::Viewport => self.target.viewport_generation,
+                    GenerationDomain::AlternateScreen => self.target.alternate_screen_generation,
+                    GenerationDomain::Overlay => self.target.overlay_generation,
+                    GenerationDomain::SelectionIme => self.target.selection_ime_generation,
+                    GenerationDomain::Prediction => self.target.prediction_generation,
+                    GenerationDomain::SynchronizedOutput => {
+                        self.target.synchronized_output_generation
+                    }
+                    GenerationDomain::FontConfig => self.target.font_config_generation,
+                    GenerationDomain::RendererCache => self.target.renderer_cache_generation,
+                    GenerationDomain::Device => self.target.device_generation,
+                    GenerationDomain::Damage => self.target.damage_generation,
+                    GenerationDomain::RemoteConnection => self.target.remote_connection_incarnation,
+                    GenerationDomain::RemoteDelivery => self.target.remote_delivery_generation,
+                };
+                let Some(next) = Self::checked_generation_successor(current) else {
                     self.fail_exhausted();
                     return;
                 };
-                self.target.geometry_generation = next;
-                self.published = None;
+                match domain {
+                    GenerationDomain::Source => self.source_generation = next,
+                    GenerationDomain::WindowIncarnation => self.target.window_incarnation = next,
+                    GenerationDomain::WindowOrder => self.target.window_order_generation = next,
+                    GenerationDomain::TabIncarnation => self.target.tab_incarnation = next,
+                    GenerationDomain::PaneIncarnation => self.target.pane_incarnation = next,
+                    GenerationDomain::Topology => self.target.topology_generation = next,
+                    GenerationDomain::Geometry => self.target.geometry_generation = next,
+                    GenerationDomain::Viewport => self.target.viewport_generation = next,
+                    GenerationDomain::AlternateScreen => {
+                        self.target.alternate_screen_generation = next
+                    }
+                    GenerationDomain::Overlay => self.target.overlay_generation = next,
+                    GenerationDomain::SelectionIme => self.target.selection_ime_generation = next,
+                    GenerationDomain::Prediction => self.target.prediction_generation = next,
+                    GenerationDomain::SynchronizedOutput => {
+                        self.target.synchronized_output_generation = next
+                    }
+                    GenerationDomain::FontConfig => self.target.font_config_generation = next,
+                    GenerationDomain::RendererCache => self.target.renderer_cache_generation = next,
+                    GenerationDomain::Device => self.target.device_generation = next,
+                    GenerationDomain::Damage => self.target.damage_generation = next,
+                    GenerationDomain::RemoteConnection => {
+                        self.target.remote_connection_incarnation = next
+                    }
+                    GenerationDomain::RemoteDelivery => {
+                        self.target.remote_delivery_generation = next
+                    }
+                }
+                if domain != GenerationDomain::Source {
+                    self.replace_published(None);
+                }
+                if matches!(
+                    domain,
+                    GenerationDomain::WindowIncarnation
+                        | GenerationDomain::TabIncarnation
+                        | GenerationDomain::PaneIncarnation
+                        | GenerationDomain::RemoteConnection
+                ) {
+                    self.source_generation = 0;
+                }
             }
 
-            fn alternate_screen_switch(&mut self) {
-                let Some(next) = self
-                    .target
-                    .alternate_screen_generation
-                    .checked_add(1)
-                    .filter(|next| *next != u8::MAX)
-                else {
-                    self.fail_exhausted();
-                    return;
-                };
-                self.target.alternate_screen_generation = next;
-                self.published = None;
+            fn force_generation(&mut self, domain: GenerationDomain, value: u8) {
+                match domain {
+                    GenerationDomain::Source => self.source_generation = value,
+                    GenerationDomain::WindowIncarnation => self.target.window_incarnation = value,
+                    GenerationDomain::WindowOrder => self.target.window_order_generation = value,
+                    GenerationDomain::TabIncarnation => self.target.tab_incarnation = value,
+                    GenerationDomain::PaneIncarnation => self.target.pane_incarnation = value,
+                    GenerationDomain::Topology => self.target.topology_generation = value,
+                    GenerationDomain::Geometry => self.target.geometry_generation = value,
+                    GenerationDomain::Viewport => self.target.viewport_generation = value,
+                    GenerationDomain::AlternateScreen => {
+                        self.target.alternate_screen_generation = value
+                    }
+                    GenerationDomain::Overlay => self.target.overlay_generation = value,
+                    GenerationDomain::SelectionIme => self.target.selection_ime_generation = value,
+                    GenerationDomain::Prediction => self.target.prediction_generation = value,
+                    GenerationDomain::SynchronizedOutput => {
+                        self.target.synchronized_output_generation = value
+                    }
+                    GenerationDomain::FontConfig => self.target.font_config_generation = value,
+                    GenerationDomain::RendererCache => {
+                        self.target.renderer_cache_generation = value
+                    }
+                    GenerationDomain::Device => self.target.device_generation = value,
+                    GenerationDomain::Damage => self.target.damage_generation = value,
+                    GenerationDomain::RemoteConnection => {
+                        self.target.remote_connection_incarnation = value
+                    }
+                    GenerationDomain::RemoteDelivery => {
+                        self.target.remote_delivery_generation = value
+                    }
+                }
             }
 
-            fn overlay_mutation(&mut self) {
-                let Some(next) = self
-                    .target
-                    .overlay_generation
-                    .checked_add(1)
-                    .filter(|next| *next != u8::MAX)
-                else {
-                    self.fail_exhausted();
+            fn tick(&mut self) {
+                let Some(candidate) = self.pending.as_mut() else {
                     return;
                 };
-                self.target.overlay_generation = next;
-                self.published = None;
-            }
-
-            fn replace_pane(&mut self) {
-                let Some(next) = self
-                    .target
-                    .pane_incarnation
-                    .checked_add(1)
-                    .filter(|next| *next != u8::MAX)
-                else {
-                    self.fail_exhausted();
+                let Some(next_age) = candidate.age_ticks.checked_add(1) else {
+                    self.drop_candidate();
                     return;
                 };
-                self.target.pane_incarnation = next;
-                self.source_generation = 0;
-                self.published = None;
+                if next_age >= self.candidate_lifetime_ticks {
+                    self.drop_candidate();
+                } else {
+                    candidate.age_ticks = next_age;
+                }
             }
 
             fn reconnect(&mut self) {
@@ -714,31 +996,27 @@ mod tests {
                     self.fail_exhausted();
                     return;
                 };
-                self.target.session = next_session;
-                self.target.window_incarnation = 1;
-                self.target.tab_incarnation = 1;
-                self.target.pane_incarnation = 1;
-                self.target.topology_generation = 1;
-                self.target.geometry_generation = 1;
-                self.target.alternate_screen_generation = 1;
-                self.target.overlay_generation = 1;
+                self.target = ExactTarget {
+                    session: next_session,
+                    ..ExactTarget::initial()
+                };
                 self.source_generation = 0;
                 self.publication_generation = 0;
                 self.attached = true;
                 self.exhausted = false;
-                self.pending = None;
-                self.published = None;
+                self.drop_candidate();
+                self.replace_published(None);
             }
 
             fn detach(&mut self) {
                 self.attached = false;
-                self.pending = None;
-                self.published = None;
+                self.drop_candidate();
+                self.replace_published(None);
             }
 
             fn acquire_render(&mut self) {
                 if self.rendering.is_none() {
-                    self.rendering = self.published;
+                    self.rendering = self.published.clone();
                 }
             }
 
@@ -746,85 +1024,410 @@ mod tests {
                 let Some(rendering) = self.rendering.take() else {
                     return false;
                 };
-                !self.exhausted
+                let settles = !self.exhausted
                     && self.attached
                     && rendering.target == self.target
-                    && self.published.is_some_and(|published| {
+                    && self.published.as_ref().is_some_and(|published| {
                         published.target == rendering.target
                             && published.publication_generation == rendering.publication_generation
-                    })
+                    });
+                let retained_by_publication = self.published.as_ref().is_some_and(|published| {
+                    published.reservation.token_id == rendering.reservation.token_id
+                });
+                if !retained_by_publication {
+                    self.arena
+                        .release(rendering.reservation)
+                        .expect("a settled render generation must release its reservation");
+                }
+                settles
             }
 
-            fn apply(&mut self, event: Event) {
+            fn apply(&mut self, event: Event) -> Result<(), String> {
+                let prior_publication_generation = self.publication_generation;
+                let prior_published = self.published.clone();
+                let mut commit_outcome = None;
                 match event {
-                    Event::BeginValid => self.begin(COMPLETE_FIELDS, 4, 1),
-                    Event::BeginIncomplete => self.begin(COMPLETE_FIELDS ^ 1, 4, 2),
-                    Event::BeginOverBudget => self.begin(COMPLETE_FIELDS, 9, 3),
+                    Event::BeginValid => self.begin_complete(4, 1),
+                    Event::BeginIncomplete => self.begin(
+                        FieldSet::COMPLETE.without(RequiredField::Cursor),
+                        4,
+                        2,
+                        2,
+                        2,
+                    ),
+                    Event::BeginUnresolvedImage => self.begin(
+                        FieldSet::COMPLETE.without(RequiredField::HyperlinksAndImages),
+                        4,
+                        2,
+                        2,
+                        3,
+                    ),
+                    Event::BeginOverBudget => self.begin_complete(9, 4),
+                    Event::BeginTooManyTabs => self.begin(FieldSet::COMPLETE, 4, 4, 2, 5),
+                    Event::BeginTabMetadataOverBudget => self.begin(FieldSet::COMPLETE, 4, 2, 5, 6),
                     Event::Commit => {
-                        let _ = self.commit();
+                        commit_outcome = Some(self.commit());
                     }
-                    Event::Cancel => self.pending = None,
+                    Event::CancelBeforePublication => self.drop_candidate(),
+                    Event::CancelAfterPublication => {}
+                    Event::Tick => self.tick(),
                     Event::AcquireRender => self.acquire_render(),
                     Event::ReleaseRender => {
                         let _ = self.release_render();
                     }
-                    Event::ContentMutation => self.content_mutation(),
-                    Event::ImageHyperlinkMutation => self.content_mutation(),
-                    Event::TopologyMutation => self.topology_mutation(),
-                    Event::Resize => self.resize(),
-                    Event::AlternateScreenSwitch => self.alternate_screen_switch(),
-                    Event::OverlayMutation => self.overlay_mutation(),
-                    Event::SelectionImeMutation => self.overlay_mutation(),
-                    Event::PaneReplacement => self.replace_pane(),
+                    Event::Advance(domain) => self.advance(domain),
+                    Event::ImageHyperlinkMutation => self.advance(GenerationDomain::Source),
                     Event::Reconnect => self.reconnect(),
                     Event::Detach => self.detach(),
                 }
-                self.assert_invariants();
+                self.check_invariants()?;
+                if matches!(
+                    event,
+                    Event::CancelBeforePublication | Event::CancelAfterPublication | Event::Tick
+                ) || matches!(
+                    commit_outcome,
+                    Some(CommitOutcome::Rejected | CommitOutcome::NoChange(_))
+                ) {
+                    if self.publication_generation != prior_publication_generation
+                        || self.published != prior_published
+                    {
+                        return Err(format!(
+                            "{event:?} mutated publication despite cancellation/rejection semantics"
+                        ));
+                    }
+                }
+                Ok(())
             }
 
-            fn assert_invariants(&self) {
-                assert!(self.publication_generation < PUBLICATION_EXHAUSTED);
+            fn reservation_matches(
+                &self,
+                reservation: &WindowReservation,
+                retained_bytes: u8,
+                hidden_tabs: u8,
+                hidden_tab_metadata_bytes: u8,
+            ) -> bool {
+                reservation.arena_id == self.arena.arena_id
+                    && reservation.publisher_id == self.publisher_id
+                    && reservation.retained_bytes == usize::from(retained_bytes)
+                    && reservation.hidden_tabs == usize::from(hidden_tabs)
+                    && reservation.hidden_tab_metadata_bytes
+                        == usize::from(hidden_tab_metadata_bytes)
+            }
+
+            fn check_invariants(&self) -> Result<(), String> {
+                if self.publication_generation >= PUBLICATION_EXHAUSTED {
+                    return Err("publication generation crossed the terminal sentinel".into());
+                }
                 let retained_slots = usize::from(self.pending.is_some())
                     + usize::from(self.published.is_some())
                     + usize::from(self.rendering.is_some());
-                assert!(retained_slots <= 3);
-                assert!(
-                    self.retained_generation_bytes(None) <= usize::from(self.retained_byte_budget)
-                );
-                if self.exhausted || !self.attached {
-                    assert!(self.published.is_none());
+                if retained_slots > 3 {
+                    return Err(format!(
+                        "retained generation slots exceeded: {retained_slots}"
+                    ));
                 }
-                if let Some(published) = self.published {
-                    assert_eq!(published.target, self.target);
-                    assert!(published.source_generation <= self.source_generation);
-                    assert!(published.publication_generation > 0);
-                    assert_eq!(published.complete_fields, COMPLETE_FIELDS);
-                    assert!(published.retained_bytes <= self.retained_byte_budget);
+                self.arena.check_invariants()?;
+                let mut exact_tokens = BTreeSet::new();
+                if let Some(candidate) = &self.pending {
+                    exact_tokens.insert(candidate.reservation.token_id);
                 }
-                if let Some(rendering) = self.rendering {
-                    assert!(rendering.publication_generation > 0);
-                    assert_eq!(rendering.complete_fields, COMPLETE_FIELDS);
-                    assert!(rendering.retained_bytes <= self.retained_byte_budget);
+                if let Some(published) = &self.published {
+                    exact_tokens.insert(published.reservation.token_id);
                 }
+                if let Some(rendering) = &self.rendering {
+                    exact_tokens.insert(rendering.reservation.token_id);
+                }
+                if exact_tokens != self.arena.live.keys().copied().collect::<BTreeSet<_>>() {
+                    return Err("retained generations and exact arena tokens diverged".into());
+                }
+                let retained_bytes = self.retained_generation_bytes();
+                if retained_bytes > usize::from(self.retained_byte_budget) {
+                    return Err(format!(
+                        "retained bytes {retained_bytes} exceeded budget {}",
+                        self.retained_byte_budget
+                    ));
+                }
+                if retained_bytes != self.arena.retained_bytes {
+                    return Err("retained-generation bytes diverged from the arena ledger".into());
+                }
+                if (self.exhausted || !self.attached) && self.published.is_some() {
+                    return Err("detached or exhausted publisher retained eligibility".into());
+                }
+                if let Some(published) = &self.published {
+                    if published.target != self.target {
+                        return Err("published target is stale".into());
+                    }
+                    if published.source_generation > self.source_generation {
+                        return Err("published source is from the future".into());
+                    }
+                    if published.publication_generation == 0 || !published.fields.is_complete() {
+                        return Err("published snapshot is unstamped or incomplete".into());
+                    }
+                    if published.hidden_tab_count > self.max_hidden_tabs
+                        || published.hidden_tab_metadata_bytes > self.max_hidden_tab_metadata_bytes
+                    {
+                        return Err("published hidden-tab accounting exceeded its cap".into());
+                    }
+                    if !self.reservation_matches(
+                        &published.reservation,
+                        published.retained_bytes,
+                        published.hidden_tab_count,
+                        published.hidden_tab_metadata_bytes,
+                    ) {
+                        return Err("published generation has mismatched arena accounting".into());
+                    }
+                }
+                if let Some(rendering) = &self.rendering {
+                    if rendering.publication_generation == 0 || !rendering.fields.is_complete() {
+                        return Err("render lease is unstamped or incomplete".into());
+                    }
+                    if rendering.hidden_tab_count > self.max_hidden_tabs
+                        || rendering.hidden_tab_metadata_bytes > self.max_hidden_tab_metadata_bytes
+                    {
+                        return Err("render hidden-tab accounting exceeded its cap".into());
+                    }
+                    if !self.reservation_matches(
+                        &rendering.reservation,
+                        rendering.retained_bytes,
+                        rendering.hidden_tab_count,
+                        rendering.hidden_tab_metadata_bytes,
+                    ) {
+                        return Err("render generation has mismatched arena accounting".into());
+                    }
+                }
+                if let Some(pending) = &self.pending {
+                    if pending.age_ticks >= self.candidate_lifetime_ticks {
+                        return Err("candidate exceeded its bounded lifetime".into());
+                    }
+                    if pending.hidden_tab_count > self.max_hidden_tabs
+                        || pending.hidden_tab_metadata_bytes > self.max_hidden_tab_metadata_bytes
+                    {
+                        return Err("candidate hidden-tab accounting exceeded its cap".into());
+                    }
+                    if !self.reservation_matches(
+                        &pending.reservation,
+                        pending.retained_bytes,
+                        pending.hidden_tab_count,
+                        pending.hidden_tab_metadata_bytes,
+                    ) {
+                        return Err("candidate has mismatched arena accounting".into());
+                    }
+                }
+                Ok(())
+            }
+
+            fn assert_invariants(&self) {
+                if let Err(error) = self.check_invariants() {
+                    panic!("publication-model invariant failed: {}", error);
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct WindowReservation {
+            arena_id: u16,
+            publisher_id: u16,
+            token_id: u16,
+            retained_bytes: usize,
+            hidden_tabs: usize,
+            hidden_tab_metadata_bytes: usize,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct ReservationAccounting {
+            publisher_id: u16,
+            retained_bytes: usize,
+            hidden_tabs: usize,
+            hidden_tab_metadata_bytes: usize,
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct SessionSnapshotBudget {
+            arena_id: u16,
+            max_publishers: usize,
+            max_retained_bytes: usize,
+            max_hidden_tabs: usize,
+            max_hidden_tab_metadata_bytes: usize,
+            next_publisher_id: u16,
+            next_token_id: u16,
+            publishers: BTreeSet<u16>,
+            live: BTreeMap<u16, ReservationAccounting>,
+            retained_bytes: usize,
+            hidden_tabs: usize,
+            hidden_tab_metadata_bytes: usize,
+        }
+
+        impl SessionSnapshotBudget {
+            fn new(
+                max_publishers: usize,
+                max_retained_bytes: usize,
+                max_hidden_tabs: usize,
+                max_hidden_tab_metadata_bytes: usize,
+                arena_id: u16,
+            ) -> Self {
+                Self {
+                    arena_id,
+                    max_publishers,
+                    max_retained_bytes,
+                    max_hidden_tabs,
+                    max_hidden_tab_metadata_bytes,
+                    next_publisher_id: 1,
+                    next_token_id: 1,
+                    publishers: BTreeSet::new(),
+                    live: BTreeMap::new(),
+                    retained_bytes: 0,
+                    hidden_tabs: 0,
+                    hidden_tab_metadata_bytes: 0,
+                }
+            }
+
+            fn register_publisher(&mut self) -> Option<u16> {
+                if self.publishers.len() >= self.max_publishers {
+                    return None;
+                }
+                let publisher_id = self.next_publisher_id;
+                self.next_publisher_id = self.next_publisher_id.checked_add(1)?;
+                if !self.publishers.insert(publisher_id) {
+                    return None;
+                }
+                Some(publisher_id)
+            }
+
+            fn try_admit(
+                &mut self,
+                publisher_id: u16,
+                retained_bytes: usize,
+                hidden_tabs: usize,
+                hidden_tab_metadata_bytes: usize,
+            ) -> Option<WindowReservation> {
+                if !self.publishers.contains(&publisher_id) {
+                    return None;
+                }
+                let aggregate_bytes = self.retained_bytes.checked_add(retained_bytes)?;
+                let aggregate_tabs = self.hidden_tabs.checked_add(hidden_tabs)?;
+                let aggregate_metadata = self
+                    .hidden_tab_metadata_bytes
+                    .checked_add(hidden_tab_metadata_bytes)?;
+                if aggregate_bytes > self.max_retained_bytes
+                    || aggregate_tabs > self.max_hidden_tabs
+                    || aggregate_metadata > self.max_hidden_tab_metadata_bytes
+                {
+                    return None;
+                }
+                let token_id = self.next_token_id;
+                self.next_token_id = self.next_token_id.checked_add(1)?;
+                let accounting = ReservationAccounting {
+                    publisher_id,
+                    retained_bytes,
+                    hidden_tabs,
+                    hidden_tab_metadata_bytes,
+                };
+                if self.live.contains_key(&token_id) {
+                    return None;
+                }
+                self.live.insert(token_id, accounting);
+                self.retained_bytes = aggregate_bytes;
+                self.hidden_tabs = aggregate_tabs;
+                self.hidden_tab_metadata_bytes = aggregate_metadata;
+                Some(WindowReservation {
+                    arena_id: self.arena_id,
+                    publisher_id,
+                    token_id,
+                    retained_bytes,
+                    hidden_tabs,
+                    hidden_tab_metadata_bytes,
+                })
+            }
+
+            fn release(&mut self, reservation: WindowReservation) -> Result<(), &'static str> {
+                if reservation.arena_id != self.arena_id {
+                    return Err("reservation belongs to another arena");
+                }
+                let expected = ReservationAccounting {
+                    publisher_id: reservation.publisher_id,
+                    retained_bytes: reservation.retained_bytes,
+                    hidden_tabs: reservation.hidden_tabs,
+                    hidden_tab_metadata_bytes: reservation.hidden_tab_metadata_bytes,
+                };
+                if self.live.get(&reservation.token_id) != Some(&expected) {
+                    return Err("reservation is stale, duplicated, or has mismatched accounting");
+                }
+                let retained_bytes = self
+                    .retained_bytes
+                    .checked_sub(reservation.retained_bytes)
+                    .ok_or("arena retained-byte accounting underflow")?;
+                let hidden_tabs = self
+                    .hidden_tabs
+                    .checked_sub(reservation.hidden_tabs)
+                    .ok_or("arena hidden-tab accounting underflow")?;
+                let hidden_tab_metadata_bytes = self
+                    .hidden_tab_metadata_bytes
+                    .checked_sub(reservation.hidden_tab_metadata_bytes)
+                    .ok_or("arena metadata accounting underflow")?;
+                self.retained_bytes = retained_bytes;
+                self.hidden_tabs = hidden_tabs;
+                self.hidden_tab_metadata_bytes = hidden_tab_metadata_bytes;
+                self.live.remove(&reservation.token_id);
+                Ok(())
+            }
+
+            fn check_invariants(&self) -> Result<(), String> {
+                let retained_bytes = self.live.values().try_fold(0_usize, |total, item| {
+                    total.checked_add(item.retained_bytes)
+                });
+                let hidden_tabs = self
+                    .live
+                    .values()
+                    .try_fold(0_usize, |total, item| total.checked_add(item.hidden_tabs));
+                let metadata = self.live.values().try_fold(0_usize, |total, item| {
+                    total.checked_add(item.hidden_tab_metadata_bytes)
+                });
+                if retained_bytes != Some(self.retained_bytes)
+                    || hidden_tabs != Some(self.hidden_tabs)
+                    || metadata != Some(self.hidden_tab_metadata_bytes)
+                {
+                    return Err("arena totals diverged from its exact live-token ledger".into());
+                }
+                if self.publishers.len() > self.max_publishers
+                    || self.retained_bytes > self.max_retained_bytes
+                    || self.hidden_tabs > self.max_hidden_tabs
+                    || self.hidden_tab_metadata_bytes > self.max_hidden_tab_metadata_bytes
+                {
+                    return Err("arena exceeded a configured aggregate cap".into());
+                }
+                if self
+                    .live
+                    .values()
+                    .any(|item| !self.publishers.contains(&item.publisher_id))
+                {
+                    return Err("arena retained a token for an unknown publisher".into());
+                }
+                Ok(())
             }
         }
 
         #[test]
         fn last_known_good_survives_content_build_failure_but_not_geometry_or_identity_change() {
             let mut model = PublicationModel::new(8);
-            model.begin(COMPLETE_FIELDS, 4, 1);
+            model.begin_complete(4, 1);
             assert_eq!(model.commit(), CommitOutcome::Published(1));
-            let first = model.published;
+            let first = model.published.clone();
 
-            model.content_mutation();
-            model.begin(COMPLETE_FIELDS ^ 1, 4, 2);
+            model.advance(GenerationDomain::Source);
+            model.begin(
+                FieldSet::COMPLETE.without(RequiredField::Cursor),
+                4,
+                2,
+                2,
+                2,
+            );
             assert_eq!(model.commit(), CommitOutcome::Rejected);
             assert_eq!(model.published, first);
 
-            model.resize();
+            model.advance(GenerationDomain::Geometry);
             assert!(model.published.is_none());
-            model.begin(COMPLETE_FIELDS, 4, 3);
-            model.replace_pane();
+            model.begin_complete(4, 3);
+            model.advance(GenerationDomain::PaneIncarnation);
             assert_eq!(model.commit(), CommitOutcome::Rejected);
             assert!(model.published.is_none());
         }
@@ -832,21 +1435,27 @@ mod tests {
         #[test]
         fn stale_incomplete_over_budget_and_same_source_equivocation_fail_closed() {
             let mut model = PublicationModel::new(8);
-            model.begin(COMPLETE_FIELDS ^ 1, 4, 1);
+            model.begin(
+                FieldSet::COMPLETE.without(RequiredField::TerminalMetadata),
+                4,
+                2,
+                2,
+                1,
+            );
             assert_eq!(model.commit(), CommitOutcome::Rejected);
-            model.begin(COMPLETE_FIELDS, 9, 1);
+            model.begin_complete(9, 1);
             assert_eq!(model.commit(), CommitOutcome::Rejected);
 
-            model.begin(COMPLETE_FIELDS, 4, 1);
+            model.begin_complete(4, 1);
             assert_eq!(model.commit(), CommitOutcome::Published(1));
-            model.begin(COMPLETE_FIELDS, 4, 1);
+            model.begin_complete(4, 1);
             assert_eq!(model.commit(), CommitOutcome::NoChange(1));
-            model.begin(COMPLETE_FIELDS, 4, 2);
+            model.begin_complete(4, 2);
             assert_eq!(model.commit(), CommitOutcome::Rejected);
 
-            model.content_mutation();
-            model.begin(COMPLETE_FIELDS, 4, 3);
-            model.content_mutation();
+            model.advance(GenerationDomain::Source);
+            model.begin_complete(4, 3);
+            model.advance(GenerationDomain::Source);
             assert_eq!(model.commit(), CommitOutcome::Rejected);
         }
 
@@ -858,105 +1467,99 @@ mod tests {
                     .checked_add(1)
                     .expect("the bounded model source must have a successor");
                 model.source_generation = source;
-                model.begin(COMPLETE_FIELDS, 4, next_publication);
+                model.begin_complete(4, next_publication);
                 assert_eq!(model.commit(), CommitOutcome::Published(next_publication));
             }
             model.source_generation = PUBLICATION_EXHAUSTED - 1;
-            model.begin(COMPLETE_FIELDS, 4, PUBLICATION_EXHAUSTED);
+            model.begin_complete(4, PUBLICATION_EXHAUSTED);
             assert_eq!(model.commit(), CommitOutcome::Exhausted);
             assert!(model.exhausted);
             assert!(model.published.is_none());
             assert_eq!(model.commit(), CommitOutcome::Exhausted);
 
             model.reconnect();
-            model.begin(COMPLETE_FIELDS, 4, 1);
+            model.begin_complete(4, 1);
             assert_eq!(model.commit(), CommitOutcome::Published(1));
         }
 
         #[test]
         fn every_named_render_state_class_has_explicit_stale_publication_semantics() {
             let mut model = PublicationModel::new(8);
-            model.begin(COMPLETE_FIELDS, 4, 1);
+            model.begin_complete(4, 1);
             assert_eq!(model.commit(), CommitOutcome::Published(1));
 
-            let last_known_good = model.published;
-            model.apply(Event::ImageHyperlinkMutation);
+            let last_known_good = model.published.clone();
+            model
+                .apply(Event::ImageHyperlinkMutation)
+                .expect("image mutation must preserve invariants");
             assert_eq!(model.published, last_known_good);
-            model.begin(COMPLETE_FIELDS, 4, 2);
-            model.apply(Event::AlternateScreenSwitch);
+            model.begin_complete(4, 2);
+            model
+                .apply(Event::Advance(GenerationDomain::AlternateScreen))
+                .expect("alternate-screen mutation must preserve invariants");
             assert_eq!(model.commit(), CommitOutcome::Rejected);
             assert!(model.published.is_none());
 
-            model.begin(COMPLETE_FIELDS, 4, 3);
+            model.begin_complete(4, 3);
             assert_eq!(model.commit(), CommitOutcome::Published(2));
-            model.begin(COMPLETE_FIELDS, 4, 4);
-            model.apply(Event::SelectionImeMutation);
+            model.begin_complete(4, 4);
+            model
+                .apply(Event::Advance(GenerationDomain::SelectionIme))
+                .expect("selection/IME mutation must preserve invariants");
             assert_eq!(model.commit(), CommitOutcome::Rejected);
             assert!(model.published.is_none());
 
-            model.begin(COMPLETE_FIELDS, 4, 5);
+            model.begin_complete(4, 5);
             assert_eq!(model.commit(), CommitOutcome::Published(3));
-            model.begin(COMPLETE_FIELDS, 4, 6);
-            model.apply(Event::TopologyMutation);
+            model.begin_complete(4, 6);
+            model
+                .apply(Event::Advance(GenerationDomain::Topology))
+                .expect("topology mutation must preserve invariants");
             assert_eq!(model.commit(), CommitOutcome::Rejected);
             assert!(model.published.is_none());
         }
 
         #[test]
         fn every_generation_domain_fails_closed_before_its_exhausted_sentinel() {
-            fn assert_exhausted(mut model: PublicationModel, event: Event) {
-                model.begin(COMPLETE_FIELDS, 4, 1);
+            for domain in GENERATION_DOMAINS {
+                let mut model = PublicationModel::new(8);
+                model.begin_complete(4, 1);
                 assert_eq!(model.commit(), CommitOutcome::Published(1));
-                model.apply(event);
+                model.force_generation(domain, u8::MAX - 1);
+                model
+                    .apply(Event::Advance(domain))
+                    .unwrap_or_else(|error| panic!("{:?} violated invariants: {}", domain, error));
                 assert!(model.exhausted);
                 assert!(model.pending.is_none());
                 assert!(model.published.is_none());
             }
 
-            let mut source = PublicationModel::new(8);
-            source.source_generation = u8::MAX - 1;
-            assert_exhausted(source, Event::ContentMutation);
-
-            let mut topology = PublicationModel::new(8);
-            topology.target.topology_generation = u8::MAX - 1;
-            assert_exhausted(topology, Event::TopologyMutation);
-
-            let mut geometry = PublicationModel::new(8);
-            geometry.target.geometry_generation = u8::MAX - 1;
-            assert_exhausted(geometry, Event::Resize);
-
-            let mut screen = PublicationModel::new(8);
-            screen.target.alternate_screen_generation = u8::MAX - 1;
-            assert_exhausted(screen, Event::AlternateScreenSwitch);
-
-            let mut overlay = PublicationModel::new(8);
-            overlay.target.overlay_generation = u8::MAX - 1;
-            assert_exhausted(overlay, Event::SelectionImeMutation);
-
-            let mut pane = PublicationModel::new(8);
-            pane.target.pane_incarnation = u8::MAX - 1;
-            assert_exhausted(pane, Event::PaneReplacement);
-
             let mut session = PublicationModel::new(8);
+            session.begin_complete(4, 1);
+            assert_eq!(session.commit(), CommitOutcome::Published(1));
             session.target.session = u8::MAX - 1;
-            assert_exhausted(session, Event::Reconnect);
+            session
+                .apply(Event::Reconnect)
+                .expect("session exhaustion must preserve invariants");
+            assert!(session.exhausted);
+            assert!(session.published.is_none());
         }
 
         #[test]
         fn newer_publication_supersedes_an_in_flight_frame_without_unbounded_generations() {
             let mut model = PublicationModel::new(8);
-            model.begin(COMPLETE_FIELDS, 4, 1);
+            model.begin_complete(4, 1);
             assert_eq!(model.commit(), CommitOutcome::Published(1));
             model.acquire_render();
-            let first_render = model.rendering;
+            let first_render = model.rendering.clone();
             model.acquire_render();
             assert_eq!(model.rendering, first_render);
 
-            model.content_mutation();
-            model.begin(COMPLETE_FIELDS, 4, 2);
+            model.advance(GenerationDomain::Source);
+            model.begin_complete(4, 2);
             assert_eq!(model.commit(), CommitOutcome::Published(2));
-            model.content_mutation();
-            model.begin(COMPLETE_FIELDS, 4, 3);
+            model.advance(GenerationDomain::Source);
+            model.begin_complete(4, 3);
             assert!(model.pending.is_none());
             assert!(!model.release_render());
             assert_eq!(
@@ -971,19 +1574,185 @@ mod tests {
         }
 
         #[test]
+        fn every_required_field_is_auditable_and_missing_fields_reject_publication() {
+            assert_eq!(FieldSet::COMPLETE.missing(), Vec::<RequiredField>::new());
+            for field in REQUIRED_FIELDS {
+                let fields = FieldSet::COMPLETE.without(field);
+                assert_eq!(fields.missing(), vec![field]);
+                let mut model = PublicationModel::new(8);
+                model.begin(fields, 4, 2, 2, 1);
+                assert_eq!(model.commit(), CommitOutcome::Rejected, "{field:?}");
+                assert!(model.published.is_none(), "{field:?}");
+            }
+        }
+
+        #[test]
+        fn cancellation_deadline_detach_and_stale_settlement_release_exact_candidates() {
+            let mut model = PublicationModel::new(8);
+            model.begin_complete(4, 1);
+            let cancelled = Arc::downgrade(&model.pending.as_ref().unwrap().strong_capture);
+            let before_cancel = (model.publication_generation, model.published.clone());
+            model
+                .apply(Event::CancelBeforePublication)
+                .expect("pre-publication cancellation must preserve invariants");
+            assert!(cancelled.upgrade().is_none());
+            assert_eq!(
+                (model.publication_generation, model.published),
+                before_cancel
+            );
+
+            model.begin_complete(4, 2);
+            assert_eq!(model.commit(), CommitOutcome::Published(1));
+            let last_known_good = model.published.clone();
+            let publication_generation = model.publication_generation;
+            model.advance(GenerationDomain::Source);
+            model.begin_complete(4, 3);
+            let expired = Arc::downgrade(&model.pending.as_ref().unwrap().strong_capture);
+            for _ in 0..CANDIDATE_LIFETIME_TICKS {
+                model
+                    .apply(Event::Tick)
+                    .expect("candidate deadline must preserve invariants");
+            }
+            assert!(model.pending.is_none());
+            assert!(expired.upgrade().is_none());
+            assert_eq!(model.publication_generation, publication_generation);
+            assert_eq!(model.published, last_known_good);
+
+            let published = model.published.clone();
+            model
+                .apply(Event::CancelAfterPublication)
+                .expect("post-publication cancellation must not retract the snapshot");
+            assert_eq!(model.published, published);
+
+            model.acquire_render();
+            model.detach();
+            assert!(model.published.is_none());
+            assert!(!model.release_render());
+            model.assert_invariants();
+        }
+
+        #[test]
+        fn per_window_and_session_budgets_bound_hidden_tabs_metadata_and_publishers() {
+            let mut window = PublicationModel::new(8);
+            window.begin(FieldSet::COMPLETE, 4, 4, 2, 1);
+            assert!(window.pending.is_none());
+            window.begin(FieldSet::COMPLETE, 4, 2, 5, 2);
+            assert!(window.pending.is_none());
+
+            let mut session = SessionSnapshotBudget::new(2, 12, 5, 7, 41);
+            let first_publisher = session.register_publisher().expect("first publisher");
+            let second_publisher = session.register_publisher().expect("second publisher");
+            assert!(session.register_publisher().is_none());
+            let first = session
+                .try_admit(first_publisher, 4, 2, 3)
+                .expect("first reservation");
+            let duplicate = first.clone();
+            let cross_arena = first.clone();
+            let second = session
+                .try_admit(second_publisher, 6, 3, 4)
+                .expect("second reservation");
+            let full = session.clone();
+            assert!(session.try_admit(first_publisher, 1, 1, 0).is_none());
+            assert_eq!(session, full);
+            session.release(first).expect("first release");
+            assert!(session.release(duplicate).is_err());
+            let mut foreign = SessionSnapshotBudget::new(1, 12, 5, 7, 42);
+            let _ = foreign.register_publisher().expect("foreign publisher");
+            assert!(foreign.release(cross_arena).is_err());
+            let replacement = session
+                .try_admit(first_publisher, 4, 2, 3)
+                .expect("released aggregate capacity must be reusable");
+            session.release(second).expect("second release");
+            session.release(replacement).expect("replacement release");
+            session
+                .check_invariants()
+                .expect("session arena invariants");
+            assert_eq!(session.publishers.len(), 2);
+            assert_eq!(session.retained_bytes, 0);
+            assert_eq!(session.hidden_tabs, 0);
+            assert_eq!(session.hidden_tab_metadata_bytes, 0);
+
+            let mut lifecycle = PublicationModel::new(12);
+            lifecycle.arena.max_hidden_tabs = 5;
+            lifecycle.arena.max_hidden_tab_metadata_bytes = 5;
+            lifecycle.begin_complete(4, 1);
+            assert_eq!(lifecycle.commit(), CommitOutcome::Published(1));
+            lifecycle.acquire_render();
+            lifecycle.advance(GenerationDomain::Source);
+            lifecycle.begin_complete(4, 2);
+            assert_eq!(lifecycle.commit(), CommitOutcome::Published(2));
+            lifecycle.advance(GenerationDomain::Source);
+            lifecycle.begin_complete(4, 3);
+            assert!(lifecycle.pending.is_none());
+            assert_eq!(lifecycle.arena.hidden_tabs, 4);
+            assert_eq!(lifecycle.arena.hidden_tab_metadata_bytes, 4);
+            lifecycle.assert_invariants();
+        }
+
+        #[test]
+        fn thread_scheduled_publication_exposes_only_whole_immutable_snapshots() {
+            let mut first_model = PublicationModel::new(8);
+            first_model.begin_complete(4, 11);
+            assert_eq!(first_model.commit(), CommitOutcome::Published(1));
+            let first = Arc::new(first_model.published.unwrap());
+
+            let mut second_model = PublicationModel::new(8);
+            second_model.advance(GenerationDomain::Source);
+            second_model.begin_complete(4, 22);
+            assert_eq!(second_model.commit(), CommitOutcome::Published(1));
+            let second = Arc::new(second_model.published.unwrap());
+
+            let slot = Arc::new(Mutex::new(Arc::clone(&first)));
+            let start = Arc::new(Barrier::new(2));
+            std::thread::scope(|scope| {
+                let writer_slot = Arc::clone(&slot);
+                let writer_start = Arc::clone(&start);
+                let writer_first = Arc::clone(&first);
+                let writer_second = Arc::clone(&second);
+                scope.spawn(move || {
+                    writer_start.wait();
+                    for iteration in 0..1_024 {
+                        let replacement = if iteration % 2 == 0 {
+                            Arc::clone(&writer_first)
+                        } else {
+                            Arc::clone(&writer_second)
+                        };
+                        *writer_slot.lock().expect("publication slot poisoned") = replacement;
+                        std::thread::yield_now();
+                    }
+                });
+
+                start.wait();
+                for _ in 0..1_024 {
+                    let observed = Arc::clone(&slot.lock().expect("publication slot poisoned"));
+                    assert!(observed.fields.is_complete());
+                    assert!(
+                        (*observed == *first && observed.digest == 11)
+                            || (*observed == *second && observed.digest == 22)
+                    );
+                    std::thread::yield_now();
+                }
+            });
+        }
+
+        #[test]
         fn bounded_event_interleavings_preserve_publication_invariants() {
-            fn visit(model: PublicationModel, depth: usize) {
+            fn visit(model: PublicationModel, depth: usize, trace: &mut Vec<Event>) {
                 if depth == 0 {
                     return;
                 }
                 for event in EVENTS {
                     let mut next = model.clone();
-                    next.apply(event);
-                    visit(next, depth - 1);
+                    trace.push(event);
+                    if let Err(error) = next.apply(event) {
+                        panic!("counterexample trace {:?}: {}", trace, error);
+                    }
+                    visit(next, depth - 1, trace);
+                    trace.pop();
                 }
             }
 
-            visit(PublicationModel::new(8), 5);
+            visit(PublicationModel::new(8), 4, &mut Vec::new());
         }
     }
 }
