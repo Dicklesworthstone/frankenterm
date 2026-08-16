@@ -7,12 +7,13 @@
 //! first (with zero allocation overhead), and any scripting-engine handlers
 //! would run after them via the `ScriptingEngine` trait's `fire_event` method.
 //!
-//! NOTE: the WASM/Lua tiers are a forward-looking capability of the priority
-//! model, not an active production path. No production code currently registers
-//! WASM or Lua handlers — the `frankenterm-scripting` crate that would is not
-//! wired into mux (it is exercised only by benches/tests/fuzz) — so in
-//! production this bus dispatches native handlers only. The ordering is still
-//! enforced whenever such handlers ARE registered (see the priority tests).
+//! NOTE: this bus is currently a benchmark/test substrate rather than a live
+//! mux event path. No production code outside this module constructs or fires
+//! one of these events, and no production code registers a native, WASM, or Lua
+//! handler. The `frankenterm-scripting` crate that could consume the lower
+//! tiers is also not wired into mux. The ordering contract is enforced whenever
+//! handlers are registered (see the priority tests), but it is not production
+//! latency evidence until real producers and consumers are connected.
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -1037,6 +1038,30 @@ mod tests {
     }
 
     #[test]
+    fn backwards_wall_clock_does_not_regress_monotonic_time() {
+        let clock = EventClock {
+            domain: EventClockDomain::new(Uuid::from_u128(7), 7)
+                .expect("fixture clock domain is non-nil"),
+            origin: Instant::now(),
+        };
+        let before = clock
+            .timestamp_from_elapsed(
+                Duration::from_nanos(10),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+            )
+            .expect("first monotonic fixture is representable");
+        let after = clock
+            .timestamp_from_elapsed(
+                Duration::from_nanos(11),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .expect("second monotonic fixture is representable");
+
+        assert!(after.wall_time_unix_ns < before.wall_time_unix_ns);
+        assert_eq!(after.duration_since(before), Ok(Duration::from_nanos(1)));
+    }
+
+    #[test]
     fn timestamps_from_different_process_epochs_are_incomparable() {
         let earlier = EventTimestamp::from_parts(
             EventClockDomain::new(Uuid::from_u128(5), 7).expect("fixture clock domain is non-nil"),
@@ -1498,8 +1523,8 @@ mod tests {
     // Concurrent stress tests
     // ===================================================================
 
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
 
     /// Multiple threads fire events concurrently on a shared bus.
     /// Verifies no panics, no lost actions, and handler count is consistent.

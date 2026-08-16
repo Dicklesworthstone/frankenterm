@@ -4132,6 +4132,36 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote the contract to a live performance claim only after the current renderer acquires one exact per-window immutable snapshot, performs shaping/glyph/atlas/quad work outside terminal and mux locks, passes state/pixel/IME/accessibility equivalence, and wins the frozen same-source native latency/resource gates without operator-session interaction.
 
+### IS-N136 — A corrected dormant event clock is not production trace authority
+
+- **Classification:** clock-correctness repair and wrong-call-graph rejection;
+  no latency or live-flight-recorder claim
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.12`
+- **Faulty baseline:** the former `coarse_nanos` helper described its result as
+  monotonic but sampled `SystemTime::now` relative to the Unix epoch. A wall
+  clock correction could therefore regress or jump while still looking like a
+  duration authority.
+- **Correction:** mux events now carry a process-epoch/PID clock-domain identity,
+  `Instant`-relative nanoseconds, optional wall-time metadata, checked duration
+  arithmetic, typed source-regression and exhaustion failures, and explicit
+  restart/fork rejection. Deterministic tests cover backwards wall time,
+  pre-origin sampling, process identity change, cross-epoch comparison,
+  same-domain regression, and `u64` exhaustion.
+- **Current-source consumer census:** outside `frankenterm/mux/src/events.rs`,
+  the mux event types are consumed only by
+  `frankenterm/mux/benches/event_bus.rs` and serde property tests for the
+  independent event-type/priority enums. No production mux path constructs or
+  fires this `Event`, and no production native, WASM, or Lua handler registers
+  with this `EventBus`. Historical `timestamp_ns` samples were therefore
+  benchmark/test substrate, not live keypress, queue, PTY, renderer, display,
+  or photon evidence.
+- **Decision:** keep the clock-domain repair as the safe time substrate for the
+  bounded recorder and future producers, and correct the module documentation
+  to state its dormant status. Do not infer that `.2.3`-`.2.5` instrumentation,
+  the `.2.6` causal harness, or any M4/M5/Threadripper latency evidence exists.
+- **Primary retry condition:**
+  > Promote this clock as production trace authority only after exact live producers and consumers carry its domain through the bounded recorder, retained loss accounting proves nonzero K0-K13 stage coverage, and same-source target-hardware runs establish bounded observer overhead without operator-session interaction.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
