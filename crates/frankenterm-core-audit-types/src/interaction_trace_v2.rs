@@ -1830,7 +1830,7 @@ mod tests {
             serde_json::json!(false);
         assert!(
             serde_json::from_value::<InteractionTraceV2>(unknown).is_err(),
-            "unknown counter availability unexpectedly decoded"
+            "unknown counter unavailability unexpectedly decoded"
         );
 
         let mut inverted_name = encoded;
