@@ -22,9 +22,10 @@ use std::sync::{Arc, Mutex};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
-    MAX_RAW_EVENT_BYTES, RecorderAccountingAuthority, RecorderCapacityV1, RecorderContractError,
-    RecorderEpochId, RecorderEventAccountingV1, RecorderMode, RecorderSamplerConfigV1,
-    RecorderTraceAccountingV1, SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION, SampledTraceContextV1,
+    CONVERSION_WORKSPACE_EVENTS, MAX_RAW_EVENT_BYTES, RecorderAccountingAuthority,
+    RecorderCapacityV1, RecorderContractError, RecorderEpochId, RecorderEventAccountingV1,
+    RecorderMode, RecorderSamplerConfigV1, RecorderTraceAccountingV1,
+    SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION, SampledTraceContextV1,
 };
 use frankenterm_core_audit_types::interaction_trace_v2::{
     INTERACTION_TRACE_V2_SCHEMA_VERSION, InteractionTraceClockDomain, InteractionTraceCorrelation,
@@ -624,7 +625,10 @@ impl FlightRecorder {
                 requested_frozen_events,
                 frozen_events.capacity(),
             )?;
-            let requested_conversion_events = requested_frozen_events.min(256);
+            // Keep the allocation identical to the manifest's checked memory
+            // equation. This workspace converts at most one bounded trace at
+            // a time; it must not grow with the recorder's global slot count.
+            let requested_conversion_events = usize::from(CONVERSION_WORKSPACE_EVENTS);
             conversion_workspace
                 .try_reserve_exact(requested_conversion_events)
                 .map_err(|_| RecorderError::AllocationFailed("conversion workspace"))?;
@@ -1722,6 +1726,10 @@ mod tests {
         assert_eq!(one.global_queue_capacity(), 64);
         assert_eq!(eight.global_queue_capacity(), 64);
         assert_eq!(one.workspace_capacities(), eight.workspace_capacities());
+        assert_eq!(
+            one.workspace_capacities().1,
+            usize::from(CONVERSION_WORKSPACE_EVENTS)
+        );
         assert_eq!(one.config().capacity().total_slots, 64);
         assert_eq!(eight.config().capacity().total_slots, 64);
         assert!(
