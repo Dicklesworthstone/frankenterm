@@ -441,6 +441,36 @@ fn complete_keypress_batch() -> (FrozenBatch, TraceToken) {
     )
 }
 
+fn single_event_batch() -> FrozenBatch {
+    let config = RecorderConfig::new(
+        epoch(23),
+        run(24),
+        RecorderMode::Certification,
+        RecorderSamplerConfigV1::certification(),
+        1,
+        1,
+        TEST_BYTE_CEILING,
+    )
+    .expect("single-event config is valid");
+    let recorder = FlightRecorder::new(config).expect("single-event recorder allocates");
+    let producer = recorder
+        .register_producer(0)
+        .expect("single-event producer registers");
+    let token = match recorder.admit_local_trace(&producer, InteractionTracePath::Keypress) {
+        TraceAdmission::Admitted { token, .. } => token,
+        other => panic!("single-event admission failed: {other:?}"),
+    };
+    assert!(matches!(
+        recorder.record(
+            &producer,
+            token,
+            &fields_for(InteractionTracePath::Keypress, 0, 1),
+        ),
+        RecordOutcome::Recorded { .. }
+    ));
+    recorder.try_freeze().expect("single-event batch freezes")
+}
+
 #[derive(Debug)]
 struct FailAfterWriter {
     limit: usize,
@@ -487,7 +517,11 @@ impl Write for FailAfterWriter {
 
 #[test]
 fn public_export_retries_after_every_planted_byte_boundary() {
-    let (mut frozen, _) = complete_keypress_batch();
+    // One event exercises every writer byte boundary without repeatedly
+    // serializing an entire 14-stage trace. Complete-trace conversion and
+    // ordering are covered independently above; keeping those concerns in
+    // this inherently quadratic boundary sweep inflated its input needlessly.
+    let mut frozen = single_event_batch();
     let mut canonical = Vec::new();
     assert!(matches!(
         frozen.write_json_lines(&mut canonical),
