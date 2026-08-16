@@ -4006,6 +4006,86 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote exact capture retirement as a performance improvement only after retained same-source long-session churn and close/reconnect runs on the intended M4/M5 Mac and 64-core/128-thread `trj` Threadripper/LAN target record p50/p95/p99/p999 keypress, retirement, and render latency, RSS/allocation/resource envelopes, and deterministic byte/state/visual/cursor/IME/accessibility/resize/zoom equivalence.
 
+### IS-N133 — Metadata/lifecycle separation removes false capture rotations but does not prove interactive latency
+
+- **Classification:** kept structural/correctness repair; performance promotion
+  withheld for missing target-hardware evidence
+- **Bead:**
+  `ft-interactive-systems-performance-4tenz.5.5.3.5.8.5.12`
+- **Baseline revision:** `ea56ad86182c3e527a084711b62b5b818851ee1f`
+- **Candidate revision:** `e80a69cc404cb8bd5c74a7c78951a54474c89ed7`
+- **Target identity:** strict-remote Linux compile/test workers only; no M4/M5
+  macOS, 64-core/128-thread `trj` Threadripper, display, direct-LAN, thermal,
+  compositor, or production-session identity was measured
+- **Workload identity:** deterministic title, cwd, display-name, tab/window
+  placement, resize, zoom, filter transition, same-ID ABA, cancellation,
+  checked-exhaustion, and q2/q20/q200/q600 schedules. These are static and
+  synthetic state-transition workloads, not retained long-running interactive
+  sessions
+- **Focused command/artifact:** exact committed clean-overlay job
+  `j-29976432671195497` ran the v44 recovery-usability regression against the
+  candidate and passed 1/1 with 0 failures and 31,031 filtered tests. Exact-SHA
+  formatting authority `j-29976432671195500` passed the named format proof 1/1
+  with 0 filtered and emitted `WORKSPACE_FORMAT_PROOF_SUCCESS`
+- **Broad command/artifact:** final-source warnings-denied Clippy
+  `j-29976432671195495` passed
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`. The first
+  lifecycle suite `j-68` passed 303 tests but failed one exact storage snapshot
+  and ignored one test; isolated job `j-72` reproduced that real defect. The
+  candidate now derives the exact canonical v44 trigger contribution inside
+  the same SQLite transaction and adds deterministic maximal-write coverage.
+  Original exact-source metadata, lifecycle, and workspace-check jobs
+  `j-29976432671195501`, `j-29976432671195499`, and
+  `j-29976432671195498` reached remote workers but exhausted RCH's one-hour SSH
+  ceiling after cold compilation; they are infrastructure negatives, not
+  passes or source failures. Their exact-source strict-remote reruns
+  `j-29976432671195504`, `j-29976432671195503`, and
+  `j-29976432671195502` also reached their admitted remote workers and ended
+  with `RCH-E104` after the same 3,600-second SSH ceiling; RCH explicitly
+  refused local fallback in every case. Cache-reuse experiments
+  `j-29976432671195505` and `j-29976432671195506` could not reuse the retained
+  remote targets because RCH selected a new source target; those redundant
+  builds were canceled with exit 130 and do not count as source or product
+  failures. No local Cargo substitute counts as proof
+- **Samples/statistics:** no keypress, render, resize, zoom, RSS, allocation,
+  wall-time distribution, confidence interval, or coefficient-of-variation
+  measurement was collected. Retained values are deterministic lifecycle
+  rotations, revocations, resyncs, crash-loop increments, metadata writes,
+  queue bounds, and state-cardinality counters only
+- **Equivalence:** exact-identity tests cover metadata-only continuity,
+  contradictory authority, evidence gain and loss, duplicate numeric IDs,
+  checked revision exhaustion, policy pause/resume, hidden replacement,
+  failed UUID revalidation, storage checkpoint accounting, cancellation, and
+  bounded latest-wins metadata delivery. Rendered pixels, byte replay,
+  cursor/IME/accessibility behavior, and real resize/zoom/reconnect equivalence
+  remain unproved
+- **Measured result:** no user-visible latency or resource result. The source
+  now separates typed lifecycle identity/revision from mutable metadata,
+  prevents ordinary title/cwd/placement/size/cursor/active/zoom/display churn
+  from impersonating pane replacement, and bounds metadata persistence with
+  debounce, coalescing, per-tick admission, and shutdown drainage
+- **Rejected hypotheses:** title or cwd is not capture-incarnation authority;
+  domain display name is not replacement authority; evidence loss is not
+  continuity; duplicate numeric pane IDs are not safe to select by iteration
+  order; policy-driven stop/reobserve is not a process restart; synthetic
+  lifecycle counters and remote Linux compiler gates are not substitutes for
+  target-class keypress/render/resize/zoom latency
+- **Negative proof history:** two Clippy passes exposed and drove repairs for
+  redundant exact-resync control flow and noncanonical set admission; a final
+  Clippy pass exposed and drove the canonical map-absence assertion. An `hz2`
+  workspace attempt failed on missing `xcb-util.pc`; obsolete candidate jobs
+  were canceled rather than promoted. A mistyped nonexistent SHA failed RCH
+  preflight before any job, a combined shell command failed RCH command
+  admission, and an accidentally invoked UBS shadow-Cargo run was local and is
+  explicitly excluded from proof. None of these involved launching or touching
+  a FrankenTerm process or session
+- **Decision:** kept durable correctness infrastructure. Metadata/lifecycle
+  separation prevents expensive false capture rotation and provides the
+  counters needed for later attribution, but it is not promoted as a measured
+  user-visible performance improvement
+- **Primary retry condition:**
+  > Promote metadata/lifecycle separation as a performance improvement only after retained same-source aged-session runs on the intended M4/M5 Mac and 64-core/128-thread `trj` Threadripper over the direct LAN record p50/p95/p99/p999 keypress-to-PTY and keypress-to-presented-frame latency, resize/zoom frame and reflow latency, queue depth/age, metadata write amplification, RSS/allocation/resource envelopes, and deterministic byte/state/visual/cursor/IME/accessibility equivalence.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
