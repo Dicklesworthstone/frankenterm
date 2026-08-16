@@ -1081,20 +1081,18 @@ mod tests {
                     Event::Detach => self.detach(),
                 }
                 self.check_invariants()?;
-                if matches!(
+                if (matches!(
                     event,
                     Event::CancelBeforePublication | Event::CancelAfterPublication | Event::Tick
                 ) || matches!(
                     commit_outcome,
                     Some(CommitOutcome::Rejected | CommitOutcome::NoChange(_))
-                ) {
-                    if self.publication_generation != prior_publication_generation
-                        || self.published != prior_published
-                    {
-                        return Err(format!(
-                            "{event:?} mutated publication despite cancellation/rejection semantics"
-                        ));
-                    }
+                )) && (self.publication_generation != prior_publication_generation
+                    || self.published != prior_published)
+                {
+                    return Err(format!(
+                        "{event:?} mutated publication despite cancellation/rejection semantics"
+                    ));
                 }
                 Ok(())
             }
@@ -1107,7 +1105,7 @@ mod tests {
                 hidden_tab_metadata_bytes: u8,
             ) -> bool {
                 reservation.arena == self.arena.arena
-                    && &reservation.publisher == &self.publisher
+                    && reservation.publisher == self.publisher
                     && reservation.retained_bytes == usize::from(retained_bytes)
                     && reservation.hidden_tabs == usize::from(hidden_tabs)
                     && reservation.hidden_tab_metadata_bytes
