@@ -1874,7 +1874,7 @@ fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
     if denominator == 0 {
         return numerator;
     }
-    numerator / denominator + u64::from(numerator % denominator != 0)
+    numerator.div_ceil(denominator)
 }
 
 fn topology_existing_cost(

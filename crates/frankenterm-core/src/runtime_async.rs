@@ -6597,7 +6597,7 @@ pub const INTERRUPTIBLE_TIMER_CAPACITY: usize = 65_536;
 /// This is deliberately below asupersync 0.3.5's seven-day wheel clamp. A
 /// larger request is refused instead of silently waking early and extending a
 /// lease, cursor deadline, or caller timeout incorrectly.
-pub const INTERRUPTIBLE_TIMER_MAX_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+pub const INTERRUPTIBLE_TIMER_MAX_DELAY: Duration = Duration::from_hours(24);
 
 /// Content-free aggregate counters for the bounded interruptible timer service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

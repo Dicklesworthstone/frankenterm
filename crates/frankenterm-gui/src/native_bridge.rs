@@ -317,10 +317,10 @@ impl Drop for NativeEventBridge {
             let _ = mux.unsubscribe(subscription_id);
         }
 
-        if let Some(sender_thread) = self.sender_thread.take() {
-            if sender_thread.join().is_err() {
-                log::warn!("Native event bridge: sender thread panicked during shutdown");
-            }
+        if let Some(sender_thread) = self.sender_thread.take()
+            && sender_thread.join().is_err()
+        {
+            log::warn!("Native event bridge: sender thread panicked during shutdown");
         }
     }
 }
@@ -406,32 +406,28 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
         }
 
         // Send Hello handshake if needed
-        if !sent_hello {
-            if let Some(ref mut s) = stream {
-                let hello = WireEvent::Hello {
-                    proto: Some(1),
-                    wezterm_version: Some(
-                        concat!("FrankenTerm ", env!("CARGO_PKG_VERSION")).into(),
-                    ),
-                    ts: Some(now_ms()),
-                };
-                if let Err(error) = write_event(s, &hello, &mut serialized_event, shutdown) {
-                    if shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    log::warn!("Native event bridge: failed to send Hello ({error}), reconnecting");
-                    stream = None;
-                    if !wait_for_retry_or_shutdown(connect_backoff, shutdown) {
-                        break;
-                    }
-                    connect_backoff = (connect_backoff * 2).min(MAX_BACKOFF);
-                    continue;
+        if !sent_hello && let Some(ref mut s) = stream {
+            let hello = WireEvent::Hello {
+                proto: Some(1),
+                wezterm_version: Some(concat!("FrankenTerm ", env!("CARGO_PKG_VERSION")).into()),
+                ts: Some(now_ms()),
+            };
+            if let Err(error) = write_event(s, &hello, &mut serialized_event, shutdown) {
+                if shutdown.load(Ordering::Acquire) {
+                    break;
                 }
-                sent_hello = true;
-                // Do not call an accepted socket healthy until this side has
-                // written one complete application-protocol frame.
-                connect_backoff = INITIAL_BACKOFF;
+                log::warn!("Native event bridge: failed to send Hello ({error}), reconnecting");
+                stream = None;
+                if !wait_for_retry_or_shutdown(connect_backoff, shutdown) {
+                    break;
+                }
+                connect_backoff = (connect_backoff * 2).min(MAX_BACKOFF);
+                continue;
             }
+            sent_hello = true;
+            // Do not call an accepted socket healthy until this side has
+            // written one complete application-protocol frame.
+            connect_backoff = INITIAL_BACKOFF;
         }
 
         // Wait for an event from the channel

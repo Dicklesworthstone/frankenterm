@@ -277,8 +277,7 @@ pub fn classify(
             .argv
             .iter()
             .any(|a| a.contains("test") || a.contains("spec"));
-    if is_test_process && context.age > Duration::from_secs(12 * 3600) && context.cpu_percent < 1.0
-    {
+    if is_test_process && context.age > Duration::from_hours(12) && context.cpu_percent < 1.0 {
         return (
             TriageCategory::StuckTest,
             TriageAction::GracefulKill {
@@ -294,7 +293,7 @@ pub fn classify(
 
     // Priority 3: Stuck CLI tools (5+ minutes).
     if CLI_TOOLS.iter().any(|t| t.eq_ignore_ascii_case(&node.name))
-        && context.age > Duration::from_secs(5 * 60)
+        && context.age > Duration::from_mins(5)
     {
         return (
             TriageCategory::StuckCli,
@@ -326,8 +325,7 @@ pub fn classify(
     }
 
     // Priority 5: Abandoned dev servers (24+ hours).
-    if DEV_SERVERS.iter().any(|s| lower_name.contains(*s))
-        && context.age > Duration::from_secs(24 * 3600)
+    if DEV_SERVERS.iter().any(|s| lower_name.contains(*s)) && context.age > Duration::from_hours(24)
     {
         return (
             TriageCategory::AbandonedServer,
@@ -343,9 +341,7 @@ pub fn classify(
     }
 
     // Priority 6: Stale sessions (tmux/screen).
-    if matches!(lower_name.as_str(), "tmux" | "screen")
-        && context.age > Duration::from_secs(24 * 3600)
-    {
+    if matches!(lower_name.as_str(), "tmux" | "screen") && context.age > Duration::from_hours(24) {
         return (
             TriageCategory::StaleSession,
             TriageAction::FlagForReview {
@@ -361,7 +357,7 @@ pub fn classify(
 
     // Priority 7-8: Agent processes.
     if AGENT_PROCESSES.iter().any(|a| lower_name.contains(*a)) {
-        if context.age > Duration::from_secs(16 * 3600) {
+        if context.age > Duration::from_hours(16) {
             return (
                 TriageCategory::ConfusedAgent,
                 TriageAction::FlagForReview {
@@ -382,7 +378,7 @@ pub fn classify(
     }
 
     // Default: flag for review if old, protect if young.
-    if context.age > Duration::from_secs(24 * 3600) && context.cpu_percent < 1.0 {
+    if context.age > Duration::from_hours(24) && context.cpu_percent < 1.0 {
         (
             TriageCategory::AbandonedServer,
             TriageAction::FlagForReview {

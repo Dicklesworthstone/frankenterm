@@ -1652,7 +1652,9 @@ fn image_from_frame(frame: &HeadlessFrame) -> Result<RgbaImage, Box<dyn std::err
 
 #[cfg(feature = "headless-render")]
 fn is_blank_rgba(rgba: &[u8]) -> bool {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .all(|pixel| pixel[0] <= 4 && pixel[1] <= 4 && pixel[2] <= 4)
 }
 

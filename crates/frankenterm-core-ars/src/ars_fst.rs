@@ -489,14 +489,9 @@ pub fn key_to_minhash(key: &[u8]) -> Result<Vec<u64>, FstError> {
         return Err(FstError::InvalidMinHashKeyLength { len: key.len() });
     }
 
-    Ok(key
-        .chunks_exact(8)
-        .map(|chunk| {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(chunk);
-            u64::from_be_bytes(arr)
-        })
-        .collect())
+    let (chunks, remainder) = key.as_chunks::<8>();
+    debug_assert!(remainder.is_empty());
+    Ok(chunks.iter().copied().map(u64::from_be_bytes).collect())
 }
 
 // =============================================================================

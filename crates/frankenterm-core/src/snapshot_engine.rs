@@ -944,7 +944,7 @@ const SESSION_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// not manufacture high-frequency scans, while very sparse configurations do
 /// not defer pruning for hours.
 const CHECKPOINT_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(30);
-const CHECKPOINT_CLEANUP_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const CHECKPOINT_CLEANUP_MAX_INTERVAL: Duration = Duration::from_mins(5);
 /// Admission contention and retry-safe failure must not turn into a tight
 /// cleanup loop, but also must not postpone the next attempt until the normal
 /// cadence elapses again.

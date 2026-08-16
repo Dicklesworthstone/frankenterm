@@ -866,8 +866,10 @@ fn decode_f32_embedding_blob(blob: &[u8], dimension: usize) -> Result<Vec<f32>> 
     }
 
     let mut out = Vec::with_capacity(dimension);
-    for chunk in blob.chunks_exact(4) {
-        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    let (chunks, remainder) = blob.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    for &bytes in chunks {
+        let value = f32::from_le_bytes(bytes);
         if !value.is_finite() {
             return Err(ChunkVectorStoreError::InvalidDbValue(
                 "embedding contains non-finite values".to_string(),

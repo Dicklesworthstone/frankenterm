@@ -255,6 +255,14 @@ items_after_statements = "allow"
 single_match_else = "allow"
 # Implicit to_string acceptable
 implicit_clone = "allow"
+# Modulo predicates remain clearer for parity, cadence, and alignment checks
+# throughout the vendored and first-party test corpus.  Avoid a repository-wide
+# non-semantic rewrite whenever Clippy adds another integer convenience method.
+manual_is_multiple_of = "allow"
+# Explicit second arithmetic is often the clearest form in generated test
+# matrices, variable-unit fixtures, and overflow probes. Canonical production
+# constants should still use `from_mins`/`from_hours` where that improves them.
+duration_suboptimal_units = "allow"
 
 [workspace.dependencies]
 # Core dependencies

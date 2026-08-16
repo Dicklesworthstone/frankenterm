@@ -1902,7 +1902,7 @@ pub struct EventDeduplicator {
 
 impl EventDeduplicator {
     /// Default dedup window: 5 minutes
-    pub const DEFAULT_WINDOW: Duration = Duration::from_secs(5 * 60);
+    pub const DEFAULT_WINDOW: Duration = Duration::from_mins(5);
     /// Default maximum tracked keys
     pub const DEFAULT_MAX_CAPACITY: usize = 2000;
 

@@ -27351,10 +27351,9 @@ fn decode_f32_embedding_blob(blob: &[u8], dimension: usize) -> Result<Vec<f32>> 
     }
 
     let mut values = Vec::with_capacity(dimension);
-    for chunk in blob.chunks_exact(4) {
-        let bytes: [u8; 4] = chunk.try_into().map_err(|_| {
-            StorageError::Database("Invalid embedding chunk length while decoding".to_string())
-        })?;
+    let (chunks, remainder) = blob.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    for &bytes in chunks {
         let value = f32::from_le_bytes(bytes);
         if !value.is_finite() {
             return Err(StorageError::Database(

@@ -168,12 +168,11 @@ fn runtime_loop_cx() -> RuntimeLoopCx {
 fn runtime_deadline_after(now: Instant, duration: Duration, label: &str) -> Instant {
     now.checked_add(duration).unwrap_or_else(|| {
         warn!("{label} duration {duration:?} is too large for Instant; clamping deadline");
-        now.checked_add(Duration::from_secs(365 * 24 * 60 * 60))
-            .unwrap_or(now)
+        now.checked_add(Duration::from_hours(8760)).unwrap_or(now)
     })
 }
 
-const RETENTION_MAINTENANCE_CADENCE: Duration = Duration::from_secs(60 * 60);
+const RETENTION_MAINTENANCE_CADENCE: Duration = Duration::from_hours(1);
 const RETENTION_MAINTENANCE_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_RUNTIME_WATCHDOG_WARNINGS: usize = 32;
 const MAX_RUNTIME_WATCHDOG_WARNING_INPUT_BYTES: usize = 64 * 1024;

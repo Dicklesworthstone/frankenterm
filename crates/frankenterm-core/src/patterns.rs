@@ -667,7 +667,7 @@ impl DetectionContext {
     // To override: set [tuning.patterns] in ft.toml.
     const MAX_SEEN_KEYS: usize = crate::tuning_config::PatternsTuning::DEFAULT_MAX_SEEN_KEYS;
     /// Default deduplication TTL
-    const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
+    const DEFAULT_TTL: Duration = Duration::from_mins(5);
     const MAX_TAIL_SIZE: usize = crate::tuning_config::PatternsTuning::DEFAULT_MAX_TAIL_SIZE_BYTES;
 
     /// Create a new empty detection context

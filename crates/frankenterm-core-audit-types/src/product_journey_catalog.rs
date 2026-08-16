@@ -1481,7 +1481,7 @@ const fn days_in_gregorian_month(year: u32, month: u32) -> u32 {
 }
 
 const fn is_gregorian_leap_year(year: u32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 fn is_direct_catalog_revision_successor(
@@ -5484,14 +5484,7 @@ fn is_canonical_utc_timestamp(value: &str) -> bool {
     let Some(second) = parse_decimal(&bytes[17..19]) else {
         return false;
     };
-    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap_year => 29,
-        2 => 28,
-        _ => return false,
-    };
+    let days_in_month = days_in_gregorian_month(year, month);
     (1..=days_in_month).contains(&day) && hour < 24 && minute < 60 && second < 60
 }
 
