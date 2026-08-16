@@ -27331,7 +27331,7 @@ fn encode_f32_embedding_blob(vector: &[f32]) -> Result<Vec<u8>> {
         .into());
     }
 
-    let mut out = Vec::with_capacity(vector.len() * 4);
+    let mut out = Vec::with_capacity(std::mem::size_of_val(vector));
     for value in vector {
         out.extend_from_slice(&value.to_le_bytes());
     }

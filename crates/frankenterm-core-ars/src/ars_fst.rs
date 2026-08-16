@@ -476,7 +476,7 @@ fn duration_us_saturating(duration: std::time::Duration) -> u64 {
 ///
 /// MinHash values are encoded as big-endian u64 bytes, concatenated.
 pub fn minhash_to_key(signature: &[u64]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(signature.len() * 8);
+    let mut key = Vec::with_capacity(std::mem::size_of_val(signature));
     for &val in signature {
         key.extend_from_slice(&val.to_be_bytes());
     }
