@@ -4060,6 +4060,8 @@ fn make_cal_result(
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
     /// All-passing strict => Approved.
     #[test]
     fn calibration_all_pass_approved(
