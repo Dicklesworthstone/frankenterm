@@ -190,7 +190,7 @@
         "paint_count": {"$ref": "#/$defs/u64"}, "frame_count": {"$ref": "#/$defs/u64"}
       }
     },
-    "counter_availability": {
+    "counter_unavailability": {
       "type": "object",
       "additionalProperties": false,
       "required": ["queue_depth", "oldest_queue_age_ns", "work_units", "bytes", "rows", "allocation_count", "allocated_bytes", "copy_count", "copied_bytes", "rpc_count", "delta_count", "dirty_rows", "full_viewport_clones", "cursor_row_duplicates", "paint_count", "frame_count"],
@@ -229,7 +229,7 @@
     "event": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "trace_id", "event_ordinal", "span_id", "parent_span_id", "stage", "stage_outcome", "producer", "topology", "started_at", "completed_at", "correlation", "counters", "counter_availability", "generations", "sampling_loss", "observation_boundary", "physical_detector"],
+      "required": ["schema_version", "trace_id", "event_ordinal", "span_id", "parent_span_id", "stage", "stage_outcome", "producer", "topology", "started_at", "completed_at", "correlation", "counters", "counter_unavailability", "generations", "sampling_loss", "observation_boundary", "physical_detector"],
       "properties": {
         "schema_version": {"const": "ft.interaction-trace.v2"},
         "trace_id": {"$ref": "#/$defs/trace_id"},
@@ -244,7 +244,7 @@
         "completed_at": {"$ref": "#/$defs/timestamp"},
         "correlation": {"$ref": "#/$defs/correlation"},
         "counters": {"$ref": "#/$defs/counters"},
-        "counter_availability": {"$ref": "#/$defs/counter_availability"},
+        "counter_unavailability": {"$ref": "#/$defs/counter_unavailability"},
         "generations": {"$ref": "#/$defs/generations"},
         "sampling_loss": {"$ref": "#/$defs/sampling_loss"},
         "observation_boundary": {"enum": ["internal_state", "software_present", "metal_drawable", "display_presented", "photon"]},

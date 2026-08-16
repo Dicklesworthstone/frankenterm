@@ -118,7 +118,7 @@ Every event has explicit queue depth and oldest age, generic work/byte/row
 counts, allocations/copies, RPCs, deltas, dirty rows, full viewport clones,
 cursor-row duplicates, paints, frames, and cumulative dropped/overwritten
 event counts. Zero means observed zero unless the corresponding boolean in the
-fixed-shape `counter_availability` object is `true`. Unavailable fields must
+fixed-shape `counter_unavailability` object is `true`. Unavailable fields must
 carry the zero placeholder, unknown fields fail deserialization, and any
 unavailable counter makes the trace diagnostic rather than qualifying. The
 fixed shape bounds deserialization and preserves the distinction between a

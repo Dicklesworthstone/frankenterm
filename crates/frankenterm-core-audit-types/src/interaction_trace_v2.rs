@@ -378,7 +378,7 @@ pub struct InteractionTracePhysicalDetector {
 
 /// Queue/work/allocation counters carried by every structured event.  A zero
 /// means observed zero unless the corresponding field in
-/// [`InteractionTraceCounterAvailability`] is `true`.  Producers unable to
+/// [`InteractionTraceCounterUnavailability`] is `true`.  Producers unable to
 /// observe a metric must declare it unavailable rather than inventing a value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -471,10 +471,10 @@ impl InteractionTraceCounterField {
 /// Explicit, fixed-size counter observability for one event.  `false` means
 /// the numeric value was observed, including observed zero; `true` means the
 /// corresponding numeric field is only a zero placeholder.  The fixed shape
-/// prevents hostile input from allocating an unbounded availability list.
+/// prevents hostile input from allocating an unbounded unavailability list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct InteractionTraceCounterAvailability {
+pub struct InteractionTraceCounterUnavailability {
     pub queue_depth: bool,
     pub oldest_queue_age_ns: bool,
     pub work_units: bool,
@@ -493,7 +493,7 @@ pub struct InteractionTraceCounterAvailability {
     pub frame_count: bool,
 }
 
-impl InteractionTraceCounterAvailability {
+impl InteractionTraceCounterUnavailability {
     /// Explicitly assert that every counter was observed.  There is
     /// intentionally no `Default` implementation: a producer must not gain a
     /// qualifying all-observed claim by mechanically defaulting the DTO.
@@ -520,7 +520,7 @@ impl InteractionTraceCounterAvailability {
     }
 
     #[must_use]
-    pub const fn is_complete(self) -> bool {
+    pub const fn is_all_available(self) -> bool {
         !self.queue_depth
             && !self.oldest_queue_age_ns
             && !self.work_units
@@ -605,7 +605,7 @@ pub struct InteractionTraceEventV2 {
     pub completed_at: InteractionTraceTimestamp,
     pub correlation: InteractionTraceCorrelation,
     pub counters: InteractionTraceCounters,
-    pub counter_availability: InteractionTraceCounterAvailability,
+    pub counter_unavailability: InteractionTraceCounterUnavailability,
     pub generations: InteractionTraceGenerations,
     pub sampling_loss: InteractionTraceSamplingLoss,
     pub observation_boundary: InteractionTraceObservationBoundary,
@@ -730,7 +730,7 @@ impl InteractionTraceV2 {
                     outcome: event.stage_outcome,
                 });
             }
-            if !event.counter_availability.is_complete() {
+            if !event.counter_unavailability.is_all_available() {
                 return Err(TraceContractError::CountersUnavailable {
                     event_ordinal: event.event_ordinal,
                 });
@@ -874,7 +874,7 @@ fn validate_event(
     event.duration_ns()?;
     validate_correlation(event.correlation)?;
     validate_stage_outcome(event)?;
-    validate_counter_availability(event)?;
+    validate_counter_unavailability(event)?;
     validate_generations(event)?;
     validate_observation_boundary(event)?;
     Ok(())
@@ -905,11 +905,11 @@ fn validate_stage_outcome(event: &InteractionTraceEventV2) -> Result<(), TraceCo
     Ok(())
 }
 
-fn validate_counter_availability(
+fn validate_counter_unavailability(
     event: &InteractionTraceEventV2,
 ) -> Result<(), TraceContractError> {
     for field in InteractionTraceCounterField::ALL {
-        if event.counter_availability.is_unavailable(field) && event.counters.value(field) != 0 {
+        if event.counter_unavailability.is_unavailable(field) && event.counters.value(field) != 0 {
             return Err(TraceContractError::UnavailableCounterHasValue { field });
         }
     }
@@ -1566,7 +1566,7 @@ mod tests {
                 protocol_generation: 1,
             },
             counters: InteractionTraceCounters::default(),
-            counter_availability: InteractionTraceCounterAvailability::all_available(),
+            counter_unavailability: InteractionTraceCounterUnavailability::all_available(),
             generations: InteractionTraceGenerations {
                 terminal_generation: Some(1),
                 snapshot_generation: Some(1),
@@ -1794,7 +1794,7 @@ mod tests {
     #[test]
     fn counter_unavailability_is_explicit_and_non_qualifying() {
         let mut trace = keypress_trace(1);
-        trace.events[3].counter_availability.queue_depth = true;
+        trace.events[3].counter_unavailability.queue_depth = true;
         assert!(trace.validate_structure().is_ok());
         assert_eq!(
             trace.validate_qualifying(),
@@ -1811,9 +1811,9 @@ mod tests {
     }
 
     #[test]
-    fn outcome_and_counter_availability_are_mandatory_closed_metadata() {
+    fn outcome_and_counter_unavailability_are_mandatory_closed_metadata() {
         let encoded = serde_json::to_value(keypress_trace(1)).expect("trace serializes");
-        for field in ["stage_outcome", "counter_availability"] {
+        for field in ["stage_outcome", "counter_unavailability"] {
             let mut missing = encoded.clone();
             missing["events"][0]
                 .as_object_mut()
@@ -1825,12 +1825,25 @@ mod tests {
             );
         }
 
-        let mut unknown = encoded;
-        unknown["events"][0]["counter_availability"]["unknown_counter"] =
+        let mut unknown = encoded.clone();
+        unknown["events"][0]["counter_unavailability"]["unknown_counter"] =
             serde_json::json!(false);
         assert!(
             serde_json::from_value::<InteractionTraceV2>(unknown).is_err(),
             "unknown counter availability unexpectedly decoded"
+        );
+
+        let mut inverted_name = encoded;
+        let first_event = inverted_name["events"][0]
+            .as_object_mut()
+            .expect("event is an object");
+        let flags = first_event
+            .remove("counter_unavailability")
+            .expect("fixture carries counter unavailability");
+        first_event.insert("counter_availability".to_owned(), flags);
+        assert!(
+            serde_json::from_value::<InteractionTraceV2>(inverted_name).is_err(),
+            "inverted counter-availability field name unexpectedly decoded"
         );
     }
 
