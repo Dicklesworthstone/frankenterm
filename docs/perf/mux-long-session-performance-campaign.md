@@ -222,12 +222,16 @@ The full-grid triple-buffer and true asynchronous viewport-first architectures
 described elsewhere in the docs are not wired into this live paint/reflow path
 today. They remain candidate designs, not current performance facts.
 
-### 2.2.1 Live snapshot and damage reconciliation (2026-08-07)
+### 2.2.1 Live snapshot and damage reconciliation (2026-08-15)
 
 This is the retained source reconciliation for
 `ft-interactive-systems-performance-4tenz.6.1`. It is a call-graph audit, not a
 native performance result or a renderer cutover. No M4/M5, `trj`, LAN, visual,
 or latency claim follows from it.
+
+The current-source revalidation used code baseline
+`eeb88117b129e63baae6d854d14f944776f6862e`. The documentation-only audit
+changes that follow do not alter that producer/consumer graph.
 
 The current local producer-to-present path is:
 
@@ -252,9 +256,17 @@ important remaining critical section is still long:
 `terminal_with_lines_mut_and_apply_hyperlinks` invokes the GUI's `LineRender`
 callback while the terminal guard is alive, and that callback performs line
 hashing, cache-key construction, shaping, glyph/atlas work, and quad
-construction. The PTY parser needs the same terminal mutex. This tranche
-removes redundant locking/traversal; it does not implement the short-lock
-immutable snapshot required by `.6.3`.
+construction, including fallible heap-quad growth and LFU updates. The PTY
+parser needs the same terminal mutex. This tranche removes redundant
+locking/traversal; it does not implement the short-lock immutable snapshot
+required by `.6.3`.
+
+The optional `disruptor-pane-io` feature does not change that default shipped
+fact. It is absent from `frankenterm/mux`'s default features. When explicitly
+enabled it can stage parser actions while paint owns the terminal mutex, but
+the next terminal accessor drains those actions under the same mutex and ring
+saturation falls back to blocking application. It is a bounded experimental
+producer-side mitigation, not a renderer snapshot or lock-elimination proof.
 
 The current remote path is:
 
@@ -285,10 +297,15 @@ decoded/GPU/in-flight unified budget yet; `.6.7.1` owns that architectural gap.
 
 The transactional `PaneRenderBeginSnapshot` and delivery-coordinator state
 machines in `sessionhandler.rs` are compiled and tested but explicitly
-`dead_code` pending live ownership transfer. The production legacy
-`PerPane::compute_changes` path still advances its baseline without an
-application acknowledgement. It is therefore incorrect to describe the
-transactional path as the live server authority.
+`dead_code` pending live ownership transfer. `PerPane::compute_changes` is now
+also `#[cfg(test)]`; it is not the legacy production entry point. Production
+uses `prepare_legacy_render_enqueue`, installs an `InFlight` baseline revision,
+and acknowledges or rolls that exact revision back when bounded queue admission
+settles. That closes speculative pre-enqueue publication, but queue admission
+is still not a client application acknowledgement. A successfully enqueued
+delta that is lost before client application has no application-owned retry
+receipt. It is therefore still incorrect to describe either the transactional
+model or queue admission as the live end-to-end render authority.
 
 | Substrate or claim | Live classification | Production effect | Exact gap |
 |---|---|---|---|
@@ -299,10 +316,51 @@ transactional path as the live server authority.
 | `render::per_row_quad_cache` | test-only foundation | pure invalidation-plan tests | no live paint consumer and no owned per-row quad vectors |
 | GUI `TerminalStateTripleBufferRegistry` | dormant/test foundation | explicit APIs and tests can publish metadata and derive watchdog health | no production producer, frame/status consumer, or renderer acquisition path; payload also lacks lines, attributes, images, hyperlinks, selection, IME, and render geometry |
 | `DifferentialCellStream` GPU delta | compiled test-only/dormant | unit tests exercise CPU diff and ring policy | types and implementation are `allow(dead_code)` and WebGPU paint has no consumer |
-| server transactional render attempt/coordinator | partial/dormant | model and unit tests cover preparation/settlement identities | legacy `compute_changes` remains live; no application-ACK-owned commit path |
-| server legacy render delta | wired, coarse | uses checked ranges, a source fence, saturation requery, and rollback/redirty on failed preparation or enqueue | clones the complete viewport before filtering; has no client application ACK and no autonomous retry of a successfully enqueued but unapplied delta |
+| server transactional render attempt/coordinator | partial/dormant | model and unit tests cover preparation/settlement identities | live ownership still uses `prepare_legacy_render_enqueue`; no application-ACK-owned commit path |
+| server legacy render delta | wired, coarse | uses checked ranges, a source fence, exact enqueue-phase baseline settlement, saturation rejection, and rollback/redirty on failed preparation or enqueue | clones the complete viewport before filtering; has no client application ACK and no autonomous retry of a successfully enqueued but unapplied delta |
 | client `RenderablePane` and `ClientPane` adapter | wired, partial | bounds line/image resources, caches received rows, reconciles prediction, retains safe shape appdata, and serves GUI lines | GUI adapter clones the requested range and allocates a mutable-reference vector; coordinate image hydration lacks global singleflight/batch ownership |
 | GUI renderer behavior tests | partial topology | pure helpers and library-owned surfaces execute under ordinary tests | the binary-owned `TermWindow`/renderer modules are declared with `test = false`; `.6.8.1` owns making their production behavior executable under normal gates |
+
+Closed historical beads are evidence only for the exact slice in their close
+reason. Their titles or original acceptance text do not upgrade a foundation
+into a production cutover:
+
+| Closed bead family | Retained result | Current production verdict |
+|---|---|---|
+| `ft-2okh0.3`, `ft-2okh0.3.2`, `ft-ipau0`, `ft-zkahy`, `ft-kyail`, `ft-r9kr6` | triple-buffer mechanics, watchdog policy, GUI registry/health adapters, and focused tests | **dormant/test foundation**: no production terminal-line producer or renderer acquire; the registered payload is the six-field persistence `TerminalState`, not renderable terminal state |
+| `ft-tfzhy`, `ft-5ykn9`, `ft-jvj78`, `ft-8pcwy` | live dirty bitmaps, sources, settlement, counters, and helpers | **wired but partial**: every visible row still enters the callback and constructs a cache key; dirty iteration is not the live row traversal authority |
+| `ft-mpc9b.1.5`, `ft-556zx` | invalidation-plan and telemetry foundations | **test-only**: production still owns the LFU `line_quad_cache`; there is no row-indexed quad owner or live `RowInvalidationPlan` consumer |
+| `ft-mpc9b.6.7` | CPU differential-cell/ring model and unit tests | **test-only**: no WebGPU upload or paint consumer exists |
+| `ft-87qfi` | bounded action-ring implementation and feature-gated concurrency tests | **off by default**: it neither removes the terminal mutex nor shortens the renderer's callback critical section |
+
+These classifications deliberately override any broader wording in historical
+bead titles, descriptions, or close reasons. A closed substrate is still useful
+engineering work, but it cannot be counted as shipped renderer behavior until
+the current production caller and consumer are both present and proved.
+
+Current-source anchors for this verdict are:
+
+- `frankenterm/mux/Cargo.toml:10-18` keeps `disruptor-pane-io` outside the
+  default feature set;
+- `crates/frankenterm-gui/src/termwindow/mod.rs:2134-2140` exposes the only
+  terminal-state registry publication method, and the repository-wide caller
+  census finds no production invocation;
+- `frankenterm/mux/src/localpane.rs:912-927` acquires the terminal guard before
+  calling `terminal_with_lines_mut_and_apply_hyperlinks`;
+- `frankenterm/mux/src/renderable.rs:173-203` runs both implicit-link mutation
+  and the caller callback while that guard remains borrowed;
+- `crates/frankenterm-gui/src/termwindow/render/pane.rs:650-840` performs the
+  metadata read, line hash, LFU lookup, shaping/glyph/atlas/quad work, cache
+  insertion, and every-visible-row callback before returning;
+- `crates/frankenterm-mux-server-impl/src/sessionhandler.rs:1563-1678` marks
+  `compute_changes` test-only and defines the live legacy enqueue guard, while
+  `:2072-2174` retains the transactional preparation behind explicit
+  `dead_code` ownership-transfer annotations;
+- `frankenterm/client/src/pane/clientpane.rs:1376-1396` clones the requested
+  remote rows, allocates the mutable-reference vector, renders outside the
+  cache lock, and conditionally writes unchanged appdata back; and
+- `crates/frankenterm-gui/src/quad.rs:202-437` keeps the differential-cell
+  stream and replay helper explicitly `dead_code` pending WebGPU cutover.
 
 The audit also found that GUI renderer damage discovery had reused
 `Selection::seqno` as its render watermark. With no active selection that

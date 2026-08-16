@@ -4086,6 +4086,31 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote metadata/lifecycle separation as a performance improvement only after retained same-source aged-session runs on the intended M4/M5 Mac and 64-core/128-thread `trj` Threadripper over the direct LAN record p50/p95/p99/p999 keypress-to-PTY and keypress-to-presented-frame latency, resize/zoom frame and reflow latency, queue depth/age, metadata write amplification, RSS/allocation/resource envelopes, and deterministic byte/state/visual/cursor/IME/accessibility equivalence.
 
+### IS-N134 — A closed renderer substrate bead is not a production cutover
+
+- **Classification:** closed-status and wrong-call-graph rejection; current
+  source reconciliation retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.6.1`
+- **Rejected inference:** closed triple-buffer, dirty-line, row-quad-cache,
+  differential-GPU, or action-ring beads prove that production paint consumes
+  immutable snapshots, traverses only dirty rows, owns quads by row, uploads
+  cell deltas, or avoids terminal-mutex contention.
+- **Negative evidence:** production local paint still calls
+  `LocalPane::with_lines_mut_and_apply_hyperlinks` and executes line hashing,
+  LFU cache lookup, shaping, glyph/atlas work, heap-quad construction, and LFU
+  insertion while the terminal mutex is held. The GUI triple-buffer registry
+  has no production publisher or renderer acquire path and stores only the
+  persistence-oriented six-field `TerminalState`. `RowInvalidationPlan` and
+  `DifferentialCellStream` have no production consumers. `disruptor-pane-io`
+  is absent from mux default features and, when enabled, still drains and
+  falls back under the terminal mutex.
+- **Decision:** retain every useful foundation, test, telemetry surface, and
+  bounded experimental feature. Classify each by its current producer and
+  consumer, and reject production, latency, memory, visual, M4/M5, or
+  Threadripper claims from closed status or synthetic fixtures alone.
+- **Primary retry condition:**
+  > Promote a renderer substrate to production only after current-source call-graph proof names its live producer and consumer, strict nonlaunching gates exercise the exact path with nonzero tests, and authorized same-source M4/M5/Threadripper workloads establish byte/state/visual equivalence plus a retained latency and resource win without touching an operator session.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
