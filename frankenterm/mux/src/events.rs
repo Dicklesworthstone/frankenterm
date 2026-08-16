@@ -1,11 +1,14 @@
-//! Native event bus for hot-path event dispatch.
+//! Typed event bus intended for latency-sensitive dispatch.
 //!
-//! Replaces Lua callbacks in performance-critical paths (update-status,
-//! pane-output, user-var-changed, window-resized) with typed Rust handlers.
+//! This models a possible replacement for Lua callbacks in performance-critical
+//! paths (update-status, pane-output, user-var-changed, window-resized) with
+//! typed Rust handlers.
 //!
 //! Handler PRIORITY ordering is **Native → WASM → Lua**: native handlers run
-//! first (with zero allocation overhead), and any scripting-engine handlers
-//! would run after them via the `ScriptingEngine` trait's `fire_event` method.
+//! first, and any scripting-engine handlers would run after them via the
+//! `ScriptingEngine` trait's `fire_event` method. Dispatch currently clones
+//! matching handler `Arc`s into a temporary vector and collects action vectors;
+//! no allocation or latency bound is claimed.
 //!
 //! NOTE: this bus is currently a benchmark/test substrate rather than a live
 //! mux event path. No production code outside this module constructs or fires
@@ -31,7 +34,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
-    /// Status bar update (fired every render frame, ~60 Hz).
+    /// Status bar update category for a future live producer.
     UpdateStatus,
     /// A user variable changed on a pane.
     UserVarChanged,
@@ -79,12 +82,12 @@ impl std::fmt::Display for EventType {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HandlerPriority {
-    /// Rust-native handlers — zero overhead, dispatched first.
+    /// Rust-native handlers, dispatched first.
     #[default]
     Native = 0,
-    /// WASM sandbox handlers — ~100 μs overhead.
+    /// WASM sandbox handlers, dispatched after native handlers.
     Wasm = 1,
-    /// Lua scripting handlers — ~1 ms overhead.
+    /// Lua scripting handlers, dispatched last.
     Lua = 2,
 }
 
@@ -94,8 +97,8 @@ pub enum HandlerPriority {
 
 /// Typed payload carried by events.
 ///
-/// Avoids the `Value` conversion overhead of the scripting layer by using
-/// concrete Rust types for the hot paths.
+/// Uses concrete Rust types rather than the scripting layer's dynamic `Value`
+/// representation. The dormant bus has no production overhead claim.
 #[derive(Clone, Debug)]
 pub enum EventPayload {
     /// No payload.
@@ -393,7 +396,7 @@ struct HandlerRecord {
 // EventBus
 // ---------------------------------------------------------------------------
 
-/// The native event bus for hot-path event dispatch.
+/// Typed in-memory event bus with deterministic handler-priority ordering.
 ///
 /// Handlers are dispatched in priority order (Native → Wasm → Lua).
 /// Within the same priority level, handlers fire in registration order.

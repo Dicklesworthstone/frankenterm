@@ -13,7 +13,9 @@
 //! ```
 //!
 //! The adapter is designed as an observer (tap) that does not modify the
-//! upstream pipeline. It is zero-cost when no sink is attached.
+//! upstream pipeline. A missing sink avoids downstream persistence, but the
+//! caller and adapter still execute a branch; no literal zero-cost claim is
+//! made.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -146,7 +148,10 @@ pub trait CaptureSink: Send + Sync {
     fn on_event(&self, event: RecorderEvent, merge_key: RecorderMergeKey);
 }
 
-/// No-op sink that discards all events (zero overhead).
+/// No-op sink that discards all events.
+///
+/// Capture still constructs and routes an event before this sink discards it,
+/// so this type is a behavioral fixture rather than a zero-overhead guarantee.
 pub struct NoopCaptureSink;
 
 impl CaptureSink for NoopCaptureSink {
@@ -291,7 +296,7 @@ impl CaptureAdapter {
         }
     }
 
-    /// Create a capture adapter with a no-op sink (zero overhead).
+    /// Create a capture adapter with a no-op sink.
     #[must_use]
     pub fn disabled() -> Self {
         Self::new(
