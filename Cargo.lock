@@ -3807,6 +3807,7 @@ dependencies = [
  "ed25519-dalek",
  "frankenterm-core-replay-types",
  "jsonschema",
+ "proptest",
  "serde",
  "serde_json",
  "sha2 0.11.0",

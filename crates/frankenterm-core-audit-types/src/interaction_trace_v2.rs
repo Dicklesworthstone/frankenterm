@@ -189,17 +189,84 @@ impl InteractionTraceStage {
         }
     }
 
+    /// Zero-based position in the frozen K0-K13 or R0-R25 inventory.
+    ///
+    /// This is the allocation-free stage identity frozen for flight-recorder
+    /// implementations.  Its value follows the corresponding `ALL` array;
+    /// changing either order is a schema change.
     #[must_use]
-    pub fn expected(path: InteractionTracePath) -> Vec<Self> {
+    pub const fn ordinal(self) -> u8 {
+        match self {
+            Self::Keypress(stage) => match stage {
+                RendererKeypressTraceStage::KeyAppkitReceipt => 0,
+                RendererKeypressTraceStage::GuiKeyMappingComplete => 1,
+                RendererKeypressTraceStage::ClientRpcEnqueue => 2,
+                RendererKeypressTraceStage::ClientEncodeSocketFlush => 3,
+                RendererKeypressTraceStage::ServerReadableDecode => 4,
+                RendererKeypressTraceStage::ServerDispatchMuxWait => 5,
+                RendererKeypressTraceStage::TerminalLockPtyWriteFlush => 6,
+                RendererKeypressTraceStage::PtyEchoParserApply => 7,
+                RendererKeypressTraceStage::ServerDeltaCompute => 8,
+                RendererKeypressTraceStage::ClientReceiveDecodeApply => 9,
+                RendererKeypressTraceStage::LocalMuxGuiInvalidation => 10,
+                RendererKeypressTraceStage::PaintShapeAtlas => 11,
+                RendererKeypressTraceStage::GpuSubmitDrawableRequest => 12,
+                RendererKeypressTraceStage::DisplayCompletion => 13,
+            },
+            Self::ResizeZoom(stage) => match stage {
+                RendererResizeTraceStage::NativeEventReceipt => 0,
+                RendererResizeTraceStage::GuiReturn => 1,
+                RendererResizeTraceStage::IntentEnqueue => 2,
+                RendererResizeTraceStage::MuxResizeDispatch => 3,
+                RendererResizeTraceStage::PaneResizeApply => 4,
+                RendererResizeTraceStage::IntentSupersession => 5,
+                RendererResizeTraceStage::WorkerCreate => 6,
+                RendererResizeTraceStage::WorkerStart => 7,
+                RendererResizeTraceStage::TerminalLockWait => 8,
+                RendererResizeTraceStage::TerminalLockHold => 9,
+                RendererResizeTraceStage::ViewportReflow => 10,
+                RendererResizeTraceStage::NearReflow => 11,
+                RendererResizeTraceStage::ColdReflow => 12,
+                RendererResizeTraceStage::FirstCoherentViewport => 13,
+                RendererResizeTraceStage::WorkerJoin => 14,
+                RendererResizeTraceStage::GuiInvalidation => 15,
+                RendererResizeTraceStage::Paint => 16,
+                RendererResizeTraceStage::TextShaping => 17,
+                RendererResizeTraceStage::GlyphRaster => 18,
+                RendererResizeTraceStage::GlyphAtlas => 19,
+                RendererResizeTraceStage::LineQuadReuseRebuild => 20,
+                RendererResizeTraceStage::GpuBind => 21,
+                RendererResizeTraceStage::GpuUpload => 22,
+                RendererResizeTraceStage::GpuSubmit => 23,
+                RendererResizeTraceStage::DrawablePresentRequest => 24,
+                RendererResizeTraceStage::DisplayCompletion => 25,
+            },
+        }
+    }
+
+    /// Number of stage slots in the frozen inventory for `path`.
+    #[must_use]
+    pub const fn stage_count(path: InteractionTracePath) -> u8 {
         match path {
-            InteractionTracePath::Keypress => RendererKeypressTraceStage::ALL
-                .into_iter()
-                .map(Self::Keypress)
-                .collect(),
-            InteractionTracePath::ResizeZoom => RendererResizeTraceStage::ALL
-                .into_iter()
-                .map(Self::ResizeZoom)
-                .collect(),
+            InteractionTracePath::Keypress => RendererKeypressTraceStage::ALL.len() as u8,
+            InteractionTracePath::ResizeZoom => RendererResizeTraceStage::ALL.len() as u8,
+        }
+    }
+
+    /// Resolve a zero-based frozen stage ordinal without allocating.
+    #[must_use]
+    pub const fn from_ordinal(path: InteractionTracePath, ordinal: u8) -> Option<Self> {
+        if ordinal >= Self::stage_count(path) {
+            return None;
+        }
+
+        match path {
+            InteractionTracePath::Keypress => Some(Self::Keypress(
+                RendererKeypressTraceStage::ALL[ordinal as usize],
+            )),
+            InteractionTracePath::ResizeZoom => Some(Self::ResizeZoom(
+                RendererResizeTraceStage::ALL[ordinal as usize],
+            )),
         }
     }
 
@@ -644,7 +711,6 @@ impl InteractionTraceV2 {
             });
         }
 
-        let expected = InteractionTraceStage::expected(self.path);
         let mut spans = BTreeSet::new();
         let mut seen_stages = BTreeSet::new();
         let mut last_start_by_clock = BTreeMap::new();
@@ -682,7 +748,10 @@ impl InteractionTraceV2 {
             } else {
                 trace_topology = Some(event.topology);
             }
-            let Some(expected_stage) = expected.get(index).copied() else {
+            let Some(expected_stage) = u8::try_from(index)
+                .ok()
+                .and_then(|ordinal| InteractionTraceStage::from_ordinal(self.path, ordinal))
+            else {
                 return Err(TraceContractError::UnexpectedStage { stage: event.stage });
             };
             if event.stage != expected_stage {
@@ -717,10 +786,17 @@ impl InteractionTraceV2 {
     /// Qualify a trace for its declared (still bounded) claim class.
     pub fn validate_qualifying(&self) -> Result<InteractionTraceClaimBoundary, TraceContractError> {
         self.validate_structure()?;
-        let expected = InteractionTraceStage::expected(self.path);
-        if self.events.len() != expected.len() {
+        let expected_count = usize::from(InteractionTraceStage::stage_count(self.path));
+        if self.events.len() != expected_count {
+            let missing_stage = u8::try_from(self.events.len())
+                .ok()
+                .and_then(|ordinal| InteractionTraceStage::from_ordinal(self.path, ordinal))
+                .ok_or(TraceContractError::TooManyEvents {
+                    actual: self.events.len(),
+                    maximum: expected_count,
+                })?;
             return Err(TraceContractError::MissingStage {
-                stage: expected[self.events.len()],
+                stage: missing_stage,
             });
         }
         for event in &self.events {
@@ -1630,6 +1706,55 @@ mod tests {
             path: InteractionTracePath::ResizeZoom,
             events,
         }
+    }
+
+    #[test]
+    fn frozen_stage_ordinals_round_trip_without_allocation() {
+        assert_eq!(
+            InteractionTraceStage::stage_count(InteractionTracePath::Keypress),
+            14
+        );
+        assert_eq!(
+            InteractionTraceStage::stage_count(InteractionTracePath::ResizeZoom),
+            26
+        );
+
+        for (ordinal, stage) in RendererKeypressTraceStage::ALL.into_iter().enumerate() {
+            let stage = InteractionTraceStage::Keypress(stage);
+            assert_eq!(stage.ordinal(), ordinal as u8);
+            assert_eq!(
+                InteractionTraceStage::from_ordinal(InteractionTracePath::Keypress, ordinal as u8),
+                Some(stage)
+            );
+        }
+        for (ordinal, stage) in RendererResizeTraceStage::ALL.into_iter().enumerate() {
+            let stage = InteractionTraceStage::ResizeZoom(stage);
+            assert_eq!(stage.ordinal(), ordinal as u8);
+            assert_eq!(
+                InteractionTraceStage::from_ordinal(
+                    InteractionTracePath::ResizeZoom,
+                    ordinal as u8
+                ),
+                Some(stage)
+            );
+        }
+
+        assert_eq!(
+            InteractionTraceStage::from_ordinal(InteractionTracePath::Keypress, 14),
+            None
+        );
+        assert_eq!(
+            InteractionTraceStage::from_ordinal(InteractionTracePath::ResizeZoom, 26),
+            None
+        );
+        assert_eq!(
+            InteractionTraceStage::from_ordinal(InteractionTracePath::Keypress, u8::MAX),
+            None
+        );
+        assert_eq!(
+            InteractionTraceStage::from_ordinal(InteractionTracePath::ResizeZoom, u8::MAX),
+            None
+        );
     }
 
     #[test]

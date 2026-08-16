@@ -67,6 +67,8 @@
 //! Renderer SLO evidence:
 //! - [`input_to_photon`] — portable input-to-photon trace/evidence DTOs and
 //!   known-key summarization used by renderer SLO proof lanes.
+//! - [`interaction_flight_recorder_v1`] — bounded recorder epoch, sampling,
+//!   accounting, export, and certification contracts.
 //! - [`renderer_scenario_catalog`] — contract-only resize/zoom scenario,
 //!   topology, corpus-authority, checkpoint, and negative-control vocabulary.
 //!
@@ -81,6 +83,7 @@ pub mod canary_rehearsal;
 pub mod cutover_evidence;
 pub mod forensic_export;
 pub mod input_to_photon;
+pub mod interaction_flight_recorder_v1;
 pub mod interaction_trace_v2;
 pub mod migration_rehearsal;
 // [ft-nsoxc / ft-8nqx0 Phase 5] Reasoning-contract types consumed by
