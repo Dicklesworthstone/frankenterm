@@ -213,7 +213,7 @@ Every test run that produces artifacts MUST generate a manifest file.
   "environment": {
     "hostname": "devbox",
     "os": "Linux 6.x x86_64",
-    "rust_version": "1.85.0-nightly",
+    "rust_version": "1.95.0-nightly",
     "ft_version": "0.1.0",
     "ft_commit": "deadbeef",
     "wezterm_version": "20250101-120000-abc123",

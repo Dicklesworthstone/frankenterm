@@ -116,7 +116,7 @@ default-members = [
 [workspace.package]
 version = "0.13.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 authors = ["Dicklesworthstone"]
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankenterm"

@@ -5,6 +5,11 @@
 > Date: 2026-02-22
 > Prerequisites: COMPREHENSIVE_ANALYSIS_OF_fastmcp_ruse.md (ft-2vuw7.26.2)
 
+> **Current dependency correction (2026-08-16):** this plan predates the
+> shipped FastMCP integration and must not be used as live version authority.
+> FrankenTerm currently pins FastMCP 0.3.1, FastAPI 0.3.0, and Asupersync
+> 0.3.10. `Cargo.toml`, `Cargo.lock`, and `UPGRADE_LOG.md` are authoritative.
+
 ---
 
 ## P1: Integration Objectives, Constraints, and Non-Goals
@@ -23,9 +28,13 @@
 
 ### Constraints
 
-- **Shared `asupersync 0.2` runtime**: Both FrankenTerm and fastmcp_rust depend on `asupersync 0.2`. Versions must remain aligned. FrankenTerm currently pins asupersync via `[patch]` sections to rev `c7c15f6` -- fastmcp_rust must use the same revision to avoid duplicate crate instances. This is already handled in the workspace `Cargo.toml` via `[patch."https://github.com/Dicklesworthstone/fastmcp_rust"]`.
+- **Shared Asupersync runtime**: Both FrankenTerm and FastMCP must resolve one
+  Asupersync type universe. The current graph uses the published Asupersync
+  0.3.10 release throughout; it no longer uses the historical 0.2 git patch.
+  Any future runtime update must migrate FastMCP, FastAPI, and FrankenSearch as
+  one compatible cohort rather than admitting split runtime versions.
 
-- **Nightly Rust toolchain**: fastmcp_rust requires nightly (`rust-toolchain.toml` specifies nightly, MSRV 1.85). FrankenTerm already uses edition 2024 with `rust-version = "1.85"`, so this is compatible. However, the nightly requirement must be documented in FrankenTerm's build prerequisites and CI configuration.
+- **Nightly Rust toolchain**: fastmcp_rust requires nightly (`rust-toolchain.toml` specifies nightly, MSRV 1.85). FrankenTerm uses edition 2024 with `rust-version = "1.95"`, the minimum required by its pinned FrankenSearch revision, so this remains compatible. The nightly requirement must be documented in FrankenTerm's build prerequisites and CI configuration.
 
 - **Feature-gated behind `mcp-server`**: All fastmcp integration lives behind the existing `mcp-server` feature flag (defined in `crates/frankenterm-core/Cargo.toml` as `mcp-server = ["dep:fastmcp", "dep:toon_rust"]`). The default build compiles without MCP support. A new `mcp-client` feature will be added for the client-side capability.
 
@@ -63,14 +72,15 @@ Import `fastmcp-server`, `fastmcp-core`, `fastmcp-protocol`, `fastmcp-client`, a
 - `MemoryTransport` enables in-process MCP testing without spawning subprocesses
 - Server composition via `ProxyCatalog` for multi-server topologies
 - MCP client capability for external tool orchestration
-- Shared `asupersync` runtime means zero overhead for async boundary crossings
+- One Asupersync runtime avoids a second executor and runtime-bridge layer;
+  ordinary scheduling and synchronization costs still apply
 - `#![forbid(unsafe_code)]` alignment
 
 **Cons**:
 - Large transitive dependency surface (~105K LOC across all fastmcp crates)
 - `fastmcp-server` hard-depends on `fastmcp-console` (brings `rich_rust`, `tracing-subscriber`)
 - Nightly Rust requirement propagated to FrankenTerm's build chain
-- `asupersync` version coupling requires coordinated patch sections
+- Asupersync version coupling requires coordinated dependency-cohort updates
 - Migration effort: existing 20+ tools and 12+ resources must be ported
 - Console/logging initialization may conflict with FrankenTerm's existing `tracing` setup
 
@@ -1021,7 +1031,7 @@ Each phase can be independently rolled back:
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
 | Proc macro compile errors on nightly update | Medium | Medium | Pin nightly version in `rust-toolchain.toml`; `trybuild` tests catch macro regressions |
-| asupersync version drift between FrankenTerm and fastmcp | Low | High | `[patch]` sections in workspace Cargo.toml pin to exact rev |
+| Asupersync version drift between FrankenTerm and FastMCP | Low | High | Enforce one resolved Asupersync package and migrate the dependency cohort together |
 | Middleware ordering bugs (format vs audit) | Medium | Low | Explicit ordering tests; middleware integration test suite |
 | Tool migration introduces response format differences | Medium | Medium | Golden-file response comparison for every migrated tool |
 | Console/logging initialization conflict | Low | Medium | Disable fastmcp console output; use FrankenTerm's tracing subscriber |
@@ -1033,7 +1043,11 @@ Each phase can be independently rolled back:
 
 ### Architecture Decision
 
-**Library import** (Option A) of `fastmcp-server`, `fastmcp-core`, `fastmcp-protocol`, `fastmcp-client`, and `fastmcp-derive` as workspace dependencies. The shared `asupersync 0.2` runtime eliminates async boundary friction and makes this the natural MCP framework for FrankenTerm.
+**Library import** (Option A) of `fastmcp-server`, `fastmcp-core`,
+`fastmcp-protocol`, `fastmcp-client`, and `fastmcp-derive` as workspace
+dependencies. The shared Asupersync 0.3.10 runtime avoids a second executor
+and runtime-bridge layer while retaining ordinary scheduling and
+synchronization costs.
 
 ### New Modules
 

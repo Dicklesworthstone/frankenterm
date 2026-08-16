@@ -2190,10 +2190,16 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   counters and the mux handler-ID allocator.
 - **Negative evidence:** strict remote all-target Clippy job
   `j-29959181985382549` rejected the recorder candidate because
-  `try_update` was stabilized in Rust 1.95 while the workspace contract is
-  Rust 1.85. Reverting only to `fetch_update` would satisfy that minimum but
-  retain a warning denied by the current pinned nightly. Neither choice is an
-  admissible workspace-wide fix.
+  `try_update` was stabilized in Rust 1.95 while the workspace contract at the
+  time was Rust 1.85. The workspace now correctly declares Rust 1.95 because
+  its immutable FrankenSearch pin requires that floor, so the original
+  compiler rejection remains historical negative evidence rather than the
+  current API constraint. Reverting only to `fetch_update` would have
+  satisfied the former minimum but retained a warning denied by the pinned
+  nightly. The explicit checked-CAS implementation remains the admitted
+  behavior because it already carries the required sticky-exhaustion and
+  contention proof; an MSRV correction alone is not a reason to churn this hot
+  path.
 - **Decision:** commits `5b42730fb8747f458c2bd2b708666bf03d25e5c6`
   and `ac067dff432be76f43173ff7c0d4eba31437a05d` use explicit
   `compare_exchange_weak` retry loops with checked successor arithmetic. The

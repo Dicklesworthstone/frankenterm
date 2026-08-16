@@ -76,7 +76,7 @@ When bumping the ftui pin, review the upstream diff for:
       conflict with ft's dependency graph (especially `unicode-width`,
       `crossterm`, or async runtime crates)
 - [ ] **Minimum Rust version** — ftui must not require a newer MSRV than ft
-      (currently nightly/1.85)
+      (currently nightly/1.95)
 - [ ] **Removed re-exports** — ensure nothing ft imports was dropped from
       `ftui/src/lib.rs`
 

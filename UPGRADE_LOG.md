@@ -1,10 +1,13 @@
 # Dependency Upgrade Log
 
-**Started:** 2026-06-14  |  **Updated:** 2026-08-14  |  **Project:** frankenterm  |  **Language:** Rust + GitHub Actions
+**Started:** 2026-06-14  |  **Updated:** 2026-08-16  |  **Project:** frankenterm  |  **Language:** Rust + GitHub Actions
 
 ## Summary
 
 - **Updated:** GitHub Actions, direct Cargo registry dependencies, and `Cargo.lock`
+- **Corrected:** workspace MSRV `1.85 -> 1.95` to match the immutable
+  FrankenSearch revision already pinned in `Cargo.lock`; this changes no
+  dependency identity
 - **Skipped:** no direct dependency update intentionally skipped
 - **Failed:** no code migration currently known failed
 - **Needs attention:** final remote `rch` workspace proof and coordinated Asupersync ecosystem convergence; see Proof and the targeted campaign below

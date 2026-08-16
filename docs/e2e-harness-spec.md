@@ -93,7 +93,7 @@ timestamp: 2026-01-19T09:00:00Z
 wezterm_version: 20250101-120000-abc123
 ft_version: 0.1.0
 ft_commit: deadbeef
-rust_version: 1.85.0-nightly
+rust_version: 1.95.0-nightly
 os: Linux 6.x x86_64
 shell: /bin/bash
 temp_workspace: /tmp/ft-e2e-abc123

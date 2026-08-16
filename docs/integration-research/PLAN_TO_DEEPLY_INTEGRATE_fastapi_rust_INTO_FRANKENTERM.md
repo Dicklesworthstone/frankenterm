@@ -5,6 +5,12 @@
 > Date: 2026-02-22
 > Prerequisites: COMPREHENSIVE_ANALYSIS_OF_fastapi_rust.md (ft-2vuw7.25.2)
 
+> **Current dependency correction (2026-08-16):** this plan predates the
+> shipped FastAPI integration and the completed direct-Tokio eradication. It
+> must not be used as live version or runtime-policy authority. FrankenTerm
+> currently pins FastAPI 0.3.0 and Asupersync 0.3.10; `Cargo.toml`,
+> `Cargo.lock`, `AGENTS.md`, and `UPGRADE_LOG.md` are authoritative.
+
 ---
 
 ## P1: Integration Objectives, Constraints, and Non-Goals
@@ -17,13 +23,20 @@
 
 3. **Typed agent HTTP API** -- Expose FrankenTerm's swarm coordination primitives (pane reservation, workflow triggers, pattern subscriptions, agent registration) as a structured REST API with fastapi extractors (`Json<T>`, `Path<T>`, `Query<T>`, `Valid<T>`) and auto-generated OpenAPI 3.1 documentation. This gives coding agents a discoverable HTTP interface to FrankenTerm beyond the MCP transport.
 
-4. **Shared asupersync runtime** -- Both FrankenTerm and fastapi_rust depend on asupersync 0.2.0 (same Git rev `c7c15f6`). The integration runs the HTTP server inside FrankenTerm's existing asupersync runtime, sharing the `Cx` capability context, structured concurrency regions, and cooperative cancellation across the entire process. No runtime nesting, no `block_on` bridges.
+4. **Shared Asupersync runtime** -- FrankenTerm and FastAPI currently resolve
+   the published Asupersync 0.3.10 release. The integration runs the HTTP
+   server inside FrankenTerm's existing runtime, sharing the `Cx` capability
+   context, structured-concurrency regions, and cooperative cancellation
+   across the process. No runtime nesting or `block_on` bridges are admitted.
 
 5. **Health and readiness probes** -- Integrate fastapi_rust's `HealthCheckRegistry` to expose structured liveness/readiness endpoints that report on FrankenTerm subsystems: storage connectivity, WezTerm multiplexer status, event bus health, FD budget headroom, and (if enabled) MCP server availability. These probes support fleet orchestration and monitoring dashboards.
 
 ### Constraints
 
-- **Runtime version lock** -- Both projects must stay on the same asupersync Git rev. The workspace `Cargo.toml` already patches asupersync globally via `[patch.crates-io]` and `[patch."https://github.com/Dicklesworthstone/fastapi_rust"]`. Any upstream asupersync bump must be coordinated across both projects simultaneously.
+- **Runtime version lock** -- FastAPI, FastMCP, FrankenSearch, and FrankenTerm
+  must stay in one compatible Asupersync type universe. The current graph
+  resolves the published 0.3.10 release without an Asupersync git patch. Any
+  future bump must migrate the dependency cohort together.
 
 - **Feature-gated** -- All fastapi_rust integration code lives behind the existing `web` feature flag (already defined: `web = ["dep:fastapi", "dep:asupersync"]`). Default builds (`cargo check`) compile nothing from this integration. The `streaming` feature implies `web`.
 
@@ -45,7 +58,10 @@
 
 - **Full Python FastAPI compatibility** -- We use fastapi_rust as a Rust HTTP framework. We do not aim for request/response parity with Python FastAPI, Starlette, or Pydantic. The OpenAPI generation is a bonus, not a compatibility target.
 
-- **Replacing tokio in the main runtime** -- FrankenTerm's core still uses tokio for the majority of async work (storage, ingest, pattern engine). The asupersync integration via `web` is additive. A full tokio-to-asupersync migration is tracked separately and is outside this bead's scope.
+- **Introducing a second async runtime** -- Direct Tokio usage is forbidden.
+  The `web` integration must use FrankenTerm's canonical `runtime_async`
+  surface and the single Asupersync runtime; it may not add a nested executor
+  or compatibility bridge.
 
 - **fastapi-output adoption** -- The agent detection and rich terminal output in `fastapi-output` (14K LOC) overlaps with FrankenTerm's own `environment.rs` and TUI modules. We do not adopt it; FrankenTerm already has `franken-agent-detection` and `ftui` for these purposes.
 
@@ -55,7 +71,11 @@
 
 ### Option A: In-Process Library Dependency (Recommended)
 
-Add fastapi_rust as an optional workspace dependency (already present in `Cargo.toml` at Git rev `9fe499e`). FrankenTerm's `web.rs` module imports `fastapi::prelude::*` and constructs an `App` with routes, middleware, and shared state. The HTTP server runs inside FrankenTerm's process, sharing memory and the asupersync runtime.
+Use the optional FastAPI workspace dependency already pinned in `Cargo.toml` at
+revision `dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2`. FrankenTerm's `web.rs`
+module imports `fastapi::prelude::*` and constructs an `App` with routes,
+middleware, and shared state. The HTTP server runs inside FrankenTerm's
+process, sharing memory and the Asupersync runtime.
 
 **Pros:**
 - Zero-copy access to FrankenTerm internals (StorageHandle, EventBus, PaneMap) -- no serialization overhead for internal data
@@ -66,7 +86,8 @@ Add fastapi_rust as an optional workspace dependency (already present in `Cargo.
 - WebSocket upgrade flows naturally from the TCP connection handler
 
 **Cons:**
-- Tight version coupling on asupersync (mitigated: already locked to same Git rev)
+- Tight version coupling on Asupersync (mitigated by the single-version
+  dependency-graph gate)
 - 111K LOC added to dependency graph when `web` feature is active (mitigated: feature-gated, LTO strips unused code)
 - HTTP parser bugs in fastapi-http affect FrankenTerm (mitigated: fastapi-http has extensive tests and zero-copy parser is well-fuzzed)
 
@@ -535,7 +556,9 @@ The existing `web.rs` (2,701 LOC) already uses fastapi types. The migration is a
 
 4. **Phase 4: Extract types** -- Move `ApiResponse`, `PaneView`, `EventView`, `SearchResultView`, `BookmarkView`, etc. into `types.rs`.
 
-5. **Phase 5: Extract streaming** -- Move `handle_stream_events`, `handle_stream_deltas`, `TokioSseStream`, and rate-limiting helpers into `streaming/sse.rs`.
+5. **Phase 5: Extract streaming** -- Move `handle_stream_events`,
+   `handle_stream_deltas`, the runtime-neutral SSE stream adapter, and
+   rate-limiting helpers into `streaming/sse.rs`.
 
 Each phase is a standalone commit. Tests pass at every step. The final `web/mod.rs` is a thin orchestrator that calls `build_app()` and `start_web_server()`.
 
@@ -799,7 +822,10 @@ The entire fastapi_rust integration is gated behind `#[cfg(feature = "web")]`. T
 
 3. **Make `ServerMetrics` observable** (low priority) -- Expose `ServerMetrics` as a structured snapshot for integration with FrankenTerm's `telemetry.rs` and `storage_telemetry.rs` modules.
 
-4. **Publish `asupersync` and `rich_rust` to crates.io** (medium priority) -- Currently sourced via Git with path patches. Publishing would simplify `Cargo.toml` and enable proper semver resolution.
+4. **Publish one compatible FastAPI/Asupersync release cohort** (medium
+   priority) -- Asupersync is already sourced from crates.io. A stable FastAPI
+   release accepting the same next runtime family as FastMCP and FrankenSearch
+   would enable a one-runtime upgrade without a split dependency graph.
 
 ### Beads References
 
