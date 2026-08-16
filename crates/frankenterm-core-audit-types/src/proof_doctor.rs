@@ -2226,7 +2226,7 @@ mod tests {
         let verdict = classify_proof_doctor(&base_input());
 
         assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
-        assert!(verdict.blockers.is_empty());
+        assert_eq!(verdict.blockers.len(), 0);
         assert_eq!(verdict.generated_at_utc, "2026-05-05T12:00:00Z");
         assert!(
             verdict
@@ -2419,7 +2419,7 @@ mod tests {
         let verdict = classify_proof_doctor(&input);
 
         assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
-        assert!(verdict.blockers.is_empty());
+        assert_eq!(verdict.blockers.len(), 0);
         let json = serde_json::to_value(&verdict).expect("serialize verdict");
         assert_eq!(
             json["evidence"]["scale_lab_artifact"]["release_claim_status"].as_str(),
@@ -2584,7 +2584,7 @@ mod tests {
         let verdict = classify_proof_doctor(&input);
 
         assert_eq!(verdict.status, ProofDoctorStatus::Runnable);
-        assert!(verdict.blockers.is_empty());
+        assert_eq!(verdict.blockers.len(), 0);
     }
 
     #[test]

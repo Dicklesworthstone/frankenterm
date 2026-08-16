@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn category_labels_non_empty() {
         for cat in ScenarioCategory::ALL {
-            assert!(!cat.label().is_empty());
+            assert_ne!(cat.label(), "");
         }
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
 
         let report = RehearsalReport::from_execution(&exec);
         assert_eq!(report.verdict, RehearsalVerdict::Ready);
-        assert!(report.failures.is_empty());
+        assert_eq!(report.failures.len(), 0);
         assert_eq!(report.pass_rate, 1.0);
     }
 
@@ -1366,7 +1366,7 @@ mod tests {
         assert_eq!(report.divergence_within_budget, Some(true));
         assert_eq!(report.passed, suite.scenario_count());
         assert_eq!(report.failed, 0);
-        assert!(!report.evidence_artifacts.is_empty());
+        assert_ne!(report.evidence_artifacts.len(), 0);
 
         // Track telemetry
         let mut telemetry = RehearsalTelemetry::default();

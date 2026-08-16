@@ -28,7 +28,7 @@
 //! # Usage
 //!
 //! ```rust
-//! use frankenterm_core::cutover_evidence::*;
+//! use frankenterm_core_audit_types::cutover_evidence::*;
 //!
 //! let mut pkg = EvidencePackage::new("asupersync-migration", 1);
 //!
@@ -47,9 +47,10 @@
 //!     command: "cargo test --lib".into(),
 //! });
 //!
-//! // Evaluate
+//! // Evaluate. A partial package must fail closed until every blocking gate
+//! // has corresponding evidence.
 //! let verdict = pkg.evaluate();
-//! assert!(verdict.decision != GoNoGoDecision::NoGo);
+//! assert_eq!(verdict.decision, GoNoGoDecision::NoGo);
 //! ```
 
 use std::collections::BTreeMap;
@@ -1570,7 +1571,7 @@ mod tests {
 
         gate.mark_closed("b");
         assert!(gate.all_closed());
-        assert!(gate.unclosed().is_empty());
+        assert_eq!(gate.unclosed().len(), 0);
     }
 
     #[test]

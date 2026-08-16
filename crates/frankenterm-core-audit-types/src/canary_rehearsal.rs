@@ -1152,7 +1152,7 @@ mod tests {
             operator_triggered: false,
         };
         let fired = evaluate_rollback_triggers(&triggers, &metrics);
-        assert!(fired.is_empty());
+        assert_eq!(fired.len(), 0);
     }
 
     #[test]
@@ -1167,7 +1167,7 @@ mod tests {
             operator_triggered: false,
         };
         let fired = evaluate_rollback_triggers(&triggers, &metrics);
-        assert!(!fired.is_empty());
+        assert_ne!(fired.len(), 0);
         assert!(
             fired
                 .iter()
@@ -1726,7 +1726,7 @@ mod tests {
             operator_triggered: false,
         };
         let fired = evaluate_rollback_triggers(&plan.rollback_triggers, &metrics);
-        assert!(fired.is_empty());
+        assert_eq!(fired.len(), 0);
 
         // 6. Evaluate promotion.
         let soak = SoakMetrics {

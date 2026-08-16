@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(evidence.p99_us, None);
         assert_eq!(evidence.p999_us, None);
         assert_eq!(evidence.within_target, None);
-        assert!(evidence.stage_breakdown_p50.is_empty());
+        assert_eq!(evidence.stage_breakdown_p50.len(), 0);
         assert!(
             evidence
                 .degradation_reason
@@ -930,7 +930,7 @@ mod tests {
         assert_eq!(evidence.p99_us, None);
         assert_eq!(evidence.p999_us, None);
         assert_eq!(evidence.within_target, None);
-        assert!(evidence.stage_breakdown_p50.is_empty());
+        assert_eq!(evidence.stage_breakdown_p50.len(), 0);
         assert!(
             evidence
                 .degradation_reason
@@ -981,7 +981,7 @@ mod tests {
             assert_eq!(evidence.p99_us, None);
             assert_eq!(evidence.p999_us, None);
             assert_eq!(evidence.within_target, None);
-            assert!(evidence.stage_breakdown_p50.is_empty());
+            assert_eq!(evidence.stage_breakdown_p50.len(), 0);
         }
     }
 

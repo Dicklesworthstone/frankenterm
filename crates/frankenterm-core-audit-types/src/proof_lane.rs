@@ -2961,7 +2961,7 @@ mod tests {
 
         assert_eq!(record.report_bucket(), ProofReportBucket::RemoteProofPassed);
         assert!(record.safe_to_close_source_bead());
-        assert!(validate_proof_record(&record).is_empty());
+        assert_eq!(validate_proof_record(&record).len(), 0);
     }
 
     #[test]
@@ -2990,7 +2990,7 @@ mod tests {
                 .map(|snapshot| snapshot.status),
             Some(ProofDoctorStatus::Passed)
         );
-        assert!(validate_proof_record(&round_trip).is_empty());
+        assert_eq!(validate_proof_record(&round_trip).len(), 0);
     }
 
     #[test]
@@ -3062,7 +3062,7 @@ mod tests {
             ProofReportBucket::PreCargoInfrastructureBlocker
         );
         assert!(!record.safe_to_close_source_bead());
-        assert!(validate_proof_record(&record).is_empty());
+        assert_eq!(validate_proof_record(&record).len(), 0);
     }
 
     #[test]
@@ -3082,7 +3082,7 @@ mod tests {
             ProofReportBucket::PostCargoInfrastructureBlocker
         );
         assert!(!record.safe_to_close_source_bead());
-        assert!(validate_proof_record(&record).is_empty());
+        assert_eq!(validate_proof_record(&record).len(), 0);
     }
 
     #[test]
@@ -3105,7 +3105,7 @@ mod tests {
 
         assert_eq!(record.report_bucket(), ProofReportBucket::InvalidLocalProof);
         assert!(!record.safe_to_close_source_bead());
-        assert!(validate_proof_record(&record).is_empty());
+        assert_eq!(validate_proof_record(&record).len(), 0);
         assert!(record.command_display().contains("bash -lc cargo test"));
     }
 
@@ -3121,7 +3121,7 @@ mod tests {
         assert_eq!(record.report_bucket(), ProofReportBucket::SourceRed);
         assert!(record.state.has_source_verdict());
         assert!(!record.safe_to_close_source_bead());
-        assert!(validate_proof_record(&record).is_empty());
+        assert_eq!(validate_proof_record(&record).len(), 0);
     }
 
     #[test]
@@ -3370,7 +3370,7 @@ mod tests {
             scoreboard.closeable_source_beads,
             vec!["ft-pass".to_string()]
         );
-        assert!(scoreboard.high_scale_claim_beads.is_empty());
+        assert_eq!(scoreboard.high_scale_claim_beads.len(), 0);
         assert_eq!(
             scoreboard
                 .latest_for_bead("ft-pass")
@@ -3856,7 +3856,7 @@ mod tests {
 
         assert!(report.closeout_eligible);
         assert_eq!(report.proof_records_analyzed, 1);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings.len(), 0);
         assert!(report.suggested_beads_wording.contains("closeout safe"));
     }
 
@@ -3875,7 +3875,7 @@ mod tests {
 
         assert!(report.closeout_eligible);
         assert_eq!(report.proof_records_analyzed, 0);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings.len(), 0);
         assert!(
             report
                 .suggested_beads_wording
@@ -3899,7 +3899,7 @@ mod tests {
         let report = lint_proof_closeout(&input);
 
         assert!(!report.closeout_eligible);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings.len(), 0);
         assert!(report.suggested_beads_wording.contains("source_blocked"));
     }
 
@@ -3918,7 +3918,7 @@ mod tests {
         let report = lint_proof_closeout(&input);
 
         assert!(!report.closeout_eligible);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings.len(), 0);
         assert!(report.suggested_beads_wording.contains("infra_blocked"));
     }
 

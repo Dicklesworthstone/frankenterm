@@ -81,7 +81,7 @@ pub struct TokenBucketTelemetrySnapshot {
 /// # Example
 ///
 /// ```
-/// use frankenterm_core::token_bucket::TokenBucket;
+/// use frankenterm_core_audit_types::token_bucket::TokenBucket;
 ///
 /// let mut bucket = TokenBucket::new(10.0, 5.0); // 10 capacity, 5 tokens/sec
 /// let now_ms = 1000;
@@ -283,7 +283,7 @@ impl TokenBucket {
 /// # Example
 ///
 /// ```
-/// use frankenterm_core::token_bucket::{TokenBucket, HierarchicalBucket};
+/// use frankenterm_core_audit_types::token_bucket::{HierarchicalBucket, TokenBucket};
 ///
 /// let mut hb = HierarchicalBucket::new(
 ///     TokenBucket::new(5.0, 2.0),   // local: 5 capacity, 2/sec

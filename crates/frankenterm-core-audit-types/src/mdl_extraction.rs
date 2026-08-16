@@ -827,7 +827,7 @@ mod tests {
         let ext = default_extractor();
         let result = ext.extract(&[]);
         assert_eq!(result.reason_code, ExtractionReason::WindowTooSmall);
-        assert!(result.commands.is_empty());
+        assert_eq!(result.commands.len(), 0);
     }
 
     #[test]
@@ -896,7 +896,7 @@ mod tests {
         ];
         let result = ext.extract(&window);
         // The extracted sequence must end with a success.
-        assert!(!result.commands.is_empty());
+        assert_ne!(result.commands.len(), 0);
         assert!(result.commands.last().unwrap().is_success());
     }
 
@@ -953,7 +953,7 @@ mod tests {
         ];
         let result = ext.extract(&window);
         // At minimum should have the fix; may include the last failure for context.
-        assert!(!result.commands.is_empty());
+        assert_ne!(result.commands.len(), 0);
     }
 
     // -------------------------------------------------------------------------
@@ -976,7 +976,7 @@ mod tests {
 
         let result = ext.extract(&window);
         // Should still find the fix in the truncated window.
-        assert!(!result.commands.is_empty());
+        assert_ne!(result.commands.len(), 0);
     }
 
     // -------------------------------------------------------------------------
@@ -986,13 +986,13 @@ mod tests {
     #[test]
     fn window_builder_basic() {
         let mut builder = WindowBuilder::new();
-        assert!(builder.is_empty());
+        assert_eq!(builder.len(), 0);
 
         builder.add_command("ls".to_string(), Some(0), Some(100), 1000);
         builder.add_command("cd /tmp".to_string(), Some(0), Some(200), 2000);
 
         assert_eq!(builder.len(), 2);
-        assert!(!builder.is_empty());
+        assert_ne!(builder.len(), 0);
         assert_eq!(builder.blocks()[0].index, 0);
         assert_eq!(builder.blocks()[1].index, 1);
     }
@@ -1019,7 +1019,7 @@ mod tests {
         let mut builder = WindowBuilder::new();
         builder.add_command("ls".to_string(), Some(0), None, 1000);
         builder.clear();
-        assert!(builder.is_empty());
+        assert_eq!(builder.len(), 0);
         assert_eq!(builder.len(), 0);
     }
 
@@ -1159,7 +1159,7 @@ mod tests {
         ];
 
         let result = ext.extract(&window);
-        assert!(!result.commands.is_empty());
+        assert_ne!(result.commands.len(), 0);
         // The extracted sequence should be smaller than the full window.
         assert!(result.commands.len() <= window.len());
         // Must end with success.
@@ -1179,7 +1179,7 @@ mod tests {
         });
         let result = ext.extract(builder.blocks());
 
-        assert!(!result.commands.is_empty());
+        assert_ne!(result.commands.len(), 0);
         assert_eq!(result.window_size, 3);
     }
 

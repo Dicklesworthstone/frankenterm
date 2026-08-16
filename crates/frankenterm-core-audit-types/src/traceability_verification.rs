@@ -1007,7 +1007,7 @@ mod tests {
         ];
         // Each category must have a non-empty label.
         for cat in &categories {
-            assert!(!cat.label().is_empty());
+            assert_ne!(cat.label(), "");
         }
         // All labels must be distinct.
         let labels: Vec<_> = categories.iter().map(|c| c.label()).collect();
@@ -1093,7 +1093,7 @@ mod tests {
         );
         assert_eq!(pack.required_met, 3);
         assert_eq!(pack.required_total, 3);
-        assert!(pack.gap_risks.is_empty());
+        assert_eq!(pack.gap_risks.len(), 0);
         assert_eq!(pack.pack_verdict, PackVerdict::Complete);
     }
 

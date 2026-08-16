@@ -816,7 +816,7 @@ mod tests {
 
         let result = store.query(&ForensicQuery::default());
         let r1 = result.records.iter().find(|r| r.record_id == "r1").unwrap();
-        assert!(r1.metadata.is_empty());
+        assert_eq!(r1.metadata.len(), 0);
         assert_eq!(r1.correlation, CorrelationIds::default());
     }
 
@@ -864,7 +864,7 @@ mod tests {
         let mut store = ForensicStore::new(100);
         let result = store.query(&ForensicQuery::default());
         assert_eq!(result.total_count, 0);
-        assert!(result.records.is_empty());
+        assert_eq!(result.records.len(), 0);
         assert!(!result.has_more);
     }
 
