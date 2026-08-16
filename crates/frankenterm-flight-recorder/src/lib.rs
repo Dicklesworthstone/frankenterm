@@ -14,6 +14,8 @@
 //! for every shard-local admitted count to reach zero before draining and
 //! publishing `Closed`.
 
+pub mod platform_markers;
+
 use std::cmp::Ordering as CmpOrdering;
 use std::io::{self, Write};
 use std::marker::PhantomData;

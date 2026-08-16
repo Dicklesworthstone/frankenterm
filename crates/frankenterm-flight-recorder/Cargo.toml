@@ -14,12 +14,22 @@ categories = ["development-tools::profiling"]
 [lints]
 workspace = true
 
+[features]
+default = []
+platform-markers = ["dep:eventheader_dynamic", "dep:signpost"]
+
 [dependencies]
 crossbeam-queue.workspace = true
 crossbeam-utils.workspace = true
 frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eventheader_dynamic = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+signpost = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1.11.0"

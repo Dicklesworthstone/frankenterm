@@ -4168,6 +4168,44 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote this clock as production trace authority only after exact live producers and consumers carry its domain through the bounded recorder, retained loss accounting proves nonzero K0-K13 stage coverage, and same-source target-hardware runs establish bounded observer overhead without operator-session interaction.
 
+### IS-N137 — A safe platform-marker call is not an exact delivery receipt
+
+- **Classification:** external-loss-domain rejection; independent internal
+  recorder authority retained
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.2.4`
+- **Rejected inference:** returning from a safe macOS kdebug or Linux
+  `user_events` API
+  proves that the marker reached the retained Instruments/DTrace/perf/ftrace
+  artifact, or can strengthen the internal interaction trace.
+- **Dependency/source audit:** `signpost 0.1.0` exposes a safe Rust call over
+  its private `kdebug_trace` FFI and accepts one 14-bit site code plus four
+  machine words, but exposes no enabled, permission, buffer-loss, or delivery
+  result. `eventheader_dynamic 0.5.0` safely owns Linux `user_events`
+  registration and exposes enabled state plus immediate `writev` errno, but a
+  successful write still does not prove downstream consumer retention. Both
+  dependencies stay target-specific behind the non-default `platform-markers`
+  feature and outside ordinary Off, Low, and internal-only Certification modes.
+  First-party marker code contains no unsafe block, string formatting, blocking
+  lock, unbounded queue, or dynamic dispatch. The Linux adapter preallocates a
+  bounded builder shard set off-path, uses `try_lock`, and performs only a
+  marker-mode `user_events` write after recorder admission has returned. Payload
+  preparation and marker accounting are bound to the exact local recorder
+  epoch; cross-epoch payloads fail before adapter invocation or accounting.
+- **Cost boundary:** the safe dynamic Linux API has higher encoding cost than
+  its static counterpart, whose registration contract requires first-party
+  unsafe code. Reusable builders are prewarmed and sharded to remove steady-state
+  allocation and lock waiting, but the target tracing syscall can still perturb
+  diagnostic-mode latency. The overhead matrix must measure that cost; no
+  ordinary recorder mode enables the adapter.
+- **Decision:** preserve platform acceptance as a useful correlation signal,
+  but mark every production adapter emission `loss_unknown`. Exact marker
+  authority is available only to a reconciled adapter whose retained artifact
+  accounts for every recorded event. Disabled, registration-failed, dropped,
+  and exhausted paths remain typed and independent; none invalidates or
+  promotes internal-only certification.
+- **Primary retry condition:**
+  > Promote macOS or Linux markers to exact marker-assisted authority only after a bounded off-path reconciliation manifest matches every numeric trace/span/stage identity against the sealed recorder epoch, reports platform buffer and consumer loss, rejects duplicates and foreign epochs, and retains same-source target-host evidence without touching an operator session.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

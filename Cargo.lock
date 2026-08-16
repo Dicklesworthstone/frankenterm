@@ -2786,6 +2786,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventheader"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82a691799c4cef15c5353998e9930bdfd991c66f4825523bf1c361474cfcad00"
+dependencies = [
+ "eventheader_types",
+ "tracepoint",
+]
+
+[[package]]
+name = "eventheader_dynamic"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b749fb4decb92459a8529ac10efd69dde0151db3134796d3ade0fad2ee4973e"
+dependencies = [
+ "eventheader",
+]
+
+[[package]]
+name = "eventheader_types"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37d0827349ebe9ab2c39ad669a597a1515b4f94dd21f9d0d7f9589d57603ea2a"
+
+[[package]]
 name = "exr"
 version = "1.74.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4041,6 +4066,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-flight-recorder"
+version = "0.13.0"
+dependencies = [
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "eventheader_dynamic",
+ "frankenterm-core-audit-types",
+ "proptest",
+ "serde_json",
+ "signpost",
+ "static_assertions",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "frankenterm-font"
 version = "0.1.0"
 dependencies = [
@@ -4078,19 +4118,6 @@ dependencies = [
  "thiserror 2.0.18",
  "walkdir",
  "winapi",
-]
-
-[[package]]
-name = "frankenterm-flight-recorder"
-version = "0.13.0"
-dependencies = [
- "crossbeam-queue",
- "crossbeam-utils",
- "frankenterm-core-audit-types",
- "proptest",
- "serde_json",
- "static_assertions",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -10158,6 +10185,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "signpost"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acde4ef7ee97ad3bac7c4f73ee22ddb71067aa1d427a22efa76284de48eada41"
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11324,6 +11357,15 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tracepoint"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5155adaef033445e459a15618c62c26aa1eecec5b2a8ec4d406267e6d521c804"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "tracing"

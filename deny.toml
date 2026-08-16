@@ -62,11 +62,12 @@ skip-tree = []
 
 [advisories]
 # Bead scope is bans only; advisories audit ships under a separate
-# follow-up bead. Set every category to "warn" so cargo-deny
-# emits findings without failing CI here.
+# follow-up bead. Current cargo-deny versions model unmaintained findings as a
+# dependency scope rather than a lint level, and removed the old `notice`
+# setting. Preserve the former all-dependency visibility; the CI action invokes
+# `check bans` and therefore does not grade advisory classes in that lane.
 yanked = "warn"
-unmaintained = "warn"
-notice = "warn"
+unmaintained = "all"
 ignore = []
 
 [licenses]

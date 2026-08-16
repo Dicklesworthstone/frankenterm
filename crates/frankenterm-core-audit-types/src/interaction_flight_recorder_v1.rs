@@ -67,6 +67,11 @@ pub enum RecorderMode {
     Low,
     /// Complete internal recording eligible for certification.
     Certification,
+    /// Complete internal recording plus independent platform-marker attempts.
+    ///
+    /// Marker delivery remains a separate loss domain and cannot strengthen
+    /// the internal recorder authority.
+    CertificationWithMarkers,
 }
 
 /// Closed, versioned whole-trace sampler vocabulary.
@@ -137,7 +142,9 @@ impl RecorderSamplerConfigV1 {
         let valid = match mode {
             RecorderMode::Off => self.is_canonical_off(),
             RecorderMode::Low => true,
-            RecorderMode::Certification => self.is_full_sampling(),
+            RecorderMode::Certification | RecorderMode::CertificationWithMarkers => {
+                self.is_full_sampling()
+            }
         };
         if valid {
             Ok(())
@@ -669,13 +676,21 @@ impl RecorderEpochManifestV1 {
     /// Validate only the independent platform-marker accounting domain.
     pub fn validate_marker_contract(self) -> Result<(), RecorderContractError> {
         let classified = self.marker_accounting.checked_classified()?;
+        if self.mode != RecorderMode::CertificationWithMarkers {
+            if self.marker_authority != PlatformMarkerAuthorityV1::NotRequested
+                || !self.marker_accounting.is_zero()
+            {
+                return Err(RecorderContractError::InvalidMarkerAccounting {
+                    detail: "platform markers require certification-with-markers mode",
+                });
+            }
+            return Ok(());
+        }
         match self.marker_authority {
             PlatformMarkerAuthorityV1::NotRequested => {
-                if !self.marker_accounting.is_zero() {
-                    return Err(RecorderContractError::InvalidMarkerAccounting {
-                        detail: "not-requested marker authority has outcomes",
-                    });
-                }
+                return Err(RecorderContractError::InvalidMarkerAccounting {
+                    detail: "marker-enabled mode lacks platform-marker authority",
+                });
             }
             PlatformMarkerAuthorityV1::ExactEveryRecordedEvent => {
                 if self.marker_accounting.loss_unknown
@@ -708,8 +723,10 @@ impl RecorderEpochManifestV1 {
         class: RecorderCertificationClass,
     ) -> Result<RecorderCertificationVerdict, RecorderContractError> {
         self.validate_internal_contract()?;
-        let internal_qualifies = self.mode == RecorderMode::Certification
-            && self.sampler.is_full_sampling()
+        let internal_qualifies = matches!(
+            self.mode,
+            RecorderMode::Certification | RecorderMode::CertificationWithMarkers
+        ) && self.sampler.is_full_sampling()
             && self.accounting_authority == RecorderAccountingAuthority::Exact
             && self.trace_accounting.sampled_in != 0
             && self.trace_accounting.sampled_out == 0
@@ -1090,7 +1107,7 @@ mod tests {
             schema_version: RECORDER_EPOCH_MANIFEST_SCHEMA_VERSION,
             epoch_id: epoch_id(1),
             previous_epoch_id: None,
-            mode: RecorderMode::Certification,
+            mode: RecorderMode::CertificationWithMarkers,
             sampler: RecorderSamplerConfigV1::certification(),
             start_reason: RecorderEpochStartReason::ProcessStart,
             close_reason: Some(RecorderEpochCloseReason::NormalShutdown),
@@ -1700,6 +1717,53 @@ mod tests {
             overflowing
                 .certification_verdict(RecorderCertificationClass::MarkerAssistedCertification),
             Err(RecorderContractError::MarkerAccountingOverflow)
+        );
+    }
+
+    #[test]
+    fn platform_markers_require_the_explicit_marker_mode() {
+        assert_eq!(
+            serde_json::to_value(RecorderMode::CertificationWithMarkers)
+                .expect("marker mode serializes"),
+            serde_json::json!("certification_with_markers")
+        );
+        let marker_manifest = qualifying_manifest();
+        assert!(marker_manifest.validate_marker_contract().is_ok());
+
+        let mut ordinary_certification = marker_manifest;
+        ordinary_certification.mode = RecorderMode::Certification;
+        assert!(ordinary_certification.validate_internal_contract().is_ok());
+        assert_eq!(
+            ordinary_certification
+                .certification_verdict(RecorderCertificationClass::InternalRecorderCertification),
+            Ok(RecorderCertificationVerdict::Qualifying)
+        );
+        assert!(matches!(
+            ordinary_certification
+                .certification_verdict(RecorderCertificationClass::MarkerAssistedCertification),
+            Err(RecorderContractError::InvalidMarkerAccounting { .. })
+        ));
+
+        ordinary_certification.marker_authority = PlatformMarkerAuthorityV1::NotRequested;
+        ordinary_certification.marker_accounting = PlatformMarkerAccountingV1::default();
+        assert!(ordinary_certification.validate_marker_contract().is_ok());
+        assert_eq!(
+            ordinary_certification
+                .certification_verdict(RecorderCertificationClass::MarkerAssistedCertification),
+            Ok(RecorderCertificationVerdict::NonQualifying)
+        );
+
+        let mut marker_mode_without_authority = marker_manifest;
+        marker_mode_without_authority.marker_authority = PlatformMarkerAuthorityV1::NotRequested;
+        marker_mode_without_authority.marker_accounting = PlatformMarkerAccountingV1::default();
+        assert!(matches!(
+            marker_mode_without_authority.validate_marker_contract(),
+            Err(RecorderContractError::InvalidMarkerAccounting { .. })
+        ));
+        assert_eq!(
+            marker_mode_without_authority
+                .certification_verdict(RecorderCertificationClass::InternalRecorderCertification),
+            Ok(RecorderCertificationVerdict::Qualifying)
         );
     }
 
