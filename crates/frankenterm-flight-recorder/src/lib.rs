@@ -2694,7 +2694,7 @@ mod tests {
                 available: 0,
             }
         );
-        assert!(destination.is_empty());
+        assert_eq!(destination.len(), 0);
     }
 
     #[test]
@@ -2810,7 +2810,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(!retry.is_empty());
+        assert_ne!(retry.len(), 0);
     }
 
     #[test]
@@ -2829,7 +2829,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(!writer.bytes.is_empty());
+        assert_ne!(writer.bytes.len(), 0);
     }
 
     #[test]
@@ -3192,7 +3192,7 @@ mod tests {
         ));
         drop(guard);
         let frozen = recorder.try_freeze().expect("freeze succeeds after drain");
-        assert!(frozen.is_empty());
+        assert_eq!(frozen.len(), 0);
         assert_eq!(frozen.accounting().event.closing, 0);
         assert_eq!(
             frozen.accounting().event.checked_sampled_event_attempts(),
@@ -3237,7 +3237,7 @@ mod tests {
         let frozen = recorder
             .try_freeze()
             .expect("sealed empty recorder freezes");
-        assert!(frozen.is_empty());
+        assert_eq!(frozen.len(), 0);
         assert_eq!(frozen.accounting().event.closing, 0);
     }
 
@@ -3256,7 +3256,7 @@ mod tests {
         let frozen = recorder
             .try_freeze()
             .expect("peer closer completes the empty freeze");
-        assert!(frozen.is_empty());
+        assert_eq!(frozen.len(), 0);
         assert_eq!(
             recorder.finish_begin_close(observed),
             CloseOutcome::AlreadyClosed
@@ -3312,7 +3312,7 @@ mod tests {
         }) else {
             panic!("quiescent close must complete");
         };
-        assert!(frozen.is_empty());
+        assert_eq!(frozen.len(), 0);
         assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closed);
     }
 
@@ -3349,7 +3349,7 @@ mod tests {
         ) else {
             panic!("quiescent retry must complete");
         };
-        assert!(frozen.is_empty());
+        assert_eq!(frozen.len(), 0);
         assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closed);
     }
 
@@ -3369,7 +3369,7 @@ mod tests {
         let BoundedCloseOutcome::Completed(frozen) = outcome else {
             panic!("final zero-wait boundary recheck must complete");
         };
-        assert!(frozen.is_empty());
+        assert_eq!(frozen.len(), 0);
         assert_eq!(recorder.lifecycle_state(), RecorderLifecycleState::Closed);
     }
 
@@ -3561,7 +3561,7 @@ mod tests {
             }
         ));
         let frozen = recorder.try_freeze().expect("quiescent recorder freezes");
-        assert!(frozen.is_empty());
+        assert_eq!(frozen.len(), 0);
         assert_eq!(frozen.accounting().trace.sampled_in, 1);
         assert_eq!(frozen.accounting().event.closing, 1);
         assert_eq!(
