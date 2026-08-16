@@ -52,12 +52,12 @@
 // this crate forbids.
 #![cfg_attr(windows, feature(windows_by_handle))]
 
-/// MSRV-stable equivalent of `AtomicU64::try_update`.
+/// Explicit checked-CAS update shared by counters with fail-closed semantics.
 ///
-/// Rust 1.95 renamed and deprecated `fetch_update` in favor of `try_update`,
-/// but `try_update` is unavailable at this workspace's Rust 1.85 MSRV. Keep
-/// the compare-exchange loop here so callers remain warning-free on current
-/// nightly while preserving the declared compiler floor.
+/// The workspace now admits `AtomicU64::try_update`, but this helper retains
+/// the already-proven compare-exchange loop so callers share one explicit
+/// overflow and memory-ordering contract without churning a campaign hot path
+/// solely because the compiler floor changed.
 #[inline]
 pub(crate) fn try_update_atomic_u64(
     counter: &std::sync::atomic::AtomicU64,
