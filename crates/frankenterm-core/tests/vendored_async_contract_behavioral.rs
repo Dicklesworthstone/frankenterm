@@ -37,7 +37,7 @@ use frankenterm_core::vendored_async_contracts::{
 };
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
 use frankenterm_core::{
-    cx::{Budget, Cx, for_testing},
+    cx::{Cx, for_testing},
     vendored::{
         DirectMuxClient, DirectMuxClientConfig, MuxPool, MuxPoolConfig, PaneDelta,
         SubscriptionConfig, subscribe_pane_output_with_inherited_cx,
@@ -102,8 +102,12 @@ async fn write_mux_response(
 
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
 fn cancelled_test_cx(message: &'static str) -> Cx {
-    let budget = Budget::new().with_poll_quota(0);
-    let cx = Cx::for_testing_with_budget(budget);
+    // Exercise caller cancellation without simultaneously exhausting another
+    // capability.  A zero poll quota has its own typed authority
+    // (`PoolError::PollQuotaExhausted`) and must not be used as a proxy for a
+    // user-cancelled context now that pool errors preserve finite budget
+    // causes.
+    let cx = Cx::for_testing();
     cx.cancel_with(frankenterm_core::outcome::CancelKind::User, Some(message));
     cx
 }
