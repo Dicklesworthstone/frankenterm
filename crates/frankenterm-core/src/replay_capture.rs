@@ -13,9 +13,9 @@
 //! ```
 //!
 //! The adapter is designed as an observer (tap) that does not modify the
-//! upstream pipeline. A missing sink avoids downstream persistence, but the
-//! caller and adapter still execute a branch; no literal zero-cost claim is
-//! made.
+//! upstream pipeline. Disabling capture returns after the enabled-flag check
+//! and avoids sequence, redaction, and sink work, but the caller and adapter
+//! still execute that branch; no literal zero-cost claim is made.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
