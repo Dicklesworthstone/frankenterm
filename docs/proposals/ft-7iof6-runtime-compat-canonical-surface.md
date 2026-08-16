@@ -1,8 +1,14 @@
 # Proposal: rename `runtime_compat` to `runtime_async` and drop the migration-seam framing
 
 **Bead:** [ft-7iof6](../../.beads/issues.jsonl) — `runtime_compat is architecturally load-bearing`
-**Status:** draft
+**Status:** implemented historical proposal; the rename completed under
+`ft-g43fq`, and the deprecated alias has been removed
 **Related:** ft-y0loj (monolith split), ft-zoxxq (wezterm pseudo-boundary)
+
+> Historical-snapshot note: importer counts, filenames, and the migration plan
+> below describe the pre-rename audit. Current code imports `runtime_async`,
+> direct Tokio use is forbidden, and no `runtime_compat` compatibility shim
+> remains.
 
 ## Stance
 

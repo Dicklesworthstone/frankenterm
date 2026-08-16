@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Historical one-shot UBS triage snapshot. The live Beads graph has evolved far
+# beyond these June 2026 counts and paths; rerunning this script would create a
+# second, stale issue hierarchy. Keep the source for audit history, but fail
+# closed before any tracker mutation. New planning must use the current
+# planning-workflow and beads-workflow against live source and `br` state.
+echo "create_beads.sh is a historical snapshot and must not be rerun" >&2
+exit 2
+
 # Epic 1: Panic Eradication
 EPIC1=$(br create --title "Epic: Eradicate Panic Surfaces in Library Code" --type epic --priority 1 --description "
 # Background
@@ -60,9 +68,11 @@ br dep add $T1_3 $EPIC1
 # Epic 2: Concurrency and Async Safety
 EPIC2=$(br create --title "Epic: Concurrency and Async Safety" --type epic --priority 0 --description "
 # Background
-The architecture of \`frankenterm\` relies heavily on Tokio for asynchronous I/O and orchestration. UBS detected critical concurrency anti-patterns:
+The architecture of \`frankenterm\` uses the project-owned \`runtime_async\`
+surface over Asupersync for asynchronous I/O and orchestration; direct Tokio
+usage is forbidden. UBS detected critical concurrency anti-patterns:
 1. \`std::thread::spawn\` used without \`join()\` handles, leading to detached zombie threads.
-2. Potential async lock guards (\`tokio::sync::MutexGuard\`) held across \`.await\` points.
+2. Potential asynchronous or standard-library lock guards held across \`.await\` points.
 3. Unclosed \`TcpStream\`s.
 
 # Reasoning
@@ -79,7 +89,7 @@ T2_1=$(br create --title "Eliminate async lock guards held across await points" 
 UBS warns of 3 potential async lock guards held across await points.
 
 # Justification
-Holding a \`tokio::sync::MutexGuard\` (or worse, a \`std::sync::MutexGuard\`) across an \`.await\` can stall other tasks waiting for the lock, increasing latency. If the awaited operation tries to re-acquire the lock or waits on a task that needs the lock, it deadlocks.
+Holding a \`runtime_async\` lock guard (or a blocking standard-library lock guard) across an \`.await\` can stall other tasks waiting for the lock, increasing latency. If the awaited operation tries to re-acquire the lock or waits on a task that needs the lock, it deadlocks.
 
 # Implementation Notes
 - Identify the 3 locations flagged by UBS.
