@@ -35,6 +35,11 @@ generation is mandatory on mux/transport stages. Each event also carries exact
 numeric window, tab, and pane IDs. Human-readable titles, commands, current
 directories, key data, and pane data are forbidden.
 
+The window/tab/pane tuple is invariant for the lifetime of one trace. A
+producer that follows an operation onto a different topology owner must start a
+new trace or record an explicit correlation in a higher-level artifact; it may
+not stitch the two owners into one apparently stable interaction.
+
 ## Closed stage inventories
 
 The contract reuses the catalog-owned closed enums rather than creating a
@@ -50,6 +55,13 @@ strict prefix so an interrupted trace remains diagnostic. Qualification
 requires the entire path in exact order, with no duplicate stage, ordinal gap,
 or recorder loss. “Viewport ready” and “display presented” remain different
 stages.
+
+Each stage also carries an explicit outcome: `performed`, `no_op`,
+`not_applicable`, `superseded`, `cancelled`, or `failed`. Conditional resize
+work therefore retains its closed stage slot without inventing execution.
+No-op, inapplicable, and superseded slots have zero duration. Until the
+scenario catalog freezes a stage-specific optionality map, only `performed`
+stages qualify; every other outcome remains honest diagnostic evidence.
 
 ## Clocks and duration arithmetic
 
@@ -105,8 +117,13 @@ impersonate display completion or photons.
 Every event has explicit queue depth and oldest age, generic work/byte/row
 counts, allocations/copies, RPCs, deltas, dirty rows, full viewport clones,
 cursor-row duplicates, paints, frames, and cumulative dropped/overwritten
-event counts. Zero means observed zero; an unavailable producer must be
-reported as degraded by the recorder rather than silently invented.
+event counts. Zero means observed zero unless the corresponding boolean in the
+fixed-shape `counter_availability` object is `true`. Unavailable fields must
+carry the zero placeholder, unknown fields fail deserialization, and any
+unavailable counter makes the trace diagnostic rather than qualifying. The
+fixed shape bounds deserialization and preserves the distinction between a
+measured zero and missing authority without putting free-form text into the
+trace.
 
 Terminal, snapshot, and frame generations are explicit optional values. Zero
 is invalid. The validator requires terminal generation at K7, snapshot
@@ -125,8 +142,10 @@ The DTOs use only closed enums, numeric counters, numeric opaque identities,
 the exact schema string, and optional wall-clock metadata. All wire structs
 deny unknown fields. There is no string slot for raw keys, composed text, pane
 contents, titles, commands, paths, hostnames, or user labels. The negative
-privacy fixture proves `raw_key` and `pane_text` are rejected at decode, and a
-serialization test checks the forbidden vocabulary cannot appear.
+privacy overlay plants `raw_key` and `pane_text` onto the otherwise-valid good
+fixture; schema validity returns only when those two fields are removed.
+Nested decode negatives and a serialization test independently check that the
+forbidden vocabulary cannot enter or leave the typed DTO.
 
 Opaque IDs must be generated independently of sensitive content. Hashing raw
 input into an ID is not permitted: a low-entropy key or title remains
@@ -140,15 +159,17 @@ The retained corpus is `fixtures/perf/interaction-trace-v2/`:
   clock split and an actual display-presented K13 boundary;
 - `old-keypress-v1.json`: old-version shape retained to prove fail-closed
   version rejection; and
-- `bad-raw-content-v2.json`: forbidden raw-content fields rejected by
-  `deny_unknown_fields`.
+- `bad-raw-content-v2.json`: forbidden raw-content overlay applied to the valid
+  v2 fixture so the planted fields are the only rejection cause.
 
 Inline tests additionally cover sequence exhaustion, duplicate/regressing IDs,
-process restart, missing stages, cross-clock arithmetic, clock regression,
+process restart, missing stages, topology changes, conditional stage outcomes,
+explicit counter unavailability, cross-clock arithmetic, clock regression,
 round trip, sampling loss, metric-map completeness, and submit-versus-photon
 authority. A Draft 2020-12 validator compiles the committed JSON schema,
 accepts the committed keypress fixture plus typed keypress and resize
-roundtrips, and rejects the retained old-version and raw-content fixtures.
+roundtrips, rejects the retained old version, and rejects the good fixture only
+after the raw-content overlay is applied.
 
 ## Non-claims and downstream work
 

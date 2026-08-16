@@ -190,6 +190,20 @@
         "paint_count": {"$ref": "#/$defs/u64"}, "frame_count": {"$ref": "#/$defs/u64"}
       }
     },
+    "counter_availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queue_depth", "oldest_queue_age_ns", "work_units", "bytes", "rows", "allocation_count", "allocated_bytes", "copy_count", "copied_bytes", "rpc_count", "delta_count", "dirty_rows", "full_viewport_clones", "cursor_row_duplicates", "paint_count", "frame_count"],
+      "properties": {
+        "queue_depth": {"type": "boolean"}, "oldest_queue_age_ns": {"type": "boolean"},
+        "work_units": {"type": "boolean"}, "bytes": {"type": "boolean"}, "rows": {"type": "boolean"},
+        "allocation_count": {"type": "boolean"}, "allocated_bytes": {"type": "boolean"},
+        "copy_count": {"type": "boolean"}, "copied_bytes": {"type": "boolean"},
+        "rpc_count": {"type": "boolean"}, "delta_count": {"type": "boolean"}, "dirty_rows": {"type": "boolean"},
+        "full_viewport_clones": {"type": "boolean"}, "cursor_row_duplicates": {"type": "boolean"},
+        "paint_count": {"type": "boolean"}, "frame_count": {"type": "boolean"}
+      }
+    },
     "generations": {
       "type": "object",
       "additionalProperties": false,
@@ -215,7 +229,7 @@
     "event": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "trace_id", "event_ordinal", "span_id", "parent_span_id", "stage", "producer", "topology", "started_at", "completed_at", "correlation", "counters", "generations", "sampling_loss", "observation_boundary", "physical_detector"],
+      "required": ["schema_version", "trace_id", "event_ordinal", "span_id", "parent_span_id", "stage", "stage_outcome", "producer", "topology", "started_at", "completed_at", "correlation", "counters", "counter_availability", "generations", "sampling_loss", "observation_boundary", "physical_detector"],
       "properties": {
         "schema_version": {"const": "ft.interaction-trace.v2"},
         "trace_id": {"$ref": "#/$defs/trace_id"},
@@ -223,12 +237,14 @@
         "span_id": {"$ref": "#/$defs/nonzero_u64"},
         "parent_span_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/nonzero_u64"}]},
         "stage": {"$ref": "#/$defs/stage"},
+        "stage_outcome": {"enum": ["performed", "no_op", "not_applicable", "superseded", "cancelled", "failed"]},
         "producer": {"$ref": "#/$defs/producer"},
         "topology": {"$ref": "#/$defs/topology"},
         "started_at": {"$ref": "#/$defs/timestamp"},
         "completed_at": {"$ref": "#/$defs/timestamp"},
         "correlation": {"$ref": "#/$defs/correlation"},
         "counters": {"$ref": "#/$defs/counters"},
+        "counter_availability": {"$ref": "#/$defs/counter_availability"},
         "generations": {"$ref": "#/$defs/generations"},
         "sampling_loss": {"$ref": "#/$defs/sampling_loss"},
         "observation_boundary": {"enum": ["internal_state", "software_present", "metal_drawable", "display_presented", "photon"]},

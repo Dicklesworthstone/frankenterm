@@ -11,6 +11,24 @@ use frankenterm_core::ingest::CapturedSegmentKind;
 use frankenterm_core::policy::{ActionKind, ActorKind};
 use frankenterm_core::recording::*;
 
+/// Integration-test sources have no sibling `lib.rs`/`main.rs` for
+/// Proptest's default `SourceParallel` persistence path.  Disable that unusable
+/// sink explicitly so a run does not emit one warning per property.  RCH keeps
+/// the full failing seed in the retained transcript.
+struct IntegrationProptestConfig;
+
+impl IntegrationProptestConfig {
+    fn with_cases(cases: u32) -> proptest::test_runner::Config {
+        proptest::test_runner::Config {
+            cases,
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        }
+    }
+}
+
+use IntegrationProptestConfig as ProptestConfig;
+
 // =============================================================================
 // Strategies
 // =============================================================================

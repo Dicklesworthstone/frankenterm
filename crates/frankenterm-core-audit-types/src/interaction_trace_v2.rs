@@ -154,6 +154,32 @@ pub enum InteractionTraceStage {
     ResizeZoom(RendererResizeTraceStage),
 }
 
+/// What happened at one frozen stage slot.
+///
+/// Resize/zoom paths contain conditional work: an intent can be a proven
+/// no-op, superseded, or can avoid spawning a worker.  Recording one of those
+/// outcomes explicitly preserves the closed R0-R25 inventory without
+/// pretending that work ran.  The current qualification contract remains
+/// conservative: only performed stages qualify until the scenario catalog
+/// freezes a stage-specific optionality map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionTraceStageOutcome {
+    Performed,
+    NoOp,
+    NotApplicable,
+    Superseded,
+    Cancelled,
+    Failed,
+}
+
+impl InteractionTraceStageOutcome {
+    #[must_use]
+    pub const fn is_qualifying(self) -> bool {
+        matches!(self, Self::Performed)
+    }
+}
+
 impl InteractionTraceStage {
     #[must_use]
     pub const fn path(self) -> InteractionTracePath {
@@ -351,9 +377,9 @@ pub struct InteractionTracePhysicalDetector {
 }
 
 /// Queue/work/allocation counters carried by every structured event.  A zero
-/// means observed zero, not omitted; producers unable to observe a metric must
-/// classify the event as degraded in the downstream recorder rather than
-/// inventing a value.
+/// means observed zero unless the corresponding field in
+/// [`InteractionTraceCounterAvailability`] is `true`.  Producers unable to
+/// observe a metric must declare it unavailable rather than inventing a value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InteractionTraceCounters {
@@ -373,6 +399,167 @@ pub struct InteractionTraceCounters {
     pub cursor_row_duplicates: u64,
     pub paint_count: u64,
     pub frame_count: u64,
+}
+
+impl InteractionTraceCounters {
+    #[must_use]
+    pub const fn value(self, field: InteractionTraceCounterField) -> u64 {
+        match field {
+            InteractionTraceCounterField::QueueDepth => self.queue_depth,
+            InteractionTraceCounterField::OldestQueueAgeNs => self.oldest_queue_age_ns,
+            InteractionTraceCounterField::WorkUnits => self.work_units,
+            InteractionTraceCounterField::Bytes => self.bytes,
+            InteractionTraceCounterField::Rows => self.rows,
+            InteractionTraceCounterField::AllocationCount => self.allocation_count,
+            InteractionTraceCounterField::AllocatedBytes => self.allocated_bytes,
+            InteractionTraceCounterField::CopyCount => self.copy_count,
+            InteractionTraceCounterField::CopiedBytes => self.copied_bytes,
+            InteractionTraceCounterField::RpcCount => self.rpc_count,
+            InteractionTraceCounterField::DeltaCount => self.delta_count,
+            InteractionTraceCounterField::DirtyRows => self.dirty_rows,
+            InteractionTraceCounterField::FullViewportClones => self.full_viewport_clones,
+            InteractionTraceCounterField::CursorRowDuplicates => self.cursor_row_duplicates,
+            InteractionTraceCounterField::PaintCount => self.paint_count,
+            InteractionTraceCounterField::FrameCount => self.frame_count,
+        }
+    }
+}
+
+/// Closed names for the fixed counter fields above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionTraceCounterField {
+    QueueDepth,
+    OldestQueueAgeNs,
+    WorkUnits,
+    Bytes,
+    Rows,
+    AllocationCount,
+    AllocatedBytes,
+    CopyCount,
+    CopiedBytes,
+    RpcCount,
+    DeltaCount,
+    DirtyRows,
+    FullViewportClones,
+    CursorRowDuplicates,
+    PaintCount,
+    FrameCount,
+}
+
+impl InteractionTraceCounterField {
+    pub const ALL: [Self; 16] = [
+        Self::QueueDepth,
+        Self::OldestQueueAgeNs,
+        Self::WorkUnits,
+        Self::Bytes,
+        Self::Rows,
+        Self::AllocationCount,
+        Self::AllocatedBytes,
+        Self::CopyCount,
+        Self::CopiedBytes,
+        Self::RpcCount,
+        Self::DeltaCount,
+        Self::DirtyRows,
+        Self::FullViewportClones,
+        Self::CursorRowDuplicates,
+        Self::PaintCount,
+        Self::FrameCount,
+    ];
+}
+
+/// Explicit, fixed-size counter observability for one event.  `false` means
+/// the numeric value was observed, including observed zero; `true` means the
+/// corresponding numeric field is only a zero placeholder.  The fixed shape
+/// prevents hostile input from allocating an unbounded availability list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionTraceCounterAvailability {
+    pub queue_depth: bool,
+    pub oldest_queue_age_ns: bool,
+    pub work_units: bool,
+    pub bytes: bool,
+    pub rows: bool,
+    pub allocation_count: bool,
+    pub allocated_bytes: bool,
+    pub copy_count: bool,
+    pub copied_bytes: bool,
+    pub rpc_count: bool,
+    pub delta_count: bool,
+    pub dirty_rows: bool,
+    pub full_viewport_clones: bool,
+    pub cursor_row_duplicates: bool,
+    pub paint_count: bool,
+    pub frame_count: bool,
+}
+
+impl InteractionTraceCounterAvailability {
+    /// Explicitly assert that every counter was observed.  There is
+    /// intentionally no `Default` implementation: a producer must not gain a
+    /// qualifying all-observed claim by mechanically defaulting the DTO.
+    #[must_use]
+    pub const fn all_available() -> Self {
+        Self {
+            queue_depth: false,
+            oldest_queue_age_ns: false,
+            work_units: false,
+            bytes: false,
+            rows: false,
+            allocation_count: false,
+            allocated_bytes: false,
+            copy_count: false,
+            copied_bytes: false,
+            rpc_count: false,
+            delta_count: false,
+            dirty_rows: false,
+            full_viewport_clones: false,
+            cursor_row_duplicates: false,
+            paint_count: false,
+            frame_count: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        !self.queue_depth
+            && !self.oldest_queue_age_ns
+            && !self.work_units
+            && !self.bytes
+            && !self.rows
+            && !self.allocation_count
+            && !self.allocated_bytes
+            && !self.copy_count
+            && !self.copied_bytes
+            && !self.rpc_count
+            && !self.delta_count
+            && !self.dirty_rows
+            && !self.full_viewport_clones
+            && !self.cursor_row_duplicates
+            && !self.paint_count
+            && !self.frame_count
+    }
+
+    #[must_use]
+    pub const fn is_unavailable(self, field: InteractionTraceCounterField) -> bool {
+        match field {
+            InteractionTraceCounterField::QueueDepth => self.queue_depth,
+            InteractionTraceCounterField::OldestQueueAgeNs => self.oldest_queue_age_ns,
+            InteractionTraceCounterField::WorkUnits => self.work_units,
+            InteractionTraceCounterField::Bytes => self.bytes,
+            InteractionTraceCounterField::Rows => self.rows,
+            InteractionTraceCounterField::AllocationCount => self.allocation_count,
+            InteractionTraceCounterField::AllocatedBytes => self.allocated_bytes,
+            InteractionTraceCounterField::CopyCount => self.copy_count,
+            InteractionTraceCounterField::CopiedBytes => self.copied_bytes,
+            InteractionTraceCounterField::RpcCount => self.rpc_count,
+            InteractionTraceCounterField::DeltaCount => self.delta_count,
+            InteractionTraceCounterField::DirtyRows => self.dirty_rows,
+            InteractionTraceCounterField::FullViewportClones => self.full_viewport_clones,
+            InteractionTraceCounterField::CursorRowDuplicates => self.cursor_row_duplicates,
+            InteractionTraceCounterField::PaintCount => self.paint_count,
+            InteractionTraceCounterField::FrameCount => self.frame_count,
+        }
+    }
 }
 
 /// Causal state generations.  `None` is explicit unavailable data; later
@@ -411,12 +598,14 @@ pub struct InteractionTraceEventV2 {
     pub span_id: u64,
     pub parent_span_id: Option<u64>,
     pub stage: InteractionTraceStage,
+    pub stage_outcome: InteractionTraceStageOutcome,
     pub producer: InteractionTraceProducer,
     pub topology: InteractionTraceTopology,
     pub started_at: InteractionTraceTimestamp,
     pub completed_at: InteractionTraceTimestamp,
     pub correlation: InteractionTraceCorrelation,
     pub counters: InteractionTraceCounters,
+    pub counter_availability: InteractionTraceCounterAvailability,
     pub generations: InteractionTraceGenerations,
     pub sampling_loss: InteractionTraceSamplingLoss,
     pub observation_boundary: InteractionTraceObservationBoundary,
@@ -459,6 +648,7 @@ impl InteractionTraceV2 {
         let mut spans = BTreeSet::new();
         let mut seen_stages = BTreeSet::new();
         let mut last_start_by_clock = BTreeMap::new();
+        let mut trace_topology = None;
 
         for (index, event) in self.events.iter().enumerate() {
             validate_schema(&event.schema_version)?;
@@ -480,6 +670,17 @@ impl InteractionTraceV2 {
                     expected: self.path,
                     actual: event.stage.path(),
                 });
+            }
+            if let Some(expected) = trace_topology {
+                if event.topology != expected {
+                    return Err(TraceContractError::TraceTopologyChanged {
+                        expected,
+                        actual: event.topology,
+                        event_ordinal: event.event_ordinal,
+                    });
+                }
+            } else {
+                trace_topology = Some(event.topology);
             }
             let Some(expected_stage) = expected.get(index).copied() else {
                 return Err(TraceContractError::UnexpectedStage { stage: event.stage });
@@ -523,6 +724,17 @@ impl InteractionTraceV2 {
             });
         }
         for event in &self.events {
+            if !event.stage_outcome.is_qualifying() {
+                return Err(TraceContractError::NonQualifyingStageOutcome {
+                    stage: event.stage,
+                    outcome: event.stage_outcome,
+                });
+            }
+            if !event.counter_availability.is_complete() {
+                return Err(TraceContractError::CountersUnavailable {
+                    event_ordinal: event.event_ordinal,
+                });
+            }
             if !event.sampling_loss.is_lossless() {
                 return Err(TraceContractError::SamplingLoss {
                     event_ordinal: event.event_ordinal,
@@ -661,8 +873,46 @@ fn validate_event(
     validate_clock(event.completed_at.clock_domain, event.producer)?;
     event.duration_ns()?;
     validate_correlation(event.correlation)?;
+    validate_stage_outcome(event)?;
+    validate_counter_availability(event)?;
     validate_generations(event)?;
     validate_observation_boundary(event)?;
+    Ok(())
+}
+
+fn validate_stage_outcome(event: &InteractionTraceEventV2) -> Result<(), TraceContractError> {
+    if matches!(event.stage, InteractionTraceStage::Keypress(_))
+        && event.stage_outcome == InteractionTraceStageOutcome::NotApplicable
+    {
+        return Err(TraceContractError::StageOutcomeInvalidForPath {
+            stage: event.stage,
+            outcome: event.stage_outcome,
+        });
+    }
+
+    if matches!(
+        event.stage_outcome,
+        InteractionTraceStageOutcome::NoOp
+            | InteractionTraceStageOutcome::NotApplicable
+            | InteractionTraceStageOutcome::Superseded
+    ) && event.started_at.monotonic_ns != event.completed_at.monotonic_ns
+    {
+        return Err(TraceContractError::InactiveStageHasDuration {
+            stage: event.stage,
+            outcome: event.stage_outcome,
+        });
+    }
+    Ok(())
+}
+
+fn validate_counter_availability(
+    event: &InteractionTraceEventV2,
+) -> Result<(), TraceContractError> {
+    for field in InteractionTraceCounterField::ALL {
+        if event.counter_availability.is_unavailable(field) && event.counters.value(field) != 0 {
+            return Err(TraceContractError::UnavailableCounterHasValue { field });
+        }
+    }
     Ok(())
 }
 
@@ -1143,6 +1393,29 @@ pub enum TraceContractError {
     InvalidTopologyIdentity {
         field: &'static str,
     },
+    TraceTopologyChanged {
+        expected: InteractionTraceTopology,
+        actual: InteractionTraceTopology,
+        event_ordinal: u64,
+    },
+    StageOutcomeInvalidForPath {
+        stage: InteractionTraceStage,
+        outcome: InteractionTraceStageOutcome,
+    },
+    InactiveStageHasDuration {
+        stage: InteractionTraceStage,
+        outcome: InteractionTraceStageOutcome,
+    },
+    NonQualifyingStageOutcome {
+        stage: InteractionTraceStage,
+        outcome: InteractionTraceStageOutcome,
+    },
+    UnavailableCounterHasValue {
+        field: InteractionTraceCounterField,
+    },
+    CountersUnavailable {
+        event_ordinal: u64,
+    },
     InvalidClockDomain {
         field: &'static str,
     },
@@ -1257,6 +1530,7 @@ mod tests {
             span_id: ordinal as u64 + 1,
             parent_span_id,
             stage,
+            stage_outcome: InteractionTraceStageOutcome::Performed,
             producer: InteractionTraceProducer {
                 host_id,
                 process_id: host_id as u32,
@@ -1292,6 +1566,7 @@ mod tests {
                 protocol_generation: 1,
             },
             counters: InteractionTraceCounters::default(),
+            counter_availability: InteractionTraceCounterAvailability::all_available(),
             generations: InteractionTraceGenerations {
                 terminal_generation: Some(1),
                 snapshot_generation: Some(1),
@@ -1482,6 +1757,99 @@ mod tests {
     }
 
     #[test]
+    fn conditional_resize_stage_outcomes_are_explicit_and_fail_closed() {
+        let mut trace = resize_trace(2);
+        let worker_create = &mut trace.events[6];
+        worker_create.stage_outcome = InteractionTraceStageOutcome::NotApplicable;
+        worker_create.completed_at = worker_create.started_at;
+        assert!(matches!(
+            trace.validate_qualifying(),
+            Err(TraceContractError::NonQualifyingStageOutcome {
+                stage: InteractionTraceStage::ResizeZoom(RendererResizeTraceStage::WorkerCreate),
+                outcome: InteractionTraceStageOutcome::NotApplicable,
+            })
+        ));
+
+        trace.events[5].stage_outcome = InteractionTraceStageOutcome::Superseded;
+        trace.events[5].completed_at = trace.events[5].started_at;
+        assert!(matches!(
+            trace.validate_qualifying(),
+            Err(TraceContractError::NonQualifyingStageOutcome {
+                stage: InteractionTraceStage::ResizeZoom(
+                    RendererResizeTraceStage::IntentSupersession
+                ),
+                outcome: InteractionTraceStageOutcome::Superseded,
+            })
+        ));
+
+        let mut keypress = keypress_trace(3);
+        keypress.events[0].stage_outcome = InteractionTraceStageOutcome::NotApplicable;
+        keypress.events[0].completed_at = keypress.events[0].started_at;
+        assert!(matches!(
+            keypress.validate_structure(),
+            Err(TraceContractError::StageOutcomeInvalidForPath { .. })
+        ));
+    }
+
+    #[test]
+    fn counter_unavailability_is_explicit_and_non_qualifying() {
+        let mut trace = keypress_trace(1);
+        trace.events[3].counter_availability.queue_depth = true;
+        assert!(trace.validate_structure().is_ok());
+        assert_eq!(
+            trace.validate_qualifying(),
+            Err(TraceContractError::CountersUnavailable { event_ordinal: 3 })
+        );
+
+        trace.events[3].counters.queue_depth = 1;
+        assert_eq!(
+            trace.validate_structure(),
+            Err(TraceContractError::UnavailableCounterHasValue {
+                field: InteractionTraceCounterField::QueueDepth,
+            })
+        );
+    }
+
+    #[test]
+    fn outcome_and_counter_availability_are_mandatory_closed_metadata() {
+        let encoded = serde_json::to_value(keypress_trace(1)).expect("trace serializes");
+        for field in ["stage_outcome", "counter_availability"] {
+            let mut missing = encoded.clone();
+            missing["events"][0]
+                .as_object_mut()
+                .expect("event is an object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<InteractionTraceV2>(missing).is_err(),
+                "missing {field} unexpectedly defaulted"
+            );
+        }
+
+        let mut unknown = encoded;
+        unknown["events"][0]["counter_availability"]["unknown_counter"] =
+            serde_json::json!(false);
+        assert!(
+            serde_json::from_value::<InteractionTraceV2>(unknown).is_err(),
+            "unknown counter availability unexpectedly decoded"
+        );
+    }
+
+    #[test]
+    fn trace_topology_must_remain_stable() {
+        let mut trace = keypress_trace(1);
+        let expected = trace.events[0].topology;
+        trace.events[4].topology.pane_id = 99;
+        assert_eq!(
+            trace.validate_structure(),
+            Err(TraceContractError::TraceTopologyChanged {
+                expected,
+                actual: trace.events[4].topology,
+                event_ordinal: 4,
+            })
+        );
+    }
+
+    #[test]
     fn cross_clock_and_clock_regression_arithmetic_fail_closed() {
         let from = InteractionTraceTimestamp {
             clock_domain: InteractionTraceClockDomain {
@@ -1589,23 +1957,37 @@ mod tests {
             );
         }
 
-        for (label, fixture) in [
-            ("old schema", OLD_FIXTURE),
-            ("raw-content fields", PRIVACY_BAD_FIXTURE),
-        ] {
-            let value: serde_json::Value =
-                serde_json::from_str(fixture).expect("negative fixture parses as JSON");
-            assert!(
-                !validator.is_valid(&value),
-                "{label} fixture unexpectedly passed"
-            );
+        let old: serde_json::Value =
+            serde_json::from_str(OLD_FIXTURE).expect("old fixture parses as JSON");
+        assert!(!validator.is_valid(&old), "old schema unexpectedly passed");
+
+        let privacy_overlay: serde_json::Value = serde_json::from_str(PRIVACY_BAD_FIXTURE)
+            .expect("privacy-negative overlay parses as JSON");
+        let mut privacy_bad: serde_json::Value =
+            serde_json::from_str(GOOD_FIXTURE).expect("good fixture parses as JSON");
+        for field in ["raw_key", "pane_text"] {
+            privacy_bad
+                .as_object_mut()
+                .expect("trace is an object")
+                .insert(field.to_owned(), privacy_overlay[field].clone());
         }
+        assert!(
+            !validator.is_valid(&privacy_bad),
+            "otherwise-valid trace with raw-content fields unexpectedly passed"
+        );
+        let privacy_bad_object = privacy_bad.as_object_mut().expect("trace is an object");
+        privacy_bad_object.remove("raw_key");
+        privacy_bad_object.remove("pane_text");
+        assert!(
+            validator.is_valid(&privacy_bad),
+            "removing only the planted raw-content fields did not restore validity"
+        );
     }
 
     #[test]
     fn old_fixture_is_retained_but_rejected_by_version() {
         let trace: InteractionTraceV2 =
-            serde_json::from_str(OLD_FIXTURE).expect("old shape remains parseable");
+            serde_json::from_str(OLD_FIXTURE).expect("old top-level envelope remains parseable");
         assert_eq!(
             trace.validate_structure(),
             Err(TraceContractError::UnsupportedSchemaVersion)
@@ -1614,7 +1996,6 @@ mod tests {
 
     #[test]
     fn unknown_raw_content_fields_are_rejected_and_never_serialized() {
-        assert!(serde_json::from_str::<InteractionTraceV2>(PRIVACY_BAD_FIXTURE).is_err());
         let encoded = serde_json::to_string(&keypress_trace(1)).expect("trace encodes");
         for forbidden in [
             "raw_key",
