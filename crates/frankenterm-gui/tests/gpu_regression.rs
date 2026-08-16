@@ -2046,17 +2046,17 @@ fn diff_perf_reports(
         else {
             continue;
         };
-        if let Some(delta_pct) = pct_increase(baseline_entry.render_ms, current_entry.render_ms) {
-            if delta_pct > threshold_per_fixture_pct {
-                per_fixture_regressions.push(PerFixtureRegression {
-                    fixture: current_entry.fixture.clone(),
-                    metric: "render_ms".to_string(),
-                    baseline_ms: baseline_entry.render_ms,
-                    current_ms: current_entry.render_ms,
-                    delta_pct,
-                    threshold_pct: threshold_per_fixture_pct,
-                });
-            }
+        if let Some(delta_pct) = pct_increase(baseline_entry.render_ms, current_entry.render_ms)
+            && delta_pct > threshold_per_fixture_pct
+        {
+            per_fixture_regressions.push(PerFixtureRegression {
+                fixture: current_entry.fixture.clone(),
+                metric: "render_ms".to_string(),
+                baseline_ms: baseline_entry.render_ms,
+                current_ms: current_entry.render_ms,
+                delta_pct,
+                threshold_pct: threshold_per_fixture_pct,
+            });
         }
     }
 
@@ -2064,16 +2064,15 @@ fn diff_perf_reports(
     if let Some(delta_pct) = pct_increase(
         baseline.aggregate.total_render_ms,
         current.aggregate.total_render_ms,
-    ) {
-        if delta_pct > threshold_aggregate_pct {
-            aggregate_regressions.push(AggregateRegression {
-                metric: "total_render_ms".to_string(),
-                baseline: baseline.aggregate.total_render_ms,
-                current: current.aggregate.total_render_ms,
-                delta_pct,
-                threshold_pct: threshold_aggregate_pct,
-            });
-        }
+    ) && delta_pct > threshold_aggregate_pct
+    {
+        aggregate_regressions.push(AggregateRegression {
+            metric: "total_render_ms".to_string(),
+            baseline: baseline.aggregate.total_render_ms,
+            current: current.aggregate.total_render_ms,
+            delta_pct,
+            threshold_pct: threshold_aggregate_pct,
+        });
     }
     if let Some(delta_pct) = pct_increase(
         baseline.aggregate.p95_render_ms,
@@ -2129,25 +2128,25 @@ fn emit_perf_summary(report: &PerfReport, report_path: &Path, comparison: Option
         "p95_render_ms": report.aggregate.p95_render_ms,
         "per_fixture": report.per_fixture,
     });
-    if let Some(cmp) = comparison {
-        if let serde_json::Value::Object(ref mut map) = value {
-            map.insert(
-                "regressions_vs_baseline".into(),
-                serde_json::to_value(&cmp.per_fixture_regressions).unwrap_or(json!([])),
-            );
-            map.insert(
-                "aggregate_regressions".into(),
-                serde_json::to_value(&cmp.aggregate_regressions).unwrap_or(json!([])),
-            );
-            map.insert(
-                "baseline_runner".into(),
-                serde_json::to_value(&cmp.baseline_runner).unwrap_or(json!(null)),
-            );
-            map.insert(
-                "baseline_generated_at_unix_secs".into(),
-                json!(cmp.baseline_generated_at_unix_secs),
-            );
-        }
+    if let Some(cmp) = comparison
+        && let serde_json::Value::Object(ref mut map) = value
+    {
+        map.insert(
+            "regressions_vs_baseline".into(),
+            serde_json::to_value(&cmp.per_fixture_regressions).unwrap_or(json!([])),
+        );
+        map.insert(
+            "aggregate_regressions".into(),
+            serde_json::to_value(&cmp.aggregate_regressions).unwrap_or(json!([])),
+        );
+        map.insert(
+            "baseline_runner".into(),
+            serde_json::to_value(&cmp.baseline_runner).unwrap_or(json!(null)),
+        );
+        map.insert(
+            "baseline_generated_at_unix_secs".into(),
+            json!(cmp.baseline_generated_at_unix_secs),
+        );
     }
     emit_json(value);
 }
