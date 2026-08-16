@@ -1663,7 +1663,7 @@ mod tests {
                 let mut model = PublicationModel::new(8);
                 model.begin(fields, 4, 2, 2, 1);
                 assert_eq!(model.commit(), CommitOutcome::Rejected, "{field:?}");
-                assert!(model.published.is_none(), "{field:?}");
+                assert!(model.published.is_none(), "{:?}", field);
             }
         }
 
@@ -1678,7 +1678,7 @@ mod tests {
                 .expect("pre-publication cancellation must preserve invariants");
             assert!(cancelled.upgrade().is_none());
             assert_eq!(
-                (model.publication_generation, model.published),
+                (model.publication_generation, model.published.clone()),
                 before_cancel
             );
 
