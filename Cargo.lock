@@ -4081,6 +4081,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-flight-recorder"
+version = "0.13.0"
+dependencies = [
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "frankenterm-core-audit-types",
+ "proptest",
+ "serde_json",
+ "static_assertions",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "frankenterm-fuzz"
 version = "0.0.0"
 dependencies = [

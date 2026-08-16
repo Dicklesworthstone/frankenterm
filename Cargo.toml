@@ -10,6 +10,7 @@ members = [
     "crates/frankenterm-core-resource-types",
     "crates/frankenterm-core-error-types",
     "crates/frankenterm-core-audit-types",
+    "crates/frankenterm-flight-recorder",
     "crates/frankenterm-core-cass-types",
     "crates/frankenterm-core-caut-types",
     "crates/frankenterm-core-connector-types",
@@ -376,6 +377,8 @@ cap-std = "3.4.5"
 cassowary = "0.3"
 colorgrad = { version = "0.8.0", features = ["named-colors", "preset"] }
 crossbeam = "0.8.4"
+crossbeam-queue = "0.3.12"
+crossbeam-utils = "0.8.21"
 csscolorparser = "0.8.3"
 deltae = "0.3.2"
 dirs-next = "2.0"
