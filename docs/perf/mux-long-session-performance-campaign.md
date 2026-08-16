@@ -694,6 +694,14 @@ charged once per arena identity, while backing retained by distinct
 generations or sessions is charged separately. A per-window budget can never
 be multiplied by an unbounded number of windows.
 
+Arena, publisher, and reservation identity are exact allocation capabilities,
+not caller-selected numeric IDs. Display IDs are diagnostic only. A
+reservation is non-`Copy`, carries its exact arena/publisher/token authority,
+and is consumed once; duplicate, stale, or same-numbered cross-arena release
+fails without changing counters. Publisher retirement is rejected while any
+generation token remains, then reclaims the active-publisher slot so window
+churn cannot exhaust capacity permanently.
+
 The initial numeric memory caps must be frozen from measured visible-state
 distributions in `.6.3`; `.6.2` does not invent target claims without data.
 The non-negotiable structural caps are three distinct snapshot generations per
