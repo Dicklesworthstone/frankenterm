@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex, TryLockError};
 
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
 use crossbeam_utils::CachePadded;
+#[cfg(all(feature = "platform-markers", target_os = "linux"))]
+use frankenterm_core_audit_types::interaction_flight_recorder_v1::MAX_SHARDS;
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
     PlatformMarkerAccountingV1, PlatformMarkerAuthorityV1, RecorderAccountingAuthority,
     RecorderEpochId, RecorderMode,
@@ -242,8 +244,6 @@ const LINUX_MARKER_BUILDER_META_CAPACITY: u16 = 256;
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
 const LINUX_MARKER_BUILDER_DATA_CAPACITY: u16 = 64;
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
-const LINUX_MARKER_MAX_SHARDS: usize = 256;
-#[cfg(all(feature = "platform-markers", target_os = "linux"))]
 const LINUX_USER_EVENTS_KEYWORD: u64 = 1;
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
 const LINUX_ERRNO_EPERM: i32 = 1;
@@ -260,10 +260,12 @@ const LINUX_ERRNO_EOPNOTSUPP: i32 = 95;
 
 /// Linux `user_events` adapter.
 ///
-/// Provider registration and all allocation happen in [`Self::try_new`]. Each
-/// emitter shard owns a builder with enough fixed capacity for the complete
-/// static schema. Emission uses `try_lock`, so concurrent shard collisions are
-/// reported as bounded drops instead of waiting on the keypress or render path.
+/// Provider registration and all allocation happen in
+/// [`PlatformMarkerEmitter::<LinuxUserEventsMarkerAdapter>::try_for_recorder`].
+/// Each emitter shard owns a builder with enough fixed capacity for the
+/// complete static schema. Emission uses `try_lock`, so concurrent shard
+/// collisions are reported as bounded drops instead of waiting on the keypress
+/// or render path.
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
 #[derive(Debug)]
 pub struct LinuxUserEventsMarkerAdapter {
@@ -280,18 +282,13 @@ impl sealed::Sealed for LinuxUserEventsMarkerAdapter {}
 
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
 impl LinuxUserEventsMarkerAdapter {
-    /// Register the numeric event set and preallocate one builder per available
-    /// CPU, capped to keep off-path setup bounded on large Threadripper hosts.
-    pub fn try_new() -> Result<Self, MarkerUnavailableReason> {
-        let shard_count = std::thread::available_parallelism().map_or(1, usize::from);
-        Self::try_new_with_shards(shard_count.min(LINUX_MARKER_MAX_SHARDS))
+    fn try_new(recorder: &FlightRecorder) -> Result<Self, MarkerUnavailableReason> {
+        Self::try_new_with_builder_count(linux_marker_shard_count_for_recorder(recorder)?)
     }
 
-    /// Register with at least the requested nonzero builder count. The actual
-    /// count is rounded to a power of two for an allocation-free mask on emit.
-    pub fn try_new_with_shards(requested_shards: usize) -> Result<Self, MarkerUnavailableReason> {
-        let shard_count = linux_marker_shard_count(requested_shards)?;
-
+    /// Register with the validated power-of-two builder count derived from the
+    /// recorder's immutable topology.
+    fn try_new_with_builder_count(shard_count: usize) -> Result<Self, MarkerUnavailableReason> {
         let mut provider = eventheader_dynamic::Provider::new(
             "frankenterm",
             &eventheader_dynamic::Provider::new_options(),
@@ -326,6 +323,18 @@ impl LinuxUserEventsMarkerAdapter {
 }
 
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
+impl PlatformMarkerEmitter<LinuxUserEventsMarkerAdapter> {
+    /// Register Linux `user_events` builders from this recorder's immutable
+    /// producer topology and bind the resulting adapter to the same exact
+    /// recorder allocation. Combining those steps prevents an undersized
+    /// adapter from being reused with a larger recorder.
+    pub fn try_for_recorder(recorder: &FlightRecorder) -> Result<Self, MarkerUnavailableReason> {
+        let adapter = LinuxUserEventsMarkerAdapter::try_new(recorder)?;
+        Ok(Self::for_recorder(recorder, adapter))
+    }
+}
+
+#[cfg(all(feature = "platform-markers", target_os = "linux"))]
 const fn map_linux_registration_errno(errno: i32) -> MarkerUnavailableReason {
     match errno {
         LINUX_ERRNO_EPERM | LINUX_ERRNO_EACCES => MarkerUnavailableReason::PermissionDenied,
@@ -337,13 +346,23 @@ const fn map_linux_registration_errno(errno: i32) -> MarkerUnavailableReason {
 }
 
 #[cfg(all(feature = "platform-markers", target_os = "linux"))]
+fn linux_marker_shard_count_for_recorder(
+    recorder: &FlightRecorder,
+) -> Result<usize, MarkerUnavailableReason> {
+    if recorder.config().mode() != RecorderMode::CertificationWithMarkers {
+        return Err(MarkerUnavailableReason::Disabled);
+    }
+    linux_marker_shard_count(usize::from(recorder.config().capacity().shard_count))
+}
+
+#[cfg(all(feature = "platform-markers", target_os = "linux"))]
 fn linux_marker_shard_count(requested_shards: usize) -> Result<usize, MarkerUnavailableReason> {
     if requested_shards == 0 {
         return Err(MarkerUnavailableReason::RegistrationFailed);
     }
     requested_shards
         .checked_next_power_of_two()
-        .filter(|count| *count <= LINUX_MARKER_MAX_SHARDS)
+        .filter(|count| *count <= usize::from(MAX_SHARDS))
         .ok_or(MarkerUnavailableReason::RegistrationFailed)
 }
 
@@ -864,6 +883,15 @@ mod tests {
         mode: RecorderMode,
         epoch_id: RecorderEpochId,
     ) -> Arc<FlightRecorder> {
+        test_recorder_for_capacity(mode, epoch_id, 1, 4)
+    }
+
+    fn test_recorder_for_capacity(
+        mode: RecorderMode,
+        epoch_id: RecorderEpochId,
+        shard_count: u16,
+        total_slots: u32,
+    ) -> Arc<FlightRecorder> {
         let sampler = if mode == RecorderMode::Off {
             RecorderSamplerConfigV1::off()
         } else {
@@ -874,8 +902,8 @@ mod tests {
             InteractionTraceRunId::new(3, 4).expect("test run is valid"),
             mode,
             sampler,
-            1,
-            4,
+            shard_count,
+            total_slots,
             TEST_BYTE_CEILING,
         )
         .expect("test recorder config is valid");
@@ -1403,8 +1431,35 @@ mod tests {
         assert_eq!(linux_marker_shard_count(128), Ok(128));
         assert_eq!(linux_marker_shard_count(129), Ok(256));
         assert_eq!(
-            linux_marker_shard_count(257).unwrap_err(),
+            linux_marker_shard_count(usize::from(MAX_SHARDS)),
+            Ok(usize::from(MAX_SHARDS))
+        );
+        assert_eq!(
+            linux_marker_shard_count(usize::from(MAX_SHARDS) + 1).unwrap_err(),
             MarkerUnavailableReason::RegistrationFailed
+        );
+        for mode in [
+            RecorderMode::Off,
+            RecorderMode::Low,
+            RecorderMode::Certification,
+        ] {
+            assert_eq!(
+                linux_marker_shard_count_for_recorder(&test_recorder(mode)),
+                Err(MarkerUnavailableReason::Disabled),
+                "a non-marker epoch must fail before provider registration"
+            );
+        }
+
+        let high_core_recorder = test_recorder_for_capacity(
+            RecorderMode::CertificationWithMarkers,
+            RecorderEpochId::new(5, 6).expect("test epoch is valid"),
+            129,
+            129,
+        );
+        assert_eq!(
+            linux_marker_shard_count_for_recorder(&high_core_recorder),
+            Ok(256),
+            "marker builders must cover the frozen recorder topology even when process-visible CPU parallelism is lower"
         );
 
         let recorder = test_recorder(RecorderMode::CertificationWithMarkers);

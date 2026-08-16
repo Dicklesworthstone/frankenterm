@@ -4199,7 +4199,15 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   allocation and lock waiting. Linux builder routing reuses the recorder's
   explicit non-`Send` producer shard, preventing every stage of one trace/span
   from collapsing onto one mutex when the builder count covers the producer
-  count. The target tracing syscall can still perturb diagnostic-mode latency.
+  count. Adapter construction derives its builder count from that immutable
+  recorder topology rather than process-visible CPU parallelism, so affinity
+  and container limits cannot silently reintroduce shard aliases; it shares the
+  recorder contract's 256-shard ceiling instead of maintaining a second cap.
+  One public constructor atomically creates the adapter and emitter from the
+  same recorder, preventing an adapter sized for one recorder from being reused
+  with a larger topology. Non-marker recorder modes fail as disabled before
+  provider registration. The target tracing syscall can still perturb
+  diagnostic-mode latency.
   The overhead matrix must measure that cost; no ordinary recorder mode enables
   the adapter.
 - **Decision:** preserve platform acceptance as a useful correlation signal,
