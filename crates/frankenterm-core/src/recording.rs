@@ -1160,6 +1160,9 @@ pub(crate) fn reset_recording_clock_anomaly_count_for_test() {
     RECORDING_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+static RECORDING_CLOCK_ANOMALY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Returns the current Unix epoch in milliseconds.
 ///
 /// br-ft-crpvd: pre-fix this used `unwrap_or_default()` which silently
@@ -1180,7 +1183,7 @@ pub fn epoch_ms_now() -> u64 {
 /// depending on the host system clock.
 fn epoch_ms_now_from(now: std::time::SystemTime) -> u64 {
     match now.duration_since(std::time::UNIX_EPOCH) {
-        Ok(ts) => ts.as_millis() as u64,
+        Ok(ts) => epoch_millis_saturating(ts),
         Err(err) => {
             saturating_atomic_increment(&RECORDING_CLOCK_ANOMALY_COUNT);
             tracing::warn!(
@@ -1192,6 +1195,10 @@ fn epoch_ms_now_from(now: std::time::SystemTime) -> u64 {
             0
         }
     }
+}
+
+fn epoch_millis_saturating(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Thread-safe monotonic sequence counter for recorder events.
@@ -2638,6 +2645,9 @@ mod tests {
 
     #[test]
     fn epoch_ms_now_from_post_epoch_no_anomaly_ft_crpvd() {
+        let _guard = super::RECORDING_CLOCK_ANOMALY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Sanity: a valid post-epoch SystemTime returns positive
         // ms and does NOT bump the anomaly counter.
         super::reset_recording_clock_anomaly_count_for_test();
@@ -2652,7 +2662,17 @@ mod tests {
     }
 
     #[test]
+    fn epoch_millis_saturates_instead_of_wrapping() {
+        let beyond_u64_millis = std::time::Duration::from_secs(u64::MAX / 1_000 + 1);
+        assert!(beyond_u64_millis.as_millis() > u128::from(u64::MAX));
+        assert_eq!(super::epoch_millis_saturating(beyond_u64_millis), u64::MAX);
+    }
+
+    #[test]
     fn epoch_ms_now_from_pre_epoch_bumps_counter_ft_crpvd() {
+        let _guard = super::RECORDING_CLOCK_ANOMALY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // br-ft-crpvd: pre-epoch SystemTime triggers the Err
         // branch. Returns 0 (preserves scalar contract) and bumps
         // the process-global counter.
