@@ -65,9 +65,11 @@ pub struct PlatformMarkerPayload {
 /// The weak owner witness is never passed to a platform API. It prevents two
 /// distinct recorder allocations that happen to reuse the same public epoch
 /// identifier from cross-crediting marker attempts, while the adapter-facing
-/// payload remains fixed-size and numeric.
+/// payload remains fixed-size and numeric. The receipt is deliberately neither
+/// `Clone` nor `Copy`, and [`PlatformMarkerEmitter::emit`] consumes it, so one
+/// retained recorder event cannot request multiple platform emissions.
 #[must_use = "emit the prepared marker or explicitly discard it"]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedPlatformMarker {
     recorder_identity: Weak<FlightRecorder>,
     payload: PlatformMarkerPayload,
@@ -633,8 +635,11 @@ where
         }
     }
 
-    /// Attempt one marker outside the recorder admission boundary.
-    pub fn emit(&self, prepared: &PreparedPlatformMarker) -> PlatformMarkerOutcome {
+    /// Consume one prepared receipt and attempt its marker outside the recorder
+    /// admission boundary. Even pre-admission rejection consumes the receipt:
+    /// caller routing mistakes fail closed instead of creating a reusable
+    /// multi-emission authority.
+    pub fn emit(&self, prepared: PreparedPlatformMarker) -> PlatformMarkerOutcome {
         if self.mode != RecorderMode::CertificationWithMarkers {
             return PlatformMarkerOutcome::NotRequested;
         }
@@ -860,7 +865,7 @@ mod tests {
         InteractionTraceRunId, InteractionTraceStageOutcome, InteractionTraceTimestamp,
         InteractionTraceTopology,
     };
-    use static_assertions::assert_impl_all;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
 
     use super::*;
     use crate::{ClockStamp, FlightRecorder, RecordOutcome, RecorderConfig, TraceAdmission};
@@ -1063,7 +1068,8 @@ mod tests {
     #[test]
     fn payload_is_copyable_numeric_identity_with_static_names() {
         assert_impl_all!(PlatformMarkerPayload: Copy, Send, Sync);
-        assert_impl_all!(PreparedPlatformMarker: Clone, Send, Sync);
+        assert_impl_all!(PreparedPlatformMarker: Send, Sync);
+        assert_not_impl_any!(PreparedPlatformMarker: Clone, Copy);
         let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
         let prepared = recorded_payload(&recorder);
         let payload = prepared.payload();
@@ -1106,7 +1112,6 @@ mod tests {
     #[test]
     fn ordinary_modes_perform_no_marker_work() {
         let marker_recorder = test_recorder(RecorderMode::CertificationWithMarkers);
-        let payload = recorded_payload(&marker_recorder);
         for mode in [RecorderMode::Low, RecorderMode::Certification] {
             let ordinary_recorder = test_recorder(mode);
             let (ordinary_producer, ordinary_token, ordinary_fields) =
@@ -1126,7 +1131,10 @@ mod tests {
                     delivery: MarkerDeliveryAuthority::Exact,
                 },
             );
-            assert_eq!(emitter.emit(&payload), PlatformMarkerOutcome::NotRequested);
+            assert_eq!(
+                emitter.emit(recorded_payload(&marker_recorder)),
+                PlatformMarkerOutcome::NotRequested
+            );
             assert_eq!(calls.load(Ordering::Relaxed), 0);
             assert_eq!(
                 emitter.snapshot(),
@@ -1152,7 +1160,7 @@ mod tests {
             },
         );
         assert_eq!(
-            off_emitter.emit(&payload),
+            off_emitter.emit(recorded_payload(&marker_recorder)),
             PlatformMarkerOutcome::NotRequested
         );
         assert_eq!(off_calls.load(Ordering::Relaxed), 0);
@@ -1188,7 +1196,7 @@ mod tests {
             },
         );
         assert_eq!(
-            emitter.emit(&foreign_payload),
+            emitter.emit(foreign_payload),
             PlatformMarkerOutcome::WrongEpoch
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -1216,7 +1224,7 @@ mod tests {
         );
 
         assert_eq!(
-            emitter.emit(&foreign_payload),
+            emitter.emit(foreign_payload),
             PlatformMarkerOutcome::WrongRecorder
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -1237,7 +1245,7 @@ mod tests {
             },
         );
         assert_eq!(
-            emitter.emit(&payload),
+            emitter.emit(payload),
             PlatformMarkerOutcome::Emitted {
                 delivery: MarkerDeliveryAuthority::Exact
             }
@@ -1295,7 +1303,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            emitter.emit(&payload),
+            emitter.emit(payload),
             PlatformMarkerOutcome::Emitted {
                 delivery: MarkerDeliveryAuthority::Exact
             }
@@ -1318,7 +1326,6 @@ mod tests {
     #[test]
     fn external_loss_unavailable_and_drop_stay_separate() {
         let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
-        let payload = recorded_payload(&recorder);
         let (lossy, _) = emitter(
             &recorder,
             PlatformMarkerAdapterOutcome::Emitted {
@@ -1326,7 +1333,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            lossy.emit(&payload),
+            lossy.emit(recorded_payload(&recorder)),
             PlatformMarkerOutcome::Emitted {
                 delivery: MarkerDeliveryAuthority::ExternalLossUnknown
             }
@@ -1337,7 +1344,7 @@ mod tests {
             PlatformMarkerAdapterOutcome::Unavailable(MarkerUnavailableReason::PermissionDenied),
         );
         assert_eq!(
-            unavailable.emit(&payload),
+            unavailable.emit(recorded_payload(&recorder)),
             PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::PermissionDenied)
         );
 
@@ -1346,7 +1353,7 @@ mod tests {
             PlatformMarkerAdapterOutcome::Dropped(MarkerDropReason::QueueFull),
         );
         assert_eq!(
-            dropped.emit(&payload),
+            dropped.emit(recorded_payload(&recorder)),
             PlatformMarkerOutcome::Dropped(MarkerDropReason::QueueFull)
         );
 
@@ -1355,7 +1362,7 @@ mod tests {
             UnsupportedPlatformMarkerAdapter::default(),
         );
         assert_eq!(
-            unsupported.emit(&payload),
+            unsupported.emit(recorded_payload(&recorder)),
             PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::UnsupportedPlatform)
         );
 
@@ -1393,7 +1400,7 @@ mod tests {
         );
         emitter.attempted.store(u64::MAX, Ordering::Relaxed);
         assert!(matches!(
-            emitter.emit(&payload),
+            emitter.emit(payload),
             PlatformMarkerOutcome::AccountingExhausted { .. }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -1418,8 +1425,11 @@ mod tests {
             },
         ));
         let worker_emitter = Arc::clone(&emitter);
-        let post_close_payload = payload.clone();
-        let worker = thread::spawn(move || worker_emitter.emit(&payload));
+        let post_close_payload = PreparedPlatformMarker {
+            recorder_identity: recorder.identity.clone(),
+            payload: payload.payload(),
+        };
+        let worker = thread::spawn(move || worker_emitter.emit(payload));
         entered.wait();
 
         let batch = freeze_recorder(&recorder);
@@ -1439,7 +1449,7 @@ mod tests {
             }
         );
         assert_eq!(
-            emitter.emit(&post_close_payload),
+            emitter.emit(post_close_payload),
             PlatformMarkerOutcome::Closed
         );
         release.wait();
@@ -1469,7 +1479,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            emitter.emit(&payload),
+            emitter.emit(payload),
             PlatformMarkerOutcome::Emitted { .. }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 1);

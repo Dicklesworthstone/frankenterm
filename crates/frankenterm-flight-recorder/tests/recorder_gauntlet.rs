@@ -1043,7 +1043,7 @@ fn unavailable_platform_marker_stays_outside_internal_recorder_authority() {
         UnsupportedPlatformMarkerAdapter::new(MarkerUnavailableReason::PermissionDenied),
     );
     assert_eq!(
-        emitter.emit(&payload),
+        emitter.emit(payload),
         PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::PermissionDenied)
     );
     let frozen = recorder
@@ -1104,7 +1104,7 @@ fn same_epoch_foreign_marker_receipt_cannot_cross_credit_an_emitter() {
     );
 
     assert_eq!(
-        emitter.emit(&foreign_receipt),
+        emitter.emit(foreign_receipt),
         PlatformMarkerOutcome::WrongRecorder
     );
     assert_eq!(
