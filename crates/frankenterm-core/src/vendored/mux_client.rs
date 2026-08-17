@@ -193,6 +193,8 @@ pub enum DirectMuxError {
     ConnectionIdExhausted,
     #[error("request serial space exhausted for this connection")]
     SerialExhausted,
+    #[error("process-local input serial space exhausted")]
+    InputSerialExhausted,
     #[error("invalid direct mux client limit {field}: value must be nonzero")]
     InvalidLimit { field: &'static str },
     #[error(
@@ -358,7 +360,8 @@ impl DirectMuxError {
     pub(super) fn is_proven_pre_write_rejection(&self) -> bool {
         matches!(
             self,
-            Self::OutboundPduInvalidForPhase { .. }
+            Self::InputSerialExhausted
+                | Self::OutboundPduInvalidForPhase { .. }
                 | Self::OutboundPduDirectionViolation { .. }
                 | Self::OutboundPduRequiresCodec { .. }
                 | Self::OutboundCapabilityNotNegotiated { .. }
@@ -2609,13 +2612,14 @@ impl DirectMuxClient {
         pane_id: u64,
         data: String,
     ) -> Result<UnitResponse, DirectMuxError> {
+        let input_serial = InputSerial::try_now().ok_or(DirectMuxError::InputSerialExhausted)?;
         let response = self
             .send_request_with_cx(
                 cx,
                 Pdu::SendPaste(SendPaste {
                     pane_id: pane_id as usize,
                     data,
-                    input_serial: InputSerial::now(),
+                    input_serial,
                 }),
             )
             .await?;
@@ -11982,6 +11986,7 @@ mod tests {
             DirectMuxError::Disconnected,
             DirectMuxError::FrameTooLarge { max_bytes: 1024 },
             DirectMuxError::SerialExhausted,
+            DirectMuxError::InputSerialExhausted,
             DirectMuxError::Codec("bad frame".to_string()),
             DirectMuxError::RemoteError("denied".to_string()),
             DirectMuxError::BatchTimeout { timeout_ms: 5000 },
@@ -12008,6 +12013,21 @@ mod tests {
                 "Error message should not be empty: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn input_serial_exhaustion_is_a_proven_pre_write_rejection() {
+        let error = DirectMuxError::InputSerialExhausted;
+        assert!(error.is_proven_pre_write_rejection());
+        assert_eq!(
+            error.recovery_decision(),
+            MuxRecoveryDecision {
+                kind: ProtocolErrorKind::Permanent,
+                retry: false,
+                connection: MuxConnectionDisposition::Reuse,
+                cancelled: false,
+            }
+        );
     }
 
     #[test]

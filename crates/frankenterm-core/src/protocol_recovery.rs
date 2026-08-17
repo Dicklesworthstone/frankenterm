@@ -251,6 +251,7 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
         || lower.contains("socket path not found")
         || lower.contains("proxy command not supported")
         || lower.contains("connection identity space exhausted")
+        || lower.contains("process-local input serial space exhausted")
         || lower.contains("invalid direct mux client limit")
         || (lower.contains("duplicate pane") && lower.contains("render-change batch"))
     {
@@ -342,6 +343,7 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
         // These failures are established by local validation before any wire
         // state is touched. They cannot invalidate an already aligned client.
         DirectMuxError::InvalidLimit { .. }
+        | DirectMuxError::InputSerialExhausted
         | DirectMuxError::DuplicateRenderBatchPane { .. }
         | DirectMuxError::OutboundPduInvalidForPhase { .. }
         | DirectMuxError::OutboundPduDirectionViolation { .. }
@@ -1268,6 +1270,7 @@ mod tests {
             ),
             (DirectMuxError::ConnectionIdExhausted, permanent_discard),
             (DirectMuxError::SerialExhausted, recoverable_retry),
+            (DirectMuxError::InputSerialExhausted, permanent_reuse),
             (
                 DirectMuxError::InvalidLimit {
                     field: "max_pending_responses",
@@ -1647,6 +1650,14 @@ mod tests {
     }
 
     #[test]
+    fn classify_input_serial_exhausted() {
+        assert_eq!(
+            classify_error_message("process-local input serial space exhausted"),
+            ProtocolErrorKind::Permanent
+        );
+    }
+
+    #[test]
     fn classify_invalid_direct_mux_limit() {
         assert_eq!(
             classify_error_message(
@@ -1694,6 +1705,7 @@ mod tests {
 
         for error in [
             DirectMuxError::ConnectionIdExhausted,
+            DirectMuxError::InputSerialExhausted,
             DirectMuxError::InvalidLimit {
                 field: "max_pending_responses",
             },
