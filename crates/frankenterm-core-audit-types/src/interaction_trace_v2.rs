@@ -344,6 +344,38 @@ pub struct InteractionTraceTopology {
     pub pane_id: u64,
 }
 
+impl InteractionTraceTopology {
+    /// Project zero-based mux identifiers into the trace schema's non-zero
+    /// identity space using the reversible mapping `trace_id = mux_id + 1`.
+    ///
+    /// Zero is reserved by the trace schema as an invalid/missing identity,
+    /// while FrankenTerm's process-local mux identifiers legitimately begin at
+    /// zero. Every producer must use this constructor so client and server
+    /// fragments retain the same topology association. Terminal values fail
+    /// closed instead of wrapping to the reserved sentinel.
+    #[must_use]
+    pub const fn from_zero_based_mux_ids(
+        window_id: u64,
+        tab_id: u64,
+        pane_id: u64,
+    ) -> Option<Self> {
+        let Some(window_id) = window_id.checked_add(1) else {
+            return None;
+        };
+        let Some(tab_id) = tab_id.checked_add(1) else {
+            return None;
+        };
+        let Some(pane_id) = pane_id.checked_add(1) else {
+            return None;
+        };
+        Some(Self {
+            window_id,
+            tab_id,
+            pane_id,
+        })
+    }
+}
+
 /// A process-local monotonic clock domain.  Equal values assert one common
 /// epoch/rate.  Wall time is retained separately and is never duration input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1685,6 +1717,30 @@ mod tests {
     const PRIVACY_BAD_FIXTURE: &str =
         include_str!("../../../fixtures/perf/interaction-trace-v2/bad-raw-content-v2.json");
     const JSON_SCHEMA: &str = include_str!("../../../docs/perf/interaction-trace-v2.schema.json");
+
+    #[test]
+    fn zero_based_mux_topology_has_one_canonical_nonzero_projection() {
+        assert_eq!(
+            InteractionTraceTopology::from_zero_based_mux_ids(0, 41, 99),
+            Some(InteractionTraceTopology {
+                window_id: 1,
+                tab_id: 42,
+                pane_id: 100,
+            })
+        );
+        assert_eq!(
+            InteractionTraceTopology::from_zero_based_mux_ids(u64::MAX, 0, 0),
+            None
+        );
+        assert_eq!(
+            InteractionTraceTopology::from_zero_based_mux_ids(0, u64::MAX, 0),
+            None
+        );
+        assert_eq!(
+            InteractionTraceTopology::from_zero_based_mux_ids(0, 0, u64::MAX),
+            None
+        );
+    }
 
     fn run_id() -> InteractionTraceRunId {
         InteractionTraceRunId::new(0xfeed, 0xbeef).expect("test run ID is non-zero")

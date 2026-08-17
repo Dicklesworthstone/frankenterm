@@ -2,8 +2,9 @@
 #![allow(clippy::type_repetition_in_bounds)]
 use crate::sessionhandler::{
     AdmittedInputTraceV1, DispatchTraceAuthority, PduDeliveryClass, PduSender, PerPane,
-    SessionAuthority, SessionHandler, SessionOwner, frozen_window_order_to_codec,
-    retire_poisoned_pane_render, validate_ordered_snapshot_projection,
+    SessionAuthority, SessionHandler, SessionOwner, SessionTraceProducer,
+    frozen_window_order_to_codec, retire_poisoned_pane_render,
+    validate_ordered_snapshot_projection,
 };
 use anyhow::Context;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -33,6 +34,7 @@ use std::io::{self, ErrorKind};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::Poll;
@@ -6276,7 +6278,7 @@ fn dispatch_client_request(
     topology: &TopologyStreamCoordinator,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
-    dispatch_client_request_with_decode_interval(handler, topology, decoded, None)
+    dispatch_client_request_with_decode_interval(handler, topology, decoded, None, None)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6289,6 +6291,7 @@ fn dispatch_client_request_with_decode_interval(
     handler: &mut SessionHandler,
     topology: &TopologyStreamCoordinator,
     decoded: DecodedPdu,
+    trace_producer: Option<&Rc<SessionTraceProducer>>,
     decode_interval: Option<ServerDecodeInterval>,
 ) -> anyhow::Result<()> {
     let result = (|| {
@@ -6333,6 +6336,7 @@ fn dispatch_client_request_with_decode_interval(
         if let (Some(admission), Some(interval)) = (input_trace_authority.as_mut(), decode_interval)
         {
             handler.record_decoded_input_trace(
+                trace_producer,
                 admission,
                 interval.started_at,
                 interval.completed_at,
@@ -6497,12 +6501,19 @@ fn dispatch_client_request_if_admitted(
     topology: &TopologyStreamCoordinator,
     terminal: &DispatchTerminal,
     decoded: DecodedPdu,
+    trace_producer: Option<&Rc<SessionTraceProducer>>,
     decode_interval: Option<ServerDecodeInterval>,
 ) -> anyhow::Result<RequestDispatchOutcome> {
     if !admit_request_dispatch(terminal) {
         return Ok(RequestDispatchOutcome::Terminal);
     }
-    dispatch_client_request_with_decode_interval(handler, topology, decoded, decode_interval)?;
+    dispatch_client_request_with_decode_interval(
+        handler,
+        topology,
+        decoded,
+        trace_producer,
+        decode_interval,
+    )?;
     Ok(RequestDispatchOutcome::Dispatched)
 }
 
@@ -6589,12 +6600,8 @@ where
     let trace_producer = config
         .trace_authority()
         .and_then(|authority| authority.claim_session(topology_stream_id));
-    let mut handler = SessionHandler::new_for_session_with_topology_stream_and_trace(
-        pdu_sender,
-        owner,
-        topology_stream_id,
-        trace_producer,
-    );
+    let mut handler =
+        SessionHandler::new_for_session_with_topology_stream(pdu_sender, owner, topology_stream_id);
 
     {
         let notification_route = TopologyNotificationRoute::new(authority.clone(), &mux, &topology);
@@ -6713,6 +6720,7 @@ where
                         &topology,
                         &terminal,
                         decoded,
+                        trace_producer.as_ref(),
                         Some(decode_interval),
                     )? == RequestDispatchOutcome::Terminal
                     {
@@ -9346,6 +9354,7 @@ mod tests {
                 }),
             },
             None,
+            None,
         )
         .expect("terminal dispatch admission should be an explicit outcome");
         assert_eq!(rejected, RequestDispatchOutcome::Terminal);
@@ -9369,6 +9378,7 @@ mod tests {
                 serial: 91,
                 pdu: Pdu::Ping(Ping {}),
             },
+            None,
             None,
         )
         .expect("admitted Ping should synchronously enqueue its Pong response");
@@ -11462,6 +11472,7 @@ mod tests {
                 serial: 197,
                 pdu: Pdu::Ping(Ping {}),
             },
+            None,
             None,
         )
         .expect("terminal request gate must return an explicit outcome");

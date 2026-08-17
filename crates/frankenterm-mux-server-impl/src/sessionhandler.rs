@@ -29,8 +29,8 @@ use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceCounterUnavailability, InteractionTraceCounters, InteractionTraceGenerations,
     InteractionTraceObservationBoundary, InteractionTraceProducer, InteractionTraceStage,
     InteractionTraceStageOutcome, InteractionTraceTimestamp, InteractionTraceTopology,
-    RendererKeypressTraceStage,
 };
+use frankenterm_core_audit_types::renderer_scenario_catalog::RendererKeypressTraceStage;
 use frankenterm_flight_recorder::{
     ClockStamp, EventFields, FlightRecorder, ProducerHandle, RecordOutcome, RecorderError,
     TraceAdmission, TraceToken,
@@ -384,6 +384,18 @@ impl SessionTraceProducer {
             dispatch_started_at,
         );
     }
+}
+
+fn trace_topology_from_mux_ids(
+    window_id: usize,
+    tab_id: usize,
+    pane_id: usize,
+) -> Option<InteractionTraceTopology> {
+    InteractionTraceTopology::from_zero_based_mux_ids(
+        u64::try_from(window_id).ok()?,
+        u64::try_from(tab_id).ok()?,
+        u64::try_from(pane_id).ok()?,
+    )
 }
 
 /// Checked, cycle-breaking conversions between the ordered-window wire schema
@@ -1082,13 +1094,14 @@ impl Drop for SessionOperationLease {
 
 /// Sampled input context admitted by one exact server connection generation.
 ///
-/// This contains only the frozen numeric trace context, the unpredictable
-/// topology-stream identity allocated for this connection, and the existing
-/// content-free pane/input-serial request identity. Key-event content never
-/// enters the authority object. The intentionally non-`Clone` token is
-/// constructed and revalidated before client-activity bookkeeping or pane
-/// mutation, then consumed by the one admitted dispatch.
-#[derive(Debug, Eq, PartialEq)]
+/// This contains the frozen numeric trace context, the unpredictable
+/// topology-stream identity allocated for this connection, the existing
+/// content-free pane/input-serial request identity, and (after recorder
+/// admission) the exact thread-affine producer that owns the trace shard.
+/// Key-event content never enters the authority object. The intentionally
+/// non-`Clone` token is constructed and revalidated before client-activity
+/// bookkeeping or pane mutation, then consumed by the one admitted dispatch.
+#[derive(Debug)]
 pub(crate) struct AdmittedInputTraceV1 {
     context: SampledTraceContextV1,
     stream_id: TopologyStreamId,
@@ -1097,6 +1110,7 @@ pub(crate) struct AdmittedInputTraceV1 {
     recorder_token: Option<TraceToken>,
     topology: Option<InteractionTraceTopology>,
     dispatch_queued_at: Option<Instant>,
+    trace_producer: Option<Rc<SessionTraceProducer>>,
 }
 
 impl AdmittedInputTraceV1 {
@@ -1126,6 +1140,7 @@ impl AdmittedInputTraceV1 {
             recorder_token: None,
             topology: None,
             dispatch_queued_at: None,
+            trace_producer: None,
         })
     }
 
@@ -4275,7 +4290,6 @@ pub struct SessionHandler {
     to_write_tx: PduSender,
     owner: SessionOwner,
     topology_stream_id: TopologyStreamId,
-    trace_producer: Option<Rc<SessionTraceProducer>>,
     per_pane: HashMap<PaneId, TrackedPane>,
     client_id: Option<Arc<ClientId>>,
     #[cfg(test)]
@@ -4312,25 +4326,10 @@ impl SessionHandler {
         owner: SessionOwner,
         topology_stream_id: TopologyStreamId,
     ) -> Self {
-        Self::new_for_session_with_topology_stream_and_trace(
-            to_write_tx,
-            owner,
-            topology_stream_id,
-            None,
-        )
-    }
-
-    pub(crate) fn new_for_session_with_topology_stream_and_trace(
-        to_write_tx: PduSender,
-        owner: SessionOwner,
-        topology_stream_id: TopologyStreamId,
-        trace_producer: Option<Rc<SessionTraceProducer>>,
-    ) -> Self {
         Self {
             to_write_tx,
             owner,
             topology_stream_id,
-            trace_producer,
             per_pane: HashMap::new(),
             client_id: None,
             #[cfg(test)]
@@ -4347,11 +4346,12 @@ impl SessionHandler {
 
     pub(crate) fn record_decoded_input_trace(
         &self,
+        trace_producer: Option<&Rc<SessionTraceProducer>>,
         admission: &mut AdmittedInputTraceV1,
         decode_started_at: Instant,
         decode_completed_at: Instant,
     ) {
-        let Some(trace_producer) = self.trace_producer.as_ref() else {
+        let Some(trace_producer) = trace_producer else {
             return;
         };
         if trace_producer.topology_stream_id != admission.stream_id {
@@ -4378,11 +4378,8 @@ impl SessionHandler {
             .increment(1);
             return;
         };
-        let (Ok(window_id), Ok(tab_id), Ok(pane_id)) = (
-            u64::try_from(window_id),
-            u64::try_from(tab_id),
-            u64::try_from(admission.pane_id),
-        ) else {
+        let Some(topology) = trace_topology_from_mux_ids(window_id, tab_id, admission.pane_id)
+        else {
             metrics::counter!(
                 "mux.server.trace_remote_admission",
                 "outcome" => "topology_id_exhausted"
@@ -4394,11 +4391,6 @@ impl SessionHandler {
 
         let Some(token) = trace_producer.admit_remote_trace(admission.context) else {
             return;
-        };
-        let topology = InteractionTraceTopology {
-            window_id,
-            tab_id,
-            pane_id,
         };
         trace_producer.record_server_stage(
             token,
@@ -4414,6 +4406,7 @@ impl SessionHandler {
         // scheduling, and mux-main queue wait cannot disappear into an
         // unmeasured gap between the two server stages.
         admission.dispatch_queued_at = Some(decode_completed_at);
+        admission.trace_producer = Some(Rc::clone(trace_producer));
     }
 
     fn per_pane_for_registration(
@@ -5183,7 +5176,9 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
                 let trace_authority = admitted_input_trace;
-                let trace_producer = self.trace_producer.as_ref().map(Rc::clone);
+                let trace_producer = trace_authority
+                    .as_ref()
+                    .and_then(|admission| admission.trace_producer.as_ref().map(Rc::clone));
                 promise::spawn::spawn(async move {
                     catch(
                         move || {
@@ -6178,8 +6173,40 @@ mod tests {
         FlightRecorder::new(config).expect("test trace recorder must allocate")
     }
 
+    fn freeze_trace_events(
+        recorder: &FlightRecorder,
+    ) -> Vec<frankenterm_core_audit_types::interaction_trace_v2::InteractionTraceEventV2> {
+        let frozen = recorder
+            .try_freeze()
+            .expect("quiescent test recorder must freeze");
+        let mut events = Vec::with_capacity(frozen.len());
+        let expected = frozen.len();
+        assert_eq!(
+            frozen.export_into(&mut events),
+            frankenterm_flight_recorder::ExportOutcome::Completed {
+                exported_events: expected,
+            }
+        );
+        events
+    }
+
     fn topology_stream(byte: u8) -> TopologyStreamId {
         TopologyStreamId::from_bytes([byte; 16])
+    }
+
+    #[test]
+    fn server_trace_topology_encoding_preserves_zero_based_mux_identity() {
+        assert_eq!(
+            trace_topology_from_mux_ids(0, 7_007, 9),
+            Some(InteractionTraceTopology {
+                window_id: 1,
+                tab_id: 7_008,
+                pane_id: 10,
+            })
+        );
+        if usize::BITS == u64::BITS {
+            assert_eq!(trace_topology_from_mux_ids(usize::MAX, 0, 0), None);
+        }
     }
 
     #[test]
@@ -6253,17 +6280,11 @@ mod tests {
             recorder_token: Some(token),
             topology: Some(topology),
             dispatch_queued_at: Some(k4_end),
+            trace_producer: None,
         };
         producer.record_mux_dispatch_start(&admission, k5_end);
 
-        let frozen = recorder
-            .try_freeze()
-            .expect("quiescent two-stage recorder must freeze");
-        let mut events = Vec::with_capacity(frozen.len());
-        assert_eq!(
-            frozen.export_into(&mut events),
-            frankenterm_flight_recorder::ExportOutcome::Completed { exported_events: 2 }
-        );
+        let events = freeze_trace_events(&recorder);
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].stage,
@@ -6279,6 +6300,149 @@ mod tests {
         assert_eq!(events[1].duration_ns().expect("K5 clock is coherent"), 7);
         assert_eq!(events[0].trace_id, sampled_key_context().trace_id);
         assert_eq!(events[1].trace_id, sampled_key_context().trace_id);
+    }
+
+    #[test]
+    fn server_trace_dispatch_records_k4_k5_on_the_exact_live_pane() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let pane = Arc::new(FakePane::new_with_id(7_007, None));
+        let pane_for_tab: Arc<dyn Pane> = pane.clone();
+        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+        tab.assign_pane(&pane_for_tab);
+        let (mux, _mux_guard) = install_tab_with_window(&tab, &[]);
+        let (_, window_id, tab_id) = mux
+            .resolve_pane_id(pane.pane_id())
+            .expect("attached test pane must have one exact topology owner");
+
+        let stream_id = topology_stream(10);
+        let recorder = trace_recorder(1);
+        let authority = DispatchTraceAuthority::new(Arc::clone(&recorder));
+        let producer = authority
+            .claim_session(stream_id)
+            .expect("test connection must claim one recorder producer");
+        let connection_generation = producer.connection_generation();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(Arc::clone(&mux)),
+            stream_id,
+        );
+        let request = sampled_key_request();
+        let mut admission = AdmittedInputTraceV1::admit(&request, stream_id, codec::CODEC_VERSION)
+            .expect("valid sampled request must receive connection authority");
+        let decode_started_at = authority.clock_origin;
+        let decode_completed_at = Instant::now();
+        handler.record_decoded_input_trace(
+            Some(&producer),
+            &mut admission,
+            decode_started_at,
+            decode_completed_at,
+        );
+        assert!(admission.recorder_token.is_some());
+
+        handler.process_one_with_dispatch_authority(
+            DecodedPdu {
+                serial: 914,
+                pdu: Pdu::SendKeyDownTracedV1(request),
+            },
+            None,
+            Some(admission),
+        );
+        tick_until_response(&executor, &captured, 2);
+
+        assert_eq!(pane.key_down_count(), 1, "the key must be applied once");
+        let events = freeze_trace_events(&recorder);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.iter().map(|event| event.stage).collect::<Vec<_>>(),
+            vec![
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode,),
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait,),
+            ]
+        );
+        let expected_topology = trace_topology_from_mux_ids(window_id, tab_id, pane.pane_id())
+            .expect("test mux topology has a trace identity");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.topology == expected_topology)
+        );
+        assert!(events[0].duration_ns().is_ok());
+        assert_eq!(
+            events[0].completed_at, events[1].started_at,
+            "the K4/K5 handoff must have no unmeasured server-side gap"
+        );
+        assert!(events[1].duration_ns().is_ok());
+        assert!(events.iter().all(|event| {
+            event.trace_id == sampled_key_context().trace_id
+                && event.producer.connection_generation == Some(connection_generation)
+        }));
+    }
+
+    #[test]
+    fn server_trace_dispatch_retirement_keeps_k5_and_key_side_effect_absent() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let pane = Arc::new(FakePane::new_with_id(7_007, None));
+        let pane_for_tab: Arc<dyn Pane> = pane.clone();
+        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+        tab.assign_pane(&pane_for_tab);
+        let (mux, _mux_guard) = install_tab_with_window(&tab, &[]);
+
+        let stream_id = topology_stream(11);
+        let recorder = trace_recorder(1);
+        let authority = DispatchTraceAuthority::new(Arc::clone(&recorder));
+        let producer = authority
+            .claim_session(stream_id)
+            .expect("test connection must claim one recorder producer");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(Arc::clone(&mux)),
+            stream_id,
+        );
+        let request = sampled_key_request();
+        let mut admission = AdmittedInputTraceV1::admit(&request, stream_id, codec::CODEC_VERSION)
+            .expect("valid sampled request must receive connection authority");
+        let decode_started_at = authority.clock_origin;
+        let decode_completed_at = Instant::now();
+        handler.record_decoded_input_trace(
+            Some(&producer),
+            &mut admission,
+            decode_started_at,
+            decode_completed_at,
+        );
+        handler.process_one_with_dispatch_authority(
+            DecodedPdu {
+                serial: 915,
+                pdu: Pdu::SendKeyDownTracedV1(request),
+            },
+            None,
+            Some(admission),
+        );
+
+        handler.owner.retire();
+        executor
+            .tick()
+            .expect("run the one retired sampled-key task");
+
+        assert_eq!(pane.key_down_count(), 0);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "retired session must not emit a response from queued work"
+        );
+        let events = freeze_trace_events(&recorder);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].stage,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode)
+        );
+        assert!(events[0].duration_ns().is_ok());
     }
 
     fn sampled_key_context() -> SampledTraceContextV1 {
