@@ -11390,10 +11390,14 @@ impl SendKeyDownTracedV1 {
 /// lifetime. A client may therefore retry this exact request after a response
 /// loss or transport-generation replacement without applying the transition a
 /// second time. Key-down and key-up share this envelope so one ordered client
-/// lane cannot let a release overtake a retried press.
+/// lane cannot let a release overtake a retried press. A request with no pane
+/// registration is an authority probe and cannot apply input; the server
+/// returns the exact live registration identity for an otherwise identical
+/// retry. A stale identity is terminal for that queued pane generation.
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ReliableKeyEventV1 {
     pub pane_id: PaneId,
+    pub pane_registration: Option<ReliablePaneRegistrationIdentityV1>,
     pub event: termwiz::input::KeyEvent,
     pub input_serial: InputSerial,
     pub kind: ReliableKeyEventKindV1,
@@ -11422,19 +11426,28 @@ pub struct ReliableInputSchedulerPressureV1 {
 pub enum ReliableKeyEventRetryV1 {
     SchedulerFull(ReliableInputSchedulerPressureV1),
     SchedulerRetired(ReliableInputSchedulerPressureV1),
-    SchedulerUnavailable { retry_after_ns: u64 },
-    DuplicatePending { retry_after_ns: u64 },
+    SchedulerUnavailable {
+        retry_after_ns: u64,
+    },
+    DuplicatePending {
+        retry_after_ns: u64,
+    },
+    ClientRegistrationTransition {
+        retry_after_ns: u64,
+    },
+    PaneAuthorityRequired {
+        pane_registration: ReliablePaneRegistrationIdentityV1,
+    },
 }
 
 /// Terminal refusal reasons. None authorize redirecting the serial to a
 /// replacement pane or changing its key payload.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
 pub enum ReliableKeyEventRejectionV1 {
-    ClientNotRegistered,
-    ClientRegistrationRetired,
     ClientLedgerUnavailable,
     IdentityAuthorityExhausted,
     PaneUnavailable,
+    PaneRegistrationMismatch,
     StaleSerial,
     IdentityConflict,
     OutcomeUnknown,
@@ -11456,6 +11469,25 @@ pub struct ReliableKeyEventV1Response {
     pub outcome: ReliableKeyEventOutcomeV1,
 }
 
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub struct ReliablePaneRegistrationIdentityV1([u8; 16]);
+
+impl ReliablePaneRegistrationIdentityV1 {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    #[must_use]
+    pub fn is_reserved(self) -> bool {
+        self.0 == [0; 16]
+    }
+}
+
 pub const RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION: usize = 60;
 pub const MAX_RELIABLE_KEY_EVENT_V1_DECOMPRESSED_BYTES: usize = 64 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_V1_ZSTD_ENCODED_BYTES: usize = 128 * 1024;
@@ -11467,6 +11499,8 @@ pub const MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS: u64 = 1_000_000_000;
 pub enum ReliableKeyEventProtocolError {
     #[error("reliable key event input serial must be nonzero")]
     ZeroInputSerial,
+    #[error("reliable key event pane registration uses the reserved all-zero identity")]
+    ReservedPaneRegistration,
     #[error("reliable key event retry delay must be in 1..={maximum_ns} ns; got {actual_ns}")]
     InvalidRetryDelay { actual_ns: u64, maximum_ns: u64 },
     #[error("reliable key event scheduler field {field} must be nonzero")]
@@ -11481,7 +11515,14 @@ pub enum ReliableKeyEventProtocolError {
 
 impl ReliableKeyEventV1 {
     pub fn validate(&self) -> Result<(), ReliableKeyEventProtocolError> {
-        validate_reliable_input_serial(self.input_serial)
+        validate_reliable_input_serial(self.input_serial)?;
+        if self
+            .pane_registration
+            .is_some_and(ReliablePaneRegistrationIdentityV1::is_reserved)
+        {
+            return Err(ReliableKeyEventProtocolError::ReservedPaneRegistration);
+        }
+        Ok(())
     }
 }
 
@@ -11495,8 +11536,18 @@ impl ReliableKeyEventV1Response {
             )) => validate_reliable_scheduler_pressure(pressure),
             ReliableKeyEventOutcomeV1::Retry(
                 ReliableKeyEventRetryV1::SchedulerUnavailable { retry_after_ns }
-                | ReliableKeyEventRetryV1::DuplicatePending { retry_after_ns },
+                | ReliableKeyEventRetryV1::DuplicatePending { retry_after_ns }
+                | ReliableKeyEventRetryV1::ClientRegistrationTransition { retry_after_ns },
             ) => validate_reliable_retry_delay(retry_after_ns),
+            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::PaneAuthorityRequired {
+                pane_registration,
+            }) => {
+                if pane_registration.is_reserved() {
+                    Err(ReliableKeyEventProtocolError::ReservedPaneRegistration)
+                } else {
+                    Ok(())
+                }
+            }
             ReliableKeyEventOutcomeV1::Applied
             | ReliableKeyEventOutcomeV1::DuplicateApplied
             | ReliableKeyEventOutcomeV1::Rejected(_) => Ok(()),
@@ -11606,11 +11657,17 @@ impl InputSerial {
     }
 
     pub fn now() -> Self {
-        let wall_clock = input_serial_from_system_time(std::time::SystemTime::now()).0;
-        let serial = next_input_serial(&LAST_INPUT_SERIAL, wall_clock).unwrap_or_else(|| {
+        Self::try_now().unwrap_or_else(|| {
             panic!("process-local input serial space exhausted; refusing to reuse an identity")
-        });
-        Self(serial)
+        })
+    }
+
+    /// Allocate the next process-local input identity without panicking at the
+    /// terminal `u64` boundary.
+    #[must_use]
+    pub fn try_now() -> Option<Self> {
+        let wall_clock = input_serial_from_system_time(std::time::SystemTime::now()).0;
+        next_input_serial(&LAST_INPUT_SERIAL, wall_clock).map(Self)
     }
 
     pub fn elapsed_millis(&self) -> u64 {
@@ -20413,8 +20470,10 @@ mod test {
 
     #[test]
     fn reliable_key_event_request_and_typed_outcomes_roundtrip_under_v60() {
+        let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x5a; 16]);
         let request = ReliableKeyEventV1 {
             pane_id: 7,
+            pane_registration: Some(pane_registration),
             event: termwiz::input::KeyEvent {
                 key: termwiz::input::KeyCode::Char('x'),
                 modifiers: termwiz::input::Modifiers::CTRL,
@@ -20442,6 +20501,14 @@ mod test {
             }),
             ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::DuplicatePending {
                 retry_after_ns: 1_000_000,
+            }),
+            ReliableKeyEventOutcomeV1::Retry(
+                ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                    retry_after_ns: 1_000_000,
+                },
+            ),
+            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::PaneAuthorityRequired {
+                pane_registration,
             }),
             ReliableKeyEventOutcomeV1::Rejected(ReliableKeyEventRejectionV1::IdentityConflict),
         ];
@@ -20483,6 +20550,7 @@ mod test {
         let mut encoded = Vec::new();
         Pdu::ReliableKeyEventV1(ReliableKeyEventV1 {
             pane_id: 7,
+            pane_registration: None,
             event: termwiz::input::KeyEvent {
                 key: termwiz::input::KeyCode::Char('x'),
                 modifiers: termwiz::input::Modifiers::NONE,
@@ -20492,6 +20560,33 @@ mod test {
         })
         .encode(&mut encoded, 31)
         .expect_err("zero cannot authorize a reliable input identity");
+        assert!(encoded.is_empty());
+
+        Pdu::ReliableKeyEventV1(ReliableKeyEventV1 {
+            pane_id: 7,
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0; 16])),
+            event: termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Char('x'),
+                modifiers: termwiz::input::Modifiers::NONE,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(1),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        })
+        .encode(&mut encoded, 31)
+        .expect_err("the all-zero pane registration cannot cross the wire");
+        assert!(encoded.is_empty());
+
+        Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+            pane_id: 7,
+            input_serial: InputSerial::from_millis_since_epoch(1),
+            outcome: ReliableKeyEventOutcomeV1::Retry(
+                ReliableKeyEventRetryV1::PaneAuthorityRequired {
+                    pane_registration: ReliablePaneRegistrationIdentityV1::from_bytes([0; 16]),
+                },
+            ),
+        })
+        .encode(&mut encoded, 31)
+        .expect_err("the server cannot mint the reserved pane registration");
         assert!(encoded.is_empty());
 
         for malformed in [
