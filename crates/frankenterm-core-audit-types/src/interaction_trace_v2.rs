@@ -1938,7 +1938,9 @@ mod tests {
             },
             retired: false,
         });
-        validate_event(&event, |_| true).expect("exact K5 queue evidence must validate");
+        let parent_span_id = event.parent_span_id;
+        validate_event(&event, |span_id| parent_span_id == Some(span_id))
+            .expect("exact K5 queue evidence must validate");
 
         let mut zero_capacity = event.clone();
         zero_capacity
@@ -1947,7 +1949,7 @@ mod tests {
             .unwrap()
             .task_capacity = 0;
         assert_eq!(
-            validate_event(&zero_capacity, |_| true),
+            validate_event(&zero_capacity, |span_id| parent_span_id == Some(span_id)),
             Err(TraceContractError::InvalidSchedulerQueueEvidence {
                 field: "task_capacity"
             })
@@ -1956,7 +1958,8 @@ mod tests {
         let mut unavailable_pressure = event.clone();
         unavailable_pressure.counter_unavailability.queue_depth = true;
         assert_eq!(
-            validate_event(&unavailable_pressure, |_| true),
+            validate_event(&unavailable_pressure, |span_id| parent_span_id
+                == Some(span_id)),
             Err(TraceContractError::InvalidSchedulerQueueEvidence {
                 field: "counter_availability"
             })
@@ -1965,7 +1968,8 @@ mod tests {
         let mut depth_over_capacity = event.clone();
         depth_over_capacity.counters.queue_depth = 17;
         assert_eq!(
-            validate_event(&depth_over_capacity, |_| true),
+            validate_event(&depth_over_capacity, |span_id| parent_span_id
+                == Some(span_id)),
             Err(TraceContractError::InvalidSchedulerQueueEvidence {
                 field: "queue_depth"
             })
@@ -1979,7 +1983,8 @@ mod tests {
             .enqueued_at
             .monotonic_ns = enqueue_after_dequeue.completed_at.monotonic_ns + 1;
         assert!(matches!(
-            validate_event(&enqueue_after_dequeue, |_| true),
+            validate_event(&enqueue_after_dequeue, |span_id| parent_span_id
+                == Some(span_id)),
             Err(TraceContractError::ClockRegression { .. })
         ));
 
@@ -1987,7 +1992,7 @@ mod tests {
         wrong_stage.stage =
             InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode);
         assert_eq!(
-            validate_event(&wrong_stage, |_| true),
+            validate_event(&wrong_stage, |span_id| parent_span_id == Some(span_id)),
             Err(TraceContractError::SchedulerQueueEvidenceUnexpected {
                 stage: wrong_stage.stage
             })
