@@ -7542,7 +7542,10 @@ mod tests {
             ErrorResponse,
         }
 
-        run_async_test(async {
+        // This scenario's protocol state machine is intentionally broad. Keep
+        // the generated future off the small Rust test-thread stack so that it
+        // remains deterministic on high-core builders with default stack sizes.
+        run_async_test(Box::pin(async {
             for (case_index, case) in [
                 LocalSemanticCase::WrongLegacyPane,
                 LocalSemanticCase::WrongLivenessPane,
@@ -7767,7 +7770,7 @@ mod tests {
                 drop(client);
                 server.await.expect("server task");
             }
-        });
+        }));
     }
 
     #[test]
