@@ -9284,6 +9284,10 @@ mod tests {
             other => panic!("single-pane test tab must flatten as one leaf, got {other:?}"),
         };
         let mut wrong_second_entry = first_entry.clone();
+        wrong_second_entry.pane_id = first_entry
+            .pane_id
+            .checked_add(1_000_000)
+            .expect("test pane identity adjustment fits usize");
         wrong_second_entry.tab_id = first_entry.tab_id.saturating_add(1_000_000);
         wrong_second_entry.is_active_pane = false;
         wrong_second_entry.is_zoomed_pane = false;

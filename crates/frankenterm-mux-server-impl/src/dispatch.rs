@@ -7509,8 +7509,8 @@ mod tests {
     }
 
     #[test]
-    fn frozen_window_transaction_reaches_legacy_client_as_one_stamped_resync() {
-        let (coordinator, item_rx, terminal_rx, _, stream_id) = bound_topology_coordinator();
+    fn frozen_window_transaction_reaches_legacy_client_as_one_resync() {
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
         let mux = Arc::new(Mux::new(None));
         let tab = Arc::new(mux::tab::Tab::new(&TerminalSize::default()));
         mux.add_tab_no_panes(&tab)
@@ -7536,22 +7536,17 @@ mod tests {
             .lock()
             .take()
             .expect("mux must publish the frozen transaction");
-        let MuxTopologyStamp::Revision(revision) = envelope.topology else {
+        let MuxTopologyStamp::Revision(_) = envelope.topology else {
             panic!("frozen transaction must carry live topology authority");
         };
         assert!(coordinator.on_notification(&mux, envelope));
 
         let emitted = take_written_pdu(&item_rx);
         assert_eq!(emitted.serial, 0);
-        let Pdu::TopologyEvent(event) = emitted.pdu else {
-            panic!("legacy stream must receive one stamped topology event");
+        let Pdu::TabResized(resync) = emitted.pdu else {
+            panic!("legacy stream must receive one established resync trigger");
         };
-        assert_eq!(event.stream_id, stream_id);
-        assert_eq!(event.revision, revision);
-        assert!(matches!(
-            event.event,
-            TopologyEventKind::TabResized { tab_id } if tab_id == tab.tab_id()
-        ));
+        assert_eq!(resync.tab_id, tab.tab_id());
         assert!(item_rx.is_empty());
         assert!(terminal_rx.is_empty());
         assert_outbound_live_counters_zero(&coordinator);
@@ -10842,9 +10837,11 @@ mod tests {
 
         // PDU87 consumes the first slot. The first legacy fallback consumes
         // the second, so the final fallback deterministically returns its Item
-        // owner after the notification queue becomes full. Every buffered
-        // window-order event also retires one compact ordered-window owner;
-        // this makes the outside-lock carrier reach exactly max_events + 1.
+        // owner after the notification queue becomes full. PDU87 publication
+        // remains the successful response linearization point while the later
+        // fallback failure retires the stream. Every buffered window-order
+        // event also retires one compact ordered-window owner; this makes the
+        // outside-lock carrier reach exactly max_events + 1.
         let (item_tx, item_rx) = bounded(MAX_EVENTS);
         let (terminal, terminal_rx) = DispatchTerminal::channel();
         let stream_id = TopologyStreamId::from_bytes([0x6a; 16]);
@@ -10902,7 +10899,7 @@ mod tests {
         }
         assert!(item_rx.is_empty());
 
-        let error = coordinator
+        coordinator
             .queue_response(
                 DecodedPdu {
                     serial: FENCE_SERIAL,
@@ -10922,12 +10919,9 @@ mod tests {
                 },
                 PduDeliveryClass::Control,
             )
-            .expect_err("the final legacy fallback must hit the exact queue boundary");
-        assert!(
-            format!("{error:#}").contains("mux dispatch topology queue is full"),
-            "unexpected exact-carrier rejection: {:#}",
-            error,
-        );
+            .expect(
+                "a published PDU87 remains successful when later fallback settlement retires the stream",
+            );
         assert_eq!(
             terminal_rx
                 .try_recv()
