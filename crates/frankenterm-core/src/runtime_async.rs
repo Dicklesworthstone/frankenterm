@@ -4516,6 +4516,16 @@ pub mod process {
             self
         }
 
+        /// Remove one inherited environment variable from the child.
+        ///
+        /// This is intentionally narrower than `env_clear`: subprocesses that
+        /// need a hermetic capability can suppress injection-specific knobs
+        /// while retaining the platform environment required by the child.
+        pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
+            self.inner.env_remove(key);
+            self
+        }
+
         /// Set the working directory used for the child process.
         pub fn current_dir<P: AsRef<std::path::Path>>(&mut self, dir: P) -> &mut Self {
             self.inner.current_dir(dir);

@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-browser-runtime-lock/v1.json",
+  "title": "FrankenTerm browser runtime lock v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "installed_byte_budget",
+    "required_free_bytes",
+    "node",
+    "playwright",
+    "chromium",
+    "protocol_version",
+    "targets"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://frankenterm.dev/schemas/ft-browser-runtime-lock/v1.json"
+    },
+    "schema_version": {
+      "const": "ft.browser_runtime_lock.v1"
+    },
+    "installed_byte_budget": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "required_free_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "node": {
+      "$ref": "#/$defs/version"
+    },
+    "playwright": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archive_sha256",
+        "archive_url",
+        "core_archive_sha256",
+        "core_archive_url",
+        "version"
+      ],
+      "properties": {
+        "archive_sha256": { "$ref": "#/$defs/sha256" },
+        "archive_url": { "$ref": "#/$defs/https_url" },
+        "core_archive_sha256": { "$ref": "#/$defs/sha256" },
+        "core_archive_url": { "$ref": "#/$defs/https_url" },
+        "version": { "$ref": "#/$defs/token" }
+      }
+    },
+    "chromium": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["browser_version", "revision"],
+      "properties": {
+        "browser_version": { "$ref": "#/$defs/token" },
+        "revision": { "$ref": "#/$defs/token" }
+      }
+    },
+    "protocol_version": { "$ref": "#/$defs/token" },
+    "targets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aarch64-apple-darwin", "x86_64-apple-darwin"],
+      "properties": {
+        "aarch64-apple-darwin": { "$ref": "#/$defs/target" },
+        "x86_64-apple-darwin": { "$ref": "#/$defs/target" }
+      }
+    }
+  },
+  "$defs": {
+    "https_url": {
+      "type": "string",
+      "pattern": "^https://[^\\s]+$",
+      "maxLength": 4096
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+      "maxLength": 255
+    },
+    "version": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version"],
+      "properties": {
+        "version": { "$ref": "#/$defs/token" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chromium_archive_root",
+        "chromium_archive_sha256",
+        "chromium_archive_url",
+        "chromium_executable",
+        "node_archive_root",
+        "node_archive_sha256",
+        "node_archive_url"
+      ],
+      "properties": {
+        "chromium_archive_root": { "$ref": "#/$defs/relative_path" },
+        "chromium_archive_sha256": { "$ref": "#/$defs/sha256" },
+        "chromium_archive_url": { "$ref": "#/$defs/https_url" },
+        "chromium_executable": { "$ref": "#/$defs/relative_path" },
+        "node_archive_root": { "$ref": "#/$defs/relative_path" },
+        "node_archive_sha256": { "$ref": "#/$defs/sha256" },
+        "node_archive_url": { "$ref": "#/$defs/https_url" }
+      }
+    },
+    "relative_path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*\\\\)[^\\u0000-\\u001f]+$",
+      "maxLength": 4096
+    }
+  }
+}

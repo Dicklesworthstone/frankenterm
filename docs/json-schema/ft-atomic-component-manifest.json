@@ -126,7 +126,10 @@
           "const": true
         },
         "path_policy": {
-          "const": "relative_utf8_no_symlink_v1"
+          "enum": [
+            "relative_utf8_browser_symlink_sidecar_v2",
+            "relative_utf8_no_symlink_v1"
+          ]
         }
       }
     }

@@ -201,6 +201,250 @@ jq -e '
     )
 ' "$SCHEMA" >/dev/null
 
+# Browser capability manifests may catalog an entire component root with one
+# exact tree while still binding the executable/module/store/license contract.
+# The fixtures are inert bytes; no Node or browser process is launched.
+BROWSER="$TEST_ROOT/browser-runtime"
+mkdir -p \
+  "$BROWSER/package/runtime/bin" \
+  "$BROWSER/package/runtime/node_modules/playwright" \
+  "$BROWSER/package/runtime/browsers/chromium-1234" \
+  "$BROWSER/package/runtime/licenses" \
+  "$BROWSER/source"
+printf 'inert-node\n' > "$BROWSER/package/runtime/bin/node"
+printf 'module.exports = {};\n' > "$BROWSER/package/runtime/node_modules/playwright/index.js"
+printf 'inert-chromium\n' > "$BROWSER/package/runtime/browsers/chromium-1234/chrome"
+printf 'node-license\n' > "$BROWSER/package/runtime/licenses/node.txt"
+printf 'playwright-license\n' > "$BROWSER/package/runtime/licenses/playwright.txt"
+printf 'chromium-license\n' > "$BROWSER/package/runtime/licenses/chromium.txt"
+printf '%s\n' '{"links":[],"schema_version":"ft.browser_runtime_symlinks.v1"}' \
+  > "$BROWSER/package/runtime/browser-symlinks.v1.json"
+chmod 0755 \
+  "$BROWSER/package/runtime/bin/node" \
+  "$BROWSER/package/runtime/browsers/chromium-1234/chrome"
+bash "$TOOL" generate \
+  --root "$BROWSER/package" \
+  --source-root "$BROWSER/source" \
+  --output "$BROWSER/manifest.json" \
+  --build-id "$BUILD_A" \
+  --source-revision "$SOURCE_A" \
+  --version "$VERSION" \
+  --target "$TARGET" \
+  --profile "$PROFILE" \
+  --feature-contract "$FEATURE_CONTRACT" \
+  --tree asset:browser-runtime:. \
+  --contract browser.runtime.schema=playwright-chromium.v1 \
+  --contract browser.runtime.target="$TARGET" \
+  --contract browser.runtime.root=runtime \
+  --contract browser.node.path=runtime/bin/node \
+  --contract browser.node.version=24.18.1 \
+  --contract browser.playwright.module-path=runtime/node_modules/playwright/index.js \
+  --contract browser.playwright.browsers-path=runtime/browsers \
+  --contract browser.playwright.version=1.62.0 \
+  --contract browser.chromium.executable-path=runtime/browsers/chromium-1234/chrome \
+  --contract browser.chromium.revision=1234 \
+  --contract browser.protocol.version=playwright-1.62.0-chromium-1234 \
+  --contract browser.license.node-path=runtime/licenses/node.txt \
+  --contract browser.license.playwright-path=runtime/licenses/playwright.txt \
+  --contract browser.license.chromium-path=runtime/licenses/chromium.txt \
+  --contract browser.symlink-manifest.path=runtime/browser-symlinks.v1.json \
+  --contract browser.disk-budget.bytes=1048576 >/dev/null
+bash "$TOOL" verify \
+  --root "$BROWSER/package" \
+  --manifest "$BROWSER/manifest.json" >/dev/null
+jq -e '
+  .contracts["browser.runtime.schema"] == "playwright-chromium.v1"
+  and .contracts["browser.playwright.version"] == "1.62.0"
+  and .contracts["browser.chromium.revision"] == "1234"
+  and .inventory.file_count == 7
+' "$BROWSER/manifest.json" >/dev/null
+
+BROWSER_UNCATALOGUED_SYMLINK="$TEST_ROOT/browser-runtime-uncatalogued-symlink"
+cp -R "$BROWSER/package" "$BROWSER_UNCATALOGUED_SYMLINK"
+ln -s chrome \
+  "$BROWSER_UNCATALOGUED_SYMLINK/runtime/browsers/chromium-1234/injected-link"
+expect_failure browser_runtime_symlink_manifest_mismatch \
+  "$BROWSER_UNCATALOGUED_SYMLINK-error.log" \
+  bash "$TOOL" verify \
+    --root "$BROWSER_UNCATALOGUED_SYMLINK" \
+    --manifest "$BROWSER/manifest.json"
+
+BROWSER_ROOT_SYMLINK="$TEST_ROOT/browser-runtime-root-symlink"
+cp -R "$BROWSER/package" "$BROWSER_ROOT_SYMLINK"
+ln -s ../.. \
+  "$BROWSER_ROOT_SYMLINK/runtime/browsers/chromium-1234/runtime-root"
+python3 - "$BROWSER_ROOT_SYMLINK/runtime/browser-symlinks.v1.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "links": [{
+                "path": "browsers/chromium-1234/runtime-root",
+                "target": "../..",
+            }],
+            "schema_version": "ft.browser_runtime_symlinks.v1",
+        },
+        handle,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    handle.write("\n")
+PY
+# Generation observes the changed sidecar bytes and therefore reaches the
+# symlink target policy rather than failing on an intentionally stale digest.
+expect_failure browser_runtime_symlink_target_escape \
+  "$BROWSER_ROOT_SYMLINK-error.log" \
+  bash "$TOOL" generate \
+    --root "$BROWSER_ROOT_SYMLINK" \
+    --source-root "$BROWSER/source" \
+    --output "$BROWSER_ROOT_SYMLINK-manifest.json" \
+    --build-id "$BUILD_A" \
+    --source-revision "$SOURCE_A" \
+    --version "$VERSION" \
+    --target "$TARGET" \
+    --profile "$PROFILE" \
+    --feature-contract "$FEATURE_CONTRACT" \
+    --tree asset:browser-runtime:. \
+    --contract browser.runtime.schema=playwright-chromium.v1 \
+    --contract browser.runtime.target="$TARGET" \
+    --contract browser.runtime.root=runtime \
+    --contract browser.node.path=runtime/bin/node \
+    --contract browser.node.version=24.18.1 \
+    --contract browser.playwright.module-path=runtime/node_modules/playwright/index.js \
+    --contract browser.playwright.browsers-path=runtime/browsers \
+    --contract browser.playwright.version=1.62.0 \
+    --contract browser.chromium.executable-path=runtime/browsers/chromium-1234/chrome \
+    --contract browser.chromium.revision=1234 \
+    --contract browser.protocol.version=playwright-1.62.0-chromium-1234 \
+    --contract browser.license.node-path=runtime/licenses/node.txt \
+    --contract browser.license.playwright-path=runtime/licenses/playwright.txt \
+    --contract browser.license.chromium-path=runtime/licenses/chromium.txt \
+    --contract browser.symlink-manifest.path=runtime/browser-symlinks.v1.json \
+    --contract browser.disk-budget.bytes=1048576
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  BROWSER_QUARANTINE="$TEST_ROOT/browser-runtime-quarantine"
+  cp -R "$BROWSER/package" "$BROWSER_QUARANTINE"
+  /usr/bin/xattr -w com.apple.quarantine '' "$BROWSER_QUARANTINE/runtime/bin/node"
+  expect_failure browser_runtime_quarantined \
+    "$BROWSER_QUARANTINE-error.log" \
+    bash "$TOOL" verify \
+      --root "$BROWSER_QUARANTINE" \
+      --manifest "$BROWSER/manifest.json"
+fi
+
+# A final app-level manifest must prove that the embedded source component
+# manifest really owns the provenance identity advertised by the app.
+BROWSER_APP="$TEST_ROOT/browser-runtime-app"
+mkdir -p "$BROWSER_APP/package/Contents/Resources"
+cp -R "$BROWSER/package" "$BROWSER_APP/package/Contents/Resources/browser-runtime"
+cp "$BROWSER/manifest.json" \
+  "$BROWSER_APP/package/Contents/Resources/browser-runtime.source-manifest.json"
+BROWSER_SOURCE_MANIFEST_ID=$(jq -er '.manifest_id' "$BROWSER/manifest.json")
+bash "$TOOL" generate \
+  --root "$BROWSER_APP/package" \
+  --source-root "$BROWSER/source" \
+  --output "$BROWSER_APP/manifest.json" \
+  --build-id "$BUILD_A" \
+  --source-revision "$SOURCE_A" \
+  --version "$VERSION" \
+  --target "$TARGET" \
+  --profile "$PROFILE" \
+  --feature-contract "$FEATURE_CONTRACT" \
+  --tree asset:browser-runtime:. \
+  --contract browser.runtime.schema=playwright-chromium.v1 \
+  --contract browser.runtime.target="$TARGET" \
+  --contract browser.runtime.root=Contents/Resources/browser-runtime/runtime \
+  --contract browser.node.path=Contents/Resources/browser-runtime/runtime/bin/node \
+  --contract browser.node.version=24.18.1 \
+  --contract browser.playwright.module-path=Contents/Resources/browser-runtime/runtime/node_modules/playwright/index.js \
+  --contract browser.playwright.browsers-path=Contents/Resources/browser-runtime/runtime/browsers \
+  --contract browser.playwright.version=1.62.0 \
+  --contract browser.chromium.executable-path=Contents/Resources/browser-runtime/runtime/browsers/chromium-1234/chrome \
+  --contract browser.chromium.revision=1234 \
+  --contract browser.protocol.version=playwright-1.62.0-chromium-1234 \
+  --contract browser.license.node-path=Contents/Resources/browser-runtime/runtime/licenses/node.txt \
+  --contract browser.license.playwright-path=Contents/Resources/browser-runtime/runtime/licenses/playwright.txt \
+  --contract browser.license.chromium-path=Contents/Resources/browser-runtime/runtime/licenses/chromium.txt \
+  --contract browser.symlink-manifest.path=Contents/Resources/browser-runtime/runtime/browser-symlinks.v1.json \
+  --contract browser.disk-budget.bytes=1048576 \
+  --contract browser.component.source-manifest-id="$BROWSER_SOURCE_MANIFEST_ID" \
+  --contract browser.component.source-manifest-path=Contents/Resources/browser-runtime.source-manifest.json >/dev/null
+bash "$TOOL" verify \
+  --root "$BROWSER_APP/package" \
+  --manifest "$BROWSER_APP/manifest.json" >/dev/null
+
+python3 - "$BROWSER_APP/package/Contents/Resources/browser-runtime.source-manifest.json" "$BROWSER_APP/manifest.json" <<'PY'
+import hashlib
+import json
+import sys
+
+source_path, outer_path = sys.argv[1:]
+with open(source_path, "r", encoding="utf-8") as handle:
+    source = json.load(handle)
+source["identity"]["version"] = "relabelled"
+source_bytes = (json.dumps(source, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+with open(source_path, "wb") as handle:
+    handle.write(source_bytes)
+
+with open(outer_path, "r", encoding="utf-8") as handle:
+    outer = json.load(handle)
+for record in outer["files"]:
+    if record["path"] == "Contents/Resources/browser-runtime.source-manifest.json":
+        record["bytes"] = len(source_bytes)
+        record["sha256"] = hashlib.sha256(source_bytes).hexdigest()
+        break
+else:
+    raise SystemExit("source manifest record missing")
+outer["inventory"]["total_bytes"] = sum(record["bytes"] for record in outer["files"])
+outer.pop("manifest_id", None)
+canonical = json.dumps(
+    outer, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+).encode()
+outer["manifest_id"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+with open(outer_path, "w", encoding="utf-8") as handle:
+    json.dump(outer, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+expect_failure browser_runtime_source_manifest_id_mismatch "$BROWSER_APP/provenance-error.log" \
+  bash "$TOOL" verify \
+    --root "$BROWSER_APP/package" \
+    --manifest "$BROWSER_APP/manifest.json"
+
+BROWSER_BUDGET="$TEST_ROOT/browser-runtime-budget"
+cp -R "$BROWSER/package" "$BROWSER_BUDGET"
+expect_failure browser_runtime_disk_budget_exceeded "$BROWSER_BUDGET/error.log" \
+  bash "$TOOL" generate \
+    --root "$BROWSER_BUDGET" \
+    --source-root "$BROWSER/source" \
+    --output "$BROWSER_BUDGET-manifest.json" \
+    --build-id "$BUILD_A" \
+    --source-revision "$SOURCE_A" \
+    --version "$VERSION" \
+    --target "$TARGET" \
+    --profile "$PROFILE" \
+    --feature-contract "$FEATURE_CONTRACT" \
+    --tree asset:browser-runtime:. \
+    --contract browser.runtime.schema=playwright-chromium.v1 \
+    --contract browser.runtime.target="$TARGET" \
+    --contract browser.runtime.root=runtime \
+    --contract browser.node.path=runtime/bin/node \
+    --contract browser.node.version=24.18.1 \
+    --contract browser.playwright.module-path=runtime/node_modules/playwright/index.js \
+    --contract browser.playwright.browsers-path=runtime/browsers \
+    --contract browser.playwright.version=1.62.0 \
+    --contract browser.chromium.executable-path=runtime/browsers/chromium-1234/chrome \
+    --contract browser.chromium.revision=1234 \
+    --contract browser.protocol.version=playwright-1.62.0-chromium-1234 \
+    --contract browser.license.node-path=runtime/licenses/node.txt \
+    --contract browser.license.playwright-path=runtime/licenses/playwright.txt \
+    --contract browser.license.chromium-path=runtime/licenses/chromium.txt \
+    --contract browser.symlink-manifest.path=runtime/browser-symlinks.v1.json \
+    --contract browser.disk-budget.bytes=1
+
 NESTED_MANIFEST="$TEST_ROOT/nested-manifest-output"
 make_fixture "$NESTED_MANIFEST"
 mkdir "$NESTED_MANIFEST/package/metadata"

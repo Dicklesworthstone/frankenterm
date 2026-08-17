@@ -31,17 +31,23 @@ OUTPUT_DIR="$PROJECT_ROOT"
 TARGET_TRIPLE="${FT_ATOMIC_BUILD_TARGET:-}"
 BUILD_PROFILE="release-interactive"
 FEATURE_CONTRACT="workspace-default-members-default-features-v1"
+BROWSER_RUNTIME_ROOT=""
+BROWSER_RUNTIME_MANIFEST=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-build) SKIP_BUILD=true; shift ;;
         --output) OUTPUT_DIR="$2"; shift 2 ;;
         --target) TARGET_TRIPLE="$2"; shift 2 ;;
+        --browser-runtime-root) BROWSER_RUNTIME_ROOT="$2"; shift 2 ;;
+        --browser-runtime-manifest) BROWSER_RUNTIME_MANIFEST="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--skip-build] [--output DIR] [--target TRIPLE]"
+            echo "Usage: $0 [--skip-build] [--output DIR] [--target TRIPLE] --browser-runtime-root DIR --browser-runtime-manifest FILE"
             echo "  --skip-build  Skip cargo build, use existing binaries"
             echo "  --output DIR  Output directory for .app bundle (default: project root)"
             echo "  --target      Exact target triple embedded in every packaged executable"
+            echo "  --browser-runtime-root      Exact preassembled Node/Playwright/Chromium component root"
+            echo "  --browser-runtime-manifest  Detached atomic manifest for that component root"
             echo "                Existing FrankenTerm.app bundles are not overwritten."
             exit 0
             ;;
@@ -85,6 +91,94 @@ if [[ ! -f "$ATOMIC_MANIFEST_TOOL" ]]; then
     echo "Error: atomic component manifest tool not found at $ATOMIC_MANIFEST_TOOL"
     exit 1
 fi
+if [[ -z "$BROWSER_RUNTIME_ROOT" || -z "$BROWSER_RUNTIME_MANIFEST" ]]; then
+    echo "Error: an exact browser runtime root and detached component manifest are required"
+    echo "Pass --browser-runtime-root and --browser-runtime-manifest; ambient Playwright is forbidden."
+    exit 1
+fi
+if [[ ! -d "$BROWSER_RUNTIME_ROOT" || ! -f "$BROWSER_RUNTIME_MANIFEST" ]]; then
+    echo "Error: browser runtime root or manifest is unavailable"
+    exit 1
+fi
+if ! bash "$ATOMIC_MANIFEST_TOOL" verify \
+    --root "$BROWSER_RUNTIME_ROOT" \
+    --manifest "$BROWSER_RUNTIME_MANIFEST"; then
+    echo "Error: browser runtime component failed offline verification"
+    exit 1
+fi
+
+BROWSER_RUNTIME_METADATA=()
+while IFS= read -r browser_runtime_record; do
+    BROWSER_RUNTIME_METADATA+=("$browser_runtime_record")
+done < <(python3 - "$BROWSER_RUNTIME_MANIFEST" "$TARGET_TRIPLE" <<'PY'
+import json
+import sys
+
+manifest_path, expected_target = sys.argv[1:]
+with open(manifest_path, "rb") as handle:
+    manifest = json.load(handle)
+if manifest.get("identity", {}).get("target") != expected_target:
+    raise SystemExit("browser runtime target does not match requested app target")
+contracts = manifest.get("contracts", {})
+required = [
+    "browser.runtime.root",
+    "browser.node.path",
+    "browser.node.version",
+    "browser.playwright.module-path",
+    "browser.playwright.browsers-path",
+    "browser.playwright.version",
+    "browser.chromium.executable-path",
+    "browser.chromium.revision",
+    "browser.protocol.version",
+    "browser.license.node-path",
+    "browser.license.playwright-path",
+    "browser.license.chromium-path",
+    "browser.symlink-manifest.path",
+    "browser.disk-budget.bytes",
+]
+for key in required:
+    value = contracts.get(key)
+    if not isinstance(value, str) or not value or "\n" in value or "\r" in value or "=" in key:
+        raise SystemExit(f"browser runtime contract is missing or unsafe: {key}")
+    print(f"{key}={value}")
+manifest_id = manifest.get("manifest_id")
+if not isinstance(manifest_id, str):
+    raise SystemExit("browser runtime manifest identity is missing")
+print(f"browser.component.source-manifest-id={manifest_id}")
+PY
+)
+if [[ "${#BROWSER_RUNTIME_METADATA[@]}" -ne 15 ]]; then
+    echo "Error: browser runtime contract extraction was incomplete"
+    exit 1
+fi
+
+browser_contract_value() {
+    local wanted="$1"
+    local record
+    for record in "${BROWSER_RUNTIME_METADATA[@]}"; do
+        if [[ "$record" == "$wanted="* ]]; then
+            printf '%s\n' "${record#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+BROWSER_RUNTIME_SOURCE_ROOT_REL=$(browser_contract_value browser.runtime.root)
+BROWSER_NODE_PATH_REL=$(browser_contract_value browser.node.path)
+BROWSER_NODE_VERSION=$(browser_contract_value browser.node.version)
+BROWSER_PLAYWRIGHT_MODULE_REL=$(browser_contract_value browser.playwright.module-path)
+BROWSER_PLAYWRIGHT_BROWSERS_REL=$(browser_contract_value browser.playwright.browsers-path)
+BROWSER_PLAYWRIGHT_VERSION=$(browser_contract_value browser.playwright.version)
+BROWSER_CHROMIUM_EXECUTABLE_REL=$(browser_contract_value browser.chromium.executable-path)
+BROWSER_CHROMIUM_REVISION=$(browser_contract_value browser.chromium.revision)
+BROWSER_PROTOCOL_VERSION=$(browser_contract_value browser.protocol.version)
+BROWSER_NODE_LICENSE_REL=$(browser_contract_value browser.license.node-path)
+BROWSER_PLAYWRIGHT_LICENSE_REL=$(browser_contract_value browser.license.playwright-path)
+BROWSER_CHROMIUM_LICENSE_REL=$(browser_contract_value browser.license.chromium-path)
+BROWSER_SYMLINK_MANIFEST_REL=$(browser_contract_value browser.symlink-manifest.path)
+BROWSER_DISK_BUDGET_BYTES=$(browser_contract_value browser.disk-budget.bytes)
+BROWSER_SOURCE_MANIFEST_ID=$(browser_contract_value browser.component.source-manifest-id)
 PANIC_CONTRACT_TOOL="$PROJECT_ROOT/scripts/check-release-panic-contract.sh"
 if [[ ! -f "$PANIC_CONTRACT_TOOL" ]]; then
     echo "Error: release panic-contract checker not found at $PANIC_CONTRACT_TOOL"
@@ -132,8 +226,15 @@ PY
 }
 
 normalize_cargo_target_dir() {
-    local -a info
-    mapfile -t info < <(resolve_project_path_info "$CARGO_TARGET_DIR")
+    local -a info=()
+    local record
+    while IFS= read -r record; do
+        info+=("$record")
+    done < <(resolve_project_path_info "$CARGO_TARGET_DIR")
+    if [[ "${#info[@]}" -ne 3 ]]; then
+        echo "Error: failed to normalize CARGO_TARGET_DIR"
+        return 1
+    fi
     CARGO_TARGET_DIR="${info[0]}"
     CARGO_TARGET_DIR_REL="${info[1]}"
     CARGO_TARGET_DIR_IN_REPO="${info[2]}"
@@ -166,8 +267,15 @@ resolve_rch_cmd() {
 }
 
 run_rch() {
-    local -a cmd
-    mapfile -t cmd < <(resolve_rch_cmd)
+    local -a cmd=()
+    local record
+    while IFS= read -r record; do
+        cmd+=("$record")
+    done < <(resolve_rch_cmd)
+    if [[ "${#cmd[@]}" -eq 0 ]]; then
+        echo "Error: failed to resolve rch command"
+        return 1
+    fi
     "${cmd[@]}" "$@"
 }
 
@@ -315,6 +423,39 @@ fi
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
+# Install the preassembled browser capability as one immutable tree. The
+# detached source manifest is retained as provenance, while the final app
+# manifest below re-hashes the post-signing bytes that runtime preflight uses.
+BROWSER_RUNTIME_DEST="$APP_BUNDLE/Contents/Resources/browser-runtime"
+BROWSER_SOURCE_MANIFEST_DEST="$APP_BUNDLE/Contents/Resources/browser-runtime.source-manifest.json"
+mkdir -p "$BROWSER_RUNTIME_DEST"
+# Archive streaming preserves the component's verified internal symlink
+# topology without following those links or merging it with prior output.
+COPYFILE_DISABLE=1 tar -C "$BROWSER_RUNTIME_ROOT" -cf - . \
+    | COPYFILE_DISABLE=1 tar -C "$BROWSER_RUNTIME_DEST" -xf -
+cp "$BROWSER_RUNTIME_MANIFEST" "$BROWSER_SOURCE_MANIFEST_DEST"
+if ! bash "$ATOMIC_MANIFEST_TOOL" verify \
+    --root "$BROWSER_RUNTIME_DEST" \
+    --manifest "$BROWSER_SOURCE_MANIFEST_DEST"; then
+    echo "Error: copied browser runtime differs from its verified source component"
+    exit 1
+fi
+
+BROWSER_BUNDLE_PREFIX="Contents/Resources/browser-runtime"
+prefix_browser_path() {
+    printf '%s/%s\n' "$BROWSER_BUNDLE_PREFIX" "$1"
+}
+BROWSER_RUNTIME_BUNDLE_ROOT=$(prefix_browser_path "$BROWSER_RUNTIME_SOURCE_ROOT_REL")
+BROWSER_NODE_BUNDLE_PATH=$(prefix_browser_path "$BROWSER_NODE_PATH_REL")
+BROWSER_PLAYWRIGHT_MODULE_BUNDLE_PATH=$(prefix_browser_path "$BROWSER_PLAYWRIGHT_MODULE_REL")
+BROWSER_PLAYWRIGHT_BROWSERS_BUNDLE_PATH=$(prefix_browser_path "$BROWSER_PLAYWRIGHT_BROWSERS_REL")
+BROWSER_CHROMIUM_EXECUTABLE_BUNDLE_PATH=$(prefix_browser_path "$BROWSER_CHROMIUM_EXECUTABLE_REL")
+BROWSER_NODE_LICENSE_BUNDLE_PATH=$(prefix_browser_path "$BROWSER_NODE_LICENSE_REL")
+BROWSER_PLAYWRIGHT_LICENSE_BUNDLE_PATH=$(prefix_browser_path "$BROWSER_PLAYWRIGHT_LICENSE_REL")
+BROWSER_CHROMIUM_LICENSE_BUNDLE_PATH=$(prefix_browser_path "$BROWSER_CHROMIUM_LICENSE_REL")
+BROWSER_SYMLINK_MANIFEST_BUNDLE_PATH=$(prefix_browser_path "$BROWSER_SYMLINK_MANIFEST_REL")
+BROWSER_SOURCE_MANIFEST_BUNDLE_PATH="Contents/Resources/browser-runtime.source-manifest.json"
+
 # --- Copy binaries built from source ---
 echo "Installing frankenterm-gui..."
 cp "$GUI_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-gui"
@@ -399,9 +540,15 @@ cp "$ATOMIC_MANIFEST_TOOL" "$APP_BUNDLE/Contents/Resources/verify-components.sh"
 chmod 0755 "$APP_BUNDLE/Contents/Resources/verify-components.sh"
 
 # --- Codesign (ad-hoc) ---
-if command -v codesign &>/dev/null; then
-    echo "Ad-hoc codesigning..."
-    codesign --force --deep -s - "$APP_BUNDLE"
+if ! command -v codesign &>/dev/null; then
+    echo "Error: codesign is required to produce a macOS application bundle"
+    exit 1
+fi
+echo "Ad-hoc codesigning..."
+codesign --force --deep -s - "$APP_BUNDLE"
+if ! codesign --verify --deep --strict "$APP_BUNDLE"; then
+    echo "Error: final application bundle failed strict deep codesign verification"
+    exit 1
 fi
 
 extract_numeric_rust_const() {
@@ -445,9 +592,11 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --entry config:default-lua:Contents/Resources/frankenterm.lua \
     --entry asset:application-icon:Contents/Resources/ft.icns \
     --entry verifier:offline-verifier:Contents/Resources/verify-components.sh \
+    --entry metadata:browser-runtime-source-manifest:Contents/Resources/browser-runtime.source-manifest.json \
     --entry metadata:info-plist:Contents/Info.plist \
     --entry metadata:package-info:Contents/PkgInfo \
     --tree font:bundled-fonts:Contents/Resources/fonts \
+    --tree asset:browser-runtime:Contents/Resources/browser-runtime \
     --optional-tree signature:codesign:Contents/_CodeSignature \
     --source-match Contents/Resources/frankenterm.toml=crates/frankenterm-gui/frankenterm.toml \
     --source-match Contents/Resources/frankenterm.lua=crates/frankenterm-gui/frankenterm.lua \
@@ -458,6 +607,8 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --input protocol.core-wire="$WIRE_SOURCE" \
     --input schema.storage="$STORAGE_SCHEMA_SOURCE" \
     --input schema.atomic=docs/json-schema/ft-atomic-component-manifest.json \
+    --input schema.browser-runtime-lock=docs/json-schema/ft-browser-runtime-lock-v1.json \
+    --input browser.runtime-lock=docs/release/browser-runtime-lock.v1.json \
     --input schema.attestations=docs/attestations/schema.json \
     --input attestations.manifest=docs/attestations/manifest.json \
     --input default.toml=crates/frankenterm-gui/frankenterm.toml \
@@ -471,6 +622,24 @@ bash "$ATOMIC_MANIFEST_TOOL" generate \
     --contract core-wire.version="$CORE_WIRE_PROTOCOL_VERSION" \
     --contract storage.schema="$STORAGE_SCHEMA_VERSION" \
     --contract application.bundle-id="$BUNDLE_ID" \
+    --contract browser.runtime.schema=playwright-chromium.v1 \
+    --contract browser.runtime.target="$TARGET_TRIPLE" \
+    --contract browser.runtime.root="$BROWSER_RUNTIME_BUNDLE_ROOT" \
+    --contract browser.node.path="$BROWSER_NODE_BUNDLE_PATH" \
+    --contract browser.node.version="$BROWSER_NODE_VERSION" \
+    --contract browser.playwright.module-path="$BROWSER_PLAYWRIGHT_MODULE_BUNDLE_PATH" \
+    --contract browser.playwright.browsers-path="$BROWSER_PLAYWRIGHT_BROWSERS_BUNDLE_PATH" \
+    --contract browser.playwright.version="$BROWSER_PLAYWRIGHT_VERSION" \
+    --contract browser.chromium.executable-path="$BROWSER_CHROMIUM_EXECUTABLE_BUNDLE_PATH" \
+    --contract browser.chromium.revision="$BROWSER_CHROMIUM_REVISION" \
+    --contract browser.protocol.version="$BROWSER_PROTOCOL_VERSION" \
+    --contract browser.license.node-path="$BROWSER_NODE_LICENSE_BUNDLE_PATH" \
+    --contract browser.license.playwright-path="$BROWSER_PLAYWRIGHT_LICENSE_BUNDLE_PATH" \
+    --contract browser.license.chromium-path="$BROWSER_CHROMIUM_LICENSE_BUNDLE_PATH" \
+    --contract browser.symlink-manifest.path="$BROWSER_SYMLINK_MANIFEST_BUNDLE_PATH" \
+    --contract browser.disk-budget.bytes="$BROWSER_DISK_BUDGET_BYTES" \
+    --contract browser.component.source-manifest-id="$BROWSER_SOURCE_MANIFEST_ID" \
+    --contract browser.component.source-manifest-path="$BROWSER_SOURCE_MANIFEST_BUNDLE_PATH" \
     --contract panic.gui=unwind \
     --contract panic.mux-server=unwind \
     --contract panic.bundled-cli=unwind

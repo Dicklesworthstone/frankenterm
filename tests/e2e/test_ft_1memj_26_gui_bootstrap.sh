@@ -8,6 +8,10 @@ ARTIFACT_DIR="${ROOT_DIR}/tests/e2e/artifacts/gui_bootstrap/${RUN_ID}"
 SCENARIO_ID="ft_1memj_26_gui_bootstrap"
 CORRELATION_ID="ft-1memj.26-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
+BUNDLE_TARGET="aarch64-apple-darwin"
+BROWSER_RUNTIME_ROOT="${ARTIFACT_DIR}/browser-runtime-component"
+BROWSER_RUNTIME_MANIFEST="${ARTIFACT_DIR}/browser-runtime-component.json"
+BROWSER_BUNDLE_ARGS=()
 
 mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
 
@@ -15,6 +19,7 @@ PASS=0
 FAIL=0
 TOTAL=0
 
+# shellcheck source=tests/e2e/lib_rch_guards.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1memj_26_gui_bootstrap"
 RCH_SKIP_SMOKE_PREFLIGHT=1
@@ -100,9 +105,12 @@ write_probe_failure_rch() {
   local mock_bin="$1"
   local marker_file="$2"
   mkdir -p "${mock_bin}"
-  cat > "${mock_bin}/rch" <<EOF
+cat > "${mock_bin}/rch" <<EOF
 #!/bin/bash
 set -euo pipefail
+if [[ "\${1:-}" == "--no-self-healing" ]]; then
+  shift
+fi
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
   printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"connection_failed","error":"RCH-E100"}]}'
   exit 0
@@ -123,9 +131,12 @@ write_success_build_rch() {
   local mock_bin="$1"
   local marker_file="$2"
   mkdir -p "${mock_bin}"
-  cat > "${mock_bin}/rch" <<EOF
+cat > "${mock_bin}/rch" <<EOF
 #!/bin/bash
 set -euo pipefail
+if [[ "\${1:-}" == "--no-self-healing" ]]; then
+  shift
+fi
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
   printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
   exit 0
@@ -152,7 +163,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     echo "missing CARGO_TARGET_DIR" >&2
     exit 64
   fi
-  mkdir -p "\${PWD}/\${target_dir}/release"
+  mkdir -p "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release"
   printf '%s\n' \
     '#!/bin/bash' \
     'if [[ "${1:-}" == "--version" ]]; then' \
@@ -163,7 +174,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  echo "stub help"' \
     '  exit 0' \
     'fi' \
-    'exit 0' > "\${PWD}/\${target_dir}/release/frankenterm-gui"
+    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui"
   printf '%s\n' \
     '#!/bin/bash' \
     'if [[ "${1:-}" == "--version" ]]; then' \
@@ -174,7 +185,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  echo "stub help"' \
     '  exit 0' \
     'fi' \
-    'exit 0' > "\${PWD}/\${target_dir}/release/ft"
+    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/ft"
   printf '%s\n' \
     '#!/bin/bash' \
     'if [[ "${1:-}" == "--version" ]]; then' \
@@ -185,8 +196,8 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  echo "stub help"' \
     '  exit 0' \
     'fi' \
-    'exit 0' > "\${PWD}/\${target_dir}/release/frankenterm-mux-server"
-  chmod +x "\${PWD}/\${target_dir}/release/frankenterm-gui" "\${PWD}/\${target_dir}/release/ft" "\${PWD}/\${target_dir}/release/frankenterm-mux-server"
+    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
+  chmod +x "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/ft" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
   exit 0
 fi
 
@@ -200,9 +211,12 @@ write_missing_x11_rch() {
   local mock_bin="$1"
   local marker_file="$2"
   mkdir -p "${mock_bin}"
-  cat > "${mock_bin}/rch" <<EOF
+cat > "${mock_bin}/rch" <<EOF
 #!/bin/bash
 set -euo pipefail
+if [[ "\${1:-}" == "--no-self-healing" ]]; then
+  shift
+fi
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
   printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
   exit 0
@@ -235,9 +249,12 @@ write_missing_gui_link_pkg_rch() {
   local marker_file="$2"
   local missing_pkg="$3"
   mkdir -p "${mock_bin}"
-  cat > "${mock_bin}/rch" <<EOF
+cat > "${mock_bin}/rch" <<EOF
 #!/bin/bash
 set -euo pipefail
+if [[ "\${1:-}" == "--no-self-healing" ]]; then
+  shift
+fi
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
   printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
   exit 0
@@ -276,6 +293,20 @@ write_codesign_mock() {
   ln -sf /usr/bin/true "${mock_bin}/codesign"
 }
 
+write_codesign_verification_failure_mock() {
+  local mock_bin="$1"
+  mkdir -p "${mock_bin}"
+  cat > "${mock_bin}/codesign" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == "--verify" ]]; then
+  exit 73
+fi
+exit 0
+EOF
+  chmod +x "${mock_bin}/codesign"
+}
+
 write_stub_binary() {
   local path="$1"
   cat > "${path}" <<'EOF'
@@ -291,6 +322,69 @@ fi
 exit 0
 EOF
   chmod +x "${path}"
+}
+
+prepare_browser_runtime_fixture() {
+  local runtime="${BROWSER_RUNTIME_ROOT}/runtime"
+  local source_revision
+  local build_id
+
+  mkdir -p \
+    "${runtime}/bin" \
+    "${runtime}/node_modules/playwright" \
+    "${runtime}/browsers/chromium-fixture" \
+    "${runtime}/licenses"
+  printf '%s\n' '#!/bin/bash' 'exit 0' > "${runtime}/bin/node"
+  printf '%s\n' 'module.exports = {};' > "${runtime}/node_modules/playwright/index.js"
+  printf '%s\n' '#!/bin/bash' 'exit 0' > "${runtime}/browsers/chromium-fixture/chrome"
+  printf '%s\n' 'node fixture license' > "${runtime}/licenses/node.txt"
+  printf '%s\n' 'playwright fixture license' > "${runtime}/licenses/playwright.txt"
+  printf '%s\n' 'chromium fixture notice' > "${runtime}/licenses/chromium.txt"
+  printf '%s\n' '{"links":[],"schema_version":"ft.browser_runtime_symlinks.v1"}' \
+    > "${runtime}/browser-symlinks.v1.json"
+  chmod 0755 \
+    "${runtime}/bin/node" \
+    "${runtime}/browsers/chromium-fixture/chrome"
+
+  source_revision="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
+  build_id="$(bash "${ROOT_DIR}/scripts/atomic-component-manifest.sh" derive-build-id \
+    --source-revision "${source_revision}" \
+    --version fixture \
+    --target "${BUNDLE_TARGET}" \
+    --profile release-browser-runtime \
+    --feature-contract test-fixture)"
+  bash "${ROOT_DIR}/scripts/atomic-component-manifest.sh" generate \
+    --root "${BROWSER_RUNTIME_ROOT}" \
+    --source-root "${ROOT_DIR}" \
+    --output "${BROWSER_RUNTIME_MANIFEST}" \
+    --build-id "${build_id}" \
+    --source-revision "${source_revision}" \
+    --version fixture \
+    --target "${BUNDLE_TARGET}" \
+    --profile release-browser-runtime \
+    --feature-contract test-fixture \
+    --tree asset:browser-runtime:. \
+    --contract browser.runtime.schema=playwright-chromium.v1 \
+    --contract browser.runtime.target="${BUNDLE_TARGET}" \
+    --contract browser.runtime.root=runtime \
+    --contract browser.node.path=runtime/bin/node \
+    --contract browser.node.version=fixture \
+    --contract browser.playwright.module-path=runtime/node_modules/playwright/index.js \
+    --contract browser.playwright.browsers-path=runtime/browsers \
+    --contract browser.playwright.version=fixture \
+    --contract browser.chromium.executable-path=runtime/browsers/chromium-fixture/chrome \
+    --contract browser.chromium.revision=fixture \
+    --contract browser.protocol.version=fixture \
+    --contract browser.license.node-path=runtime/licenses/node.txt \
+    --contract browser.license.playwright-path=runtime/licenses/playwright.txt \
+    --contract browser.license.chromium-path=runtime/licenses/chromium.txt \
+    --contract browser.symlink-manifest.path=runtime/browser-symlinks.v1.json \
+    --contract browser.disk-budget.bytes=1048576 >/dev/null
+  BROWSER_BUNDLE_ARGS=(
+    --target "${BUNDLE_TARGET}"
+    --browser-runtime-root "${BROWSER_RUNTIME_ROOT}"
+    --browser-runtime-manifest "${BROWSER_RUNTIME_MANIFEST}"
+  )
 }
 
 scenario_dry_run_skips_rch() {
@@ -504,17 +598,17 @@ scenario_bundle_skip_build_creates_structure() {
   local codesign_log="${scenario_dir}/codesign.log"
   local app_bundle="${output_dir}/FrankenTerm.app"
 
-  mkdir -p "${scenario_dir}" "${target_dir}/release" "${output_dir}"
-  write_stub_binary "${target_dir}/release/frankenterm-gui"
-  write_stub_binary "${target_dir}/release/frankenterm-mux-server"
-  write_stub_binary "${target_dir}/release/ft"
+  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/ft"
   write_codesign_mock "${mock_bin}" "${codesign_log}"
 
   emit_log "running" "bundle_skip_build_creates_structure" "skip_build_bundle" "none" "none" "${stdout_file}" "scripts/create-macos-bundle.sh --skip-build"
   if env \
     PATH="${mock_bin}:${PATH}" \
     CARGO_TARGET_DIR="${target_dir}" \
-    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --skip-build --output "${output_dir}" >"${stdout_file}" 2>"${stderr_file}"; then
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --skip-build --output "${output_dir}" "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_file}" 2>"${stderr_file}"; then
     for required_path in \
       "${app_bundle}/Contents/Info.plist" \
       "${app_bundle}/Contents/PkgInfo" \
@@ -547,13 +641,13 @@ scenario_bundle_refuses_overwrite() {
   local app_bundle="${output_dir}/FrankenTerm.app"
   local rc
 
-  mkdir -p "${scenario_dir}" "${target_dir}/release" "${output_dir}"
-  write_stub_binary "${target_dir}/release/frankenterm-gui"
-  write_stub_binary "${target_dir}/release/frankenterm-mux-server"
-  write_stub_binary "${target_dir}/release/ft"
+  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/ft"
   write_codesign_mock "${mock_bin}" "${codesign_log}"
 
-  if ! env PATH="${mock_bin}:${PATH}" CARGO_TARGET_DIR="${target_dir}" "${ROOT_DIR}/scripts/create-macos-bundle.sh" --skip-build --output "${output_dir}" >"${stdout_first}" 2>"${stderr_first}"; then
+  if ! env PATH="${mock_bin}:${PATH}" CARGO_TARGET_DIR="${target_dir}" "${ROOT_DIR}/scripts/create-macos-bundle.sh" --skip-build --output "${output_dir}" "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_first}" 2>"${stderr_first}"; then
     record_result "bundle_refuses_overwrite" "false" "seed_bundle_failed" "SEED_BUNDLE_FAILED" "unable to create initial bundle"
     return
   fi
@@ -564,7 +658,7 @@ scenario_bundle_refuses_overwrite() {
 
   emit_log "running" "bundle_refuses_overwrite" "overwrite_guard" "none" "none" "${stdout_second}" "bundle overwrite refusal"
   set +e
-  env PATH="${mock_bin}:${PATH}" CARGO_TARGET_DIR="${target_dir}" "${ROOT_DIR}/scripts/create-macos-bundle.sh" --skip-build --output "${output_dir}" >"${stdout_second}" 2>"${stderr_second}"
+  env PATH="${mock_bin}:${PATH}" CARGO_TARGET_DIR="${target_dir}" "${ROOT_DIR}/scripts/create-macos-bundle.sh" --skip-build --output "${output_dir}" "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_second}" 2>"${stderr_second}"
   rc=$?
   set -e
 
@@ -577,6 +671,40 @@ scenario_bundle_refuses_overwrite() {
     return
   fi
   record_result "bundle_refuses_overwrite" "true"
+}
+
+scenario_bundle_refuses_failed_codesign_verification() {
+  local scenario_dir="${ARTIFACT_DIR}/bundle_refuses_failed_codesign_verification"
+  local mock_bin="${scenario_dir}/mock-bin"
+  local target_dir="${scenario_dir}/target"
+  local output_dir="${scenario_dir}/output"
+  local stdout_file="${scenario_dir}/stdout.log"
+  local stderr_file="${scenario_dir}/stderr.log"
+  local rc
+
+  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/ft"
+  write_codesign_verification_failure_mock "${mock_bin}"
+
+  emit_log "running" "bundle_refuses_failed_codesign_verification" "codesign_verify" "none" "none" "${stdout_file}" "strict deep codesign verification failure"
+  set +e
+  env \
+    PATH="${mock_bin}:${PATH}" \
+    CARGO_TARGET_DIR="${target_dir}" \
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" \
+      --skip-build \
+      --output "${output_dir}" \
+      "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_file}" 2>"${stderr_file}"
+  rc=$?
+  set -e
+
+  if [[ "${rc}" -ne 0 ]] && grep -q "failed strict deep codesign verification" "${stdout_file}"; then
+    record_result "bundle_refuses_failed_codesign_verification" "true"
+    return
+  fi
+  record_result "bundle_refuses_failed_codesign_verification" "false" "codesign_verify_false_green" "CODESIGN_VERIFY_FALSE_GREEN" "bundle did not fail closed when strict deep verification failed"
 }
 
 scenario_bundle_probe_failure_refuses_exec() {
@@ -595,7 +723,7 @@ scenario_bundle_probe_failure_refuses_exec() {
   env \
     RCH_BIN="${mock_bin}/rch" \
     CARGO_TARGET_DIR="${scenario_dir}/target" \
-    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${scenario_dir}/output" >"${stdout_file}" 2>"${stderr_file}"
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${scenario_dir}/output" "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_file}" 2>"${stderr_file}"
   rc=$?
   set -e
 
@@ -630,7 +758,7 @@ scenario_bundle_missing_x11_refuses_exec() {
   env \
     RCH_BIN="${mock_bin}/rch" \
     CARGO_TARGET_DIR="${scenario_dir}/target" \
-    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${scenario_dir}/output" >"${stdout_file}" 2>"${stderr_file}"
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${scenario_dir}/output" "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_file}" 2>"${stderr_file}"
   rc=$?
   set -e
 
@@ -673,7 +801,7 @@ scenario_bundle_missing_gui_link_pkg_refuses_exec() {
   env \
     RCH_BIN="${mock_bin}/rch" \
     CARGO_TARGET_DIR="${scenario_dir}/target" \
-    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${scenario_dir}/output" >"${stdout_file}" 2>"${stderr_file}"
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${scenario_dir}/output" "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_file}" 2>"${stderr_file}"
   rc=$?
   set -e
 
@@ -717,7 +845,7 @@ scenario_bundle_build_uses_repo_relative_paths() {
     PATH="${mock_bin}:${PATH}" \
     RCH_BIN="${mock_bin}/rch" \
     CARGO_TARGET_DIR="${scenario_dir}/target" \
-    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${output_dir}" >"${stdout_file}" 2>"${stderr_file}"; then
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${output_dir}" "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_file}" 2>"${stderr_file}"; then
     if [[ ! -f "${marker_file}" ]]; then
       record_result "bundle_build_uses_repo_relative_paths" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
       return
@@ -749,6 +877,7 @@ main() {
   require_cmd jq
   require_cmd python3
   require_cmd file
+  prepare_browser_runtime_fixture
 
   scenario_dry_run_skips_rch
   scenario_e2e_probe_failure_refuses_exec
@@ -756,6 +885,7 @@ main() {
   scenario_e2e_missing_gui_link_pkg_refuses_cargo
   scenario_bundle_skip_build_creates_structure
   scenario_bundle_refuses_overwrite
+  scenario_bundle_refuses_failed_codesign_verification
   scenario_bundle_probe_failure_refuses_exec
   scenario_bundle_missing_x11_refuses_exec
   scenario_bundle_missing_gui_link_pkg_refuses_exec

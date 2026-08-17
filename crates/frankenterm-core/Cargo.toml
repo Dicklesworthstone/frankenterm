@@ -184,6 +184,9 @@ sysinfo = { version = "0.39.3", default-features = false, features = ["system", 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, optional = true, features = ["fs", "socket", "user"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+xattr.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true, features = ["trace"] }

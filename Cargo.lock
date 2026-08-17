@@ -3800,6 +3800,7 @@ dependencies = [
  "tru",
  "url",
  "x509-parser",
+ "xattr",
  "zstd",
 ]
 

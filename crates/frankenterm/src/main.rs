@@ -75224,7 +75224,7 @@ async fn handle_auth_command(
                         account: account.clone(),
                         error: "Browser runtime readiness validation failed".to_string(),
                         next_step: Some(
-                            "Ensure Node can resolve the 'playwright' module and its Chromium browser bundle is installed"
+                            "Repair or reinstall the exact browser-runtime component shipped with FrankenTerm"
                                 .into(),
                         ),
                     },
@@ -75577,13 +75577,13 @@ async fn handle_auth_command(
                         "ok": false,
                         "error": "Browser runtime readiness validation failed",
                         "error_code": "E_BROWSER_NOT_READY",
-                        "hint": "Ensure Node can resolve the 'playwright' module and its Chromium browser bundle is installed",
+                        "hint": "Repair or reinstall the exact browser-runtime component shipped with FrankenTerm",
                     });
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else {
                     eprintln!("Error: Browser runtime readiness validation failed");
                     eprintln!(
-                        "Hint: Ensure Node can resolve the 'playwright' module and its Chromium browser bundle is installed"
+                        "Hint: Repair or reinstall the exact browser-runtime component shipped with FrankenTerm"
                     );
                 }
                 std::process::exit(1);
@@ -80022,7 +80022,7 @@ async fn run_diagnostics(
             Err(error) => checks.push(DiagnosticCheck::warning(
                 "Playwright",
                 error.detail(),
-                "Ensure Node can resolve the 'playwright' module and its Chromium browser bundle is installed",
+                "Repair or reinstall the exact browser-runtime component shipped with FrankenTerm",
             )),
         }
 

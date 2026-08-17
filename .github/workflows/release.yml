@@ -365,11 +365,18 @@ jobs:
           # tool can't fail the whole release. brew is preinstalled on runners.
           command -v zstd >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install zstd
           mkdir -p dist
+          scripts/assemble-browser-runtime.sh \
+            --target "${{ matrix.target }}" \
+            --output dist-browser/runtime-component \
+            --manifest dist-browser/runtime-component-manifest.json \
+            --cache target/browser-runtime-download-cache
           CARGO_TARGET_DIR=target SOURCE_DATE_EPOCH=0 \
             FT_ATOMIC_BUILD_IDENTITY="$FT_ATOMIC_BUILD_IDENTITY" \
             scripts/create-macos-bundle.sh \
               --skip-build \
               --target "${{ matrix.target }}" \
+              --browser-runtime-root dist-browser/runtime-component \
+              --browser-runtime-manifest dist-browser/runtime-component-manifest.json \
               --output dist-app
           cd dist-app
           # COPYFILE_DISABLE stops bsdtar from emitting ._* AppleDouble sidecars.

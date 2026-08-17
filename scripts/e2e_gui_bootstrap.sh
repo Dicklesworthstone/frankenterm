@@ -140,8 +140,16 @@ PY
 }
 
 normalize_gui_target_dir() {
-  local -a info
-  mapfile -t info < <(resolve_project_path_info "$GUI_TARGET_DIR")
+  local -a info=()
+  local record
+  while IFS= read -r record; do
+    info+=("$record")
+  done < <(resolve_project_path_info "$GUI_TARGET_DIR")
+  if [[ "${#info[@]}" -ne 3 ]]; then
+    BUILD_STEP_STATUS="failed"
+    BUILD_STEP_DETAIL="build step failed (unable to normalize GUI_TARGET_DIR)"
+    return 1
+  fi
   GUI_TARGET_DIR="${info[0]}"
   GUI_TARGET_DIR_REL="${info[1]}"
   GUI_TARGET_DIR_IN_REPO="${info[2]}"
@@ -177,8 +185,15 @@ resolve_rch_cmd() {
 }
 
 run_rch() {
-  local -a cmd
-  mapfile -t cmd < <(resolve_rch_cmd)
+  local -a cmd=()
+  local record
+  while IFS= read -r record; do
+    cmd+=("$record")
+  done < <(resolve_rch_cmd)
+  if [[ "${#cmd[@]}" -eq 0 ]]; then
+    log "Failed to resolve the rch command."
+    return 1
+  fi
   "${cmd[@]}" "$@"
 }
 
@@ -376,10 +391,6 @@ validate_macos_bundle() {
     mark_skip "create-macos-bundle.sh missing"
     return 125
   fi
-  if [[ ! -d "/Applications/WezTerm.app" ]]; then
-    mark_skip "/Applications/WezTerm.app missing"
-    return 125
-  fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     mark_skip "dry-run (bundle validation skipped)"
     return 125
@@ -387,7 +398,26 @@ validate_macos_bundle() {
   skip_if_build_failed "bundle inputs unavailable" || return $?
 
   mkdir -p "$BUNDLE_OUTPUT_DIR"
-  run_cmd "$PROJECT_ROOT/scripts/create-macos-bundle.sh" --skip-build --output "$BUNDLE_OUTPUT_DIR"
+  local bundle_target
+  case "$(uname -m)" in
+    arm64) bundle_target="aarch64-apple-darwin" ;;
+    x86_64) bundle_target="x86_64-apple-darwin" ;;
+    *) return 1 ;;
+  esac
+  local browser_root="$BUNDLE_OUTPUT_DIR/browser-runtime-component"
+  local browser_manifest="$BUNDLE_OUTPUT_DIR/browser-runtime-component.json"
+  local browser_cache="${FT_BROWSER_RUNTIME_CACHE:-$LOG_DIR/browser-runtime-cache}"
+  run_cmd "$PROJECT_ROOT/scripts/assemble-browser-runtime.sh" \
+    --target "$bundle_target" \
+    --output "$browser_root" \
+    --manifest "$browser_manifest" \
+    --cache "$browser_cache"
+  run_cmd "$PROJECT_ROOT/scripts/create-macos-bundle.sh" \
+    --skip-build \
+    --output "$BUNDLE_OUTPUT_DIR" \
+    --target "$bundle_target" \
+    --browser-runtime-root "$browser_root" \
+    --browser-runtime-manifest "$browser_manifest"
 
   local app="$BUNDLE_OUTPUT_DIR/FrankenTerm.app"
   [[ -d "$app" ]] || return 1

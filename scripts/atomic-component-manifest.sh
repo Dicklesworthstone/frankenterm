@@ -72,6 +72,30 @@ ALLOWED_KINDS = {
     "signature",
     "verifier",
 }
+BROWSER_RUNTIME_SCHEMA = "playwright-chromium.v1"
+BROWSER_RUNTIME_PATH_POLICY = "relative_utf8_browser_symlink_sidecar_v2"
+BROWSER_RUNTIME_REQUIRED_CONTRACTS = {
+    "browser.runtime.schema",
+    "browser.runtime.target",
+    "browser.runtime.root",
+    "browser.node.path",
+    "browser.node.version",
+    "browser.playwright.module-path",
+    "browser.playwright.browsers-path",
+    "browser.playwright.version",
+    "browser.chromium.executable-path",
+    "browser.chromium.revision",
+    "browser.protocol.version",
+    "browser.license.node-path",
+    "browser.license.playwright-path",
+    "browser.license.chromium-path",
+    "browser.symlink-manifest.path",
+    "browser.disk-budget.bytes",
+}
+BROWSER_RUNTIME_PROVENANCE_CONTRACTS = {
+    "browser.component.source-manifest-id",
+    "browser.component.source-manifest-path",
+}
 TOP_LEVEL_KEYS = {
     "$schema",
     "schema_version",
@@ -185,6 +209,7 @@ class ReadEvidence:
 class InventorySnapshot:
     files: dict[str, StatIdentity]
     directories: dict[str, StatIdentity]
+    symlinks: dict[str, str]
     invalid: tuple[str, ...]
 
 
@@ -427,6 +452,7 @@ class AnchoredRoot:
     def scan_inventory(self, ignored: set[str]) -> InventorySnapshot:
         files: dict[str, StatIdentity] = {}
         directories: dict[str, StatIdentity] = {}
+        symlinks: dict[str, str] = {}
         invalid: list[str] = []
         pending: list[tuple[int, str]] = [(os.dup(self.fd), "")]
         try:
@@ -484,9 +510,19 @@ class AnchoredRoot:
                         elif stat.S_ISREG(observed.st_mode):
                             if relative not in ignored:
                                 files[relative] = stable_stat_identity(observed)
+                        elif stat.S_ISLNK(observed.st_mode):
+                            try:
+                                target = os.readlink(entry.name, dir_fd=directory_fd)
+                            except (OSError, UnicodeError):
+                                invalid.append(relative)
+                                continue
+                            if not target or "\x00" in target or len(target.encode("utf-8")) > MAX_PATH_BYTES:
+                                invalid.append(relative)
+                                continue
+                            symlinks[relative] = target
                         else:
                             invalid.append(relative)
-                        if len(files) > MAX_FILES or len(files) + len(directories) > MAX_INVENTORY_ENTRIES:
+                        if len(files) > MAX_FILES or len(files) + len(directories) + len(symlinks) > MAX_INVENTORY_ENTRIES:
                             fail(
                                 "inventory_too_large",
                                 "package inventory exceeds the bounded verifier limit",
@@ -498,7 +534,7 @@ class AnchoredRoot:
         finally:
             for directory_fd, _prefix in pending:
                 os.close(directory_fd)
-        return InventorySnapshot(files, directories, tuple(sorted(invalid)))
+        return InventorySnapshot(files, directories, symlinks, tuple(sorted(invalid)))
 
     def assert_regular_identity(self, relative: str, expected: StatIdentity) -> None:
         with self.open_regular(relative) as (_fd, observed):
@@ -864,7 +900,8 @@ def parse_tree(value: str) -> tuple[str, str, str]:
             remedy="catalog each executable with --entry KIND:ROLE:PATH:COMPONENT",
         )
     validate_role("role_prefix", role_prefix)
-    normalized_relative(relative)
+    if relative != ".":
+        normalized_relative(relative)
     return kind, role_prefix, relative
 
 
@@ -899,14 +936,15 @@ def expand_specs(
         (value, True) for value in optional_trees
     ]:
         kind, prefix, relative = parse_tree(value)
-        try:
-            with root.open_directory(relative):
-                pass
-        except ManifestError as exc:
-            if optional and exc.code == "required_tree_missing":
-                continue
-            raise
-        tree_prefix = relative + "/"
+        if relative != ".":
+            try:
+                with root.open_directory(relative):
+                    pass
+            except ManifestError as exc:
+                if optional and exc.code == "required_tree_missing":
+                    continue
+                raise
+        tree_prefix = "" if relative == "." else relative + "/"
         for package_rel in sorted(path for path in inventory.files if path.startswith(tree_prefix)):
             # The package path already gives each tree member a unique,
             # case-preserving identity. Keep the semantic role at the
@@ -1115,6 +1153,8 @@ def inventory_change_details(
     final_files = set(final.files)
     initial_directories = set(initial.directories)
     final_directories = set(final.directories)
+    initial_symlinks = set(initial.symlinks)
+    final_symlinks = set(final.symlinks)
     return {
         "added_files": sorted(final_files - initial_files),
         "removed_files": sorted(initial_files - final_files),
@@ -1133,6 +1173,13 @@ def inventory_change_details(
                 path in allowed
                 and initial.directories[path][:3] == final.directories[path][:3]
             )
+        ),
+        "added_symlinks": sorted(final_symlinks - initial_symlinks),
+        "removed_symlinks": sorted(initial_symlinks - final_symlinks),
+        "retargeted_symlinks": sorted(
+            path
+            for path in initial_symlinks & final_symlinks
+            if initial.symlinks[path] != final.symlinks[path]
         ),
         "invalid_entries": list(final.invalid),
     }
@@ -1192,6 +1239,13 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
                 paths=list(initial.invalid),
                 remedy="stage only regular files in a fresh package root",
             )
+        contracts = parse_contracts(args.contract)
+        if initial.symlinks and contracts.get("browser.runtime.schema") != BROWSER_RUNTIME_SCHEMA:
+            fail(
+                "non_regular_inventory_entry",
+                "package contains symlinks outside the browser runtime contract",
+                paths=sorted(initial.symlinks),
+            )
         specs = expand_specs(root, initial, args.entry, args.tree, args.optional_tree)
         if not specs:
             fail("empty_catalog", "at least one package file must be catalogued")
@@ -1225,7 +1279,6 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
         root.assert_path_identity()
         root.maybe_test_swap_after_precommit_scan()
 
-        contracts = parse_contracts(args.contract)
         total_bytes = sum(record["bytes"] for record in file_records)
         manifest: dict[str, Any] = {
             "$schema": SCHEMA_URI,
@@ -1242,9 +1295,17 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
             "verification": {
                 "algorithm": "sha256",
                 "offline": True,
-                "path_policy": "relative_utf8_no_symlink_v1",
+                "path_policy": (
+                    BROWSER_RUNTIME_PATH_POLICY
+                    if contracts.get("browser.runtime.schema") == BROWSER_RUNTIME_SCHEMA
+                    else "relative_utf8_no_symlink_v1"
+                ),
             },
         }
+        validate_browser_runtime_contract(identity, contracts, file_records)
+        validate_browser_runtime_symlinks(root, manifest, initial.symlinks)
+        verify_browser_runtime_provenance(root, manifest)
+        verify_browser_runtime_quarantine(root.path, manifest)
         manifest["manifest_id"] = "sha256:" + sha256_bytes(canonical_bytes(manifest))
         payload = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
         write_new_absolute(output, payload)
@@ -1292,6 +1353,366 @@ def validate_nonnegative_int(value: Any, field: str) -> int:
     if type(value) is not int or value < 0:
         fail("schema_type_mismatch", f"{field} must be a non-negative integer", field=field, actual=value)
     return value
+
+
+def path_is_or_descendant(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory + "/")
+
+
+def validate_browser_runtime_contract(
+    identity: dict[str, str],
+    contracts: dict[str, str],
+    files: list[dict[str, Any]],
+) -> None:
+    schema = contracts.get("browser.runtime.schema")
+    browser_keys = {key for key in contracts if key.startswith("browser.")}
+    if schema is None:
+        if browser_keys:
+            fail(
+                "browser_runtime_contract_incomplete",
+                "browser-prefixed contracts require browser.runtime.schema",
+                keys=sorted(browser_keys),
+            )
+        return
+    if schema != BROWSER_RUNTIME_SCHEMA:
+        fail(
+            "browser_runtime_schema_mismatch",
+            "browser runtime contract schema is unsupported",
+            expected=BROWSER_RUNTIME_SCHEMA,
+            actual=schema,
+        )
+
+    missing = BROWSER_RUNTIME_REQUIRED_CONTRACTS - browser_keys
+    provenance_present = browser_keys & BROWSER_RUNTIME_PROVENANCE_CONTRACTS
+    if provenance_present and provenance_present != BROWSER_RUNTIME_PROVENANCE_CONTRACTS:
+        missing |= BROWSER_RUNTIME_PROVENANCE_CONTRACTS - provenance_present
+    allowed = BROWSER_RUNTIME_REQUIRED_CONTRACTS | BROWSER_RUNTIME_PROVENANCE_CONTRACTS
+    extra = browser_keys - allowed
+    if missing or extra:
+        fail(
+            "browser_runtime_contract_field_mismatch",
+            "browser runtime contract has an unexpected field set",
+            missing=sorted(missing),
+            extra=sorted(extra),
+        )
+    if contracts["browser.runtime.target"] != identity["target"]:
+        fail(
+            "browser_runtime_target_mismatch",
+            "browser runtime target must match the enclosing component identity",
+            expected=identity["target"],
+            actual=contracts["browser.runtime.target"],
+        )
+
+    for key in [
+        "browser.node.version",
+        "browser.playwright.version",
+        "browser.chromium.revision",
+        "browser.protocol.version",
+    ]:
+        validate_token(key, contracts[key])
+
+    runtime_root = normalized_relative(
+        contracts["browser.runtime.root"],
+        "contracts.browser.runtime.root",
+    )
+    path_keys = [
+        "browser.node.path",
+        "browser.playwright.module-path",
+        "browser.playwright.browsers-path",
+        "browser.chromium.executable-path",
+        "browser.license.node-path",
+        "browser.license.playwright-path",
+        "browser.license.chromium-path",
+        "browser.symlink-manifest.path",
+    ]
+    paths = {
+        key: normalized_relative(contracts[key], f"contracts.{key}")
+        for key in path_keys
+    }
+    for key, path in paths.items():
+        if not path_is_or_descendant(path, runtime_root):
+            fail(
+                "browser_runtime_path_escape",
+                "browser runtime capability path is outside its fixed root",
+                field=key,
+                path=path,
+                root=runtime_root,
+            )
+    browsers_root = paths["browser.playwright.browsers-path"]
+    chromium_path = paths["browser.chromium.executable-path"]
+    if not path_is_or_descendant(chromium_path, browsers_root) or chromium_path == browsers_root:
+        fail(
+            "browser_runtime_chromium_outside_store",
+            "Chromium executable must be below the fixed Playwright browser store",
+            chromium_path=chromium_path,
+            browsers_root=browsers_root,
+        )
+
+    records = {record["path"]: record for record in files}
+    required_files = {
+        paths["browser.node.path"],
+        paths["browser.playwright.module-path"],
+        chromium_path,
+        paths["browser.license.node-path"],
+        paths["browser.license.playwright-path"],
+        paths["browser.license.chromium-path"],
+        paths["browser.symlink-manifest.path"],
+    }
+    if provenance_present:
+        source_manifest_path = normalized_relative(
+            contracts["browser.component.source-manifest-path"],
+            "contracts.browser.component.source-manifest-path",
+        )
+        required_files.add(source_manifest_path)
+        source_manifest_id = contracts["browser.component.source-manifest-id"]
+        if not source_manifest_id.startswith("sha256:") or not SHA256_RE.fullmatch(
+            source_manifest_id[7:]
+        ):
+            fail(
+                "browser_runtime_source_manifest_id_invalid",
+                "browser runtime source manifest identity is not canonical SHA-256",
+            )
+    missing_files = sorted(required_files - records.keys())
+    if missing_files:
+        fail(
+            "browser_runtime_required_file_missing",
+            "browser runtime contract references files absent from the exact catalog",
+            missing=missing_files,
+        )
+    for executable_path in [paths["browser.node.path"], chromium_path]:
+        if not records[executable_path]["executable"]:
+            fail(
+                "browser_runtime_executable_mode_missing",
+                "browser runtime executable path is not executable",
+                path=executable_path,
+            )
+    if not any(path.startswith(browsers_root + "/") for path in records):
+        fail(
+            "browser_runtime_store_empty",
+            "Playwright browser store contains no catalogued files",
+            path=browsers_root,
+        )
+
+    disk_budget_raw = contracts["browser.disk-budget.bytes"]
+    if not disk_budget_raw.isascii() or not disk_budget_raw.isdigit():
+        fail(
+            "browser_runtime_disk_budget_invalid",
+            "browser runtime disk budget must be a canonical decimal byte count",
+            actual=disk_budget_raw,
+        )
+    disk_budget = int(disk_budget_raw)
+    component_bytes = sum(
+        record["bytes"]
+        for record in files
+        if path_is_or_descendant(record["path"], runtime_root)
+    )
+    if component_bytes == 0 or component_bytes > disk_budget:
+        fail(
+            "browser_runtime_disk_budget_exceeded",
+            "browser runtime exceeds its declared installed-byte budget",
+            component_bytes=component_bytes,
+            disk_budget_bytes=disk_budget,
+        )
+
+
+def validate_browser_runtime_symlinks(
+    root: AnchoredRoot,
+    manifest: dict[str, Any],
+    observed: dict[str, str],
+) -> None:
+    contracts = manifest["contracts"]
+    if contracts.get("browser.runtime.schema") != BROWSER_RUNTIME_SCHEMA:
+        if observed:
+            fail(
+                "non_regular_inventory_entry",
+                "package contains symlinks outside the browser runtime contract",
+                paths=sorted(observed),
+            )
+        return
+    if len(observed) > 256:
+        fail(
+            "browser_runtime_symlink_limit_exceeded",
+            "browser runtime exceeds the bounded symlink allowance",
+            maximum=256,
+            actual=len(observed),
+        )
+    runtime_root = normalized_relative(
+        contracts["browser.runtime.root"],
+        "contracts.browser.runtime.root",
+    )
+    sidecar_path = normalized_relative(
+        contracts["browser.symlink-manifest.path"],
+        "contracts.browser.symlink-manifest.path",
+    )
+    evidence = root.read_regular(sidecar_path)
+    if evidence.payload is None:
+        fail(
+            "browser_runtime_symlink_manifest_oversized",
+            "browser runtime symlink manifest exceeds the bounded verifier limit",
+            path=sidecar_path,
+        )
+    sidecar = load_json_strict(evidence.payload, sidecar_path)
+    require_exact_keys(sidecar, {"links", "schema_version"}, "browser symlink manifest")
+    if sidecar["schema_version"] != "ft.browser_runtime_symlinks.v1":
+        fail(
+            "browser_runtime_symlink_schema_mismatch",
+            "browser runtime symlink manifest schema is unsupported",
+            actual=sidecar["schema_version"],
+        )
+    links = sidecar["links"]
+    if not isinstance(links, list) or len(links) > 256:
+        fail(
+            "browser_runtime_symlink_manifest_invalid",
+            "browser runtime symlink manifest links must be a bounded array",
+        )
+    declared: dict[str, str] = {}
+    previous = ""
+    for index, record in enumerate(links):
+        if not isinstance(record, dict):
+            fail("browser_runtime_symlink_manifest_invalid", "browser symlink record must be an object")
+        require_exact_keys(record, {"path", "target"}, f"browser symlink record {index}")
+        path = normalized_relative(record["path"], f"browser symlink record {index}.path")
+        target = record["target"]
+        if (
+            not isinstance(target, str)
+            or not target
+            or "\\" in target
+            or "\x00" in target
+            or len(target.encode("utf-8")) > MAX_PATH_BYTES
+            or PurePosixPath(target).is_absolute()
+        ):
+            fail(
+                "browser_runtime_symlink_target_invalid",
+                "browser runtime symlink target must be a bounded relative POSIX path",
+                path=path,
+            )
+        if path <= previous or path in declared:
+            fail(
+                "browser_runtime_symlink_order_invalid",
+                "browser runtime symlink records must be unique and strictly path-sorted",
+                path=path,
+            )
+        package_path = f"{runtime_root}/{path}"
+        declared[package_path] = target
+        previous = path
+    if declared != observed:
+        fail(
+            "browser_runtime_symlink_manifest_mismatch",
+            "browser runtime symlink inventory differs from its exact sidecar",
+            missing=sorted(set(observed) - set(declared)),
+            uncatalogued=sorted(set(declared) - set(observed)),
+            retargeted=sorted(
+                path
+                for path in set(declared) & set(observed)
+                if declared[path] != observed[path]
+            ),
+        )
+    runtime_absolute = (root.path / runtime_root).resolve(strict=True)
+    for path in declared:
+        try:
+            resolved = (root.path / path).resolve(strict=True)
+            if resolved == runtime_absolute:
+                raise ValueError("symlink resolves to the browser runtime root")
+            resolved.relative_to(runtime_absolute)
+        except (OSError, RuntimeError, ValueError) as exc:
+            fail(
+                "browser_runtime_symlink_target_escape",
+                f"browser runtime symlink does not resolve within its fixed root: {exc}",
+                path=path,
+            )
+
+
+def verify_browser_runtime_quarantine(root: Path, manifest: dict[str, Any]) -> None:
+    contracts = manifest["contracts"]
+    if contracts.get("browser.runtime.schema") != BROWSER_RUNTIME_SCHEMA:
+        return
+    absent_codes = {errno.ENODATA, errno.ENOTSUP}
+    enoattr = getattr(errno, "ENOATTR", None)
+    if enoattr is not None:
+        absent_codes.add(enoattr)
+    for key in ["browser.node.path", "browser.chromium.executable-path"]:
+        relative = normalized_relative(contracts[key], f"contracts.{key}")
+        try:
+            path = root / relative
+            if hasattr(os, "getxattr"):
+                os.getxattr(path, "com.apple.quarantine", follow_symlinks=False)
+            elif sys.platform == "darwin":
+                import ctypes
+
+                libc = ctypes.CDLL(None, use_errno=True)
+                getxattr = libc.getxattr
+                getxattr.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                    ctypes.c_uint32,
+                    ctypes.c_int,
+                ]
+                getxattr.restype = ctypes.c_ssize_t
+                result = getxattr(
+                    os.fsencode(path),
+                    b"com.apple.quarantine",
+                    None,
+                    0,
+                    0,
+                    0,
+                )
+                if result < 0:
+                    raise OSError(ctypes.get_errno(), "getxattr failed")
+            else:
+                raise OSError(errno.ENOTSUP, "extended attributes are unsupported")
+        except OSError as exc:
+            if exc.errno in absent_codes:
+                continue
+            fail(
+                "browser_runtime_quarantine_check_failed",
+                "browser runtime quarantine state could not be inspected",
+                path=relative,
+                error_kind=errno.errorcode.get(exc.errno, "unknown"),
+            )
+        fail(
+            "browser_runtime_quarantined",
+            "browser runtime executable carries Gatekeeper quarantine metadata",
+            path=relative,
+            remedy="obtain a release-installed component without quarantine metadata",
+        )
+
+
+def verify_browser_runtime_provenance(root: AnchoredRoot, manifest: dict[str, Any]) -> None:
+    contracts = manifest["contracts"]
+    if "browser.component.source-manifest-id" not in contracts:
+        return
+    relative = normalized_relative(
+        contracts["browser.component.source-manifest-path"],
+        "contracts.browser.component.source-manifest-path",
+    )
+    evidence = root.read_regular(relative)
+    if evidence.payload is None:
+        fail(
+            "browser_runtime_source_manifest_oversized",
+            "browser runtime source manifest exceeds the bounded verifier limit",
+            path=relative,
+        )
+    source_manifest = load_json_strict(evidence.payload, relative)
+    claimed = source_manifest.get("manifest_id")
+    if not isinstance(claimed, str):
+        fail(
+            "browser_runtime_source_manifest_id_missing",
+            "browser runtime source manifest has no canonical manifest identity",
+            path=relative,
+        )
+    authority = contracts["browser.component.source-manifest-id"]
+    actual = "sha256:" + sha256_bytes(canonical_bytes(manifest_without_id(source_manifest)))
+    if claimed != authority or actual != authority:
+        fail(
+            "browser_runtime_source_manifest_id_mismatch",
+            "embedded browser runtime source manifest does not match its provenance contract",
+            path=relative,
+            expected=authority,
+            claimed=claimed,
+            actual=actual,
+        )
 
 
 def verify_manifest_shape(manifest: dict[str, Any]) -> tuple[dict[str, str], list[dict[str, Any]]]:
@@ -1433,12 +1854,18 @@ def verify_manifest_shape(manifest: dict[str, Any]) -> tuple[dict[str, str], lis
     if not isinstance(verification, dict):
         fail("schema_type_mismatch", "verification must be an object")
     require_exact_keys(verification, {"algorithm", "offline", "path_policy"}, "verification")
+    expected_path_policy = (
+        BROWSER_RUNTIME_PATH_POLICY
+        if contracts.get("browser.runtime.schema") == BROWSER_RUNTIME_SCHEMA
+        else "relative_utf8_no_symlink_v1"
+    )
     if verification != {
         "algorithm": "sha256",
         "offline": True,
-        "path_policy": "relative_utf8_no_symlink_v1",
+        "path_policy": expected_path_policy,
     }:
         fail("verification_contract_mismatch", "unsupported verification contract", actual=verification)
+    validate_browser_runtime_contract(identity, contracts, files)
     return identity, files
 
 
@@ -1460,6 +1887,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             )
         expected_files = {record["path"] for record in files}
         actual_files = set(initial.files)
+        validate_browser_runtime_symlinks(root, manifest, initial.symlinks)
         if actual_files != expected_files:
             fail(
                 "package_inventory_mismatch",
@@ -1494,6 +1922,8 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 )
             if component is not None:
                 verify_component_markers(evidence.markers, relative, component, identity)
+        verify_browser_runtime_provenance(root, manifest)
+        verify_browser_runtime_quarantine(root.path, manifest)
         final = root.scan_inventory(ignored)
         require_stable_inventory(initial, final)
         root.assert_path_identity()

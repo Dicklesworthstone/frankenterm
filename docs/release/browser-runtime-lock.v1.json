@@ -1,0 +1,41 @@
+{
+  "$schema": "https://frankenterm.dev/schemas/ft-browser-runtime-lock/v1.json",
+  "schema_version": "ft.browser_runtime_lock.v1",
+  "installed_byte_budget": 805306368,
+  "required_free_bytes": 2147483648,
+  "node": {
+    "version": "24.18.1"
+  },
+  "playwright": {
+    "archive_sha256": "6c727ffdfdfda1b46843f00ccbd04e1b798818a4e44386eb5b003b1c47cc008a",
+    "archive_url": "https://registry.npmjs.org/playwright/-/playwright-1.62.0.tgz",
+    "core_archive_sha256": "257b0e29fb807039d3d67fe7c9188a2b9696403c57821b10cb6c8d635e39789a",
+    "core_archive_url": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.62.0.tgz",
+    "version": "1.62.0"
+  },
+  "chromium": {
+    "browser_version": "151.0.7922.34",
+    "revision": "1234"
+  },
+  "protocol_version": "playwright-1.62.0-chromium-1234",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "chromium_archive_root": "chrome-mac-arm64",
+      "chromium_archive_sha256": "01a23ef9501b2745e0c2944c2e583207e6f6132d8d91c3a87ff65b5079e438ef",
+      "chromium_archive_url": "https://cdn.playwright.dev/builds/cft/151.0.7922.34/mac-arm64/chrome-mac-arm64.zip",
+      "chromium_executable": "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+      "node_archive_root": "node-v24.18.1-darwin-arm64",
+      "node_archive_sha256": "1d60b703fe5d7e7072489be8187f430f1a095a658c31e5e1e281331a5873fac3",
+      "node_archive_url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-darwin-arm64.tar.xz"
+    },
+    "x86_64-apple-darwin": {
+      "chromium_archive_root": "chrome-mac-x64",
+      "chromium_archive_sha256": "69bcc853db975a2380767e9ff36da17f1d7b782fbbe191a210f676d2d5967d3e",
+      "chromium_archive_url": "https://cdn.playwright.dev/builds/cft/151.0.7922.34/mac-x64/chrome-mac-x64.zip",
+      "chromium_executable": "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+      "node_archive_root": "node-v24.18.1-darwin-x64",
+      "node_archive_sha256": "f892c7895720f40d3750bde24f3554242d36f23602b5167b5b73ec4d13938aef",
+      "node_archive_url": "https://nodejs.org/dist/v24.18.1/node-v24.18.1-darwin-x64.tar.xz"
+    }
+  }
+}

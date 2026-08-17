@@ -447,7 +447,7 @@ impl InteractiveBootstrap {
 
         super::admit_node_script_source(format!(
             r"
-const {{ chromium }} = require('playwright');
+const {{ chromium }} = require(process.argv[2]);
 	const input = JSON.parse(Buffer.from('{input_base64}', 'base64').toString('utf8'));
 
 	function matchesSuccessUrl(currentValue, prefixValue) {{

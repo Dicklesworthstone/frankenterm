@@ -1,7 +1,7 @@
 //! Browser automation scaffolding for Playwright-based auth flows.
 //!
-//! Provides lazy Playwright initialization, profile directory management,
-//! and safe logging for browser automation tasks.
+//! Provides lazy initialization of FrankenTerm's content-addressed packaged
+//! Playwright/Chromium capability, profile management, and safe logging.
 //!
 //! # Architecture
 //!
@@ -12,7 +12,7 @@
 //! BrowserContext (lazy init, profile isolation)
 //!       │
 //!       ▼
-//! Playwright Node module (bounded stdin capability probe + auth flows)
+//! Exact packaged Node + Playwright + Chromium (bounded probe + auth flows)
 //! ```
 //!
 //! # Profiles
@@ -235,6 +235,760 @@ const BROWSER_NODE_MAX_STDERR_BYTES: usize = 256 * 1024;
 const BROWSER_NODE_MAX_FLOW_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const BROWSER_NODE_MAX_POLL_INTERVAL_MS: u64 = 60 * 1000;
 const BROWSER_NODE_PROCESS_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+const BROWSER_RUNTIME_SCHEMA: &str = "playwright-chromium.v1";
+const BROWSER_RUNTIME_NODE_VERSION: &str = "24.18.1";
+const BROWSER_RUNTIME_PLAYWRIGHT_VERSION: &str = "1.62.0";
+const BROWSER_RUNTIME_CHROMIUM_REVISION: &str = "1234";
+const BROWSER_RUNTIME_PROTOCOL_VERSION: &str = "playwright-1.62.0-chromium-1234";
+const ATOMIC_COMPONENT_SCHEMA: &str = "ft.atomic_component_manifest.v1";
+const ATOMIC_COMPONENT_SCHEMA_URI: &str =
+    "https://frankenterm.dev/schemas/ft-atomic-component-manifest/v1.json";
+const BROWSER_RUNTIME_MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const BROWSER_RUNTIME_MAX_FILES: usize = 100_000;
+const BROWSER_RUNTIME_MAX_INVENTORY_ENTRIES: usize = 200_000;
+const BROWSER_RUNTIME_MAX_PATH_BYTES: usize = 4096;
+const BROWSER_RUNTIME_MAX_SYMLINKS: usize = 256;
+
+#[derive(Debug, Clone)]
+struct BrowserRuntimeCapability {
+    root: PathBuf,
+    node_executable: PathBuf,
+    playwright_module: PathBuf,
+    browsers_root: PathBuf,
+    chromium_executable: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserRuntimeManifest {
+    #[serde(rename = "$schema")]
+    schema: String,
+    schema_version: String,
+    manifest_id: String,
+    identity: BrowserRuntimeManifestIdentity,
+    contracts: std::collections::BTreeMap<String, String>,
+    files: Vec<BrowserRuntimeManifestFile>,
+    verification: BrowserRuntimeManifestVerification,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserRuntimeManifestIdentity {
+    target: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserRuntimeManifestVerification {
+    algorithm: String,
+    offline: bool,
+    path_policy: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserRuntimeManifestFile {
+    bytes: u64,
+    executable: bool,
+    path: String,
+    sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BrowserRuntimeInventory {
+    files: std::collections::BTreeMap<PathBuf, Option<BrowserRuntimeFileIdentity>>,
+    directories: std::collections::BTreeMap<PathBuf, Option<BrowserRuntimeFileIdentity>>,
+    symlinks: Vec<(PathBuf, PathBuf)>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserRuntimeSymlinkManifest {
+    schema_version: String,
+    links: Vec<BrowserRuntimeSymlinkRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserRuntimeSymlinkRecord {
+    path: String,
+    target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct BrowserRuntimeFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    mode: u32,
+}
+
+#[cfg(unix)]
+fn browser_runtime_file_identity(
+    metadata: &std::fs::Metadata,
+) -> Option<BrowserRuntimeFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Some(BrowserRuntimeFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+        mode: metadata.mode(),
+    })
+}
+
+#[cfg(not(unix))]
+fn browser_runtime_file_identity(
+    _metadata: &std::fs::Metadata,
+) -> Option<BrowserRuntimeFileIdentity> {
+    None
+}
+
+fn current_packaged_browser_runtime()
+-> std::result::Result<BrowserRuntimeCapability, BrowserNodeCommandFailure> {
+    if packaged_browser_target() == "unsupported" {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let executable = std::env::current_exe().map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    let macos = executable
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "MacOS"))
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    let contents = macos
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Contents"))
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    load_packaged_browser_runtime(contents)
+}
+
+fn open_browser_runtime_file_nofollow(
+    path: &Path,
+) -> std::result::Result<std::fs::File, BrowserNodeCommandFailure> {
+    let parent = path
+        .parent()
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    let name = path
+        .file_name()
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    let name = Path::new(name);
+    let directory = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    directory
+        .open_with(name, &options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)
+}
+
+fn load_packaged_browser_runtime(
+    contents: &Path,
+) -> std::result::Result<BrowserRuntimeCapability, BrowserNodeCommandFailure> {
+    use sha2::{Digest as _, Sha256};
+
+    let root = contents
+        .parent()
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?
+        .to_path_buf();
+    let bundle_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    let manifest_name = format!("{bundle_name}.component-manifest.json");
+    let manifest_path = root
+        .parent()
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?
+        .join(manifest_name);
+    let manifest_metadata = std::fs::symlink_metadata(&manifest_path)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if !manifest_metadata.file_type().is_file()
+        || manifest_metadata.len() > BROWSER_RUNTIME_MANIFEST_MAX_BYTES
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let manifest_file = open_browser_runtime_file_nofollow(&manifest_path)?;
+    let opened_manifest_metadata = manifest_file
+        .metadata()
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if !opened_manifest_metadata.file_type().is_file()
+        || opened_manifest_metadata.len() != manifest_metadata.len()
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let mut manifest_bytes = Vec::new();
+    manifest_file
+        .take(BROWSER_RUNTIME_MANIFEST_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut manifest_bytes)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if u64::try_from(manifest_bytes.len()).ok() != Some(manifest_metadata.len()) {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+
+    let mut manifest_value: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    let manifest_object = manifest_value
+        .as_object_mut()
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    let claimed_manifest_id = manifest_object
+        .remove("manifest_id")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    let canonical =
+        serde_json::to_vec(&manifest_value).map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    let actual_manifest_id = format!("sha256:{}", hex::encode(Sha256::digest(canonical)));
+    if claimed_manifest_id != actual_manifest_id {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+
+    let manifest: BrowserRuntimeManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if manifest.schema != ATOMIC_COMPONENT_SCHEMA_URI
+        || manifest.schema_version != ATOMIC_COMPONENT_SCHEMA
+        || manifest.manifest_id != claimed_manifest_id
+        || manifest.identity.target != packaged_browser_target()
+        || manifest.verification.algorithm != "sha256"
+        || !manifest.verification.offline
+        || manifest.verification.path_policy != "relative_utf8_browser_symlink_sidecar_v2"
+        || contract(&manifest, "browser.runtime.schema")? != BROWSER_RUNTIME_SCHEMA
+        || contract(&manifest, "browser.runtime.target")? != packaged_browser_target()
+        || contract(&manifest, "browser.node.version")? != BROWSER_RUNTIME_NODE_VERSION
+        || contract(&manifest, "browser.playwright.version")? != BROWSER_RUNTIME_PLAYWRIGHT_VERSION
+        || contract(&manifest, "browser.chromium.revision")? != BROWSER_RUNTIME_CHROMIUM_REVISION
+        || contract(&manifest, "browser.protocol.version")? != BROWSER_RUNTIME_PROTOCOL_VERSION
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+
+    let node_path = contract(&manifest, "browser.node.path")?;
+    let module_path = contract(&manifest, "browser.playwright.module-path")?;
+    let browsers_path = contract(&manifest, "browser.playwright.browsers-path")?;
+    let chromium_path = contract(&manifest, "browser.chromium.executable-path")?;
+    let runtime_root_path = contract(&manifest, "browser.runtime.root")?;
+    for required in [
+        "browser.component.source-manifest-id",
+        "browser.component.source-manifest-path",
+        "browser.license.node-path",
+        "browser.license.playwright-path",
+        "browser.license.chromium-path",
+        "browser.symlink-manifest.path",
+        "browser.disk-budget.bytes",
+    ] {
+        if contract(&manifest, required)?.is_empty() {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+    }
+    let source_manifest_id = contract(&manifest, "browser.component.source-manifest-id")?;
+    if source_manifest_id.len() != 71
+        || !source_manifest_id.starts_with("sha256:")
+        || !source_manifest_id[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let disk_budget = contract(&manifest, "browser.disk-budget.bytes")?
+        .parse::<u64>()
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+
+    if manifest.files.is_empty() || manifest.files.len() > BROWSER_RUNTIME_MAX_FILES {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let mut expected = std::collections::BTreeMap::new();
+    let runtime_root_relative = admit_browser_runtime_relative_path(runtime_root_path)?;
+    let mut component_bytes = 0_u64;
+    for record in &manifest.files {
+        let relative = admit_browser_runtime_relative_path(&record.path)?;
+        let belongs_to_runtime = relative.starts_with(&runtime_root_relative);
+        if expected.insert(relative, record).is_some()
+            || record.sha256.len() != 64
+            || !record
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+        if belongs_to_runtime {
+            component_bytes = component_bytes
+                .checked_add(record.bytes)
+                .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+        }
+    }
+    if expected.is_empty() || component_bytes == 0 || component_bytes > disk_budget {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+
+    let actual = collect_browser_runtime_inventory(&root)?;
+    if actual.files.len() != expected.len()
+        || actual
+            .files
+            .keys()
+            .zip(expected.keys())
+            .any(|(actual, expected)| actual != expected)
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let mut verified_inodes = std::collections::BTreeMap::new();
+    for (relative, record) in &expected {
+        verify_browser_runtime_file(&root.join(relative), record, &mut verified_inodes)?;
+    }
+
+    let source_manifest_relative = admit_browser_runtime_relative_path(contract(
+        &manifest,
+        "browser.component.source-manifest-path",
+    )?)?;
+    let source_manifest_record = expected
+        .get(&source_manifest_relative)
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    verify_browser_runtime_source_manifest(
+        &root.join(&source_manifest_relative),
+        source_manifest_record,
+        source_manifest_id,
+    )?;
+    verify_browser_runtime_symlinks(
+        &root,
+        &runtime_root_relative,
+        contract(&manifest, "browser.symlink-manifest.path")?,
+        &actual.symlinks,
+    )?;
+
+    for required_path in [
+        node_path,
+        module_path,
+        chromium_path,
+        contract(&manifest, "browser.license.node-path")?,
+        contract(&manifest, "browser.license.playwright-path")?,
+        contract(&manifest, "browser.license.chromium-path")?,
+        contract(&manifest, "browser.symlink-manifest.path")?,
+        contract(&manifest, "browser.component.source-manifest-path")?,
+    ] {
+        let relative = admit_browser_runtime_relative_path(required_path)?;
+        if required_path != contract(&manifest, "browser.component.source-manifest-path")?
+            && !relative.starts_with(&runtime_root_relative)
+        {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+        if !manifest
+            .files
+            .iter()
+            .any(|record| record.path == required_path)
+            || !root.join(relative).is_file()
+        {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+    }
+    let runtime_directory = root.join(&runtime_root_relative);
+    let runtime_metadata = std::fs::symlink_metadata(&runtime_directory)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if !runtime_metadata.file_type().is_dir() {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let browsers_relative = admit_browser_runtime_relative_path(browsers_path)?;
+    let browsers_root = root.join(browsers_relative);
+    let browsers_metadata = std::fs::symlink_metadata(&browsers_root)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if !browsers_metadata.file_type().is_dir() {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+
+    let node_executable = root.join(admit_browser_runtime_relative_path(node_path)?);
+    let playwright_module = root.join(admit_browser_runtime_relative_path(module_path)?);
+    let chromium_executable = root.join(admit_browser_runtime_relative_path(chromium_path)?);
+    if !manifest
+        .files
+        .iter()
+        .find(|record| record.path == node_path)
+        .is_some_and(|record| record.executable)
+        || !manifest
+            .files
+            .iter()
+            .find(|record| record.path == chromium_path)
+            .is_some_and(|record| record.executable)
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    verify_browser_runtime_not_quarantined(&node_executable)?;
+    verify_browser_runtime_not_quarantined(&chromium_executable)?;
+    if collect_browser_runtime_inventory(&root)? != actual {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+
+    Ok(BrowserRuntimeCapability {
+        root: runtime_directory,
+        node_executable,
+        playwright_module,
+        browsers_root,
+        chromium_executable,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_browser_runtime_not_quarantined(
+    path: &Path,
+) -> std::result::Result<(), BrowserNodeCommandFailure> {
+    use xattr::FileExt as _;
+
+    let file = open_browser_runtime_file_nofollow(path)?;
+    match file.get_xattr("com.apple.quarantine") {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) | Err(_) => Err(BrowserNodeCommandFailure::Unavailable),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_browser_runtime_not_quarantined(
+    _path: &Path,
+) -> std::result::Result<(), BrowserNodeCommandFailure> {
+    Ok(())
+}
+
+fn contract<'a>(
+    manifest: &'a BrowserRuntimeManifest,
+    key: &str,
+) -> std::result::Result<&'a str, BrowserNodeCommandFailure> {
+    manifest
+        .contracts
+        .get(key)
+        .map(String::as_str)
+        .ok_or(BrowserNodeCommandFailure::Unavailable)
+}
+
+fn packaged_browser_target() -> &'static str {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        "aarch64-apple-darwin"
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+    {
+        "x86_64-apple-darwin"
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "macos")
+    )))]
+    {
+        "unsupported"
+    }
+}
+
+fn admit_browser_runtime_relative_path(
+    candidate: &str,
+) -> std::result::Result<PathBuf, BrowserNodeCommandFailure> {
+    if candidate.is_empty()
+        || candidate.len() > BROWSER_RUNTIME_MAX_PATH_BYTES
+        || candidate.contains('\\')
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let path = Path::new(candidate);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    Ok(path.to_path_buf())
+}
+
+fn collect_browser_runtime_inventory(
+    root: &Path,
+) -> std::result::Result<BrowserRuntimeInventory, BrowserNodeCommandFailure> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut directories = std::collections::BTreeMap::new();
+    let mut symlinks = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut observed_entries = 0_usize;
+    while let Some(directory) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&directory)
+            .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+        if !metadata.file_type().is_dir() {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+        let directory_relative = directory
+            .strip_prefix(root)
+            .map_err(|_| BrowserNodeCommandFailure::Unavailable)?
+            .to_path_buf();
+        if directories
+            .insert(directory_relative, browser_runtime_file_identity(&metadata))
+            .is_some()
+        {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+        for entry in
+            std::fs::read_dir(&directory).map_err(|_| BrowserNodeCommandFailure::Unavailable)?
+        {
+            let entry = entry.map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+            observed_entries = observed_entries
+                .checked_add(1)
+                .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+            if observed_entries > BROWSER_RUNTIME_MAX_INVENTORY_ENTRIES {
+                return Err(BrowserNodeCommandFailure::Unavailable);
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| BrowserNodeCommandFailure::Unavailable)?
+                .to_path_buf();
+            if relative.as_os_str().as_encoded_bytes().len() > BROWSER_RUNTIME_MAX_PATH_BYTES {
+                return Err(BrowserNodeCommandFailure::Unavailable);
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+            if file_type.is_symlink() {
+                let target = std::fs::read_link(&path)
+                    .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+                if target.as_os_str().as_encoded_bytes().len() > BROWSER_RUNTIME_MAX_PATH_BYTES {
+                    return Err(BrowserNodeCommandFailure::Unavailable);
+                }
+                symlinks.push((relative, target));
+                if symlinks.len() > BROWSER_RUNTIME_MAX_SYMLINKS {
+                    return Err(BrowserNodeCommandFailure::Unavailable);
+                }
+            } else if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                let metadata = std::fs::symlink_metadata(&path)
+                    .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+                if !metadata.file_type().is_file()
+                    || files
+                        .insert(relative, browser_runtime_file_identity(&metadata))
+                        .is_some()
+                {
+                    return Err(BrowserNodeCommandFailure::Unavailable);
+                }
+                if files.len() > BROWSER_RUNTIME_MAX_FILES {
+                    return Err(BrowserNodeCommandFailure::Unavailable);
+                }
+            } else {
+                return Err(BrowserNodeCommandFailure::Unavailable);
+            }
+        }
+    }
+    symlinks.sort();
+    Ok(BrowserRuntimeInventory {
+        files,
+        directories,
+        symlinks,
+    })
+}
+
+fn verify_browser_runtime_symlinks(
+    root: &Path,
+    runtime_root: &Path,
+    manifest_path: &str,
+    actual: &[(PathBuf, PathBuf)],
+) -> std::result::Result<(), BrowserNodeCommandFailure> {
+    if actual.len() > BROWSER_RUNTIME_MAX_SYMLINKS {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let manifest_relative = admit_browser_runtime_relative_path(manifest_path)?;
+    if !manifest_relative.starts_with(runtime_root) {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let manifest_file = open_browser_runtime_file_nofollow(&root.join(&manifest_relative))?;
+    let metadata = manifest_file
+        .metadata()
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if !metadata.file_type().is_file() || metadata.len() > BROWSER_RUNTIME_MANIFEST_MAX_BYTES {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let mut bytes = Vec::new();
+    manifest_file
+        .take(BROWSER_RUNTIME_MANIFEST_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if u64::try_from(bytes.len()).ok() != Some(metadata.len()) {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let sidecar: BrowserRuntimeSymlinkManifest =
+        serde_json::from_slice(&bytes).map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if sidecar.schema_version != "ft.browser_runtime_symlinks.v1"
+        || sidecar.links.len() > BROWSER_RUNTIME_MAX_SYMLINKS
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+
+    let mut expected = Vec::new();
+    let mut previous = None::<String>;
+    for record in sidecar.links {
+        if previous.as_ref().is_some_and(|path| path >= &record.path)
+            || record.target.is_empty()
+            || record.target.len() > BROWSER_RUNTIME_MAX_PATH_BYTES
+            || record.target.contains('\\')
+        {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+        let relative = admit_browser_runtime_relative_path(&record.path)?;
+        let target = PathBuf::from(&record.target);
+        if target.is_absolute()
+            || target.components().any(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::Normal(_)
+                        | std::path::Component::ParentDir
+                        | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+        expected.push((runtime_root.join(relative), target));
+        previous = Some(record.path);
+    }
+    if expected != actual {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+
+    let runtime_absolute = std::fs::canonicalize(root.join(runtime_root))
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    for (path, _) in actual {
+        let resolved = std::fs::canonicalize(root.join(path))
+            .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+        if !resolved.starts_with(&runtime_absolute) || resolved == runtime_absolute {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+    }
+    Ok(())
+}
+
+fn verify_browser_runtime_file(
+    path: &Path,
+    expected: &BrowserRuntimeManifestFile,
+    verified_inodes: &mut std::collections::BTreeMap<
+        BrowserRuntimeFileIdentity,
+        (String, u64, bool),
+    >,
+) -> std::result::Result<(), BrowserNodeCommandFailure> {
+    use sha2::{Digest as _, Sha256};
+
+    let before =
+        std::fs::symlink_metadata(path).map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if !before.file_type().is_file() || before.len() != expected.bytes {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if (before.permissions().mode() & 0o111 != 0) != expected.executable {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+    }
+    let mut file = open_browser_runtime_file_nofollow(path)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if !opened.file_type().is_file() || opened.len() != before.len() {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    if let Some(opened_identity) = browser_runtime_file_identity(&opened) {
+        if browser_runtime_file_identity(&before) != Some(opened_identity) {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+        if let Some((sha256, bytes, executable)) = verified_inodes.get(&opened_identity) {
+            let after = std::fs::symlink_metadata(path)
+                .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+            if browser_runtime_file_identity(&after) != Some(opened_identity)
+                || sha256 != &expected.sha256
+                || *bytes != expected.bytes
+                || *executable != expected.executable
+            {
+                return Err(BrowserNodeCommandFailure::Unavailable);
+            }
+            return Ok(());
+        }
+    }
+    let mut digest = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(u64::try_from(read).map_err(|_| BrowserNodeCommandFailure::Unavailable)?)
+            .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+        if observed > expected.bytes {
+            return Err(BrowserNodeCommandFailure::Unavailable);
+        }
+        digest.update(&buffer[..read]);
+    }
+    let after =
+        std::fs::symlink_metadata(path).map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    let actual_sha256 = hex::encode(digest.finalize());
+    if browser_runtime_file_identity(&before).is_some()
+        && browser_runtime_file_identity(&before) != browser_runtime_file_identity(&after)
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    if browser_runtime_file_identity(&before).is_none()
+        && (before.len() != after.len() || before.modified().ok() != after.modified().ok())
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    if observed != expected.bytes || actual_sha256 != expected.sha256 {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    if let Some(identity) = browser_runtime_file_identity(&after) {
+        verified_inodes.insert(
+            identity,
+            (actual_sha256, expected.bytes, expected.executable),
+        );
+    }
+    Ok(())
+}
+
+fn verify_browser_runtime_source_manifest(
+    path: &Path,
+    expected: &BrowserRuntimeManifestFile,
+    expected_manifest_id: &str,
+) -> std::result::Result<(), BrowserNodeCommandFailure> {
+    use sha2::{Digest as _, Sha256};
+
+    if expected.bytes > BROWSER_RUNTIME_MANIFEST_MAX_BYTES {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let file = open_browser_runtime_file_nofollow(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if !metadata.file_type().is_file() || metadata.len() != expected.bytes {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let mut bytes = Vec::new();
+    file.take(BROWSER_RUNTIME_MANIFEST_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    if u64::try_from(bytes.len()).ok() != Some(expected.bytes)
+        || hex::encode(Sha256::digest(&bytes)) != expected.sha256
+    {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    let object = value
+        .as_object_mut()
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    let claimed_manifest_id = object
+        .remove("manifest_id")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or(BrowserNodeCommandFailure::Unavailable)?;
+    let canonical =
+        serde_json::to_vec(&value).map_err(|_| BrowserNodeCommandFailure::Unavailable)?;
+    let actual_manifest_id = format!("sha256:{}", hex::encode(Sha256::digest(canonical)));
+    if claimed_manifest_id != expected_manifest_id || actual_manifest_id != expected_manifest_id {
+        return Err(BrowserNodeCommandFailure::Unavailable);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BrowserNodeCommandFailure {
@@ -532,9 +1286,19 @@ pub(super) fn run_node_script_bounded(
     let timeout = std::time::Duration::from_millis(flow_timeout_ms)
         .checked_add(BROWSER_NODE_PROCESS_GRACE)
         .ok_or(BrowserNodeCommandFailure::InvalidTimeout)?;
-    let mut command = crate::runtime_async::process::Command::new("node");
+    let runtime = current_packaged_browser_runtime()?;
+    let mut command = crate::runtime_async::process::Command::new(&runtime.node_executable);
     command
         .arg("-")
+        .arg(&runtime.playwright_module)
+        .arg(&runtime.chromium_executable)
+        .current_dir(&runtime.root)
+        .env("PLAYWRIGHT_BROWSERS_PATH", &runtime.browsers_root)
+        .env("PLAYWRIGHT_SKIP_BROWSER_GC", "1")
+        .env_remove("NODE_PATH")
+        .env_remove("NODE_OPTIONS")
+        .env_remove("DYLD_INSERT_LIBRARIES")
+        .env_remove("DYLD_LIBRARY_PATH")
         .stdin_limit(BROWSER_NODE_SCRIPT_MAX_BYTES)
         .stdin_bytes(script.into_bytes())
         .stdout_limit(stdout_limit)
@@ -3212,15 +3976,26 @@ pub fn probe_playwright_chromium_capability(
     timeout: std::time::Duration,
 ) -> std::result::Result<(), PlaywrightCapabilityProbeError> {
     const PROBE_MARKER: &str = "playwright-chromium-persistent-context";
-    const PROBE_SCRIPT: &str = "const fs = require('node:fs');\nconst { chromium } = require('playwright');\nif (!chromium || typeof chromium.launchPersistentContext !== 'function') process.exit(2);\nconst executable = chromium.executablePath();\nif (!executable || !fs.statSync(executable).isFile()) process.exit(2);\nprocess.stdout.write('playwright-chromium-persistent-context');\n";
+    const PROBE_SCRIPT: &str = "const fs = require('node:fs');\nconst { chromium } = require(process.argv[2]);\nif (!chromium || typeof chromium.launchPersistentContext !== 'function') process.exit(2);\nconst executable = chromium.executablePath();\nconst expected = process.argv[3];\nif (!executable || !expected || !fs.statSync(executable).isFile()) process.exit(2);\nif (fs.realpathSync(executable) !== fs.realpathSync(expected)) process.exit(2);\nprocess.stdout.write('playwright-chromium-persistent-context');\n";
     const PROBE_OUTPUT_LIMIT_BYTES: usize = 256;
     let timeout_ms = u64::try_from(timeout.as_millis())
         .map_err(|_| PlaywrightCapabilityProbeError::InvalidTimeout)?;
     admit_browser_timeout(timeout_ms)
         .map_err(|_| PlaywrightCapabilityProbeError::InvalidTimeout)?;
-    let mut command = crate::runtime_async::process::Command::new("node");
+    let runtime = current_packaged_browser_runtime()
+        .map_err(|_| PlaywrightCapabilityProbeError::Unavailable)?;
+    let mut command = crate::runtime_async::process::Command::new(&runtime.node_executable);
     command
         .arg("-")
+        .arg(&runtime.playwright_module)
+        .arg(&runtime.chromium_executable)
+        .current_dir(&runtime.root)
+        .env("PLAYWRIGHT_BROWSERS_PATH", &runtime.browsers_root)
+        .env("PLAYWRIGHT_SKIP_BROWSER_GC", "1")
+        .env_remove("NODE_PATH")
+        .env_remove("NODE_OPTIONS")
+        .env_remove("DYLD_INSERT_LIBRARIES")
+        .env_remove("DYLD_LIBRARY_PATH")
         .stdin_limit(PROBE_SCRIPT.len())
         .stdin_bytes(PROBE_SCRIPT.as_bytes().to_vec())
         .stdout_limit(PROBE_OUTPUT_LIMIT_BYTES)
@@ -3252,9 +4027,455 @@ pub fn probe_playwright_chromium_capability(
 mod tests {
     use super::*;
 
+    fn write_browser_runtime_fixture() -> (tempfile::TempDir, PathBuf) {
+        use sha2::{Digest as _, Sha256};
+
+        let temporary = tempfile::tempdir().expect("browser runtime fixture root");
+        let app = temporary.path().join("FrankenTerm.app");
+        let contents = app.join("Contents");
+        let runtime_root = "Contents/Resources/browser-runtime/runtime";
+        let source_manifest_payload = serde_json::json!({
+            "fixture": "browser-runtime-source",
+        });
+        let source_manifest_id = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&source_manifest_payload)
+                    .expect("canonical source fixture manifest")
+            ))
+        );
+        let mut source_manifest = source_manifest_payload;
+        source_manifest
+            .as_object_mut()
+            .expect("source fixture manifest object")
+            .insert(
+                "manifest_id".to_string(),
+                serde_json::json!(source_manifest_id.clone()),
+            );
+        let symlink_manifest = if cfg!(unix) {
+            serde_json::json!({
+                "links": [{
+                    "path": "browsers/chromium-1234/chrome-current",
+                    "target": "chrome",
+                }],
+                "schema_version": "ft.browser_runtime_symlinks.v1",
+            })
+        } else {
+            serde_json::json!({
+                "links": [],
+                "schema_version": "ft.browser_runtime_symlinks.v1",
+            })
+        };
+        let files = vec![
+            (
+                "Contents/Resources/browser-runtime.source-manifest.json",
+                serde_json::to_vec_pretty(&source_manifest)
+                    .expect("serialize source fixture manifest"),
+                false,
+            ),
+            (
+                "Contents/Resources/browser-runtime/runtime/bin/node",
+                b"node".to_vec(),
+                true,
+            ),
+            (
+                "Contents/Resources/browser-runtime/runtime/browser-symlinks.v1.json",
+                serde_json::to_vec_pretty(&symlink_manifest)
+                    .expect("serialize fixture symlink manifest"),
+                false,
+            ),
+            (
+                "Contents/Resources/browser-runtime/runtime/browsers/chromium-1234/chrome",
+                b"chromium".to_vec(),
+                true,
+            ),
+            (
+                "Contents/Resources/browser-runtime/runtime/licenses/chromium.txt",
+                b"chromium-license".to_vec(),
+                false,
+            ),
+            (
+                "Contents/Resources/browser-runtime/runtime/licenses/node.txt",
+                b"node-license".to_vec(),
+                false,
+            ),
+            (
+                "Contents/Resources/browser-runtime/runtime/licenses/playwright.txt",
+                b"playwright-license".to_vec(),
+                false,
+            ),
+            (
+                "Contents/Resources/browser-runtime/runtime/node_modules/playwright/index.js",
+                b"module.exports = {};".to_vec(),
+                false,
+            ),
+        ];
+        let mut records = Vec::new();
+        let mut component_bytes = 0_u64;
+        for (relative, bytes, executable) in &files {
+            let path = app.join(relative);
+            std::fs::create_dir_all(path.parent().expect("fixture file parent"))
+                .expect("create fixture parent");
+            std::fs::write(&path, bytes).expect("write fixture file");
+            #[cfg(unix)]
+            if *executable {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("mark fixture executable");
+            }
+            if relative.starts_with(runtime_root) {
+                component_bytes = component_bytes
+                    .checked_add(u64::try_from(bytes.len()).expect("fixture length"))
+                    .expect("fixture byte sum");
+            }
+            records.push(serde_json::json!({
+                "bytes": bytes.len(),
+                "executable": executable,
+                "kind": "asset",
+                "path": relative,
+                "role": "browser-runtime",
+                "sha256": hex::encode(Sha256::digest(bytes)),
+            }));
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "chrome",
+            app.join(
+                "Contents/Resources/browser-runtime/runtime/browsers/chromium-1234/chrome-current",
+            ),
+        )
+        .expect("create fixture browser symlink");
+        records.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        let mut manifest = serde_json::json!({
+            "$schema": ATOMIC_COMPONENT_SCHEMA_URI,
+            "schema_version": ATOMIC_COMPONENT_SCHEMA,
+            "identity": {
+                "build_id": "0".repeat(64),
+                "feature_contract": "fixture",
+                "profile": "release-interactive",
+                "source_revision": "0".repeat(40),
+                "target": packaged_browser_target(),
+                "version": "0.0.0",
+            },
+            "contracts": {
+                "browser.chromium.executable-path": "Contents/Resources/browser-runtime/runtime/browsers/chromium-1234/chrome",
+                "browser.chromium.revision": BROWSER_RUNTIME_CHROMIUM_REVISION,
+                "browser.component.source-manifest-id": source_manifest_id,
+                "browser.component.source-manifest-path": "Contents/Resources/browser-runtime.source-manifest.json",
+                "browser.disk-budget.bytes": component_bytes.to_string(),
+                "browser.license.chromium-path": "Contents/Resources/browser-runtime/runtime/licenses/chromium.txt",
+                "browser.license.node-path": "Contents/Resources/browser-runtime/runtime/licenses/node.txt",
+                "browser.license.playwright-path": "Contents/Resources/browser-runtime/runtime/licenses/playwright.txt",
+                "browser.node.path": "Contents/Resources/browser-runtime/runtime/bin/node",
+                "browser.node.version": BROWSER_RUNTIME_NODE_VERSION,
+                "browser.playwright.browsers-path": "Contents/Resources/browser-runtime/runtime/browsers",
+                "browser.playwright.module-path": "Contents/Resources/browser-runtime/runtime/node_modules/playwright/index.js",
+                "browser.playwright.version": BROWSER_RUNTIME_PLAYWRIGHT_VERSION,
+                "browser.protocol.version": BROWSER_RUNTIME_PROTOCOL_VERSION,
+                "browser.runtime.root": runtime_root,
+                "browser.runtime.schema": BROWSER_RUNTIME_SCHEMA,
+                "browser.runtime.target": packaged_browser_target(),
+                "browser.symlink-manifest.path": "Contents/Resources/browser-runtime/runtime/browser-symlinks.v1.json",
+            },
+            "files": records,
+            "inputs": [],
+            "inventory": {
+                "file_count": files.len(),
+                "mode": "exact",
+                "total_bytes": files.iter().map(|(_, bytes, _)| bytes.len()).sum::<usize>(),
+            },
+            "verification": {
+                "algorithm": "sha256",
+                "offline": true,
+                "path_policy": "relative_utf8_browser_symlink_sidecar_v2",
+            },
+        });
+        let manifest_id = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&manifest).expect("canonical fixture manifest")
+            ))
+        );
+        manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .insert("manifest_id".to_string(), serde_json::json!(manifest_id));
+        std::fs::write(
+            temporary
+                .path()
+                .join("FrankenTerm.app.component-manifest.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize fixture manifest"),
+        )
+        .expect("write fixture manifest");
+        (temporary, contents)
+    }
+
+    fn rewrite_browser_runtime_fixture_manifest(
+        temporary: &tempfile::TempDir,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        use sha2::{Digest as _, Sha256};
+
+        let manifest_path = temporary
+            .path()
+            .join("FrankenTerm.app.component-manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read outer fixture manifest"),
+        )
+        .expect("parse outer fixture manifest");
+        mutate(&mut manifest);
+        manifest
+            .as_object_mut()
+            .expect("outer fixture manifest object")
+            .remove("manifest_id");
+        let manifest_id = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&manifest).expect("canonical outer fixture manifest")
+            ))
+        );
+        manifest
+            .as_object_mut()
+            .expect("outer fixture manifest object")
+            .insert("manifest_id".to_string(), serde_json::json!(manifest_id));
+        std::fs::write(
+            manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize outer fixture manifest"),
+        )
+        .expect("write rewritten outer fixture manifest");
+    }
+
     fn canonical_system_temp_dir() -> PathBuf {
         std::fs::canonicalize(std::env::temp_dir())
             .expect("system temporary directory must be resolvable")
+    }
+
+    #[test]
+    fn packaged_browser_runtime_accepts_one_exact_fixed_root_without_launching() {
+        let (_temporary, contents) = write_browser_runtime_fixture();
+        let capability = load_packaged_browser_runtime(&contents).expect("valid capability");
+        assert!(capability.node_executable.ends_with("runtime/bin/node"));
+        assert!(
+            capability
+                .playwright_module
+                .ends_with("runtime/node_modules/playwright/index.js")
+        );
+        assert!(capability.browsers_root.ends_with("runtime/browsers"));
+        assert!(
+            capability
+                .chromium_executable
+                .ends_with("runtime/browsers/chromium-1234/chrome")
+        );
+    }
+
+    #[test]
+    fn packaged_browser_runtime_rejects_a_missing_outer_manifest() {
+        let temporary = tempfile::tempdir().expect("missing manifest fixture root");
+        let contents = temporary.path().join("FrankenTerm.app/Contents");
+        std::fs::create_dir_all(&contents).expect("missing manifest fixture contents");
+        assert!(matches!(
+            load_packaged_browser_runtime(&contents),
+            Err(BrowserNodeCommandFailure::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn packaged_browser_runtime_rejects_corrupt_or_uncatalogued_bytes() {
+        let (_temporary, contents) = write_browser_runtime_fixture();
+        let module =
+            contents.join("Resources/browser-runtime/runtime/node_modules/playwright/index.js");
+        std::fs::write(&module, b"corrupt").expect("corrupt module fixture");
+        assert!(matches!(
+            load_packaged_browser_runtime(&contents),
+            Err(BrowserNodeCommandFailure::Unavailable)
+        ));
+
+        let (_temporary, contents) = write_browser_runtime_fixture();
+        std::fs::write(
+            contents.join("Resources/browser-runtime/runtime/injected.js"),
+            b"injected",
+        )
+        .expect("write uncatalogued fixture");
+        assert!(matches!(
+            load_packaged_browser_runtime(&contents),
+            Err(BrowserNodeCommandFailure::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn packaged_browser_runtime_rejects_relabelled_source_manifest() {
+        use sha2::{Digest as _, Sha256};
+
+        let (temporary, contents) = write_browser_runtime_fixture();
+        let source_path = contents.join("Resources/browser-runtime.source-manifest.json");
+        let mut source: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&source_path).expect("read source fixture manifest"),
+        )
+        .expect("parse source fixture manifest");
+        source["fixture"] = serde_json::json!("relabelled-source");
+        let source_bytes = serde_json::to_vec_pretty(&source).expect("serialize relabelled source");
+        std::fs::write(&source_path, &source_bytes).expect("write relabelled source");
+
+        let manifest_path = temporary
+            .path()
+            .join("FrankenTerm.app.component-manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read outer fixture manifest"),
+        )
+        .expect("parse outer fixture manifest");
+        let records = manifest["files"]
+            .as_array_mut()
+            .expect("outer manifest file records");
+        let record = records
+            .iter_mut()
+            .find(|record| {
+                record["path"] == "Contents/Resources/browser-runtime.source-manifest.json"
+            })
+            .expect("source fixture record");
+        record["bytes"] = serde_json::json!(source_bytes.len());
+        record["sha256"] = serde_json::json!(hex::encode(Sha256::digest(&source_bytes)));
+        let total_bytes = records.iter().fold(0_u64, |total, record| {
+            total
+                .checked_add(record["bytes"].as_u64().expect("fixture record byte count"))
+                .expect("fixture inventory byte sum")
+        });
+        manifest["inventory"]["total_bytes"] = serde_json::json!(total_bytes);
+        manifest
+            .as_object_mut()
+            .expect("outer fixture manifest object")
+            .remove("manifest_id");
+        let manifest_id = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&manifest).expect("canonical outer fixture manifest")
+            ))
+        );
+        manifest
+            .as_object_mut()
+            .expect("outer fixture manifest object")
+            .insert("manifest_id".to_string(), serde_json::json!(manifest_id));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize outer fixture manifest"),
+        )
+        .expect("write outer fixture manifest");
+
+        assert!(matches!(
+            load_packaged_browser_runtime(&contents),
+            Err(BrowserNodeCommandFailure::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn packaged_browser_runtime_rejects_self_consistent_wrong_versions() {
+        let (temporary, contents) = write_browser_runtime_fixture();
+        rewrite_browser_runtime_fixture_manifest(&temporary, |manifest| {
+            manifest["contracts"]["browser.playwright.version"] = serde_json::json!("1.61.0");
+        });
+
+        assert!(matches!(
+            load_packaged_browser_runtime(&contents),
+            Err(BrowserNodeCommandFailure::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn packaged_browser_runtime_rejects_self_consistent_wrong_architecture() {
+        let (temporary, contents) = write_browser_runtime_fixture();
+        let wrong_target = if packaged_browser_target() == "aarch64-apple-darwin" {
+            "x86_64-apple-darwin"
+        } else {
+            "aarch64-apple-darwin"
+        };
+        rewrite_browser_runtime_fixture_manifest(&temporary, |manifest| {
+            manifest["identity"]["target"] = serde_json::json!(wrong_target);
+            manifest["contracts"]["browser.runtime.target"] = serde_json::json!(wrong_target);
+        });
+        assert!(matches!(
+            load_packaged_browser_runtime(&contents),
+            Err(BrowserNodeCommandFailure::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn packaged_browser_runtime_source_pins_match_the_release_lock() {
+        let lock_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/release/browser-runtime-lock.v1.json");
+        let lock: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(lock_path).expect("read browser runtime release lock"),
+        )
+        .expect("parse browser runtime release lock");
+        assert_eq!(lock["node"]["version"], BROWSER_RUNTIME_NODE_VERSION);
+        assert_eq!(
+            lock["playwright"]["version"],
+            BROWSER_RUNTIME_PLAYWRIGHT_VERSION
+        );
+        assert_eq!(
+            lock["chromium"]["revision"],
+            BROWSER_RUNTIME_CHROMIUM_REVISION
+        );
+        assert_eq!(lock["protocol_version"], BROWSER_RUNTIME_PROTOCOL_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_browser_runtime_rejects_symlinked_capability_files() {
+        let (_temporary, contents) = write_browser_runtime_fixture();
+        let runtime = contents.join("Resources/browser-runtime/runtime");
+        std::os::unix::fs::symlink(
+            "node_modules/playwright/index.js",
+            runtime.join("injected-link.js"),
+        )
+        .expect("symlink fixture module");
+        assert!(matches!(
+            load_packaged_browser_runtime(&contents),
+            Err(BrowserNodeCommandFailure::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn packaged_browser_runtime_paths_are_bounded_and_strictly_relative() {
+        assert!(admit_browser_runtime_relative_path("runtime/bin/node").is_ok());
+        let oversized = "a".repeat(BROWSER_RUNTIME_MAX_PATH_BYTES + 1);
+        for rejected in [
+            "",
+            "/runtime/bin/node",
+            "runtime/../bin/node",
+            "runtime\\bin\\node",
+            oversized.as_str(),
+        ] {
+            assert!(
+                admit_browser_runtime_relative_path(rejected).is_err(),
+                "unexpectedly admitted {rejected:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_browser_runtime_inventory_detects_same_path_metadata_changes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_temporary, contents) = write_browser_runtime_fixture();
+        let app = contents.parent().expect("fixture app root");
+        let before = collect_browser_runtime_inventory(app).expect("initial exact inventory");
+        let node = contents.join("Resources/browser-runtime/runtime/bin/node");
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700))
+            .expect("change fixture mode");
+        let after = collect_browser_runtime_inventory(app).expect("changed exact inventory");
+        assert_ne!(before, after);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn packaged_browser_runtime_rejects_even_empty_quarantine_attributes() {
+        let (_temporary, contents) = write_browser_runtime_fixture();
+        let node = contents.join("Resources/browser-runtime/runtime/bin/node");
+        xattr::set(&node, "com.apple.quarantine", b"").expect("set quarantine fixture");
+        assert!(matches!(
+            load_packaged_browser_runtime(&contents),
+            Err(BrowserNodeCommandFailure::Unavailable)
+        ));
     }
 
     // =========================================================================
@@ -3630,15 +4851,21 @@ mod tests {
             .find("\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nenum ProfileMetadataReadFailure")
             .expect("node runner source boundary");
         let runner = &runner_tail[..runner_end];
-        assert!(runner.contains("Command::new(\"node\")"));
+        assert!(runner.contains("current_packaged_browser_runtime()?"));
+        assert!(runner.contains("Command::new(&runtime.node_executable)"));
         assert!(runner.contains(".arg(\"-\")"));
+        assert!(runner.contains(".arg(&runtime.playwright_module)"));
+        assert!(runner.contains(".arg(&runtime.chromium_executable)"));
+        assert!(runner.contains(".env_remove(\"NODE_PATH\")"));
+        assert!(runner.contains(".env_remove(\"NODE_OPTIONS\")"));
+        assert!(runner.contains(".env(\"PLAYWRIGHT_BROWSERS_PATH\""));
+        assert!(runner.contains(".env(\"PLAYWRIGHT_SKIP_BROWSER_GC\", \"1\")"));
         assert!(runner.contains(".stdin_limit("));
         assert!(runner.contains(".stdin_bytes("));
         assert!(runner.contains(".stdout_limit("));
         assert!(runner.contains(".stderr_limit("));
         assert!(runner.contains(".output_blocking("));
         assert!(!runner.contains(".arg(\"-e\")"));
-        assert!(!runner.contains(".env("));
         assert!(!runner.contains("tempfile"));
 
         let probe_start = source
@@ -3650,16 +4877,32 @@ mod tests {
             .expect("Playwright probe source boundary");
         let probe = &probe_tail[..probe_end];
         assert!(probe.contains("runtime_async::process::Command"));
-        assert!(probe.contains("Command::new(\"node\")"));
-        assert!(probe.contains("require('playwright')"));
+        assert!(probe.contains("Command::new(&runtime.node_executable)"));
+        assert!(probe.contains("require(process.argv[2])"));
         assert!(probe.contains("launchPersistentContext !== 'function'"));
         assert!(probe.contains("chromium.executablePath()"));
         assert!(probe.contains("fs.statSync(executable).isFile()"));
+        assert!(probe.contains("fs.realpathSync(executable) !== fs.realpathSync(expected)"));
+        assert!(probe.contains(".arg(&runtime.playwright_module)"));
+        assert!(probe.contains(".arg(&runtime.chromium_executable)"));
+        assert!(probe.contains(".env_remove(\"NODE_PATH\")"));
+        assert!(probe.contains(".env_remove(\"NODE_OPTIONS\")"));
         assert!(probe.contains(".stdin_limit("));
         assert!(probe.contains(".stdin_bytes("));
         assert!(probe.contains("output_blocking"));
         assert!(!probe.contains("Command::new(\"npx\")"));
         assert!(!probe.contains("chromium.launchPersistentContext("));
+
+        for auth_source in [
+            include_str!("anthropic_auth.rs"),
+            include_str!("bootstrap.rs"),
+            include_str!("google_auth.rs"),
+            include_str!("openai_device.rs"),
+        ] {
+            assert!(auth_source.contains("require(process.argv[2])"));
+            assert!(!auth_source.contains("require('playwright')"));
+            assert!(!auth_source.contains("require(\"playwright\")"));
+        }
     }
 
     #[test]
