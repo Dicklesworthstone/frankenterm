@@ -1969,6 +1969,7 @@ impl Drop for ScopedExecutor {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Barrier, Mutex as StdMutex};
     use std::time::{Duration, Instant};
 
@@ -2741,7 +2742,7 @@ mod tests {
         let occupying_reservation = match try_reserve_main_thread(MainThreadServiceClass::Input, 16)
         {
             MainThreadReservationOutcome::Reserved(reservation) => reservation,
-            outcome => panic!("expected occupying reservation, got {outcome:?}"),
+            outcome => panic!("expected occupying reservation, got {:?}", outcome),
         };
         let producer_state_constructions = AtomicUsize::new(0);
 
@@ -2754,7 +2755,7 @@ mod tests {
             MainThreadReservationOutcome::RetryableFull(rejection) => {
                 assert_eq!(rejection.snapshot.active_tasks, 1);
             }
-            outcome => panic!("expected retryable saturation, got {outcome:?}"),
+            outcome => panic!("expected retryable saturation, got {:?}", outcome),
         }
 
         assert_eq!(producer_state_constructions.load(Ordering::SeqCst), 0);
@@ -2776,7 +2777,7 @@ mod tests {
             std::future::pending::<()>(),
         ) {
             MainThreadSpawnOutcome::Spawned(spawned) => spawned,
-            outcome => panic!("expected old-generation admission, got {outcome:?}"),
+            outcome => panic!("expected old-generation admission, got {:?}", outcome),
         };
         let old_identity = old.scheduler_identity();
         assert!(!old.queue_snapshot().retired);
@@ -2801,13 +2802,8 @@ mod tests {
     fn simple_executor_bounded_high_priority_burst_preserves_low_priority_progress() {
         let _lock = TEST_LOCK.lock().unwrap();
         let exec = SimpleExecutor::try_with_limits(
-            MainThreadAdmissionLimits::new(
-                SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST + 2,
-                4_096,
-                0,
-                0,
-            )
-            .unwrap(),
+            MainThreadAdmissionLimits::new(SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST + 2, 4_096, 0, 0)
+                .unwrap(),
         )
         .unwrap();
         let order = Arc::new(StdMutex::new(Vec::new()));
@@ -2821,19 +2817,15 @@ mod tests {
             },
         ) {
             MainThreadSpawnOutcome::Spawned(spawned) => spawned.detach(),
-            outcome => panic!("expected low-priority admission, got {outcome:?}"),
+            outcome => panic!("expected low-priority admission, got {:?}", outcome),
         }
         for sequence in 0..=SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST {
             let high_order = Arc::clone(&order);
-            match try_spawn_with_admission(
-                MainThreadServiceClass::Input,
-                1,
-                async move {
-                    high_order.lock().unwrap().push(sequence);
-                },
-            ) {
+            match try_spawn_with_admission(MainThreadServiceClass::Input, 1, async move {
+                high_order.lock().unwrap().push(sequence);
+            }) {
                 MainThreadSpawnOutcome::Spawned(spawned) => spawned.detach(),
-                outcome => panic!("expected high-priority admission, got {outcome:?}"),
+                outcome => panic!("expected high-priority admission, got {:?}", outcome),
             }
         }
 
