@@ -12,9 +12,9 @@
 #![allow(clippy::range_plus_one)]
 
 // Both async-smol and async-asupersync may be enabled simultaneously due to Cargo
-// workspace feature unification. While legacy vendored clients still pass
-// smol Async streams into codec async APIs, mixed graphs must continue to use
-// the smol path until those callers migrate.
+// workspace feature unification. The production mux client now uses asupersync,
+// so mixed graphs must keep the canonical runtime's I/O traits. A smol-only
+// consumer still receives the legacy smol API.
 
 use anyhow::{Context as _, Error, bail};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
@@ -41,12 +41,12 @@ use rangeset::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-#[cfg(all(feature = "async-asupersync", not(feature = "async-smol")))]
+#[cfg(feature = "async-asupersync")]
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-#[cfg(feature = "async-smol")]
+#[cfg(all(feature = "async-smol", not(feature = "async-asupersync")))]
 use smol::io::AsyncWriteExt;
-#[cfg(feature = "async-smol")]
+#[cfg(all(feature = "async-smol", not(feature = "async-asupersync")))]
 use smol::prelude::*;
 
 use std::collections::{HashMap, HashSet};
@@ -659,7 +659,7 @@ pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize_for_fu
 
 #[cfg(test)]
 mod runtime {
-    #[cfg(all(feature = "async-asupersync", not(feature = "async-smol")))]
+    #[cfg(feature = "async-asupersync")]
     static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
         std::sync::LazyLock::new(|| {
             asupersync::runtime::RuntimeBuilder::current_thread()
@@ -667,20 +667,20 @@ mod runtime {
                 .expect("failed to build codec asupersync runtime")
         });
 
-    #[cfg(all(feature = "async-asupersync", not(feature = "async-smol")))]
+    #[cfg(feature = "async-asupersync")]
     pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
         ASUPERSYNC_RUNTIME.block_on(future)
     }
 
-    #[cfg(feature = "async-smol")]
+    #[cfg(all(feature = "async-smol", not(feature = "async-asupersync")))]
     pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
         smol::block_on(future)
     }
 
-    #[cfg(all(feature = "async-asupersync", not(feature = "async-smol")))]
+    #[cfg(feature = "async-asupersync")]
     pub type Cursor<T> = std::io::Cursor<T>;
 
-    #[cfg(feature = "async-smol")]
+    #[cfg(all(feature = "async-smol", not(feature = "async-asupersync")))]
     pub type Cursor<T> = smol::io::Cursor<T>;
 }
 
@@ -22557,18 +22557,18 @@ mod test {
 
     #[cfg(all(feature = "async-smol", feature = "async-asupersync"))]
     #[test]
-    fn mixed_feature_mode_still_accepts_smol_cursors() {
-        fn assert_smol_cursor(_: &smol::io::Cursor<Vec<u8>>) {}
+    fn mixed_feature_mode_uses_canonical_asupersync_io() {
+        fn assert_std_cursor(_: &std::io::Cursor<Vec<u8>>) {}
 
         runtime::block_on(async {
             let mut writer = runtime::Cursor::new(Vec::<u8>::new());
-            assert_smol_cursor(&writer);
+            assert_std_cursor(&writer);
 
             encode_raw_async(19, 29, b"mixed-features", false, &mut writer)
                 .await
                 .expect("encode_raw_async");
 
-            let mut reader = smol::io::Cursor::new(writer.into_inner());
+            let mut reader = std::io::Cursor::new(writer.into_inner());
             let decoded = decode_raw_async(&mut reader, None)
                 .await
                 .expect("decode_raw_async");

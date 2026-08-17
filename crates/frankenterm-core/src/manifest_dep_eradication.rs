@@ -417,7 +417,7 @@ impl EradicationPlan {
                 severity: ViolationSeverity::Warning,
             },
             action: EradicationAction::FeatureGate,
-            rationale: "Codec crate now defaults to async-asupersync, but mixed graphs still honor the async-smol fallback until legacy vendored stream users migrate."
+            rationale: "Codec defaults to async-asupersync and mixed-feature graphs preserve that canonical I/O surface; smol remains available only to explicit smol-only consumers."
                 .into(),
             migration_feature: Some("async-asupersync".into()),
             completed: false,

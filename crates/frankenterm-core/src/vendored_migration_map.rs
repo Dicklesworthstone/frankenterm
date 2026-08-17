@@ -375,7 +375,7 @@ pub fn build_canonical_map() -> VendoredMigrationMap {
             difficulty: MigrationDifficulty::Medium,
             criticality: Criticality::High,
             wave: MigrationWave::Wave1Codec,
-            recommended_target: "default-on async-asupersync with smol kept as a temporary fallback".into(),
+            recommended_target: "default-on async-asupersync with smol isolated to explicit smol-only builds".into(),
             feature_gates: FeatureGateConfig {
                 has_async_smol: true,
                 has_async_asupersync: true,
@@ -400,7 +400,7 @@ pub fn build_canonical_map() -> VendoredMigrationMap {
             depends_on: vec![],
             depended_by: vec![VendoredCrateId::new("ssh")],
             affected_workflows: vec!["sftp-protocol".into(), "mux-wire-format".into()],
-            notes: "SFTP protocol PDU serialization. Default runtime is now async-asupersync; mixed graphs still fall back to smol while legacy vendored clients use smol::Async streams.".into(),
+            notes: "SFTP protocol PDU serialization. Default and mixed-feature builds use asupersync I/O; only explicit smol-only builds retain the legacy traits.".into(),
         },
     );
 
