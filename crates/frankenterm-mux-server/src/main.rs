@@ -423,7 +423,7 @@ pub fn spawn_listener(
     for unix_dom in &config.unix_domains {
         let mut listener = frankenterm_mux_server_impl::local::LocalListener::with_domain(
             unix_dom,
-            dispatch_config,
+            dispatch_config.clone(),
         )?;
         thread::Builder::new()
             .name("local-mux-listener".to_string())
@@ -434,7 +434,7 @@ pub fn spawn_listener(
     }
 
     for tls_server in &config.tls_servers {
-        ossl::spawn_tls_listener(tls_server, dispatch_config)?;
+        ossl::spawn_tls_listener(tls_server, dispatch_config.clone())?;
     }
 
     Ok(())

@@ -154,7 +154,7 @@ impl OpenSSLNetListener {
                 Ok(stream) => {
                     stream.set_nodelay(true).ok();
                     let acceptor = self.acceptor.clone();
-                    let dispatch_config = self.dispatch_config;
+                    let dispatch_config = self.dispatch_config.clone();
 
                     match Self::accept_tls_with_timeout(&acceptor, stream) {
                         Ok(stream) => {
@@ -164,16 +164,19 @@ impl OpenSSLNetListener {
                                 continue;
                             }
                             spawn_into_main_thread(async move {
-                                log::debug!("Making new AsyncSslStream");
-                                frankenterm_mux_server_impl::dispatch::process_with_config(
-                                    AsyncSslStream::new(stream),
-                                    dispatch_config,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    log::error!("process: {:?}", e);
-                                    e
+                                promise::spawn::spawn(async move {
+                                    log::debug!("Making new AsyncSslStream");
+                                    frankenterm_mux_server_impl::dispatch::process_with_config(
+                                        AsyncSslStream::new(stream),
+                                        dispatch_config,
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        log::error!("process: {:?}", e);
+                                        e
+                                    })
                                 })
+                                .detach();
                             })
                             .detach();
                         }

@@ -24,15 +24,18 @@ use codec::{
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceContextV1;
+use frankenterm_flight_recorder::{FlightRecorder, ProducerHandle, RecorderError};
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::client::ClientId;
 use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::{CurrentPane, Mux, PaneRegistrationHandle};
 use promise::spawn::spawn_into_main_thread;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
@@ -42,6 +45,83 @@ use termwiz::surface::SequenceNo;
 use url::Url;
 use wezterm_term::StableRowIndex;
 use wezterm_term::terminal::Alert;
+
+/// Explicit, process-owned recorder authority for mux-server connections.
+///
+/// This is deliberately injected through [`crate::dispatch::DispatchRuntimeConfig`]
+/// rather than installed in a process-global singleton. Each binary-protocol
+/// connection claims one recorder shard before it starts decoding requests;
+/// request hot paths therefore never allocate or perform hidden first-use
+/// producer registration.
+#[derive(Debug)]
+pub struct DispatchTraceAuthority {
+    recorder: Arc<FlightRecorder>,
+    next_shard: AtomicUsize,
+}
+
+impl DispatchTraceAuthority {
+    #[must_use]
+    pub fn new(recorder: Arc<FlightRecorder>) -> Arc<Self> {
+        Arc::new(Self {
+            recorder,
+            next_shard: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn claim_session(
+        self: &Arc<Self>,
+        topology_stream_id: TopologyStreamId,
+    ) -> Option<Rc<SessionTraceProducer>> {
+        let shard_count = usize::from(self.recorder.config().capacity().shard_count);
+        let start = self.next_shard.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..shard_count {
+            let shard_index = start.wrapping_add(offset) % shard_count;
+            match self.recorder.register_producer(shard_index) {
+                Ok(producer) => {
+                    return Some(Rc::new(SessionTraceProducer {
+                        authority: Arc::clone(self),
+                        producer,
+                        topology_stream_id,
+                        _main_thread_affinity: Cell::new(()),
+                    }));
+                }
+                Err(RecorderError::ShardAlreadyClaimed { .. }) => {}
+                Err(error) => {
+                    log::warn!(
+                        "mux-server trace producer registration failed; tracing this connection is disabled: {error}"
+                    );
+                    metrics::counter!(
+                        "mux.server.trace_session_registration",
+                        "outcome" => "recorder_rejected"
+                    )
+                    .increment(1);
+                    return None;
+                }
+            }
+        }
+
+        metrics::counter!(
+            "mux.server.trace_session_registration",
+            "outcome" => "shards_exhausted"
+        )
+        .increment(1);
+        None
+    }
+}
+
+/// One connection's explicitly registered, thread-affine recorder producer.
+///
+/// `ProducerHandle` and the `Rc` owner are intentionally neither `Send` nor
+/// `Sync`. The binary dispatch future is consequently a main-thread-local
+/// future; listener threads perform one small `Send` bridge and then spawn it
+/// with `promise::spawn::spawn` on the destination thread.
+#[derive(Debug)]
+pub(crate) struct SessionTraceProducer {
+    authority: Arc<DispatchTraceAuthority>,
+    producer: ProducerHandle,
+    topology_stream_id: TopologyStreamId,
+    _main_thread_affinity: Cell<()>,
+}
 
 /// Checked, cycle-breaking conversions between the ordered-window wire schema
 /// and mux authority.
@@ -3926,6 +4006,7 @@ pub struct SessionHandler {
     to_write_tx: PduSender,
     owner: SessionOwner,
     topology_stream_id: TopologyStreamId,
+    _trace_producer: Option<Rc<SessionTraceProducer>>,
     per_pane: HashMap<PaneId, TrackedPane>,
     client_id: Option<Arc<ClientId>>,
     #[cfg(test)]
@@ -3962,10 +4043,25 @@ impl SessionHandler {
         owner: SessionOwner,
         topology_stream_id: TopologyStreamId,
     ) -> Self {
+        Self::new_for_session_with_topology_stream_and_trace(
+            to_write_tx,
+            owner,
+            topology_stream_id,
+            None,
+        )
+    }
+
+    pub(crate) fn new_for_session_with_topology_stream_and_trace(
+        to_write_tx: PduSender,
+        owner: SessionOwner,
+        topology_stream_id: TopologyStreamId,
+        trace_producer: Option<Rc<SessionTraceProducer>>,
+    ) -> Self {
         Self {
             to_write_tx,
             owner,
             topology_stream_id,
+            _trace_producer: trace_producer,
             per_pane: HashMap::new(),
             client_id: None,
             #[cfg(test)]
@@ -5695,7 +5791,8 @@ mod tests {
     use super::*;
     use config::keyassignment::PaneDirection;
     use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
-        RecorderEpochId, RecorderSamplerAlgorithm, SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+        RecorderEpochId, RecorderMode, RecorderSamplerAlgorithm, RecorderSamplerConfigV1,
+        SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
     };
     use frankenterm_core_audit_types::interaction_trace_v2::{
         InteractionTraceId, InteractionTracePath, InteractionTraceRunId,
@@ -5715,6 +5812,58 @@ mod tests {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::terminal::Progress;
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
+
+    fn trace_recorder(shard_count: u16) -> Arc<FlightRecorder> {
+        let config = frankenterm_flight_recorder::RecorderConfig::new(
+            RecorderEpochId {
+                nonce_hi: 1,
+                nonce_lo: 2,
+            },
+            InteractionTraceRunId {
+                epoch_nonce_hi: 3,
+                epoch_nonce_lo: 4,
+            },
+            RecorderMode::Certification,
+            RecorderSamplerConfigV1::certification(),
+            shard_count,
+            u32::from(shard_count) * 4,
+            8 * 1024 * 1024,
+        )
+        .expect("test trace-recorder configuration must be valid");
+        FlightRecorder::new(config).expect("test trace recorder must allocate")
+    }
+
+    fn topology_stream(byte: u8) -> TopologyStreamId {
+        TopologyStreamId::from_bytes([byte; 16])
+    }
+
+    #[test]
+    fn dispatch_trace_authority_claims_bounded_shards_off_hot_path() {
+        let authority = DispatchTraceAuthority::new(trace_recorder(2));
+        let first = authority
+            .claim_session(topology_stream(1))
+            .expect("first connection must claim a producer shard");
+        let second = authority
+            .claim_session(topology_stream(2))
+            .expect("second connection must claim the other producer shard");
+
+        assert_ne!(first.producer.shard_index(), second.producer.shard_index());
+        assert_eq!(first.topology_stream_id, topology_stream(1));
+        assert_eq!(second.topology_stream_id, topology_stream(2));
+        assert!(Arc::ptr_eq(&first.authority, &authority));
+        assert!(
+            authority.claim_session(topology_stream(3)).is_none(),
+            "a third connection must degrade tracing instead of sharing an SPSC shard"
+        );
+
+        let released_shard = first.producer.shard_index();
+        drop(first);
+        let replacement = authority
+            .claim_session(topology_stream(4))
+            .expect("dropping a connection must release its exact producer claim");
+        assert_eq!(replacement.producer.shard_index(), released_shard);
+        assert_eq!(replacement.topology_stream_id, topology_stream(4));
+    }
 
     fn sampled_key_context() -> SampledTraceContextV1 {
         SampledTraceContextV1 {

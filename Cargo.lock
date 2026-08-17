@@ -4303,6 +4303,7 @@ dependencies = [
  "frankenterm-client",
  "frankenterm-core",
  "frankenterm-core-audit-types",
+ "frankenterm-flight-recorder",
  "frankenterm-sigpipe",
  "frankenterm-term",
  "frankenterm-uds",

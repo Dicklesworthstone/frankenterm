@@ -1,9 +1,9 @@
 #![allow(clippy::future_not_send)]
 #![allow(clippy::type_repetition_in_bounds)]
 use crate::sessionhandler::{
-    AdmittedInputTraceV1, PduDeliveryClass, PduSender, PerPane, SessionAuthority, SessionHandler,
-    SessionOwner, frozen_window_order_to_codec, retire_poisoned_pane_render,
-    validate_ordered_snapshot_projection,
+    AdmittedInputTraceV1, DispatchTraceAuthority, PduDeliveryClass, PduSender, PerPane,
+    SessionAuthority, SessionHandler, SessionOwner, frozen_window_order_to_codec,
+    retire_poisoned_pane_render, validate_ordered_snapshot_projection,
 };
 use anyhow::Context;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -766,20 +766,37 @@ pub enum DispatchIoPreference {
     Poll,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DispatchRuntimeConfig {
     preference: DispatchIoPreference,
+    trace_authority: Option<Arc<DispatchTraceAuthority>>,
 }
 
 impl DispatchRuntimeConfig {
     #[must_use]
     pub const fn new(preference: DispatchIoPreference) -> Self {
-        Self { preference }
+        Self {
+            preference,
+            trace_authority: None,
+        }
     }
 
     #[must_use]
-    pub const fn preference(self) -> DispatchIoPreference {
+    pub const fn preference(&self) -> DispatchIoPreference {
         self.preference
+    }
+
+    /// Bind one explicit recorder authority to subsequently accepted binary
+    /// mux connections. Producer registration occurs once per connection,
+    /// before request decoding, and never through a global singleton.
+    #[must_use]
+    pub fn with_trace_authority(mut self, authority: Arc<DispatchTraceAuthority>) -> Self {
+        self.trace_authority = Some(authority);
+        self
+    }
+
+    fn trace_authority(&self) -> Option<Arc<DispatchTraceAuthority>> {
+        self.trace_authority.as_ref().map(Arc::clone)
     }
 }
 
@@ -6509,7 +6526,7 @@ where
     T: 'static,
     T: DispatchStream,
 {
-    let reactor = DispatchReactor::resolve(config, stream.dispatch_stream_kind());
+    let reactor = DispatchReactor::resolve(config.clone(), stream.dispatch_stream_kind());
     if let Some(reason) = reactor.fallback_reason() {
         log::trace!(
             "process_async configured backend {:?} resolved to {:?}: {}",
@@ -6545,8 +6562,15 @@ where
         topology_stream_id,
     ));
     let pdu_sender = pdu_sender_for_topology(&topology);
-    let mut handler =
-        SessionHandler::new_for_session_with_topology_stream(pdu_sender, owner, topology_stream_id);
+    let trace_producer = config
+        .trace_authority()
+        .and_then(|authority| authority.claim_session(topology_stream_id));
+    let mut handler = SessionHandler::new_for_session_with_topology_stream_and_trace(
+        pdu_sender,
+        owner,
+        topology_stream_id,
+        trace_producer,
+    );
 
     {
         let notification_route = TopologyNotificationRoute::new(authority.clone(), &mux, &topology);

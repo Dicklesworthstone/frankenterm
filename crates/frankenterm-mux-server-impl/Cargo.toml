@@ -24,6 +24,7 @@ config.workspace = true
 dns-lookup.workspace = true
 frankenterm-core = { workspace = true, default-features = false }
 frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
+frankenterm-flight-recorder = { path = "../frankenterm-flight-recorder" }
 frankenterm-sigpipe.workspace = true
 futures.workspace = true
 fs2.workspace = true

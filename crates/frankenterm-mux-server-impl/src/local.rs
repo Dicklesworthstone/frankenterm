@@ -53,14 +53,17 @@ impl LocalListener {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let dispatch_config = self.dispatch_config;
+                    let dispatch_config = self.dispatch_config.clone();
                     spawn_into_main_thread(async move {
-                        crate::dispatch::process_unix_auto_with_config(stream, dispatch_config)
-                            .await
-                            .map_err(|e| {
-                                log::error!("{:#}", e);
-                                e
-                            })
+                        promise::spawn::spawn(async move {
+                            crate::dispatch::process_unix_auto_with_config(stream, dispatch_config)
+                                .await
+                                .map_err(|e| {
+                                    log::error!("{:#}", e);
+                                    e
+                                })
+                        })
+                        .detach();
                     })
                     .detach();
                 }
