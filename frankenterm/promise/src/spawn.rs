@@ -1,15 +1,489 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_executor::Executor;
-use flume::{Receiver, bounded, unbounded};
+use flume::{bounded, unbounded, Receiver};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 use std::thread::ThreadId;
+use std::time::Instant;
+use thiserror::Error;
 
 pub use async_task::{Runnable, Task};
 pub type SpawnFunc = Box<dyn FnOnce() + Send>;
 pub type ScheduleFunc = Box<dyn Fn(Runnable) + Send + Sync + 'static>;
 type SharedScheduleFunc = Arc<dyn Fn(Runnable) + Send + Sync + 'static>;
+
+/// Semantic service lane for work admitted to the process main-thread
+/// scheduler.
+///
+/// Correctness-critical input and topology work may consume the capacity held
+/// in reserve for overload recovery. Other work is constrained to the general
+/// pool even while that reserve is idle, so a paint or background flood cannot
+/// make the application unable to process input, close, or topology work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MainThreadServiceClass {
+    Input,
+    Topology,
+    Interactive,
+    Render,
+    Background,
+}
+
+impl MainThreadServiceClass {
+    fn is_correctness_critical(self) -> bool {
+        matches!(self, Self::Input | Self::Topology)
+    }
+}
+
+/// Finite task-lifetime limits for one exact main-thread scheduler generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainThreadAdmissionLimits {
+    task_capacity: NonZeroUsize,
+    estimated_byte_capacity: NonZeroUsize,
+    reserved_critical_tasks: usize,
+    reserved_critical_estimated_bytes: usize,
+}
+
+impl MainThreadAdmissionLimits {
+    pub fn new(
+        task_capacity: usize,
+        estimated_byte_capacity: usize,
+        reserved_critical_tasks: usize,
+        reserved_critical_estimated_bytes: usize,
+    ) -> std::result::Result<Self, MainThreadAdmissionConfigError> {
+        let Some(task_capacity) = NonZeroUsize::new(task_capacity) else {
+            return Err(MainThreadAdmissionConfigError::ZeroTaskCapacity);
+        };
+        let Some(estimated_byte_capacity) = NonZeroUsize::new(estimated_byte_capacity) else {
+            return Err(MainThreadAdmissionConfigError::ZeroEstimatedByteCapacity);
+        };
+        if reserved_critical_tasks > task_capacity.get() {
+            return Err(MainThreadAdmissionConfigError::TaskReserveExceedsCapacity {
+                reserve: reserved_critical_tasks,
+                capacity: task_capacity.get(),
+            });
+        }
+        if reserved_critical_estimated_bytes > estimated_byte_capacity.get() {
+            return Err(
+                MainThreadAdmissionConfigError::EstimatedByteReserveExceedsCapacity {
+                    reserve: reserved_critical_estimated_bytes,
+                    capacity: estimated_byte_capacity.get(),
+                },
+            );
+        }
+        Ok(Self {
+            task_capacity,
+            estimated_byte_capacity,
+            reserved_critical_tasks,
+            reserved_critical_estimated_bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn task_capacity(self) -> usize {
+        self.task_capacity.get()
+    }
+
+    #[must_use]
+    pub fn estimated_byte_capacity(self) -> usize {
+        self.estimated_byte_capacity.get()
+    }
+
+    #[must_use]
+    pub fn reserved_critical_tasks(self) -> usize {
+        self.reserved_critical_tasks
+    }
+
+    #[must_use]
+    pub fn reserved_critical_estimated_bytes(self) -> usize {
+        self.reserved_critical_estimated_bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MainThreadAdmissionConfigError {
+    #[error("main-thread scheduler task capacity must be nonzero")]
+    ZeroTaskCapacity,
+    #[error("main-thread scheduler estimated-byte capacity must be nonzero")]
+    ZeroEstimatedByteCapacity,
+    #[error("critical task reserve {reserve} exceeds task capacity {capacity}")]
+    TaskReserveExceedsCapacity { reserve: usize, capacity: usize },
+    #[error("critical estimated-byte reserve {reserve} exceeds byte capacity {capacity}")]
+    EstimatedByteReserveExceedsCapacity { reserve: usize, capacity: usize },
+}
+
+/// Callback-free accounting state observed at one admission linearization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainThreadAdmissionSnapshot {
+    pub active_tasks: usize,
+    pub active_estimated_bytes: usize,
+    pub active_general_tasks: usize,
+    pub active_general_estimated_bytes: usize,
+    pub task_capacity: usize,
+    pub estimated_byte_capacity: usize,
+    pub retired: bool,
+}
+
+/// Exact task-lifetime admission receipt. Queue implementations add enqueue
+/// depth and age at the later runnable-enqueue boundary; those values are not
+/// fabricated from the number of live task permits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainThreadAdmissionReceipt {
+    pub queue_id: NonZeroU64,
+    pub scheduler_generation: NonZeroU64,
+    pub task_ticket: NonZeroU64,
+    pub service_class: MainThreadServiceClass,
+    pub estimated_bytes: NonZeroUsize,
+    pub admitted_at: Instant,
+    pub snapshot_after_admission: MainThreadAdmissionSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MainThreadAdmissionError {
+    #[error("estimated task size must be nonzero")]
+    ZeroEstimatedBytes,
+    #[error("scheduler generation is retired")]
+    RetiredGeneration,
+    #[error("scheduler task ticket authority is exhausted")]
+    TicketExhausted,
+    #[error(
+        "scheduler task capacity exhausted: active={active}, capacity={capacity}, class={service_class:?}"
+    )]
+    TaskCapacityExhausted {
+        active: usize,
+        capacity: usize,
+        service_class: MainThreadServiceClass,
+    },
+    #[error(
+        "scheduler estimated-byte capacity exhausted: active={active}, requested={requested}, capacity={capacity}, class={service_class:?}"
+    )]
+    EstimatedByteCapacityExhausted {
+        active: usize,
+        requested: usize,
+        capacity: usize,
+        service_class: MainThreadServiceClass,
+    },
+}
+
+#[derive(Debug)]
+struct MainThreadAdmissionState {
+    active_tasks: usize,
+    active_estimated_bytes: usize,
+    active_general_tasks: usize,
+    active_general_estimated_bytes: usize,
+    next_ticket: Option<NonZeroU64>,
+    retired: bool,
+}
+
+#[derive(Debug)]
+struct MainThreadAdmissionInner {
+    queue_id: NonZeroU64,
+    scheduler_generation: NonZeroU64,
+    limits: MainThreadAdmissionLimits,
+    state: Mutex<MainThreadAdmissionState>,
+}
+
+/// Queue-independent task-lifetime capacity authority.
+///
+/// A permit is acquired before an async task is allocated and held by the
+/// future until it completes or is cancelled. Since `async-task` has at most
+/// one runnable per task, a queue sized to the same admitted-task capacity can
+/// always accept a wake for an already admitted task. Queue implementations
+/// must not perform a second fallible slot admission for such wakes.
+#[derive(Debug, Clone)]
+pub struct MainThreadAdmissionController {
+    inner: Arc<MainThreadAdmissionInner>,
+}
+
+impl MainThreadAdmissionController {
+    #[must_use]
+    pub fn new(
+        queue_id: NonZeroU64,
+        scheduler_generation: NonZeroU64,
+        limits: MainThreadAdmissionLimits,
+    ) -> Self {
+        Self {
+            inner: Arc::new(MainThreadAdmissionInner {
+                queue_id,
+                scheduler_generation,
+                limits,
+                state: Mutex::new(MainThreadAdmissionState {
+                    active_tasks: 0,
+                    active_estimated_bytes: 0,
+                    active_general_tasks: 0,
+                    active_general_estimated_bytes: 0,
+                    next_ticket: NonZeroU64::new(1),
+                    retired: false,
+                }),
+            }),
+        }
+    }
+
+    pub fn try_admit(
+        &self,
+        service_class: MainThreadServiceClass,
+        estimated_bytes: usize,
+    ) -> std::result::Result<MainThreadTaskPermit, MainThreadAdmissionError> {
+        let Some(estimated_bytes) = NonZeroUsize::new(estimated_bytes) else {
+            return Err(MainThreadAdmissionError::ZeroEstimatedBytes);
+        };
+        let mut state = lock_or_recover(&self.inner.state);
+        if state.retired {
+            return Err(MainThreadAdmissionError::RetiredGeneration);
+        }
+        let Some(task_ticket) = state.next_ticket else {
+            return Err(MainThreadAdmissionError::TicketExhausted);
+        };
+
+        let critical = service_class.is_correctness_critical();
+        let task_capacity = if critical {
+            self.inner.limits.task_capacity()
+        } else {
+            self.inner
+                .limits
+                .task_capacity()
+                .saturating_sub(self.inner.limits.reserved_critical_tasks())
+        };
+        let active_tasks = if critical {
+            state.active_tasks
+        } else {
+            state.active_general_tasks
+        };
+        if active_tasks >= task_capacity {
+            return Err(MainThreadAdmissionError::TaskCapacityExhausted {
+                active: active_tasks,
+                capacity: task_capacity,
+                service_class,
+            });
+        }
+
+        let estimated_byte_capacity = if critical {
+            self.inner.limits.estimated_byte_capacity()
+        } else {
+            self.inner
+                .limits
+                .estimated_byte_capacity()
+                .saturating_sub(self.inner.limits.reserved_critical_estimated_bytes())
+        };
+        let active_estimated_bytes = if critical {
+            state.active_estimated_bytes
+        } else {
+            state.active_general_estimated_bytes
+        };
+        let Some(prospective_estimated_bytes) =
+            active_estimated_bytes.checked_add(estimated_bytes.get())
+        else {
+            return Err(MainThreadAdmissionError::EstimatedByteCapacityExhausted {
+                active: active_estimated_bytes,
+                requested: estimated_bytes.get(),
+                capacity: estimated_byte_capacity,
+                service_class,
+            });
+        };
+        if prospective_estimated_bytes > estimated_byte_capacity {
+            return Err(MainThreadAdmissionError::EstimatedByteCapacityExhausted {
+                active: active_estimated_bytes,
+                requested: estimated_bytes.get(),
+                capacity: estimated_byte_capacity,
+                service_class,
+            });
+        }
+
+        let Some(total_tasks) = state.active_tasks.checked_add(1) else {
+            return Err(MainThreadAdmissionError::TaskCapacityExhausted {
+                active: state.active_tasks,
+                capacity: self.inner.limits.task_capacity(),
+                service_class,
+            });
+        };
+        let Some(total_estimated_bytes) = state
+            .active_estimated_bytes
+            .checked_add(estimated_bytes.get())
+        else {
+            return Err(MainThreadAdmissionError::EstimatedByteCapacityExhausted {
+                active: state.active_estimated_bytes,
+                requested: estimated_bytes.get(),
+                capacity: self.inner.limits.estimated_byte_capacity(),
+                service_class,
+            });
+        };
+        if total_tasks > self.inner.limits.task_capacity() {
+            return Err(MainThreadAdmissionError::TaskCapacityExhausted {
+                active: state.active_tasks,
+                capacity: self.inner.limits.task_capacity(),
+                service_class,
+            });
+        }
+        if total_estimated_bytes > self.inner.limits.estimated_byte_capacity() {
+            return Err(MainThreadAdmissionError::EstimatedByteCapacityExhausted {
+                active: state.active_estimated_bytes,
+                requested: estimated_bytes.get(),
+                capacity: self.inner.limits.estimated_byte_capacity(),
+                service_class,
+            });
+        }
+
+        state.active_tasks = total_tasks;
+        state.active_estimated_bytes = total_estimated_bytes;
+        if !critical {
+            state.active_general_tasks = state
+                .active_general_tasks
+                .checked_add(1)
+                .expect("general task count was bounded by total task capacity");
+            state.active_general_estimated_bytes = prospective_estimated_bytes;
+        }
+        state.next_ticket = task_ticket.get().checked_add(1).and_then(NonZeroU64::new);
+
+        let receipt = MainThreadAdmissionReceipt {
+            queue_id: self.inner.queue_id,
+            scheduler_generation: self.inner.scheduler_generation,
+            task_ticket,
+            service_class,
+            estimated_bytes,
+            admitted_at: Instant::now(),
+            snapshot_after_admission: self.snapshot_locked(&state),
+        };
+        Ok(MainThreadTaskPermit {
+            inner: MainThreadTaskPermitInner {
+                controller: Arc::clone(&self.inner),
+                service_class,
+                estimated_bytes,
+                receipt,
+            },
+        })
+    }
+
+    pub fn retire(&self) {
+        lock_or_recover(&self.inner.state).retired = true;
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> MainThreadAdmissionSnapshot {
+        let state = lock_or_recover(&self.inner.state);
+        self.snapshot_locked(&state)
+    }
+
+    fn snapshot_locked(&self, state: &MainThreadAdmissionState) -> MainThreadAdmissionSnapshot {
+        MainThreadAdmissionSnapshot {
+            active_tasks: state.active_tasks,
+            active_estimated_bytes: state.active_estimated_bytes,
+            active_general_tasks: state.active_general_tasks,
+            active_general_estimated_bytes: state.active_general_estimated_bytes,
+            task_capacity: self.inner.limits.task_capacity(),
+            estimated_byte_capacity: self.inner.limits.estimated_byte_capacity(),
+            retired: state.retired,
+        }
+    }
+}
+
+static MAIN_THREAD_ADMISSION_ACCOUNTING_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+#[must_use]
+pub fn main_thread_admission_accounting_errors() -> u64 {
+    MAIN_THREAD_ADMISSION_ACCOUNTING_ERRORS.load(Ordering::Relaxed)
+}
+
+#[derive(Debug)]
+struct MainThreadTaskPermitInner {
+    controller: Arc<MainThreadAdmissionInner>,
+    service_class: MainThreadServiceClass,
+    estimated_bytes: NonZeroUsize,
+    receipt: MainThreadAdmissionReceipt,
+}
+
+impl Drop for MainThreadTaskPermitInner {
+    fn drop(&mut self) {
+        let mut state = lock_or_recover(&self.controller.state);
+        let Some(active_tasks) = state.active_tasks.checked_sub(1) else {
+            state.retired = true;
+            MAIN_THREAD_ADMISSION_ACCOUNTING_ERRORS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let Some(active_estimated_bytes) = state
+            .active_estimated_bytes
+            .checked_sub(self.estimated_bytes.get())
+        else {
+            state.retired = true;
+            MAIN_THREAD_ADMISSION_ACCOUNTING_ERRORS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let general_after_release = if self.service_class.is_correctness_critical() {
+            None
+        } else {
+            let Some(active_general_tasks) = state.active_general_tasks.checked_sub(1) else {
+                state.retired = true;
+                MAIN_THREAD_ADMISSION_ACCOUNTING_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let Some(active_general_estimated_bytes) = state
+                .active_general_estimated_bytes
+                .checked_sub(self.estimated_bytes.get())
+            else {
+                state.retired = true;
+                MAIN_THREAD_ADMISSION_ACCOUNTING_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            Some((active_general_tasks, active_general_estimated_bytes))
+        };
+
+        state.active_tasks = active_tasks;
+        state.active_estimated_bytes = active_estimated_bytes;
+        if let Some((active_general_tasks, active_general_estimated_bytes)) = general_after_release
+        {
+            state.active_general_tasks = active_general_tasks;
+            state.active_general_estimated_bytes = active_general_estimated_bytes;
+        }
+    }
+}
+
+/// Unique task-lifetime capacity permit. This value is intentionally not
+/// cloneable: exactly one future owns release authority.
+#[derive(Debug)]
+#[must_use = "dropping the permit releases its reserved scheduler capacity"]
+pub struct MainThreadTaskPermit {
+    inner: MainThreadTaskPermitInner,
+}
+
+impl MainThreadTaskPermit {
+    #[must_use]
+    pub fn receipt(&self) -> MainThreadAdmissionReceipt {
+        self.inner.receipt
+    }
+
+    #[must_use = "the admitted future must be polled or scheduled"]
+    pub fn bind<F: Future>(self, future: F) -> MainThreadAdmittedFuture<F> {
+        MainThreadAdmittedFuture {
+            future: Box::pin(future),
+            permit: Some(self),
+        }
+    }
+}
+
+/// Future wrapper that releases task-lifetime scheduler capacity at the exact
+/// completion or cancellation boundary.
+#[must_use = "futures do nothing unless polled or scheduled"]
+pub struct MainThreadAdmittedFuture<F> {
+    future: Pin<Box<F>>,
+    permit: Option<MainThreadTaskPermit>,
+}
+
+impl<F: Future> Future for MainThreadAdmittedFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.future.as_mut().poll(cx) {
+            Poll::Ready(output) => {
+                drop(this.permit.take());
+                Poll::Ready(output)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 fn no_scheduler_configured(_: Runnable) {
     panic!("no scheduler has been configured");
@@ -514,11 +988,360 @@ impl Drop for ScopedExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::sync::{Barrier, Mutex as StdMutex};
     use std::time::{Duration, Instant};
 
     // Serialize spawn tests that touch global scheduler state
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn admission_controller(
+        task_capacity: usize,
+        estimated_byte_capacity: usize,
+        reserved_critical_tasks: usize,
+        reserved_critical_estimated_bytes: usize,
+    ) -> MainThreadAdmissionController {
+        MainThreadAdmissionController::new(
+            NonZeroU64::new(11).unwrap(),
+            NonZeroU64::new(17).unwrap(),
+            MainThreadAdmissionLimits::new(
+                task_capacity,
+                estimated_byte_capacity,
+                reserved_critical_tasks,
+                reserved_critical_estimated_bytes,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn admission_limits_reject_zero_and_overcommitted_reserves() {
+        assert_eq!(
+            MainThreadAdmissionLimits::new(0, 1, 0, 0),
+            Err(MainThreadAdmissionConfigError::ZeroTaskCapacity)
+        );
+        assert_eq!(
+            MainThreadAdmissionLimits::new(1, 0, 0, 0),
+            Err(MainThreadAdmissionConfigError::ZeroEstimatedByteCapacity)
+        );
+        assert_eq!(
+            MainThreadAdmissionLimits::new(2, 8, 3, 0),
+            Err(MainThreadAdmissionConfigError::TaskReserveExceedsCapacity {
+                reserve: 3,
+                capacity: 2,
+            })
+        );
+        assert_eq!(
+            MainThreadAdmissionLimits::new(2, 8, 0, 9),
+            Err(
+                MainThreadAdmissionConfigError::EstimatedByteReserveExceedsCapacity {
+                    reserve: 9,
+                    capacity: 8,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn admission_reserves_capacity_for_input_and_topology() {
+        let controller = admission_controller(3, 30, 1, 10);
+        let first = controller
+            .try_admit(MainThreadServiceClass::Render, 10)
+            .unwrap();
+        let second = controller
+            .try_admit(MainThreadServiceClass::Interactive, 10)
+            .unwrap();
+        assert!(matches!(
+            controller.try_admit(MainThreadServiceClass::Background, 1),
+            Err(MainThreadAdmissionError::TaskCapacityExhausted {
+                active: 2,
+                capacity: 2,
+                service_class: MainThreadServiceClass::Background,
+            })
+        ));
+
+        let critical = controller
+            .try_admit(MainThreadServiceClass::Input, 10)
+            .expect("critical input must consume the protected reserve");
+        assert_eq!(controller.snapshot().active_tasks, 3);
+        assert_eq!(controller.snapshot().active_estimated_bytes, 30);
+
+        drop(second);
+        let replacement = controller
+            .try_admit(MainThreadServiceClass::Background, 10)
+            .expect("releasing one general permit must restore one general slot");
+        drop((first, critical, replacement));
+        assert_eq!(
+            controller.snapshot(),
+            MainThreadAdmissionSnapshot {
+                active_tasks: 0,
+                active_estimated_bytes: 0,
+                active_general_tasks: 0,
+                active_general_estimated_bytes: 0,
+                task_capacity: 3,
+                estimated_byte_capacity: 30,
+                retired: false,
+            }
+        );
+    }
+
+    #[test]
+    fn admission_enforces_estimated_byte_reserve_independently() {
+        let controller = admission_controller(8, 100, 0, 40);
+        let general = controller
+            .try_admit(MainThreadServiceClass::Render, 60)
+            .unwrap();
+        assert!(matches!(
+            controller.try_admit(MainThreadServiceClass::Render, 1),
+            Err(MainThreadAdmissionError::EstimatedByteCapacityExhausted {
+                active: 60,
+                requested: 1,
+                capacity: 60,
+                service_class: MainThreadServiceClass::Render,
+            })
+        ));
+        let critical = controller
+            .try_admit(MainThreadServiceClass::Topology, 40)
+            .expect("topology work must retain the protected byte reserve");
+        assert_eq!(controller.snapshot().active_estimated_bytes, 100);
+        drop((general, critical));
+        assert_eq!(controller.snapshot().active_estimated_bytes, 0);
+    }
+
+    #[test]
+    fn retired_generation_rejects_new_tasks_without_revoking_live_permits() {
+        let controller = admission_controller(2, 32, 0, 0);
+        let admitted = controller
+            .try_admit(MainThreadServiceClass::Interactive, 8)
+            .unwrap();
+        let receipt = admitted.receipt();
+        controller.retire();
+        assert!(matches!(
+            controller.try_admit(MainThreadServiceClass::Input, 8),
+            Err(MainThreadAdmissionError::RetiredGeneration)
+        ));
+        assert_eq!(receipt.queue_id, NonZeroU64::new(11).unwrap());
+        assert_eq!(receipt.scheduler_generation, NonZeroU64::new(17).unwrap());
+        assert_eq!(controller.snapshot().active_tasks, 1);
+        drop(admitted);
+        assert_eq!(controller.snapshot().active_tasks, 0);
+        assert!(controller.snapshot().retired);
+
+        let replacement = MainThreadAdmissionController::new(
+            NonZeroU64::new(11).unwrap(),
+            NonZeroU64::new(18).unwrap(),
+            MainThreadAdmissionLimits::new(2, 32, 0, 0).unwrap(),
+        );
+        assert!(replacement
+            .try_admit(MainThreadServiceClass::Input, 8)
+            .is_ok());
+    }
+
+    #[test]
+    fn task_ticket_exhaustion_is_nonwrapping_and_mutation_free() {
+        let controller = admission_controller(2, 32, 0, 0);
+        lock_or_recover(&controller.inner.state).next_ticket = NonZeroU64::new(u64::MAX);
+
+        let final_ticket = controller
+            .try_admit(MainThreadServiceClass::Input, 8)
+            .expect("the final nonzero ticket remains usable");
+        assert_eq!(final_ticket.receipt().task_ticket.get(), u64::MAX);
+        let before = controller.snapshot();
+        assert!(matches!(
+            controller.try_admit(MainThreadServiceClass::Input, 8),
+            Err(MainThreadAdmissionError::TicketExhausted)
+        ));
+        assert_eq!(controller.snapshot(), before);
+        drop(final_ticket);
+        assert_eq!(controller.snapshot().active_tasks, 0);
+    }
+
+    #[test]
+    fn admitted_future_holds_capacity_across_self_wake_and_releases_on_completion() {
+        let controller = admission_controller(1, 64, 0, 0);
+        let permit = controller
+            .try_admit(MainThreadServiceClass::Interactive, 16)
+            .unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_in_task = Arc::clone(&polls);
+        let future = std::future::poll_fn(move |cx| {
+            if polls_in_task.fetch_add(1, Ordering::SeqCst) == 0 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(42)
+            }
+        });
+        let (sender, receiver) = unbounded();
+        let (runnable, task) = async_task::spawn(permit.bind(future), move |runnable| {
+            sender.send(runnable).unwrap();
+        });
+        runnable.schedule();
+
+        assert_eq!(controller.snapshot().active_tasks, 1);
+        receiver.recv().unwrap().run();
+        assert_eq!(
+            controller.snapshot().active_tasks,
+            1,
+            "a self-wake must retain its task-lifetime permit between polls"
+        );
+        receiver.recv().unwrap().run();
+        assert_eq!(controller.snapshot().active_tasks, 0);
+        assert_eq!(block_on(task), 42);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn dropping_scheduled_runnable_releases_cancelled_task_permit() {
+        let controller = admission_controller(1, 64, 0, 0);
+        let permit = controller
+            .try_admit(MainThreadServiceClass::Background, 16)
+            .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = Arc::clone(&dropped);
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let drop_flag = DropFlag(dropped_in_task);
+        let future = async move {
+            let _drop_flag = drop_flag;
+            std::future::pending::<()>().await;
+        };
+        let (sender, receiver) = unbounded();
+        let (runnable, task) = async_task::spawn(permit.bind(future), move |runnable| {
+            sender.send(runnable).unwrap();
+        });
+        runnable.schedule();
+
+        drop(receiver.recv().unwrap());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(controller.snapshot().active_tasks, 0);
+        drop(task);
+    }
+
+    #[test]
+    fn concurrent_admission_never_oversubscribes_task_capacity() {
+        let controller = admission_controller(4, 4_096, 0, 0);
+        let barrier = Arc::new(Barrier::new(17));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let controller = controller.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                controller.try_admit(MainThreadServiceClass::Interactive, 1)
+            }));
+        }
+        barrier.wait();
+
+        let admitted = threads
+            .into_iter()
+            .filter_map(|thread| thread.join().unwrap().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(admitted.len(), 4);
+        assert_eq!(controller.snapshot().active_tasks, 4);
+        drop(admitted);
+        assert_eq!(controller.snapshot().active_tasks, 0);
+    }
+
+    #[test]
+    fn panicking_admitted_future_releases_its_permit() {
+        let controller = admission_controller(1, 64, 0, 0);
+        let permit = controller
+            .try_admit(MainThreadServiceClass::Interactive, 16)
+            .unwrap();
+        let (sender, receiver) = unbounded();
+        let (runnable, task) = async_task::spawn(
+            permit.bind(async {
+                panic!("intentional admitted-future panic");
+            }),
+            move |runnable| sender.send(runnable).unwrap(),
+        );
+        runnable.schedule();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            receiver.recv().unwrap().run();
+        }));
+        assert!(result.is_err());
+        assert_eq!(controller.snapshot().active_tasks, 0);
+        drop(task);
+    }
+
+    proptest! {
+        #[test]
+        fn admission_accounting_matches_a_bounded_sequential_model(
+            operations in prop::collection::vec(
+                (any::<bool>(), 0_u8..5, 1_usize..80, any::<usize>()),
+                0..256,
+            )
+        ) {
+            let controller = admission_controller(8, 256, 2, 64);
+            let mut held = Vec::new();
+            let mut active_tasks = 0_usize;
+            let mut active_bytes = 0_usize;
+            let mut general_tasks = 0_usize;
+            let mut general_bytes = 0_usize;
+
+            for (admit, class_selector, estimated_bytes, removal_selector) in operations {
+                if admit {
+                    let service_class = match class_selector {
+                        0 => MainThreadServiceClass::Input,
+                        1 => MainThreadServiceClass::Topology,
+                        2 => MainThreadServiceClass::Interactive,
+                        3 => MainThreadServiceClass::Render,
+                        _ => MainThreadServiceClass::Background,
+                    };
+                    let critical = service_class.is_correctness_critical();
+                    let expected_admission = active_tasks < 8
+                        && active_bytes
+                            .checked_add(estimated_bytes)
+                            .is_some_and(|bytes| bytes <= 256)
+                        && (critical
+                            || (general_tasks < 6
+                                && general_bytes
+                                    .checked_add(estimated_bytes)
+                                    .is_some_and(|bytes| bytes <= 192)));
+                    let result = controller.try_admit(service_class, estimated_bytes);
+                    if expected_admission {
+                        prop_assert!(result.is_ok());
+                        held.push((result.unwrap(), service_class, estimated_bytes));
+                        active_tasks += 1;
+                        active_bytes += estimated_bytes;
+                        if !critical {
+                            general_tasks += 1;
+                            general_bytes += estimated_bytes;
+                        }
+                    } else {
+                        prop_assert!(result.is_err());
+                    }
+                } else if !held.is_empty() {
+                    let index = removal_selector % held.len();
+                    let (permit, service_class, estimated_bytes) = held.swap_remove(index);
+                    drop(permit);
+                    active_tasks -= 1;
+                    active_bytes -= estimated_bytes;
+                    if !service_class.is_correctness_critical() {
+                        general_tasks -= 1;
+                        general_bytes -= estimated_bytes;
+                    }
+                }
+
+                let snapshot = controller.snapshot();
+                prop_assert_eq!(snapshot.active_tasks, active_tasks);
+                prop_assert_eq!(snapshot.active_estimated_bytes, active_bytes);
+                prop_assert_eq!(snapshot.active_general_tasks, general_tasks);
+                prop_assert_eq!(snapshot.active_general_estimated_bytes, general_bytes);
+                prop_assert!(!snapshot.retired);
+            }
+
+            drop(held);
+            prop_assert_eq!(controller.snapshot().active_tasks, 0);
+            prop_assert_eq!(controller.snapshot().active_estimated_bytes, 0);
+        }
+    }
 
     #[test]
     fn block_on_ready_future() {
