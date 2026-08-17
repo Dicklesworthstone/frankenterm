@@ -4029,6 +4029,10 @@ pub enum VendoredCompressionMode {
     Never,
 }
 
+pub(crate) const DEFAULT_VENDORED_MUX_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const DEFAULT_VENDORED_MUX_MAX_OUTBOUND_CODEC_BYTES: usize = 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_VENDORED_MUX_MAX_OUTBOUND_IN_FLIGHT_REQUESTS: usize = 256;
+
 /// Vendored mux connection pool settings.
 ///
 /// These settings control how many persistent Unix socket connections to the
@@ -4047,6 +4051,12 @@ pub struct VendoredMuxPoolConfig {
     pub pipeline_depth: usize,
     /// Timeout for a full pipelined mux batch operation.
     pub pipeline_timeout_ms: u64,
+    /// Maximum encoded bytes in one outbound mux frame.
+    pub max_frame_bytes: usize,
+    /// Pool-wide logical codec-memory ceiling for admitted outbound requests.
+    pub max_outbound_codec_bytes: usize,
+    /// Pool-wide count ceiling for requests that currently own codec memory.
+    pub max_outbound_in_flight_requests: usize,
     /// Compression mode for direct mux transport.
     pub compression: VendoredCompressionMode,
 }
@@ -4059,6 +4069,9 @@ impl Default for VendoredMuxPoolConfig {
             acquire_timeout_seconds: 10,
             pipeline_depth: 32,
             pipeline_timeout_ms: 5_000,
+            max_frame_bytes: DEFAULT_VENDORED_MUX_MAX_FRAME_BYTES,
+            max_outbound_codec_bytes: DEFAULT_VENDORED_MUX_MAX_OUTBOUND_CODEC_BYTES,
+            max_outbound_in_flight_requests: DEFAULT_VENDORED_MUX_MAX_OUTBOUND_IN_FLIGHT_REQUESTS,
             compression: VendoredCompressionMode::Auto,
         }
     }
@@ -5838,6 +5851,36 @@ impl Config {
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
 
+        for (field, value) in [
+            (
+                "vendored.mux_pool.max_connections",
+                self.vendored.mux_pool.max_connections,
+            ),
+            (
+                "vendored.mux_pool.pipeline_depth",
+                self.vendored.mux_pool.pipeline_depth,
+            ),
+            (
+                "vendored.mux_pool.max_frame_bytes",
+                self.vendored.mux_pool.max_frame_bytes,
+            ),
+            (
+                "vendored.mux_pool.max_outbound_codec_bytes",
+                self.vendored.mux_pool.max_outbound_codec_bytes,
+            ),
+            (
+                "vendored.mux_pool.max_outbound_in_flight_requests",
+                self.vendored.mux_pool.max_outbound_in_flight_requests,
+            ),
+        ] {
+            if value == 0 {
+                return Err(crate::error::ConfigError::ValidationError(format!(
+                    "{field} must be >= 1"
+                ))
+                .into());
+            }
+        }
+
         if self.vendored.sharding.enabled {
             if self.vendored.sharding.socket_paths.len() < 2 {
                 return Err(crate::error::ConfigError::ValidationError(
@@ -7444,6 +7487,33 @@ max_sender_id_len = 0
         config.vendored.sharding.socket_paths = vec!["/tmp/wa-shard-0.sock".to_string()];
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("requires at least 2 socket_paths"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_vendored_mux_pool_bounds() {
+        let cases: [(&str, fn(&mut Config)); 5] = [
+            ("max_connections", |config: &mut Config| {
+                config.vendored.mux_pool.max_connections = 0
+            }),
+            ("pipeline_depth", |config: &mut Config| {
+                config.vendored.mux_pool.pipeline_depth = 0
+            }),
+            ("max_frame_bytes", |config: &mut Config| {
+                config.vendored.mux_pool.max_frame_bytes = 0
+            }),
+            ("max_outbound_codec_bytes", |config: &mut Config| {
+                config.vendored.mux_pool.max_outbound_codec_bytes = 0
+            }),
+            ("max_outbound_in_flight_requests", |config: &mut Config| {
+                config.vendored.mux_pool.max_outbound_in_flight_requests = 0;
+            }),
+        ];
+        for (field, set_zero) in cases {
+            let mut config = Config::default();
+            set_zero(&mut config);
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(field), "unexpected error for {field}: {err}");
+        }
     }
 
     #[test]

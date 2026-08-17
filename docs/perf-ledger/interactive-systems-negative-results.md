@@ -4361,6 +4361,35 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > If wire-spec construction becomes private, keep exact registry identity or an unforgeable generated token at the inheritance cut; never authorize a queue class from caller-populated public fields alone.
 
+### IS-N143 — A per-connection outbound budget is not a mux-pool bound
+
+- **Classification:** aggregate-memory authority rejection; direct-client mux
+  admission repaired
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.3.5.5.5`
+- **Rejected inference:** bounding each `DirectMuxClient` independently bounds
+  a `MuxPool`, because each connection writes only one frame at a time.
+- **Counterexample:** a pool can drive several connections concurrently, and a
+  discarded connection can be replaced while other connections still hold
+  codec buffers. Giving each connection a fresh authority multiplies the
+  configured codec-memory ceiling by live connection and recovery churn. It
+  also lets bulk/query work consume the final capacity needed for a small key
+  input.
+- **Decision:** a standalone direct client owns one outbound root, while a
+  `MuxPool` constructs one root and passes the same exact `Arc` to every new,
+  idle-reused, and replacement connection. Each request carries one non-clone
+  PDU/plan lease from pre-serial admission through bounded encoding and the
+  completed write attempt. The root charges conservative codec peak bytes and
+  in-flight request count; one sixteenth of bytes plus one slot remain outside
+  the noninteractive lane when the configured limits permit a reserve.
+- **Planted negatives:** cap-minus-one rejection in Never, Auto, and Always
+  modes leaves the serial, socket-write witness, connection health, and root
+  usage unchanged; two simulated connection incarnations exhaust one shared
+  root rather than two private roots; noninteractive saturation rejects a
+  second query while admitting one small interactive write; a discarded pool
+  connection and its replacement prove exact root pointer identity.
+- **Primary retry condition:**
+  > If admission expands beyond one `MuxPool`, preserve this pool-owned root as a child of the later process-wide authority; never recreate byte authority at a connection or recovery boundary.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

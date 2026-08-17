@@ -749,6 +749,36 @@ fn schema_rejects_zero_for_documented_minimum_one_fields() {
                 }
             }),
         ),
+        (
+            "vendored.mux_pool.max_frame_bytes",
+            serde_json::json!({
+                "vendored": {
+                    "mux_pool": {
+                        "max_frame_bytes": 0
+                    }
+                }
+            }),
+        ),
+        (
+            "vendored.mux_pool.max_outbound_codec_bytes",
+            serde_json::json!({
+                "vendored": {
+                    "mux_pool": {
+                        "max_outbound_codec_bytes": 0
+                    }
+                }
+            }),
+        ),
+        (
+            "vendored.mux_pool.max_outbound_in_flight_requests",
+            serde_json::json!({
+                "vendored": {
+                    "mux_pool": {
+                        "max_outbound_in_flight_requests": 0
+                    }
+                }
+            }),
+        ),
     ] {
         assert!(
             schema.validate(&bad).is_err(),

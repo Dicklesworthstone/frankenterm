@@ -146,6 +146,9 @@
             "acquire_timeout_seconds": { "type": "integer", "minimum": 0 },
             "pipeline_depth": { "type": "integer", "minimum": 1 },
             "pipeline_timeout_ms": { "type": "integer", "minimum": 0 },
+            "max_frame_bytes": { "type": "integer", "minimum": 1 },
+            "max_outbound_codec_bytes": { "type": "integer", "minimum": 1 },
+            "max_outbound_in_flight_requests": { "type": "integer", "minimum": 1 },
             "compression": { "type": "string", "minLength": 1, "pattern": "\\S" }
           }
         },

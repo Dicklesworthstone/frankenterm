@@ -1360,6 +1360,9 @@ idle_timeout_seconds = 60
 acquire_timeout_seconds = 10
 pipeline_depth = 32
 pipeline_timeout_ms = 5000
+max_frame_bytes = 4194304
+max_outbound_codec_bytes = 1073741824
+max_outbound_in_flight_requests = 256
 compression = "auto"
 
 [vendored.sharding]

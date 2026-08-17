@@ -27,6 +27,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,8 @@ use crate::retry::RetryPolicy;
 use crate::runtime_async::sleep;
 
 use super::mux_client::{
-    DirectMuxClient, DirectMuxClientConfig, DirectMuxError, validate_render_batch_panes,
+    DirectMuxClient, DirectMuxClientConfig, DirectMuxError, DirectMuxOutboundBudget,
+    validate_render_batch_panes,
 };
 use codec::{
     GetLinesResponse, GetPaneRenderChangesResponse, GetPaneTieredScrollbackStatusesV1Response,
@@ -195,6 +197,7 @@ pub struct MuxPoolStats {
 pub struct MuxPool {
     pool: Pool<DirectMuxClient>,
     mux_config: DirectMuxClientConfig,
+    outbound_budget: Arc<DirectMuxOutboundBudget>,
     recovery: MuxRecoveryConfig,
     connections_created: AtomicU64,
     connections_failed: AtomicU64,
@@ -321,9 +324,11 @@ impl MuxPool {
         } else {
             config.pipeline_timeout
         };
+        let outbound_budget = Arc::new(DirectMuxOutboundBudget::from_config(&config.mux));
         Self {
             pool: Pool::new(config.pool),
             mux_config: config.mux,
+            outbound_budget,
             recovery: config.recovery,
             connections_created: AtomicU64::new(0),
             connections_failed: AtomicU64::new(0),
@@ -567,7 +572,13 @@ impl MuxPool {
                 );
                 c
             }
-            None => match DirectMuxClient::connect_with_cx(cx, self.mux_config.clone()).await {
+            None => match DirectMuxClient::connect_with_cx_and_budget(
+                cx,
+                self.mux_config.clone(),
+                Arc::clone(&self.outbound_budget),
+            )
+            .await
+            {
                 Ok(client) => {
                     let count = saturating_atomic_increment(&self.connections_created);
                     tracing::debug!(
@@ -2066,6 +2077,37 @@ mod tests {
     }
 
     #[test]
+    fn replacement_connections_share_one_outbound_budget_root() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 1));
+            let cx = crate::cx::for_testing();
+
+            let (first, first_guard) = pool
+                .acquire_client_with_cx(&cx)
+                .await
+                .expect("first connection");
+            assert!(first.shares_outbound_budget(&pool.outbound_budget));
+            drop(first);
+            drop(first_guard);
+
+            let (successor, successor_guard) = pool
+                .acquire_client_with_cx(&cx)
+                .await
+                .expect("replacement connection");
+            assert!(successor.shares_outbound_budget(&pool.outbound_budget));
+            assert_eq!(
+                pool.stats().await.connections_created,
+                2,
+                "discarded connection replacement must not create a second authority"
+            );
+            drop(successor);
+            drop(successor_guard);
+        });
+    }
+
+    #[test]
     fn pool_list_panes_with_cx_succeeds() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2357,9 +2399,13 @@ mod tests {
             let pool = MuxPool::new(pool_config(socket_path, 2));
             let cx = crate::cx::for_testing();
 
-            let client = DirectMuxClient::connect_with_cx(&cx, pool.mux_config.clone())
-                .await
-                .expect("seed aligned mux client");
+            let client = DirectMuxClient::connect_with_cx_and_budget(
+                &cx,
+                pool.mux_config.clone(),
+                Arc::clone(&pool.outbound_budget),
+            )
+            .await
+            .expect("seed aligned mux client");
             pool.pool
                 .put_with_cx(&cx, client)
                 .await
@@ -4425,9 +4471,13 @@ mod tests {
             let pool = MuxPool::new(config);
             let cx = crate::cx::for_testing();
 
-            let client = DirectMuxClient::connect_with_cx(&cx, pool.mux_config.clone())
-                .await
-                .expect("seed mux client");
+            let client = DirectMuxClient::connect_with_cx_and_budget(
+                &cx,
+                pool.mux_config.clone(),
+                Arc::clone(&pool.outbound_budget),
+            )
+            .await
+            .expect("seed mux client");
             pool.pool
                 .put_with_cx(&cx, client)
                 .await

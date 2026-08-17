@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use crate::config as wa_config;
@@ -24,11 +25,11 @@ use codec::{
     CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneTieredScrollbackStatusesV1, GetPaneTieredScrollbackStatusesV1Response, GetSemanticZones,
-    GetSemanticZonesResponse, InputSerial, ListPanes, ListPanesResponse, MoveFloatingPane, Pdu,
-    PduCapabilityUse, PduProducer, PduWireRole, RemoveFloatingPane, Resize, SelectStackPane,
-    SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane,
-    StreamingPduBuffer, SwapToLayout, ToggleFloatingPane, TopologyCapabilities, UnitResponse,
-    UpdatePaneConstraints, WriteToPane,
+    GetSemanticZonesResponse, InputSerial, ListPanes, ListPanesResponse, MoveFloatingPane,
+    OwnedPreparedPduOutbound, Pdu, PduCapabilityUse, PduProducer, PduQueueQos, PduWireRole,
+    RemoveFloatingPane, Resize, SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ,
+    SetLayoutCycle, SpawnResponse, SpawnV2, SplitPane, StreamingPduBuffer, SwapToLayout,
+    ToggleFloatingPane, TopologyCapabilities, UnitResponse, UpdatePaneConstraints, WriteToPane,
 };
 use config as wezterm_config;
 use frankenterm_term::TerminalSize;
@@ -38,7 +39,6 @@ use mux::tab::FloatingPaneRect;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_WRITE_TIMEOUT_MS: u64 = 5_000;
-const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_OUTSTANDING_REQUESTS: usize = 256;
 const DEFAULT_MAX_PENDING_RESPONSES: usize = 256;
 const DEFAULT_MAX_PENDING_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -55,6 +55,16 @@ pub struct DirectMuxClientConfig {
     pub read_timeout: Duration,
     pub write_timeout: Duration,
     pub max_frame_bytes: usize,
+    /// Shared logical codec-memory ceiling for admitted outbound requests.
+    ///
+    /// A standalone client owns one authority. Every connection and recovery
+    /// successor created by a [`super::mux_pool::MuxPool`] shares the pool's
+    /// single authority. One sixteenth of this byte ceiling and one request
+    /// slot (when more than one exists) remain reserved for control and
+    /// interactive traffic so bulk/query saturation cannot starve key input.
+    pub max_outbound_codec_bytes: usize,
+    /// Shared count ceiling for requests that currently own codec memory.
+    pub max_outbound_in_flight_requests: usize,
     /// Maximum request serials that may await a response on one connection.
     pub max_outstanding_requests: usize,
     /// Maximum out-of-order responses retained until their waiter consumes them.
@@ -84,6 +94,10 @@ impl DirectMuxClientConfig {
                 cfg.socket_path = Some(PathBuf::from(path));
             }
         }
+        cfg.max_frame_bytes = config.vendored.mux_pool.max_frame_bytes;
+        cfg.max_outbound_codec_bytes = config.vendored.mux_pool.max_outbound_codec_bytes;
+        cfg.max_outbound_in_flight_requests =
+            config.vendored.mux_pool.max_outbound_in_flight_requests;
         cfg.compression_mode = config.vendored.mux_pool.compression;
         cfg
     }
@@ -97,6 +111,11 @@ impl DirectMuxClientConfig {
     fn validate(&self) -> Result<(), DirectMuxError> {
         for (field, value) in [
             ("max_frame_bytes", self.max_frame_bytes),
+            ("max_outbound_codec_bytes", self.max_outbound_codec_bytes),
+            (
+                "max_outbound_in_flight_requests",
+                self.max_outbound_in_flight_requests,
+            ),
             ("max_outstanding_requests", self.max_outstanding_requests),
             ("max_pending_responses", self.max_pending_responses),
             (
@@ -135,7 +154,10 @@ impl Default for DirectMuxClientConfig {
             connect_timeout: Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS),
             read_timeout: Duration::from_millis(DEFAULT_READ_TIMEOUT_MS),
             write_timeout: Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
-            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_frame_bytes: crate::config::DEFAULT_VENDORED_MUX_MAX_FRAME_BYTES,
+            max_outbound_codec_bytes: crate::config::DEFAULT_VENDORED_MUX_MAX_OUTBOUND_CODEC_BYTES,
+            max_outbound_in_flight_requests:
+                crate::config::DEFAULT_VENDORED_MUX_MAX_OUTBOUND_IN_FLIGHT_REQUESTS,
             max_outstanding_requests: DEFAULT_MAX_OUTSTANDING_REQUESTS,
             max_pending_responses: DEFAULT_MAX_PENDING_RESPONSES,
             max_pending_response_bytes: DEFAULT_MAX_PENDING_RESPONSE_BYTES,
@@ -1043,6 +1065,203 @@ impl DirectMuxProtocolState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DirectMuxOutboundBudgetState {
+    codec_bytes: usize,
+    noninteractive_codec_bytes: usize,
+    requests: usize,
+    noninteractive_requests: usize,
+    peak_codec_bytes: usize,
+}
+
+/// One outbound-memory authority shared by every connection incarnation in a
+/// direct-client ownership domain.
+///
+/// The budget charges the codec's conservative peak, not just final wire
+/// bytes. This covers the counted payload, bounded compression destination,
+/// and final frame while they can coexist. A lease is released only after the
+/// write attempt has completed or the pre-write path has failed.
+#[derive(Debug)]
+pub(super) struct DirectMuxOutboundBudget {
+    max_codec_bytes: usize,
+    max_noninteractive_codec_bytes: usize,
+    max_requests: usize,
+    max_noninteractive_requests: usize,
+    state: StdMutex<DirectMuxOutboundBudgetState>,
+}
+
+impl DirectMuxOutboundBudget {
+    pub(super) fn from_config(config: &DirectMuxClientConfig) -> Self {
+        let interactive_byte_reserve = config.max_outbound_codec_bytes / 16;
+        let max_noninteractive_codec_bytes = config
+            .max_outbound_codec_bytes
+            .saturating_sub(interactive_byte_reserve);
+        let max_noninteractive_requests = if config.max_outbound_in_flight_requests > 1 {
+            config.max_outbound_in_flight_requests - 1
+        } else {
+            config.max_outbound_in_flight_requests
+        };
+        Self {
+            max_codec_bytes: config.max_outbound_codec_bytes,
+            max_noninteractive_codec_bytes,
+            max_requests: config.max_outbound_in_flight_requests,
+            max_noninteractive_requests,
+            state: StdMutex::new(DirectMuxOutboundBudgetState::default()),
+        }
+    }
+
+    fn try_admit(
+        self: &Arc<Self>,
+        prepared: OwnedPreparedPduOutbound,
+        max_frame_bytes: usize,
+    ) -> Result<DirectMuxOutboundLease, DirectMuxError> {
+        if prepared.maximum_frame_bytes() > max_frame_bytes {
+            return Err(DirectMuxError::proven_pre_write_rejection(
+                DirectMuxError::FrameTooLarge {
+                    max_bytes: max_frame_bytes,
+                },
+            ));
+        }
+        let planned_codec_bytes = prepared.codec_peak_bytes();
+        let noninteractive = matches!(
+            prepared.metadata().queue_qos,
+            PduQueueQos::Normal | PduQueueQos::Bulk
+        );
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (requested_count, requested_bytes) = checked_retention_after_insert(
+            "outbound mux admission",
+            state.requests,
+            state.codec_bytes,
+            None,
+            planned_codec_bytes,
+            RetentionLimit {
+                max_count: self.max_requests,
+                max_bytes: self.max_codec_bytes,
+            },
+        )
+        .map_err(DirectMuxError::proven_pre_write_rejection)?;
+        let (requested_noninteractive_count, requested_noninteractive_bytes) = if noninteractive {
+            checked_retention_after_insert(
+                "noninteractive outbound mux admission",
+                state.noninteractive_requests,
+                state.noninteractive_codec_bytes,
+                None,
+                planned_codec_bytes,
+                RetentionLimit {
+                    max_count: self.max_noninteractive_requests,
+                    max_bytes: self.max_noninteractive_codec_bytes,
+                },
+            )
+            .map_err(DirectMuxError::proven_pre_write_rejection)?
+        } else {
+            (
+                state.noninteractive_requests,
+                state.noninteractive_codec_bytes,
+            )
+        };
+        state.codec_bytes = requested_bytes;
+        state.noninteractive_codec_bytes = requested_noninteractive_bytes;
+        state.requests = requested_count;
+        state.noninteractive_requests = requested_noninteractive_count;
+        state.peak_codec_bytes = state.peak_codec_bytes.max(requested_bytes);
+        drop(state);
+
+        metrics::counter!(
+            "mux.direct_client.outbound.admission.total",
+            "outcome" => "admitted"
+        )
+        .increment(1);
+        metrics::counter!(
+            "mux.direct_client.outbound.codec_bytes.total",
+            "outcome" => "reserved"
+        )
+        .increment(u64::try_from(planned_codec_bytes).unwrap_or(u64::MAX));
+
+        Ok(DirectMuxOutboundLease {
+            budget: Arc::clone(self),
+            prepared: Some(prepared),
+            planned_codec_bytes,
+            noninteractive,
+        })
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> DirectMuxOutboundBudgetState {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[derive(Debug)]
+struct DirectMuxOutboundLease {
+    budget: Arc<DirectMuxOutboundBudget>,
+    prepared: Option<OwnedPreparedPduOutbound>,
+    planned_codec_bytes: usize,
+    noninteractive: bool,
+}
+
+impl DirectMuxOutboundLease {
+    fn pdu_name(&self) -> &'static str {
+        self.prepared
+            .as_ref()
+            .expect("direct mux outbound lease retains its PDU until encoding")
+            .pdu()
+            .pdu_name()
+    }
+
+    fn encode_frame(&mut self, serial: u64) -> Result<Vec<u8>, DirectMuxError> {
+        self.prepared
+            .take()
+            .expect("direct mux outbound lease encodes its exact PDU once")
+            .encode_frame(serial)
+            .map_err(|error| DirectMuxError::Codec(error.to_string()))
+            .map_err(DirectMuxError::proven_pre_write_rejection)
+    }
+}
+
+impl Drop for DirectMuxOutboundLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.codec_bytes = state
+            .codec_bytes
+            .checked_sub(self.planned_codec_bytes)
+            .expect("direct mux outbound codec reservation underflow");
+        state.requests = state
+            .requests
+            .checked_sub(1)
+            .expect("direct mux outbound request reservation underflow");
+        if self.noninteractive {
+            state.noninteractive_codec_bytes = state
+                .noninteractive_codec_bytes
+                .checked_sub(self.planned_codec_bytes)
+                .expect("direct mux noninteractive codec reservation underflow");
+            state.noninteractive_requests = state
+                .noninteractive_requests
+                .checked_sub(1)
+                .expect("direct mux noninteractive request reservation underflow");
+        }
+        drop(state);
+        metrics::counter!(
+            "mux.direct_client.outbound.lease_release.total"
+        )
+        .increment(1);
+        metrics::counter!(
+            "mux.direct_client.outbound.codec_bytes.total",
+            "outcome" => "released"
+        )
+        .increment(u64::try_from(self.planned_codec_bytes).unwrap_or(u64::MAX));
+    }
+}
+
 pub struct DirectMuxClient {
     connection_id: u64,
     protocol_state: DirectMuxProtocolState,
@@ -1055,6 +1274,7 @@ pub struct DirectMuxClient {
     pending_response_bytes: usize,
     pending_render_changes: PendingRenderChanges,
     render_change_snapshots: RenderChangeSnapshots,
+    outbound_budget: Arc<DirectMuxOutboundBudget>,
     config: DirectMuxClientConfig,
     compression_mode: CompressionMode,
     connection_poisoned: bool,
@@ -1768,6 +1988,11 @@ impl Drop for RenderBatchGuard<'_> {
 }
 
 impl DirectMuxClient {
+    #[cfg(test)]
+    pub(super) fn shares_outbound_budget(&self, budget: &Arc<DirectMuxOutboundBudget>) -> bool {
+        Arc::ptr_eq(&self.outbound_budget, budget)
+    }
+
     pub async fn connect(config: DirectMuxClientConfig) -> Result<Self, DirectMuxError> {
         // Keep the ambient entry point for compatibility, but route the
         // actual transport work through the explicit-Cx path so connect,
@@ -1781,6 +2006,16 @@ impl DirectMuxClient {
     pub async fn connect_with_cx(
         cx: &Cx,
         config: DirectMuxClientConfig,
+    ) -> Result<Self, DirectMuxError> {
+        config.validate()?;
+        let outbound_budget = Arc::new(DirectMuxOutboundBudget::from_config(&config));
+        Self::connect_with_cx_and_budget(cx, config, outbound_budget).await
+    }
+
+    pub(super) async fn connect_with_cx_and_budget(
+        cx: &Cx,
+        config: DirectMuxClientConfig,
+        outbound_budget: Arc<DirectMuxOutboundBudget>,
     ) -> Result<Self, DirectMuxError> {
         config.validate()?;
         let socket_path = resolve_socket_path(&config)?;
@@ -1801,6 +2036,7 @@ impl DirectMuxClient {
             socket_path.clone(),
             config.clone(),
             preferred_mode,
+            Arc::clone(&outbound_budget),
         )
         .await
         {
@@ -1821,8 +2057,14 @@ impl DirectMuxClient {
                     explicit_cx = true,
                     "retrying direct mux connection with compression fallback"
                 );
-                Self::connect_with_mode_with_cx(cx, socket_path, config, CompressionMode::Always)
-                    .await
+                Self::connect_with_mode_with_cx(
+                    cx,
+                    socket_path,
+                    config,
+                    CompressionMode::Always,
+                    outbound_budget,
+                )
+                .await
             }
             Err(err) => Err(err),
         }
@@ -1833,6 +2075,7 @@ impl DirectMuxClient {
         socket_path: PathBuf,
         config: DirectMuxClientConfig,
         compression_mode: CompressionMode,
+        outbound_budget: Arc<DirectMuxOutboundBudget>,
     ) -> Result<Self, DirectMuxError> {
         let connection_id = next_connection_id()?;
         checkpoint_mux_cx(cx, connection_id, "connect_start")?;
@@ -1870,6 +2113,7 @@ impl DirectMuxClient {
             pending_response_bytes: 0,
             pending_render_changes: PendingRenderChanges::default(),
             render_change_snapshots: RenderChangeSnapshots::default(),
+            outbound_budget,
             connection_poisoned: false,
             #[cfg(test)]
             poison_transition_count: 0,
@@ -3324,6 +3568,34 @@ impl DirectMuxClient {
         Ok(Some(pdu))
     }
 
+    /// Plan and charge one exact request before serial allocation or codec
+    /// buffer construction. The returned lease owns the PDU/plan pair and the
+    /// shared budget reservation through the write boundary.
+    fn admit_outbound_request(&self, pdu: Pdu) -> Result<DirectMuxOutboundLease, DirectMuxError> {
+        let prepared = pdu
+            .prepare_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                self.compression_mode,
+            )
+            .map_err(|error| DirectMuxError::Codec(error.to_string()))
+            .map_err(DirectMuxError::proven_pre_write_rejection);
+        let admitted = match prepared {
+            Ok(prepared) => self
+                .outbound_budget
+                .try_admit(prepared, self.config.max_frame_bytes),
+            Err(error) => Err(error),
+        };
+        admitted.inspect_err(|_| {
+            metrics::counter!(
+                "mux.direct_client.outbound.admission.total",
+                "outcome" => "rejected"
+            )
+            .increment(1);
+        })
+    }
+
     async fn send_request_with_cx(&mut self, cx: &Cx, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
         let serial = self.send_request_only_with_cx(cx, pdu).await?;
         self.await_response_with_cx(cx, serial).await
@@ -3348,14 +3620,19 @@ impl DirectMuxClient {
             .ensure_outstanding_request_capacity()
             .map_err(DirectMuxError::proven_pre_write_rejection);
         self.settle_transport_result(capacity, "outstanding request admission failure", false)?;
+        let admitted = self.admit_outbound_request(pdu);
+        let mut outbound = self.settle_transport_result(
+            admitted,
+            "outbound request byte admission failure",
+            false,
+        )?;
         let serial_result = next_request_serial(&mut self.serial);
         let serial = self.settle_transport_result(
             serial_result,
             "request serial allocation failure",
             false,
         )?;
-        let pdu_name = pdu.pdu_name();
-        let mut buf = Vec::new();
+        let pdu_name = outbound.pdu_name();
         tracing::trace!(
             connection_id = self.connection_id,
             request_serial = serial,
@@ -3364,11 +3641,8 @@ impl DirectMuxClient {
             compression_mode = ?self.compression_mode,
             "encoding mux request"
         );
-        let encoded = pdu
-            .encode_with_mode(&mut buf, serial, self.compression_mode)
-            .map_err(|err| DirectMuxError::Codec(err.to_string()))
-            .map_err(DirectMuxError::proven_pre_write_rejection);
-        self.settle_transport_result(encoded, "outbound PDU encoding failure", false)?;
+        let encoded = outbound.encode_frame(serial);
+        let buf = self.settle_transport_result(encoded, "outbound PDU encoding failure", false)?;
         let encoded_len = buf.len();
         if let Some(write_boundary_entered) = write_boundary_entered {
             *write_boundary_entered = true;
@@ -3446,11 +3720,16 @@ impl DirectMuxClient {
             .ensure_outstanding_request_capacity()
             .map_err(DirectMuxError::proven_pre_write_rejection);
         self.settle_transport_result(capacity, "outstanding request admission failure", true)?;
+        let admitted = self.admit_outbound_request(pdu);
+        let mut outbound = self.settle_transport_result(
+            admitted,
+            "outbound request byte admission failure",
+            true,
+        )?;
         let serial_result = next_request_serial(&mut self.serial);
         let serial =
             self.settle_transport_result(serial_result, "request serial allocation failure", true)?;
-        let pdu_name = pdu.pdu_name();
-        let mut buf = Vec::new();
+        let pdu_name = outbound.pdu_name();
         tracing::trace!(
             connection_id = self.connection_id,
             request_serial = serial,
@@ -3460,11 +3739,8 @@ impl DirectMuxClient {
             compression_mode = ?self.compression_mode,
             "encoding mux request"
         );
-        let encoded = pdu
-            .encode_with_mode(&mut buf, serial, self.compression_mode)
-            .map_err(|err| DirectMuxError::Codec(err.to_string()))
-            .map_err(DirectMuxError::proven_pre_write_rejection);
-        self.settle_transport_result(encoded, "outbound PDU encoding failure", true)?;
+        let encoded = outbound.encode_frame(serial);
+        let buf = self.settle_transport_result(encoded, "outbound PDU encoding failure", true)?;
         let encoded_len = buf.len();
         let checkpoint = checkpoint_mux_cx(cx, self.connection_id, "request_write_wait");
         self.settle_transport_result(checkpoint, "pre-write cancellation", true)?;
@@ -4874,8 +5150,8 @@ mod tests {
     use crate::runtime_async::{CompatRuntime, Mutex, RuntimeBuilder, sleep};
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     const COMPRESSED_MASK: u64 = 1 << 63;
 
@@ -10360,6 +10636,331 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_zero_outbound_budget_before_transport_use() {
+        for (field, config) in [
+            (
+                "max_outbound_codec_bytes",
+                DirectMuxClientConfig {
+                    max_outbound_codec_bytes: 0,
+                    ..DirectMuxClientConfig::default()
+                },
+            ),
+            (
+                "max_outbound_in_flight_requests",
+                DirectMuxClientConfig {
+                    max_outbound_in_flight_requests: 0,
+                    ..DirectMuxClientConfig::default()
+                },
+            ),
+        ] {
+            let err = config
+                .validate()
+                .expect_err("zero outbound budget must fail closed");
+            assert!(matches!(
+                err,
+                DirectMuxError::InvalidLimit { field: got } if got == field
+            ));
+        }
+    }
+
+    fn prepared_write_request(
+        compression_mode: CompressionMode,
+        payload_bytes: usize,
+    ) -> OwnedPreparedPduOutbound {
+        Pdu::WriteToPane(WriteToPane {
+            pane_id: 7,
+            data: vec![b'x'; payload_bytes],
+        })
+        .prepare_outbound(
+            PduProducer::Client,
+            PduWireRole::Request,
+            None,
+            compression_mode,
+        )
+        .expect("bounded write request must produce an outbound plan")
+    }
+
+    #[test]
+    fn outbound_frame_limit_is_exact_and_precedes_budget_mutation_for_every_mode() {
+        for compression_mode in [
+            CompressionMode::Never,
+            CompressionMode::Auto,
+            CompressionMode::Always,
+        ] {
+            let probe = prepared_write_request(compression_mode, 4096);
+            let exact_frame_bytes = probe.maximum_frame_bytes();
+            let exact_codec_bytes = probe.codec_peak_bytes();
+            let config = DirectMuxClientConfig {
+                max_frame_bytes: exact_frame_bytes,
+                max_outbound_codec_bytes: exact_codec_bytes,
+                max_outbound_in_flight_requests: 1,
+                ..DirectMuxClientConfig::default()
+            };
+            let budget = Arc::new(DirectMuxOutboundBudget::from_config(&config));
+
+            let lease = budget
+                .try_admit(probe, exact_frame_bytes)
+                .expect("the exact conservative frame and codec bounds must admit");
+            assert_eq!(
+                budget.snapshot(),
+                DirectMuxOutboundBudgetState {
+                    codec_bytes: exact_codec_bytes,
+                    noninteractive_codec_bytes: 0,
+                    requests: 1,
+                    noninteractive_requests: 0,
+                    peak_codec_bytes: exact_codec_bytes,
+                }
+            );
+            drop(lease);
+            assert_eq!(
+                budget.snapshot(),
+                DirectMuxOutboundBudgetState {
+                    peak_codec_bytes: exact_codec_bytes,
+                    ..DirectMuxOutboundBudgetState::default()
+                }
+            );
+
+            let rejected = budget
+                .try_admit(
+                    prepared_write_request(compression_mode, 4096),
+                    exact_frame_bytes - 1,
+                )
+                .expect_err("one byte below the planned frame bound must reject");
+            assert!(matches!(
+                rejected,
+                DirectMuxError::ProvenPreWriteRejection(source)
+                    if matches!(*source, DirectMuxError::FrameTooLarge { max_bytes }
+                        if max_bytes == exact_frame_bytes - 1)
+            ));
+            assert_eq!(
+                budget.snapshot(),
+                DirectMuxOutboundBudgetState {
+                    peak_codec_bytes: exact_codec_bytes,
+                    ..DirectMuxOutboundBudgetState::default()
+                },
+                "frame-cap rejection must not charge the shared authority"
+            );
+        }
+    }
+
+    #[test]
+    fn outbound_budget_is_shared_and_releases_the_exact_lease() {
+        let first = prepared_write_request(CompressionMode::Never, 1024);
+        let one_request_bytes = first.codec_peak_bytes();
+        let max_codec_bytes = one_request_bytes
+            .checked_mul(2)
+            .expect("small test budget must fit");
+        let config = DirectMuxClientConfig {
+            max_frame_bytes: first.maximum_frame_bytes(),
+            max_outbound_codec_bytes: max_codec_bytes,
+            max_outbound_in_flight_requests: 2,
+            ..DirectMuxClientConfig::default()
+        };
+        let budget = Arc::new(DirectMuxOutboundBudget::from_config(&config));
+        let first_lease = budget
+            .try_admit(first, config.max_frame_bytes)
+            .expect("first connection incarnation must admit");
+        let successor_budget = Arc::clone(&budget);
+        let successor_lease = successor_budget
+            .try_admit(
+                prepared_write_request(CompressionMode::Never, 1024),
+                config.max_frame_bytes,
+            )
+            .expect("successor connection must share the remaining root capacity");
+
+        let rejected = successor_budget
+            .try_admit(
+                prepared_write_request(CompressionMode::Never, 1024),
+                config.max_frame_bytes,
+            )
+            .expect_err("a third connection must not bypass the shared root");
+        assert!(matches!(
+            rejected,
+            DirectMuxError::ProvenPreWriteRejection(source)
+                if matches!(*source, DirectMuxError::RetentionLimitExceeded {
+                    resource: "outbound mux admission",
+                    ..
+                })
+        ));
+        assert_eq!(budget.snapshot().codec_bytes, max_codec_bytes);
+        assert_eq!(budget.snapshot().requests, 2);
+
+        drop(first_lease);
+        let replacement = successor_budget
+            .try_admit(
+                prepared_write_request(CompressionMode::Never, 1024),
+                config.max_frame_bytes,
+            )
+            .expect("dropping one exact lease must restore one root slot");
+        assert_eq!(budget.snapshot().codec_bytes, max_codec_bytes);
+        assert_eq!(budget.snapshot().requests, 2);
+        drop(replacement);
+        drop(successor_lease);
+        assert_eq!(budget.snapshot().codec_bytes, 0);
+        assert_eq!(budget.snapshot().requests, 0);
+        assert_eq!(budget.snapshot().peak_codec_bytes, max_codec_bytes);
+    }
+
+    #[test]
+    fn noninteractive_saturation_preserves_one_small_input_admission() {
+        let query = Pdu::ListPanes(ListPanes {})
+            .prepare_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Never,
+            )
+            .expect("query plan");
+        assert_eq!(query.metadata().queue_qos, PduQueueQos::Normal);
+        let query_bytes = query.codec_peak_bytes();
+        let query_frame_bytes = query.maximum_frame_bytes();
+        let input = prepared_write_request(CompressionMode::Never, 1);
+        assert_eq!(input.metadata().queue_qos, PduQueueQos::Interactive);
+        let input_bytes = input.codec_peak_bytes();
+        let input_frame_bytes = input.maximum_frame_bytes();
+        let total_bytes = query_bytes
+            .checked_add(input_bytes)
+            .expect("small reserve proof must fit");
+        let budget = Arc::new(DirectMuxOutboundBudget {
+            max_codec_bytes: total_bytes,
+            max_noninteractive_codec_bytes: query_bytes,
+            max_requests: 2,
+            max_noninteractive_requests: 1,
+            state: StdMutex::new(DirectMuxOutboundBudgetState::default()),
+        });
+
+        let query_lease = budget
+            .try_admit(query, query_frame_bytes)
+            .expect("first noninteractive request must admit");
+        let second_query = budget
+            .try_admit(
+                Pdu::ListPanes(ListPanes {})
+                    .prepare_outbound(
+                        PduProducer::Client,
+                        PduWireRole::Request,
+                        None,
+                        CompressionMode::Never,
+                    )
+                    .expect("second query plan"),
+                query_frame_bytes,
+            )
+            .expect_err("noninteractive lane must stop before consuming input reserve");
+        assert!(matches!(
+            second_query,
+            DirectMuxError::ProvenPreWriteRejection(source)
+                if matches!(*source, DirectMuxError::RetentionLimitExceeded {
+                    resource: "noninteractive outbound mux admission",
+                    ..
+                })
+        ));
+
+        let input_lease = budget
+            .try_admit(input, input_frame_bytes)
+            .expect("small interactive input must use the reserved root capacity");
+        assert_eq!(budget.snapshot().codec_bytes, total_bytes);
+        assert_eq!(budget.snapshot().requests, 2);
+        assert_eq!(budget.snapshot().noninteractive_codec_bytes, query_bytes);
+        assert_eq!(budget.snapshot().noninteractive_requests, 1);
+        drop(input_lease);
+        drop(query_lease);
+        assert_eq!(budget.snapshot().codec_bytes, 0);
+        assert_eq!(budget.snapshot().requests, 0);
+    }
+
+    #[test]
+    fn outbound_cap_rejection_precedes_serial_and_wire_for_every_mode() {
+        run_async_test(async {
+            for compression_mode in [
+                CompressionMode::Never,
+                CompressionMode::Auto,
+                CompressionMode::Always,
+            ] {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = temp_dir
+                    .path()
+                    .join(format!("outbound-cap-{compression_mode:?}.sock"));
+                let listener = compat_unix::bind(&socket_path)
+                    .await
+                    .expect("bind direct mux listener");
+                let server = task::spawn(async move {
+                    let mut stream = accept_direct_mux_handshake(
+                        listener,
+                        CODEC_VERSION,
+                        CODEC_VERSION_MIN_SUPPORTED,
+                    )
+                    .await;
+                    let mut read_buf = StreamingPduBuffer::new();
+                    let observed = read_test_request_pdu(&mut stream, &mut read_buf).await;
+                    assert!(
+                        matches!(&observed.pdu, Pdu::ListPanes(_)),
+                        "the first post-handshake frame must be the causal follow-up, not the rejected request: {:?}",
+                        observed.pdu
+                    );
+                });
+
+                let cx = crate::cx::for_testing();
+                let config = DirectMuxClientConfig::default().with_socket_path(&socket_path);
+                let budget = Arc::new(DirectMuxOutboundBudget::from_config(&config));
+                let mut client = DirectMuxClient::connect_with_mode_with_cx(
+                    &cx,
+                    socket_path,
+                    config,
+                    compression_mode,
+                    Arc::clone(&budget),
+                )
+                .await
+                .expect("direct mux handshake");
+                let request = Pdu::WriteToPane(WriteToPane {
+                    pane_id: 7,
+                    data: vec![b'x'; 4096],
+                });
+                let planned_frame_bytes = request
+                    .plan_outbound(
+                        PduProducer::Client,
+                        PduWireRole::Request,
+                        None,
+                        compression_mode,
+                    )
+                    .expect("request plan")
+                    .maximum_frame_bytes();
+                client.config.max_frame_bytes = planned_frame_bytes - 1;
+                let serial_before = client.serial;
+                let mut write_boundary_entered = false;
+                let rejected = client
+                    .send_request_only_with_cx_tracking(
+                        &cx,
+                        request,
+                        Some(&mut write_boundary_entered),
+                    )
+                    .await
+                    .expect_err("cap-minus-one must reject before the request serial");
+                assert!(matches!(
+                    rejected,
+                    DirectMuxError::ProvenPreWriteRejection(source)
+                        if matches!(*source, DirectMuxError::FrameTooLarge { max_bytes }
+                            if max_bytes == planned_frame_bytes - 1)
+                ));
+                assert_eq!(client.serial, serial_before);
+                assert!(!write_boundary_entered);
+                assert!(!client.connection_poisoned);
+                assert_eq!(budget.snapshot().codec_bytes, 0);
+                assert_eq!(budget.snapshot().requests, 0);
+
+                client.config.max_frame_bytes =
+                    crate::config::DEFAULT_VENDORED_MUX_MAX_FRAME_BYTES;
+                let follow_up_serial = client
+                    .send_request_only_with_cx(&cx, Pdu::ListPanes(ListPanes {}))
+                    .await
+                    .expect("pre-write rejection must leave the connection reusable");
+                assert_eq!(follow_up_serial, serial_before + 1);
+
+                server.await.expect("causal server observer task");
+                drop(client);
+            }
+        });
+    }
+
+    #[test]
     fn pending_render_sideband_index_uses_one_keyed_take_per_response() {
         for depth in [
             32usize,
@@ -11018,6 +11619,8 @@ mod tests {
         assert!(config.read_timeout.as_secs() > 0);
         assert!(config.write_timeout.as_secs() > 0);
         assert!(config.max_frame_bytes > 0);
+        assert!(config.max_outbound_codec_bytes > 0);
+        assert!(config.max_outbound_in_flight_requests > 0);
         assert!(config.max_outstanding_requests > 0);
         assert!(config.max_pending_responses > 0);
         assert!(config.max_pending_response_bytes > 0);
@@ -11075,6 +11678,19 @@ mod tests {
             config.compression_mode,
             crate::config::VendoredCompressionMode::Never
         );
+    }
+
+    #[test]
+    fn config_from_wa_config_with_outbound_admission_bounds() {
+        let mut wa_cfg = crate::config::Config::default();
+        wa_cfg.vendored.mux_pool.max_frame_bytes = 12_345;
+        wa_cfg.vendored.mux_pool.max_outbound_codec_bytes = 67_890;
+        wa_cfg.vendored.mux_pool.max_outbound_in_flight_requests = 17;
+
+        let config = DirectMuxClientConfig::from_wa_config(&wa_cfg);
+        assert_eq!(config.max_frame_bytes, 12_345);
+        assert_eq!(config.max_outbound_codec_bytes, 67_890);
+        assert_eq!(config.max_outbound_in_flight_requests, 17);
     }
 
     #[test]
