@@ -88,6 +88,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::{TryFrom, TryInto};
 use std::io::{Read, Write};
+use std::num::NonZeroU64;
 #[cfg(windows)]
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -96,6 +97,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
+use termwiz::input::KeyEvent;
 use thiserror::*;
 #[cfg(windows)]
 use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
@@ -4313,6 +4315,7 @@ pub struct Mux {
     pane_count_recomputes: AtomicUsize,
     banner: RwLock<Option<String>>,
     clients: RwLock<HashMap<ClientId, ClientInfo>>,
+    reliable_input: Mutex<ReliableInputLedger>,
     identity: RwLock<Option<Arc<ClientId>>>,
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
     main_thread_id: std::thread::ThreadId,
@@ -4321,6 +4324,202 @@ pub struct Mux {
     /// high-rate Alert. Used by `notify` to drop duplicate repeats within
     /// `HIGH_RATE_ALERT_DEDUPE_WINDOW`. ft-18xgy.
     last_high_rate_alert: Mutex<HashMap<(PaneId, HighRateAlertKind), Instant>>,
+}
+
+/// Maximum number of distinct client incarnations whose latest reliable input
+/// identity is retained for one mux lifetime. Reconnects reuse the same
+/// [`ClientId`] entry. A new identity beyond this bound is admitted as an
+/// ordinary client but receives a typed reliable-input refusal rather than
+/// growing mux memory without limit.
+pub const MAX_RELIABLE_INPUT_CLIENTS: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliableInputKeyKind {
+    KeyDown,
+    KeyUp,
+}
+
+#[derive(Debug, Clone)]
+struct ReliableInputFingerprint {
+    registration: PaneRegistrationHandle,
+    input_serial: u64,
+    kind: ReliableInputKeyKind,
+    event: KeyEvent,
+}
+
+impl ReliableInputFingerprint {
+    fn matches(
+        &self,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        kind: ReliableInputKeyKind,
+        event: &KeyEvent,
+    ) -> bool {
+        self.registration.same_registration(registration)
+            && self.input_serial == input_serial
+            && self.kind == kind
+            && self.event == *event
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReliableInputTerminalOutcome {
+    Applied,
+    OutcomeUnknown,
+}
+
+#[derive(Debug)]
+struct ReliableInputTerminal {
+    fingerprint: ReliableInputFingerprint,
+    outcome: ReliableInputTerminalOutcome,
+}
+
+#[derive(Debug)]
+struct ReliableInputPending {
+    claim_id: NonZeroU64,
+    fingerprint: ReliableInputFingerprint,
+    side_effect_started: bool,
+}
+
+#[derive(Debug)]
+struct ReliableInputClientLedger {
+    next_claim_id: Option<NonZeroU64>,
+    pending: Option<ReliableInputPending>,
+    terminal: Option<ReliableInputTerminal>,
+}
+
+impl ReliableInputClientLedger {
+    fn new() -> Self {
+        Self {
+            next_claim_id: NonZeroU64::new(1),
+            pending: None,
+            terminal: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReliableInputLedger {
+    clients: HashMap<ClientId, Arc<Mutex<ReliableInputClientLedger>>>,
+}
+
+impl ReliableInputLedger {
+    fn new() -> Self {
+        Self {
+            clients: HashMap::with_capacity(MAX_RELIABLE_INPUT_CLIENTS),
+        }
+    }
+
+    fn prepare_client(&mut self, client_id: &ClientId) -> bool {
+        if self.clients.contains_key(client_id) {
+            return true;
+        }
+        if self.clients.len() >= MAX_RELIABLE_INPUT_CLIENTS {
+            return false;
+        }
+        self.clients.insert(
+            client_id.clone(),
+            Arc::new(Mutex::new(ReliableInputClientLedger::new())),
+        );
+        true
+    }
+}
+
+#[derive(Debug)]
+pub enum ReliableInputClaimOutcome {
+    Execute(ReliableInputCommitPermit),
+    DuplicateApplied,
+    DuplicatePending,
+    OutcomeUnknown,
+    ClientNotRegistered,
+    ClientRegistrationRetired,
+    ClientLedgerUnavailable,
+    IdentityAuthorityExhausted,
+    StaleSerial,
+    IdentityConflict,
+}
+
+/// Armed ownership of one client's sole pending reliable key transition.
+///
+/// Dropping before [`Self::begin_side_effect`] rolls the claim back so a retry
+/// may execute. Dropping after the pane callback begins records an
+/// outcome-unknown terminal state: replay is then refused rather than risking
+/// a duplicate key effect after a panic or callback error.
+pub struct ReliableInputCommitPermit {
+    client: Arc<Mutex<ReliableInputClientLedger>>,
+    claim_id: NonZeroU64,
+    armed: bool,
+}
+
+impl std::fmt::Debug for ReliableInputCommitPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReliableInputCommitPermit")
+            .field("claim_id", &self.claim_id)
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReliableInputCommitPermit {
+    /// Mark the exact point after which a callback failure cannot prove that no
+    /// externally visible key effect occurred.
+    pub fn begin_side_effect(&mut self) -> bool {
+        let mut client = self.client.lock();
+        let Some(pending) = client.pending.as_mut() else {
+            return false;
+        };
+        if pending.claim_id != self.claim_id || pending.side_effect_started {
+            return false;
+        }
+        pending.side_effect_started = true;
+        true
+    }
+
+    /// Commit successful application without allocation.
+    pub fn commit_applied(mut self) -> bool {
+        let committed = {
+            let mut client = self.client.lock();
+            let Some(pending) = client.pending.take() else {
+                return false;
+            };
+            if pending.claim_id != self.claim_id || !pending.side_effect_started {
+                client.pending = Some(pending);
+                return false;
+            }
+            client.terminal = Some(ReliableInputTerminal {
+                fingerprint: pending.fingerprint,
+                outcome: ReliableInputTerminalOutcome::Applied,
+            });
+            true
+        };
+        if committed {
+            self.armed = false;
+        }
+        committed
+    }
+}
+
+impl Drop for ReliableInputCommitPermit {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut client = self.client.lock();
+        let Some(pending) = client.pending.take() else {
+            return;
+        };
+        if pending.claim_id != self.claim_id {
+            client.pending = Some(pending);
+            return;
+        }
+        if pending.side_effect_started {
+            client.terminal = Some(ReliableInputTerminal {
+                fingerprint: pending.fingerprint,
+                outcome: ReliableInputTerminalOutcome::OutcomeUnknown,
+            });
+        }
+    }
 }
 
 fn mux_socket_buffer_size() -> usize {
@@ -5026,6 +5225,7 @@ impl Mux {
             pane_count_recomputes: AtomicUsize::new(0),
             banner: RwLock::new(None),
             clients: RwLock::new(HashMap::new()),
+            reliable_input: Mutex::new(ReliableInputLedger::new()),
             identity: RwLock::new(None),
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
@@ -5301,6 +5501,11 @@ impl Mux {
     }
 
     pub fn register_client(&self, client_id: Arc<ClientId>) {
+        let reliable_input_prepared = self.reliable_input.lock().prepare_client(&client_id);
+        if !reliable_input_prepared {
+            metrics::counter!("mux.reliable_input.client_admission", "outcome" => "capacity")
+                .increment(1);
+        }
         let replaced = {
             let mut clients = self.clients.write();
             if clients
@@ -5332,6 +5537,90 @@ impl Mux {
             .read()
             .get(client_id.as_ref())
             .is_some_and(|info| Arc::ptr_eq(&info.client_id, client_id))
+    }
+
+    /// Claim the sole pending reliable key transition for an exact registered
+    /// client and pane generation. This method invokes no pane callback and
+    /// retains no mux lock in the returned permit.
+    pub fn claim_reliable_key_event(
+        &self,
+        client_id: Option<&Arc<ClientId>>,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        kind: ReliableInputKeyKind,
+        event: &KeyEvent,
+    ) -> ReliableInputClaimOutcome {
+        let Some(client_id) = client_id else {
+            return ReliableInputClaimOutcome::ClientNotRegistered;
+        };
+        if !self.client_registration_is_current(client_id) {
+            return ReliableInputClaimOutcome::ClientRegistrationRetired;
+        }
+        let Some(client_ledger) = self
+            .reliable_input
+            .lock()
+            .clients
+            .get(client_id.as_ref())
+            .cloned()
+        else {
+            return ReliableInputClaimOutcome::ClientLedgerUnavailable;
+        };
+        let mut ledger = client_ledger.lock();
+        if let Some(pending) = &ledger.pending {
+            return if pending.fingerprint.input_serial < input_serial {
+                ReliableInputClaimOutcome::DuplicatePending
+            } else if pending.fingerprint.input_serial > input_serial {
+                ReliableInputClaimOutcome::StaleSerial
+            } else if pending
+                .fingerprint
+                .matches(registration, input_serial, kind, event)
+            {
+                ReliableInputClaimOutcome::DuplicatePending
+            } else {
+                ReliableInputClaimOutcome::IdentityConflict
+            };
+        }
+        if let Some(terminal) = &ledger.terminal {
+            if terminal.fingerprint.input_serial > input_serial {
+                return ReliableInputClaimOutcome::StaleSerial;
+            }
+            if terminal.fingerprint.input_serial == input_serial {
+                if !terminal
+                    .fingerprint
+                    .matches(registration, input_serial, kind, event)
+                {
+                    return ReliableInputClaimOutcome::IdentityConflict;
+                }
+                return match terminal.outcome {
+                    ReliableInputTerminalOutcome::Applied => {
+                        ReliableInputClaimOutcome::DuplicateApplied
+                    }
+                    ReliableInputTerminalOutcome::OutcomeUnknown => {
+                        ReliableInputClaimOutcome::OutcomeUnknown
+                    }
+                };
+            }
+        }
+        let Some(claim_id) = ledger.next_claim_id else {
+            return ReliableInputClaimOutcome::IdentityAuthorityExhausted;
+        };
+        ledger.next_claim_id = claim_id.get().checked_add(1).and_then(NonZeroU64::new);
+        ledger.pending = Some(ReliableInputPending {
+            claim_id,
+            fingerprint: ReliableInputFingerprint {
+                registration: registration.clone(),
+                input_serial,
+                kind,
+                event: event.clone(),
+            },
+            side_effect_started: false,
+        });
+        drop(ledger);
+        ReliableInputClaimOutcome::Execute(ReliableInputCommitPermit {
+            client: client_ledger,
+            claim_id,
+            armed: true,
+        })
     }
 
     pub fn iter_clients(&self) -> Vec<ClientInfo> {
@@ -11569,6 +11858,172 @@ mod tests {
         mux.add_tab_to_window(&tab, window_id)
             .expect("test tab should attach to its exact window");
         (tab, window_id)
+    }
+
+    fn reliable_input_test_event(character: char) -> KeyEvent {
+        KeyEvent {
+            key: termwiz::input::KeyCode::Char(character),
+            modifiers: termwiz::input::Modifiers::CTRL,
+        }
+    }
+
+    #[test]
+    fn reliable_input_ledger_deduplicates_commit_and_survives_client_reconnect() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let pane = register_test_pane(&mux, 301);
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable input pane registration");
+        let original_client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&original_client));
+        let event = reliable_input_test_event('x');
+
+        let ReliableInputClaimOutcome::Execute(mut permit) = mux.claim_reliable_key_event(
+            Some(&original_client),
+            &registration,
+            11,
+            ReliableInputKeyKind::KeyDown,
+            &event,
+        ) else {
+            panic!("first exact identity must own execution");
+        };
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&original_client),
+                &registration,
+                11,
+                ReliableInputKeyKind::KeyDown,
+                &event,
+            ),
+            ReliableInputClaimOutcome::DuplicatePending
+        ));
+        assert!(permit.begin_side_effect());
+        assert!(permit.commit_applied());
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&original_client),
+                &registration,
+                11,
+                ReliableInputKeyKind::KeyDown,
+                &event,
+            ),
+            ReliableInputClaimOutcome::DuplicateApplied
+        ));
+
+        let replacement_client = Arc::new(original_client.as_ref().clone());
+        mux.register_client(Arc::clone(&replacement_client));
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&original_client),
+                &registration,
+                11,
+                ReliableInputKeyKind::KeyDown,
+                &event,
+            ),
+            ReliableInputClaimOutcome::ClientRegistrationRetired
+        ));
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&replacement_client),
+                &registration,
+                11,
+                ReliableInputKeyKind::KeyDown,
+                &event,
+            ),
+            ReliableInputClaimOutcome::DuplicateApplied
+        ));
+    }
+
+    #[test]
+    fn reliable_input_ledger_rolls_back_before_callback_and_fails_closed_after_start() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let pane = register_test_pane(&mux, 302);
+        let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("reliable input pane registration");
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        let event = reliable_input_test_event('y');
+
+        let ReliableInputClaimOutcome::Execute(permit) = mux.claim_reliable_key_event(
+            Some(&client),
+            &registration,
+            21,
+            ReliableInputKeyKind::KeyDown,
+            &event,
+        ) else {
+            panic!("first exact identity must own execution");
+        };
+        drop(permit);
+        let ReliableInputClaimOutcome::Execute(mut retry) = mux.claim_reliable_key_event(
+            Some(&client),
+            &registration,
+            21,
+            ReliableInputKeyKind::KeyDown,
+            &event,
+        ) else {
+            panic!("pre-callback cancellation must permit exact retry");
+        };
+        assert!(retry.begin_side_effect());
+        drop(retry);
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&client),
+                &registration,
+                21,
+                ReliableInputKeyKind::KeyDown,
+                &event,
+            ),
+            ReliableInputClaimOutcome::OutcomeUnknown
+        ));
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&client),
+                &registration,
+                20,
+                ReliableInputKeyKind::KeyDown,
+                &event,
+            ),
+            ReliableInputClaimOutcome::StaleSerial
+        ));
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&client),
+                &registration,
+                21,
+                ReliableInputKeyKind::KeyUp,
+                &event,
+            ),
+            ReliableInputClaimOutcome::IdentityConflict
+        ));
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&client),
+                &registration,
+                22,
+                ReliableInputKeyKind::KeyUp,
+                &event,
+            ),
+            ReliableInputClaimOutcome::Execute(_)
+        ));
+    }
+
+    #[test]
+    fn reliable_input_client_ledger_has_a_hard_cardinality_bound() {
+        let mut ledger = ReliableInputLedger::new();
+        let mut client_id = ClientId::new();
+        for id in 0..MAX_RELIABLE_INPUT_CLIENTS {
+            client_id.id = id;
+            assert!(ledger.prepare_client(&client_id));
+        }
+        assert_eq!(ledger.clients.len(), MAX_RELIABLE_INPUT_CLIENTS);
+        client_id.id = MAX_RELIABLE_INPUT_CLIENTS;
+        assert!(!ledger.prepare_client(&client_id));
+        assert_eq!(ledger.clients.len(), MAX_RELIABLE_INPUT_CLIENTS);
     }
 
     #[test]
