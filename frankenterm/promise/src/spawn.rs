@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_executor::Executor;
-use flume::{bounded, unbounded, Receiver};
+use flume::{Receiver, bounded, unbounded};
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::thread::ThreadId;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub use async_task::{Runnable, Task};
@@ -115,6 +115,65 @@ pub enum MainThreadAdmissionConfigError {
     EstimatedByteReserveExceedsCapacity { reserve: usize, capacity: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainThreadSchedulerIdentity {
+    pub queue_id: NonZeroU64,
+    pub scheduler_generation: NonZeroU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("main-thread scheduler identity authority is exhausted")]
+pub struct MainThreadSchedulerIdentityExhausted;
+
+#[derive(Debug)]
+struct MainThreadSchedulerIdentityState {
+    next_queue_id: Option<NonZeroU64>,
+    next_scheduler_generation: Option<NonZeroU64>,
+}
+
+/// Checked nonwrapping authority for scheduler queue/generation identities.
+///
+/// The pair is reserved under one mutex so exhaustion of either sequence is
+/// mutation-free: callers never receive half of an identity and a numeric
+/// successor can never alias an older scheduler generation.
+#[derive(Debug)]
+pub struct MainThreadSchedulerIdentityAuthority {
+    state: Mutex<MainThreadSchedulerIdentityState>,
+}
+
+impl MainThreadSchedulerIdentityAuthority {
+    #[must_use]
+    pub fn new(first_queue_id: NonZeroU64, first_scheduler_generation: NonZeroU64) -> Self {
+        Self {
+            state: Mutex::new(MainThreadSchedulerIdentityState {
+                next_queue_id: Some(first_queue_id),
+                next_scheduler_generation: Some(first_scheduler_generation),
+            }),
+        }
+    }
+
+    pub fn try_allocate(
+        &self,
+    ) -> std::result::Result<MainThreadSchedulerIdentity, MainThreadSchedulerIdentityExhausted>
+    {
+        let mut state = lock_or_recover(&self.state);
+        let (Some(queue_id), Some(scheduler_generation)) =
+            (state.next_queue_id, state.next_scheduler_generation)
+        else {
+            return Err(MainThreadSchedulerIdentityExhausted);
+        };
+        state.next_queue_id = queue_id.get().checked_add(1).and_then(NonZeroU64::new);
+        state.next_scheduler_generation = scheduler_generation
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new);
+        Ok(MainThreadSchedulerIdentity {
+            queue_id,
+            scheduler_generation,
+        })
+    }
+}
+
 /// Callback-free accounting state observed at one admission linearization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MainThreadAdmissionSnapshot {
@@ -139,6 +198,148 @@ pub struct MainThreadAdmissionReceipt {
     pub estimated_bytes: NonZeroUsize,
     pub admitted_at: Instant,
     pub snapshot_after_admission: MainThreadAdmissionSnapshot,
+}
+
+/// Callback-free state of one exact runnable queue after an enqueue or
+/// rejection linearizes.
+///
+/// This is deliberately separate from [`MainThreadAdmissionSnapshot`]. A live
+/// task may be polling rather than queued, and a self-wake does not acquire a
+/// second task permit, so task-lifetime counts cannot truthfully stand in for
+/// runnable depth or oldest queue age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainThreadQueueSnapshot {
+    pub depth: usize,
+    pub capacity: usize,
+    pub estimated_bytes: usize,
+    pub estimated_byte_capacity: usize,
+    pub oldest_enqueued_at: Option<Instant>,
+    pub retired: bool,
+}
+
+impl MainThreadQueueSnapshot {
+    pub fn new(
+        depth: usize,
+        capacity: usize,
+        estimated_bytes: usize,
+        estimated_byte_capacity: usize,
+        oldest_enqueued_at: Option<Instant>,
+        retired: bool,
+    ) -> std::result::Result<Self, MainThreadQueueSnapshotError> {
+        if capacity == 0 {
+            return Err(MainThreadQueueSnapshotError::ZeroCapacity);
+        }
+        if estimated_byte_capacity == 0 {
+            return Err(MainThreadQueueSnapshotError::ZeroEstimatedByteCapacity);
+        }
+        if depth > capacity {
+            return Err(MainThreadQueueSnapshotError::DepthExceedsCapacity { depth, capacity });
+        }
+        if estimated_bytes > estimated_byte_capacity {
+            return Err(MainThreadQueueSnapshotError::EstimatedBytesExceedCapacity {
+                estimated_bytes,
+                capacity: estimated_byte_capacity,
+            });
+        }
+        if depth == 0 && oldest_enqueued_at.is_some() {
+            return Err(MainThreadQueueSnapshotError::OldestPresentForEmptyQueue);
+        }
+        if depth > 0 && oldest_enqueued_at.is_none() {
+            return Err(MainThreadQueueSnapshotError::OldestMissingForNonemptyQueue);
+        }
+        Ok(Self {
+            depth,
+            capacity,
+            estimated_bytes,
+            estimated_byte_capacity,
+            oldest_enqueued_at,
+            retired,
+        })
+    }
+
+    #[must_use]
+    pub fn oldest_age_at(self, observed_at: Instant) -> Option<Duration> {
+        self.oldest_enqueued_at
+            .map(|enqueued_at| observed_at.saturating_duration_since(enqueued_at))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MainThreadQueueSnapshotError {
+    #[error("main-thread runnable queue capacity must be nonzero")]
+    ZeroCapacity,
+    #[error("main-thread runnable queue estimated-byte capacity must be nonzero")]
+    ZeroEstimatedByteCapacity,
+    #[error("main-thread runnable depth {depth} exceeds capacity {capacity}")]
+    DepthExceedsCapacity { depth: usize, capacity: usize },
+    #[error("main-thread runnable estimated bytes {estimated_bytes} exceed capacity {capacity}")]
+    EstimatedBytesExceedCapacity {
+        estimated_bytes: usize,
+        capacity: usize,
+    },
+    #[error("an empty main-thread runnable queue cannot have an oldest enqueue time")]
+    OldestPresentForEmptyQueue,
+    #[error("a nonempty main-thread runnable queue must have an oldest enqueue time")]
+    OldestMissingForNonemptyQueue,
+}
+
+/// Exact evidence from placing one admitted task's sole runnable on its bound
+/// scheduler generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainThreadEnqueueReceipt {
+    pub queue_id: NonZeroU64,
+    pub scheduler_generation: NonZeroU64,
+    pub task_ticket: NonZeroU64,
+    pub enqueued_at: Instant,
+    pub snapshot_after_enqueue: MainThreadQueueSnapshot,
+}
+
+/// Exact-generation authority for replacing pending coalescible work.
+///
+/// Queue implementations may return `Coalesced` only when both values match
+/// the pending work they supersede. Numeric work keys alone are insufficient
+/// because a key may be reused after a scheduler replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MainThreadCoalescingKey {
+    pub scheduler_generation: NonZeroU64,
+    pub work_generation: NonZeroU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainThreadCoalescedReceipt {
+    pub queue_id: NonZeroU64,
+    pub key: MainThreadCoalescingKey,
+    pub superseded_task_ticket: NonZeroU64,
+    pub coalesced_at: Instant,
+    pub snapshot_after_coalescing: MainThreadQueueSnapshot,
+}
+
+/// Callback-free evidence for a failed initial task admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainThreadAdmissionRejection {
+    pub queue_id: NonZeroU64,
+    pub scheduler_generation: NonZeroU64,
+    pub service_class: MainThreadServiceClass,
+    pub requested_estimated_bytes: usize,
+    pub rejected_at: Instant,
+    pub snapshot: MainThreadAdmissionSnapshot,
+}
+
+/// One-shot producer-visible result for initial main-thread task admission.
+///
+/// Only `Admitted` owns a task-lifetime permit. `Coalesced` proves that exact
+/// same-generation pending work now represents the request. Every other
+/// outcome is terminal for this attempt and must be handled explicitly by the
+/// producer; it must never create a `Task` whose first runnable can be lost.
+#[derive(Debug)]
+#[must_use = "main-thread admission outcomes must be handled explicitly"]
+pub enum MainThreadAdmissionOutcome {
+    Admitted(MainThreadTaskPermit),
+    Coalesced(MainThreadCoalescedReceipt),
+    RetryableFull(MainThreadAdmissionRejection),
+    RetiredGeneration(MainThreadAdmissionRejection),
+    InvalidSize(MainThreadAdmissionRejection),
+    AuthorityExhausted(MainThreadAdmissionRejection),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -227,10 +428,19 @@ impl MainThreadAdmissionController {
         service_class: MainThreadServiceClass,
         estimated_bytes: usize,
     ) -> std::result::Result<MainThreadTaskPermit, MainThreadAdmissionError> {
+        let mut state = lock_or_recover(&self.inner.state);
+        self.try_admit_locked(&mut state, service_class, estimated_bytes)
+    }
+
+    fn try_admit_locked(
+        &self,
+        state: &mut MainThreadAdmissionState,
+        service_class: MainThreadServiceClass,
+        estimated_bytes: usize,
+    ) -> std::result::Result<MainThreadTaskPermit, MainThreadAdmissionError> {
         let Some(estimated_bytes) = NonZeroUsize::new(estimated_bytes) else {
             return Err(MainThreadAdmissionError::ZeroEstimatedBytes);
         };
-        let mut state = lock_or_recover(&self.inner.state);
         if state.retired {
             return Err(MainThreadAdmissionError::RetiredGeneration);
         }
@@ -344,7 +554,7 @@ impl MainThreadAdmissionController {
             service_class,
             estimated_bytes,
             admitted_at: Instant::now(),
-            snapshot_after_admission: self.snapshot_locked(&state),
+            snapshot_after_admission: self.snapshot_locked(state),
         };
         Ok(MainThreadTaskPermit {
             inner: MainThreadTaskPermitInner {
@@ -354,6 +564,47 @@ impl MainThreadAdmissionController {
                 receipt,
             },
         })
+    }
+
+    /// Classify initial admission without collapsing overload, retirement,
+    /// invalid input, and identity exhaustion into one opaque error.
+    ///
+    /// Coalescing remains a queue-level decision because only the queue can
+    /// prove that an exact-generation pending item was superseded.
+    pub fn admit(
+        &self,
+        service_class: MainThreadServiceClass,
+        estimated_bytes: usize,
+    ) -> MainThreadAdmissionOutcome {
+        let mut state = lock_or_recover(&self.inner.state);
+        match self.try_admit_locked(&mut state, service_class, estimated_bytes) {
+            Ok(permit) => MainThreadAdmissionOutcome::Admitted(permit),
+            Err(error) => {
+                let rejection = MainThreadAdmissionRejection {
+                    queue_id: self.inner.queue_id,
+                    scheduler_generation: self.inner.scheduler_generation,
+                    service_class,
+                    requested_estimated_bytes: estimated_bytes,
+                    rejected_at: Instant::now(),
+                    snapshot: self.snapshot_locked(&state),
+                };
+                match error {
+                    MainThreadAdmissionError::ZeroEstimatedBytes => {
+                        MainThreadAdmissionOutcome::InvalidSize(rejection)
+                    }
+                    MainThreadAdmissionError::RetiredGeneration => {
+                        MainThreadAdmissionOutcome::RetiredGeneration(rejection)
+                    }
+                    MainThreadAdmissionError::TicketExhausted => {
+                        MainThreadAdmissionOutcome::AuthorityExhausted(rejection)
+                    }
+                    MainThreadAdmissionError::TaskCapacityExhausted { .. }
+                    | MainThreadAdmissionError::EstimatedByteCapacityExhausted { .. } => {
+                        MainThreadAdmissionOutcome::RetryableFull(rejection)
+                    }
+                }
+            }
+        }
     }
 
     pub fn retire(&self) {
@@ -589,17 +840,18 @@ fn block_on_main_thread_panic() -> ! {
     );
 }
 
+#[cfg(test)]
 fn schedule_runnable(runnable: Runnable, high_pri: bool) {
-    let func = {
-        let guard = if high_pri {
-            lock_or_recover(&ON_MAIN_THREAD)
-        } else {
-            lock_or_recover(&ON_MAIN_THREAD_LOW_PRI)
-        };
-        Arc::clone(&*guard)
-    };
+    capture_scheduler(high_pri)(runnable);
+}
 
-    func(runnable);
+fn capture_scheduler(high_pri: bool) -> SharedScheduleFunc {
+    let guard = if high_pri {
+        lock_or_recover(&ON_MAIN_THREAD)
+    } else {
+        lock_or_recover(&ON_MAIN_THREAD_LOW_PRI)
+    };
+    Arc::clone(&*guard)
 }
 
 pub fn is_scheduler_configured() -> bool {
@@ -673,7 +925,8 @@ where
     if let Some(executor) = get_scoped() {
         return executor.spawn(future);
     }
-    let (runnable, task) = async_task::spawn(future, |runnable| schedule_runnable(runnable, true));
+    let scheduler = capture_scheduler(true);
+    let (runnable, task) = async_task::spawn(future, move |runnable| scheduler(runnable));
     runnable.schedule();
     task
 }
@@ -692,7 +945,8 @@ where
     if let Some(executor) = get_scoped() {
         return executor.spawn(future);
     }
-    let (runnable, task) = async_task::spawn(future, |runnable| schedule_runnable(runnable, false));
+    let scheduler = capture_scheduler(false);
+    let (runnable, task) = async_task::spawn(future, move |runnable| scheduler(runnable));
     runnable.schedule();
     task
 }
@@ -703,8 +957,8 @@ where
     F: Future<Output = R> + 'static,
     R: 'static,
 {
-    let (runnable, task) =
-        async_task::spawn_local(future, |runnable| schedule_runnable(runnable, true));
+    let scheduler = capture_scheduler(true);
+    let (runnable, task) = async_task::spawn_local(future, move |runnable| scheduler(runnable));
     runnable.schedule();
     task
 }
@@ -716,8 +970,8 @@ where
     F: Future<Output = R> + 'static,
     R: 'static,
 {
-    let (runnable, task) =
-        async_task::spawn_local(future, |runnable| schedule_runnable(runnable, false));
+    let scheduler = capture_scheduler(false);
+    let (runnable, task) = async_task::spawn_local(future, move |runnable| scheduler(runnable));
     runnable.schedule();
     task
 }
@@ -1043,6 +1297,30 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_identity_authority_is_nonwrapping_and_exhaustion_is_mutation_free() {
+        let authority = MainThreadSchedulerIdentityAuthority::new(
+            NonZeroU64::new(u64::MAX).unwrap(),
+            NonZeroU64::new(u64::MAX).unwrap(),
+        );
+        assert_eq!(
+            authority.try_allocate().unwrap(),
+            MainThreadSchedulerIdentity {
+                queue_id: NonZeroU64::new(u64::MAX).unwrap(),
+                scheduler_generation: NonZeroU64::new(u64::MAX).unwrap(),
+            }
+        );
+        assert_eq!(
+            authority.try_allocate(),
+            Err(MainThreadSchedulerIdentityExhausted)
+        );
+        assert_eq!(
+            authority.try_allocate(),
+            Err(MainThreadSchedulerIdentityExhausted),
+            "identity exhaustion must remain terminal without wrapping"
+        );
+    }
+
+    #[test]
     fn admission_reserves_capacity_for_input_and_topology() {
         let controller = admission_controller(3, 30, 1, 10);
         let first = controller
@@ -1109,6 +1387,102 @@ mod tests {
     }
 
     #[test]
+    fn admission_outcomes_preserve_retry_retirement_and_invalid_size_authority() {
+        let controller = admission_controller(1, 16, 0, 0);
+        let admitted = match controller.admit(MainThreadServiceClass::Interactive, 16) {
+            MainThreadAdmissionOutcome::Admitted(permit) => permit,
+            outcome => panic!("expected admitted outcome, got {:?}", outcome),
+        };
+
+        let full = match controller.admit(MainThreadServiceClass::Input, 1) {
+            MainThreadAdmissionOutcome::RetryableFull(rejection) => rejection,
+            outcome => panic!("expected retryable-full outcome, got {:?}", outcome),
+        };
+        assert_eq!(full.queue_id, admitted.receipt().queue_id);
+        assert_eq!(
+            full.scheduler_generation,
+            admitted.receipt().scheduler_generation
+        );
+        assert_eq!(full.snapshot.active_tasks, 1);
+        assert_eq!(full.requested_estimated_bytes, 1);
+
+        drop(admitted);
+        let invalid = match controller.admit(MainThreadServiceClass::Render, 0) {
+            MainThreadAdmissionOutcome::InvalidSize(rejection) => rejection,
+            outcome => panic!("expected invalid-size outcome, got {:?}", outcome),
+        };
+        assert_eq!(invalid.requested_estimated_bytes, 0);
+        assert_eq!(invalid.snapshot.active_tasks, 0);
+
+        controller.retire();
+        let retired = match controller.admit(MainThreadServiceClass::Topology, 1) {
+            MainThreadAdmissionOutcome::RetiredGeneration(rejection) => rejection,
+            outcome => panic!("expected retired-generation outcome, got {:?}", outcome),
+        };
+        assert!(retired.snapshot.retired);
+    }
+
+    #[test]
+    fn queue_snapshot_reports_oldest_age_without_underflow() {
+        let before_enqueue = Instant::now();
+        let enqueued_at = Instant::now();
+        let snapshot = MainThreadQueueSnapshot {
+            depth: 1,
+            capacity: 4,
+            estimated_bytes: 8,
+            estimated_byte_capacity: 64,
+            oldest_enqueued_at: Some(enqueued_at),
+            retired: false,
+        };
+
+        assert_eq!(snapshot.oldest_age_at(before_enqueue), Some(Duration::ZERO));
+        assert!(snapshot.oldest_age_at(Instant::now()).is_some());
+        assert_eq!(
+            MainThreadQueueSnapshot {
+                oldest_enqueued_at: None,
+                ..snapshot
+            }
+            .oldest_age_at(Instant::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn queue_snapshot_rejects_inconsistent_depth_bytes_and_oldest_time() {
+        let now = Instant::now();
+        assert!(matches!(
+            MainThreadQueueSnapshot::new(1, 0, 1, 1, Some(now), false),
+            Err(MainThreadQueueSnapshotError::ZeroCapacity)
+        ));
+        assert!(matches!(
+            MainThreadQueueSnapshot::new(1, 1, 1, 0, Some(now), false),
+            Err(MainThreadQueueSnapshotError::ZeroEstimatedByteCapacity)
+        ));
+        assert!(matches!(
+            MainThreadQueueSnapshot::new(2, 1, 1, 1, Some(now), false),
+            Err(MainThreadQueueSnapshotError::DepthExceedsCapacity {
+                depth: 2,
+                capacity: 1
+            })
+        ));
+        assert!(matches!(
+            MainThreadQueueSnapshot::new(1, 1, 2, 1, Some(now), false),
+            Err(MainThreadQueueSnapshotError::EstimatedBytesExceedCapacity {
+                estimated_bytes: 2,
+                capacity: 1
+            })
+        ));
+        assert!(matches!(
+            MainThreadQueueSnapshot::new(0, 1, 0, 1, Some(now), false),
+            Err(MainThreadQueueSnapshotError::OldestPresentForEmptyQueue)
+        ));
+        assert!(matches!(
+            MainThreadQueueSnapshot::new(1, 1, 1, 1, None, false),
+            Err(MainThreadQueueSnapshotError::OldestMissingForNonemptyQueue)
+        ));
+    }
+
+    #[test]
     fn retired_generation_rejects_new_tasks_without_revoking_live_permits() {
         let controller = admission_controller(2, 32, 0, 0);
         let admitted = controller
@@ -1132,9 +1506,11 @@ mod tests {
             NonZeroU64::new(18).unwrap(),
             MainThreadAdmissionLimits::new(2, 32, 0, 0).unwrap(),
         );
-        assert!(replacement
-            .try_admit(MainThreadServiceClass::Input, 8)
-            .is_ok());
+        assert!(
+            replacement
+                .try_admit(MainThreadServiceClass::Input, 8)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1574,6 +1950,74 @@ mod tests {
         assert!(result.is_err());
         drop(task);
 
+        set_schedulers(Box::new(|_| {}), Box::new(|_| {}));
+    }
+
+    #[test]
+    fn local_task_wakes_remain_bound_to_the_scheduler_captured_at_creation() {
+        struct DropThread {
+            observed: Arc<StdMutex<Option<ThreadId>>>,
+        }
+
+        impl Drop for DropThread {
+            fn drop(&mut self) {
+                *self.observed.lock().unwrap() = Some(std::thread::current().id());
+            }
+        }
+
+        let _lock = TEST_LOCK.lock().unwrap();
+        let owner = std::thread::current().id();
+        let (old_tx, old_rx) = unbounded();
+        let old_tx_low = old_tx.clone();
+        set_schedulers(
+            Box::new(move |runnable| old_tx.send(runnable).unwrap()),
+            Box::new(move |runnable| old_tx_low.send(runnable).unwrap()),
+        );
+
+        let drop_thread = Arc::new(StdMutex::new(None));
+        let drop_thread_in_task = Arc::clone(&drop_thread);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_in_task = Arc::clone(&polls);
+        let task = spawn(async move {
+            let _drop_thread = DropThread {
+                observed: drop_thread_in_task,
+            };
+            std::future::poll_fn(move |cx| {
+                if polls_in_task.fetch_add(1, Ordering::SeqCst) == 0 {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::<()>::Pending
+            })
+            .await;
+        });
+
+        let (replacement_tx, replacement_rx) = unbounded();
+        let replacement_tx_low = replacement_tx.clone();
+        std::thread::spawn(move || {
+            set_schedulers(
+                Box::new(move |runnable| replacement_tx.send(runnable).unwrap()),
+                Box::new(move |runnable| replacement_tx_low.send(runnable).unwrap()),
+            );
+        })
+        .join()
+        .unwrap();
+
+        old_rx
+            .recv()
+            .expect("the initial runnable belongs to the captured scheduler")
+            .run();
+        let second = old_rx
+            .recv()
+            .expect("a self-wake must return to the captured scheduler");
+        assert!(matches!(
+            replacement_rx.try_recv(),
+            Err(flume::TryRecvError::Empty)
+        ));
+
+        drop(second);
+        assert_eq!(*drop_thread.lock().unwrap(), Some(owner));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        drop(task);
         set_schedulers(Box::new(|_| {}), Box::new(|_| {}));
     }
 
