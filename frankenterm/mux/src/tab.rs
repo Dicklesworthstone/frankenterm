@@ -4113,6 +4113,14 @@ impl Tab {
         self.inner.lock().snapshot_panes_callback_free()
     }
 
+    /// Test exact structural ownership without cloning a pane census or
+    /// invoking any `Pane` callback.
+    pub(crate) fn contains_exact_pane_callback_free(&self, expected: &Arc<dyn Pane>) -> bool {
+        self.inner
+            .lock()
+            .contains_exact_pane_callback_free(expected)
+    }
+
     /// Freeze the structural pane pointers and retain the topology lock while
     /// `f` commits a callback-free mux transaction derived from that snapshot.
     /// Any mux registry guards must be acquired before entering; the callback
@@ -6717,6 +6725,35 @@ impl TabInner {
         }
 
         panes
+    }
+
+    fn contains_exact_pane_callback_free(&self, expected: &Arc<dyn Pane>) -> bool {
+        fn tree_contains_exact(tree: &Tree, expected: &Arc<dyn Pane>) -> bool {
+            match tree {
+                Tree::Empty => false,
+                Tree::Leaf(pane) => Arc::ptr_eq(pane, expected),
+                Tree::Node { left, right, .. } => {
+                    tree_contains_exact(left, expected) || tree_contains_exact(right, expected)
+                }
+            }
+        }
+
+        self.pane
+            .as_ref()
+            .is_some_and(|tree| tree_contains_exact(tree, expected))
+            || self
+                .pane_stacks
+                .values()
+                .flat_map(|stack| stack.panes())
+                .any(|pane| Arc::ptr_eq(pane, expected))
+            || self
+                .floating_panes
+                .iter()
+                .any(|floating| Arc::ptr_eq(&floating.pane, expected))
+            || self
+                .zoomed
+                .as_ref()
+                .is_some_and(|pane| Arc::ptr_eq(pane, expected))
     }
 
     /// Fallibly census one ordered-snapshot tab before invoking pane code.

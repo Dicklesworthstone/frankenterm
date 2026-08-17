@@ -2689,6 +2689,25 @@ mod pane_registration_handle {
                 && Arc::ptr_eq(&self.generation, &registered.generation)
         }
 
+        /// Acquire a callback-free retirement fence for a cached location.
+        /// The cache's topology revision separately validates structural
+        /// ownership. Keeping this lease through the final registry/revision
+        /// checks closes the check-then-retire race without taking the global
+        /// pane-registration serializer on every stable key event.
+        pub(super) fn cached_location_lease_for_owner(
+            &self,
+            expected_owner: &Mux,
+        ) -> Option<PaneRegistrationOperationLease> {
+            let lease = self.generation.try_acquire()?;
+            let Some(owner) = self.generation.owner.upgrade() else {
+                return None;
+            };
+            if !std::ptr::eq(owner.as_ref(), expected_owner) || self.pane.upgrade().is_none() {
+                return None;
+            }
+            Some(lease)
+        }
+
         /// Acquire non-cloneable exact authority for a complete pane operation.
         pub fn operation_guard(&self, expected_owner: &Arc<Mux>) -> Option<PaneOperationGuard> {
             let operation = self.generation.try_acquire()?;
@@ -4089,6 +4108,25 @@ impl TabParentRegistration {
     }
 }
 
+/// Revision-coherent exact location of one registered pane.
+///
+/// A stable session resolves the same pane for every key event.  Repeating the
+/// historical all-tabs/all-panes scan on that path made input latency grow
+/// with unrelated session size.  This cache is safe without mutation hooks in
+/// every `Tab` method because a hit revalidates the exact registration, tab,
+/// parent, and structural pane presence inside the same topology revision in
+/// which the location was censused. A revision change causes one exact cold
+/// refresh; subsequent stable key events avoid every unrelated tab.
+#[derive(Clone)]
+struct PaneLocationCacheEntry {
+    registration: PaneRegistrationHandle,
+    pane: Weak<dyn Pane>,
+    tab: Weak<Tab>,
+    domain_id: DomainId,
+    window_id: WindowId,
+    topology_revision: TopologyRevision,
+}
+
 /// Discriminant key for the high-rate Alert variants we dedupe per pane.
 ///
 /// `CurrentWorkingDirectoryChanged` (OSC 7) re-emits on every shell prompt
@@ -4240,6 +4278,13 @@ pub struct Mux {
     tab_parent_lookup_probes: AtomicUsize,
     #[cfg(test)]
     tab_parent_write_cuts: AtomicUsize,
+    pane_location_cache: RwLock<HashMap<PaneId, PaneLocationCacheEntry>>,
+    #[cfg(test)]
+    pane_location_cache_hits: AtomicUsize,
+    #[cfg(test)]
+    pane_location_full_scans: AtomicUsize,
+    #[cfg(test)]
+    pane_location_scan_tab_probes: AtomicUsize,
     panes: RwLock<HashMap<PaneId, LivePaneRegistration>>,
     pane_retirements: Arc<PaneRetirementTracker>,
     pane_preparations: Mutex<HashMap<PaneId, PanePreparation>>,
@@ -4946,6 +4991,13 @@ impl Mux {
             tab_parent_lookup_probes: AtomicUsize::new(0),
             #[cfg(test)]
             tab_parent_write_cuts: AtomicUsize::new(0),
+            pane_location_cache: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            pane_location_cache_hits: AtomicUsize::new(0),
+            #[cfg(test)]
+            pane_location_full_scans: AtomicUsize::new(0),
+            #[cfg(test)]
+            pane_location_scan_tab_probes: AtomicUsize::new(0),
             panes: RwLock::new(HashMap::new()),
             pane_retirements: Arc::new(PaneRetirementTracker::default()),
             pane_preparations: Mutex::new(HashMap::new()),
@@ -6156,6 +6208,14 @@ impl Mux {
     // removed concurrently may still observe the current notification if it
     // was present in the snapshot; removals only affect future notifications.
     pub(crate) fn dispatch_notification_envelope(&self, envelope: MuxNotificationEnvelope) {
+        if let MuxNotification::PaneRemoved(pane_id) = &envelope.notification {
+            // Numeric pane identifiers may eventually be reused.  Drop the
+            // retired generation's location promptly so long-running churn is
+            // bounded by currently relevant pane IDs rather than historical
+            // session cardinality.  Exact-Arc and revision checks already make
+            // a retained entry safe; this is the memory-bound half.
+            self.pane_location_cache.write().remove(pane_id);
+        }
         let subscribers = self
             .subscribers
             .read()
@@ -9708,20 +9768,167 @@ impl Mux {
     }
 
     pub fn resolve_pane_id(&self, pane_id: PaneId) -> Option<(DomainId, WindowId, TabId)> {
-        // `Tab::domain_id_for_pane` calls pane trait methods. Snapshot the Arc
-        // values so no external pane callback runs while the mux tab registry
-        // is locked; callbacks are permitted to re-enter mux lookup APIs.
-        let tabs = self.tabs.read().values().cloned().collect::<Vec<_>>();
-        let mut ids = None;
-        for tab in tabs {
-            if let Some(domain_id) = tab.domain_id_for_pane(pane_id) {
-                ids = Some((tab.tab_id(), domain_id));
-                break;
+        const COHERENCE_ATTEMPTS: usize = 3;
+
+        for _ in 0..COHERENCE_ATTEMPTS {
+            let revision = self.topology.lock().current_revision();
+            if let Some(location) = self.cached_pane_location(pane_id, revision) {
+                if self.topology.lock().current_revision() == revision {
+                    #[cfg(test)]
+                    self.pane_location_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(location);
+                }
+                continue;
             }
+            if self.topology.lock().current_revision() != revision {
+                continue;
+            }
+
+            #[cfg(test)]
+            self.pane_location_full_scans
+                .fetch_add(1, Ordering::Relaxed);
+
+            // Resolve the numeric slot once, then compare only exact Arc
+            // identities while walking callback-free tab snapshots.  This is
+            // both safer and cheaper than invoking Pane::pane_id/domain_id for
+            // every pane in the session, and it rejects duplicate structural
+            // ownership instead of returning HashMap iteration's first match.
+            // The registration serializer closes the small publication gap in
+            // which a new pane/tab map entry exists but its lifecycle topology
+            // revision has not yet been reserved.
+            let _registration = self.pane_registration.lock();
+            let (pane, domain_id, exact_registration) = {
+                let panes = self.panes.read();
+                let registered = panes.get(&pane_id)?;
+                (
+                    Arc::clone(&registered.pane),
+                    registered.domain_id,
+                    PaneRegistrationHandle::new(&registered.pane, &registered.generation),
+                )
+            };
+            let tabs = {
+                let registered = self.tabs.read();
+                let mut snapshot = Vec::new();
+                snapshot.try_reserve_exact(registered.len()).ok()?;
+                snapshot.extend(registered.values().cloned());
+                snapshot
+            };
+            let mut owner = None;
+            for tab in tabs {
+                #[cfg(test)]
+                self.pane_location_scan_tab_probes
+                    .fetch_add(1, Ordering::Relaxed);
+                if tab.contains_exact_pane_callback_free(&pane) {
+                    if owner.is_some() {
+                        drop(_registration);
+                        self.pane_location_cache.write().remove(&pane_id);
+                        log::error!(
+                            "refusing ambiguous pane {pane_id} lookup: its exact allocation has multiple structural tab owners"
+                        );
+                        return None;
+                    }
+                    owner = Some(tab);
+                }
+            }
+            let tab = owner?;
+            let tab_id = tab.tab_id();
+            let window_id = {
+                let parents = self.tab_parents.read();
+                let parent = parents.get(&tab_id)?;
+                if !parent.matches(&tab, parent.window_id) {
+                    return None;
+                }
+                parent.window_id
+            };
+
+            // The topology authority is the cache's generation fence.  If a
+            // pane, tab, or window moved during the cold scan, retry from a new
+            // cut rather than publishing a stale location.
+            if self.topology.lock().current_revision() != revision {
+                continue;
+            }
+            let still_registered = self.panes.read().get(&pane_id).is_some_and(|registered| {
+                Arc::ptr_eq(&registered.pane, &pane) && registered.domain_id == domain_id
+            });
+            let tab_still_registered = self
+                .tabs
+                .read()
+                .get(&tab_id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &tab));
+            let parent_still_registered = self
+                .tab_parents
+                .read()
+                .get(&tab_id)
+                .is_some_and(|parent| parent.matches(&tab, window_id));
+            if !still_registered
+                || !tab_still_registered
+                || !parent_still_registered
+                || self.topology.lock().current_revision() != revision
+            {
+                continue;
+            }
+
+            let entry = PaneLocationCacheEntry {
+                registration: exact_registration,
+                pane: Arc::downgrade(&pane),
+                tab: Arc::downgrade(&tab),
+                domain_id,
+                window_id,
+                topology_revision: revision,
+            };
+            let mut cache = self.pane_location_cache.write();
+            if cache.try_reserve(1).is_ok() {
+                cache.insert(pane_id, entry);
+            }
+            return Some((domain_id, window_id, tab_id));
         }
-        let (tab_id, domain_id) = ids?;
-        let window_id = self.window_containing_tab(tab_id)?;
-        Some((domain_id, window_id, tab_id))
+
+        None
+    }
+
+    fn cached_pane_location(
+        &self,
+        pane_id: PaneId,
+        topology_revision: TopologyRevision,
+    ) -> Option<(DomainId, WindowId, TabId)> {
+        let entry = self.pane_location_cache.read().get(&pane_id).cloned()?;
+        if entry.topology_revision != topology_revision {
+            return None;
+        }
+        let _operation = entry.registration.cached_location_lease_for_owner(self)?;
+        let pane = entry.pane.upgrade()?;
+        let tab = entry.tab.upgrade()?;
+        let tab_id = tab.tab_id();
+        if entry.registration.pane_id() != pane_id {
+            return None;
+        }
+        if !self
+            .tabs
+            .read()
+            .get(&tab_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &tab))
+        {
+            return None;
+        }
+        if !self
+            .tab_parents
+            .read()
+            .get(&tab_id)
+            .is_some_and(|parent| parent.matches(&tab, entry.window_id))
+        {
+            return None;
+        }
+        if !tab.contains_exact_pane_callback_free(&pane) {
+            return None;
+        }
+        if !self.panes.read().get(&pane_id).is_some_and(|registered| {
+            entry.registration.matches_live_registration(registered)
+                && registered.domain_id == entry.domain_id
+        }) {
+            return None;
+        }
+        Some((entry.domain_id, entry.window_id, tab_id))
     }
 
     pub fn domain_was_detached(&self, domain: DomainId) {
@@ -20247,6 +20454,143 @@ mod tests {
                 "mux_tab_parent_lookup_work tab_count={count} lookups={count} hash_probes={probes}"
             );
         }
+    }
+
+    #[test]
+    fn pane_location_cache_makes_stable_key_path_constant_after_one_large_session_scan() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        const UNRELATED_TABS: usize = 16_384;
+        const STABLE_LOOKUPS: usize = 4_096;
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let (pane, _kills) = KillCountingPane::new(912_001, test_size());
+        let (target_tab, original_window_id) = register_attached_test_pane(&_guard, &mux, &pane);
+
+        // Empty tabs are sufficient to reproduce the old session-cardinality
+        // cost without starting PTYs or touching a product process.
+        {
+            let mut tabs = mux.tabs.write();
+            let mut windows = mux.windows.write();
+            let mut parents = mux.tab_parents.write();
+            tabs.try_reserve(UNRELATED_TABS)
+                .expect("reserve large-session tab registry");
+            windows
+                .try_reserve(UNRELATED_TABS)
+                .expect("reserve large-session window registry");
+            parents
+                .try_reserve(UNRELATED_TABS)
+                .expect("reserve large-session parent index");
+            for _ in 0..UNRELATED_TABS {
+                let tab = Arc::new(Tab::new(&test_size()));
+                let tab_id = tab.tab_id();
+                let mut window = Window::new(Some("pane-location-scale".to_string()), None);
+                let window_id = window.window_id();
+                window.push(&tab).expect("seed unrelated exact membership");
+                assert!(tabs.insert(tab_id, Arc::clone(&tab)).is_none());
+                assert!(windows.insert(window_id, window).is_none());
+                assert!(parents
+                    .insert(tab_id, TabParentRegistration::new(&tab, window_id))
+                    .is_none());
+            }
+        }
+        mux.assert_tab_parent_index_matches_windows();
+
+        let scans_before = mux.pane_location_full_scans.load(Ordering::Relaxed);
+        let probes_before = mux.pane_location_scan_tab_probes.load(Ordering::Relaxed);
+        let hits_before = mux.pane_location_cache_hits.load(Ordering::Relaxed);
+        assert_eq!(
+            mux.resolve_pane_id(912_001),
+            Some((pane.domain_id(), original_window_id, target_tab.tab_id()))
+        );
+        let scans_after_cold = mux.pane_location_full_scans.load(Ordering::Relaxed);
+        let probes_after_cold = mux.pane_location_scan_tab_probes.load(Ordering::Relaxed);
+        assert_eq!(scans_after_cold.saturating_sub(scans_before), 1);
+        assert_eq!(
+            probes_after_cold.saturating_sub(probes_before),
+            UNRELATED_TABS + 1,
+            "the planted cold miss must expose the former all-tab work"
+        );
+
+        assert!(mux.set_tab_title(target_tab.tab_id(), "cache-refreshes-after-title-revision"));
+
+        for _ in 0..STABLE_LOOKUPS {
+            assert_eq!(
+                mux.resolve_pane_id(912_001),
+                Some((pane.domain_id(), original_window_id, target_tab.tab_id()))
+            );
+        }
+        assert_eq!(
+            mux.pane_location_full_scans.load(Ordering::Relaxed),
+            scans_after_cold + 1,
+            "one revision change must cause one exact refresh, not one global scan per keypress"
+        );
+        assert_eq!(
+            mux.pane_location_scan_tab_probes.load(Ordering::Relaxed),
+            probes_after_cold + UNRELATED_TABS + 1,
+            "one revision refresh must be the only additional unrelated-tab census"
+        );
+        assert_eq!(
+            mux.pane_location_cache_hits
+                .load(Ordering::Relaxed)
+                .saturating_sub(hits_before),
+            STABLE_LOOKUPS - 1,
+        );
+
+        // A real topology transaction invalidates the revision fence.  The
+        // next lookup must perform exactly one new census and cache the new
+        // parent rather than returning the old window.
+        let destination = mux.new_empty_window(Some("pane-location-scale".to_string()), None);
+        let destination_window_id = *destination;
+        mux.move_tab_between_windows(target_tab.tab_id(), destination_window_id, None)
+            .expect("move target tab to a new exact parent");
+        assert_eq!(
+            mux.resolve_pane_id(912_001),
+            Some((pane.domain_id(), destination_window_id, target_tab.tab_id()))
+        );
+        assert_eq!(
+            mux.pane_location_full_scans.load(Ordering::Relaxed),
+            scans_after_cold + 2,
+            "one topology change should cause one cold refresh"
+        );
+
+        drop(destination);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn pane_location_cache_rejects_duplicate_exact_structural_owners() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let (pane, _kills) = KillCountingPane::new(912_002, test_size());
+        let (first_tab, first_window_id) = register_attached_test_pane(&_guard, &mux, &pane);
+        assert_eq!(
+            mux.resolve_pane_id(912_002),
+            Some((pane.domain_id(), first_window_id, first_tab.tab_id()))
+        );
+        assert!(mux.pane_location_cache.read().contains_key(&912_002));
+
+        // Seed the malformed topology through the ordinary public surfaces:
+        // an already-registered exact pane must never become a cacheable
+        // HashMap-order-dependent owner merely because a second tab points at
+        // it.
+        let duplicate_tab = Arc::new(Tab::new(&test_size()));
+        duplicate_tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&duplicate_tab)
+            .expect("the duplicate-owner fixture reuses the existing pane registration");
+        let duplicate_window = mux.new_empty_window(None, None);
+        mux.add_tab_to_window(&duplicate_tab, *duplicate_window)
+            .expect("attach duplicate-owner fixture");
+
+        assert_eq!(mux.resolve_pane_id(912_002), None);
+        assert!(mux.pane_location_cache.read().get(&912_002).is_none());
+
+        drop(duplicate_window);
+        Mux::shutdown();
     }
 
     #[test]
