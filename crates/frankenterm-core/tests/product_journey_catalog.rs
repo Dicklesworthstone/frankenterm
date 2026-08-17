@@ -2190,12 +2190,12 @@ fn checked_in_v2_catalog_is_typed_complete_and_exactly_migrates_v1_inventory() {
         assert_eq!(producer.field_bead_id, source.field_bead_id);
         assert_eq!(
             producer.lifecycle.identity_preflight.steps.as_slice(),
-            source.setup[..1],
+            &source.setup[..1],
             "identity preflight must explicitly retain only v1 setup[0]"
         );
         assert_eq!(
             producer.lifecycle.clean_setup.steps.as_slice(),
-            source.setup[1..],
+            &source.setup[1..],
             "clean setup must explicitly retain only the later v1 setup steps"
         );
         assert_eq!(producer.lifecycle.steady_work.steps, source.steady_work);
