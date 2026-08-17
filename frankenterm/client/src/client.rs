@@ -9607,6 +9607,13 @@ mod tests {
                     role: PduWireRole::Request,
                 }],
                 encoded_body_limit: codec::PduEncodedBodyLimit::GlobalMaximum,
+                semantic_class: codec::PduCorrelatedRequestPolicy::Fixed(
+                    codec::PduSemanticClass::Query,
+                ),
+                admission_cap_key: codec::PduCorrelatedRequestPolicy::Fixed(
+                    codec::PduAdmissionCapKey::Query,
+                ),
+                queue_qos: codec::PduCorrelatedRequestPolicy::Fixed(codec::PduQueueQos::Normal),
             };
             assert!(
                 !RpcProtocolAuthority::endpoint_is_activated(&synthetic),

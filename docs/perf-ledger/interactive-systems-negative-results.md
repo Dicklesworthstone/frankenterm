@@ -4331,6 +4331,36 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > If local trace tokens ever cross a process boundary, preserve the current remote-context re-admission cut or replace the local witness with an authenticated receiving-recorder capability; never serialize and trust a raw process-local instance ID.
 
+### IS-N142 — A caller-constructed wire spec is not outbound admission authority
+
+- **Classification:** queue-policy authority rejection; codec registry API
+  repaired
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.3.5.5.1`
+- **Rejected inference:** generic response metadata can safely inherit semantic
+  class, admission-cap key, and queue QoS from any public `PduWireSpec` whose
+  producer/role tuple says client request.
+- **Counterexample:** `PduWireSpec` is a public structural type used by protocol
+  tests. A caller can copy a real interactive request, replace its QoS with
+  control, and pass that forged value as the correlated request for
+  `ErrorResponse` or `UnitResponse`. Direction validation alone would then
+  promote ordinary response work into the reserved control lane.
+- **Decision:** the generated `pdu!` declaration is the only outbound metadata
+  authority. Every assigned PDU row must provide semantic class, cap key, and
+  QoS at compile time. Outbound planning rejects a noncanonical response spec
+  before direction validation, and generic response inheritance accepts only
+  a byte-for-byte equal canonical request registry entry. `Invalid`, missing
+  correlation, forbidden direction, inconsistent inheritance, and recursive
+  inheritance remain typed *definitely not sent* outcomes before serial,
+  codec, queue, compression, or transport effects.
+- **Planted negatives:** a copied `Ping` spec with bulk QoS is rejected as
+  `NonCanonicalWireSpec`; a copied `SendPaste` request promoted to control QoS
+  is rejected as `InvalidCorrelatedRequest`; an actual server reply cannot be
+  substituted for a client request. Removing only the forged metadata restores
+  exact inheritance of interactive-input semantics, bulk-data charging, and
+  interactive queue service.
+- **Primary retry condition:**
+  > If wire-spec construction becomes private, keep exact registry identity or an unforgeable generated token at the inheritance cut; never authorize a queue class from caller-populated public fields alone.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
