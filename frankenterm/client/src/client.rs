@@ -1180,10 +1180,11 @@ impl RpcProtocolAuthority {
         // activation. Spell the assigned legacy ranges exactly: a future PDU
         // placed in one of the historical numeric gaps must remain dormant by
         // default instead of inheriting authority from a broad `<=` cutoff.
-        // Only the fenced-topology trio is active above the legacy surface.
+        // Above the legacy surface, only the fenced-topology trio and the
+        // explicitly coordinated reliable-input request/reply are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96 | 97
         )
     }
 
@@ -3933,6 +3934,11 @@ macro_rules! rpc_surface {
         rpc!(send_paste, SendPaste, UnitResponse);
         rpc!(key_down, SendKeyDown, UnitResponse);
         rpc!(key_up, SendKeyUp, UnitResponse);
+        rpc!(
+            reliable_key_event_v1,
+            ReliableKeyEventV1,
+            ReliableKeyEventV1Response
+        );
         rpc!(mouse_event, SendMouseEvent, UnitResponse);
         rpc!(resize, Resize, UnitResponse);
         rpc!(set_zoomed, SetPaneZoomed, UnitResponse);
@@ -8349,6 +8355,12 @@ impl Client {
         RpcGenerationScope::capture(self.sender.clone(), Arc::clone(&self.rpc_transport))
     }
 
+    pub(crate) fn agreed_codec_version(&self) -> Option<usize> {
+        self.rpc_scope()
+            .codec_authority()
+            .map(|authority| authority.agreed)
+    }
+
     pub(crate) fn bootstrap_rpc_scope(&self) -> RpcGenerationScope {
         RpcGenerationScope::bootstrap(self.sender.clone(), Arc::clone(&self.rpc_transport))
     }
@@ -10126,7 +10138,7 @@ mod tests {
             }
         }
 
-        for gap in [5, 6, 7, 15, 16, 17, 18, 19, 21, 95, u64::MAX] {
+        for gap in [5, 6, 7, 15, 16, 17, 18, 19, 21, u64::MAX] {
             assert_eq!(
                 Pdu::wire_spec_for_ident(gap),
                 None,
@@ -10183,7 +10195,9 @@ mod tests {
             )
             .expect("topology events activate only after the fenced snapshot");
 
-        for inactive in [79, 80, 84, 85, 86, 87, 88, 89, 90, 91, 92] {
+        for inactive in [
+            79, 80, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,
+        ] {
             let spec = Pdu::wire_spec_for_ident(inactive).expect("inactive PDU remains assigned");
             let authority = spec
                 .authorities
@@ -10236,6 +10250,7 @@ mod tests {
         expected.push(20);
         expected.extend(22..=78);
         expected.extend(81..=83);
+        expected.extend(96..=97);
 
         let actual = Pdu::all_wire_specs()
             .iter()

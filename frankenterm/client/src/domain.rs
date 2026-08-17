@@ -2,7 +2,7 @@ use crate::client::{
     with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
     RpcGenerationScope,
 };
-use crate::pane::ClientPane;
+use crate::pane::{ClientPane, ReliableInputQueue};
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
@@ -179,6 +179,7 @@ pub struct ClientInner {
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
     detached: AtomicBool,
 }
 
@@ -1200,6 +1201,7 @@ impl ClientInner {
             remote_to_local_pane: Mutex::new(HashMap::new()),
             spare_local_pane_ids: Mutex::new(Vec::new()),
             focused_remote_pane_id: Mutex::new(None),
+            reliable_input_queue: ReliableInputQueue::new(),
             detached: AtomicBool::new(false),
         }
     }

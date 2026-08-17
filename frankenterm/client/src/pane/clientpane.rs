@@ -1,9 +1,11 @@
-use crate::client::{admit_interactive_rpc_now, RpcConsumerKind, RpcGenerationScope};
-use crate::domain::{lock_or_recover, ClientInner};
+use crate::client::{
+    ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope, admit_interactive_rpc_now,
+};
+use crate::domain::{ClientInner, lock_or_recover};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
-    hydrate_lines, hydrate_render_application_lines, RenderableInner, RenderablePaneBinding,
-    RenderableState,
+    RenderableInner, RenderablePaneBinding, RenderableState, hydrate_lines,
+    hydrate_render_application_lines,
 };
 use anyhow::bail;
 use async_trait::async_trait;
@@ -17,16 +19,18 @@ use mux::pane::{
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
-use mux::PaneRegistrationSlot;
+use mux::{PaneRegistrationHandle, PaneRegistrationSlot};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use rangeset::RangeSet;
 use ratelim::RateLimiter;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::future::Future;
 use std::ops::Range;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Weak};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 use termwiz::input::KeyEvent;
 use termwiz::surface::SequenceNo;
@@ -63,6 +67,418 @@ where
     })
     .detach();
     Ok(())
+}
+
+const RELIABLE_INPUT_QUEUE_CAPACITY: usize = 4_096;
+const RELIABLE_INPUT_TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(5);
+const RELIABLE_INPUT_MAX_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReliableInputCodecDisposition {
+    AwaitingAuthority,
+    Legacy,
+    Reliable,
+}
+
+fn reliable_input_codec_disposition(
+    agreed_codec_version: Option<usize>,
+) -> ReliableInputCodecDisposition {
+    match agreed_codec_version {
+        None => ReliableInputCodecDisposition::AwaitingAuthority,
+        Some(version) if version < RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION => {
+            ReliableInputCodecDisposition::Legacy
+        }
+        Some(_) => ReliableInputCodecDisposition::Reliable,
+    }
+}
+
+fn reliable_input_retry_delay(base: Duration, consecutive_retries: u32) -> Duration {
+    let multiplier = 1u32 << consecutive_retries.min(6);
+    // Never shorten an authoritative peer delay. The local ceiling only
+    // bounds our exponential amplification of a smaller transport/scheduler
+    // prompt.
+    let ceiling = RELIABLE_INPUT_MAX_RETRY_DELAY.max(base);
+    base.saturating_mul(multiplier).min(ceiling)
+}
+
+async fn yield_reliable_input_worker_once() {
+    let mut yielded = false;
+    futures::future::poll_fn(move |context| {
+        if std::mem::replace(&mut yielded, true) {
+            Poll::Ready(())
+        } else {
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+#[derive(Clone)]
+struct QueuedReliableInput {
+    registration: PaneRegistrationHandle,
+    pane_authority: Arc<Mutex<Option<ReliablePaneRegistrationIdentityV1>>>,
+    request: ReliableKeyEventV1,
+}
+
+struct ReliableInputQueueState {
+    pending: VecDeque<QueuedReliableInput>,
+    worker_running: bool,
+}
+
+pub(crate) struct ReliableInputQueue {
+    state: Mutex<ReliableInputQueueState>,
+}
+
+enum ReliableInputAttempt {
+    Complete(&'static str),
+    Retry(Duration, &'static str),
+    DropOne(&'static str),
+    AbortLane(&'static str),
+    BindPaneAuthority(ReliablePaneRegistrationIdentityV1),
+    PaneAuthorityRetired(&'static str),
+}
+
+impl ReliableInputQueue {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ReliableInputQueueState {
+                pending: VecDeque::with_capacity(RELIABLE_INPUT_QUEUE_CAPACITY),
+                worker_running: false,
+            }),
+        })
+    }
+
+    fn enqueue(
+        self: &Arc<Self>,
+        client: &Arc<ClientInner>,
+        registration: PaneRegistrationHandle,
+        pane_authority: Arc<Mutex<Option<ReliablePaneRegistrationIdentityV1>>>,
+        request: ReliableKeyEventV1,
+    ) -> anyhow::Result<()> {
+        let start_worker = {
+            let mut state = self.state.lock();
+            if state.pending.len() >= RELIABLE_INPUT_QUEUE_CAPACITY {
+                metrics::counter!("mux.client.reliable_input_queue", "outcome" => "full")
+                    .increment(1);
+                bail!(
+                    "reliable input queue reached its fixed {}-event capacity",
+                    RELIABLE_INPUT_QUEUE_CAPACITY
+                );
+            }
+            state.pending.push_back(QueuedReliableInput {
+                registration,
+                pane_authority,
+                request,
+            });
+            if state.worker_running {
+                false
+            } else {
+                state.worker_running = true;
+                true
+            }
+        };
+        metrics::counter!("mux.client.reliable_input_queue", "outcome" => "enqueued").increment(1);
+        if start_worker {
+            Self::start_worker_now(Arc::clone(self), Arc::downgrade(client));
+        }
+        Ok(())
+    }
+
+    fn start_worker_now(queue: Arc<Self>, client: Weak<ClientInner>) {
+        let mut worker: Pin<Box<dyn Future<Output = ()>>> = Box::pin(Self::run(queue, client));
+        let waker = futures::task::noop_waker();
+        let mut context = TaskContext::from_waker(&waker);
+        if worker.as_mut().poll(&mut context).is_pending() {
+            promise::spawn::spawn(worker).detach();
+        }
+    }
+
+    async fn run(queue: Arc<Self>, client: Weak<ClientInner>) {
+        let mut consecutive_retries = 0u32;
+        loop {
+            let Some(client) = client.upgrade() else {
+                queue.finish_worker("client_dropped");
+                return;
+            };
+            if client.is_detached() {
+                queue.finish_worker("domain_detached");
+                return;
+            }
+            let entry = {
+                let mut state = queue.state.lock();
+                let entry = state.pending.front().cloned();
+                if entry.is_none() {
+                    // Linearize the drained transition with enqueue. An
+                    // enqueue that follows this unlock observes false and
+                    // starts the successor worker; an enqueue before it is
+                    // visible here and cannot be stranded.
+                    state.worker_running = false;
+                }
+                entry
+            };
+            let Some(entry) = entry else {
+                metrics::counter!(
+                    "mux.client.reliable_input_worker",
+                    "outcome" => "drained"
+                )
+                .increment(1);
+                return;
+            };
+            if entry.registration.try_with_current(|_| ()).is_none() {
+                if !queue.complete_front(&entry, "pane_registration_retired") {
+                    return;
+                }
+                consecutive_retries = 0;
+                yield_reliable_input_worker_once().await;
+                continue;
+            }
+            match Self::attempt(&client, &entry).await {
+                ReliableInputAttempt::Complete(outcome)
+                | ReliableInputAttempt::DropOne(outcome) => {
+                    if !queue.complete_front(&entry, outcome) {
+                        return;
+                    }
+                    consecutive_retries = 0;
+                    yield_reliable_input_worker_once().await;
+                }
+                ReliableInputAttempt::Retry(delay, outcome) => {
+                    metrics::counter!(
+                        "mux.client.reliable_input_attempt",
+                        "outcome" => outcome
+                    )
+                    .increment(1);
+                    promise::spawn::sleep(reliable_input_retry_delay(delay, consecutive_retries))
+                        .await;
+                    consecutive_retries = consecutive_retries.saturating_add(1);
+                }
+                ReliableInputAttempt::AbortLane(outcome) => {
+                    metrics::counter!(
+                        "mux.client.reliable_input_attempt",
+                        "outcome" => outcome
+                    )
+                    .increment(1);
+                    queue.finish_worker(outcome);
+                    return;
+                }
+                ReliableInputAttempt::BindPaneAuthority(pane_registration) => {
+                    if !queue.bind_front_pane_authority(&entry, pane_registration) {
+                        queue.finish_worker("pane_authority_conflict");
+                        return;
+                    }
+                    consecutive_retries = 0;
+                    yield_reliable_input_worker_once().await;
+                }
+                ReliableInputAttempt::PaneAuthorityRetired(outcome) => {
+                    if !queue.retire_front_pane_authority(&entry, outcome) {
+                        queue.finish_worker("pane_authority_retirement_conflict");
+                        return;
+                    }
+                    consecutive_retries = 0;
+                    yield_reliable_input_worker_once().await;
+                }
+            }
+        }
+    }
+
+    async fn attempt(
+        client: &Arc<ClientInner>,
+        entry: &QueuedReliableInput,
+    ) -> ReliableInputAttempt {
+        match reliable_input_codec_disposition(client.client.agreed_codec_version()) {
+            ReliableInputCodecDisposition::AwaitingAuthority => {
+                return ReliableInputAttempt::Retry(
+                    RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
+                    "transport_not_ready",
+                );
+            }
+            ReliableInputCodecDisposition::Legacy => {
+                // An event that entered this queue had reliable-protocol
+                // authority. Never replay it through a legacy request after a
+                // reconnect downgrade: the older peer cannot deduplicate a
+                // prior v60 attempt whose response was lost.
+                return ReliableInputAttempt::AbortLane("codec_downgrade");
+            }
+            ReliableInputCodecDisposition::Reliable => {}
+        }
+
+        let mut request = entry.request.clone();
+        request.pane_registration = *entry.pane_authority.lock();
+        let request_had_pane_authority = request.pane_registration.is_some();
+        let response = client.client.reliable_key_event_v1(request).await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.root_cause().is::<crate::client::RpcTransportError>() => {
+                return ReliableInputAttempt::Retry(
+                    RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
+                    "transport_retired",
+                );
+            }
+            Err(error) if error.root_cause().is::<ClientOutboundAdmissionError>() => {
+                return ReliableInputAttempt::Retry(
+                    RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
+                    "outbound_admission_full",
+                );
+            }
+            Err(error) => {
+                log::warn!("reliable key protocol attempt failed terminally: {error:#}");
+                return ReliableInputAttempt::AbortLane("protocol_error");
+            }
+        };
+        if response.pane_id != entry.request.pane_id
+            || response.input_serial != entry.request.input_serial
+        {
+            log::warn!(
+                "reliable key response identity mismatch: expected pane={} serial={}, got pane={} serial={}",
+                entry.request.pane_id,
+                entry.request.input_serial.get(),
+                response.pane_id,
+                response.input_serial.get(),
+            );
+            return ReliableInputAttempt::AbortLane("response_identity_mismatch");
+        }
+        match response.outcome {
+            ReliableKeyEventOutcomeV1::Applied => ReliableInputAttempt::Complete("applied"),
+            ReliableKeyEventOutcomeV1::DuplicateApplied => {
+                ReliableInputAttempt::Complete("duplicate_applied")
+            }
+            ReliableKeyEventOutcomeV1::Retry(retry) => {
+                let (retry_after_ns, outcome) = match retry {
+                    ReliableKeyEventRetryV1::SchedulerFull(pressure) => {
+                        (pressure.retry_after_ns, "scheduler_full")
+                    }
+                    ReliableKeyEventRetryV1::SchedulerRetired(pressure) => {
+                        (pressure.retry_after_ns, "scheduler_retired")
+                    }
+                    ReliableKeyEventRetryV1::SchedulerUnavailable { retry_after_ns } => {
+                        (retry_after_ns, "scheduler_unavailable")
+                    }
+                    ReliableKeyEventRetryV1::DuplicatePending { retry_after_ns } => {
+                        (retry_after_ns, "duplicate_pending")
+                    }
+                    ReliableKeyEventRetryV1::ClientRegistrationTransition { retry_after_ns } => {
+                        (retry_after_ns, "client_registration_transition")
+                    }
+                    ReliableKeyEventRetryV1::PaneAuthorityRequired { pane_registration } => {
+                        return if !request_had_pane_authority {
+                            ReliableInputAttempt::BindPaneAuthority(pane_registration)
+                        } else {
+                            log::warn!(
+                                "server requested pane authority after the reliable key request already carried one"
+                            );
+                            ReliableInputAttempt::AbortLane("repeated_pane_authority_probe")
+                        };
+                    }
+                };
+                ReliableInputAttempt::Retry(Duration::from_nanos(retry_after_ns), outcome)
+            }
+            ReliableKeyEventOutcomeV1::Rejected(rejection) => match rejection {
+                ReliableKeyEventRejectionV1::PaneUnavailable => {
+                    ReliableInputAttempt::PaneAuthorityRetired("pane_unavailable")
+                }
+                ReliableKeyEventRejectionV1::PaneRegistrationMismatch => {
+                    ReliableInputAttempt::PaneAuthorityRetired("pane_registration_mismatch")
+                }
+                ReliableKeyEventRejectionV1::ClientLedgerUnavailable => {
+                    ReliableInputAttempt::AbortLane("client_ledger_unavailable")
+                }
+                ReliableKeyEventRejectionV1::IdentityAuthorityExhausted => {
+                    ReliableInputAttempt::AbortLane("identity_authority_exhausted")
+                }
+                ReliableKeyEventRejectionV1::StaleSerial => {
+                    ReliableInputAttempt::AbortLane("stale_serial")
+                }
+                ReliableKeyEventRejectionV1::IdentityConflict => {
+                    ReliableInputAttempt::AbortLane("identity_conflict")
+                }
+                ReliableKeyEventRejectionV1::OutcomeUnknown => {
+                    // This serial cannot be replayed safely, but the server's
+                    // terminal ledger still permits the next serial. Dropping
+                    // only this event lets an already-queued key-up release a
+                    // possibly-applied key-down and preserves unrelated panes.
+                    ReliableInputAttempt::DropOne("outcome_unknown")
+                }
+                ReliableKeyEventRejectionV1::InvalidSchedulerConfiguration => {
+                    ReliableInputAttempt::AbortLane("invalid_scheduler_configuration")
+                }
+            },
+        }
+    }
+
+    fn complete_front(&self, expected: &QueuedReliableInput, outcome: &'static str) -> bool {
+        let mut state = self.state.lock();
+        let matches = state.pending.front().is_some_and(|front| {
+            front.request == expected.request
+                && front.registration.same_registration(&expected.registration)
+        });
+        if matches {
+            let _ = state.pending.pop_front();
+        } else {
+            log::error!(
+                "reliable input FIFO authority changed while completing serial {}",
+                expected.request.input_serial.get()
+            );
+            state.worker_running = false;
+            return false;
+        }
+        metrics::counter!("mux.client.reliable_input_attempt", "outcome" => outcome).increment(1);
+        true
+    }
+
+    fn bind_front_pane_authority(
+        &self,
+        expected: &QueuedReliableInput,
+        pane_registration: ReliablePaneRegistrationIdentityV1,
+    ) -> bool {
+        let mut pane_authority = expected.pane_authority.lock();
+        if pane_authority.is_some_and(|current| current != pane_registration) {
+            return false;
+        }
+        let state = self.state.lock();
+        let matches = state.pending.front().is_some_and(|front| {
+            front.request == expected.request
+                && front.registration.same_registration(&expected.registration)
+                && Arc::ptr_eq(&front.pane_authority, &expected.pane_authority)
+        });
+        if !matches {
+            return false;
+        }
+        *pane_authority = Some(pane_registration);
+        true
+    }
+
+    fn retire_front_pane_authority(
+        &self,
+        expected: &QueuedReliableInput,
+        outcome: &'static str,
+    ) -> bool {
+        let mut pane_authority = expected.pane_authority.lock();
+        let mut state = self.state.lock();
+        let matches = state.pending.front().is_some_and(|front| {
+            front.request == expected.request
+                && front.registration.same_registration(&expected.registration)
+                && Arc::ptr_eq(&front.pane_authority, &expected.pane_authority)
+        });
+        if !matches {
+            return false;
+        }
+        state.pending.retain(|queued| {
+            !queued
+                .registration
+                .same_registration(&expected.registration)
+                || !Arc::ptr_eq(&queued.pane_authority, &expected.pane_authority)
+        });
+        *pane_authority = None;
+        metrics::counter!("mux.client.reliable_input_attempt", "outcome" => outcome).increment(1);
+        true
+    }
+
+    fn finish_worker(&self, outcome: &'static str) {
+        let mut state = self.state.lock();
+        state.pending.clear();
+        state.worker_running = false;
+        metrics::counter!("mux.client.reliable_input_worker", "outcome" => outcome).increment(1);
+    }
 }
 
 fn should_process_unilateral_render_delta(
@@ -477,6 +893,7 @@ pub struct ClientPane {
         reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
     )]
     render_application_limits: ClientRenderApplicationLimits,
+    reliable_input_pane_authority: Arc<Mutex<Option<ReliablePaneRegistrationIdentityV1>>>,
     mux_registration: Arc<PaneRegistrationSlot>,
 }
 
@@ -819,6 +1236,7 @@ impl ClientPane {
             semantic_state: Mutex::new(ClientSemanticState::default()),
             render_application_state: Mutex::new(ClientRenderApplicationState::default()),
             render_application_limits: ClientRenderApplicationLimits::default(),
+            reliable_input_pane_authority: Arc::new(Mutex::new(None)),
             mux_registration,
         }
     }
@@ -1449,7 +1867,8 @@ impl Pane for ClientPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
-        let input_serial = InputSerial::now();
+        let input_serial = InputSerial::try_now()
+            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         let data = text.to_owned();
@@ -1558,23 +1977,53 @@ impl Pane for ClientPane {
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        let input_serial = InputSerial::now();
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let request = client.client.key_down(SendKeyDown {
-            pane_id: remote_pane_id,
+        let input_serial = InputSerial::try_now()
+            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
+        if reliable_input_codec_disposition(self.client.client.agreed_codec_version())
+            == ReliableInputCodecDisposition::Legacy
+        {
+            let request = self.client.client.key_down(SendKeyDown {
+                pane_id: self.remote_pane_id,
+                event: KeyEvent {
+                    key,
+                    modifiers: mods,
+                },
+                input_serial,
+            });
+            let renderable = self.renderable.lock();
+            let mut inner = renderable.inner.borrow_mut();
+            dispatch_interactive_rpc(request, "key_down")?;
+            inner.input_serial = input_serial;
+            inner.predict_from_key_event(key, mods);
+            inner.update_last_send();
+            return Ok(());
+        }
+        let registration = self.mux_registration.load().ok_or_else(|| {
+            anyhow::anyhow!("client pane is not bound to a live mux registration")
+        })?;
+        let request = ReliableKeyEventV1 {
+            pane_id: self.remote_pane_id,
+            pane_registration: None,
             event: KeyEvent {
                 key,
                 modifiers: mods,
             },
             input_serial,
-        });
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
         // Keep the same pane authority across bounded admission and prediction
-        // publication. A response handler needs this lock before it can record
-        // the dispatch fence, so it cannot overtake the new prediction.
+        // publication. The shared reliable FIFO synchronously polls its first
+        // RPC attempt in this callback, and a response handler needs this lock
+        // before it can record the dispatch fence, so neither can overtake the
+        // new prediction.
         let renderable = self.renderable.lock();
         let mut inner = renderable.inner.borrow_mut();
-        dispatch_interactive_rpc(request, "key_down")?;
+        self.client.reliable_input_queue.enqueue(
+            &self.client,
+            registration,
+            Arc::clone(&self.reliable_input_pane_authority),
+            request,
+        )?;
         inner.input_serial = input_serial;
         inner.predict_from_key_event(key, mods);
         inner.update_last_send();
@@ -1582,16 +2031,40 @@ impl Pane for ClientPane {
     }
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let request = client.client.key_up(SendKeyUp {
-            pane_id: remote_pane_id,
-            event: KeyEvent {
-                key,
-                modifiers: mods,
+        if reliable_input_codec_disposition(self.client.client.agreed_codec_version())
+            == ReliableInputCodecDisposition::Legacy
+        {
+            return dispatch_interactive_rpc(
+                self.client.client.key_up(SendKeyUp {
+                    pane_id: self.remote_pane_id,
+                    event: KeyEvent {
+                        key,
+                        modifiers: mods,
+                    },
+                }),
+                "key_up",
+            );
+        }
+        let input_serial = InputSerial::try_now()
+            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
+        let registration = self.mux_registration.load().ok_or_else(|| {
+            anyhow::anyhow!("client pane is not bound to a live mux registration")
+        })?;
+        self.client.reliable_input_queue.enqueue(
+            &self.client,
+            registration,
+            Arc::clone(&self.reliable_input_pane_authority),
+            ReliableKeyEventV1 {
+                pane_id: self.remote_pane_id,
+                pane_registration: None,
+                event: KeyEvent {
+                    key,
+                    modifiers: mods,
+                },
+                input_serial,
+                kind: ReliableKeyEventKindV1::KeyUp,
             },
-        });
-        dispatch_interactive_rpc(request, "key_up")?;
+        )?;
         Ok(())
     }
 
@@ -1788,14 +2261,14 @@ impl std::io::Write for PaneWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MuxTestScope;
     use crate::client::{Client, TEST_RENDER_CONNECTION_IDENTITY};
     use crate::domain::ClientDomainConfig;
-    use crate::MuxTestScope;
     use config::UnixDomain;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::{Mux, MuxNotification, MuxSessionIncarnation};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use termwiz::cell::{CellAttributes, SemanticType};
 
     const SUCCESSOR_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
@@ -1822,6 +2295,52 @@ mod tests {
         assert!(should_process_unilateral_render_delta(11, 10, Some(serial)));
         assert!(should_process_unilateral_render_delta(11, 11, None));
         assert!(should_process_unilateral_render_delta(11, 12, None));
+    }
+
+    #[test]
+    fn reliable_input_retry_backoff_is_bounded_and_keeps_the_first_retry_prompt() {
+        let base = Duration::from_millis(1);
+        assert_eq!(reliable_input_retry_delay(base, 0), base);
+        assert_eq!(
+            reliable_input_retry_delay(base, 1),
+            Duration::from_millis(2)
+        );
+        assert_eq!(
+            reliable_input_retry_delay(base, 6),
+            Duration::from_millis(64)
+        );
+        assert_eq!(
+            reliable_input_retry_delay(base, u32::MAX),
+            RELIABLE_INPUT_MAX_RETRY_DELAY
+        );
+        let authoritative = Duration::from_secs(1);
+        assert_eq!(
+            reliable_input_retry_delay(authoritative, u32::MAX),
+            authoritative,
+            "local exponential backoff must not shorten the peer's retry authority"
+        );
+    }
+
+    #[test]
+    fn reliable_input_codec_boundary_never_downgrades_a_queued_retry() {
+        assert_eq!(
+            reliable_input_codec_disposition(None),
+            ReliableInputCodecDisposition::AwaitingAuthority
+        );
+        assert_eq!(
+            reliable_input_codec_disposition(Some(
+                RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION.saturating_sub(1)
+            )),
+            ReliableInputCodecDisposition::Legacy
+        );
+        assert_eq!(
+            reliable_input_codec_disposition(Some(RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION)),
+            ReliableInputCodecDisposition::Reliable
+        );
+        assert_eq!(
+            reliable_input_codec_disposition(Some(RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION + 1)),
+            ReliableInputCodecDisposition::Reliable
+        );
     }
 
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
@@ -1886,6 +2405,176 @@ mod tests {
             after_paste, before,
             "rejected paste must not advance prediction authority"
         );
+    }
+
+    #[test]
+    fn reliable_input_queue_has_a_hard_bound_and_retains_fifo_identity() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 43, 29);
+        let pane_for_mux: Arc<dyn Pane> = pane;
+        mux.add_pane(&pane_for_mux)
+            .expect("reliable-input queue test pane should register");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("reliable-input queue test needs exact pane authority");
+        {
+            let mut state = inner.reliable_input_queue.state.lock();
+            // Keep this unit test entirely off the transport worker while it
+            // exercises bounded admission through the production method.
+            state.worker_running = true;
+        }
+        let pane_authority = Arc::new(Mutex::new(None));
+
+        for offset in 0..RELIABLE_INPUT_QUEUE_CAPACITY {
+            inner
+                .reliable_input_queue
+                .enqueue(
+                    &inner,
+                    registration.clone(),
+                    Arc::clone(&pane_authority),
+                    ReliableKeyEventV1 {
+                        pane_id: 29,
+                        pane_registration: None,
+                        event: KeyEvent {
+                            key: KeyCode::Char('q'),
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        input_serial: InputSerial::from_millis_since_epoch(
+                            u64::try_from(offset).unwrap() + 1,
+                        ),
+                        kind: if offset % 2 == 0 {
+                            ReliableKeyEventKindV1::KeyDown
+                        } else {
+                            ReliableKeyEventKindV1::KeyUp
+                        },
+                    },
+                )
+                .expect("every slot through the exact fixed capacity must admit");
+        }
+        let rejected = inner.reliable_input_queue.enqueue(
+            &inner,
+            registration,
+            Arc::clone(&pane_authority),
+            ReliableKeyEventV1 {
+                pane_id: 29,
+                pane_registration: None,
+                event: KeyEvent {
+                    key: KeyCode::Char('q'),
+                    modifiers: KeyModifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(
+                    u64::try_from(RELIABLE_INPUT_QUEUE_CAPACITY).unwrap() + 1,
+                ),
+                kind: ReliableKeyEventKindV1::KeyDown,
+            },
+        );
+        assert!(rejected.is_err(), "capacity plus one must fail closed");
+
+        let first = {
+            let state = inner.reliable_input_queue.state.lock();
+            assert_eq!(state.pending.len(), RELIABLE_INPUT_QUEUE_CAPACITY);
+            assert_eq!(state.pending.front().unwrap().request.input_serial.get(), 1);
+            assert_eq!(
+                state.pending.back().unwrap().request.input_serial.get(),
+                u64::try_from(RELIABLE_INPUT_QUEUE_CAPACITY).unwrap()
+            );
+            assert_eq!(
+                state.pending.front().unwrap().request.kind,
+                ReliableKeyEventKindV1::KeyDown
+            );
+            assert_eq!(
+                state.pending.get(1).unwrap().request.kind,
+                ReliableKeyEventKindV1::KeyUp
+            );
+            state.pending.front().unwrap().clone()
+        };
+        let remote_authority = ReliablePaneRegistrationIdentityV1::from_bytes([0x61; 16]);
+        assert!(
+            inner
+                .reliable_input_queue
+                .bind_front_pane_authority(&first, remote_authority)
+        );
+        assert_eq!(*pane_authority.lock(), Some(remote_authority));
+        let mut state = inner.reliable_input_queue.state.lock();
+        assert!(
+            state
+                .pending
+                .iter()
+                .all(|queued| queued.request.pane_registration.is_none()),
+            "authority binding must stay O(1) instead of rewriting the queued burst"
+        );
+        state.pending.clear();
+        state.worker_running = false;
+    }
+
+    #[test]
+    fn reliable_input_pane_authority_retirement_is_exact_registration_scoped() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let first_pane: Arc<dyn Pane> = test_client_pane(&inner, 43, 29);
+        let second_pane: Arc<dyn Pane> = test_client_pane(&inner, 44, 30);
+        mux.add_pane(&first_pane)
+            .expect("register first client pane");
+        mux.add_pane(&second_pane)
+            .expect("register second client pane");
+        let first_registration = mux
+            .capture_pane_registration(&first_pane)
+            .expect("capture first exact client pane registration");
+        let second_registration = mux
+            .capture_pane_registration(&second_pane)
+            .expect("capture second exact client pane registration");
+        let first_authority = ReliablePaneRegistrationIdentityV1::from_bytes([0x61; 16]);
+        let second_authority = ReliablePaneRegistrationIdentityV1::from_bytes([0x62; 16]);
+        let first_authority_cache = Arc::new(Mutex::new(Some(first_authority)));
+        let second_authority_cache = Arc::new(Mutex::new(Some(second_authority)));
+        let request = |pane_id, pane_registration, input_serial| ReliableKeyEventV1 {
+            pane_id,
+            pane_registration: Some(pane_registration),
+            event: KeyEvent {
+                key: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(input_serial),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        let first = QueuedReliableInput {
+            registration: first_registration,
+            pane_authority: Arc::clone(&first_authority_cache),
+            request: request(29, first_authority, 1),
+        };
+        let second = QueuedReliableInput {
+            registration: second_registration,
+            pane_authority: Arc::clone(&second_authority_cache),
+            request: request(30, second_authority, 2),
+        };
+        {
+            let mut state = inner.reliable_input_queue.state.lock();
+            state.pending.push_back(first.clone());
+            state.pending.push_back(second.clone());
+            state.worker_running = true;
+        }
+
+        assert!(
+            inner
+                .reliable_input_queue
+                .retire_front_pane_authority(&first, "pane_registration_mismatch")
+        );
+        assert_eq!(*first_authority_cache.lock(), None);
+        assert_eq!(*second_authority_cache.lock(), Some(second_authority));
+        let state = inner.reliable_input_queue.state.lock();
+        assert_eq!(state.pending.len(), 1);
+        assert!(
+            state.pending[0]
+                .registration
+                .same_registration(&second.registration),
+            "retiring one pane generation must preserve another pane's FIFO work"
+        );
+        assert_eq!(state.pending[0].request, second.request);
     }
 
     fn test_render_application_update(
