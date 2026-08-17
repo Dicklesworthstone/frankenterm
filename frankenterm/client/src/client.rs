@@ -13412,9 +13412,6 @@ mod tests {
         );
         let (sender, receiver) = unbounded();
         let (completion_tx, completion_rx) = bounded(1);
-        let attempt_id = rpc_transport
-            .allocate_attempt("inbound-protocol-transport-probe")
-            .expect("test transport should allocate its probe attempt");
         let prepared = Pdu::Ping(Ping {})
             .prepare_outbound(
                 PduProducer::Client,
@@ -13423,6 +13420,10 @@ mod tests {
                 CompressionMode::Auto,
             )
             .expect("inbound protocol probe should produce an outbound plan");
+        let request_name = prepared.pdu().pdu_name();
+        let attempt_id = rpc_transport
+            .allocate_attempt(request_name)
+            .expect("test transport should allocate its probe attempt");
         let lease = rpc_transport
             .outbound_budget
             .try_reserve(Arc::downgrade(&rpc_transport), generation, prepared)
@@ -13432,7 +13433,7 @@ mod tests {
                 binding: RpcBinding {
                     generation,
                     attempt_id,
-                    request: "inbound-protocol-transport-probe",
+                    request: request_name,
                     expected_response_ident: NonZeroU64::new(ident),
                 },
                 lease,
@@ -13486,7 +13487,7 @@ mod tests {
         assert!(matches!(
             caller_error.downcast_ref::<RpcTransportError>(),
             Some(RpcTransportError::Retired {
-                request: "inbound-protocol-transport-probe",
+                request: "Ping",
                 stage: RpcRetirementStage::AwaitingResponse,
                 certainty: RpcDeliveryCertainty::OutcomeUnknown,
                 ..
