@@ -6276,6 +6276,21 @@ fn dispatch_client_request(
     topology: &TopologyStreamCoordinator,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
+    dispatch_client_request_with_decode_interval(handler, topology, decoded, None)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServerDecodeInterval {
+    started_at: std::time::Instant,
+    completed_at: std::time::Instant,
+}
+
+fn dispatch_client_request_with_decode_interval(
+    handler: &mut SessionHandler,
+    topology: &TopologyStreamCoordinator,
+    decoded: DecodedPdu,
+    decode_interval: Option<ServerDecodeInterval>,
+) -> anyhow::Result<()> {
     let result = (|| {
         if decoded.serial == 0 {
             metrics::counter!(
@@ -6307,7 +6322,7 @@ fn dispatch_client_request(
             );
         }
 
-        let input_trace_authority = match &decoded.pdu {
+        let mut input_trace_authority = match &decoded.pdu {
             Pdu::SendKeyDownTracedV1(request) => Some(AdmittedInputTraceV1::admit(
                 request,
                 topology.stream_id,
@@ -6315,6 +6330,14 @@ fn dispatch_client_request(
             )?),
             _ => None,
         };
+        if let (Some(admission), Some(interval)) = (input_trace_authority.as_mut(), decode_interval)
+        {
+            handler.record_decoded_input_trace(
+                admission,
+                interval.started_at,
+                interval.completed_at,
+            );
+        }
 
         let ordered_authority = match &decoded.pdu {
             Pdu::ListPanesCoherent(request) => {
@@ -6474,11 +6497,12 @@ fn dispatch_client_request_if_admitted(
     topology: &TopologyStreamCoordinator,
     terminal: &DispatchTerminal,
     decoded: DecodedPdu,
+    decode_interval: Option<ServerDecodeInterval>,
 ) -> anyhow::Result<RequestDispatchOutcome> {
     if !admit_request_dispatch(terminal) {
         return Ok(RequestDispatchOutcome::Terminal);
     }
-    dispatch_client_request(handler, topology, decoded)?;
+    dispatch_client_request_with_decode_interval(handler, topology, decoded, decode_interval)?;
     Ok(RequestDispatchOutcome::Dispatched)
 }
 
@@ -6647,6 +6671,7 @@ where
 
             match next_item {
                 Ok(Item::Readable) => {
+                    let decode_started_at = std::time::Instant::now();
                     let decoded = match decode_client_pdu_or_terminal(&mut stream, &terminal_rx)
                         .await
                     {
@@ -6675,6 +6700,10 @@ where
                         }
                         Ok(data) => data,
                     };
+                    let decode_interval = ServerDecodeInterval {
+                        started_at: decode_started_at,
+                        completed_at: std::time::Instant::now(),
+                    };
                     // This short admission is the request-dispatch
                     // linearization point. The wrapper releases it before the
                     // handler because synchronous response callbacks
@@ -6684,6 +6713,7 @@ where
                         &topology,
                         &terminal,
                         decoded,
+                        Some(decode_interval),
                     )? == RequestDispatchOutcome::Terminal
                     {
                         let reason = terminal_rx
@@ -9315,6 +9345,7 @@ mod tests {
                     is_proxy: false,
                 }),
             },
+            None,
         )
         .expect("terminal dispatch admission should be an explicit outcome");
         assert_eq!(rejected, RequestDispatchOutcome::Terminal);
@@ -9338,6 +9369,7 @@ mod tests {
                 serial: 91,
                 pdu: Pdu::Ping(Ping {}),
             },
+            None,
         )
         .expect("admitted Ping should synchronously enqueue its Pong response");
         assert_eq!(dispatched, RequestDispatchOutcome::Dispatched);
@@ -11430,6 +11462,7 @@ mod tests {
                 serial: 197,
                 pdu: Pdu::Ping(Ping {}),
             },
+            None,
         )
         .expect("terminal request gate must return an explicit outcome");
         assert_eq!(retry, RequestDispatchOutcome::Terminal);

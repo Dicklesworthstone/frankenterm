@@ -24,7 +24,17 @@ use codec::{
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceContextV1;
-use frankenterm_flight_recorder::{FlightRecorder, ProducerHandle, RecorderError};
+use frankenterm_core_audit_types::interaction_trace_v2::{
+    InteractionTraceClockDomain, InteractionTraceCorrelation,
+    InteractionTraceCounterUnavailability, InteractionTraceCounters, InteractionTraceGenerations,
+    InteractionTraceObservationBoundary, InteractionTraceProducer, InteractionTraceStage,
+    InteractionTraceStageOutcome, InteractionTraceTimestamp, InteractionTraceTopology,
+    RendererKeypressTraceStage,
+};
+use frankenterm_flight_recorder::{
+    ClockStamp, EventFields, FlightRecorder, ProducerHandle, RecordOutcome, RecorderError,
+    TraceAdmission, TraceToken,
+};
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::client::ClientId;
 use mux::pane::{CachePolicy, PaneId};
@@ -36,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 #[cfg(test)]
@@ -57,14 +67,46 @@ use wezterm_term::terminal::Alert;
 pub struct DispatchTraceAuthority {
     recorder: Arc<FlightRecorder>,
     next_shard: AtomicUsize,
+    next_connection_generation: AtomicU64,
+    process_identity: DispatchTraceProcessIdentity,
+    clock_origin: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DispatchTraceProcessIdentity {
+    host_id: u64,
+    process_id: u32,
+    process_generation: u64,
+    clock_id: u64,
 }
 
 impl DispatchTraceAuthority {
     #[must_use]
     pub fn new(recorder: Arc<FlightRecorder>) -> Arc<Self> {
+        let nonce = *uuid::Uuid::new_v4().as_bytes();
+        let host_id = u64::from_le_bytes([
+            nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7],
+        ])
+        .max(1);
+        let process_generation = u64::from_le_bytes([
+            nonce[8], nonce[9], nonce[10], nonce[11], nonce[12], nonce[13], nonce[14], nonce[15],
+        ])
+        .max(1);
+        let clock_id = host_id
+            .rotate_left(17)
+            .wrapping_add(process_generation)
+            .max(1);
         Arc::new(Self {
             recorder,
             next_shard: AtomicUsize::new(0),
+            next_connection_generation: AtomicU64::new(1),
+            process_identity: DispatchTraceProcessIdentity {
+                host_id,
+                process_id: std::process::id().max(1),
+                process_generation,
+                clock_id,
+            },
+            clock_origin: Instant::now(),
         })
     }
 
@@ -78,10 +120,19 @@ impl DispatchTraceAuthority {
             let shard_index = start.wrapping_add(offset) % shard_count;
             match self.recorder.register_producer(shard_index) {
                 Ok(producer) => {
+                    let Some(connection_generation) = self.allocate_connection_generation() else {
+                        metrics::counter!(
+                            "mux.server.trace_session_registration",
+                            "outcome" => "connection_generation_exhausted"
+                        )
+                        .increment(1);
+                        return None;
+                    };
                     return Some(Rc::new(SessionTraceProducer {
                         authority: Arc::clone(self),
                         producer,
                         topology_stream_id,
+                        connection_generation,
                         _main_thread_affinity: Cell::new(()),
                     }));
                 }
@@ -107,6 +158,24 @@ impl DispatchTraceAuthority {
         .increment(1);
         None
     }
+
+    fn allocate_connection_generation(&self) -> Option<u64> {
+        let mut observed = self.next_connection_generation.load(Ordering::Relaxed);
+        loop {
+            if observed == u64::MAX {
+                return None;
+            }
+            match self.next_connection_generation.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(observed),
+                Err(actual) => observed = actual,
+            }
+        }
+    }
 }
 
 /// One connection's explicitly registered, thread-affine recorder producer.
@@ -120,7 +189,201 @@ pub(crate) struct SessionTraceProducer {
     authority: Arc<DispatchTraceAuthority>,
     producer: ProducerHandle,
     topology_stream_id: TopologyStreamId,
+    connection_generation: u64,
     _main_thread_affinity: Cell<()>,
+}
+
+impl SessionTraceProducer {
+    fn connection_generation(&self) -> u64 {
+        self.connection_generation
+    }
+
+    fn producer_identity(&self) -> Option<InteractionTraceProducer> {
+        let thread_id = u64::try_from(self.producer.shard_index())
+            .ok()?
+            .checked_add(1)?;
+        let process = self.authority.process_identity;
+        Some(InteractionTraceProducer {
+            host_id: process.host_id,
+            process_id: process.process_id,
+            process_generation: process.process_generation,
+            thread_id,
+            connection_generation: Some(self.connection_generation()),
+        })
+    }
+
+    fn timestamp_at(&self, observed: Instant) -> Option<InteractionTraceTimestamp> {
+        let elapsed = observed.checked_duration_since(self.authority.clock_origin)?;
+        let monotonic_ns = u64::try_from(elapsed.as_nanos()).ok()?;
+        let process = self.authority.process_identity;
+        Some(InteractionTraceTimestamp {
+            clock_domain: InteractionTraceClockDomain {
+                host_id: process.host_id,
+                process_generation: process.process_generation,
+                clock_id: process.clock_id,
+            },
+            monotonic_ns,
+            wall_time_unix_ns: None,
+        })
+    }
+
+    fn admit_remote_trace(&self, context: SampledTraceContextV1) -> Option<TraceToken> {
+        match self
+            .authority
+            .recorder
+            .admit_remote_trace(&self.producer, context)
+        {
+            TraceAdmission::Admitted { token, .. } => Some(token),
+            TraceAdmission::Off => None,
+            TraceAdmission::Closing => {
+                metrics::counter!(
+                    "mux.server.trace_remote_admission",
+                    "outcome" => "closing"
+                )
+                .increment(1);
+                None
+            }
+            TraceAdmission::InvalidRemoteContext => {
+                metrics::counter!(
+                    "mux.server.trace_remote_admission",
+                    "outcome" => "invalid_context"
+                )
+                .increment(1);
+                None
+            }
+            TraceAdmission::WrongRecorder
+            | TraceAdmission::SampledOut { .. }
+            | TraceAdmission::TraceIdExhausted { .. } => {
+                metrics::counter!(
+                    "mux.server.trace_remote_admission",
+                    "outcome" => "authority_rejected"
+                )
+                .increment(1);
+                None
+            }
+        }
+    }
+
+    fn record_server_stage(
+        &self,
+        token: TraceToken,
+        stage: RendererKeypressTraceStage,
+        topology: InteractionTraceTopology,
+        started_at: Instant,
+        completed_at: Instant,
+    ) {
+        let Some(producer) = self.producer_identity() else {
+            metrics::counter!(
+                "mux.server.trace_event",
+                "outcome" => "producer_identity_exhausted"
+            )
+            .increment(1);
+            return;
+        };
+        let (Some(started_at), Some(completed_at)) = (
+            self.timestamp_at(started_at),
+            self.timestamp_at(completed_at),
+        ) else {
+            metrics::counter!("mux.server.trace_event", "outcome" => "clock_invalid").increment(1);
+            return;
+        };
+        let stage = InteractionTraceStage::Keypress(stage);
+        let fields = match EventFields::new(
+            u64::from(stage.ordinal()),
+            u64::from(stage.ordinal()) + 1,
+            Some(u64::from(stage.ordinal())),
+            stage,
+            InteractionTraceStageOutcome::Performed,
+            producer,
+            topology,
+            ClockStamp {
+                started_at,
+                completed_at,
+            },
+            InteractionTraceCorrelation::ExactProtocol {
+                protocol_token: token.trace_id().sequence,
+                protocol_generation: self.connection_generation(),
+            },
+            InteractionTraceCounters {
+                work_units: 1,
+                rpc_count: 1,
+                ..InteractionTraceCounters::default()
+            },
+            InteractionTraceCounterUnavailability {
+                queue_depth: true,
+                oldest_queue_age_ns: true,
+                work_units: false,
+                bytes: true,
+                rows: true,
+                allocation_count: true,
+                allocated_bytes: true,
+                copy_count: true,
+                copied_bytes: true,
+                rpc_count: false,
+                delta_count: true,
+                dirty_rows: true,
+                full_viewport_clones: true,
+                cursor_row_duplicates: true,
+                paint_count: true,
+                frame_count: true,
+            },
+            InteractionTraceGenerations::default(),
+            InteractionTraceObservationBoundary::InternalState,
+            None,
+        ) {
+            Ok(fields) => fields,
+            Err(error) => {
+                log::warn!("refusing invalid mux-server trace event: {error}");
+                metrics::counter!("mux.server.trace_event", "outcome" => "invalid_fields")
+                    .increment(1);
+                return;
+            }
+        };
+        let outcome = self
+            .authority
+            .recorder
+            .record(&self.producer, token, &fields);
+        let outcome = match outcome {
+            RecordOutcome::Recorded { .. } => "recorded",
+            RecordOutcome::QueueFull { .. } => "queue_full",
+            RecordOutcome::Closing { .. } | RecordOutcome::OutsideEpoch => "closing",
+            RecordOutcome::Off => "off",
+            RecordOutcome::WrongRecorder | RecordOutcome::EpochMismatch { .. } => {
+                "authority_rejected"
+            }
+            RecordOutcome::ClockInvalid { .. } => "clock_invalid",
+        };
+        metrics::counter!("mux.server.trace_event", "outcome" => outcome).increment(1);
+    }
+
+    fn record_mux_dispatch_start(
+        &self,
+        admission: &AdmittedInputTraceV1,
+        dispatch_started_at: Instant,
+    ) {
+        if admission.stream_id != self.topology_stream_id {
+            metrics::counter!(
+                "mux.server.trace_event",
+                "outcome" => "connection_generation_mismatch"
+            )
+            .increment(1);
+            return;
+        }
+        let (Some(token), Some(topology), Some(dispatch_queued_at)) = (
+            admission.recorder_token,
+            admission.topology,
+            admission.dispatch_queued_at,
+        ) else {
+            return;
+        };
+        self.record_server_stage(
+            token,
+            RendererKeypressTraceStage::ServerDispatchMuxWait,
+            topology,
+            dispatch_queued_at,
+            dispatch_started_at,
+        );
+    }
 }
 
 /// Checked, cycle-breaking conversions between the ordered-window wire schema
@@ -831,6 +1094,9 @@ pub(crate) struct AdmittedInputTraceV1 {
     stream_id: TopologyStreamId,
     pane_id: PaneId,
     input_serial: InputSerial,
+    recorder_token: Option<TraceToken>,
+    topology: Option<InteractionTraceTopology>,
+    dispatch_queued_at: Option<Instant>,
 }
 
 impl AdmittedInputTraceV1 {
@@ -857,6 +1123,9 @@ impl AdmittedInputTraceV1 {
             stream_id,
             pane_id: request.request.pane_id,
             input_serial: request.request.input_serial,
+            recorder_token: None,
+            topology: None,
+            dispatch_queued_at: None,
         })
     }
 
@@ -4006,7 +4275,7 @@ pub struct SessionHandler {
     to_write_tx: PduSender,
     owner: SessionOwner,
     topology_stream_id: TopologyStreamId,
-    _trace_producer: Option<Rc<SessionTraceProducer>>,
+    trace_producer: Option<Rc<SessionTraceProducer>>,
     per_pane: HashMap<PaneId, TrackedPane>,
     client_id: Option<Arc<ClientId>>,
     #[cfg(test)]
@@ -4061,7 +4330,7 @@ impl SessionHandler {
             to_write_tx,
             owner,
             topology_stream_id,
-            _trace_producer: trace_producer,
+            trace_producer,
             per_pane: HashMap::new(),
             client_id: None,
             #[cfg(test)]
@@ -4074,6 +4343,77 @@ impl SessionHandler {
     fn new(to_write_tx: PduSender) -> Self {
         let mux_owner = Mux::try_get().unwrap_or_else(|| Arc::new(Mux::new(None)));
         Self::new_for_session(to_write_tx, SessionOwner::new(mux_owner))
+    }
+
+    pub(crate) fn record_decoded_input_trace(
+        &self,
+        admission: &mut AdmittedInputTraceV1,
+        decode_started_at: Instant,
+        decode_completed_at: Instant,
+    ) {
+        let Some(trace_producer) = self.trace_producer.as_ref() else {
+            return;
+        };
+        if trace_producer.topology_stream_id != admission.stream_id {
+            metrics::counter!(
+                "mux.server.trace_remote_admission",
+                "outcome" => "connection_generation_mismatch"
+            )
+            .increment(1);
+            return;
+        }
+        let Ok(session) = self.owner.authority().acquire() else {
+            metrics::counter!(
+                "mux.server.trace_remote_admission",
+                "outcome" => "session_retired"
+            )
+            .increment(1);
+            return;
+        };
+        let Some((_, window_id, tab_id)) = session.resolve_pane_id(admission.pane_id) else {
+            metrics::counter!(
+                "mux.server.trace_remote_admission",
+                "outcome" => "pane_location_unresolved"
+            )
+            .increment(1);
+            return;
+        };
+        let (Ok(window_id), Ok(tab_id), Ok(pane_id)) = (
+            u64::try_from(window_id),
+            u64::try_from(tab_id),
+            u64::try_from(admission.pane_id),
+        ) else {
+            metrics::counter!(
+                "mux.server.trace_remote_admission",
+                "outcome" => "topology_id_exhausted"
+            )
+            .increment(1);
+            return;
+        };
+        drop(session);
+
+        let Some(token) = trace_producer.admit_remote_trace(admission.context) else {
+            return;
+        };
+        let topology = InteractionTraceTopology {
+            window_id,
+            tab_id,
+            pane_id,
+        };
+        trace_producer.record_server_stage(
+            token,
+            RendererKeypressTraceStage::ServerReadableDecode,
+            topology,
+            decode_started_at,
+            decode_completed_at,
+        );
+        admission.recorder_token = Some(token);
+        admission.topology = Some(topology);
+        // K4 ends at decode completion; K5 begins at that same boundary so
+        // request validation, exact-topology admission, recorder publication,
+        // scheduling, and mux-main queue wait cannot disappear into an
+        // unmeasured gap between the two server stages.
+        admission.dispatch_queued_at = Some(decode_completed_at);
     }
 
     fn per_pane_for_registration(
@@ -4843,16 +5183,21 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
                 let trace_authority = admitted_input_trace;
-                spawn_into_main_thread(async move {
+                let trace_producer = self.trace_producer.as_ref().map(Rc::clone);
+                promise::spawn::spawn(async move {
                     catch(
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
-                                // Retain the exact K4 connection-generation
-                                // authority through the mux-main handoff. The
-                                // K5/K6 instrumentation child consumes it here;
-                                // this plumbing bead intentionally records no
-                                // timing event yet.
-                                let _ = trace_authority;
+                                if let (Some(producer), Some(admission)) =
+                                    (trace_producer.as_ref(), trace_authority.as_ref())
+                                {
+                                    // End K5 only after the queued task has
+                                    // revalidated the exact session and pane
+                                    // registration. A retired session or
+                                    // replaced pane therefore cannot fabricate
+                                    // a performed mux-dispatch stage.
+                                    producer.record_mux_dispatch_start(admission, Instant::now());
+                                }
                                 pane.key_down(event.key, event.modifiers)?;
                                 push_input_dispatch_changes_after_committed_input(
                                     pane,
@@ -5848,6 +6193,7 @@ mod tests {
             .expect("second connection must claim the other producer shard");
 
         assert_ne!(first.producer.shard_index(), second.producer.shard_index());
+        assert_ne!(first.connection_generation, second.connection_generation);
         assert_eq!(first.topology_stream_id, topology_stream(1));
         assert_eq!(second.topology_stream_id, topology_stream(2));
         assert!(Arc::ptr_eq(&first.authority, &authority));
@@ -5862,7 +6208,77 @@ mod tests {
             .claim_session(topology_stream(4))
             .expect("dropping a connection must release its exact producer claim");
         assert_eq!(replacement.producer.shard_index(), released_shard);
+        assert_ne!(
+            replacement.connection_generation,
+            second.connection_generation
+        );
         assert_eq!(replacement.topology_stream_id, topology_stream(4));
+    }
+
+    #[test]
+    fn server_trace_producer_records_exact_k4_k5_prefix_without_content() {
+        let recorder = trace_recorder(1);
+        let authority = DispatchTraceAuthority::new(Arc::clone(&recorder));
+        let producer = authority
+            .claim_session(topology_stream(9))
+            .expect("connection must claim its producer before request dispatch");
+        let token = producer
+            .admit_remote_trace(sampled_key_context())
+            .expect("certification recorder must admit the sampled remote trace");
+        let topology = InteractionTraceTopology {
+            window_id: 101,
+            tab_id: 202,
+            pane_id: 303,
+        };
+        let k4_start = Instant::now();
+        let k4_end = k4_start
+            .checked_add(std::time::Duration::from_nanos(5))
+            .expect("test instant addition must fit");
+        let k5_end = k4_end
+            .checked_add(std::time::Duration::from_nanos(7))
+            .expect("test instant addition must fit");
+
+        producer.record_server_stage(
+            token,
+            RendererKeypressTraceStage::ServerReadableDecode,
+            topology,
+            k4_start,
+            k4_end,
+        );
+        let admission = AdmittedInputTraceV1 {
+            context: sampled_key_context(),
+            stream_id: topology_stream(9),
+            pane_id: 303,
+            input_serial: InputSerial::from_millis_since_epoch(11),
+            recorder_token: Some(token),
+            topology: Some(topology),
+            dispatch_queued_at: Some(k4_end),
+        };
+        producer.record_mux_dispatch_start(&admission, k5_end);
+
+        let frozen = recorder
+            .try_freeze()
+            .expect("quiescent two-stage recorder must freeze");
+        let mut events = Vec::with_capacity(frozen.len());
+        assert_eq!(
+            frozen.export_into(&mut events),
+            frankenterm_flight_recorder::ExportOutcome::Completed { exported_events: 2 }
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].stage,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode)
+        );
+        assert_eq!(
+            events[1].stage,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait)
+        );
+        assert_eq!(events[0].topology, topology);
+        assert_eq!(events[1].topology, topology);
+        assert_eq!(events[0].duration_ns().expect("K4 clock is coherent"), 5);
+        assert_eq!(events[1].duration_ns().expect("K5 clock is coherent"), 7);
+        assert_eq!(events[0].trace_id, sampled_key_context().trace_id);
+        assert_eq!(events[1].trace_id, sampled_key_context().trace_id);
     }
 
     fn sampled_key_context() -> SampledTraceContextV1 {
