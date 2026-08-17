@@ -4,7 +4,7 @@
 
 **Wire schema:** `ft.interaction-trace.v2`
 
-**Rust authority:** `frankenterm_core::interaction_trace_v2`
+**Rust authority:** `frankenterm_core_audit_types::interaction_trace_v2`
 
 **JSON schema:** `docs/perf/interaction-trace-v2.schema.json`
 
@@ -124,6 +124,18 @@ unavailable counter makes the trace diagnostic rather than qualifying. The
 fixed shape bounds deserialization and preserves the distinction between a
 measured zero and missing authority without putting free-form text into the
 trace.
+
+K5 may additionally carry `scheduler_queue`, a fixed numeric receipt containing
+the exact queue ID, scheduler generation, task ticket, finite task/estimated-
+byte capacities, enqueue timestamp, and retirement state. The receipt is valid
+only on `K5.server_dispatch_mux_wait`; its enqueue timestamp must use the event
+producer's clock domain and lie between the stage start and dequeue/completion
+timestamps. Its queue depth and byte pressure remain the canonical counter
+values and may not exceed the retained capacities; `oldest_queue_age_ns` is the
+age in the same post-enqueue snapshot, not a later reconstruction after other
+tasks may have drained. This prevents two replaced scheduler generations from
+being aggregated as one queue and distinguishes decode completion, actual
+enqueue, and actual dequeue without adding content or a free-form label.
 
 Terminal, snapshot, and frame generations are explicit optional values. Zero
 is invalid. The validator requires terminal generation at K7, snapshot

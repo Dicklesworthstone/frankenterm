@@ -38,9 +38,11 @@ use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceEventV2, InteractionTraceGenerations, InteractionTraceId,
     InteractionTraceObservationBoundary, InteractionTracePath, InteractionTracePhysicalDetector,
     InteractionTraceProducer, InteractionTraceRunId, InteractionTraceSamplingLoss,
-    InteractionTraceStage, InteractionTraceStageOutcome, InteractionTraceTimestamp,
-    InteractionTraceTopology, TraceContractError, validate_interaction_trace_structure,
+    InteractionTraceSchedulerQueueEvidence, InteractionTraceStage, InteractionTraceStageOutcome,
+    InteractionTraceTimestamp, InteractionTraceTopology, TraceContractError,
+    validate_interaction_trace_structure,
 };
+use frankenterm_core_audit_types::renderer_scenario_catalog::RendererKeypressTraceStage;
 use thiserror::Error;
 
 const AUTHORITY_EXACT: u8 = 0;
@@ -277,6 +279,7 @@ pub struct EventFields {
     counters: InteractionTraceCounters,
     counter_unavailability: InteractionTraceCounterUnavailability,
     generations: InteractionTraceGenerations,
+    scheduler_queue: Option<InteractionTraceSchedulerQueueEvidence>,
     observation_boundary: InteractionTraceObservationBoundary,
     physical_detector: Option<InteractionTracePhysicalDetector>,
 }
@@ -297,6 +300,7 @@ impl EventFields {
         counters: InteractionTraceCounters,
         counter_unavailability: InteractionTraceCounterUnavailability,
         generations: InteractionTraceGenerations,
+        scheduler_queue: Option<InteractionTraceSchedulerQueueEvidence>,
         observation_boundary: InteractionTraceObservationBoundary,
         physical_detector: Option<InteractionTracePhysicalDetector>,
     ) -> Result<Self, RecorderError> {
@@ -313,6 +317,7 @@ impl EventFields {
             counters,
             counter_unavailability,
             generations,
+            scheduler_queue,
             observation_boundary,
             physical_detector,
         };
@@ -368,6 +373,7 @@ impl EventFields {
         }
         validate_correlation(self.correlation)?;
         validate_generations(self.stage, self.generations)?;
+        validate_scheduler_queue(self)?;
         validate_observation(
             self.stage,
             self.observation_boundary,
@@ -1603,6 +1609,13 @@ struct RawInteractionEvent {
     terminal_generation: u64,
     snapshot_generation: u64,
     frame_generation: u64,
+    scheduler_queue_id: u64,
+    scheduler_generation: u64,
+    scheduler_task_ticket: u64,
+    scheduler_task_capacity: u64,
+    scheduler_estimated_byte_capacity: u64,
+    scheduler_enqueued_monotonic_ns: u64,
+    scheduler_enqueued_wall_time_unix_ns: u64,
     dropped_events: u64,
     detector_id: u64,
     calibration_id: u64,
@@ -1669,6 +1682,23 @@ impl RawInteractionEvent {
             terminal_generation: fields.generations.terminal_generation.unwrap_or(0),
             snapshot_generation: fields.generations.snapshot_generation.unwrap_or(0),
             frame_generation: fields.generations.frame_generation.unwrap_or(0),
+            scheduler_queue_id: fields.scheduler_queue.map_or(0, |queue| queue.queue_id),
+            scheduler_generation: fields
+                .scheduler_queue
+                .map_or(0, |queue| queue.scheduler_generation),
+            scheduler_task_ticket: fields.scheduler_queue.map_or(0, |queue| queue.task_ticket),
+            scheduler_task_capacity: fields
+                .scheduler_queue
+                .map_or(0, |queue| queue.task_capacity),
+            scheduler_estimated_byte_capacity: fields
+                .scheduler_queue
+                .map_or(0, |queue| queue.estimated_byte_capacity),
+            scheduler_enqueued_monotonic_ns: fields
+                .scheduler_queue
+                .map_or(0, |queue| queue.enqueued_at.monotonic_ns),
+            scheduler_enqueued_wall_time_unix_ns: fields
+                .scheduler_queue
+                .map_or(0, |queue| queue.enqueued_at.wall_time_unix_ns.unwrap_or(0)),
             dropped_events,
             detector_id: fields
                 .physical_detector
@@ -1744,6 +1774,26 @@ impl RawInteractionEvent {
                 snapshot_generation: flag(self.flags, 5).then_some(self.snapshot_generation),
                 frame_generation: flag(self.flags, 6).then_some(self.frame_generation),
             },
+            scheduler_queue: flag(self.flags, 9).then_some(
+                InteractionTraceSchedulerQueueEvidence {
+                    queue_id: self.scheduler_queue_id,
+                    scheduler_generation: self.scheduler_generation,
+                    task_ticket: self.scheduler_task_ticket,
+                    task_capacity: self.scheduler_task_capacity,
+                    estimated_byte_capacity: self.scheduler_estimated_byte_capacity,
+                    enqueued_at: InteractionTraceTimestamp {
+                        clock_domain: InteractionTraceClockDomain {
+                            host_id: self.started_clock_host_id,
+                            process_generation: self.started_clock_process_generation,
+                            clock_id: self.started_clock_id,
+                        },
+                        monotonic_ns: self.scheduler_enqueued_monotonic_ns,
+                        wall_time_unix_ns: flag(self.flags, 10)
+                            .then_some(self.scheduler_enqueued_wall_time_unix_ns),
+                    },
+                    retired: flag(self.flags, 8),
+                },
+            ),
             sampling_loss: InteractionTraceSamplingLoss {
                 dropped_events: self.dropped_events,
                 overwritten_events: 0,
@@ -1836,6 +1886,15 @@ impl RawInteractionEvent {
                 self.snapshot_generation,
                 self.frame_generation,
             ),
+            (
+                self.scheduler_queue_id,
+                self.scheduler_generation,
+                self.scheduler_task_ticket,
+                self.scheduler_task_capacity,
+                self.scheduler_estimated_byte_capacity,
+                self.scheduler_enqueued_monotonic_ns,
+                self.scheduler_enqueued_wall_time_unix_ns,
+            ),
             (self.dropped_events, self.unavailable_mask),
             (self.detector_id, self.calibration_id),
             (
@@ -1859,6 +1918,15 @@ impl RawInteractionEvent {
                     other.terminal_generation,
                     other.snapshot_generation,
                     other.frame_generation,
+                ),
+                (
+                    other.scheduler_queue_id,
+                    other.scheduler_generation,
+                    other.scheduler_task_ticket,
+                    other.scheduler_task_capacity,
+                    other.scheduler_estimated_byte_capacity,
+                    other.scheduler_enqueued_monotonic_ns,
+                    other.scheduler_enqueued_wall_time_unix_ns,
                 ),
                 (other.dropped_events, other.unavailable_mask),
                 (other.detector_id, other.calibration_id),
@@ -2002,6 +2070,51 @@ fn validate_generations(
     }
     if stage.is_display_completion() && generations.frame_generation.is_none() {
         return Err(RecorderError::InvalidEvent("frame generation missing"));
+    }
+    Ok(())
+}
+
+fn validate_scheduler_queue(fields: &EventFields) -> Result<(), RecorderError> {
+    let Some(queue) = fields.scheduler_queue else {
+        return Ok(());
+    };
+    if !matches!(
+        fields.stage,
+        InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait)
+    ) {
+        return Err(RecorderError::InvalidEvent(
+            "scheduler queue evidence is attached to the wrong stage",
+        ));
+    }
+    if queue.queue_id == 0
+        || queue.scheduler_generation == 0
+        || queue.task_ticket == 0
+        || queue.task_capacity == 0
+        || queue.estimated_byte_capacity == 0
+    {
+        return Err(RecorderError::InvalidEvent(
+            "invalid scheduler queue identity or capacity",
+        ));
+    }
+    ClockStamp {
+        started_at: fields.clock.started_at,
+        completed_at: queue.enqueued_at,
+    }
+    .validate(fields.producer)?;
+    ClockStamp {
+        started_at: queue.enqueued_at,
+        completed_at: fields.clock.completed_at,
+    }
+    .validate(fields.producer)?;
+    if fields.counter_unavailability.queue_depth
+        || fields.counter_unavailability.oldest_queue_age_ns
+        || fields.counter_unavailability.bytes
+        || fields.counters.queue_depth > queue.task_capacity
+        || fields.counters.bytes > queue.estimated_byte_capacity
+    {
+        return Err(RecorderError::InvalidEvent(
+            "scheduler queue counters disagree with queue evidence",
+        ));
     }
     Ok(())
 }
@@ -2220,6 +2333,13 @@ fn encode_flags(fields: &EventFields) -> u16 {
         | (u16::from(fields.generations.snapshot_generation.is_some()) << 5)
         | (u16::from(fields.generations.frame_generation.is_some()) << 6)
         | (u16::from(fields.physical_detector.is_some()) << 7)
+        | (u16::from(fields.scheduler_queue.is_some_and(|queue| queue.retired)) << 8)
+        | (u16::from(fields.scheduler_queue.is_some()) << 9)
+        | (u16::from(
+            fields
+                .scheduler_queue
+                .is_some_and(|queue| queue.enqueued_at.wall_time_unix_ns.is_some()),
+        ) << 10)
 }
 
 fn flag(flags: u16, bit: u8) -> bool {
@@ -2280,6 +2400,23 @@ mod tests {
             clock_id: 33,
         };
         let display_completion = stage.is_display_completion();
+        let scheduler_queue = matches!(
+            stage,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait)
+        )
+        .then_some(InteractionTraceSchedulerQueueEvidence {
+            queue_id: 7,
+            scheduler_generation: 8,
+            task_ticket: 9,
+            task_capacity: 16,
+            estimated_byte_capacity: 4_096,
+            enqueued_at: InteractionTraceTimestamp {
+                clock_domain,
+                monotonic_ns: 100 + u64::from(stage.ordinal()),
+                wall_time_unix_ns: None,
+            },
+            retired: false,
+        });
         EventFields::new(
             u64::from(stage.ordinal()),
             u64::from(stage.ordinal()) + 1,
@@ -2318,6 +2455,7 @@ mod tests {
                 snapshot_generation: Some(2),
                 frame_generation: display_completion.then_some(3),
             },
+            scheduler_queue,
             if display_completion {
                 InteractionTraceObservationBoundary::DisplayPresented
             } else {
@@ -2722,6 +2860,46 @@ mod tests {
             events: exported,
         };
         assert_eq!(trace.validate_structure(), Ok(()));
+    }
+
+    #[test]
+    fn scheduler_queue_evidence_survives_fixed_raw_ring_roundtrip() {
+        let recorder = FlightRecorder::new(config(1, 1)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        let fields = fields_for(
+            9,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait),
+        );
+        assert!(matches!(
+            recorder.record(&producer, token, &fields),
+            RecordOutcome::Recorded { .. }
+        ));
+        let frozen = recorder.try_freeze().expect("freeze succeeds");
+        let mut exported = Vec::with_capacity(1);
+        assert_eq!(
+            frozen.export_into(&mut exported),
+            ExportOutcome::Completed { exported_events: 1 }
+        );
+        assert_eq!(exported[0].scheduler_queue, fields.scheduler_queue);
+        assert_eq!(
+            exported[0]
+                .scheduler_queue
+                .expect("K5 queue evidence must survive the raw ring"),
+            InteractionTraceSchedulerQueueEvidence {
+                queue_id: 7,
+                scheduler_generation: 8,
+                task_ticket: 9,
+                task_capacity: 16,
+                estimated_byte_capacity: 4_096,
+                enqueued_at: InteractionTraceTimestamp {
+                    clock_domain: fields.clock.started_at.clock_domain,
+                    monotonic_ns: fields.clock.started_at.monotonic_ns,
+                    wall_time_unix_ns: None,
+                },
+                retired: false,
+            }
+        );
     }
 
     #[test]

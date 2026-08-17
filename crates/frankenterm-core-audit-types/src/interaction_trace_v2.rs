@@ -703,6 +703,25 @@ pub struct InteractionTraceSamplingLoss {
     pub overwritten_events: u64,
 }
 
+/// Exact admission and queue authority for a task executed by the bounded
+/// main-thread scheduler.
+///
+/// Queue depth, oldest age, and byte pressure remain in the fixed counter
+/// vocabulary. This receipt carries the identity/capacity coordinates and the
+/// actual enqueue timestamp needed to interpret those counters without
+/// conflating scheduler generations or inferring enqueue time from decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionTraceSchedulerQueueEvidence {
+    pub queue_id: u64,
+    pub scheduler_generation: u64,
+    pub task_ticket: u64,
+    pub task_capacity: u64,
+    pub estimated_byte_capacity: u64,
+    pub enqueued_at: InteractionTraceTimestamp,
+    pub retired: bool,
+}
+
 impl InteractionTraceSamplingLoss {
     #[must_use]
     pub const fn is_lossless(self) -> bool {
@@ -729,6 +748,8 @@ pub struct InteractionTraceEventV2 {
     pub counters: InteractionTraceCounters,
     pub counter_unavailability: InteractionTraceCounterUnavailability,
     pub generations: InteractionTraceGenerations,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_queue: Option<InteractionTraceSchedulerQueueEvidence>,
     pub sampling_loss: InteractionTraceSamplingLoss,
     pub observation_boundary: InteractionTraceObservationBoundary,
     pub physical_detector: Option<InteractionTracePhysicalDetector>,
@@ -1100,6 +1121,7 @@ where
     validate_stage_outcome(event)?;
     validate_counter_unavailability(event)?;
     validate_generations(event)?;
+    validate_scheduler_queue(event)?;
     validate_observation_boundary(event)?;
     Ok(())
 }
@@ -1256,6 +1278,51 @@ fn validate_generations(event: &InteractionTraceEventV2) -> Result<(), TraceCont
         return Err(TraceContractError::GenerationMissing {
             field,
             stage: event.stage,
+        });
+    }
+    Ok(())
+}
+
+fn validate_scheduler_queue(event: &InteractionTraceEventV2) -> Result<(), TraceContractError> {
+    let Some(queue) = event.scheduler_queue else {
+        return Ok(());
+    };
+    if !matches!(
+        event.stage,
+        InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait)
+    ) {
+        return Err(TraceContractError::SchedulerQueueEvidenceUnexpected { stage: event.stage });
+    }
+    for (field, value) in [
+        ("queue_id", queue.queue_id),
+        ("scheduler_generation", queue.scheduler_generation),
+        ("task_ticket", queue.task_ticket),
+        ("task_capacity", queue.task_capacity),
+        ("estimated_byte_capacity", queue.estimated_byte_capacity),
+    ] {
+        if value == 0 {
+            return Err(TraceContractError::InvalidSchedulerQueueEvidence { field });
+        }
+    }
+    validate_clock(queue.enqueued_at.clock_domain, event.producer)?;
+    event.started_at.duration_until(queue.enqueued_at)?;
+    queue.enqueued_at.duration_until(event.completed_at)?;
+    if event.counter_unavailability.queue_depth
+        || event.counter_unavailability.oldest_queue_age_ns
+        || event.counter_unavailability.bytes
+    {
+        return Err(TraceContractError::InvalidSchedulerQueueEvidence {
+            field: "counter_availability",
+        });
+    }
+    if event.counters.queue_depth > queue.task_capacity {
+        return Err(TraceContractError::InvalidSchedulerQueueEvidence {
+            field: "queue_depth",
+        });
+    }
+    if event.counters.bytes > queue.estimated_byte_capacity {
+        return Err(TraceContractError::InvalidSchedulerQueueEvidence {
+            field: "estimated_bytes",
         });
     }
     Ok(())
@@ -1668,6 +1735,12 @@ pub enum TraceContractError {
         field: &'static str,
         stage: InteractionTraceStage,
     },
+    InvalidSchedulerQueueEvidence {
+        field: &'static str,
+    },
+    SchedulerQueueEvidenceUnexpected {
+        stage: InteractionTraceStage,
+    },
     SamplingLoss {
         event_ordinal: u64,
         dropped_events: u64,
@@ -1820,6 +1893,7 @@ mod tests {
                 snapshot_generation: Some(1),
                 frame_generation: Some(1),
             },
+            scheduler_queue: None,
             sampling_loss: InteractionTraceSamplingLoss::default(),
             observation_boundary: if stage.is_display_completion() {
                 InteractionTraceObservationBoundary::DisplayPresented
@@ -1841,6 +1915,83 @@ mod tests {
                 .map(|(ordinal, stage)| keypress_event(sequence, ordinal, stage))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn scheduler_queue_evidence_is_exactly_bound_to_k5_and_its_clock_interval() {
+        let stage = RendererKeypressTraceStage::ServerDispatchMuxWait;
+        let stage_ordinal = InteractionTraceStage::Keypress(stage).ordinal();
+        let mut event = keypress_event(1, usize::from(stage_ordinal), stage);
+        event.counters.queue_depth = 3;
+        event.counters.oldest_queue_age_ns = 25;
+        event.counters.bytes = 4_096;
+        event.scheduler_queue = Some(InteractionTraceSchedulerQueueEvidence {
+            queue_id: 7,
+            scheduler_generation: 8,
+            task_ticket: 9,
+            task_capacity: 16,
+            estimated_byte_capacity: 8_192,
+            enqueued_at: InteractionTraceTimestamp {
+                clock_domain: event.started_at.clock_domain,
+                monotonic_ns: event.started_at.monotonic_ns + 10,
+                wall_time_unix_ns: None,
+            },
+            retired: false,
+        });
+        validate_event(&event, |_| true).expect("exact K5 queue evidence must validate");
+
+        let mut zero_capacity = event.clone();
+        zero_capacity
+            .scheduler_queue
+            .as_mut()
+            .unwrap()
+            .task_capacity = 0;
+        assert_eq!(
+            validate_event(&zero_capacity, |_| true),
+            Err(TraceContractError::InvalidSchedulerQueueEvidence {
+                field: "task_capacity"
+            })
+        );
+
+        let mut unavailable_pressure = event.clone();
+        unavailable_pressure.counter_unavailability.queue_depth = true;
+        assert_eq!(
+            validate_event(&unavailable_pressure, |_| true),
+            Err(TraceContractError::InvalidSchedulerQueueEvidence {
+                field: "counter_availability"
+            })
+        );
+
+        let mut depth_over_capacity = event.clone();
+        depth_over_capacity.counters.queue_depth = 17;
+        assert_eq!(
+            validate_event(&depth_over_capacity, |_| true),
+            Err(TraceContractError::InvalidSchedulerQueueEvidence {
+                field: "queue_depth"
+            })
+        );
+
+        let mut enqueue_after_dequeue = event.clone();
+        enqueue_after_dequeue
+            .scheduler_queue
+            .as_mut()
+            .unwrap()
+            .enqueued_at
+            .monotonic_ns = enqueue_after_dequeue.completed_at.monotonic_ns + 1;
+        assert!(matches!(
+            validate_event(&enqueue_after_dequeue, |_| true),
+            Err(TraceContractError::ClockRegression { .. })
+        ));
+
+        let mut wrong_stage = event;
+        wrong_stage.stage =
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode);
+        assert_eq!(
+            validate_event(&wrong_stage, |_| true),
+            Err(TraceContractError::SchedulerQueueEvidenceUnexpected {
+                stage: wrong_stage.stage
+            })
+        );
     }
 
     fn resize_trace(sequence: u64) -> InteractionTraceV2 {

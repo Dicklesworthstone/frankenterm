@@ -220,6 +220,20 @@
       "required": ["dropped_events", "overwritten_events"],
       "properties": {"dropped_events": {"$ref": "#/$defs/u64"}, "overwritten_events": {"$ref": "#/$defs/u64"}}
     },
+    "scheduler_queue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queue_id", "scheduler_generation", "task_ticket", "task_capacity", "estimated_byte_capacity", "enqueued_at", "retired"],
+      "properties": {
+        "queue_id": {"$ref": "#/$defs/nonzero_u64"},
+        "scheduler_generation": {"$ref": "#/$defs/nonzero_u64"},
+        "task_ticket": {"$ref": "#/$defs/nonzero_u64"},
+        "task_capacity": {"$ref": "#/$defs/nonzero_u64"},
+        "estimated_byte_capacity": {"$ref": "#/$defs/nonzero_u64"},
+        "enqueued_at": {"$ref": "#/$defs/timestamp"},
+        "retired": {"type": "boolean"}
+      }
+    },
     "physical_detector": {
       "type": "object",
       "additionalProperties": false,
@@ -246,6 +260,7 @@
         "counters": {"$ref": "#/$defs/counters"},
         "counter_unavailability": {"$ref": "#/$defs/counter_unavailability"},
         "generations": {"$ref": "#/$defs/generations"},
+        "scheduler_queue": {"$ref": "#/$defs/scheduler_queue"},
         "sampling_loss": {"$ref": "#/$defs/sampling_loss"},
         "observation_boundary": {"enum": ["internal_state", "software_present", "metal_drawable", "display_presented", "photon"]},
         "physical_detector": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/physical_detector"}]}

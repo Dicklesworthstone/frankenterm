@@ -104,6 +104,7 @@ fn fields_for_with_completed_clock_id(
             snapshot_generation: Some(2),
             frame_generation: display_completion.then_some(3),
         },
+        None,
         if display_completion {
             InteractionTraceObservationBoundary::DisplayPresented
         } else {

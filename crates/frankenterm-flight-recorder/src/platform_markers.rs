@@ -979,6 +979,7 @@ mod tests {
                 snapshot_generation: None,
                 frame_generation: None,
             },
+            None,
             InteractionTraceObservationBoundary::InternalState,
             None,
         )

@@ -27,8 +27,9 @@ use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceCo
 use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceClockDomain, InteractionTraceCorrelation,
     InteractionTraceCounterUnavailability, InteractionTraceCounters, InteractionTraceGenerations,
-    InteractionTraceObservationBoundary, InteractionTraceProducer, InteractionTraceStage,
-    InteractionTraceStageOutcome, InteractionTraceTimestamp, InteractionTraceTopology,
+    InteractionTraceObservationBoundary, InteractionTraceProducer,
+    InteractionTraceSchedulerQueueEvidence, InteractionTraceStage, InteractionTraceStageOutcome,
+    InteractionTraceTimestamp, InteractionTraceTopology,
 };
 use frankenterm_core_audit_types::renderer_scenario_catalog::RendererKeypressTraceStage;
 use frankenterm_flight_recorder::{
@@ -74,6 +75,60 @@ fn record_send_key_down_scheduler_receipt(receipt: MainThreadEnqueueReceipt, sam
         metrics::histogram!("mux.server.input_scheduler_oldest_age_seconds")
             .record(oldest_age.as_secs_f64());
     }
+}
+
+fn scheduler_trace_counters(
+    receipt: MainThreadEnqueueReceipt,
+    enqueued_at: InteractionTraceTimestamp,
+) -> Option<(
+    InteractionTraceCounters,
+    InteractionTraceCounterUnavailability,
+    InteractionTraceSchedulerQueueEvidence,
+)> {
+    let snapshot = receipt.snapshot_after_enqueue;
+    let queue_depth = u64::try_from(snapshot.depth).ok()?;
+    let bytes = u64::try_from(snapshot.estimated_bytes).ok()?;
+    let oldest_queue_age_ns =
+        u64::try_from(snapshot.oldest_age_at(receipt.enqueued_at)?.as_nanos()).ok()?;
+    let task_capacity = u64::try_from(snapshot.capacity).ok()?;
+    let estimated_byte_capacity = u64::try_from(snapshot.estimated_byte_capacity).ok()?;
+    Some((
+        InteractionTraceCounters {
+            queue_depth,
+            oldest_queue_age_ns,
+            work_units: 1,
+            bytes,
+            rpc_count: 1,
+            ..InteractionTraceCounters::default()
+        },
+        InteractionTraceCounterUnavailability {
+            queue_depth: false,
+            oldest_queue_age_ns: false,
+            work_units: false,
+            bytes: false,
+            rows: true,
+            allocation_count: true,
+            allocated_bytes: true,
+            copy_count: true,
+            copied_bytes: true,
+            rpc_count: false,
+            delta_count: true,
+            dirty_rows: true,
+            full_viewport_clones: true,
+            cursor_row_duplicates: true,
+            paint_count: true,
+            frame_count: true,
+        },
+        InteractionTraceSchedulerQueueEvidence {
+            queue_id: receipt.queue_id.get(),
+            scheduler_generation: receipt.scheduler_generation.get(),
+            task_ticket: receipt.task_ticket.get(),
+            task_capacity,
+            estimated_byte_capacity,
+            enqueued_at,
+            retired: snapshot.retired,
+        },
+    ))
 }
 
 fn reject_send_key_down_scheduler_admission(
@@ -326,7 +381,8 @@ impl SessionTraceProducer {
         stage: RendererKeypressTraceStage,
         topology: InteractionTraceTopology,
         started_at: Instant,
-        completed_at: Instant,
+        completed_at_instant: Instant,
+        scheduler_enqueue: Option<MainThreadEnqueueReceipt>,
     ) {
         let Some(producer) = self.producer_identity() else {
             metrics::counter!(
@@ -338,11 +394,47 @@ impl SessionTraceProducer {
         };
         let (Some(started_at), Some(completed_at)) = (
             self.timestamp_at(started_at),
-            self.timestamp_at(completed_at),
+            self.timestamp_at(completed_at_instant),
         ) else {
             metrics::counter!("mux.server.trace_event", "outcome" => "clock_invalid").increment(1);
             return;
         };
+        let scheduler_counters = scheduler_enqueue.and_then(|receipt| {
+            let enqueued_at = self.timestamp_at(receipt.enqueued_at)?;
+            scheduler_trace_counters(receipt, enqueued_at)
+        });
+        let (counters, counter_unavailability, scheduler_queue) = scheduler_counters
+            .map(|(counters, counter_unavailability, scheduler_queue)| {
+                (counters, counter_unavailability, Some(scheduler_queue))
+            })
+            .unwrap_or_else(|| {
+                (
+                    InteractionTraceCounters {
+                        work_units: 1,
+                        rpc_count: 1,
+                        ..InteractionTraceCounters::default()
+                    },
+                    InteractionTraceCounterUnavailability {
+                        queue_depth: true,
+                        oldest_queue_age_ns: true,
+                        work_units: false,
+                        bytes: true,
+                        rows: true,
+                        allocation_count: true,
+                        allocated_bytes: true,
+                        copy_count: true,
+                        copied_bytes: true,
+                        rpc_count: false,
+                        delta_count: true,
+                        dirty_rows: true,
+                        full_viewport_clones: true,
+                        cursor_row_duplicates: true,
+                        paint_count: true,
+                        frame_count: true,
+                    },
+                    None,
+                )
+            });
         let stage = InteractionTraceStage::Keypress(stage);
         let fields = match EventFields::new(
             u64::from(stage.ordinal()),
@@ -360,30 +452,10 @@ impl SessionTraceProducer {
                 protocol_token: token.trace_id().sequence,
                 protocol_generation: self.connection_generation(),
             },
-            InteractionTraceCounters {
-                work_units: 1,
-                rpc_count: 1,
-                ..InteractionTraceCounters::default()
-            },
-            InteractionTraceCounterUnavailability {
-                queue_depth: true,
-                oldest_queue_age_ns: true,
-                work_units: false,
-                bytes: true,
-                rows: true,
-                allocation_count: true,
-                allocated_bytes: true,
-                copy_count: true,
-                copied_bytes: true,
-                rpc_count: false,
-                delta_count: true,
-                dirty_rows: true,
-                full_viewport_clones: true,
-                cursor_row_duplicates: true,
-                paint_count: true,
-                frame_count: true,
-            },
+            counters,
+            counter_unavailability,
             InteractionTraceGenerations::default(),
+            scheduler_queue,
             InteractionTraceObservationBoundary::InternalState,
             None,
         ) {
@@ -438,6 +510,7 @@ impl SessionTraceProducer {
             topology,
             dispatch_queued_at,
             dispatch_started_at,
+            admission.scheduler_enqueue.get(),
         );
     }
 }
@@ -1166,6 +1239,7 @@ pub(crate) struct AdmittedInputTraceV1 {
     recorder_token: Option<TraceToken>,
     topology: Option<InteractionTraceTopology>,
     dispatch_queued_at: Option<Instant>,
+    scheduler_enqueue: Rc<Cell<Option<MainThreadEnqueueReceipt>>>,
     trace_producer: Option<Rc<SessionTraceProducer>>,
 }
 
@@ -1196,6 +1270,7 @@ impl AdmittedInputTraceV1 {
             recorder_token: None,
             topology: None,
             dispatch_queued_at: None,
+            scheduler_enqueue: Rc::new(Cell::new(None)),
             trace_producer: None,
         })
     }
@@ -4454,6 +4529,7 @@ impl SessionHandler {
             topology,
             decode_started_at,
             decode_completed_at,
+            None,
         );
         admission.recorder_token = Some(token);
         admission.topology = Some(topology);
@@ -5238,6 +5314,9 @@ impl SessionHandler {
                 let sampled_trace = trace_authority
                     .as_ref()
                     .is_some_and(|admission| admission.recorder_token.is_some());
+                let scheduler_enqueue = trace_authority
+                    .as_ref()
+                    .map(|admission| Rc::clone(&admission.scheduler_enqueue));
                 let reservation = match try_reserve_main_thread(
                     MainThreadServiceClass::Input,
                     SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
@@ -5276,10 +5355,15 @@ impl SessionHandler {
                         send_response,
                     );
                 });
-                record_send_key_down_scheduler_receipt(
-                    spawned.initial_enqueue_receipt(),
-                    sampled_trace,
-                );
+                let enqueue_receipt = spawned.initial_enqueue_receipt();
+                if let Some(scheduler_enqueue) = scheduler_enqueue {
+                    // The server's SimpleExecutor callback only publishes the
+                    // runnable, and only its owner thread can tick it. Store
+                    // the exact enqueue receipt before this dispatch turn can
+                    // return to that main-thread loop and close K5.
+                    scheduler_enqueue.set(Some(enqueue_receipt));
+                }
+                record_send_key_down_scheduler_receipt(enqueue_receipt, sampled_trace);
                 spawned.detach();
             }
             Pdu::SendKeyUp(SendKeyUp { pane_id, event }) => {
@@ -6346,6 +6430,7 @@ mod tests {
             topology,
             k4_start,
             k4_end,
+            None,
         );
         let admission = AdmittedInputTraceV1 {
             context: sampled_key_context(),
@@ -6355,6 +6440,7 @@ mod tests {
             recorder_token: Some(token),
             topology: Some(topology),
             dispatch_queued_at: Some(k4_end),
+            scheduler_enqueue: Rc::new(Cell::new(None)),
             trace_producer: None,
         };
         producer.record_mux_dispatch_start(&admission, k5_end);
@@ -6459,6 +6545,34 @@ mod tests {
             "the K4/K5 handoff must have no unmeasured server-side gap"
         );
         assert!(events[1].duration_ns().is_ok());
+        assert_eq!(events[1].counters.queue_depth, 1);
+        assert_eq!(
+            events[1].counters.bytes,
+            u64::try_from(SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES).unwrap()
+        );
+        assert!(!events[1].counter_unavailability.queue_depth);
+        assert!(!events[1].counter_unavailability.oldest_queue_age_ns);
+        assert!(!events[1].counter_unavailability.bytes);
+        let scheduler_queue = events[1]
+            .scheduler_queue
+            .expect("K5 must retain exact scheduler queue authority");
+        assert_eq!(
+            scheduler_queue.queue_id,
+            executor.scheduler_identity().queue_id.get()
+        );
+        assert_eq!(
+            scheduler_queue.scheduler_generation,
+            executor.scheduler_identity().scheduler_generation.get()
+        );
+        assert_eq!(
+            scheduler_queue.task_capacity,
+            u64::try_from(executor.admission_snapshot().task_capacity).unwrap()
+        );
+        assert_eq!(
+            scheduler_queue.estimated_byte_capacity,
+            u64::try_from(executor.admission_snapshot().estimated_byte_capacity).unwrap()
+        );
+        assert!(!scheduler_queue.retired);
         assert!(events.iter().all(|event| {
             event.trace_id == sampled_key_context().trace_id
                 && event.producer.connection_generation == Some(connection_generation)
