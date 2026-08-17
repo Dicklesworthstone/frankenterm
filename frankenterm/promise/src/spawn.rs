@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
 use async_executor::Executor;
-use flume::{Receiver, bounded, unbounded};
+use flume::bounded;
+#[cfg(test)]
+use flume::unbounded;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
@@ -15,6 +18,18 @@ pub use async_task::{Runnable, Task};
 pub type SpawnFunc = Box<dyn FnOnce() + Send>;
 pub type ScheduleFunc = Box<dyn Fn(Runnable) + Send + Sync + 'static>;
 type SharedScheduleFunc = Arc<dyn Fn(Runnable) + Send + Sync + 'static>;
+pub type MainThreadBoundScheduleFunc = Box<
+    dyn Fn(Runnable, MainThreadAdmissionReceipt) -> MainThreadEnqueueReceipt
+        + Send
+        + Sync
+        + 'static,
+>;
+type SharedMainThreadBoundScheduleFunc = Arc<
+    dyn Fn(Runnable, MainThreadAdmissionReceipt) -> MainThreadEnqueueReceipt
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Semantic service lane for work admitted to the process main-thread
 /// scheduler.
@@ -342,6 +357,90 @@ pub enum MainThreadAdmissionOutcome {
     AuthorityExhausted(MainThreadAdmissionRejection),
 }
 
+#[derive(Debug)]
+#[must_use = "spawn outcomes must be handled so overload cannot orphan a task"]
+pub enum MainThreadSpawnOutcome<R> {
+    Spawned(MainThreadSpawnedTask<R>),
+    Coalesced(MainThreadCoalescedReceipt),
+    RetryableFull(MainThreadAdmissionRejection),
+    RetiredGeneration(MainThreadAdmissionRejection),
+    InvalidSize(MainThreadAdmissionRejection),
+    AuthorityExhausted(MainThreadAdmissionRejection),
+    SchedulerUnavailable,
+}
+
+#[derive(Debug)]
+#[must_use = "the spawned task must be awaited, detached, or explicitly dropped"]
+pub struct MainThreadSpawnedTask<R> {
+    task: Task<R>,
+    admission: MainThreadAdmissionReceipt,
+    initial_enqueue: MainThreadEnqueueReceipt,
+}
+
+#[derive(Debug)]
+#[must_use = "reservation outcomes must be handled before constructing task state"]
+pub enum MainThreadReservationOutcome {
+    Reserved(MainThreadSpawnReservation),
+    Coalesced(MainThreadCoalescedReceipt),
+    RetryableFull(MainThreadAdmissionRejection),
+    RetiredGeneration(MainThreadAdmissionRejection),
+    InvalidSize(MainThreadAdmissionRejection),
+    AuthorityExhausted(MainThreadAdmissionRejection),
+    SchedulerUnavailable,
+}
+
+#[derive(Debug)]
+#[must_use = "a reservation must be used to spawn or dropped to release capacity"]
+pub struct MainThreadSpawnReservation {
+    binding: Arc<MainThreadSchedulerBinding>,
+    permit: MainThreadTaskPermit,
+    high_priority: bool,
+}
+
+impl MainThreadSpawnReservation {
+    #[must_use]
+    pub fn admission_receipt(&self) -> MainThreadAdmissionReceipt {
+        self.permit.receipt()
+    }
+
+    pub fn spawn<F, R>(self, future: F) -> MainThreadSpawnedTask<R>
+    where
+        F: Future<Output = R> + Send + 'static,
+        R: Send + 'static,
+    {
+        admitted_send_task(self.binding, self.permit, future, self.high_priority)
+    }
+
+    pub fn spawn_local<F, R>(self, future: F) -> MainThreadSpawnedTask<R>
+    where
+        F: Future<Output = R> + 'static,
+        R: 'static,
+    {
+        admitted_local_task(self.binding, self.permit, future, self.high_priority)
+    }
+}
+
+impl<R> MainThreadSpawnedTask<R> {
+    #[must_use]
+    pub fn admission_receipt(&self) -> MainThreadAdmissionReceipt {
+        self.admission
+    }
+
+    #[must_use]
+    pub fn initial_enqueue_receipt(&self) -> MainThreadEnqueueReceipt {
+        self.initial_enqueue
+    }
+
+    #[must_use]
+    pub fn into_task(self) -> Task<R> {
+        self.task
+    }
+
+    pub fn detach(self) {
+        self.task.detach();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MainThreadAdmissionError {
     #[error("estimated task size must be nonzero")]
@@ -420,6 +519,14 @@ impl MainThreadAdmissionController {
                     retired: false,
                 }),
             }),
+        }
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> MainThreadSchedulerIdentity {
+        MainThreadSchedulerIdentity {
+            queue_id: self.inner.queue_id,
+            scheduler_generation: self.inner.scheduler_generation,
         }
     }
 
@@ -630,6 +737,106 @@ impl MainThreadAdmissionController {
     }
 }
 
+/// One exact scheduler generation and its infallible admitted-runnable lanes.
+///
+/// Tasks capture an `Arc` to this value before task allocation. Replacing the
+/// process-current binding retires only new admission on the old controller;
+/// already-admitted tasks retain the exact callbacks required to finish or
+/// cancel on their original owner queue.
+pub struct MainThreadSchedulerBinding {
+    admission: MainThreadAdmissionController,
+    high_priority: SharedMainThreadBoundScheduleFunc,
+    low_priority: SharedMainThreadBoundScheduleFunc,
+    retired: AtomicBool,
+}
+
+impl std::fmt::Debug for MainThreadSchedulerBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MainThreadSchedulerBinding")
+            .field("identity", &self.admission.identity())
+            .field("admission", &self.admission.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MainThreadSchedulerBinding {
+    #[must_use]
+    pub fn new(
+        identity: MainThreadSchedulerIdentity,
+        limits: MainThreadAdmissionLimits,
+        high_priority: MainThreadBoundScheduleFunc,
+        low_priority: MainThreadBoundScheduleFunc,
+    ) -> Self {
+        Self {
+            admission: MainThreadAdmissionController::new(
+                identity.queue_id,
+                identity.scheduler_generation,
+                limits,
+            ),
+            high_priority: Arc::from(high_priority),
+            low_priority: Arc::from(low_priority),
+            retired: AtomicBool::new(false),
+        }
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> MainThreadSchedulerIdentity {
+        self.admission.identity()
+    }
+
+    #[must_use]
+    pub fn admission_snapshot(&self) -> MainThreadAdmissionSnapshot {
+        self.admission.snapshot()
+    }
+
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.admission.retire();
+    }
+
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    fn schedule(
+        &self,
+        runnable: Runnable,
+        admission: MainThreadAdmissionReceipt,
+        high_priority: bool,
+    ) -> MainThreadEnqueueReceipt {
+        let mut enqueue = if high_priority {
+            (self.high_priority)(runnable, admission)
+        } else {
+            (self.low_priority)(runnable, admission)
+        };
+        enqueue.snapshot_after_enqueue.retired = self.is_retired();
+        assert_eq!(
+            (
+                enqueue.queue_id,
+                enqueue.scheduler_generation,
+                enqueue.task_ticket
+            ),
+            (
+                admission.queue_id,
+                admission.scheduler_generation,
+                admission.task_ticket,
+            ),
+            "bound scheduler returned enqueue authority for a different admitted task"
+        );
+        enqueue
+    }
+
+    fn try_admit(
+        &self,
+        service_class: MainThreadServiceClass,
+        estimated_bytes: usize,
+    ) -> MainThreadAdmissionOutcome {
+        self.admission.admit(service_class, estimated_bytes)
+    }
+}
+
 static MAIN_THREAD_ADMISSION_ACCOUNTING_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 #[must_use]
@@ -745,6 +952,8 @@ lazy_static::lazy_static! {
         Mutex::new(Arc::new(no_scheduler_configured));
     static ref ON_MAIN_THREAD_LOW_PRI: Mutex<SharedScheduleFunc> =
         Mutex::new(Arc::new(no_scheduler_configured));
+    static ref BOUND_MAIN_THREAD_SCHEDULER: Mutex<Option<Arc<MainThreadSchedulerBinding>>> =
+        Mutex::new(None);
     static ref SCOPED_EXECUTOR: Mutex<ScopedExecutorRegistry> =
         Mutex::new(ScopedExecutorRegistry::default());
     static ref SCOPED_EXECUTOR_AVAILABLE: Condvar = Condvar::new();
@@ -856,7 +1065,40 @@ fn capture_scheduler(high_pri: bool) -> SharedScheduleFunc {
 
 pub fn is_scheduler_configured() -> bool {
     SCHEDULER_CONFIGURED.load(Ordering::Relaxed)
+        || lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER).is_some()
         || lock_or_recover(&SCOPED_EXECUTOR).executor.is_some()
+}
+
+/// Publish one exact admission-aware scheduler generation.
+///
+/// The previous generation is retired while the registry lock still excludes
+/// new captures. A racing producer therefore either admits on the old
+/// generation before retirement or observes the replacement; it cannot admit
+/// new work on the old generation after the replacement linearizes.
+pub fn set_bounded_main_thread_scheduler(binding: Arc<MainThreadSchedulerBinding>) {
+    let mut current = lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER);
+    if let Some(previous) = current.as_ref() {
+        previous.retire();
+    }
+    *current = Some(binding);
+    SCHEDULER_CONFIGURED.store(true, Ordering::Relaxed);
+}
+
+fn capture_bounded_main_thread_scheduler() -> Option<Arc<MainThreadSchedulerBinding>> {
+    lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER)
+        .as_ref()
+        .map(Arc::clone)
+}
+
+fn clear_bounded_main_thread_scheduler() {
+    let previous = {
+        let mut current = lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER);
+        if let Some(previous) = current.as_ref() {
+            previous.retire();
+        }
+        current.take()
+    };
+    drop(previous);
 }
 
 /// Set callbacks for scheduling normal and low priority futures.
@@ -867,9 +1109,227 @@ pub fn is_scheduler_configured() -> bool {
 /// it just provides the abstraction for scheduling the work.
 /// This function allows the embedding application to set that up.
 pub fn set_schedulers(main: ScheduleFunc, low_pri: ScheduleFunc) {
+    clear_bounded_main_thread_scheduler();
     *lock_or_recover(&ON_MAIN_THREAD) = Arc::from(main);
     *lock_or_recover(&ON_MAIN_THREAD_LOW_PRI) = Arc::from(low_pri);
     SCHEDULER_CONFIGURED.store(true, Ordering::Relaxed);
+}
+
+fn rejected_spawn_outcome<R>(outcome: MainThreadAdmissionOutcome) -> MainThreadSpawnOutcome<R> {
+    match outcome {
+        MainThreadAdmissionOutcome::Admitted(_) => {
+            unreachable!("admitted permit must be consumed before rejection mapping")
+        }
+        MainThreadAdmissionOutcome::Coalesced(receipt) => {
+            MainThreadSpawnOutcome::Coalesced(receipt)
+        }
+        MainThreadAdmissionOutcome::RetryableFull(rejection) => {
+            MainThreadSpawnOutcome::RetryableFull(rejection)
+        }
+        MainThreadAdmissionOutcome::RetiredGeneration(rejection) => {
+            MainThreadSpawnOutcome::RetiredGeneration(rejection)
+        }
+        MainThreadAdmissionOutcome::InvalidSize(rejection) => {
+            MainThreadSpawnOutcome::InvalidSize(rejection)
+        }
+        MainThreadAdmissionOutcome::AuthorityExhausted(rejection) => {
+            MainThreadSpawnOutcome::AuthorityExhausted(rejection)
+        }
+    }
+}
+
+fn admitted_send_task<F, R>(
+    binding: Arc<MainThreadSchedulerBinding>,
+    permit: MainThreadTaskPermit,
+    future: F,
+    high_priority: bool,
+) -> MainThreadSpawnedTask<R>
+where
+    F: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    let admission = permit.receipt();
+    let wake_binding = Arc::clone(&binding);
+    let (runnable, task) = async_task::spawn(permit.bind(future), move |runnable| {
+        let _receipt = wake_binding.schedule(runnable, admission, high_priority);
+    });
+    let initial_enqueue = binding.schedule(runnable, admission, high_priority);
+    MainThreadSpawnedTask {
+        task,
+        admission,
+        initial_enqueue,
+    }
+}
+
+fn admitted_local_task<F, R>(
+    binding: Arc<MainThreadSchedulerBinding>,
+    permit: MainThreadTaskPermit,
+    future: F,
+    high_priority: bool,
+) -> MainThreadSpawnedTask<R>
+where
+    F: Future<Output = R> + 'static,
+    R: 'static,
+{
+    let admission = permit.receipt();
+    let wake_binding = Arc::clone(&binding);
+    let (runnable, task) = async_task::spawn_local(permit.bind(future), move |runnable| {
+        let _receipt = wake_binding.schedule(runnable, admission, high_priority);
+    });
+    let initial_enqueue = binding.schedule(runnable, admission, high_priority);
+    MainThreadSpawnedTask {
+        task,
+        admission,
+        initial_enqueue,
+    }
+}
+
+fn rejected_reservation_outcome(
+    outcome: MainThreadAdmissionOutcome,
+) -> MainThreadReservationOutcome {
+    match outcome {
+        MainThreadAdmissionOutcome::Admitted(_) => {
+            unreachable!("admitted permit must be consumed before rejection mapping")
+        }
+        MainThreadAdmissionOutcome::Coalesced(receipt) => {
+            MainThreadReservationOutcome::Coalesced(receipt)
+        }
+        MainThreadAdmissionOutcome::RetryableFull(rejection) => {
+            MainThreadReservationOutcome::RetryableFull(rejection)
+        }
+        MainThreadAdmissionOutcome::RetiredGeneration(rejection) => {
+            MainThreadReservationOutcome::RetiredGeneration(rejection)
+        }
+        MainThreadAdmissionOutcome::InvalidSize(rejection) => {
+            MainThreadReservationOutcome::InvalidSize(rejection)
+        }
+        MainThreadAdmissionOutcome::AuthorityExhausted(rejection) => {
+            MainThreadReservationOutcome::AuthorityExhausted(rejection)
+        }
+    }
+}
+
+fn try_reserve_main_thread_impl(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    high_priority: bool,
+) -> MainThreadReservationOutcome {
+    let Some(binding) = capture_bounded_main_thread_scheduler() else {
+        return MainThreadReservationOutcome::SchedulerUnavailable;
+    };
+    match binding.try_admit(service_class, estimated_bytes) {
+        MainThreadAdmissionOutcome::Admitted(permit) => {
+            MainThreadReservationOutcome::Reserved(MainThreadSpawnReservation {
+                binding,
+                permit,
+                high_priority,
+            })
+        }
+        rejected => rejected_reservation_outcome(rejected),
+    }
+}
+
+/// Reserve capacity before constructing or moving producer-owned task state.
+/// This lets rejection paths retain their response/rollback authority.
+pub fn try_reserve_main_thread(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+) -> MainThreadReservationOutcome {
+    try_reserve_main_thread_impl(service_class, estimated_bytes, true)
+}
+
+/// Low-priority variant of [`try_reserve_main_thread`].
+pub fn try_reserve_main_thread_with_low_priority(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+) -> MainThreadReservationOutcome {
+    try_reserve_main_thread_impl(service_class, estimated_bytes, false)
+}
+
+/// Attempt to create a `Send` task on the exact current bounded main-thread
+/// scheduler. No task is allocated for a rejected attempt.
+pub fn try_spawn_into_main_thread_with_admission<F, R>(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    future: F,
+) -> MainThreadSpawnOutcome<R>
+where
+    F: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    let Some(binding) = capture_bounded_main_thread_scheduler() else {
+        return MainThreadSpawnOutcome::SchedulerUnavailable;
+    };
+    match binding.try_admit(service_class, estimated_bytes) {
+        MainThreadAdmissionOutcome::Admitted(permit) => {
+            MainThreadSpawnOutcome::Spawned(admitted_send_task(binding, permit, future, true))
+        }
+        rejected => rejected_spawn_outcome(rejected),
+    }
+}
+
+/// Low-priority variant of [`try_spawn_into_main_thread_with_admission`].
+pub fn try_spawn_into_main_thread_with_low_priority_admission<F, R>(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    future: F,
+) -> MainThreadSpawnOutcome<R>
+where
+    F: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    let Some(binding) = capture_bounded_main_thread_scheduler() else {
+        return MainThreadSpawnOutcome::SchedulerUnavailable;
+    };
+    match binding.try_admit(service_class, estimated_bytes) {
+        MainThreadAdmissionOutcome::Admitted(permit) => {
+            MainThreadSpawnOutcome::Spawned(admitted_send_task(binding, permit, future, false))
+        }
+        rejected => rejected_spawn_outcome(rejected),
+    }
+}
+
+/// Attempt to create a thread-local task on the exact current bounded
+/// main-thread scheduler. No task is allocated for a rejected attempt.
+pub fn try_spawn_with_admission<F, R>(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    future: F,
+) -> MainThreadSpawnOutcome<R>
+where
+    F: Future<Output = R> + 'static,
+    R: 'static,
+{
+    let Some(binding) = capture_bounded_main_thread_scheduler() else {
+        return MainThreadSpawnOutcome::SchedulerUnavailable;
+    };
+    match binding.try_admit(service_class, estimated_bytes) {
+        MainThreadAdmissionOutcome::Admitted(permit) => {
+            MainThreadSpawnOutcome::Spawned(admitted_local_task(binding, permit, future, true))
+        }
+        rejected => rejected_spawn_outcome(rejected),
+    }
+}
+
+/// Low-priority variant of [`try_spawn_with_admission`].
+pub fn try_spawn_with_low_priority_admission<F, R>(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    future: F,
+) -> MainThreadSpawnOutcome<R>
+where
+    F: Future<Output = R> + 'static,
+    R: 'static,
+{
+    let Some(binding) = capture_bounded_main_thread_scheduler() else {
+        return MainThreadSpawnOutcome::SchedulerUnavailable;
+    };
+    match binding.try_admit(service_class, estimated_bytes) {
+        MainThreadAdmissionOutcome::Admitted(permit) => {
+            MainThreadSpawnOutcome::Spawned(admitted_local_task(binding, permit, future, false))
+        }
+        rejected => rejected_spawn_outcome(rejected),
+    }
 }
 
 /// Spawn a new thread to execute the provided function.
@@ -1059,8 +1519,225 @@ pub fn block_on_io<F: Future>(future: F) -> F::Output {
     async_io::block_on(future)
 }
 
+const SIMPLE_EXECUTOR_TASK_CAPACITY: usize = 4_096;
+const SIMPLE_EXECUTOR_ESTIMATED_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+const SIMPLE_EXECUTOR_CRITICAL_TASK_RESERVE: usize = 512;
+const SIMPLE_EXECUTOR_CRITICAL_ESTIMATED_BYTE_RESERVE: usize = 8 * 1024 * 1024;
+const SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST: usize = 16;
+const SIMPLE_EXECUTOR_IDLE_POLL: Duration = Duration::from_millis(250);
+
+lazy_static::lazy_static! {
+    static ref SIMPLE_EXECUTOR_IDENTITIES: MainThreadSchedulerIdentityAuthority =
+        MainThreadSchedulerIdentityAuthority::new(
+            NonZeroU64::new(1).expect("one is nonzero"),
+            NonZeroU64::new(1).expect("one is nonzero"),
+        );
+}
+
+struct SimpleExecutorBoundedItem {
+    func: SpawnFunc,
+    enqueued_at: Instant,
+    estimated_bytes: NonZeroUsize,
+}
+
+struct SimpleExecutorQueueState {
+    admitted_high: VecDeque<SimpleExecutorBoundedItem>,
+    admitted_low: VecDeque<SimpleExecutorBoundedItem>,
+    legacy: VecDeque<SpawnFunc>,
+    admitted_estimated_bytes: usize,
+    high_priority_streak: usize,
+    prefer_admitted: bool,
+}
+
+struct SimpleExecutorQueue {
+    identity: MainThreadSchedulerIdentity,
+    task_capacity: usize,
+    estimated_byte_capacity: usize,
+    state: Mutex<SimpleExecutorQueueState>,
+    available: Condvar,
+}
+
+impl SimpleExecutorQueue {
+    fn new(identity: MainThreadSchedulerIdentity, limits: MainThreadAdmissionLimits) -> Self {
+        Self {
+            identity,
+            task_capacity: limits.task_capacity(),
+            estimated_byte_capacity: limits.estimated_byte_capacity(),
+            state: Mutex::new(SimpleExecutorQueueState {
+                // Each lane can temporarily contain every admitted task, so
+                // reserve each independently and keep the combined count
+                // bounded by the shared task-lifetime authority.
+                admitted_high: VecDeque::with_capacity(limits.task_capacity()),
+                admitted_low: VecDeque::with_capacity(limits.task_capacity()),
+                legacy: VecDeque::new(),
+                admitted_estimated_bytes: 0,
+                high_priority_streak: 0,
+                prefer_admitted: true,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn enqueue_legacy(&self, func: SpawnFunc) {
+        lock_or_recover(&self.state).legacy.push_back(func);
+        self.available.notify_one();
+    }
+
+    fn enqueue_admitted(
+        &self,
+        runnable: Runnable,
+        admission: MainThreadAdmissionReceipt,
+        high_priority: bool,
+    ) -> MainThreadEnqueueReceipt {
+        assert_eq!(
+            (admission.queue_id, admission.scheduler_generation),
+            (self.identity.queue_id, self.identity.scheduler_generation),
+            "admitted runnable was sent to a different SimpleExecutor generation"
+        );
+        let enqueued_at = Instant::now();
+        let estimated_bytes = admission.estimated_bytes;
+        let mut state = lock_or_recover(&self.state);
+        let depth = state
+            .admitted_high
+            .len()
+            .checked_add(state.admitted_low.len())
+            .and_then(|depth| depth.checked_add(1))
+            .expect("admitted SimpleExecutor depth overflow");
+        assert!(
+            depth <= self.task_capacity,
+            "admitted SimpleExecutor depth exceeded task-lifetime capacity"
+        );
+        let estimated_bytes_after = state
+            .admitted_estimated_bytes
+            .checked_add(estimated_bytes.get())
+            .expect("admitted SimpleExecutor byte count overflow");
+        assert!(
+            estimated_bytes_after <= self.estimated_byte_capacity,
+            "admitted SimpleExecutor bytes exceeded task-lifetime capacity"
+        );
+
+        let item = SimpleExecutorBoundedItem {
+            func: Box::new(move || {
+                runnable.run();
+            }),
+            enqueued_at,
+            estimated_bytes,
+        };
+        if high_priority {
+            state.admitted_high.push_back(item);
+        } else {
+            state.admitted_low.push_back(item);
+        }
+        state.admitted_estimated_bytes = estimated_bytes_after;
+        let oldest_enqueued_at = match (state.admitted_high.front(), state.admitted_low.front()) {
+            (Some(high), Some(low)) => Some(high.enqueued_at.min(low.enqueued_at)),
+            (Some(high), None) => Some(high.enqueued_at),
+            (None, Some(low)) => Some(low.enqueued_at),
+            (None, None) => None,
+        };
+        let snapshot_after_enqueue = MainThreadQueueSnapshot::new(
+            depth,
+            self.task_capacity,
+            estimated_bytes_after,
+            self.estimated_byte_capacity,
+            oldest_enqueued_at,
+            false,
+        )
+        .expect("SimpleExecutor queue accounting must remain internally consistent");
+        drop(state);
+        self.available.notify_one();
+        MainThreadEnqueueReceipt {
+            queue_id: admission.queue_id,
+            scheduler_generation: admission.scheduler_generation,
+            task_ticket: admission.task_ticket,
+            enqueued_at,
+            snapshot_after_enqueue,
+        }
+    }
+
+    fn snapshot(&self) -> MainThreadQueueSnapshot {
+        let state = lock_or_recover(&self.state);
+        let depth = state
+            .admitted_high
+            .len()
+            .checked_add(state.admitted_low.len())
+            .expect("admitted SimpleExecutor depth overflow");
+        let oldest_enqueued_at = match (state.admitted_high.front(), state.admitted_low.front()) {
+            (Some(high), Some(low)) => Some(high.enqueued_at.min(low.enqueued_at)),
+            (Some(high), None) => Some(high.enqueued_at),
+            (None, Some(low)) => Some(low.enqueued_at),
+            (None, None) => None,
+        };
+        MainThreadQueueSnapshot::new(
+            depth,
+            self.task_capacity,
+            state.admitted_estimated_bytes,
+            self.estimated_byte_capacity,
+            oldest_enqueued_at,
+            false,
+        )
+        .expect("SimpleExecutor queue accounting must remain internally consistent")
+    }
+
+    fn pop_admitted_locked(
+        state: &mut SimpleExecutorQueueState,
+    ) -> Option<SimpleExecutorBoundedItem> {
+        let take_high = !state.admitted_high.is_empty()
+            && (state.admitted_low.is_empty()
+                || state.high_priority_streak < SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST);
+        let item = if take_high {
+            state.high_priority_streak = state.high_priority_streak.saturating_add(1);
+            state.admitted_high.pop_front()
+        } else {
+            state.high_priority_streak = 0;
+            state.admitted_low.pop_front()
+        }?;
+        state.admitted_estimated_bytes = state
+            .admitted_estimated_bytes
+            .checked_sub(item.estimated_bytes.get())
+            .expect("admitted SimpleExecutor byte count underflow");
+        Some(item)
+    }
+
+    fn pop_locked(state: &mut SimpleExecutorQueueState) -> Option<SpawnFunc> {
+        let have_admitted = !state.admitted_high.is_empty() || !state.admitted_low.is_empty();
+        let have_legacy = !state.legacy.is_empty();
+        let take_admitted = have_admitted && (!have_legacy || state.prefer_admitted);
+        let result = if take_admitted {
+            Self::pop_admitted_locked(state).map(|item| item.func)
+        } else {
+            state.legacy.pop_front()
+        };
+        if have_admitted && have_legacy {
+            state.prefer_admitted = !state.prefer_admitted;
+        }
+        result
+    }
+
+    fn try_pop(&self) -> Option<SpawnFunc> {
+        Self::pop_locked(&mut lock_or_recover(&self.state))
+    }
+
+    fn pop_until_idle_poll(&self) -> Option<SpawnFunc> {
+        let mut state = lock_or_recover(&self.state);
+        if let Some(func) = Self::pop_locked(&mut state) {
+            return Some(func);
+        }
+        let (mut state, _) = self
+            .available
+            .wait_timeout(state, SIMPLE_EXECUTOR_IDLE_POLL)
+            .unwrap_or_else(|poisoned| {
+                self.state.clear_poison();
+                poisoned.into_inner()
+            });
+        Self::pop_locked(&mut state)
+    }
+}
+
 pub struct SimpleExecutor {
-    rx: Receiver<SpawnFunc>,
+    queue: Arc<SimpleExecutorQueue>,
+    binding: Arc<MainThreadSchedulerBinding>,
+    owner_thread: ThreadId,
 }
 
 impl Default for SimpleExecutor {
@@ -1071,36 +1748,88 @@ impl Default for SimpleExecutor {
 
 impl SimpleExecutor {
     pub fn new() -> Self {
-        let (tx, rx) = unbounded();
+        let limits = MainThreadAdmissionLimits::new(
+            SIMPLE_EXECUTOR_TASK_CAPACITY,
+            SIMPLE_EXECUTOR_ESTIMATED_BYTE_CAPACITY,
+            SIMPLE_EXECUTOR_CRITICAL_TASK_RESERVE,
+            SIMPLE_EXECUTOR_CRITICAL_ESTIMATED_BYTE_RESERVE,
+        )
+        .expect("SimpleExecutor limits are valid");
+        Self::try_with_limits(limits)
+            .expect("SimpleExecutor scheduler identity authority exhausted")
+    }
 
-        let tx_main = tx.clone();
-        let tx_low = tx.clone();
-        let queue_func = move |f: SpawnFunc| {
-            tx_main.send(f).ok();
-        };
-        let queue_func_low = move |f: SpawnFunc| {
-            tx_low.send(f).ok();
-        };
+    pub fn try_with_limits(
+        limits: MainThreadAdmissionLimits,
+    ) -> std::result::Result<Self, MainThreadSchedulerIdentityExhausted> {
+        let identity = SIMPLE_EXECUTOR_IDENTITIES.try_allocate()?;
+        let queue = Arc::new(SimpleExecutorQueue::new(identity, limits));
+
+        let legacy_high = Arc::clone(&queue);
+        let legacy_low = Arc::clone(&queue);
         set_schedulers(
             Box::new(move |task| {
-                queue_func(Box::new(move || {
+                legacy_high.enqueue_legacy(Box::new(move || {
                     task.run();
-                }))
+                }));
             }),
             Box::new(move |task| {
-                queue_func_low(Box::new(move || {
+                legacy_low.enqueue_legacy(Box::new(move || {
                     task.run();
-                }))
+                }));
             }),
         );
-        Self { rx }
+        let admitted_high = Arc::clone(&queue);
+        let admitted_low = Arc::clone(&queue);
+        let binding = Arc::new(MainThreadSchedulerBinding::new(
+            identity,
+            limits,
+            Box::new(move |runnable, admission| {
+                admitted_high.enqueue_admitted(runnable, admission, true)
+            }),
+            Box::new(move |runnable, admission| {
+                admitted_low.enqueue_admitted(runnable, admission, false)
+            }),
+        ));
+        set_bounded_main_thread_scheduler(Arc::clone(&binding));
+        Ok(Self {
+            queue,
+            binding,
+            owner_thread: std::thread::current().id(),
+        })
+    }
+
+    #[must_use]
+    pub fn scheduler_identity(&self) -> MainThreadSchedulerIdentity {
+        self.binding.identity()
+    }
+
+    #[must_use]
+    pub fn admission_snapshot(&self) -> MainThreadAdmissionSnapshot {
+        self.binding.admission_snapshot()
+    }
+
+    #[must_use]
+    pub fn queue_snapshot(&self) -> MainThreadQueueSnapshot {
+        let mut snapshot = self.queue.snapshot();
+        snapshot.retired = self.binding.is_retired();
+        snapshot
+    }
+
+    fn ensure_owner_thread(&self) -> anyhow::Result<()> {
+        let current = std::thread::current().id();
+        anyhow::ensure!(
+            current == self.owner_thread,
+            "SimpleExecutor may only run or drop local tasks on its owner thread"
+        );
+        Ok(())
     }
 
     pub fn tick(&self) -> anyhow::Result<()> {
-        match self.rx.recv() {
-            Ok(func) => func(),
-            Err(err) => anyhow::bail!("while waiting for events: {:?}", err),
-        };
+        self.ensure_owner_thread()?;
+        if let Some(func) = self.queue.pop_until_idle_poll() {
+            func();
+        }
         Ok(())
     }
 
@@ -1112,15 +1841,12 @@ impl SimpleExecutor {
     /// thread to drop the final scheduler sender would destroy that state on
     /// the wrong thread.
     pub fn try_tick(&self) -> anyhow::Result<bool> {
-        match self.rx.try_recv() {
-            Ok(func) => {
-                func();
-                Ok(true)
-            }
-            Err(flume::TryRecvError::Empty) => Ok(false),
-            Err(flume::TryRecvError::Disconnected) => {
-                anyhow::bail!("while polling for events: scheduler queue disconnected")
-            }
+        self.ensure_owner_thread()?;
+        if let Some(func) = self.queue.try_pop() {
+            func();
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 }
@@ -1914,6 +2640,251 @@ mod tests {
         assert!(exec.try_tick().expect("queued callback must run"));
         assert!(observed.load(Ordering::Acquire));
         assert!(!exec.try_tick().expect("drained queue remains connected"));
+    }
+
+    #[test]
+    fn simple_executor_refuses_to_run_thread_local_tasks_off_owner_thread() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = Arc::new(SimpleExecutor::new());
+        let wrong_thread = Arc::clone(&exec);
+        let error = std::thread::spawn(move || wrong_thread.try_tick().unwrap_err())
+            .join()
+            .unwrap();
+        assert!(error.to_string().contains("owner thread"));
+        assert!(!exec.try_tick().unwrap());
+    }
+
+    #[test]
+    fn simple_executor_admitted_task_has_exact_queue_receipt_and_releases_capacity() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(2, 64, 1, 16).unwrap())
+                .unwrap();
+        let spawned =
+            match try_spawn_with_admission(MainThreadServiceClass::Input, 16, async { 42 }) {
+                MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+                outcome => panic!("expected admitted spawn, got {:?}", outcome),
+            };
+        let admission = spawned.admission_receipt();
+        let enqueue = spawned.initial_enqueue_receipt();
+        assert_eq!(
+            (admission.queue_id, admission.scheduler_generation),
+            (
+                exec.scheduler_identity().queue_id,
+                exec.scheduler_identity().scheduler_generation,
+            )
+        );
+        assert_eq!(enqueue.task_ticket, admission.task_ticket);
+        assert_eq!(enqueue.snapshot_after_enqueue.depth, 1);
+        assert_eq!(enqueue.snapshot_after_enqueue.capacity, 2);
+        assert_eq!(exec.queue_snapshot(), enqueue.snapshot_after_enqueue);
+        assert_eq!(exec.admission_snapshot().active_tasks, 1);
+
+        let task = spawned.into_task();
+        assert!(exec.try_tick().unwrap());
+        assert_eq!(block_on(task), 42);
+        assert_eq!(exec.queue_snapshot().depth, 0);
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+    }
+
+    #[test]
+    fn simple_executor_rejects_before_task_creation_and_recovers_after_cancellation() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(2, 16, 0, 0).unwrap())
+                .unwrap();
+        let first = match try_spawn_with_admission(
+            MainThreadServiceClass::Interactive,
+            8,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected first admitted spawn, got {:?}", outcome),
+        };
+        let second = match try_spawn_with_admission(
+            MainThreadServiceClass::Interactive,
+            8,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected second admitted spawn, got {:?}", outcome),
+        };
+        let rejected = match try_spawn_with_admission(MainThreadServiceClass::Input, 1, async {}) {
+            MainThreadSpawnOutcome::RetryableFull(rejection) => rejection,
+            outcome => panic!("expected retryable saturation, got {:?}", outcome),
+        };
+        assert_eq!(rejected.snapshot.active_tasks, 2);
+        assert_eq!(exec.queue_snapshot().depth, 2);
+
+        drop((first, second));
+        assert!(exec.try_tick().unwrap());
+        assert!(exec.try_tick().unwrap());
+        assert_eq!(exec.queue_snapshot().depth, 0);
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+
+        let recovered =
+            match try_spawn_with_admission(MainThreadServiceClass::Input, 1, async { 7 }) {
+                MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+                outcome => panic!("expected admission after cancellation, got {:?}", outcome),
+            };
+        let task = recovered.into_task();
+        assert!(exec.try_tick().unwrap());
+        assert_eq!(block_on(task), 7);
+    }
+
+    #[test]
+    fn two_phase_reservation_rejects_before_producer_state_is_constructed() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
+                .unwrap();
+        let occupying_reservation = match try_reserve_main_thread(MainThreadServiceClass::Input, 16)
+        {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("expected occupying reservation, got {outcome:?}"),
+        };
+        let producer_state_constructions = AtomicUsize::new(0);
+
+        match try_reserve_main_thread(MainThreadServiceClass::Input, 1) {
+            MainThreadReservationOutcome::Reserved(reservation) => {
+                producer_state_constructions.fetch_add(1, Ordering::SeqCst);
+                drop(reservation);
+                panic!("saturated scheduler unexpectedly admitted producer state");
+            }
+            MainThreadReservationOutcome::RetryableFull(rejection) => {
+                assert_eq!(rejection.snapshot.active_tasks, 1);
+            }
+            outcome => panic!("expected retryable saturation, got {outcome:?}"),
+        }
+
+        assert_eq!(producer_state_constructions.load(Ordering::SeqCst), 0);
+        assert_eq!(exec.queue_snapshot().depth, 0);
+        assert_eq!(exec.admission_snapshot().active_tasks, 1);
+        drop(occupying_reservation);
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+    }
+
+    #[test]
+    fn replacing_simple_executor_retires_exact_old_generation_without_revoking_live_task() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let old =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
+                .unwrap();
+        let pending = match try_spawn_with_admission(
+            MainThreadServiceClass::Input,
+            8,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected old-generation admission, got {outcome:?}"),
+        };
+        let old_identity = old.scheduler_identity();
+        assert!(!old.queue_snapshot().retired);
+
+        let replacement =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
+                .unwrap();
+        assert_ne!(replacement.scheduler_identity(), old_identity);
+        assert!(old.admission_snapshot().retired);
+        assert!(old.queue_snapshot().retired);
+        assert_eq!(old.admission_snapshot().active_tasks, 1);
+
+        drop(pending);
+        assert!(old.try_tick().unwrap());
+        assert_eq!(old.queue_snapshot().depth, 0);
+        assert_eq!(old.admission_snapshot().active_tasks, 0);
+        assert_eq!(replacement.queue_snapshot().depth, 0);
+        assert!(!replacement.queue_snapshot().retired);
+    }
+
+    #[test]
+    fn simple_executor_bounded_high_priority_burst_preserves_low_priority_progress() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(
+                SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST + 2,
+                4_096,
+                0,
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let order = Arc::new(StdMutex::new(Vec::new()));
+
+        let low_order = Arc::clone(&order);
+        match try_spawn_with_low_priority_admission(
+            MainThreadServiceClass::Background,
+            1,
+            async move {
+                low_order.lock().unwrap().push(99usize);
+            },
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned.detach(),
+            outcome => panic!("expected low-priority admission, got {outcome:?}"),
+        }
+        for sequence in 0..=SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST {
+            let high_order = Arc::clone(&order);
+            match try_spawn_with_admission(
+                MainThreadServiceClass::Input,
+                1,
+                async move {
+                    high_order.lock().unwrap().push(sequence);
+                },
+            ) {
+                MainThreadSpawnOutcome::Spawned(spawned) => spawned.detach(),
+                outcome => panic!("expected high-priority admission, got {outcome:?}"),
+            }
+        }
+
+        while exec.try_tick().unwrap() {}
+        let order = order.lock().unwrap();
+        assert_eq!(
+            &order[..SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST],
+            &(0..SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST).collect::<Vec<_>>()
+        );
+        assert_eq!(order[SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST], 99);
+        assert_eq!(
+            order[SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST + 1],
+            SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST
+        );
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+    }
+
+    #[test]
+    fn simple_executor_self_wake_requeues_without_a_second_admission() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 16, 0, 0).unwrap())
+                .unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_in_task = Arc::clone(&polls);
+        let spawned = match try_spawn_with_admission(
+            MainThreadServiceClass::Input,
+            8,
+            std::future::poll_fn(move |cx| {
+                if polls_in_task.fetch_add(1, Ordering::SeqCst) == 0 {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(9)
+                }
+            }),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected admitted self-waking task, got {:?}", outcome),
+        };
+        let ticket = spawned.admission_receipt().task_ticket;
+        let task = spawned.into_task();
+
+        assert!(exec.try_tick().unwrap());
+        assert_eq!(exec.queue_snapshot().depth, 1);
+        assert_eq!(exec.admission_snapshot().active_tasks, 1);
+        assert!(exec.try_tick().unwrap());
+        assert_eq!(block_on(task), 9);
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert!(ticket.get() > 0);
     }
 
     #[test]

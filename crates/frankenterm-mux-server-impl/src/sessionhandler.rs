@@ -40,7 +40,10 @@ use mux::client::ClientId;
 use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::{CurrentPane, Mux, PaneRegistrationHandle};
-use promise::spawn::spawn_into_main_thread;
+use promise::spawn::{
+    MainThreadEnqueueReceipt, MainThreadReservationOutcome, MainThreadServiceClass,
+    spawn_into_main_thread, try_reserve_main_thread,
+};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -55,6 +58,59 @@ use termwiz::surface::SequenceNo;
 use url::Url;
 use wezterm_term::StableRowIndex;
 use wezterm_term::terminal::Alert;
+
+const SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
+
+fn record_send_key_down_scheduler_receipt(receipt: MainThreadEnqueueReceipt, sampled: bool) {
+    let snapshot = receipt.snapshot_after_enqueue;
+    metrics::counter!("mux.server.input_scheduler_admission", "outcome" => "admitted").increment(1);
+    if !sampled {
+        return;
+    }
+    metrics::histogram!("mux.server.input_scheduler_queue_depth").record(snapshot.depth as f64);
+    metrics::histogram!("mux.server.input_scheduler_queue_estimated_bytes")
+        .record(snapshot.estimated_bytes as f64);
+    if let Some(oldest_age) = snapshot.oldest_age_at(Instant::now()) {
+        metrics::histogram!("mux.server.input_scheduler_oldest_age_seconds")
+            .record(oldest_age.as_secs_f64());
+    }
+}
+
+fn reject_send_key_down_scheduler_admission(
+    outcome: MainThreadReservationOutcome,
+) -> anyhow::Result<Pdu> {
+    let (label, detail) = match outcome {
+        MainThreadReservationOutcome::Reserved(_) => {
+            unreachable!("reserved input must be spawned instead of rejected")
+        }
+        MainThreadReservationOutcome::Coalesced(_) => (
+            "invalid_coalescing",
+            "input work cannot be coalesced without losing a key event",
+        ),
+        MainThreadReservationOutcome::RetryableFull(_) => (
+            "retryable_full",
+            "main-thread input admission is temporarily full; retry this key event",
+        ),
+        MainThreadReservationOutcome::RetiredGeneration(_) => (
+            "retired_generation",
+            "main-thread input scheduler generation retired; retry this key event",
+        ),
+        MainThreadReservationOutcome::InvalidSize(_) => (
+            "invalid_size",
+            "main-thread input admission rejected its configured size",
+        ),
+        MainThreadReservationOutcome::AuthorityExhausted(_) => (
+            "authority_exhausted",
+            "main-thread input scheduler identity authority is exhausted",
+        ),
+        MainThreadReservationOutcome::SchedulerUnavailable => (
+            "scheduler_unavailable",
+            "bounded main-thread input scheduler is unavailable; retry this key event",
+        ),
+    };
+    metrics::counter!("mux.server.input_scheduler_admission", "outcome" => label).increment(1);
+    Err(anyhow!(detail))
+}
 
 /// Explicit, process-owned recorder authority for mux-server connections.
 ///
@@ -5179,7 +5235,20 @@ impl SessionHandler {
                 let trace_producer = trace_authority
                     .as_ref()
                     .and_then(|admission| admission.trace_producer.as_ref().map(Rc::clone));
-                promise::spawn::spawn(async move {
+                let sampled_trace = trace_authority
+                    .as_ref()
+                    .is_some_and(|admission| admission.recorder_token.is_some());
+                let reservation = match try_reserve_main_thread(
+                    MainThreadServiceClass::Input,
+                    SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
+                ) {
+                    MainThreadReservationOutcome::Reserved(reservation) => reservation,
+                    rejected => {
+                        send_response(reject_send_key_down_scheduler_admission(rejected));
+                        return;
+                    }
+                };
+                let spawned = reservation.spawn_local(async move {
                     catch(
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
@@ -5206,8 +5275,12 @@ impl SessionHandler {
                         },
                         send_response,
                     );
-                })
-                .detach();
+                });
+                record_send_key_down_scheduler_receipt(
+                    spawned.initial_enqueue_receipt(),
+                    sampled_trace,
+                );
+                spawned.detach();
             }
             Pdu::SendKeyUp(SendKeyUp { pane_id, event }) => {
                 let Some(registration) =
@@ -6140,7 +6213,9 @@ mod tests {
     use mux::domain::DomainId;
     use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use parking_lot::{MappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
-    use promise::spawn::SimpleExecutor;
+    use promise::spawn::{
+        MainThreadAdmissionLimits, MainThreadSpawnOutcome, SimpleExecutor, try_spawn_with_admission,
+    };
     use proptest::prelude::*;
     use rangeset::RangeSet;
     use std::collections::{HashMap, HashSet};
@@ -6351,10 +6426,17 @@ mod tests {
             None,
             Some(admission),
         );
+        let queued = executor.queue_snapshot();
+        assert_eq!(queued.depth, 1, "the sampled key must own one runnable");
+        assert_eq!(queued.capacity, executor.admission_snapshot().task_capacity);
+        assert!(queued.oldest_enqueued_at.is_some());
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
         tick_until_response(&executor, &captured, 2);
         drain_simple_executor(&executor);
 
         assert_eq!(pane.key_down_count(), 1, "the key must be applied once");
+        assert_eq!(executor.queue_snapshot().depth, 0);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
         let events = freeze_trace_events(&recorder);
         assert_eq!(events.len(), 2);
         assert_eq!(
@@ -6381,6 +6463,52 @@ mod tests {
             event.trace_id == sampled_key_context().trace_id
                 && event.producer.connection_generation == Some(connection_generation)
         }));
+    }
+
+    #[test]
+    fn server_trace_send_key_down_saturation_returns_retryable_error_without_key_side_effect() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let blocker = match try_spawn_with_admission(
+            MainThreadServiceClass::Topology,
+            4 * 1024,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected test blocker admission, got {:?}", outcome),
+        };
+        let pane = Arc::new(FakePane::new_with_id(7_007, None));
+        let pane_for_tab: Arc<dyn Pane> = pane.clone();
+        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+        tab.assign_pane(&pane_for_tab);
+        let (mux, _mux_guard) = install_tab_with_window(&tab, &[]);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+
+        handler.process_one(DecodedPdu {
+            serial: 915,
+            pdu: Pdu::SendKeyDown(sampled_key_request().request),
+        });
+
+        assert_eq!(pane.key_down_count(), 0);
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 915);
+        let Pdu::ErrorResponse(error) = response.pdu else {
+            panic!("saturated key admission must return an ErrorResponse");
+        };
+        assert!(error.reason.contains("temporarily full"));
+        assert_eq!(executor.queue_snapshot().depth, 1);
+        assert_eq!(executor.admission_snapshot().active_tasks, 1);
+
+        drop(blocker);
+        assert!(executor.try_tick().unwrap());
+        assert_eq!(executor.queue_snapshot().depth, 0);
+        assert_eq!(executor.admission_snapshot().active_tasks, 0);
     }
 
     #[test]
