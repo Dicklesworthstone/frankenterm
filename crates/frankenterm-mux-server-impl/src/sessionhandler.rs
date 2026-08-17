@@ -7314,6 +7314,7 @@ mod tests {
         assert_eq!(pane.key_down_count(), 0);
         assert!(handler.per_pane.is_empty());
 
+        let expected_input_serial = request.request.input_serial;
         let admitted = AdmittedInputTraceV1::admit(&request, current_stream, codec::CODEC_VERSION)
             .expect("current connection should admit the sampled request");
         handler.process_one_with_dispatch_authority(
@@ -7338,10 +7339,31 @@ mod tests {
             executor.tick().expect("drive sampled key input");
         }
         assert_eq!(pane.key_down_count(), 1);
+        let mut responses = captured.lock().unwrap_or_else(|err| err.into_inner());
         assert_eq!(
-            take_response(&captured).pdu,
+            responses.len(),
+            2,
+            "committed key input must emit one correlated response and one render fence"
+        );
+        let correlated_index = responses
+            .iter()
+            .position(|response| response.serial == 913)
+            .expect("committed key input must retain its request serial");
+        assert_eq!(
+            responses.remove(correlated_index).pdu,
             Pdu::UnitResponse(UnitResponse {})
         );
+        let render_fence = responses
+            .pop()
+            .expect("committed key input must emit its render fence");
+        assert_eq!(render_fence.serial, 0);
+        match render_fence.pdu {
+            Pdu::GetPaneRenderChangesResponse(response) => {
+                assert_eq!(response.pane_id, 7_007);
+                assert_eq!(response.input_serial, Some(expected_input_serial));
+            }
+            other => panic!("expected input-correlated render fence, got {other:?}"),
+        }
     }
 
     #[test]

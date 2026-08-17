@@ -16,7 +16,7 @@
 // smol Async streams into codec async APIs, mixed graphs must continue to use
 // the smol path until those callers migrate.
 
-use anyhow::{bail, Context as _, Error};
+use anyhow::{Context as _, Error, bail};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 pub use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceContextV1;
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
@@ -101,7 +101,7 @@ pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize;
 /// range-checked, the chunk cache is capped, and reconstructed output is capped
 /// at [`MAX_PDU_SIZE`].
 pub mod cdc_dedup {
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
     use std::collections::HashMap;
     use std::convert::TryFrom;
 
@@ -7167,8 +7167,7 @@ fn flatten_ordered_panes(
         if matches!(tree, PaneNode::Empty) {
             return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                 tree_index,
-                detail:
-                    "ordered pane snapshots cannot recreate an empty tab without size authority",
+                detail: "ordered pane snapshots cannot recreate an empty tab without size authority",
             });
         }
 
@@ -7536,8 +7535,7 @@ pub fn validate_ordered_pane_arena(panes: &PaneArena) -> Result<(), OrderedWindo
             (None, 0) => {
                 return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                     tree_index,
-                    detail:
-                        "ordered pane snapshots cannot recreate an empty tab without size authority",
+                    detail: "ordered pane snapshots cannot recreate an empty tab without size authority",
                 });
             }
             (None, _) => {
@@ -13797,9 +13795,11 @@ mod test {
         reset_test_bounded_serialize_growth_events();
         let error = serialize_uncompressed_bounded(&payload, payload.len() - 1, 92, 87)
             .expect_err("an over-limit payload must fail before exceeding its ceiling");
-        assert!(error
-            .downcast_ref::<PduEncodedBodyLimitExceeded>()
-            .is_some());
+        assert!(
+            error
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .is_some()
+        );
     }
 
     #[test]
@@ -14033,23 +14033,29 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_true_variants() {
-        assert!(Pdu::WriteToPane(WriteToPane {
-            pane_id: 0,
-            data: vec![]
-        })
-        .is_user_input());
-        assert!(Pdu::SendPaste(SendPaste {
-            pane_id: 0,
-            data: String::new(),
-            input_serial: InputSerial::empty(),
-        })
-        .is_user_input());
-        assert!(Pdu::Resize(Resize {
-            containing_tab_id: 0,
-            pane_id: 0,
-            size: TerminalSize::default(),
-        })
-        .is_user_input());
+        assert!(
+            Pdu::WriteToPane(WriteToPane {
+                pane_id: 0,
+                data: vec![]
+            })
+            .is_user_input()
+        );
+        assert!(
+            Pdu::SendPaste(SendPaste {
+                pane_id: 0,
+                data: String::new(),
+                input_serial: InputSerial::empty(),
+            })
+            .is_user_input()
+        );
+        assert!(
+            Pdu::Resize(Resize {
+                containing_tab_id: 0,
+                pane_id: 0,
+                size: TerminalSize::default(),
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -15013,8 +15019,10 @@ mod test {
                 }
             )
         );
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1)
+        );
         assert_eq!(EXACT_RENDER_DELIVERY_V1_MIN_CODEC_VERSION, 52);
         assert!(!codec_version_supports_exact_render_delivery_v1(51));
         assert!(codec_version_supports_exact_render_delivery_v1(52));
@@ -17184,7 +17192,9 @@ mod test {
         let shorter_error =
             ensure_exact_render_canonical_payload(&value, &canonical_shorter, "test")
                 .expect_err("canonical serialization shorter than payload must fail");
-        assert!(format!("{shorter_error:#}").contains("canonical serialization is 1 bytes shorter"));
+        assert!(
+            format!("{shorter_error:#}").contains("canonical serialization is 1 bytes shorter")
+        );
     }
 
     #[test]
@@ -17592,12 +17602,14 @@ mod test {
         let error = Pdu::ListPanesOrderedV1Response(malformed)
             .encode_frame(0x872)
             .expect_err("ordinary public encoding must also reject the malformed arena");
-        assert!(error
-            .downcast_ref::<OrderedWindowProtocolError>()
-            .is_some_and(|error| matches!(
-                error,
-                OrderedWindowProtocolError::PaneArenaCardinalityMismatch { .. }
-            )));
+        assert!(
+            error
+                .downcast_ref::<OrderedWindowProtocolError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    OrderedWindowProtocolError::PaneArenaCardinalityMismatch { .. }
+                ))
+        );
         assert_eq!(
             debug_ordered_snapshot_validation_passes(),
             OrderedSnapshotValidationPasses {
@@ -18546,10 +18558,12 @@ mod test {
         assert_eq!(actual.session_incarnation, expected.session_incarnation);
         assert_eq!(actual.topology_revision, expected.topology_revision);
         assert_eq!(actual.panes, expected.panes);
-        assert!(actual
-            .ordered_windows
-            .iter()
-            .eq(expected.ordered_windows.iter()));
+        assert!(
+            actual
+                .ordered_windows
+                .iter()
+                .eq(expected.ordered_windows.iter())
+        );
     }
 
     #[test]
@@ -20209,7 +20223,13 @@ mod test {
         .expect("hostile sampled input fixture should frame");
         let error = Pdu::decode(frame.as_slice())
             .expect_err("sampled context schema mismatch must fail during decode");
-        assert!(format!("{error:#}").contains("unsupported schema version"));
+        assert!(matches!(
+            error.downcast_ref::<SampledInputTraceContextError>(),
+            Some(SampledInputTraceContextError::Contract(
+                RecorderContractError::UnsupportedSchemaVersion { expected, actual }
+            )) if *expected == SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION
+                && *actual == SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION + 1
+        ));
     }
 
     #[test]
@@ -20291,7 +20311,8 @@ mod test {
             error
                 .downcast_ref::<PduEncodedBodyLimitExceeded>()
                 .is_some(),
-            "unexpected oversized-body error: {error:#}"
+            "unexpected oversized-body error: {:#}",
+            error
         );
 
         let oversized_compressed = vec![0_u8; MAX_SEND_KEY_DOWN_TRACED_V1_ZSTD_ENCODED_BYTES + 1];
@@ -20310,7 +20331,8 @@ mod test {
             error
                 .downcast_ref::<PduEncodedBodyLimitExceeded>()
                 .is_some(),
-            "unexpected compressed-body rejection: {error:#}"
+            "unexpected compressed-body rejection: {:#}",
+            error
         );
     }
 
@@ -21752,12 +21774,18 @@ mod test {
         }
 
         assert_eq!(TopologyCapabilities::SERVER_SUPPORTED, fenced);
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1));
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1));
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1)
+        );
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1)
+        );
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1)
+        );
     }
 
     #[test]
@@ -22746,12 +22774,14 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_set_pane_zoomed() {
-        assert!(Pdu::SetPaneZoomed(SetPaneZoomed {
-            containing_tab_id: 0,
-            pane_id: 0,
-            zoomed: true,
-        })
-        .is_user_input());
+        assert!(
+            Pdu::SetPaneZoomed(SetPaneZoomed {
+                containing_tab_id: 0,
+                pane_id: 0,
+                zoomed: true,
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -22761,12 +22791,14 @@ mod test {
 
     #[test]
     fn server_unilateral_clipboard_is_not_client_input() {
-        assert!(!Pdu::SetClipboard(SetClipboard {
-            pane_id: 55,
-            clipboard: Some("copied".to_string()),
-            selection: ClipboardSelection::Clipboard,
-        })
-        .is_user_input());
+        assert!(
+            !Pdu::SetClipboard(SetClipboard {
+                pane_id: 55,
+                clipboard: Some("copied".to_string()),
+                selection: ClipboardSelection::Clipboard,
+            })
+            .is_user_input()
+        );
     }
 
     // --- Additional encode/decode edge cases ---
@@ -23908,9 +23940,11 @@ mod test {
         assert_eq!(serialized.validate_structure().unwrap().images, 2);
         let (_, images) = serialized.extract_data_checked().unwrap();
         assert_eq!(images.len(), 2);
-        assert!(images
-            .iter()
-            .all(|image| { image.line_idx == 5 && image.cell_idx == 0 }));
+        assert!(
+            images
+                .iter()
+                .all(|image| { image.line_idx == 5 && image.cell_idx == 0 })
+        );
         assert_eq!(
             images.iter().map(|image| image.z_index).collect::<Vec<_>>(),
             vec![-1, 2],
