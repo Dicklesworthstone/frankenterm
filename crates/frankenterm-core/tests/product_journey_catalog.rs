@@ -7,11 +7,15 @@ use std::path::{Component, Path, PathBuf};
 use frankenterm_core::product_journey_catalog::{
     ActorMode, CatalogClaimState, CatalogLineageValidationCode, CatalogLineageValidationReport,
     CatalogValidationCode, ContradictionStatus, EvidenceState, FleetPoint, FreshnessState,
-    JourneyVariant, MAX_PRODUCT_JOURNEY_CATALOG_BYTES, MAX_PRODUCT_JOURNEY_LINEAGE_BYTES,
-    ProducerCoverage, ProductJourneyCatalog, ProductJourneyDecodeCode,
+    JourneyIdentityRequirementV2, JourneyLifecyclePhaseV2, JourneyLifecycleRoleV2,
+    JourneyLifecycleV2, JourneyMutationClassV2, JourneyPhaseOutcomeV2,
+    JourneyPhasePreconditionV2, JourneyVariant,
+    MAX_PRODUCT_JOURNEY_CATALOG_BYTES, MAX_PRODUCT_JOURNEY_LINEAGE_BYTES, ProducerCoverage,
+    ProductJourneyCatalog, ProductJourneyCatalogV2, ProductJourneyDecodeCode,
     ProductJourneyLineageDecodeError, ProductJourneyLineageManifest, REQUIRED_COVERAGE_CELL_COUNT,
-    ReleaseRequirement, ReviewAuthorityKind, ReviewDisposition, RunVerdict, SupportDeclaration,
-    TargetAvailability, TargetMode, Topology, Transport, verify_product_journey_lineage,
+    REQUIRED_FIELD_JOURNEY_COUNT, REQUIRED_LIFECYCLE_PHASE_COUNT_V2, ReleaseRequirement,
+    ReviewAuthorityKind, ReviewDisposition, RunVerdict, SupportDeclaration, TargetAvailability,
+    TargetMode, Topology, Transport, verify_product_journey_lineage,
 };
 use jsonschema::{Draft, Validator};
 use proptest::prelude::*;
@@ -19,8 +23,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const CATALOG_RELATIVE_PATH: &str = "docs/design/product-journey-catalog.v1.json";
+const CATALOG_V2_RELATIVE_PATH: &str = "docs/design/product-journey-catalog.v2.json";
 const LINEAGE_RELATIVE_PATH: &str = "docs/design/product-journey-lineage.v1.json";
 const SCHEMA_RELATIVE_PATH: &str = "docs/json-schema/ft-product-journey-catalog.json";
+const SCHEMA_V2_RELATIVE_PATH: &str = "docs/json-schema/ft-product-journey-catalog-v2.json";
 const LINEAGE_SCHEMA_RELATIVE_PATH: &str = "docs/json-schema/ft-product-journey-lineage.json";
 const ISSUES_RELATIVE_PATH: &str = ".beads/issues.jsonl";
 
@@ -51,6 +57,18 @@ fn load_catalog(root: &Path) -> ProductJourneyCatalog {
         "checked-in catalog exceeds its public bounded-decoder limit"
     );
     ProductJourneyCatalog::decode_json_bounded(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "catalog {} failed bounded typed decode: {error}",
+            path.display()
+        )
+    })
+}
+
+fn load_catalog_v2(root: &Path) -> ProductJourneyCatalogV2 {
+    let path = root.join(CATALOG_V2_RELATIVE_PATH);
+    let bytes = fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    ProductJourneyCatalogV2::decode_json_bounded(&bytes).unwrap_or_else(|error| {
         panic!(
             "catalog {} failed bounded typed decode: {error}",
             path.display()
@@ -220,6 +238,16 @@ fn duplicate_scalar_field(
 
 fn load_schema_validator(root: &Path) -> Validator {
     let path = root.join(SCHEMA_RELATIVE_PATH);
+    let schema = read_json(&path);
+    Validator::options()
+        .with_draft(Draft::Draft202012)
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap_or_else(|error| panic!("schema {} failed to compile: {error}", path.display()))
+}
+
+fn load_schema_v2_validator(root: &Path) -> Validator {
+    let path = root.join(SCHEMA_V2_RELATIVE_PATH);
     let schema = read_json(&path);
     Validator::options()
         .with_draft(Draft::Draft202012)
@@ -541,11 +569,41 @@ fn assert_has_code(catalog: &ProductJourneyCatalog, code: CatalogValidationCode)
     );
 }
 
+fn assert_v2_has_code(catalog: &ProductJourneyCatalogV2, code: CatalogValidationCode) {
+    let report = catalog.validate();
+    assert!(
+        report.contains_code(code),
+        "expected v2 validation code {} ({code:?}), got:\n{}",
+        code.as_str(),
+        report
+            .errors
+            .iter()
+            .map(|error| format!("{} {}: {}", error.code.as_str(), error.path, error.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 fn first_variant(catalog: &mut ProductJourneyCatalog) -> &mut JourneyVariant {
     catalog
         .variants
         .first_mut()
         .expect("checked-in catalog must contain variants")
+}
+
+fn lifecycle_phase_v2_mut(
+    lifecycle: &mut JourneyLifecycleV2,
+    index: usize,
+) -> &mut JourneyLifecyclePhaseV2 {
+    match index {
+        0 => &mut lifecycle.identity_preflight,
+        1 => &mut lifecycle.clean_setup,
+        2 => &mut lifecycle.steady_work,
+        3 => &mut lifecycle.failure_overload,
+        4 => &mut lifecycle.recovery_convergence,
+        5 => &mut lifecycle.teardown_outcome,
+        _ => panic!("v2 lifecycle phase index {index} is out of range"),
+    }
 }
 
 #[test]
@@ -2094,6 +2152,251 @@ fn contradiction_ledger_is_closed_domain_and_resolution_evidence_bound() {
     );
 }
 
+#[test]
+fn checked_in_v2_catalog_is_typed_complete_and_exactly_migrates_v1_inventory() {
+    let root = repository_root();
+    let value = read_json(&root.join(CATALOG_V2_RELATIVE_PATH));
+    let schema = load_schema_v2_validator(&root);
+    let schema_errors = schema_errors(&schema, &value);
+    assert!(
+        schema_errors.is_empty(),
+        "checked-in v2 catalog failed JSON Schema:\n{}",
+        schema_errors.join("\n")
+    );
+
+    let v1 = load_catalog(&root);
+    let v2 = load_catalog_v2(&root);
+    let report = v2.validate();
+    assert!(
+        report.valid,
+        "checked-in v2 catalog failed semantic validation:\n{}",
+        report
+            .errors
+            .iter()
+            .map(|error| format!("{} {}: {}", error.code.as_str(), error.path, error.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(v2.phase_contracts.len(), REQUIRED_LIFECYCLE_PHASE_COUNT_V2);
+    assert_eq!(v2.journey_producers.len(), REQUIRED_FIELD_JOURNEY_COUNT);
+    assert_eq!(v2.closure_consumers.len(), REQUIRED_COVERAGE_CELL_COUNT);
+
+    for producer in &v2.journey_producers {
+        let source = v1
+            .journey_definitions
+            .iter()
+            .find(|definition| definition.journey_id == producer.journey_id)
+            .unwrap_or_else(|| panic!("v1 journey `{}` must exist", producer.journey_id));
+        assert_eq!(producer.field_bead_id, source.field_bead_id);
+        assert_eq!(
+            producer.lifecycle.identity_preflight.steps.as_slice(),
+            source.setup[..1],
+            "identity preflight must explicitly retain only v1 setup[0]"
+        );
+        assert_eq!(
+            producer.lifecycle.clean_setup.steps.as_slice(),
+            source.setup[1..],
+            "clean setup must explicitly retain only the later v1 setup steps"
+        );
+        assert_eq!(producer.lifecycle.steady_work.steps, source.steady_work);
+        assert_eq!(
+            producer.lifecycle.failure_overload.steps,
+            source.failure_overload
+        );
+        assert_eq!(
+            producer.lifecycle.recovery_convergence.steps,
+            source.recovery
+        );
+        assert_eq!(producer.lifecycle.teardown_outcome.steps, source.teardown);
+    }
+
+    for consumer in &v2.closure_consumers {
+        let source = v1
+            .variants
+            .iter()
+            .find(|variant| variant.claim_id == consumer.claim_id)
+            .unwrap_or_else(|| panic!("v1 claim `{}` must exist", consumer.claim_id));
+        assert_eq!(consumer.coverage, source.coverage);
+        assert_eq!(consumer.journey_ids, source.journey_ids);
+    }
+}
+
+#[test]
+fn v1_and_v2_decoders_have_no_implicit_compatibility_path() {
+    let root = repository_root();
+    let v1_bytes = fs::read(root.join(CATALOG_RELATIVE_PATH)).expect("read v1 catalog");
+    let v2_bytes = fs::read(root.join(CATALOG_V2_RELATIVE_PATH)).expect("read v2 catalog");
+
+    let v1_as_v2 = ProductJourneyCatalogV2::decode_json_bounded(&v1_bytes)
+        .expect_err("v1 positional data must not auto-upgrade to v2");
+    assert_eq!(v1_as_v2.code(), ProductJourneyDecodeCode::InvalidJson);
+
+    let v2_as_v1 = ProductJourneyCatalog::decode_json_bounded(&v2_bytes)
+        .expect_err("v2 typed data must not be accepted by the v1 decoder");
+    assert_eq!(v2_as_v1.code(), ProductJourneyDecodeCode::InvalidJson);
+}
+
+#[test]
+fn v2_schema_rejects_omitted_and_legacy_positional_lifecycle_fields() {
+    let root = repository_root();
+    let schema = load_schema_v2_validator(&root);
+    let mut omitted = read_json(&root.join(CATALOG_V2_RELATIVE_PATH));
+    omitted["journey_producers"][0]["lifecycle"]
+        .as_object_mut()
+        .expect("lifecycle object")
+        .remove("identity_preflight");
+    assert!(!schema.is_valid(&omitted));
+    let omitted_bytes = serde_json::to_vec(&omitted).expect("serialize omitted-field mutation");
+    assert_eq!(
+        ProductJourneyCatalogV2::decode_json_bounded(&omitted_bytes)
+            .expect_err("missing explicit phase must fail typed decode")
+            .code(),
+        ProductJourneyDecodeCode::InvalidJson
+    );
+
+    let mut legacy = read_json(&root.join(CATALOG_V2_RELATIVE_PATH));
+    legacy["journey_producers"][0]["lifecycle"]["setup"] =
+        json!(["positional preflight", "positional setup"]);
+    assert!(!schema.is_valid(&legacy));
+    let legacy_bytes = serde_json::to_vec(&legacy).expect("serialize legacy-field mutation");
+    assert_eq!(
+        ProductJourneyCatalogV2::decode_json_bounded(&legacy_bytes)
+            .expect_err("legacy setup array must not be accepted")
+            .code(),
+        ProductJourneyDecodeCode::InvalidJson
+    );
+}
+
+#[test]
+fn v2_semantics_reject_swapped_empty_duplicated_and_collapsed_phases() {
+    let root = repository_root();
+
+    let mut swapped = load_catalog_v2(&root);
+    swapped.journey_producers[0]
+        .lifecycle
+        .identity_preflight
+        .contract_role = JourneyLifecycleRoleV2::CleanSetup;
+    assert_v2_has_code(&swapped, CatalogValidationCode::SwappedLifecyclePhase);
+
+    let mut empty = load_catalog_v2(&root);
+    empty.journey_producers[0]
+        .lifecycle
+        .steady_work
+        .steps
+        .clear();
+    assert_v2_has_code(&empty, CatalogValidationCode::EmptyRequiredField);
+
+    let mut duplicated = load_catalog_v2(&root);
+    let duplicated_steps = duplicated.journey_producers[0]
+        .lifecycle
+        .identity_preflight
+        .steps
+        .clone();
+    duplicated.journey_producers[0].lifecycle.clean_setup.steps = duplicated_steps;
+    assert_v2_has_code(&duplicated, CatalogValidationCode::DuplicateLifecyclePhase);
+
+    let mut collapsed = load_catalog_v2(&root);
+    let repeated = "one collapsed lifecycle action".to_string();
+    for phase_index in 0..REQUIRED_LIFECYCLE_PHASE_COUNT_V2 {
+        lifecycle_phase_v2_mut(&mut collapsed.journey_producers[0].lifecycle, phase_index).steps =
+            vec![repeated.clone()];
+    }
+    assert_v2_has_code(&collapsed, CatalogValidationCode::DuplicateLifecyclePhase);
+}
+
+#[test]
+fn v2_semantics_reject_post_mutation_preflight_recovery_without_failure_and_no_outcome_teardown() {
+    let root = repository_root();
+
+    let mut duplicate_requirement = load_catalog_v2(&root);
+    duplicate_requirement.phase_contracts[0]
+        .required_identities
+        .push(JourneyIdentityRequirementV2::RendererDisplay);
+    assert_v2_has_code(
+        &duplicate_requirement,
+        CatalogValidationCode::InvalidLifecycleContract,
+    );
+
+    let mut post_mutation_preflight = load_catalog_v2(&root);
+    let preflight = post_mutation_preflight
+        .phase_contracts
+        .iter_mut()
+        .find(|contract| contract.role == JourneyLifecycleRoleV2::IdentityPreflight)
+        .expect("identity preflight contract");
+    preflight
+        .allowed_mutations
+        .push(JourneyMutationClassV2::CleanSetup);
+    assert_v2_has_code(
+        &post_mutation_preflight,
+        CatalogValidationCode::PostMutationPreflight,
+    );
+
+    let mut recovery_without_failure = load_catalog_v2(&root);
+    let recovery = recovery_without_failure
+        .phase_contracts
+        .iter_mut()
+        .find(|contract| contract.role == JourneyLifecycleRoleV2::RecoveryConvergence)
+        .expect("recovery contract");
+    recovery.required_preconditions = vec![JourneyPhasePreconditionV2::CleanSetupComplete];
+    assert_v2_has_code(
+        &recovery_without_failure,
+        CatalogValidationCode::RecoveryWithoutFailure,
+    );
+
+    let mut teardown_without_outcome = load_catalog_v2(&root);
+    let teardown = teardown_without_outcome
+        .phase_contracts
+        .iter_mut()
+        .find(|contract| contract.role == JourneyLifecycleRoleV2::TeardownOutcome)
+        .expect("teardown contract");
+    teardown.required_outcomes = vec![JourneyPhaseOutcomeV2::ResourcesReleased];
+    assert_v2_has_code(
+        &teardown_without_outcome,
+        CatalogValidationCode::TeardownWithoutOutcome,
+    );
+}
+
+#[test]
+fn v2_semantics_reject_incomplete_producer_and_consumer_migrations() {
+    let root = repository_root();
+
+    let mut missing_producer = load_catalog_v2(&root);
+    missing_producer.journey_producers.pop();
+    assert_v2_has_code(
+        &missing_producer,
+        CatalogValidationCode::InvalidLifecycleMigration,
+    );
+
+    let mut missing_consumer = load_catalog_v2(&root);
+    missing_consumer.closure_consumers.pop();
+    assert_v2_has_code(
+        &missing_consumer,
+        CatalogValidationCode::MissingRequiredCoverage,
+    );
+
+    let mut dangling_consumer = load_catalog_v2(&root);
+    dangling_consumer.closure_consumers[0].journey_ids[0] = "journey.not_migrated".to_string();
+    assert_v2_has_code(&dangling_consumer, CatalogValidationCode::DanglingReference);
+
+    let mut wrong_but_valid_mapping = load_catalog_v2(&root);
+    let replacement = wrong_but_valid_mapping
+        .journey_producers
+        .iter()
+        .map(|producer| &producer.journey_id)
+        .find(|journey_id| {
+            !wrong_but_valid_mapping.closure_consumers[0]
+                .journey_ids
+                .contains(journey_id)
+        })
+        .expect("the first closure cell does not consume all fourteen journeys")
+        .clone();
+    wrong_but_valid_mapping.closure_consumers[0].journey_ids[0] = replacement;
+    assert_v2_has_code(
+        &wrong_but_valid_mapping,
+        CatalogValidationCode::InvalidLifecycleMigration,
+    );
+}
+
 proptest! {
     #[test]
     fn removing_any_materialized_variant_breaks_exact_coverage(
@@ -2124,6 +2427,29 @@ proptest! {
             report.contains_code(CatalogValidationCode::DuplicateCompositeKey)
                 && report.contains_code(CatalogValidationCode::DuplicateClaimId),
             "duplicating variant {index} did not break key and claim uniqueness"
+        );
+    }
+
+    #[test]
+    fn assigning_any_wrong_v2_role_is_rejected_as_a_swapped_phase(
+        producer_index in 0usize..REQUIRED_FIELD_JOURNEY_COUNT,
+        phase_index in 0usize..REQUIRED_LIFECYCLE_PHASE_COUNT_V2,
+        role_offset in 1usize..REQUIRED_LIFECYCLE_PHASE_COUNT_V2,
+    ) {
+        let root = repository_root();
+        let mut catalog = load_catalog_v2(&root);
+        prop_assume!(catalog.journey_producers.len() == REQUIRED_FIELD_JOURNEY_COUNT);
+        let wrong_role = JourneyLifecycleRoleV2::ALL
+            [(phase_index + role_offset) % REQUIRED_LIFECYCLE_PHASE_COUNT_V2];
+        lifecycle_phase_v2_mut(
+            &mut catalog.journey_producers[producer_index].lifecycle,
+            phase_index,
+        )
+        .contract_role = wrong_role;
+        let report = catalog.validate();
+        prop_assert!(
+            report.contains_code(CatalogValidationCode::SwappedLifecyclePhase),
+            "producer {producer_index} phase {phase_index} accepted wrong role {wrong_role:?}"
         );
     }
 }

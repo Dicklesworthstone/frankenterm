@@ -1,9 +1,12 @@
 # Product Journey Contract
 
-- Catalog contract ID: `ft.product_journey_catalog.v1`
-- Human companion revision: 3
-- Machine companion: `docs/design/product-journey-catalog.v1.json`
-- Schema: `docs/json-schema/ft-product-journey-catalog.json`
+- Signed inventory contract ID: `ft.product_journey_catalog.v1`
+- Signed inventory companion revision: 3
+- Signed inventory: `docs/design/product-journey-catalog.v1.json`
+- Signed inventory schema: `docs/json-schema/ft-product-journey-catalog.json`
+- Typed lifecycle migration contract ID: `ft.product_journey_catalog.v2`
+- Typed lifecycle migration: `docs/design/product-journey-catalog.v2.json`
+- Typed lifecycle schema: `docs/json-schema/ft-product-journey-catalog-v2.json`
 - Lineage envelope: `docs/design/product-journey-lineage.v1.json`
 - Lineage schema: `docs/json-schema/ft-product-journey-lineage.json`
 - Owning Bead: `ft-interactive-swarm-product-convergence-7xqz4.1.1`
@@ -23,6 +26,38 @@ fleet qualification points. The resulting 32 cells are materialized even when
 the current answer is conditional or a producer is missing. An absent cell is
 never interpreted as implicitly supported.
 
+## Typed Six-Phase Lifecycle Migration
+
+The signed v1 inventory remains immutable historical authority for its exact
+fourteen journey IDs, field-Bead bindings, and thirty-two closure cells. Its
+lifecycle representation is not semantic proof: `setup[0]` and `setup[1..]`
+were positional prose conventions, while `steady_work`, `failure_overload`,
+`recovery`, and `teardown` were untyped string arrays. The v2 migration marks
+those positional semantics `unproved`; it never automatically decodes,
+converts, or promotes a v1 document.
+
+V2 explicitly restates every journey producer with six named fields:
+
+1. `identity_preflight`
+2. `clean_setup`
+3. `steady_work`
+4. `failure_overload`
+5. `recovery_convergence`
+6. `teardown_outcome`
+
+Each field binds one of six closed phase contracts. Those contracts freeze the
+required identity domains, causal preconditions, allowed mutation classes,
+required outcomes, retained evidence class, cancellation behavior, and failure
+semantics. Identity preflight permits no mutation. Recovery requires an
+observed failure/overload boundary. Teardown must both release resources and
+retain a final success, degraded, failed, cancelled, or indeterminate outcome.
+
+The migration also restates all thirty-two closure consumers and their exact
+journey-ID sets. Offline validation compares those identities and mappings with
+the signed v1 head; v2 adds lifecycle meaning without inventing new producer or
+claim coverage. Neither schema version proves that a journey ran or that a
+cell is supported.
+
 ## Authority and Conflict Resolution
 
 The following authority boundaries are deliberate:
@@ -31,14 +66,18 @@ The following authority boundaries are deliberate:
    identifiers, the 32-cell inventory, current status fields, target posture,
    cross-references, and machine validation only when its exact bytes equal the
    current signed snapshot in `product-journey-lineage.v1.json`.
-2. This document is authoritative for the meaning of those fields, the
+2. `docs/design/product-journey-catalog.v2.json` is authoritative only for the
+   typed six-phase lifecycle migration when it passes its closed JSON Schema,
+   Rust semantic validator, and exact v1 identity/mapping comparison. It does
+   not replace v1 support, target, evidence, review, or lineage fields.
+3. This document is authoritative for the meaning of those fields, the
    promotion rules, non-claims, and how humans should interpret the catalog.
-3. Beads are authoritative for work ownership and dependency state. An open or
+4. Beads are authoritative for work ownership and dependency state. An open or
    closed Bead is not, by itself, a product-support verdict.
-4. Retained artifacts and their verifiers are authoritative for run and
+5. Retained artifacts and their verifiers are authoritative for run and
    evidence claims. Prose, source presence, a checked-in fixture, or a passing
    reduced harness cannot mint a target-qualified result.
-5. `README.md`, the GUI guide, playbooks, demos, and release notes are derived
+6. `README.md`, the GUI guide, playbooks, demos, and release notes are derived
    claim surfaces. They must not be more optimistic than the catalog and
    retained evidence.
 

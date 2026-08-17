@@ -1,0 +1,380 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-product-journey-catalog-v2.json",
+  "title": "FrankenTerm Product Journey Catalog V2 Lifecycle Migration",
+  "description": "Breaking, fail-closed migration from unproved v1 positional lifecycle prose to six explicit typed phases. This schema has no v1 fallback or automatic upgrade path.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_id",
+    "schema_version",
+    "catalog_revision",
+    "source_bead_id",
+    "catalog_claim_state",
+    "predecessor_contract_id",
+    "predecessor_catalog_revision",
+    "predecessor_raw_sha256",
+    "v1_positional_lifecycle_semantics",
+    "phase_contracts",
+    "journey_producers",
+    "closure_consumers"
+  ],
+  "properties": {
+    "contract_id": {
+      "const": "ft.product_journey_catalog.v2"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "catalog_revision": {
+      "$ref": "#/$defs/non_empty_string"
+    },
+    "source_bead_id": {
+      "const": "ft-interactive-swarm-product-convergence-7xqz4.1.1.3"
+    },
+    "catalog_claim_state": {
+      "const": "contract_only"
+    },
+    "predecessor_contract_id": {
+      "const": "ft.product_journey_catalog.v1"
+    },
+    "predecessor_catalog_revision": {
+      "const": "2026-07-27.3"
+    },
+    "predecessor_raw_sha256": {
+      "const": "dd3b8a2bdd73c369152b291775205bbfc0bc1a0c9d41bf1bd091b53807408a54"
+    },
+    "v1_positional_lifecycle_semantics": {
+      "const": "unproved"
+    },
+    "phase_contracts": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/phase_contract"
+      }
+    },
+    "journey_producers": {
+      "type": "array",
+      "minItems": 14,
+      "maxItems": 14,
+      "items": {
+        "$ref": "#/$defs/journey_producer"
+      }
+    },
+    "closure_consumers": {
+      "type": "array",
+      "minItems": 32,
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/closure_consumer"
+      }
+    }
+  },
+  "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "non_empty_strings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/non_empty_string"
+      }
+    },
+    "lifecycle_role": {
+      "type": "string",
+      "enum": [
+        "identity_preflight",
+        "clean_setup",
+        "steady_work",
+        "failure_overload",
+        "recovery_convergence",
+        "teardown_outcome"
+      ]
+    },
+    "identity_requirement": {
+      "type": "string",
+      "enum": [
+        "exact_candidate",
+        "controller_target",
+        "session_host_target",
+        "topology_transport",
+        "route",
+        "mux_session",
+        "pane_fleet",
+        "renderer_display",
+        "configuration_policy",
+        "workload_actors"
+      ]
+    },
+    "phase_precondition": {
+      "type": "string",
+      "enum": [
+        "unmodified_starting_state",
+        "identity_preflight_passed",
+        "clean_setup_complete",
+        "steady_work_started",
+        "failure_overload_observed",
+        "recovery_attempted"
+      ]
+    },
+    "mutation_class": {
+      "type": "string",
+      "enum": [
+        "clean_setup",
+        "user_work",
+        "fault_or_overload_injection",
+        "recovery_action",
+        "resource_release"
+      ]
+    },
+    "phase_outcome": {
+      "type": "string",
+      "enum": [
+        "identity_bound",
+        "clean_baseline_ready",
+        "steady_work_completed",
+        "failure_observed",
+        "authoritative_state_converged",
+        "resources_released",
+        "final_outcome_recorded"
+      ]
+    },
+    "phase_evidence": {
+      "type": "string",
+      "enum": [
+        "identity_receipt",
+        "setup_receipt",
+        "work_receipt",
+        "failure_receipt",
+        "convergence_receipt",
+        "teardown_receipt"
+      ]
+    },
+    "cancellation_semantics": {
+      "type": "string",
+      "enum": [
+        "abort_before_mutation",
+        "rollback_or_resume_setup",
+        "preserve_user_intent",
+        "preserve_failure_evidence",
+        "checkpoint_retryable_recovery",
+        "cleanup_remains_required"
+      ]
+    },
+    "failure_semantics": {
+      "type": "string",
+      "enum": [
+        "stop_before_mutation",
+        "setup_failure_is_explicit",
+        "work_failure_is_explicit",
+        "failure_is_test_input",
+        "non_convergence_is_failure",
+        "incomplete_teardown_is_failure"
+      ]
+    },
+    "phase_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "required_identities",
+        "required_preconditions",
+        "allowed_mutations",
+        "required_outcomes",
+        "required_evidence",
+        "cancellation",
+        "failure_semantics"
+      ],
+      "properties": {
+        "role": {
+          "$ref": "#/$defs/lifecycle_role"
+        },
+        "required_identities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identity_requirement"
+          }
+        },
+        "required_preconditions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/phase_precondition"
+          }
+        },
+        "allowed_mutations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/mutation_class"
+          }
+        },
+        "required_outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/phase_outcome"
+          }
+        },
+        "required_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/phase_evidence"
+          }
+        },
+        "cancellation": {
+          "$ref": "#/$defs/cancellation_semantics"
+        },
+        "failure_semantics": {
+          "$ref": "#/$defs/failure_semantics"
+        }
+      }
+    },
+    "journey_phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_role",
+        "steps"
+      ],
+      "properties": {
+        "contract_role": {
+          "$ref": "#/$defs/lifecycle_role"
+        },
+        "steps": {
+          "$ref": "#/$defs/non_empty_strings"
+        }
+      }
+    },
+    "journey_lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity_preflight",
+        "clean_setup",
+        "steady_work",
+        "failure_overload",
+        "recovery_convergence",
+        "teardown_outcome"
+      ],
+      "properties": {
+        "identity_preflight": {
+          "$ref": "#/$defs/journey_phase"
+        },
+        "clean_setup": {
+          "$ref": "#/$defs/journey_phase"
+        },
+        "steady_work": {
+          "$ref": "#/$defs/journey_phase"
+        },
+        "failure_overload": {
+          "$ref": "#/$defs/journey_phase"
+        },
+        "recovery_convergence": {
+          "$ref": "#/$defs/journey_phase"
+        },
+        "teardown_outcome": {
+          "$ref": "#/$defs/journey_phase"
+        }
+      }
+    },
+    "journey_producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "journey_id",
+        "field_bead_id",
+        "lifecycle"
+      ],
+      "properties": {
+        "journey_id": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "field_bead_id": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/journey_lifecycle"
+        }
+      }
+    },
+    "product_persona": {
+      "type": "string",
+      "enum": [
+        "interactive_human",
+        "meta_agent_operator",
+        "automation_agent",
+        "incident_responder"
+      ]
+    },
+    "fleet_point": {
+      "type": "string",
+      "enum": [
+        "q002",
+        "q020",
+        "q050",
+        "q200"
+      ]
+    },
+    "topology": {
+      "type": "string",
+      "enum": [
+        "local_only",
+        "mac_lan_remote"
+      ]
+    },
+    "coverage_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "persona",
+        "fleet_point",
+        "topology"
+      ],
+      "properties": {
+        "persona": {
+          "$ref": "#/$defs/product_persona"
+        },
+        "fleet_point": {
+          "$ref": "#/$defs/fleet_point"
+        },
+        "topology": {
+          "$ref": "#/$defs/topology"
+        }
+      }
+    },
+    "closure_consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim_id",
+        "coverage",
+        "journey_ids"
+      ],
+      "properties": {
+        "claim_id": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage_key"
+        },
+        "journey_ids": {
+          "$ref": "#/$defs/non_empty_strings"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,312 @@
+{
+  "contract_id": "ft.product_journey_catalog.v2",
+  "schema_version": 2,
+  "catalog_revision": "2026-08-17.1",
+  "source_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.1.1.3",
+  "catalog_claim_state": "contract_only",
+  "predecessor_contract_id": "ft.product_journey_catalog.v1",
+  "predecessor_catalog_revision": "2026-07-27.3",
+  "predecessor_raw_sha256": "dd3b8a2bdd73c369152b291775205bbfc0bc1a0c9d41bf1bd091b53807408a54",
+  "v1_positional_lifecycle_semantics": "unproved",
+  "phase_contracts": [
+    {
+      "role": "identity_preflight",
+      "required_identities": [
+        "exact_candidate",
+        "controller_target",
+        "session_host_target",
+        "topology_transport",
+        "route",
+        "mux_session",
+        "pane_fleet",
+        "renderer_display",
+        "configuration_policy",
+        "workload_actors"
+      ],
+      "required_preconditions": ["unmodified_starting_state"],
+      "allowed_mutations": [],
+      "required_outcomes": ["identity_bound"],
+      "required_evidence": ["identity_receipt"],
+      "cancellation": "abort_before_mutation",
+      "failure_semantics": "stop_before_mutation"
+    },
+    {
+      "role": "clean_setup",
+      "required_identities": [
+        "exact_candidate",
+        "topology_transport",
+        "mux_session",
+        "configuration_policy"
+      ],
+      "required_preconditions": ["identity_preflight_passed"],
+      "allowed_mutations": ["clean_setup"],
+      "required_outcomes": ["clean_baseline_ready"],
+      "required_evidence": ["setup_receipt"],
+      "cancellation": "rollback_or_resume_setup",
+      "failure_semantics": "setup_failure_is_explicit"
+    },
+    {
+      "role": "steady_work",
+      "required_identities": [
+        "exact_candidate",
+        "mux_session",
+        "pane_fleet",
+        "workload_actors"
+      ],
+      "required_preconditions": ["clean_setup_complete"],
+      "allowed_mutations": ["user_work"],
+      "required_outcomes": ["steady_work_completed"],
+      "required_evidence": ["work_receipt"],
+      "cancellation": "preserve_user_intent",
+      "failure_semantics": "work_failure_is_explicit"
+    },
+    {
+      "role": "failure_overload",
+      "required_identities": [
+        "exact_candidate",
+        "route",
+        "mux_session",
+        "pane_fleet"
+      ],
+      "required_preconditions": ["steady_work_started"],
+      "allowed_mutations": ["fault_or_overload_injection"],
+      "required_outcomes": ["failure_observed"],
+      "required_evidence": ["failure_receipt"],
+      "cancellation": "preserve_failure_evidence",
+      "failure_semantics": "failure_is_test_input"
+    },
+    {
+      "role": "recovery_convergence",
+      "required_identities": [
+        "exact_candidate",
+        "route",
+        "mux_session",
+        "pane_fleet"
+      ],
+      "required_preconditions": ["failure_overload_observed"],
+      "allowed_mutations": ["recovery_action"],
+      "required_outcomes": ["authoritative_state_converged"],
+      "required_evidence": ["convergence_receipt"],
+      "cancellation": "checkpoint_retryable_recovery",
+      "failure_semantics": "non_convergence_is_failure"
+    },
+    {
+      "role": "teardown_outcome",
+      "required_identities": [
+        "exact_candidate",
+        "mux_session",
+        "pane_fleet"
+      ],
+      "required_preconditions": ["recovery_attempted"],
+      "allowed_mutations": ["resource_release"],
+      "required_outcomes": ["resources_released", "final_outcome_recorded"],
+      "required_evidence": ["teardown_receipt"],
+      "cancellation": "cleanup_remains_required",
+      "failure_semantics": "incomplete_teardown_is_failure"
+    }
+  ],
+  "journey_producers": [
+    {
+      "journey_id": "journey.clean_mac_first_hour",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.1",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Record package, app, CLI, mux, config, renderer, display, OS, target, and first-run authority identity."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Begin from a declared clean compatible Mac and install the packaged, signed candidate."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Launch, complete setup, open a project, start two useful agents, type, paste, switch panes, search, approve, resize, and zoom.", "Quit and relaunch through the supported product path without manual source-tree substitution."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Exercise missing config, denied authority, stale companion, and interrupted first launch with typed and actionable feedback."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Resume or retry idempotently, preserve accepted setup choices, and reach the same authoritative candidate without duplicate side effects."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Exit cleanly, preserve the declared session state, and emit a privacy-safe setup and relaunch outcome record."]}
+      }
+    },
+    {
+      "journey_id": "journey.two_agent_everyday",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.2",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Record pane, mux, application, route, display, renderer, config, and target identities."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Start the exact packaged candidate with two real project agents in the selected local or Mac-to-LAN topology."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Perform four hours of typing, paste, search, approval, pane navigation, scrollback, resize, zoom, and agent supervision.", "Include quiet, normal, and burst-output phases while preserving a protected interactive pane."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Inject rate limits, burst output, one agent restart, and a bounded transport interruption when the topology is remote."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Recover exact pane intent, focus, geometry, search state, and pending approvals without duplicate input or hidden local fallback."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Stop the agents and product cleanly, verify durable receipts and explicit gaps, and retain bounded four-hour evidence."]}
+      }
+    },
+    {
+      "journey_id": "journey.twenty_pane_daily",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.3",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Pin candidate, mux, route, storage, index, policy, renderer, display, and target identity."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Create exactly twenty panes with declared real-agent, shell, and workload roles in the selected topology."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Run normal coding, approvals, search, capture, pane churn, scrollback, resize, zoom, Robot or MCP queries, and bounded background maintenance.", "Preserve a designated interactive pane and observable agent state transitions."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Apply synchronized output bursts, pane churn, index or capture pressure, approvals, and a recoverable agent or connection failure."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Restore authoritative pane state, interaction priority, machine envelopes, search freshness, and exact pending intent within declared bounds."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Drain bounded work, stop the fleet, verify durable state and explicit gaps, and archive the exact q020 manifest and outcome."]}
+      }
+    },
+    {
+      "journey_id": "journey.fifty_pane_mac_trj",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.4",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Declare a protected interactive pane and record both host identities, CPU topology, route, protocol, mux generation, renderer, display, storage, and workload."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Create exactly fifty panes on the authoritative trj mux and connect from the exact Mac candidate over the named LAN route."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Run loaded agent output, capture, search, policy, approval, indexing, maintenance, resize, zoom, scrolling, and machine supervision.", "Continuously exercise the protected pane while measuring native input-to-present and remote round-trip segments."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Drive burst output, maintenance collision, queue pressure, route jitter, loss, and a bounded disconnect while preserving diagnostic observability."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Reconnect and resynchronize to the exact mux generation, preserve or explicitly reject pending input, and converge text, geometry, search, policy, and agent state."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Drain or cancel bounded work, stop the fifty-pane fleet, and retain manifests, route evidence, fairness evidence, gaps, and final convergence."]}
+      }
+    },
+    {
+      "journey_id": "journey.two_hundred_pane_mission",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.5",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Preflight resource headroom, artifact retention, privacy tier, recovery checkpoints, and duration authority."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Create exactly two hundred declared panes on the selected target topology with a protected interactive pane and exact candidate, host, route, CPU, memory, storage, renderer, display, policy, and workload identity."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Run the target mission for four hours and 24 hours, plus the selected 72-hour scenario, with realistic agents, bursts, approvals, search, capture, indexing, backups, GC, WAL, rules, resize, zoom, and supervision.", "Measure protected interaction, fairness, presentation quality, bounded machine calls, resource slopes, and thermal or affinity state."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Exercise declared saturation, synchronized output, maintenance collision, route disruption when remote, component restart, storage pressure, and thermal or scheduler variance without hiding degraded intervals."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Shed or defer work by declared policy, reconnect or restart safely, converge the exact two-hundred-pane state, and prove no duplicate mutation, unbounded backlog, or silent gap."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Quiesce the mission, verify durable and final user intent, release resources, and seal the exact duration and target artifact bundle."]}
+      }
+    },
+    {
+      "journey_id": "journey.attention_and_verified_submit",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.6",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Bind every mutation and prompt to a stable correlation and idempotency identity."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Create declared agent, policy, approval, mission, transaction, rate-limit, and attention states with exact pane and candidate identity."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Supervise mixed agent work through Robot and MCP surfaces, approvals, compaction, deduplicated attention, policy feedback, and Verified Submit.", "Keep human and machine views consistent while bounded waits and actions proceed."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Generate rate limits, duplicate notifications, stale approvals, conflicting submissions, cancellation, slow consumers, and denied authority."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Deduplicate safely, preserve causal order, expire stale authority, resume approved work, and expose every refusal or unresolved ambiguity."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Drain or cancel pending work, close approvals and transactions, and retain durable receipts and the final attention state."]}
+      }
+    },
+    {
+      "journey_id": "journey.concurrent_maintenance",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.7",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Set bounded maintenance budgets and identify protected interaction and machine-control work."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Prepare declared capture, search, index, storage, backup, GC, WAL, rules, incident, and fleet state on the exact candidate."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Run foreground typing, search, approval, capture, and agent supervision while search, indexing, backup, GC, WAL, rules, and incident tasks overlap.", "Observe scheduling, queueing, cancellation, storage, and freshness without serializing away realistic contention."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Apply storage pressure, index backlog, long readers, rule bursts, backup collision, cancelled tasks, and slow consumers."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Bound, defer, or cancel background work, restore freshness and storage invariants, and return protected foreground work to the declared envelope."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Drain maintenance safely, verify WAL, backup, index, capture, and incident consistency, and retain final resource and queue state."]}
+      }
+    },
+    {
+      "journey_id": "journey.remote_unavailable_recovery",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.8",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Record route, endpoint, expected mux generation, pending intent, policy, and retry budget."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Select the exact Mac-to-LAN remote topology and candidate while the named authoritative remote host is unavailable."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Launch and observe bounded unavailable-state behavior through native, Robot, MCP, workflow, and incident surfaces as applicable.", "Keep local UI and machine APIs responsive while no remote authority exists."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Maintain unavailability through retries, route changes, stale discovery, queued actions, and concurrent local activity."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Return the remote host, re-authenticate or reconnect, bind the authoritative mux generation, reconcile pending actions, and resynchronize without duplicate input."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Close or retain the recovered session by explicit choice and archive unavailable, retry, reconnect, reconciliation, and final-state evidence."]}
+      }
+    },
+    {
+      "journey_id": "journey.route_roam_sleep_wake",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.9",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Declare the allowed LAN, Wi-Fi, and tailnet transitions plus sleep and wake sequence."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Connect the exact Mac client to the named remote mux and record initial LAN route, endpoint, mux generation, pending intent, display, renderer, and target identity."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Type, supervise agents, search, scroll, resize, and zoom while transitioning among declared routes and display states.", "Maintain typed connection and route state across background and foreground changes."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Exercise packet loss, jitter, route disappearance, sleep, wake, stale sockets, simultaneous output, and input near each transition."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Reconnect on the intended route, bind the exact mux generation, resynchronize text and geometry, and resolve pending input without duplication or reordering."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Return to the declared final route or disconnect explicitly and retain transition, resynchronization, presentation, and final-intent evidence."]}
+      }
+    },
+    {
+      "journey_id": "journey.live_update_rollback",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.10",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Record all component, protocol, config, bundle, and rollback identities."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Start a healthy exact candidate with active panes, watcher, GUI, mux, storage, machine clients, and a declared update candidate."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Continue interactive and machine work while staging and initiating the supported component update and watcher handoff.", "Expose current and candidate identity throughout the transition."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Fail the candidate at declared preflight, handoff, launch, protocol, health, or migration boundaries while foreground work continues."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Rollback or complete the update atomically, restore one authoritative watcher and mux path, reconcile queued work, and prevent mixed-version claims."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Verify the final installed and running identities, stop obsolete components safely, and retain update, failure, rollback, and continuity receipts."]}
+      }
+    },
+    {
+      "journey_id": "journey.component_crash_recovery",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.11",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Create bounded checkpoints and declare each component crash injection."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Start the exact candidate with declared active pane, storage, search, policy, renderer, watcher, connection, and machine-client state."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Maintain interactive and machine work while observing component health, durable receipts, frame state, queues, and resource bounds.", "Capture the authoritative pre-crash state without raw content by default."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Crash GUI, watcher, mux, renderer, storage, and connection components separately and in declared compound cases."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Restart the correct component, reject stale generations, restore durable state, reconcile pending work, redraw coherently, and disclose every gap or lost capability."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Verify final component identity, pane and machine state, storage consistency, connections, presentation, and resource cleanup before sealing evidence."]}
+      }
+    },
+    {
+      "journey_id": "journey.accessible_operator_day",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.12",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Record assistive technology, OS, app, renderer, display, target, and scenario identity."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Start the exact native candidate with the declared accessibility corpus, keyboard configuration, VoiceOver, reduced-motion, low-vision, IME, display, and zoom settings."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Complete project, tab, split, pane, command palette, dialog, approval, search, scroll, resize, zoom, display migration, IME, and recovery tasks without pointer dependence.", "Exercise names, roles, values, ordering, announcements, geometry, focus, contrast, cursor, selection, and policy feedback."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Apply output bursts, alert churn, resize storms, connection loss, denied policy, and component recovery while assistive features remain active."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Restore a stable logical focus, correct VoiceOver geometry and ordering, readable final presentation, and equivalent recovery actions without pointer-only steps."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Return settings and focus safely, record human-locked observations where required, and retain redacted deterministic and review artifacts."]}
+      }
+    },
+    {
+      "journey_id": "journey.field_lag_diagnosis",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.13",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["State candidate causes, confidence, falsifiers, and missing measurements before collection."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Start from a real lag report and bind the exact candidate, target, topology, route, pane class, renderer, display, workload, time window, privacy authority, and evidence budget."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Collect bounded native input, mux, PTY, application, transport, render, presentation, queue, resource, and workload signals while preserving operator usability.", "Correlate measurements without retaining raw key or pane content by default."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Exercise unavailable probes, sampling overhead, gaps, clock uncertainty, stale identity, collection failure, and contradictory signals."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Reduce collection safely, seal a redacted portable bundle, replay the admissible portions on the named target, update causal candidates, and identify a safe next action."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Expire temporary authority, remove transient collection state by the supported retention path, and retain hashes, receipts, uncertainty, and handoff status."]}
+      }
+    },
+    {
+      "journey_id": "journey.version_pinned_agent_dogfood",
+      "field_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.11.14",
+      "lifecycle": {
+        "identity_preflight": {"contract_role": "identity_preflight", "steps": ["Separate real-agent runs from simulated or replayed fixtures."]},
+        "clean_setup": {"contract_role": "clean_setup", "steps": ["Pin the exact FrankenTerm candidate, supported agent products and versions, model or profile identity, authentication posture, policy, project fixture, pane manifest, topology, and target."]},
+        "steady_work": {"contract_role": "steady_work", "steps": ["Run representative coding, review, tool use, approval, search, compaction, rate limit, cancellation, pane navigation, Robot or MCP supervision, resize, and zoom workflows.", "Observe human and machine outcomes without assuming equivalent behavior among agent products."]},
+        "failure_overload": {"contract_role": "failure_overload", "steps": ["Exercise agent rate limits, compaction, prompts, tool denial, malformed or delayed output, restart, network interruption, and version drift."]},
+        "recovery_convergence": {"contract_role": "recovery_convergence", "steps": ["Detect exact agent state, preserve policy and pending intent, resume or refuse safely, and avoid duplicate submissions or cross-agent inference."]},
+        "teardown_outcome": {"contract_role": "teardown_outcome", "steps": ["Stop agents, revoke transient authority, retain version and outcome receipts, and separate content-free diagnostics from any explicitly authorized samples."]}
+      }
+    }
+  ],
+  "closure_consumers": [
+    {"claim_id": "claim.interactive_human.local_only.q002", "coverage": {"persona": "interactive_human", "fleet_point": "q002", "topology": "local_only"}, "journey_ids": ["journey.clean_mac_first_hour", "journey.two_agent_everyday", "journey.accessible_operator_day", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.interactive_human.local_only.q020", "coverage": {"persona": "interactive_human", "fleet_point": "q020", "topology": "local_only"}, "journey_ids": ["journey.twenty_pane_daily", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.accessible_operator_day", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.interactive_human.local_only.q050", "coverage": {"persona": "interactive_human", "fleet_point": "q050", "topology": "local_only"}, "journey_ids": ["journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.accessible_operator_day", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.interactive_human.local_only.q200", "coverage": {"persona": "interactive_human", "fleet_point": "q200", "topology": "local_only"}, "journey_ids": ["journey.two_hundred_pane_mission", "journey.concurrent_maintenance", "journey.component_crash_recovery", "journey.accessible_operator_day", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.interactive_human.mac_lan_remote.q002", "coverage": {"persona": "interactive_human", "fleet_point": "q002", "topology": "mac_lan_remote"}, "journey_ids": ["journey.two_agent_everyday", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.accessible_operator_day", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.interactive_human.mac_lan_remote.q020", "coverage": {"persona": "interactive_human", "fleet_point": "q020", "topology": "mac_lan_remote"}, "journey_ids": ["journey.twenty_pane_daily", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.accessible_operator_day", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.interactive_human.mac_lan_remote.q050", "coverage": {"persona": "interactive_human", "fleet_point": "q050", "topology": "mac_lan_remote"}, "journey_ids": ["journey.fifty_pane_mac_trj", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.accessible_operator_day", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.interactive_human.mac_lan_remote.q200", "coverage": {"persona": "interactive_human", "fleet_point": "q200", "topology": "mac_lan_remote"}, "journey_ids": ["journey.two_hundred_pane_mission", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.accessible_operator_day", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.meta_agent_operator.local_only.q002", "coverage": {"persona": "meta_agent_operator", "fleet_point": "q002", "topology": "local_only"}, "journey_ids": ["journey.clean_mac_first_hour", "journey.two_agent_everyday", "journey.attention_and_verified_submit", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.meta_agent_operator.local_only.q020", "coverage": {"persona": "meta_agent_operator", "fleet_point": "q020", "topology": "local_only"}, "journey_ids": ["journey.twenty_pane_daily", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.meta_agent_operator.local_only.q050", "coverage": {"persona": "meta_agent_operator", "fleet_point": "q050", "topology": "local_only"}, "journey_ids": ["journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.meta_agent_operator.local_only.q200", "coverage": {"persona": "meta_agent_operator", "fleet_point": "q200", "topology": "local_only"}, "journey_ids": ["journey.two_hundred_pane_mission", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.meta_agent_operator.mac_lan_remote.q002", "coverage": {"persona": "meta_agent_operator", "fleet_point": "q002", "topology": "mac_lan_remote"}, "journey_ids": ["journey.two_agent_everyday", "journey.attention_and_verified_submit", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.meta_agent_operator.mac_lan_remote.q020", "coverage": {"persona": "meta_agent_operator", "fleet_point": "q020", "topology": "mac_lan_remote"}, "journey_ids": ["journey.twenty_pane_daily", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.meta_agent_operator.mac_lan_remote.q050", "coverage": {"persona": "meta_agent_operator", "fleet_point": "q050", "topology": "mac_lan_remote"}, "journey_ids": ["journey.fifty_pane_mac_trj", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.meta_agent_operator.mac_lan_remote.q200", "coverage": {"persona": "meta_agent_operator", "fleet_point": "q200", "topology": "mac_lan_remote"}, "journey_ids": ["journey.two_hundred_pane_mission", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.automation_agent.local_only.q002", "coverage": {"persona": "automation_agent", "fleet_point": "q002", "topology": "local_only"}, "journey_ids": ["journey.clean_mac_first_hour", "journey.two_agent_everyday", "journey.attention_and_verified_submit", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.automation_agent.local_only.q020", "coverage": {"persona": "automation_agent", "fleet_point": "q020", "topology": "local_only"}, "journey_ids": ["journey.twenty_pane_daily", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.automation_agent.local_only.q050", "coverage": {"persona": "automation_agent", "fleet_point": "q050", "topology": "local_only"}, "journey_ids": ["journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.automation_agent.local_only.q200", "coverage": {"persona": "automation_agent", "fleet_point": "q200", "topology": "local_only"}, "journey_ids": ["journey.two_hundred_pane_mission", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.automation_agent.mac_lan_remote.q002", "coverage": {"persona": "automation_agent", "fleet_point": "q002", "topology": "mac_lan_remote"}, "journey_ids": ["journey.two_agent_everyday", "journey.attention_and_verified_submit", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.automation_agent.mac_lan_remote.q020", "coverage": {"persona": "automation_agent", "fleet_point": "q020", "topology": "mac_lan_remote"}, "journey_ids": ["journey.twenty_pane_daily", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.automation_agent.mac_lan_remote.q050", "coverage": {"persona": "automation_agent", "fleet_point": "q050", "topology": "mac_lan_remote"}, "journey_ids": ["journey.fifty_pane_mac_trj", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.automation_agent.mac_lan_remote.q200", "coverage": {"persona": "automation_agent", "fleet_point": "q200", "topology": "mac_lan_remote"}, "journey_ids": ["journey.two_hundred_pane_mission", "journey.attention_and_verified_submit", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis", "journey.version_pinned_agent_dogfood"]},
+    {"claim_id": "claim.incident_responder.local_only.q002", "coverage": {"persona": "incident_responder", "fleet_point": "q002", "topology": "local_only"}, "journey_ids": ["journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis"]},
+    {"claim_id": "claim.incident_responder.local_only.q020", "coverage": {"persona": "incident_responder", "fleet_point": "q020", "topology": "local_only"}, "journey_ids": ["journey.twenty_pane_daily", "journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis"]},
+    {"claim_id": "claim.incident_responder.local_only.q050", "coverage": {"persona": "incident_responder", "fleet_point": "q050", "topology": "local_only"}, "journey_ids": ["journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis"]},
+    {"claim_id": "claim.incident_responder.local_only.q200", "coverage": {"persona": "incident_responder", "fleet_point": "q200", "topology": "local_only"}, "journey_ids": ["journey.two_hundred_pane_mission", "journey.concurrent_maintenance", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis"]},
+    {"claim_id": "claim.incident_responder.mac_lan_remote.q002", "coverage": {"persona": "incident_responder", "fleet_point": "q002", "topology": "mac_lan_remote"}, "journey_ids": ["journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis"]},
+    {"claim_id": "claim.incident_responder.mac_lan_remote.q020", "coverage": {"persona": "incident_responder", "fleet_point": "q020", "topology": "mac_lan_remote"}, "journey_ids": ["journey.twenty_pane_daily", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis"]},
+    {"claim_id": "claim.incident_responder.mac_lan_remote.q050", "coverage": {"persona": "incident_responder", "fleet_point": "q050", "topology": "mac_lan_remote"}, "journey_ids": ["journey.fifty_pane_mac_trj", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis"]},
+    {"claim_id": "claim.incident_responder.mac_lan_remote.q200", "coverage": {"persona": "incident_responder", "fleet_point": "q200", "topology": "mac_lan_remote"}, "journey_ids": ["journey.two_hundred_pane_mission", "journey.concurrent_maintenance", "journey.remote_unavailable_recovery", "journey.route_roam_sleep_wake", "journey.live_update_rollback", "journey.component_crash_recovery", "journey.field_lag_diagnosis"]}
+  ]
+}

@@ -103,6 +103,23 @@ pub const REQUIRED_COVERAGE_CELL_COUNT: usize = 32;
 /// Number of exact field journeys governed by the catalog.
 pub const REQUIRED_FIELD_JOURNEY_COUNT: usize = 14;
 
+/// Breaking successor contract for typed six-phase journey lifecycles.
+pub const PRODUCT_JOURNEY_CONTRACT_ID_V2: &str = "ft.product_journey_catalog.v2";
+
+/// Schema version for the typed six-phase lifecycle migration contract.
+pub const PRODUCT_JOURNEY_SCHEMA_VERSION_V2: u32 = 2;
+
+/// Bead that owns the breaking lifecycle migration.
+pub const PRODUCT_JOURNEY_LIFECYCLE_SOURCE_BEAD_ID_V2: &str =
+    "ft-interactive-swarm-product-convergence-7xqz4.1.1.3";
+
+/// Exact signed v1 head whose positional lifecycle semantics remain unproved.
+pub const PRODUCT_JOURNEY_V1_PREDECESSOR_RAW_SHA256: &str =
+    "dd3b8a2bdd73c369152b291775205bbfc0bc1a0c9d41bf1bd091b53807408a54";
+
+/// Number of typed lifecycle roles required for every v2 journey.
+pub const REQUIRED_LIFECYCLE_PHASE_COUNT_V2: usize = 6;
+
 /// Whether the catalog is still a contract or is bound to qualifying evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -663,6 +680,300 @@ pub struct JourneyDefinition {
     pub gate_ids: Vec<String>,
 }
 
+/// Explicit statement about the evidentiary value of v1 positional lifecycle fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyPositionalLifecycleSemanticsV2 {
+    /// V1 string positions cannot be promoted into typed lifecycle proof.
+    Unproved,
+}
+
+/// Closed lifecycle roles used by the breaking v2 contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JourneyLifecycleRoleV2 {
+    /// Bind candidate, target, route, topology, and workload identities before mutation.
+    IdentityPreflight,
+    /// Establish a clean baseline only after identity preflight succeeds.
+    CleanSetup,
+    /// Exercise the intended user or machine workflow.
+    SteadyWork,
+    /// Introduce the declared failure, pressure, or overload condition.
+    FailureOverload,
+    /// Recover and converge authoritative user intent after the observed failure.
+    RecoveryConvergence,
+    /// Release resources and retain a final outcome.
+    TeardownOutcome,
+}
+
+impl JourneyLifecycleRoleV2 {
+    /// Every role, in lifecycle order.
+    pub const ALL: [Self; REQUIRED_LIFECYCLE_PHASE_COUNT_V2] = [
+        Self::IdentityPreflight,
+        Self::CleanSetup,
+        Self::SteadyWork,
+        Self::FailureOverload,
+        Self::RecoveryConvergence,
+        Self::TeardownOutcome,
+    ];
+
+    /// Stable serialized field label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdentityPreflight => "identity_preflight",
+            Self::CleanSetup => "clean_setup",
+            Self::SteadyWork => "steady_work",
+            Self::FailureOverload => "failure_overload",
+            Self::RecoveryConvergence => "recovery_convergence",
+            Self::TeardownOutcome => "teardown_outcome",
+        }
+    }
+}
+
+/// Identity domains that a lifecycle phase must bind explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JourneyIdentityRequirementV2 {
+    /// Exact packaged candidate or component build identity.
+    ExactCandidate,
+    /// Exact controller target and operating-system identity.
+    ControllerTarget,
+    /// Exact session-host target and operating-system identity.
+    SessionHostTarget,
+    /// Exact topology and transport identity.
+    TopologyTransport,
+    /// Exact route or local endpoint identity.
+    Route,
+    /// Exact mux server, domain, and session generation.
+    MuxSession,
+    /// Exact pane inventory and fleet qualification point.
+    PaneFleet,
+    /// Exact renderer and display identity when presentation is in scope.
+    RendererDisplay,
+    /// Exact configuration, policy, and authority posture.
+    ConfigurationPolicy,
+    /// Exact workload and actor versions or deterministic fixture identities.
+    WorkloadActors,
+}
+
+/// Preconditions that order the six lifecycle phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JourneyPhasePreconditionV2 {
+    /// No product or workload mutation has occurred yet.
+    UnmodifiedStartingState,
+    /// Identity preflight completed successfully.
+    IdentityPreflightPassed,
+    /// Clean setup completed successfully.
+    CleanSetupComplete,
+    /// Steady work has begun and the system is observable.
+    SteadyWorkStarted,
+    /// The declared failure or overload was actually observed.
+    FailureOverloadObserved,
+    /// Recovery was attempted and its terminal state is known.
+    RecoveryAttempted,
+}
+
+/// Mutation classes permitted within one lifecycle role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JourneyMutationClassV2 {
+    /// Establish the declared clean baseline.
+    CleanSetup,
+    /// Perform intended user or machine work.
+    UserWork,
+    /// Inject or induce the declared failure/pressure condition.
+    FaultOrOverloadInjection,
+    /// Apply a recovery or convergence action.
+    RecoveryAction,
+    /// Release resources and close authority.
+    ResourceRelease,
+}
+
+/// Required terminal outcomes for a lifecycle role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JourneyPhaseOutcomeV2 {
+    /// Every required identity was bound before mutation.
+    IdentityBound,
+    /// A declared clean baseline is ready.
+    CleanBaselineReady,
+    /// Intended steady work reached its declared terminal boundary.
+    SteadyWorkCompleted,
+    /// The declared failure or overload was observed rather than inferred.
+    FailureObserved,
+    /// Authoritative user intent and product state converged.
+    AuthoritativeStateConverged,
+    /// Resources and transient authority were released.
+    ResourcesReleased,
+    /// A final success, degraded, failed, cancelled, or indeterminate outcome was retained.
+    FinalOutcomeRecorded,
+}
+
+/// Evidence classes retained by one lifecycle role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JourneyPhaseEvidenceV2 {
+    /// Candidate, target, topology, route, and workload identity receipt.
+    IdentityReceipt,
+    /// Clean-setup and precondition receipt.
+    SetupReceipt,
+    /// Intended-work and user-outcome receipt.
+    WorkReceipt,
+    /// Failure-injection and observed-failure receipt.
+    FailureReceipt,
+    /// Recovery and convergence receipt.
+    ConvergenceReceipt,
+    /// Cleanup, final-state, and terminal-outcome receipt.
+    TeardownReceipt,
+}
+
+/// Cancellation semantics frozen for each lifecycle role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JourneyCancellationSemanticsV2 {
+    /// Stop before any product or workload mutation.
+    AbortBeforeMutation,
+    /// Roll back or retain an explicit resumable setup receipt.
+    RollbackOrResumeSetup,
+    /// Preserve acknowledged user intent and expose the cancellation boundary.
+    PreserveUserIntent,
+    /// Preserve already-observed failure evidence without inventing recovery.
+    PreserveFailureEvidence,
+    /// Retain a retryable recovery checkpoint and exact pending intent.
+    CheckpointRetryableRecovery,
+    /// Cleanup remains required and incomplete cleanup is reported explicitly.
+    CleanupRemainsRequired,
+}
+
+/// Failure semantics frozen for each lifecycle role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JourneyFailureSemanticsV2 {
+    /// Identity uncertainty stops the journey before mutation.
+    StopBeforeMutation,
+    /// Setup failure is explicit and cannot masquerade as a clean baseline.
+    SetupFailureIsExplicit,
+    /// Steady-work failure is explicit and cannot be promoted as completion.
+    WorkFailureIsExplicit,
+    /// The injected failure is test input; inability to observe it fails the phase.
+    FailureIsTestInput,
+    /// Failure to converge is a terminal journey failure or typed degraded outcome.
+    NonConvergenceIsFailure,
+    /// Incomplete cleanup or missing final outcome fails teardown.
+    IncompleteTeardownIsFailure,
+}
+
+/// Canonical semantic contract referenced by every journey phase of one role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JourneyLifecyclePhaseContractV2 {
+    /// Lifecycle role governed by this contract.
+    pub role: JourneyLifecycleRoleV2,
+    /// Identity domains that must be bound for this role.
+    pub required_identities: Vec<JourneyIdentityRequirementV2>,
+    /// Preconditions that must be established before this role begins.
+    pub required_preconditions: Vec<JourneyPhasePreconditionV2>,
+    /// Mutation classes permitted in this role; empty for identity preflight.
+    pub allowed_mutations: Vec<JourneyMutationClassV2>,
+    /// Outcomes that must be observed before the role completes.
+    pub required_outcomes: Vec<JourneyPhaseOutcomeV2>,
+    /// Evidence classes required from this role.
+    pub required_evidence: Vec<JourneyPhaseEvidenceV2>,
+    /// Cancellation behavior for this role.
+    pub cancellation: JourneyCancellationSemanticsV2,
+    /// Failure behavior for this role.
+    pub failure_semantics: JourneyFailureSemanticsV2,
+}
+
+/// One explicitly typed journey phase bound to a canonical role contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JourneyLifecyclePhaseV2 {
+    /// Role contract that governs these journey-specific steps.
+    pub contract_role: JourneyLifecycleRoleV2,
+    /// Non-empty journey-specific actions and assertions for this role.
+    pub steps: Vec<String>,
+}
+
+/// Six explicit lifecycle fields for one v2 journey producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JourneyLifecycleV2 {
+    /// Pre-mutation identity and authority binding.
+    pub identity_preflight: JourneyLifecyclePhaseV2,
+    /// Clean baseline establishment.
+    pub clean_setup: JourneyLifecyclePhaseV2,
+    /// Intended workflow execution.
+    pub steady_work: JourneyLifecyclePhaseV2,
+    /// Failure and overload exercise.
+    pub failure_overload: JourneyLifecyclePhaseV2,
+    /// Recovery and authoritative convergence.
+    pub recovery_convergence: JourneyLifecyclePhaseV2,
+    /// Cleanup and retained final outcome.
+    pub teardown_outcome: JourneyLifecyclePhaseV2,
+}
+
+/// Explicit migration record for one of the fourteen field-journey producers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JourneyLifecycleProducerV2 {
+    /// Stable journey identifier retained from the signed v1 head.
+    pub journey_id: String,
+    /// Exact field-journey Bead that owns this producer.
+    pub field_bead_id: String,
+    /// Complete typed six-phase lifecycle.
+    pub lifecycle: JourneyLifecycleV2,
+}
+
+/// Explicit v2 migration record for one of the 32 release-closure consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JourneyClosureConsumerV2 {
+    /// Stable claim identifier retained from the signed v1 head.
+    pub claim_id: String,
+    /// Exact persona/fleet/topology cell consumed at release closure.
+    pub coverage: CoverageKey,
+    /// Explicit typed journey producers required by this cell.
+    pub journey_ids: Vec<String>,
+}
+
+/// Breaking v2 migration catalog for typed journey lifecycles.
+///
+/// This contract deliberately does not deserialize or upgrade v1 positional
+/// lifecycle arrays. It binds the signed v1 inventory by digest, marks its
+/// positional meaning unproved, and requires all fourteen producers and all
+/// thirty-two closure consumers to be restated explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductJourneyCatalogV2 {
+    /// Must equal [`PRODUCT_JOURNEY_CONTRACT_ID_V2`].
+    pub contract_id: String,
+    /// Must equal [`PRODUCT_JOURNEY_SCHEMA_VERSION_V2`].
+    pub schema_version: u32,
+    /// Content revision of this unsigned migration contract.
+    pub catalog_revision: String,
+    /// Bead that owns the breaking lifecycle migration.
+    pub source_bead_id: String,
+    /// V2 remains a contract and cannot mint product support.
+    pub catalog_claim_state: CatalogClaimState,
+    /// Historical v1 contract identifier; never treated as v2 data.
+    pub predecessor_contract_id: String,
+    /// Exact signed v1 head revision.
+    pub predecessor_catalog_revision: String,
+    /// Exact raw SHA-256 of the signed v1 head.
+    pub predecessor_raw_sha256: String,
+    /// Mandatory negative-evidence statement about v1 positions.
+    pub v1_positional_lifecycle_semantics: LegacyPositionalLifecycleSemanticsV2,
+    /// Canonical closed contracts for all six phase roles.
+    pub phase_contracts: Vec<JourneyLifecyclePhaseContractV2>,
+    /// Explicitly migrated fourteen journey producers.
+    pub journey_producers: Vec<JourneyLifecycleProducerV2>,
+    /// Explicitly migrated thirty-two release-closure consumers.
+    pub closure_consumers: Vec<JourneyClosureConsumerV2>,
+}
+
 /// The exact composite key for a promised catalog coverage cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1086,6 +1397,19 @@ impl ProductJourneyCatalog {
     }
 }
 
+impl ProductJourneyCatalogV2 {
+    /// Decode one bounded v2 migration catalog without accepting v1 data.
+    pub fn decode_json_bounded(raw: &[u8]) -> Result<Self, ProductJourneyDecodeError> {
+        decode_product_journey_catalog_v2(raw)
+    }
+
+    /// Validate the breaking lifecycle migration without file I/O.
+    #[must_use]
+    pub fn validate(&self) -> CatalogValidationReport {
+        validate_product_journey_catalog_v2(self)
+    }
+}
+
 /// Stable bounded-decoder failure category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1184,6 +1508,34 @@ pub fn decode_product_journey_catalog(
 
     let mut decoder = serde_json::Deserializer::from_slice(raw);
     let catalog = ProductJourneyCatalog::deserialize(&mut decoder).map_err(|error| {
+        ProductJourneyDecodeError::InvalidJson {
+            detail: error.to_string(),
+        }
+    })?;
+    decoder
+        .end()
+        .map_err(|error| ProductJourneyDecodeError::TrailingData {
+            detail: error.to_string(),
+        })?;
+    Ok(catalog)
+}
+
+/// Decode one bounded, closed-shape v2 lifecycle-migration catalog.
+///
+/// This entry point accepts only [`ProductJourneyCatalogV2`]. In particular,
+/// there is no fallback decoder or conversion from v1 positional arrays.
+pub fn decode_product_journey_catalog_v2(
+    raw: &[u8],
+) -> Result<ProductJourneyCatalogV2, ProductJourneyDecodeError> {
+    if raw.len() > MAX_PRODUCT_JOURNEY_CATALOG_BYTES {
+        return Err(ProductJourneyDecodeError::PayloadTooLarge {
+            actual_bytes: raw.len(),
+            max_bytes: MAX_PRODUCT_JOURNEY_CATALOG_BYTES,
+        });
+    }
+
+    let mut decoder = serde_json::Deserializer::from_slice(raw);
+    let catalog = ProductJourneyCatalogV2::deserialize(&mut decoder).map_err(|error| {
         ProductJourneyDecodeError::InvalidJson {
             detail: error.to_string(),
         }
@@ -1991,6 +2343,20 @@ pub enum CatalogValidationCode {
     DanglingReference,
     /// A required materialized lifecycle phase is empty.
     EmptyLifecyclePhase,
+    /// A v2 phase contract differs from its closed role semantics.
+    InvalidLifecycleContract,
+    /// A journey phase is bound to the wrong explicit role.
+    SwappedLifecyclePhase,
+    /// Lifecycle steps or roles were duplicated or collapsed.
+    DuplicateLifecyclePhase,
+    /// Identity preflight permits or follows a product mutation.
+    PostMutationPreflight,
+    /// Recovery is not causally preceded by an observed failure/overload.
+    RecoveryWithoutFailure,
+    /// Teardown does not retain resource-release and final-outcome authority.
+    TeardownWithoutOutcome,
+    /// The v2 producer/consumer migration is incomplete or changes v1 identity.
+    InvalidLifecycleMigration,
     /// Support, evidence, run verdict, or availability disagree.
     ContradictoryClaim,
     /// A contract-only catalog attempted to declare support.
@@ -2029,6 +2395,13 @@ impl CatalogValidationCode {
             Self::MissingRequiredCoverage => "PJC-COVERAGE-001",
             Self::DanglingReference => "PJC-REFERENCE-001",
             Self::EmptyLifecyclePhase => "PJC-LIFECYCLE-001",
+            Self::InvalidLifecycleContract => "PJC-LIFECYCLE-002",
+            Self::SwappedLifecyclePhase => "PJC-LIFECYCLE-003",
+            Self::DuplicateLifecyclePhase => "PJC-LIFECYCLE-004",
+            Self::PostMutationPreflight => "PJC-LIFECYCLE-005",
+            Self::RecoveryWithoutFailure => "PJC-LIFECYCLE-006",
+            Self::TeardownWithoutOutcome => "PJC-LIFECYCLE-007",
+            Self::InvalidLifecycleMigration => "PJC-LIFECYCLE-008",
             Self::ContradictoryClaim => "PJC-CLAIM-001",
             Self::ContractOnlySupportedClaim => "PJC-CLAIM-002",
             Self::UnsupportedClaimAuthority => "PJC-AUTHORITY-001",
@@ -2227,6 +2600,556 @@ pub fn validate_product_journey_catalog(
     CatalogValidationReport {
         valid: validator.errors.is_empty(),
         errors: validator.errors,
+    }
+}
+
+/// Validate the breaking v2 typed-lifecycle migration without performing I/O.
+#[must_use]
+pub fn validate_product_journey_catalog_v2(
+    catalog: &ProductJourneyCatalogV2,
+) -> CatalogValidationReport {
+    let mut validator = ValidatorState::new();
+
+    if catalog.contract_id != PRODUCT_JOURNEY_CONTRACT_ID_V2 {
+        validator.error(
+            CatalogValidationCode::UnknownContract,
+            "contract_id",
+            format!(
+                "expected `{PRODUCT_JOURNEY_CONTRACT_ID_V2}`, got `{}`",
+                catalog.contract_id
+            ),
+        );
+    }
+    if catalog.schema_version != PRODUCT_JOURNEY_SCHEMA_VERSION_V2 {
+        validator.error(
+            CatalogValidationCode::UnknownSchemaVersion,
+            "schema_version",
+            format!(
+                "expected schema version {PRODUCT_JOURNEY_SCHEMA_VERSION_V2}, got {}",
+                catalog.schema_version
+            ),
+        );
+    }
+    validator.require_text("catalog_revision", &catalog.catalog_revision);
+    if catalog_revision_sort_key(&catalog.catalog_revision).is_none() {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleMigration,
+            "catalog_revision",
+            "v2 catalog revision must be a canonical Gregorian YYYY-MM-DD.N successor label",
+        );
+    }
+    if catalog.source_bead_id != PRODUCT_JOURNEY_LIFECYCLE_SOURCE_BEAD_ID_V2 {
+        validator.error(
+            CatalogValidationCode::MalformedReference,
+            "source_bead_id",
+            format!("v2 lifecycle source must be `{PRODUCT_JOURNEY_LIFECYCLE_SOURCE_BEAD_ID_V2}`"),
+        );
+    }
+    if catalog.catalog_claim_state != CatalogClaimState::ContractOnly {
+        validator.error(
+            CatalogValidationCode::UnsupportedClaimAuthority,
+            "catalog_claim_state",
+            "v2 typed lifecycle metadata is contract-only and cannot mint product support",
+        );
+    }
+    if catalog.predecessor_contract_id != PRODUCT_JOURNEY_CONTRACT_ID
+        || catalog.predecessor_catalog_revision != PRODUCT_JOURNEY_LINEAGE_CURRENT_REVISION
+        || catalog.predecessor_raw_sha256 != PRODUCT_JOURNEY_V1_PREDECESSOR_RAW_SHA256
+        || catalog.v1_positional_lifecycle_semantics
+            != LegacyPositionalLifecycleSemanticsV2::Unproved
+    {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleMigration,
+            "predecessor",
+            "v2 must bind the exact signed v1 head and mark its positional lifecycle semantics unproved",
+        );
+    }
+    validator.require_hex_digest(
+        CatalogValidationCode::InvalidLifecycleMigration,
+        "predecessor_raw_sha256",
+        &catalog.predecessor_raw_sha256,
+        64,
+        "v1 predecessor raw SHA-256",
+    );
+
+    validate_phase_contracts_v2(catalog, &mut validator);
+    let producer_ids = validate_journey_producers_v2(catalog, &mut validator);
+    validate_closure_consumers_v2(catalog, &producer_ids, &mut validator);
+
+    CatalogValidationReport {
+        valid: validator.errors.is_empty(),
+        errors: validator.errors,
+    }
+}
+
+fn canonical_phase_contract_v2(role: JourneyLifecycleRoleV2) -> JourneyLifecyclePhaseContractV2 {
+    use JourneyCancellationSemanticsV2 as Cancellation;
+    use JourneyFailureSemanticsV2 as Failure;
+    use JourneyIdentityRequirementV2 as Identity;
+    use JourneyMutationClassV2 as Mutation;
+    use JourneyPhaseEvidenceV2 as Evidence;
+    use JourneyPhaseOutcomeV2 as Outcome;
+    use JourneyPhasePreconditionV2 as Precondition;
+
+    match role {
+        JourneyLifecycleRoleV2::IdentityPreflight => JourneyLifecyclePhaseContractV2 {
+            role,
+            required_identities: vec![
+                Identity::ExactCandidate,
+                Identity::ControllerTarget,
+                Identity::SessionHostTarget,
+                Identity::TopologyTransport,
+                Identity::Route,
+                Identity::MuxSession,
+                Identity::PaneFleet,
+                Identity::RendererDisplay,
+                Identity::ConfigurationPolicy,
+                Identity::WorkloadActors,
+            ],
+            required_preconditions: vec![Precondition::UnmodifiedStartingState],
+            allowed_mutations: Vec::new(),
+            required_outcomes: vec![Outcome::IdentityBound],
+            required_evidence: vec![Evidence::IdentityReceipt],
+            cancellation: Cancellation::AbortBeforeMutation,
+            failure_semantics: Failure::StopBeforeMutation,
+        },
+        JourneyLifecycleRoleV2::CleanSetup => JourneyLifecyclePhaseContractV2 {
+            role,
+            required_identities: vec![
+                Identity::ExactCandidate,
+                Identity::TopologyTransport,
+                Identity::MuxSession,
+                Identity::ConfigurationPolicy,
+            ],
+            required_preconditions: vec![Precondition::IdentityPreflightPassed],
+            allowed_mutations: vec![Mutation::CleanSetup],
+            required_outcomes: vec![Outcome::CleanBaselineReady],
+            required_evidence: vec![Evidence::SetupReceipt],
+            cancellation: Cancellation::RollbackOrResumeSetup,
+            failure_semantics: Failure::SetupFailureIsExplicit,
+        },
+        JourneyLifecycleRoleV2::SteadyWork => JourneyLifecyclePhaseContractV2 {
+            role,
+            required_identities: vec![
+                Identity::ExactCandidate,
+                Identity::MuxSession,
+                Identity::PaneFleet,
+                Identity::WorkloadActors,
+            ],
+            required_preconditions: vec![Precondition::CleanSetupComplete],
+            allowed_mutations: vec![Mutation::UserWork],
+            required_outcomes: vec![Outcome::SteadyWorkCompleted],
+            required_evidence: vec![Evidence::WorkReceipt],
+            cancellation: Cancellation::PreserveUserIntent,
+            failure_semantics: Failure::WorkFailureIsExplicit,
+        },
+        JourneyLifecycleRoleV2::FailureOverload => JourneyLifecyclePhaseContractV2 {
+            role,
+            required_identities: vec![
+                Identity::ExactCandidate,
+                Identity::Route,
+                Identity::MuxSession,
+                Identity::PaneFleet,
+            ],
+            required_preconditions: vec![Precondition::SteadyWorkStarted],
+            allowed_mutations: vec![Mutation::FaultOrOverloadInjection],
+            required_outcomes: vec![Outcome::FailureObserved],
+            required_evidence: vec![Evidence::FailureReceipt],
+            cancellation: Cancellation::PreserveFailureEvidence,
+            failure_semantics: Failure::FailureIsTestInput,
+        },
+        JourneyLifecycleRoleV2::RecoveryConvergence => JourneyLifecyclePhaseContractV2 {
+            role,
+            required_identities: vec![
+                Identity::ExactCandidate,
+                Identity::Route,
+                Identity::MuxSession,
+                Identity::PaneFleet,
+            ],
+            required_preconditions: vec![Precondition::FailureOverloadObserved],
+            allowed_mutations: vec![Mutation::RecoveryAction],
+            required_outcomes: vec![Outcome::AuthoritativeStateConverged],
+            required_evidence: vec![Evidence::ConvergenceReceipt],
+            cancellation: Cancellation::CheckpointRetryableRecovery,
+            failure_semantics: Failure::NonConvergenceIsFailure,
+        },
+        JourneyLifecycleRoleV2::TeardownOutcome => JourneyLifecyclePhaseContractV2 {
+            role,
+            required_identities: vec![
+                Identity::ExactCandidate,
+                Identity::MuxSession,
+                Identity::PaneFleet,
+            ],
+            required_preconditions: vec![Precondition::RecoveryAttempted],
+            allowed_mutations: vec![Mutation::ResourceRelease],
+            required_outcomes: vec![Outcome::ResourcesReleased, Outcome::FinalOutcomeRecorded],
+            required_evidence: vec![Evidence::TeardownReceipt],
+            cancellation: Cancellation::CleanupRemainsRequired,
+            failure_semantics: Failure::IncompleteTeardownIsFailure,
+        },
+    }
+}
+
+fn validate_unique_phase_contract_values<T: Ord>(
+    validator: &mut ValidatorState,
+    path: &str,
+    values: &[T],
+) {
+    if values.len() != values.iter().collect::<BTreeSet<_>>().len() {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleContract,
+            path,
+            "phase contract collections must not contain duplicate semantic requirements",
+        );
+    }
+}
+
+fn validate_phase_contracts_v2(catalog: &ProductJourneyCatalogV2, validator: &mut ValidatorState) {
+    if catalog.phase_contracts.len() != REQUIRED_LIFECYCLE_PHASE_COUNT_V2 {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleContract,
+            "phase_contracts",
+            format!("v2 requires exactly {REQUIRED_LIFECYCLE_PHASE_COUNT_V2} phase contracts"),
+        );
+    }
+
+    let mut roles = BTreeSet::new();
+    for (index, contract) in catalog.phase_contracts.iter().enumerate() {
+        let path = format!("phase_contracts[{index}]");
+        if !roles.insert(contract.role) {
+            validator.error(
+                CatalogValidationCode::DuplicateLifecyclePhase,
+                format!("{path}.role"),
+                format!("duplicate phase role `{}`", contract.role.as_str()),
+            );
+        }
+
+        validate_unique_phase_contract_values(
+            validator,
+            &format!("{path}.required_identities"),
+            &contract.required_identities,
+        );
+        validate_unique_phase_contract_values(
+            validator,
+            &format!("{path}.required_preconditions"),
+            &contract.required_preconditions,
+        );
+        validate_unique_phase_contract_values(
+            validator,
+            &format!("{path}.allowed_mutations"),
+            &contract.allowed_mutations,
+        );
+        validate_unique_phase_contract_values(
+            validator,
+            &format!("{path}.required_outcomes"),
+            &contract.required_outcomes,
+        );
+        validate_unique_phase_contract_values(
+            validator,
+            &format!("{path}.required_evidence"),
+            &contract.required_evidence,
+        );
+
+        let expected = canonical_phase_contract_v2(contract.role);
+        if contract != &expected {
+            validator.error(
+                CatalogValidationCode::InvalidLifecycleContract,
+                path.clone(),
+                format!(
+                    "phase contract `{}` differs from its closed v2 semantics",
+                    contract.role.as_str()
+                ),
+            );
+        }
+        if contract.role == JourneyLifecycleRoleV2::IdentityPreflight
+            && (!contract.allowed_mutations.is_empty()
+                || contract.required_preconditions.as_slice()
+                    != [JourneyPhasePreconditionV2::UnmodifiedStartingState].as_slice())
+        {
+            validator.error(
+                CatalogValidationCode::PostMutationPreflight,
+                path.clone(),
+                "identity preflight must occur in an unmodified state and permit no mutation",
+            );
+        }
+        if contract.role == JourneyLifecycleRoleV2::RecoveryConvergence
+            && !contract
+                .required_preconditions
+                .contains(&JourneyPhasePreconditionV2::FailureOverloadObserved)
+        {
+            validator.error(
+                CatalogValidationCode::RecoveryWithoutFailure,
+                path.clone(),
+                "recovery_convergence requires an observed failure_overload boundary",
+            );
+        }
+        if contract.role == JourneyLifecycleRoleV2::TeardownOutcome
+            && (!contract
+                .required_outcomes
+                .contains(&JourneyPhaseOutcomeV2::ResourcesReleased)
+                || !contract
+                    .required_outcomes
+                    .contains(&JourneyPhaseOutcomeV2::FinalOutcomeRecorded))
+        {
+            validator.error(
+                CatalogValidationCode::TeardownWithoutOutcome,
+                path,
+                "teardown_outcome must release resources and retain a final outcome",
+            );
+        }
+    }
+
+    let expected = JourneyLifecycleRoleV2::ALL
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if roles != expected {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleContract,
+            "phase_contracts",
+            "phase contracts must cover each of the six roles exactly once",
+        );
+    }
+}
+
+fn lifecycle_phases_v2(
+    lifecycle: &JourneyLifecycleV2,
+) -> [(
+    &'static str,
+    JourneyLifecycleRoleV2,
+    &JourneyLifecyclePhaseV2,
+); REQUIRED_LIFECYCLE_PHASE_COUNT_V2] {
+    [
+        (
+            "identity_preflight",
+            JourneyLifecycleRoleV2::IdentityPreflight,
+            &lifecycle.identity_preflight,
+        ),
+        (
+            "clean_setup",
+            JourneyLifecycleRoleV2::CleanSetup,
+            &lifecycle.clean_setup,
+        ),
+        (
+            "steady_work",
+            JourneyLifecycleRoleV2::SteadyWork,
+            &lifecycle.steady_work,
+        ),
+        (
+            "failure_overload",
+            JourneyLifecycleRoleV2::FailureOverload,
+            &lifecycle.failure_overload,
+        ),
+        (
+            "recovery_convergence",
+            JourneyLifecycleRoleV2::RecoveryConvergence,
+            &lifecycle.recovery_convergence,
+        ),
+        (
+            "teardown_outcome",
+            JourneyLifecycleRoleV2::TeardownOutcome,
+            &lifecycle.teardown_outcome,
+        ),
+    ]
+}
+
+fn validate_journey_producers_v2(
+    catalog: &ProductJourneyCatalogV2,
+    validator: &mut ValidatorState,
+) -> BTreeSet<String> {
+    if catalog.journey_producers.len() != REQUIRED_FIELD_JOURNEY_COUNT {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleMigration,
+            "journey_producers",
+            format!("v2 requires exactly {REQUIRED_FIELD_JOURNEY_COUNT} journey producers"),
+        );
+    }
+
+    let mut journey_ids = BTreeSet::new();
+    let mut field_bead_ids = BTreeSet::new();
+    for (index, producer) in catalog.journey_producers.iter().enumerate() {
+        let path = format!("journey_producers[{index}]");
+        validator.require_text(&format!("{path}.journey_id"), &producer.journey_id);
+        validator.require_bead_refs(
+            &format!("{path}.field_bead_id"),
+            std::slice::from_ref(&producer.field_bead_id),
+            false,
+        );
+        if !journey_ids.insert(producer.journey_id.clone()) {
+            validator.error(
+                CatalogValidationCode::DuplicateId,
+                format!("{path}.journey_id"),
+                format!("duplicate migrated journey `{}`", producer.journey_id),
+            );
+        }
+        if !field_bead_ids.insert(producer.field_bead_id.clone()) {
+            validator.error(
+                CatalogValidationCode::DuplicateId,
+                format!("{path}.field_bead_id"),
+                format!("duplicate migrated field Bead `{}`", producer.field_bead_id),
+            );
+        }
+        if canonical_journey_id_for_field_bead(&producer.field_bead_id)
+            != Some(producer.journey_id.as_str())
+        {
+            validator.error(
+                CatalogValidationCode::InvalidLifecycleMigration,
+                path.clone(),
+                "v2 journey and field-Bead identities must equal the signed v1 inventory",
+            );
+        }
+
+        let mut normalized_steps = BTreeSet::new();
+        for (field, expected_role, phase) in lifecycle_phases_v2(&producer.lifecycle) {
+            let phase_path = format!("{path}.lifecycle.{field}");
+            if phase.contract_role != expected_role {
+                validator.error(
+                    CatalogValidationCode::SwappedLifecyclePhase,
+                    format!("{phase_path}.contract_role"),
+                    format!(
+                        "field `{field}` must bind role `{}`, not `{}`",
+                        expected_role.as_str(),
+                        phase.contract_role.as_str()
+                    ),
+                );
+            }
+            validator.require_text_list(&format!("{phase_path}.steps"), &phase.steps);
+            for (step_index, step) in phase.steps.iter().enumerate() {
+                let normalized = step.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !normalized.is_empty() && !normalized_steps.insert(normalized) {
+                    validator.error(
+                        CatalogValidationCode::DuplicateLifecyclePhase,
+                        format!("{phase_path}.steps[{step_index}]"),
+                        "journey lifecycle phases must not duplicate or collapse the same step",
+                    );
+                }
+            }
+        }
+    }
+
+    let expected_bindings = canonical_field_journey_bindings();
+    let expected_journeys = expected_bindings
+        .iter()
+        .map(|(_, journey_id)| (*journey_id).to_string())
+        .collect::<BTreeSet<_>>();
+    let expected_beads = expected_bindings
+        .iter()
+        .map(|(bead_id, _)| (*bead_id).to_string())
+        .collect::<BTreeSet<_>>();
+    if journey_ids != expected_journeys || field_bead_ids != expected_beads {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleMigration,
+            "journey_producers",
+            "v2 must migrate the exact fourteen signed-v1 journey/field-Bead identities",
+        );
+    }
+
+    journey_ids
+}
+
+fn claim_id_for_coverage_v2(coverage: CoverageKey) -> String {
+    format!(
+        "claim.{}.{}.{}",
+        coverage.persona.as_str(),
+        coverage.topology.as_str(),
+        coverage.fleet_point.as_str()
+    )
+}
+
+fn validate_closure_consumers_v2(
+    catalog: &ProductJourneyCatalogV2,
+    producer_ids: &BTreeSet<String>,
+    validator: &mut ValidatorState,
+) {
+    if catalog.closure_consumers.len() != REQUIRED_COVERAGE_CELL_COUNT {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleMigration,
+            "closure_consumers",
+            format!("v2 requires exactly {REQUIRED_COVERAGE_CELL_COUNT} closure consumers"),
+        );
+    }
+
+    let mut claim_ids = BTreeSet::new();
+    let mut coverage = BTreeSet::new();
+    let mut consumed_journeys = BTreeSet::new();
+    for (index, consumer) in catalog.closure_consumers.iter().enumerate() {
+        let path = format!("closure_consumers[{index}]");
+        validator.require_text(&format!("{path}.claim_id"), &consumer.claim_id);
+        if !claim_ids.insert(consumer.claim_id.clone()) {
+            validator.error(
+                CatalogValidationCode::DuplicateClaimId,
+                format!("{path}.claim_id"),
+                format!("duplicate v2 closure consumer `{}`", consumer.claim_id),
+            );
+        }
+        if consumer.claim_id != claim_id_for_coverage_v2(consumer.coverage) {
+            validator.error(
+                CatalogValidationCode::InvalidLifecycleMigration,
+                format!("{path}.claim_id"),
+                "closure claim identity must equal its explicit persona/topology/fleet coverage",
+            );
+        }
+        if !coverage.insert(consumer.coverage) {
+            validator.error(
+                CatalogValidationCode::DuplicateCompositeKey,
+                format!("{path}.coverage"),
+                format!("duplicate v2 coverage `{}`", consumer.coverage.label()),
+            );
+        }
+        if consumer.journey_ids.is_empty() {
+            validator.error(
+                CatalogValidationCode::EmptyRequiredField,
+                format!("{path}.journey_ids"),
+                "closure consumer must bind at least one typed journey producer",
+            );
+        }
+        let mut local_ids = BTreeSet::new();
+        for (journey_index, journey_id) in consumer.journey_ids.iter().enumerate() {
+            if !local_ids.insert(journey_id.clone()) {
+                validator.error(
+                    CatalogValidationCode::DuplicateId,
+                    format!("{path}.journey_ids[{journey_index}]"),
+                    format!("duplicate journey reference `{journey_id}`"),
+                );
+            }
+            if !producer_ids.contains(journey_id) {
+                validator.error(
+                    CatalogValidationCode::DanglingReference,
+                    format!("{path}.journey_ids[{journey_index}]"),
+                    format!("closure consumer references unmigrated journey `{journey_id}`"),
+                );
+            }
+            consumed_journeys.insert(journey_id.clone());
+        }
+        let actual_journeys = consumer
+            .journey_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected_journeys = canonical_variant_journeys(consumer.coverage);
+        if actual_journeys != expected_journeys
+            || actual_journeys.len() != consumer.journey_ids.len()
+        {
+            validator.error(
+                CatalogValidationCode::InvalidLifecycleMigration,
+                format!("{path}.journey_ids"),
+                "v2 closure journeys must equal the exact signed-v1 persona/fleet/topology projection without duplicates",
+            );
+        }
+    }
+
+    if coverage != expected_coverage_keys() {
+        validator.error(
+            CatalogValidationCode::MissingRequiredCoverage,
+            "closure_consumers",
+            "v2 closure consumers must materialize the exact 32 persona/fleet/topology cells",
+        );
+    }
+    if &consumed_journeys != producer_ids {
+        validator.error(
+            CatalogValidationCode::InvalidLifecycleMigration,
+            "closure_consumers",
+            "every migrated journey producer must be consumed by at least one explicit closure cell",
+        );
     }
 }
 
