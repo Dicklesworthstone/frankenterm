@@ -845,18 +845,63 @@ fn remote_origin_is_preserved_and_cross_recorder_authority_fails_closed() {
         receiver.admit_remote_trace(&receiver_producer, invalid_context),
         TraceAdmission::InvalidRemoteContext
     );
-    assert!(matches!(
+    assert_eq!(
         receiver.record(
             &receiver_producer,
             origin_token,
             &fields_for(InteractionTracePath::Keypress, 0, 2),
         ),
-        RecordOutcome::EpochMismatch { .. }
-    ));
+        RecordOutcome::WrongRecorder
+    );
     let accounting = receiver.accounting_snapshot();
     assert_eq!(accounting.trace.sampled_in, 1);
     assert_eq!(accounting.event.recorded, 1);
-    assert_eq!(accounting.event.epoch_mismatch, 1);
+    assert_eq!(accounting.event.epoch_mismatch, 0);
+}
+
+#[test]
+fn same_epoch_foreign_local_token_is_rejected_before_event_accounting() {
+    let config = RecorderConfig::new(
+        epoch(78),
+        run(79),
+        RecorderMode::Certification,
+        RecorderSamplerConfigV1::certification(),
+        1,
+        1,
+        TEST_BYTE_CEILING,
+    )
+    .expect("same-epoch token config is valid");
+    let first = FlightRecorder::new(config).expect("first recorder allocates");
+    let second = FlightRecorder::new(config).expect("second recorder allocates");
+    let first_producer = first
+        .register_producer(0)
+        .expect("first producer registers");
+    let second_producer = second
+        .register_producer(0)
+        .expect("second producer registers");
+    let first_token = match first.admit_local_trace(&first_producer, InteractionTracePath::Keypress)
+    {
+        TraceAdmission::Admitted { token, .. } => token,
+        other => panic!("first trace admission failed: {other:?}"),
+    };
+
+    assert_eq!(
+        second.record(
+            &second_producer,
+            first_token,
+            &fields_for(InteractionTracePath::Keypress, 0, 1),
+        ),
+        RecordOutcome::WrongRecorder
+    );
+    assert_eq!(second.queued_events(), 0);
+    assert_eq!(
+        second
+            .accounting_snapshot()
+            .event
+            .checked_sampled_event_attempts(),
+        Ok(0),
+        "a foreign local token is an API authority error, not an event attempt"
+    );
 }
 
 #[test]
@@ -998,7 +1043,7 @@ fn unavailable_platform_marker_stays_outside_internal_recorder_authority() {
         UnsupportedPlatformMarkerAdapter::new(MarkerUnavailableReason::PermissionDenied),
     );
     assert_eq!(
-        emitter.emit(payload),
+        emitter.emit(&payload),
         PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::PermissionDenied)
     );
     let frozen = recorder
@@ -1019,6 +1064,53 @@ fn unavailable_platform_marker_stays_outside_internal_recorder_authority() {
     assert_eq!(
         frozen.accounting().authority,
         RecorderAccountingAuthority::Exact
+    );
+}
+
+#[test]
+fn same_epoch_foreign_marker_receipt_cannot_cross_credit_an_emitter() {
+    let config = RecorderConfig::new(
+        epoch(33),
+        run(34),
+        RecorderMode::CertificationWithMarkers,
+        RecorderSamplerConfigV1::certification(),
+        1,
+        1,
+        TEST_BYTE_CEILING,
+    )
+    .expect("marker identity config is valid");
+    let recorder = FlightRecorder::new(config).expect("origin recorder allocates");
+    let foreign_recorder = FlightRecorder::new(config).expect("foreign recorder allocates");
+    let foreign_producer = foreign_recorder
+        .register_producer(0)
+        .expect("foreign producer registers");
+    let foreign_token = match foreign_recorder
+        .admit_local_trace(&foreign_producer, InteractionTracePath::Keypress)
+    {
+        TraceAdmission::Admitted { token, .. } => token,
+        other => panic!("foreign trace admission failed: {other:?}"),
+    };
+    let (_, foreign_receipt) = foreign_recorder
+        .record_and_prepare_platform_marker(
+            &foreign_producer,
+            foreign_token,
+            &fields_for(InteractionTracePath::Keypress, 0, 1),
+        )
+        .expect("foreign marker event is valid");
+    let foreign_receipt = foreign_receipt.expect("marker mode prepares a receipt");
+    let emitter = PlatformMarkerEmitter::for_recorder(
+        &recorder,
+        UnsupportedPlatformMarkerAdapter::new(MarkerUnavailableReason::PermissionDenied),
+    );
+
+    assert_eq!(
+        emitter.emit(&foreign_receipt),
+        PlatformMarkerOutcome::WrongRecorder
+    );
+    assert_eq!(
+        emitter.snapshot().accounting,
+        PlatformMarkerAccountingV1::default(),
+        "the rejected receipt must not mutate the origin recorder's marker authority"
     );
 }
 

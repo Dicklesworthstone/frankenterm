@@ -2,9 +2,10 @@
 //!
 //! Marker emission is deliberately not part of [`crate::FlightRecorder::record`].
 //! [`FlightRecorder::record_and_prepare_platform_marker`] first records an
-//! event and returns a fixed numeric payload only when that exact marker-mode
-//! recorder retained it. The caller then invokes [`PlatformMarkerEmitter::emit`]
-//! outside recorder admission. Platform tooling is an external loss domain:
+//! event and returns an exact-recorder receipt around a fixed numeric payload
+//! only when that marker-mode recorder retained it. The caller then invokes
+//! [`PlatformMarkerEmitter::emit`] outside recorder admission. Platform tooling
+//! is an external loss domain:
 //! adapters report their own acceptance and delivery authority, and ambiguity
 //! cannot strengthen the internal recorder evidence.
 
@@ -57,6 +58,27 @@ pub struct PlatformMarkerPayload {
     // recorder shard keeps each non-Send producer on one Linux builder and
     // avoids forcing every producer for one trace/span onto the same mutex.
     producer_shard_index: usize,
+}
+
+/// Exact-recorder receipt for one numeric platform marker payload.
+///
+/// The weak owner witness is never passed to a platform API. It prevents two
+/// distinct recorder allocations that happen to reuse the same public epoch
+/// identifier from cross-crediting marker attempts, while the adapter-facing
+/// payload remains fixed-size and numeric.
+#[must_use = "emit the prepared marker or explicitly discard it"]
+#[derive(Debug, Clone)]
+pub struct PreparedPlatformMarker {
+    recorder_identity: Weak<FlightRecorder>,
+    payload: PlatformMarkerPayload,
+}
+
+impl PreparedPlatformMarker {
+    /// Return the fixed numeric payload for diagnostics and target adapters.
+    #[must_use]
+    pub const fn payload(&self) -> PlatformMarkerPayload {
+        self.payload
+    }
 }
 
 impl PlatformMarkerPayload {
@@ -139,19 +161,19 @@ impl PlatformMarkerPayload {
 }
 
 impl FlightRecorder {
-    /// Record one event, then prepare a platform payload only when that exact
-    /// recorder retained it in the explicit marker-enabled epoch mode.
+    /// Record one event, then prepare an exact-recorder platform-marker receipt
+    /// only when that recorder retained it in the explicit marker-enabled mode.
     ///
     /// The platform call remains outside recorder admission: callers pass the
-    /// returned payload to [`PlatformMarkerEmitter::emit`] only after this
+    /// returned receipt to [`PlatformMarkerEmitter::emit`] only after this
     /// method returns. Ordinary modes and all non-recorded outcomes return no
-    /// payload and therefore cannot accidentally perform marker work.
+    /// receipt and therefore cannot accidentally perform marker work.
     pub fn record_and_prepare_platform_marker(
         &self,
         producer: &ProducerHandle,
         token: TraceToken,
         fields: &EventFields,
-    ) -> Result<(RecordOutcome, Option<PlatformMarkerPayload>), MarkerPayloadError> {
+    ) -> Result<(RecordOutcome, Option<PreparedPlatformMarker>), MarkerPayloadError> {
         let outcome = self.record(producer, token, fields);
         if self.config().mode() != RecorderMode::CertificationWithMarkers
             || !matches!(outcome, RecordOutcome::Recorded { .. })
@@ -164,7 +186,13 @@ impl FlightRecorder {
             token,
             fields,
         )?;
-        Ok((outcome, Some(payload)))
+        Ok((
+            outcome,
+            Some(PreparedPlatformMarker {
+                recorder_identity: self.identity.clone(),
+                payload,
+            }),
+        ))
     }
 }
 
@@ -527,6 +555,9 @@ pub enum PlatformMarkerOutcome {
     Closed,
     /// The payload belongs to a different immutable recorder epoch.
     WrongEpoch,
+    /// The payload was prepared by a different recorder allocation, even if
+    /// both allocations claim the same public epoch identifier.
+    WrongRecorder,
     Emitted {
         delivery: MarkerDeliveryAuthority,
     },
@@ -603,10 +634,14 @@ where
     }
 
     /// Attempt one marker outside the recorder admission boundary.
-    pub fn emit(&self, payload: PlatformMarkerPayload) -> PlatformMarkerOutcome {
+    pub fn emit(&self, prepared: &PreparedPlatformMarker) -> PlatformMarkerOutcome {
         if self.mode != RecorderMode::CertificationWithMarkers {
             return PlatformMarkerOutcome::NotRequested;
         }
+        if !Weak::ptr_eq(&self.recorder_identity, &prepared.recorder_identity) {
+            return PlatformMarkerOutcome::WrongRecorder;
+        }
+        let payload = prepared.payload;
         if payload.local_epoch_id() != self.epoch_id {
             return PlatformMarkerOutcome::WrongEpoch;
         }
@@ -974,7 +1009,7 @@ mod tests {
         (producer, token, fields)
     }
 
-    fn recorded_payload(recorder: &Arc<FlightRecorder>) -> PlatformMarkerPayload {
+    fn recorded_payload(recorder: &Arc<FlightRecorder>) -> PreparedPlatformMarker {
         let (producer, token, fields) = event_parts(recorder);
         let (outcome, payload) = recorder
             .record_and_prepare_platform_marker(&producer, token, &fields)
@@ -1028,8 +1063,10 @@ mod tests {
     #[test]
     fn payload_is_copyable_numeric_identity_with_static_names() {
         assert_impl_all!(PlatformMarkerPayload: Copy, Send, Sync);
+        assert_impl_all!(PreparedPlatformMarker: Clone, Send, Sync);
         let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
-        let payload = recorded_payload(&recorder);
+        let prepared = recorded_payload(&recorder);
+        let payload = prepared.payload();
         assert_eq!(payload.static_name(), KEYPRESS_STAGE_MARKER_NAME);
         assert_eq!(payload.span_id(), 17);
         assert_eq!(payload.identity_words()[3], 17);
@@ -1082,14 +1119,14 @@ mod tests {
                 )
                 .expect("ordinary-mode record path is valid");
             assert!(matches!(outcome, RecordOutcome::Recorded { .. }));
-            assert_eq!(prepared, None);
+            assert!(prepared.is_none());
             let (emitter, calls) = emitter(
                 &ordinary_recorder,
                 PlatformMarkerAdapterOutcome::Emitted {
                     delivery: MarkerDeliveryAuthority::Exact,
                 },
             );
-            assert_eq!(emitter.emit(payload), PlatformMarkerOutcome::NotRequested);
+            assert_eq!(emitter.emit(&payload), PlatformMarkerOutcome::NotRequested);
             assert_eq!(calls.load(Ordering::Relaxed), 0);
             assert_eq!(
                 emitter.snapshot(),
@@ -1107,7 +1144,7 @@ mod tests {
             .record_and_prepare_platform_marker(&foreign_producer, foreign_token, &foreign_fields)
             .expect("off-mode record path is valid");
         assert_eq!(outcome, RecordOutcome::Off);
-        assert_eq!(prepared, None);
+        assert!(prepared.is_none());
         let (off_emitter, off_calls) = emitter(
             &off_recorder,
             PlatformMarkerAdapterOutcome::Emitted {
@@ -1115,7 +1152,7 @@ mod tests {
             },
         );
         assert_eq!(
-            off_emitter.emit(payload),
+            off_emitter.emit(&payload),
             PlatformMarkerOutcome::NotRequested
         );
         assert_eq!(off_calls.load(Ordering::Relaxed), 0);
@@ -1130,16 +1167,19 @@ mod tests {
             .record_and_prepare_platform_marker(&producer, token, &fields)
             .expect("non-recorded outcome does not need marker preparation");
         assert_eq!(outcome, RecordOutcome::OutsideEpoch);
-        assert_eq!(payload, None);
+        assert!(payload.is_none());
     }
 
     #[test]
     fn emitter_rejects_cross_epoch_payload_without_accounting_it() {
         let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
-        let payload = recorded_payload(&recorder);
-        let foreign_payload = PlatformMarkerPayload {
-            local_epoch_id: RecorderEpochId::new(99, 100).expect("foreign epoch is valid"),
-            ..payload
+        let prepared = recorded_payload(&recorder);
+        let foreign_payload = PreparedPlatformMarker {
+            recorder_identity: recorder.identity.clone(),
+            payload: PlatformMarkerPayload {
+                local_epoch_id: RecorderEpochId::new(99, 100).expect("foreign epoch is valid"),
+                ..prepared.payload()
+            },
         };
         let (emitter, calls) = emitter(
             &recorder,
@@ -1148,7 +1188,7 @@ mod tests {
             },
         );
         assert_eq!(
-            emitter.emit(foreign_payload),
+            emitter.emit(&foreign_payload),
             PlatformMarkerOutcome::WrongEpoch
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -1156,6 +1196,34 @@ mod tests {
         let snapshot = finish_ready(&emitter, &batch);
         assert_eq!(snapshot.accounting.attempted, 0);
         assert_eq!(snapshot.authority, PlatformMarkerAuthorityV1::Inexact);
+    }
+
+    #[test]
+    fn emitter_rejects_same_epoch_payload_from_a_different_recorder() {
+        let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
+        let foreign_recorder = test_recorder(RecorderMode::CertificationWithMarkers);
+        assert_eq!(
+            recorder.config().epoch_id(),
+            foreign_recorder.config().epoch_id(),
+            "the negative must isolate exact allocation identity"
+        );
+        let foreign_payload = recorded_payload(&foreign_recorder);
+        let (emitter, calls) = emitter(
+            &recorder,
+            PlatformMarkerAdapterOutcome::Emitted {
+                delivery: MarkerDeliveryAuthority::Exact,
+            },
+        );
+
+        assert_eq!(
+            emitter.emit(&foreign_payload),
+            PlatformMarkerOutcome::WrongRecorder
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            emitter.snapshot().accounting,
+            PlatformMarkerAccountingV1::default()
+        );
     }
 
     #[test]
@@ -1169,7 +1237,7 @@ mod tests {
             },
         );
         assert_eq!(
-            emitter.emit(payload),
+            emitter.emit(&payload),
             PlatformMarkerOutcome::Emitted {
                 delivery: MarkerDeliveryAuthority::Exact
             }
@@ -1227,7 +1295,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            emitter.emit(payload),
+            emitter.emit(&payload),
             PlatformMarkerOutcome::Emitted {
                 delivery: MarkerDeliveryAuthority::Exact
             }
@@ -1258,7 +1326,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            lossy.emit(payload),
+            lossy.emit(&payload),
             PlatformMarkerOutcome::Emitted {
                 delivery: MarkerDeliveryAuthority::ExternalLossUnknown
             }
@@ -1269,7 +1337,7 @@ mod tests {
             PlatformMarkerAdapterOutcome::Unavailable(MarkerUnavailableReason::PermissionDenied),
         );
         assert_eq!(
-            unavailable.emit(payload),
+            unavailable.emit(&payload),
             PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::PermissionDenied)
         );
 
@@ -1278,7 +1346,7 @@ mod tests {
             PlatformMarkerAdapterOutcome::Dropped(MarkerDropReason::QueueFull),
         );
         assert_eq!(
-            dropped.emit(payload),
+            dropped.emit(&payload),
             PlatformMarkerOutcome::Dropped(MarkerDropReason::QueueFull)
         );
 
@@ -1287,7 +1355,7 @@ mod tests {
             UnsupportedPlatformMarkerAdapter::default(),
         );
         assert_eq!(
-            unsupported.emit(payload),
+            unsupported.emit(&payload),
             PlatformMarkerOutcome::Unavailable(MarkerUnavailableReason::UnsupportedPlatform)
         );
 
@@ -1325,7 +1393,7 @@ mod tests {
         );
         emitter.attempted.store(u64::MAX, Ordering::Relaxed);
         assert!(matches!(
-            emitter.emit(payload),
+            emitter.emit(&payload),
             PlatformMarkerOutcome::AccountingExhausted { .. }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -1350,7 +1418,8 @@ mod tests {
             },
         ));
         let worker_emitter = Arc::clone(&emitter);
-        let worker = thread::spawn(move || worker_emitter.emit(payload));
+        let post_close_payload = payload.clone();
+        let worker = thread::spawn(move || worker_emitter.emit(&payload));
         entered.wait();
 
         let batch = freeze_recorder(&recorder);
@@ -1369,7 +1438,10 @@ mod tests {
                 in_flight_operations: 1
             }
         );
-        assert_eq!(emitter.emit(payload), PlatformMarkerOutcome::Closed);
+        assert_eq!(
+            emitter.emit(&post_close_payload),
+            PlatformMarkerOutcome::Closed
+        );
         release.wait();
         assert!(matches!(
             worker.join().expect("marker worker must not panic"),
@@ -1397,7 +1469,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            emitter.emit(payload),
+            emitter.emit(&payload),
             PlatformMarkerOutcome::Emitted { .. }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -1463,7 +1535,8 @@ mod tests {
         );
 
         let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
-        let payload = recorded_payload(&recorder);
+        let prepared = recorded_payload(&recorder);
+        let payload = prepared.payload();
         let adjacent_producer = PlatformMarkerPayload {
             producer_shard_index: payload.producer_shard_index + 1,
             ..payload

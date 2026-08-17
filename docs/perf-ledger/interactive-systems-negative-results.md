@@ -4188,11 +4188,12 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   First-party marker code contains no unsafe block, string formatting, blocking
   lock, unbounded queue, or dynamic dispatch. The Linux adapter preallocates a
   bounded builder shard set off-path, uses `try_lock`, and performs only a
-  marker-mode `user_events` write after recorder admission has returned. Payload
-  preparation is bound to the exact local recorder epoch, and terminal marker
-  authority is bound to the exact originating recorder instance plus its frozen
-  batch. Cross-epoch payloads fail before adapter invocation or accounting;
-  same-epoch batches from a different recorder cannot finalize authority.
+  marker-mode `user_events` write after recorder admission has returned. Marker
+  preparation returns an exact-allocation receipt, and terminal marker authority
+  is bound to that same originating recorder instance plus its frozen batch.
+  Cross-epoch payloads fail before adapter invocation or accounting; same-epoch
+  receipts and batches from a different recorder cannot mutate or finalize
+  authority.
 - **Cost boundary:** the safe dynamic Linux API has higher encoding cost than
   its static counterpart, whose registration contract requires first-party
   unsafe code. Reusable builders are prewarmed and sharded to remove steady-state
@@ -4276,19 +4277,53 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   `ExactEveryRecordedEvent` even though the recorder retained more events.
   Matching only `RecorderEpochId` is also insufficient because a caller can
   construct two recorder instances with the same nonzero epoch value.
-- **Decision:** live marker snapshots are always diagnostic and inexact.
-  Terminal `finish` accepts only the opaque `FrozenBatch` minted by the exact
-  originating recorder allocation, verifies exact internal accounting and the
-  retained-event cardinality, and then seals marker admission. A weak
-  allocation identity preserves exact-instance comparison without retaining a
-  strong recorder or adding another heap allocation. Wrong-recorder batches
-  fail without sealing, so a correct retry remains possible.
-- **Planted negatives:** a same-epoch batch from a distinct recorder is rejected
-  as `WrongRecorder`; exact adapter delivery paired with exhausted internal
-  accounting remains marker-inexact; only the exact frozen batch with matching
-  recorded cardinality can produce terminal exact marker authority.
+- **Decision:** live marker snapshots are always diagnostic and inexact. Each
+  retained marker event yields an opaque prepared receipt containing a weak
+  exact-recorder witness around the numeric platform payload; `emit` rejects a
+  receipt from another allocation before adapter work or marker accounting.
+  Terminal `finish` likewise accepts only the opaque `FrozenBatch` minted by
+  the exact originating recorder allocation, verifies exact internal accounting
+  and retained-event cardinality, and then seals marker admission. Weak
+  allocation identities preserve exact-instance comparison without retaining
+  a strong recorder or adding another heap allocation. Wrong-recorder receipts
+  and batches fail without mutating authority, so a correct call remains
+  possible.
+- **Planted negatives:** a same-epoch prepared receipt and a same-epoch frozen
+  batch from distinct recorder allocations are both rejected as
+  `WrongRecorder`; exact adapter delivery paired with exhausted internal
+  accounting remains marker-inexact; only exact-receipt emissions followed by
+  the exact frozen batch with matching recorded cardinality can produce
+  terminal exact marker authority.
 - **Primary retry condition:**
   > Any future distributed marker reconciliation must bind an authenticated recorder-instance and frozen-batch digest, not a caller-provided count or reusable numeric epoch alone, before it can upgrade marker-assisted certification.
+
+### IS-N141 — A public recorder epoch is not an exact local-token owner
+
+- **Classification:** trace-publication identity rejection; hot-path API
+  repaired
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.2.2`
+- **Rejected inference:** a `TraceToken` belongs to exactly one local recorder
+  allocation merely because its `local_epoch_id` matches that recorder's
+  immutable public `RecorderEpochId`.
+- **Counterexample:** `RecorderConfig` intentionally accepts a caller-supplied
+  nonzero epoch. Two simultaneously live recorder allocations can therefore
+  share the same epoch and run IDs. Before this repair, a producer registered
+  with the second recorder could publish a local token admitted by the first;
+  the numeric epoch/path checks passed and the foreign event entered the second
+  recorder's exact accounting.
+- **Decision:** each recorder allocation now receives a private, process-local,
+  nonwrapping instance ID. Local and remote admission stamp that ID into the
+  still-fixed-size, numeric, `Copy` `TraceToken`; event publication compares it
+  before entering event admission or mutating any outcome counter or queue. The
+  sampled remote context deliberately excludes this local routing witness, so a receiving
+  recorder must continue to mint its own token through `admit_remote_trace`.
+  Allocation authority fails stop if the process-local ID space is exhausted.
+- **Planted negatives:** a public-API same-epoch/different-allocation token is
+  rejected as `WrongRecorder` with zero queued events and zero event attempts;
+  a local allocator test proves unique IDs under contention plus sticky
+  nonwrapping exhaustion.
+- **Primary retry condition:**
+  > If local trace tokens ever cross a process boundary, preserve the current remote-context re-admission cut or replace the local witness with an authenticated receiving-recorder capability; never serialize and trust a raw process-local instance ID.
 
 ## Open hypothesis register
 

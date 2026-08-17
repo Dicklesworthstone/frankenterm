@@ -52,11 +52,35 @@ const ADMISSION_SEALED: u64 = 1 << 63;
 const IN_FLIGHT_MASK: u64 = ADMISSION_SEALED - 1;
 const COUNTER_EXHAUSTED: u64 = u64::MAX;
 const LAST_EXACT_COUNTER_VALUE: u64 = u64::MAX - 1;
+const RECORDER_INSTANCE_ID_EXHAUSTED: u64 = u64::MAX;
+static NEXT_RECORDER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_SERIALIZATION_WORKSPACE_BYTES: usize = 64 * 1024;
 // Reserve fixed bookkeeping slack for each heap-backed recorder component.
 // This is intentionally charged once per shard below, so a multi-shard
 // configuration overestimates rather than hides recorder-global metadata.
 const FIXED_BOOKKEEPING_WORDS_PER_SHARD: usize = 16;
+
+fn allocate_recorder_instance_id() -> Option<u64> {
+    allocate_nonwrapping_instance_id(&NEXT_RECORDER_INSTANCE_ID)
+}
+
+fn allocate_nonwrapping_instance_id(next: &AtomicU64) -> Option<u64> {
+    let mut observed = next.load(Ordering::Relaxed);
+    loop {
+        if observed == RECORDER_INSTANCE_ID_EXHAUSTED {
+            return None;
+        }
+        match next.compare_exchange_weak(
+            observed,
+            observed + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(observed),
+            Err(actual) => observed = actual,
+        }
+    }
+}
 
 /// Immutable configuration for one recorder epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,10 +381,12 @@ impl EventFields {
     }
 }
 
-/// Whole-trace token. The origin context survives a remote hop while
-/// `local_epoch_id` binds publication to exactly one receiving recorder.
+/// Whole-trace token. The origin context survives a remote hop while the
+/// private process-local instance ID binds publication to the exact receiving
+/// recorder allocation even if a caller reuses the public epoch identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceToken {
+    recorder_instance_id: u64,
     local_epoch_id: RecorderEpochId,
     context: SampledTraceContextV1,
 }
@@ -882,6 +908,7 @@ struct RecorderWorkspace {
 #[derive(Debug)]
 pub struct FlightRecorder {
     identity: Weak<FlightRecorder>,
+    recorder_instance_id: u64,
     config: RecorderConfig,
     shards: Vec<RecorderShard>,
     next_trace_sequence: AtomicU64,
@@ -965,8 +992,14 @@ impl FlightRecorder {
             )?;
         }
 
+        let recorder_instance_id = if enabled {
+            allocate_recorder_instance_id().ok_or(RecorderError::RecorderInstanceIdExhausted)?
+        } else {
+            0
+        };
         Ok(Arc::new_cyclic(|identity| Self {
             identity: identity.clone(),
+            recorder_instance_id,
             config,
             shards,
             next_trace_sequence: AtomicU64::new(1),
@@ -1064,6 +1097,7 @@ impl FlightRecorder {
         let authority = self.increment(&shard.counters.sampled_in);
         TraceAdmission::Admitted {
             token: TraceToken {
+                recorder_instance_id: self.recorder_instance_id,
                 local_epoch_id: self.config.epoch_id,
                 context: SampledTraceContextV1 {
                     schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
@@ -1099,6 +1133,7 @@ impl FlightRecorder {
         let authority = self.increment(&shard.counters.sampled_in);
         TraceAdmission::Admitted {
             token: TraceToken {
+                recorder_instance_id: self.recorder_instance_id,
                 local_epoch_id: self.config.epoch_id,
                 context,
             },
@@ -1119,6 +1154,9 @@ impl FlightRecorder {
         let Some(shard) = self.shard_for_handle(producer) else {
             return RecordOutcome::WrongRecorder;
         };
+        if token.recorder_instance_id != self.recorder_instance_id {
+            return RecordOutcome::WrongRecorder;
+        }
         let Some(admission) = self.claim_active_admission(shard) else {
             return RecordOutcome::OutsideEpoch;
         };
@@ -1140,6 +1178,9 @@ impl FlightRecorder {
                 };
             }
         };
+        if token.recorder_instance_id != self.recorder_instance_id {
+            return RecordOutcome::WrongRecorder;
+        }
         if token.local_epoch_id != self.config.epoch_id || token.context.validate().is_err() {
             return RecordOutcome::EpochMismatch {
                 accounting_authority: self.increment(&shard.counters.epoch_mismatch),
@@ -1850,6 +1891,8 @@ pub enum RecorderError {
     InvalidEpochId,
     #[error("invalid local trace run id")]
     InvalidRunId,
+    #[error("process-local recorder instance id authority is exhausted")]
+    RecorderInstanceIdExhausted,
     #[error("raw event size {actual} exceeds semantic maximum {maximum}")]
     RawEventTooLarge { actual: usize, maximum: usize },
     #[error("recorder capacity arithmetic overflow")]
@@ -2577,6 +2620,10 @@ mod tests {
         )
         .expect("canonical off config must be valid");
         let recorder = FlightRecorder::new(off).expect("off recorder must construct");
+        assert_eq!(
+            recorder.recorder_instance_id, 0,
+            "Off construction must not consume process-local identity authority"
+        );
         let producer = recorder
             .register_producer(999)
             .expect("off registration is a no-op handle");
@@ -2588,6 +2635,7 @@ mod tests {
             TraceAdmission::Off
         );
         let token = TraceToken {
+            recorder_instance_id: u64::MAX,
             local_epoch_id: off.epoch_id(),
             context: SampledTraceContextV1 {
                 schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
@@ -2995,6 +3043,7 @@ mod tests {
         )
         .expect("second config is valid");
         let second = FlightRecorder::new(second_config).expect("second recorder allocates");
+        assert_ne!(first.recorder_instance_id, second.recorder_instance_id);
         let first_producer = first
             .register_producer(0)
             .expect("first producer registers");
@@ -3003,13 +3052,34 @@ mod tests {
             .expect("second producer registers");
         let first_token = admitted_local(&first, &first_producer, InteractionTracePath::Keypress);
         let event = fields_for(1, stage(InteractionTracePath::Keypress, 0));
-        assert!(matches!(
+        let admission_before = second.shards[0].counters.in_flight.load(Ordering::Relaxed);
+        assert_eq!(
             second.record(&second_producer, first_token, &event),
-            RecordOutcome::EpochMismatch { .. }
-        ));
+            RecordOutcome::WrongRecorder
+        );
+        assert_eq!(
+            second.shards[0].counters.in_flight.load(Ordering::Relaxed),
+            admission_before,
+            "a foreign token must fail before event admission"
+        );
+        assert_eq!(
+            second
+                .accounting_snapshot()
+                .event
+                .checked_sampled_event_attempts(),
+            Ok(0)
+        );
 
         let second_token =
             admitted_local(&second, &second_producer, InteractionTracePath::Keypress);
+        let wrong_epoch_token = TraceToken {
+            local_epoch_id: first.config().epoch_id(),
+            ..second_token
+        };
+        assert!(matches!(
+            second.record(&second_producer, wrong_epoch_token, &event),
+            RecordOutcome::EpochMismatch { .. }
+        ));
         let mut invalid_clock = event;
         invalid_clock.clock.completed_at.clock_domain.clock_id = 999;
         assert!(matches!(
@@ -3076,6 +3146,38 @@ mod tests {
             RecordOutcome::OutsideEpoch
         );
         assert_eq!(recorder.accounting_snapshot(), before_close);
+    }
+
+    #[test]
+    fn recorder_instance_ids_are_unique_under_contention_and_fail_stop() {
+        let next = AtomicU64::new(1);
+        let mut ids = thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..64 {
+                workers.push(scope.spawn(|| {
+                    allocate_nonwrapping_instance_id(&next)
+                        .expect("the bounded test allocator has capacity")
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("instance-id worker must not panic"))
+                .collect::<Vec<_>>()
+        });
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=64).collect::<Vec<_>>());
+
+        let exhausted = AtomicU64::new(RECORDER_INSTANCE_ID_EXHAUSTED - 1);
+        assert_eq!(
+            allocate_nonwrapping_instance_id(&exhausted),
+            Some(RECORDER_INSTANCE_ID_EXHAUSTED - 1)
+        );
+        assert_eq!(allocate_nonwrapping_instance_id(&exhausted), None);
+        assert_eq!(allocate_nonwrapping_instance_id(&exhausted), None);
+        assert_eq!(
+            exhausted.load(Ordering::Relaxed),
+            RECORDER_INSTANCE_ID_EXHAUSTED
+        );
     }
 
     #[test]
