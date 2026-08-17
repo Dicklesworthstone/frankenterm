@@ -93,7 +93,7 @@ fn reliable_input_codec_disposition(
 }
 
 fn reliable_input_retry_delay(base: Duration, consecutive_retries: u32) -> Duration {
-    let multiplier = 1u32 << consecutive_retries.min(6);
+    let multiplier = 1u32.checked_shl(consecutive_retries).unwrap_or(u32::MAX);
     // Never shorten an authoritative peer delay. The local ceiling only
     // bounds our exponential amplification of a smaller transport/scheduler
     // prompt.
@@ -124,6 +124,7 @@ struct QueuedReliableInput {
 struct ReliableInputQueueState {
     pending: VecDeque<QueuedReliableInput>,
     worker_running: bool,
+    domain_detached: bool,
 }
 
 pub(crate) struct ReliableInputQueue {
@@ -145,6 +146,7 @@ impl ReliableInputQueue {
             state: Mutex::new(ReliableInputQueueState {
                 pending: VecDeque::with_capacity(RELIABLE_INPUT_QUEUE_CAPACITY),
                 worker_running: false,
+                domain_detached: false,
             }),
         })
     }
@@ -158,7 +160,11 @@ impl ReliableInputQueue {
     ) -> anyhow::Result<()> {
         let start_worker = {
             let mut state = self.state.lock();
+            if state.domain_detached || client.is_detached() {
+                bail!("cannot enqueue reliable input for a detached client domain");
+            }
             if state.pending.len() >= RELIABLE_INPUT_QUEUE_CAPACITY {
+                drop(state);
                 metrics::counter!("mux.client.reliable_input_queue", "outcome" => "full")
                     .increment(1);
                 bail!(
@@ -198,11 +204,10 @@ impl ReliableInputQueue {
         let mut consecutive_retries = 0u32;
         loop {
             let Some(client) = client.upgrade() else {
-                queue.finish_worker("client_dropped");
+                queue.retire("client_dropped");
                 return;
             };
             if client.is_detached() {
-                queue.finish_worker("domain_detached");
                 return;
             }
             let entry = {
@@ -233,7 +238,11 @@ impl ReliableInputQueue {
                 yield_reliable_input_worker_once().await;
                 continue;
             }
-            match Self::attempt(&client, &entry).await {
+            let attempt = Self::attempt(&client, &entry).await;
+            if client.is_detached() {
+                return;
+            }
+            match attempt {
                 ReliableInputAttempt::Complete(outcome)
                 | ReliableInputAttempt::DropOne(outcome) => {
                     if !queue.complete_front(&entry, outcome) {
@@ -258,12 +267,12 @@ impl ReliableInputQueue {
                         "outcome" => outcome
                     )
                     .increment(1);
-                    queue.finish_worker(outcome);
+                    queue.retire(outcome);
                     return;
                 }
                 ReliableInputAttempt::BindPaneAuthority(pane_registration) => {
                     if !queue.bind_front_pane_authority(&entry, pane_registration) {
-                        queue.finish_worker("pane_authority_conflict");
+                        queue.retire("pane_authority_conflict");
                         return;
                     }
                     consecutive_retries = 0;
@@ -271,7 +280,7 @@ impl ReliableInputQueue {
                 }
                 ReliableInputAttempt::PaneAuthorityRetired(outcome) => {
                     if !queue.retire_front_pane_authority(&entry, outcome) {
-                        queue.finish_worker("pane_authority_retirement_conflict");
+                        queue.retire("pane_authority_retirement_conflict");
                         return;
                     }
                     consecutive_retries = 0;
@@ -411,16 +420,21 @@ impl ReliableInputQueue {
             front.request == expected.request
                 && front.registration.same_registration(&expected.registration)
         });
-        if matches {
-            let _ = state.pending.pop_front();
-        } else {
+        if !matches {
+            let domain_detached = state.domain_detached;
+            state.worker_running = false;
+            drop(state);
+            if domain_detached {
+                return false;
+            }
             log::error!(
                 "reliable input FIFO authority changed while completing serial {}",
                 expected.request.input_serial.get()
             );
-            state.worker_running = false;
             return false;
         }
+        let _ = state.pending.pop_front();
+        drop(state);
         metrics::counter!("mux.client.reliable_input_attempt", "outcome" => outcome).increment(1);
         true
     }
@@ -469,15 +483,36 @@ impl ReliableInputQueue {
                 || !Arc::ptr_eq(&queued.pane_authority, &expected.pane_authority)
         });
         *pane_authority = None;
+        drop(state);
+        drop(pane_authority);
         metrics::counter!("mux.client.reliable_input_attempt", "outcome" => outcome).increment(1);
         true
     }
 
-    fn finish_worker(&self, outcome: &'static str) {
+    pub(crate) fn retire(&self, outcome: &'static str) {
         let mut state = self.state.lock();
         state.pending.clear();
         state.worker_running = false;
+        drop(state);
         metrics::counter!("mux.client.reliable_input_worker", "outcome" => outcome).increment(1);
+    }
+
+    pub(crate) fn detach_domain(&self, detached: &std::sync::atomic::AtomicBool) {
+        use std::sync::atomic::Ordering;
+
+        let mut state = self.state.lock();
+        if detached.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        state.domain_detached = true;
+        state.pending.clear();
+        state.worker_running = false;
+        drop(state);
+        metrics::counter!(
+            "mux.client.reliable_input_worker",
+            "outcome" => "domain_detached"
+        )
+        .increment(1);
     }
 }
 
@@ -2508,6 +2543,59 @@ mod tests {
         );
         state.pending.clear();
         state.worker_running = false;
+    }
+
+    #[test]
+    fn reliable_input_domain_detach_atomically_retires_and_closes_admission() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane: Arc<dyn Pane> = test_client_pane(&inner, 45, 31);
+        mux.add_pane(&pane).expect("register detach test pane");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("capture detach test pane registration");
+        {
+            let mut state = inner.reliable_input_queue.state.lock();
+            state.worker_running = true;
+        }
+        let pane_authority = Arc::new(Mutex::new(None));
+        let request = ReliableKeyEventV1 {
+            pane_id: 31,
+            pane_registration: None,
+            event: KeyEvent {
+                key: KeyCode::Char('d'),
+                modifiers: KeyModifiers::NONE,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(1),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        inner
+            .reliable_input_queue
+            .enqueue(
+                &inner,
+                registration.clone(),
+                Arc::clone(&pane_authority),
+                request.clone(),
+            )
+            .expect("pre-detach input should be retained");
+
+        inner.mark_detached();
+        assert!(inner.is_detached());
+        {
+            let state = inner.reliable_input_queue.state.lock();
+            assert!(state.domain_detached);
+            assert!(state.pending.is_empty());
+            assert!(!state.worker_running);
+        }
+        assert!(
+            inner
+                .reliable_input_queue
+                .enqueue(&inner, registration, pane_authority, request)
+                .is_err(),
+            "detached-domain admission must remain closed after retirement"
+        );
     }
 
     #[test]

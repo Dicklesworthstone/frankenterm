@@ -1210,8 +1210,8 @@ impl ClientInner {
         self.detached.load(Ordering::Acquire)
     }
 
-    fn mark_detached(&self) {
-        self.detached.store(true, Ordering::Release);
+    pub(crate) fn mark_detached(&self) {
+        self.reliable_input_queue.detach_domain(&self.detached);
     }
 }
 
