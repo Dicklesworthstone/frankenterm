@@ -33,7 +33,7 @@ use std::num::NonZeroU64;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
@@ -52,6 +52,16 @@ const MAX_RPC_READINESS_PUBLICATIONS: usize = 64;
 const MAX_RPC_READINESS_WAITERS: usize = 64;
 const MUX_RPC_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 const TOPOLOGY_FENCE_MIN_CODEC_VERSION: usize = 49;
+const CLIENT_OUTBOUND_NONINTERACTIVE_SLOTS: usize = 4_096;
+const CLIENT_OUTBOUND_RESERVED_SLOTS: usize = 64;
+const CLIENT_OUTBOUND_TOTAL_SLOTS: usize =
+    CLIENT_OUTBOUND_NONINTERACTIVE_SLOTS + CLIENT_OUTBOUND_RESERVED_SLOTS;
+// Safety envelopes, not promoted performance defaults. One legal global-cap
+// PDU can require roughly three 256 MiB logical buffers in the conservative
+// codec plan. The noninteractive ceiling leaves a separate 64 MiB tranche for
+// small control/input frames even while bulk/query/state-sync work is full.
+const CLIENT_OUTBOUND_TOTAL_CODEC_BYTES: usize = 1_024 * 1024 * 1024;
+const CLIENT_OUTBOUND_NONINTERACTIVE_CODEC_BYTES: usize = 960 * 1024 * 1024;
 #[cfg(test)]
 pub(crate) const TEST_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
     RenderConnectionIdentity::new(
@@ -322,6 +332,343 @@ struct RpcBinding {
     attempt_id: NonZeroU64,
     request: &'static str,
     expected_response_ident: Option<NonZeroU64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientOutboundBudgetLimits {
+    total_codec_bytes: usize,
+    noninteractive_codec_bytes: usize,
+    total_slots: usize,
+    noninteractive_slots: usize,
+}
+
+impl Default for ClientOutboundBudgetLimits {
+    fn default() -> Self {
+        Self {
+            total_codec_bytes: CLIENT_OUTBOUND_TOTAL_CODEC_BYTES,
+            noninteractive_codec_bytes: CLIENT_OUTBOUND_NONINTERACTIVE_CODEC_BYTES,
+            total_slots: CLIENT_OUTBOUND_TOTAL_SLOTS,
+            noninteractive_slots: CLIENT_OUTBOUND_NONINTERACTIVE_SLOTS,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ClientOutboundBudgetState {
+    codec_bytes: usize,
+    noninteractive_codec_bytes: usize,
+    slots: usize,
+    noninteractive_slots: usize,
+    peak_codec_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientOutboundBudgetLimit {
+    Arithmetic,
+    TotalCodecBytes,
+    NoninteractiveCodecBytes,
+    TotalSlots,
+    NoninteractiveSlots,
+}
+
+impl ClientOutboundBudgetLimit {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Arithmetic => "arithmetic",
+            Self::TotalCodecBytes => "total_codec_bytes",
+            Self::NoninteractiveCodecBytes => "noninteractive_codec_bytes",
+            Self::TotalSlots => "total_slots",
+            Self::NoninteractiveSlots => "noninteractive_slots",
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error(
+    "mux client outbound PDU {ident} could not reserve {planned_codec_bytes} logical codec bytes: {limit:?}"
+)]
+pub struct ClientOutboundAdmissionError {
+    pub ident: u64,
+    pub planned_codec_bytes: usize,
+    pub limit: ClientOutboundBudgetLimit,
+}
+
+impl ClientOutboundAdmissionError {
+    /// Admission failures occur before serial assignment, queue mutation,
+    /// codec allocation, compression, or a socket write.
+    #[must_use]
+    pub const fn delivery_certainty(&self) -> RpcDeliveryCertainty {
+        RpcDeliveryCertainty::DefinitelyNotSent
+    }
+}
+
+#[derive(Debug)]
+struct ClientOutboundBudget {
+    limits: ClientOutboundBudgetLimits,
+    state: ParkingMutex<ClientOutboundBudgetState>,
+}
+
+impl Default for ClientOutboundBudget {
+    fn default() -> Self {
+        Self {
+            limits: ClientOutboundBudgetLimits::default(),
+            state: ParkingMutex::new(ClientOutboundBudgetState::default()),
+        }
+    }
+}
+
+impl ClientOutboundBudget {
+    #[cfg(test)]
+    fn with_limits(limits: ClientOutboundBudgetLimits) -> Self {
+        Self {
+            limits,
+            state: ParkingMutex::new(ClientOutboundBudgetState::default()),
+        }
+    }
+
+    fn checked_reservation_state(
+        &self,
+        mut state: ClientOutboundBudgetState,
+        planned_codec_bytes: usize,
+        noninteractive: bool,
+    ) -> Result<ClientOutboundBudgetState, ClientOutboundBudgetLimit> {
+        state.codec_bytes = state
+            .codec_bytes
+            .checked_add(planned_codec_bytes)
+            .ok_or(ClientOutboundBudgetLimit::Arithmetic)?;
+        if state.codec_bytes > self.limits.total_codec_bytes {
+            return Err(ClientOutboundBudgetLimit::TotalCodecBytes);
+        }
+        state.slots = state
+            .slots
+            .checked_add(1)
+            .ok_or(ClientOutboundBudgetLimit::Arithmetic)?;
+        if state.slots > self.limits.total_slots {
+            return Err(ClientOutboundBudgetLimit::TotalSlots);
+        }
+        if noninteractive {
+            state.noninteractive_codec_bytes = state
+                .noninteractive_codec_bytes
+                .checked_add(planned_codec_bytes)
+                .ok_or(ClientOutboundBudgetLimit::Arithmetic)?;
+            if state.noninteractive_codec_bytes > self.limits.noninteractive_codec_bytes {
+                return Err(ClientOutboundBudgetLimit::NoninteractiveCodecBytes);
+            }
+            state.noninteractive_slots = state
+                .noninteractive_slots
+                .checked_add(1)
+                .ok_or(ClientOutboundBudgetLimit::Arithmetic)?;
+            if state.noninteractive_slots > self.limits.noninteractive_slots {
+                return Err(ClientOutboundBudgetLimit::NoninteractiveSlots);
+            }
+        }
+        state.peak_codec_bytes = state.peak_codec_bytes.max(state.codec_bytes);
+        Ok(state)
+    }
+
+    fn try_reserve(
+        self: &Arc<Self>,
+        generation: NonZeroU64,
+        plan: &PduOutboundPlan,
+    ) -> Result<ClientOutboundLease, ClientOutboundAdmissionError> {
+        let metadata = plan.metadata();
+        let noninteractive = matches!(metadata.queue_qos, PduQueueQos::Normal | PduQueueQos::Bulk);
+        let planned_codec_bytes = plan.codec_peak_bytes();
+        let reservation = {
+            let mut state = self.state.lock();
+            match self.checked_reservation_state(*state, planned_codec_bytes, noninteractive) {
+                Ok(next) => {
+                    *state = next;
+                    Ok(())
+                }
+                Err(limit) => Err(limit),
+            }
+        };
+        if let Err(limit) = reservation {
+            metrics::counter!(
+                "mux.client.outbound.admission.total",
+                "outcome" => "rejected",
+                "qos" => client_outbound_qos_label(metadata.queue_qos),
+                "limit" => limit.label(),
+            )
+            .increment(1);
+            return Err(ClientOutboundAdmissionError {
+                ident: plan.ident(),
+                planned_codec_bytes,
+                limit,
+            });
+        }
+        metrics::counter!(
+            "mux.client.outbound.admission.total",
+            "outcome" => "admitted",
+            "qos" => client_outbound_qos_label(metadata.queue_qos),
+            "limit" => "none",
+        )
+        .increment(1);
+        Ok(ClientOutboundLease {
+            state: Arc::new(ClientOutboundLeaseState {
+                phase: AtomicU8::new(ClientOutboundLeasePhase::Queued as u8),
+                budget: Arc::clone(self),
+                generation,
+                ident: plan.ident(),
+                planned_codec_bytes,
+                noninteractive,
+                qos: metadata.queue_qos,
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> ClientOutboundBudgetState {
+        *self.state.lock()
+    }
+}
+
+const fn client_outbound_qos_label(qos: PduQueueQos) -> &'static str {
+    match qos {
+        PduQueueQos::Control => "control",
+        PduQueueQos::Interactive => "interactive",
+        PduQueueQos::Normal => "normal",
+        PduQueueQos::Bulk => "bulk",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ClientOutboundLeasePhase {
+    Queued = 0,
+    ReaderOwned = 1,
+    Settled = 2,
+}
+
+struct ClientOutboundLeaseState {
+    phase: AtomicU8,
+    budget: Arc<ClientOutboundBudget>,
+    generation: NonZeroU64,
+    ident: u64,
+    planned_codec_bytes: usize,
+    noninteractive: bool,
+    qos: PduQueueQos,
+}
+
+impl ClientOutboundLeaseState {
+    fn release_budget(&self) {
+        {
+            let mut state = self.budget.state.lock();
+            state.codec_bytes = state
+                .codec_bytes
+                .checked_sub(self.planned_codec_bytes)
+                .expect("client outbound logical-codec reservation underflow");
+            state.slots = state
+                .slots
+                .checked_sub(1)
+                .expect("client outbound slot reservation underflow");
+            if self.noninteractive {
+                state.noninteractive_codec_bytes = state
+                    .noninteractive_codec_bytes
+                    .checked_sub(self.planned_codec_bytes)
+                    .expect("client outbound noninteractive-byte reservation underflow");
+                state.noninteractive_slots = state
+                    .noninteractive_slots
+                    .checked_sub(1)
+                    .expect("client outbound noninteractive-slot reservation underflow");
+            }
+        }
+        metrics::counter!(
+            "mux.client.outbound.admission.total",
+            "outcome" => "released",
+            "qos" => client_outbound_qos_label(self.qos),
+            "limit" => "none",
+        )
+        .increment(1);
+    }
+
+    fn cancel_if_queued(&self) {
+        if self
+            .phase
+            .compare_exchange(
+                ClientOutboundLeasePhase::Queued as u8,
+                ClientOutboundLeasePhase::Settled as u8,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
+        {
+            self.release_budget();
+        }
+    }
+
+    fn claim_for_reader(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                ClientOutboundLeasePhase::Queued as u8,
+                ClientOutboundLeasePhase::ReaderOwned as u8,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn settle(&self) {
+        let prior = self.phase.swap(
+            ClientOutboundLeasePhase::Settled as u8,
+            AtomicOrdering::AcqRel,
+        );
+        if prior != ClientOutboundLeasePhase::Settled as u8 {
+            self.release_budget();
+        }
+    }
+}
+
+struct ClientOutboundLease {
+    state: Arc<ClientOutboundLeaseState>,
+}
+
+struct ClientOutboundCancellationGuard {
+    state: Arc<ClientOutboundLeaseState>,
+}
+
+impl Drop for ClientOutboundCancellationGuard {
+    fn drop(&mut self) {
+        self.state.cancel_if_queued();
+    }
+}
+
+impl std::fmt::Debug for ClientOutboundLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientOutboundLease")
+            .field("generation", &self.state.generation)
+            .field("ident", &self.state.ident)
+            .field("planned_codec_bytes", &self.state.planned_codec_bytes)
+            .field("qos", &self.state.qos)
+            .finish()
+    }
+}
+
+impl ClientOutboundLease {
+    fn cancellation_guard(&self) -> ClientOutboundCancellationGuard {
+        ClientOutboundCancellationGuard {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    fn matches(&self, binding: RpcBinding, prepared: &OwnedPreparedPduOutbound) -> bool {
+        self.state.generation == binding.generation
+            && self.state.ident == prepared.ident()
+            && self.state.planned_codec_bytes == prepared.codec_peak_bytes()
+            && self.state.qos == prepared.metadata().queue_qos
+    }
+
+    fn claim_for_reader(&self) -> bool {
+        self.state.claim_for_reader()
+    }
+}
+
+impl Drop for ClientOutboundLease {
+    fn drop(&mut self) {
+        self.state.settle();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1361,6 +1708,10 @@ impl RpcTransportLifecycle {
 struct RpcTransportState {
     lifecycle: ParkingMutex<RpcTransportLifecycle>,
     consumer_commits_drained: Condvar,
+    /// One incarnation-wide root bounds every queued generation, including
+    /// old work that has not yet observed retirement and a newly activated
+    /// successor. Leases themselves remain bound to one exact generation.
+    outbound_budget: Arc<ClientOutboundBudget>,
     /// Hot-path mirror. Zero means that external RPC admission is disabled.
     live_generation: AtomicU64,
     /// Ambient user/workflow admission is enabled only after this physical
@@ -1426,6 +1777,7 @@ impl RpcTransportState {
                 render_connection_identity: None,
             }),
             consumer_commits_drained: Condvar::new(),
+            outbound_budget: Arc::new(ClientOutboundBudget::default()),
             live_generation: AtomicU64::new(generation.get()),
             ready_generation: AtomicU64::new(0),
             next_attempt_id: AtomicU64::new(1),
@@ -1434,6 +1786,13 @@ impl RpcTransportState {
             terminal_reader_wake_rx,
             topology_sync: futures::lock::Mutex::new(()),
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_outbound_budget_limits(limits: ClientOutboundBudgetLimits) -> Self {
+        let mut state = Self::new();
+        state.outbound_budget = Arc::new(ClientOutboundBudget::with_limits(limits));
+        state
     }
 
     fn allocate_monotonic(counter: &AtomicU64) -> Result<NonZeroU64, u64> {
@@ -1969,7 +2328,8 @@ enum TopologySnapshotDecisionAck {
 enum ReaderMessage {
     SendPdu {
         binding: RpcBinding,
-        pdu: Box<Pdu>,
+        prepared: Box<OwnedPreparedPduOutbound>,
+        lease: ClientOutboundLease,
         promise: Sender<anyhow::Result<Pdu>>,
     },
     PublishReady {
@@ -2422,6 +2782,9 @@ impl RpcGenerationScope {
         let sender = self.sender.clone();
         let scoped_generation = self.generation;
         let allow_unready = self.allow_unready;
+        // Cheap generation/dialect validation precedes potentially large
+        // schema counting. The second validation cut below closes a retirement
+        // race while the immutable PDU was being measured.
         let attempt = rpc_transport.allocate_attempt(request);
         let binding: anyhow::Result<RpcBinding> =
             attempt.map_err(anyhow::Error::new).and_then(|attempt_id| {
@@ -2477,16 +2840,115 @@ impl RpcGenerationScope {
                     expected_response_ident,
                 })
             });
+        // Planning and the worst-case logical-byte reservation both happen
+        // synchronously, before this future can allocate a wire serial, touch
+        // the pending map, enter the queue, serialize, compress, or write.
+        let admission: anyhow::Result<(RpcBinding, OwnedPreparedPduOutbound, ClientOutboundLease)> =
+            binding.and_then(|binding| {
+                let prepared = pdu
+                    .prepare_outbound(
+                        PduProducer::Client,
+                        PduWireRole::Request,
+                        None,
+                        CompressionMode::Auto,
+                    )
+                    .map_err(anyhow::Error::new)?;
+                {
+                    let lifecycle = rpc_transport.lifecycle.lock();
+                    if !matches!(
+                        lifecycle.phase,
+                        RpcTransportPhase::Live(observed) if observed == binding.generation
+                    ) || rpc_transport.live_generation.load(AtomicOrdering::Acquire)
+                        != binding.generation.get()
+                        || (!allow_unready
+                            && rpc_transport.ready_generation.load(AtomicOrdering::Acquire)
+                                != binding.generation.get())
+                    {
+                        return Err(anyhow::Error::new(rpc_transport.retirement_error(
+                            binding,
+                            RpcRetirementStage::Admission,
+                            RpcDeliveryCertainty::DefinitelyNotSent,
+                            "exact-generation RPC retired while its outbound PDU was being planned",
+                        )));
+                    }
+                    lifecycle
+                        .protocol_for(binding.generation)
+                        .and_then(|protocol| {
+                            protocol.validate_outbound_pdu(
+                                prepared.pdu(),
+                                RpcOutboundAdmissionPoint::Preflight,
+                            )
+                        })
+                        .map_err(|error| {
+                            record_ordinary_mux_protocol_rejection(&error, "outbound", "preflight");
+                            anyhow::Error::new(error)
+                        })?;
+                }
+                let lease = rpc_transport
+                    .outbound_budget
+                    .try_reserve(binding.generation, prepared.plan())
+                    .map_err(anyhow::Error::new)?;
+                // The reservation emits metrics, so it deliberately runs with
+                // no lifecycle lock held. Revalidate once more before handing
+                // the exact-generation lease to the lazy future; a concurrent
+                // retirement releases this lease without queue/codec effects.
+                let final_validation = {
+                    let lifecycle = rpc_transport.lifecycle.lock();
+                    if !matches!(
+                        lifecycle.phase,
+                        RpcTransportPhase::Live(observed) if observed == binding.generation
+                    ) || rpc_transport.live_generation.load(AtomicOrdering::Acquire)
+                        != binding.generation.get()
+                        || (!allow_unready
+                            && rpc_transport.ready_generation.load(AtomicOrdering::Acquire)
+                                != binding.generation.get())
+                    {
+                        Err(anyhow::Error::new(rpc_transport.retirement_error(
+                            binding,
+                            RpcRetirementStage::Admission,
+                            RpcDeliveryCertainty::DefinitelyNotSent,
+                            "exact-generation RPC retired during outbound budget admission",
+                        )))
+                    } else {
+                        lifecycle
+                            .protocol_for(binding.generation)
+                            .and_then(|protocol| {
+                                protocol.validate_outbound_pdu(
+                                    prepared.pdu(),
+                                    RpcOutboundAdmissionPoint::Preflight,
+                                )
+                            })
+                            .map_err(|error| {
+                                record_ordinary_mux_protocol_rejection(
+                                    &error,
+                                    "outbound",
+                                    "preflight",
+                                );
+                                anyhow::Error::new(error)
+                            })
+                    }
+                };
+                if let Err(error) = final_validation {
+                    drop(lease);
+                    return Err(error);
+                }
+                Ok((binding, prepared, lease))
+            });
         async move {
-            let binding = match binding {
-                Ok(binding) => binding,
+            let (binding, prepared, lease) = match admission {
+                Ok(admission) => admission,
                 Err(error) => return Err(error),
             };
+            // Once the request enters the physical queue, dropping the caller
+            // future cancels and settles the reservation only while the reader
+            // has not claimed it. After that claim, the reader retains the
+            // budget through encoding and completed write/flush teardown.
+            let cancellation_guard = lease.cancellation_guard();
             let (promise, rx) = bounded(1);
             // Hold the short admission gate through the nonblocking enqueue.
             // Retirement takes the same gate before publishing Reconnecting,
             // so bind-then-enqueue cannot straddle transport generations.
-            {
+            let rejected_message = {
                 let mut lifecycle = rpc_transport.lifecycle.lock();
                 if !matches!(
                     lifecycle.phase,
@@ -2504,33 +2966,39 @@ impl RpcGenerationScope {
                         "bound RPC was first polled after its transport retired",
                     )));
                 }
-                let transition = lifecycle
+                let protocol = lifecycle
                     .protocol_for_mut(binding.generation)
-                    .and_then(|protocol| protocol.admit_outbound(&pdu))
-                    .map_err(|error| {
-                        record_ordinary_mux_protocol_rejection(&error, "outbound", "enqueue");
-                        anyhow::Error::new(error)
-                    })?;
-                if let Err(TrySendError::Closed(_) | TrySendError::Full(_)) =
-                    sender.try_send(ReaderMessage::SendPdu {
-                        binding,
-                        pdu: Box::new(pdu),
-                        promise,
-                    })
-                {
-                    lifecycle
-                        .protocol_for_mut(binding.generation)
-                        .map_err(anyhow::Error::new)?
-                        .rollback_outbound(transition);
-                    return Err(anyhow::Error::new(rpc_transport.retirement_error(
-                        binding,
-                        RpcRetirementStage::Enqueue,
-                        RpcDeliveryCertainty::DefinitelyNotSent,
-                        "RPC queue was unavailable during exact-generation admission",
-                    )));
+                    .map_err(anyhow::Error::new)?;
+                let transition = protocol.admit_outbound(prepared.pdu()).map_err(|error| {
+                    record_ordinary_mux_protocol_rejection(&error, "outbound", "enqueue");
+                    anyhow::Error::new(error)
+                })?;
+                match sender.try_send(ReaderMessage::SendPdu {
+                    binding,
+                    prepared: Box::new(prepared),
+                    lease,
+                    promise,
+                }) {
+                    Ok(()) => None,
+                    Err(TrySendError::Closed(message) | TrySendError::Full(message)) => {
+                        protocol.rollback_outbound(transition);
+                        Some(message)
+                    }
                 }
+            };
+            if let Some(message) = rejected_message {
+                // Dropping the rejected queue node releases its byte/slot
+                // lease and emits metrics. Keep both operations outside the
+                // lifecycle critical section.
+                drop(message);
+                return Err(anyhow::Error::new(rpc_transport.retirement_error(
+                    binding,
+                    RpcRetirementStage::Enqueue,
+                    RpcDeliveryCertainty::DefinitelyNotSent,
+                    "RPC queue was unavailable during exact-generation admission",
+                )));
             }
-            match rx.recv().await {
+            let result = match rx.recv().await {
                 Ok(Ok(pdu)) => {
                     rpc_transport
                         .validate(
@@ -2552,7 +3020,9 @@ impl RpcGenerationScope {
                     RpcDeliveryCertainty::OutcomeUnknown,
                     "RPC completion channel closed without a terminal result",
                 ))),
-            }
+            };
+            drop(cancellation_guard);
+            result
         }
     }
 
@@ -5978,9 +6448,15 @@ async fn client_thread_async(
                 }
                 NextEvent::Message(Ok(ReaderMessage::SendPdu {
                     binding,
-                    pdu,
+                    prepared,
+                    lease,
                     promise,
                 })) => {
+                    if !lease.matches(binding, prepared.as_ref()) {
+                        return Err(anyhow!(
+                            "mux client outbound lease does not match its exact binding and PDU"
+                        ));
+                    }
                     if binding.generation != generation {
                         let error = dispatch_authority.rpc_transport.make_retirement_error(
                             binding,
@@ -6002,7 +6478,7 @@ async fn client_thread_async(
                     }
                     if let Err(error) = dispatch_authority
                         .rpc_transport
-                        .validate_dequeued_outbound(generation, &pdu)
+                        .validate_dequeued_outbound(generation, prepared.pdu())
                     {
                         record_ordinary_mux_protocol_rejection(
                             &error,
@@ -6019,17 +6495,30 @@ async fn client_thread_async(
                             }
                         }
                     }
-                    let effect = if matches!(pdu.as_ref(), Pdu::ListPanesCoherent(_)) {
+                    let effect = if matches!(prepared.pdu(), Pdu::ListPanesCoherent(_)) {
                         PendingRpcEffect::CoherentTopologyFence
                     } else {
                         PendingRpcEffect::Ordinary
                     };
+                    if !lease.claim_for_reader() {
+                        if !promise.is_closed() {
+                            bail!(
+                                "mux client outbound lease settled before reader claim while its \
+                                 completion channel remained open"
+                            );
+                        }
+                        dispatch_authority
+                            .rpc_transport
+                            .rollback_unadmitted_outbound(generation, prepared.pdu())
+                            .map_err(anyhow::Error::new)?;
+                        continue;
+                    }
                     let serial = match pending.admit(promise, binding, effect) {
                         Ok(Some(serial)) => serial,
                         Ok(None) => {
                             dispatch_authority
                                 .rpc_transport
-                                .rollback_unadmitted_outbound(generation, &pdu)
+                                .rollback_unadmitted_outbound(generation, prepared.pdu())
                                 .map_err(anyhow::Error::new)?;
                             continue;
                         }
@@ -6056,7 +6545,7 @@ async fn client_thread_async(
                     // Build the complete frame before touching the socket. Besides
                     // eliminating ambiguity at the encode boundary, this lets a
                     // retired request prove zero wire bytes before `write_all`.
-                    let frame = match pdu
+                    let frame = match (*prepared)
                         .encode_frame(serial.get())
                         .context("encoding a PDU frame to send to the server")
                     {
@@ -6109,6 +6598,12 @@ async fn client_thread_async(
                         return Err(anyhow::Error::new(error));
                     }
                     pending.set_stage(serial, RpcRetirementStage::AwaitingResponse)?;
+                    // The socket accepted and flushed the complete frame. No
+                    // codec-owned outbound bytes remain live after these two
+                    // owners drop; the pending reply retains only correlation
+                    // state and the caller's completion channel.
+                    drop(frame);
+                    drop(lease);
                 }
                 NextEvent::Message(Err(_)) => {
                     return Err(NotReconnectableError::ClientWasDestroyed.into());
@@ -7956,6 +8451,14 @@ impl Client {
 
     fn test_reader_message(&self, pdu: Pdu, promise: Sender<anyhow::Result<Pdu>>) -> ReaderMessage {
         let request = pdu.pdu_name();
+        let prepared = pdu
+            .prepare_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("test request should produce an owned outbound plan");
         let attempt_id = self
             .rpc_transport
             .allocate_attempt(request)
@@ -7964,6 +8467,11 @@ impl Client {
             .rpc_transport
             .active_generation()
             .expect("test RPC transport should be live");
+        let lease = self
+            .rpc_transport
+            .outbound_budget
+            .try_reserve(generation, prepared.plan())
+            .expect("test request should fit the client outbound budget");
         ReaderMessage::SendPdu {
             binding: RpcBinding {
                 generation,
@@ -7971,7 +8479,8 @@ impl Client {
                 request,
                 expected_response_ident: None,
             },
-            pdu: Box::new(pdu),
+            prepared: Box::new(prepared),
+            lease,
             promise,
         }
     }
@@ -8377,8 +8886,27 @@ mod tests {
     }
 
     fn client_with_idle_rpc_queue() -> (Client, Receiver<ReaderMessage>) {
+        client_with_idle_rpc_queue_and_limits(ClientOutboundBudgetLimits::default())
+    }
+
+    fn client_with_idle_rpc_queue_and_limits(
+        limits: ClientOutboundBudgetLimits,
+    ) -> (Client, Receiver<ReaderMessage>) {
         let (sender, receiver) = unbounded();
-        let rpc_transport = Arc::new(RpcTransportState::new());
+        client_with_rpc_queue_and_limits(sender, receiver, limits)
+    }
+
+    fn client_with_bounded_idle_rpc_queue(capacity: usize) -> (Client, Receiver<ReaderMessage>) {
+        let (sender, receiver) = bounded(capacity);
+        client_with_rpc_queue_and_limits(sender, receiver, ClientOutboundBudgetLimits::default())
+    }
+
+    fn client_with_rpc_queue_and_limits(
+        sender: Sender<ReaderMessage>,
+        receiver: Receiver<ReaderMessage>,
+        limits: ClientOutboundBudgetLimits,
+    ) -> (Client, Receiver<ReaderMessage>) {
+        let rpc_transport = Arc::new(RpcTransportState::new_with_outbound_budget_limits(limits));
         rpc_transport.mark_current_generation_ready_for_test();
         (
             Client {
@@ -8993,10 +9521,13 @@ mod tests {
                     .recv()
                     .await
                     .expect("a valid successor request must still enqueue");
-                let ReaderMessage::SendPdu { pdu, promise, .. } = message else {
+                let ReaderMessage::SendPdu {
+                    prepared, promise, ..
+                } = message
+                else {
                     panic!("valid successor must enqueue as a reader PDU");
                 };
-                assert!(matches!(pdu.as_ref(), Pdu::Ping(_)));
+                assert!(matches!(prepared.pdu(), Pdu::Ping(_)));
                 promise
                     .send(Ok(Pdu::Pong(Pong {})))
                     .await
@@ -9354,7 +9885,8 @@ mod tests {
 
         let ReaderMessage::SendPdu {
             binding,
-            pdu,
+            prepared,
+            lease,
             promise,
         } = receiver
             .try_recv()
@@ -9364,7 +9896,7 @@ mod tests {
         };
         client
             .rpc_transport
-            .validate_dequeued_outbound(generation, &pdu)
+            .validate_dequeued_outbound(generation, prepared.pdu())
             .expect("registration remains valid at its exact dequeue gate");
         let (metrics, probe) = RpcMetricProbe::new();
         let mut pending =
@@ -9380,8 +9912,9 @@ mod tests {
         assert_eq!(pending.highest_issued(), 0);
         client
             .rpc_transport
-            .rollback_unadmitted_outbound(generation, &pdu)
+            .rollback_unadmitted_outbound(generation, prepared.pdu())
             .expect("preclosed registration must roll its transition back");
+        drop(lease);
         assert_eq!(
             client
                 .rpc_transport
@@ -9401,7 +9934,8 @@ mod tests {
             async {
                 let ReaderMessage::SendPdu {
                     binding,
-                    pdu,
+                    prepared,
+                    lease: _lease,
                     promise,
                 } = receiver
                     .recv()
@@ -9410,7 +9944,7 @@ mod tests {
                 else {
                     panic!("replacement registration enqueued a non-PDU message");
                 };
-                assert!(matches!(pdu.as_ref(), Pdu::SetClientId(_)));
+                assert!(matches!(prepared.pdu(), Pdu::SetClientId(_)));
                 let response = Pdu::UnitResponse(UnitResponse {});
                 client
                     .rpc_transport
@@ -10888,6 +11422,229 @@ mod tests {
     }
 
     #[test]
+    fn client_outbound_budget_reserves_capacity_for_small_key_input() {
+        let normal = Pdu::ListPanes(ListPanes {})
+            .prepare_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("state-sync request should plan");
+        let key = Pdu::WriteToPane(WriteToPane {
+            pane_id: 1,
+            data: vec![b'k'],
+        })
+        .prepare_outbound(
+            PduProducer::Client,
+            PduWireRole::Request,
+            None,
+            CompressionMode::Auto,
+        )
+        .expect("one-byte key input should plan");
+        assert_eq!(normal.metadata().queue_qos, PduQueueQos::Normal);
+        assert_eq!(key.metadata().queue_qos, PduQueueQos::Interactive);
+
+        let total_codec_bytes = normal
+            .codec_peak_bytes()
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(key.codec_peak_bytes()))
+            .expect("small test plans should not overflow");
+        let budget = Arc::new(ClientOutboundBudget::with_limits(
+            ClientOutboundBudgetLimits {
+                total_codec_bytes,
+                noninteractive_codec_bytes: normal.codec_peak_bytes(),
+                total_slots: 3,
+                noninteractive_slots: 1,
+            },
+        ));
+        let generation = NonZeroU64::new(1).expect("test generation is nonzero");
+        let normal_lease = budget
+            .try_reserve(generation, normal.plan())
+            .expect("first noninteractive request should fill its lane");
+        let rejected = budget
+            .try_reserve(generation, normal.plan())
+            .expect_err("a second noninteractive request must not borrow the reserve");
+        assert_eq!(
+            rejected.limit,
+            ClientOutboundBudgetLimit::NoninteractiveCodecBytes
+        );
+        let key_lease = budget
+            .try_reserve(generation, key.plan())
+            .expect("small key input must retain reserved admission capacity");
+        let saturated = budget.snapshot();
+        assert_eq!(saturated.slots, 2);
+        assert_eq!(saturated.noninteractive_slots, 1);
+        assert_eq!(
+            saturated.noninteractive_codec_bytes,
+            normal.codec_peak_bytes()
+        );
+
+        drop(normal_lease);
+        drop(key_lease);
+        let released = budget.snapshot();
+        assert_eq!(released.codec_bytes, 0);
+        assert_eq!(released.noninteractive_codec_bytes, 0);
+        assert_eq!(released.slots, 0);
+        assert_eq!(released.noninteractive_slots, 0);
+        assert_eq!(released.peak_codec_bytes, saturated.codec_bytes);
+    }
+
+    #[test]
+    fn client_outbound_rejects_plan_before_serial_queue_or_codec_work() {
+        let ping = Pdu::Ping(Ping {})
+            .plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("ping should produce a reference plan");
+        let rejected_limit = ping
+            .codec_peak_bytes()
+            .checked_sub(1)
+            .expect("a ping plan should retain nonzero codec bytes");
+        let (client, receiver) =
+            client_with_idle_rpc_queue_and_limits(ClientOutboundBudgetLimits {
+                total_codec_bytes: rejected_limit,
+                noninteractive_codec_bytes: rejected_limit,
+                total_slots: 1,
+                noninteractive_slots: 1,
+            });
+        let serial_before = client
+            .rpc_transport
+            .next_wire_serial
+            .load(AtomicOrdering::Acquire);
+
+        let error = asupersync_block_on(client.ping())
+            .expect_err("a request above its aggregate byte envelope must fail closed");
+        assert!(matches!(
+            error.downcast_ref::<ClientOutboundAdmissionError>(),
+            Some(ClientOutboundAdmissionError {
+                ident: Ping::IDENT,
+                planned_codec_bytes,
+                limit: ClientOutboundBudgetLimit::TotalCodecBytes,
+            }) if *planned_codec_bytes == ping.codec_peak_bytes()
+        ));
+        assert_eq!(
+            error
+                .downcast_ref::<ClientOutboundAdmissionError>()
+                .expect("budget rejection should remain typed")
+                .delivery_certainty(),
+            RpcDeliveryCertainty::DefinitelyNotSent
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            client
+                .rpc_transport
+                .next_wire_serial
+                .load(AtomicOrdering::Acquire),
+            serial_before
+        );
+        assert_eq!(
+            client.rpc_transport.outbound_budget.snapshot(),
+            ClientOutboundBudgetState::default()
+        );
+    }
+
+    #[test]
+    fn unpolled_and_canceled_client_requests_release_one_exact_lease() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let serial_before = client
+            .rpc_transport
+            .next_wire_serial
+            .load(AtomicOrdering::Acquire);
+
+        let unpolled = client.ping();
+        let reserved = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(reserved.slots, 1);
+        assert!(reserved.codec_bytes > 0);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        drop(unpolled);
+        let released = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(released.slots, 0);
+        assert_eq!(released.codec_bytes, 0);
+
+        let canceled = admit_interactive_rpc_now(client.ping())
+            .expect("live request should enter the reader queue")
+            .expect("queued request should await a response");
+        assert_eq!(client.rpc_transport.outbound_budget.snapshot().slots, 1);
+        drop(canceled);
+        let canceled_released = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(canceled_released.slots, 0);
+        assert_eq!(canceled_released.codec_bytes, 0);
+        let message = receiver
+            .try_recv()
+            .expect("canceled request remains exactly once in the reader queue");
+        let ReaderMessage::SendPdu { promise, lease, .. } = &message else {
+            panic!("canceled request enqueued a non-PDU message");
+        };
+        assert!(promise.is_closed());
+        assert!(
+            !lease.claim_for_reader(),
+            "a pre-reader caller cancellation must revoke encoding authority"
+        );
+        drop(message);
+        assert_eq!(
+            client.rpc_transport.outbound_budget.snapshot(),
+            canceled_released,
+            "dropping the stale queue node must not settle its lease twice"
+        );
+        assert_eq!(
+            client
+                .rpc_transport
+                .next_wire_serial
+                .load(AtomicOrdering::Acquire),
+            serial_before,
+            "unpolled and pre-reader-canceled requests must not consume a serial"
+        );
+    }
+
+    #[test]
+    fn reader_claim_retains_outbound_budget_after_caller_abandonment() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let waiter = admit_interactive_rpc_now(client.ping())
+            .expect("live request should enter the reader queue")
+            .expect("queued request should await a response");
+        let ReaderMessage::SendPdu {
+            binding,
+            prepared,
+            lease,
+            promise,
+        } = receiver
+            .try_recv()
+            .expect("the reader should receive the admitted request")
+        else {
+            panic!("admitted request enqueued a non-PDU message");
+        };
+        assert!(lease.claim_for_reader());
+        drop(waiter);
+        assert!(promise.is_closed());
+        assert_eq!(
+            client.rpc_transport.outbound_budget.snapshot().slots,
+            1,
+            "caller abandonment must not release bytes owned by the active reader"
+        );
+
+        client
+            .rpc_transport
+            .rollback_unadmitted_outbound(binding.generation, prepared.pdu())
+            .expect("test reader claim should roll back its protocol transition");
+        drop(prepared);
+        drop(promise);
+        drop(lease);
+        let released = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(released.slots, 0);
+        assert_eq!(released.codec_bytes, 0);
+    }
+
+    #[test]
     fn interactive_rpc_admission_enqueues_now_and_awaits_without_blocking() {
         let (client, receiver) = client_with_idle_rpc_queue();
         let pending = admit_interactive_rpc_now(client.ping())
@@ -10897,10 +11654,16 @@ mod tests {
         let message = receiver
             .try_recv()
             .expect("interactive admission must enqueue during the caller's turn");
-        let ReaderMessage::SendPdu { pdu, promise, .. } = message else {
+        let ReaderMessage::SendPdu {
+            prepared,
+            lease: _lease,
+            promise,
+            ..
+        } = message
+        else {
             panic!("interactive admission enqueued a non-RPC reader message");
         };
-        assert!(matches!(*pdu, Pdu::Ping(Ping {})));
+        assert!(matches!(prepared.pdu(), Pdu::Ping(Ping {})));
         promise
             .try_send(Ok(Pdu::Pong(Pong {})))
             .expect("complete admitted interactive RPC");
@@ -10910,7 +11673,12 @@ mod tests {
     #[test]
     fn interactive_rpc_admission_reports_a_closed_queue_immediately() {
         let (client, receiver) = client_with_idle_rpc_queue();
+        let serial_before = client
+            .rpc_transport
+            .next_wire_serial
+            .load(AtomicOrdering::Acquire);
         let request = client.ping();
+        assert_eq!(client.rpc_transport.outbound_budget.snapshot().slots, 1);
         drop(receiver);
 
         let error = match admit_interactive_rpc_now(request) {
@@ -10925,6 +11693,65 @@ mod tests {
                 ..
             })
         ));
+        let released = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(released.slots, 0);
+        assert_eq!(released.codec_bytes, 0);
+        assert_eq!(
+            client
+                .rpc_transport
+                .next_wire_serial
+                .load(AtomicOrdering::Acquire),
+            serial_before,
+            "queue rejection must precede serial assignment"
+        );
+    }
+
+    #[test]
+    fn full_reader_queue_releases_only_the_rejected_request_lease() {
+        let (client, receiver) = client_with_bounded_idle_rpc_queue(1);
+        let serial_before = client
+            .rpc_transport
+            .next_wire_serial
+            .load(AtomicOrdering::Acquire);
+        let first = admit_interactive_rpc_now(client.ping())
+            .expect("first request should fill the one-slot queue")
+            .expect("first request should await a response");
+        assert_eq!(client.rpc_transport.outbound_budget.snapshot().slots, 1);
+
+        let error = match admit_interactive_rpc_now(client.ping()) {
+            Err(error) => error,
+            Ok(_) => panic!("second request must fail while the physical queue is full"),
+        };
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                stage: RpcRetirementStage::Enqueue,
+                certainty: RpcDeliveryCertainty::DefinitelyNotSent,
+                ..
+            })
+        ));
+        assert_eq!(
+            client.rpc_transport.outbound_budget.snapshot().slots,
+            1,
+            "queue failure must release the rejected lease without touching the incumbent"
+        );
+        assert_eq!(
+            client
+                .rpc_transport
+                .next_wire_serial
+                .load(AtomicOrdering::Acquire),
+            serial_before
+        );
+
+        drop(first);
+        drop(
+            receiver
+                .try_recv()
+                .expect("the incumbent request should remain queued exactly once"),
+        );
+        let released = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(released.slots, 0);
+        assert_eq!(released.codec_bytes, 0);
     }
 
     #[test]
@@ -10934,6 +11761,11 @@ mod tests {
         let first_generation_scope = client.rpc_scope();
 
         let bound_on_first = client.send_pdu(Pdu::Ping(Ping {}));
+        assert_eq!(
+            client.rpc_transport.outbound_budget.snapshot().slots,
+            1,
+            "synchronous planning must retain one exact unpolled lease"
+        );
         assert!(
             matches!(receiver.try_recv(), Err(async_channel::TryRecvError::Empty)),
             "constructing a bound RPC future must retain normal lazy-future semantics"
@@ -10958,6 +11790,11 @@ mod tests {
             receiver.try_recv(),
             Err(async_channel::TryRecvError::Empty)
         ));
+        assert_eq!(client.rpc_transport.outbound_budget.snapshot().slots, 0);
+        assert_eq!(
+            client.rpc_transport.outbound_budget.snapshot().codec_bytes,
+            0
+        );
 
         let during_reconnect = client.send_pdu(Pdu::Ping(Ping {}));
         let error = asupersync_block_on(during_reconnect)
@@ -11010,11 +11847,17 @@ mod tests {
             .rpc_transport
             .mark_current_generation_ready_for_test();
         let fresh_but_unpolled = client.send_pdu(Pdu::Ping(Ping {}));
+        assert_eq!(client.rpc_transport.outbound_budget.snapshot().slots, 1);
         assert!(matches!(
             receiver.try_recv(),
             Err(async_channel::TryRecvError::Empty)
         ));
         drop(fresh_but_unpolled);
+        assert_eq!(client.rpc_transport.outbound_budget.snapshot().slots, 0);
+        assert_eq!(
+            client.rpc_transport.outbound_budget.snapshot().codec_bytes,
+            0
+        );
     }
 
     #[test]
@@ -12433,6 +13276,18 @@ mod tests {
         let attempt_id = rpc_transport
             .allocate_attempt("inbound-protocol-transport-probe")
             .expect("test transport should allocate its probe attempt");
+        let prepared = Pdu::Ping(Ping {})
+            .prepare_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("inbound protocol probe should produce an outbound plan");
+        let lease = rpc_transport
+            .outbound_budget
+            .try_reserve(generation, prepared.plan())
+            .expect("inbound protocol probe should fit the outbound budget");
         sender
             .try_send(ReaderMessage::SendPdu {
                 binding: RpcBinding {
@@ -12441,7 +13296,8 @@ mod tests {
                     request: "inbound-protocol-transport-probe",
                     expected_response_ident: NonZeroU64::new(ident),
                 },
-                pdu: Box::new(Pdu::Ping(Ping {})),
+                prepared: Box::new(prepared),
+                lease,
                 promise: completion_tx,
             })
             .expect("queue inbound protocol transport probe");
@@ -13393,14 +14249,15 @@ mod tests {
                     .expect("version gate must issue one bootstrap RPC");
                 let ReaderMessage::SendPdu {
                     binding,
-                    pdu,
+                    prepared,
+                    lease: _lease,
                     promise,
                 } = first
                 else {
                     panic!("version gate must begin with GetCodecVersion");
                 };
                 assert_eq!(binding.request, "GetCodecVersion");
-                assert!(matches!(pdu.as_ref(), Pdu::GetCodecVersion(_)));
+                assert!(matches!(prepared.pdu(), Pdu::GetCodecVersion(_)));
                 promise
                     .send(Ok(Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
                         codec_vers: rejected_codec_version,

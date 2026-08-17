@@ -2731,6 +2731,57 @@ impl std::ops::Deref for PreparedPduOutbound<'_> {
     }
 }
 
+/// Owned exact-PDU capability for crossing a bounded transport queue.
+///
+/// Unlike [`PreparedPduOutbound`], this owner can be moved between threads
+/// without separating the immutable PDU from the plan measured from it.  It is
+/// intentionally neither `Clone` nor `Copy`: one admitted transport path owns
+/// one plan, one payload, and at most one frame construction attempt.
+#[must_use = "an owned prepared outbound PDU must be admitted, encoded, or rejected"]
+pub struct OwnedPreparedPduOutbound {
+    pdu: Pdu,
+    plan: PduOutboundPlan,
+}
+
+impl std::fmt::Debug for OwnedPreparedPduOutbound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedPreparedPduOutbound")
+            .field("pdu_name", &self.pdu.pdu_name())
+            .field("plan", &self.plan)
+            .finish()
+    }
+}
+
+impl OwnedPreparedPduOutbound {
+    #[must_use]
+    pub const fn pdu(&self) -> &Pdu {
+        &self.pdu
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> &PduOutboundPlan {
+        &self.plan
+    }
+
+    /// Consume the exact payload/plan pair and build one bounded frame.
+    ///
+    /// The caller still owns transport admission and serial reservation. This
+    /// method performs no queue, socket, or delivery-ledger side effect.
+    pub fn encode_frame(self, serial: u64) -> Result<Vec<u8>, PduOutboundEncodeError> {
+        let Self { pdu, plan } = self;
+        pdu.encode_frame_from_outbound_plan(serial, &plan)
+    }
+}
+
+impl std::ops::Deref for OwnedPreparedPduOutbound {
+    type Target = PduOutboundPlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
 /// Typed pre-allocation planning failure.
 ///
 /// Every variant has *definitely not sent* delivery certainty.  Planning does
@@ -3706,6 +3757,27 @@ macro_rules! pdu {
                     counted,
                 )?;
                 Ok(PreparedPduOutbound { pdu: self, plan })
+            }
+
+            /// Measure and retain one owned PDU for a later bounded transport
+            /// admission without allowing its plan to be paired with another
+            /// payload.
+            pub fn prepare_outbound(
+                self,
+                producer: PduProducer,
+                role: PduWireRole,
+                correlated_request: Option<&PduWireSpec>,
+                compression_mode: CompressionMode,
+            ) -> Result<OwnedPreparedPduOutbound, PduOutboundPlanError> {
+                let plan = self
+                    .plan_outbound(
+                        producer,
+                        role,
+                        correlated_request,
+                        compression_mode,
+                    )?
+                    .plan;
+                Ok(OwnedPreparedPduOutbound { pdu: self, plan })
             }
 
             fn encode_frame_from_outbound_plan(
@@ -21281,6 +21353,37 @@ mod test {
         let debug = format!("{prepared:?}");
         assert!(debug.contains("SendPaste"));
         assert!(!debug.contains(secret));
+    }
+
+    #[test]
+    fn owned_prepared_outbound_keeps_exact_payload_and_plan_together() {
+        let secret = "OWNED-OUTBOUND-MUST-NOT-LOG-THIS-CONTENT";
+        let pdu = Pdu::SendPaste(SendPaste {
+            pane_id: 13,
+            data: secret.repeat(64),
+            input_serial: InputSerial::from_millis_since_epoch(2),
+        });
+        let expected = pdu
+            .encode_frame_with_mode(OUTBOUND_PLAN_RESERVED_SERIAL, CompressionMode::Auto)
+            .expect("legacy encoder should accept the owned fixture");
+        let prepared = pdu
+            .prepare_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("paste should produce an owned exact-PDU plan");
+        assert!(matches!(prepared.pdu(), Pdu::SendPaste(_)));
+        let debug = format!("{prepared:?}");
+        assert!(debug.contains("SendPaste"));
+        assert!(!debug.contains(secret));
+        assert_eq!(
+            prepared
+                .encode_frame(OUTBOUND_PLAN_RESERVED_SERIAL)
+                .expect("owned exact-PDU plan should encode once"),
+            expected
+        );
     }
 
     #[test]
