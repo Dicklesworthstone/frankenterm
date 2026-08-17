@@ -6352,6 +6352,7 @@ mod tests {
             Some(admission),
         );
         tick_until_response(&executor, &captured, 2);
+        drain_simple_executor(&executor);
 
         assert_eq!(pane.key_down_count(), 1, "the key must be applied once");
         let events = freeze_trace_events(&recorder);
@@ -6430,6 +6431,7 @@ mod tests {
         executor
             .tick()
             .expect("run the one retired sampled-key task");
+        drain_simple_executor(&executor);
 
         assert_eq!(pane.key_down_count(), 0);
         assert!(
@@ -6894,6 +6896,19 @@ mod tests {
 
         let observed = captured.lock().unwrap().len();
         panic!("timed out waiting for {expected} response PDUs; saw {observed}");
+    }
+
+    fn drain_simple_executor(executor: &SimpleExecutor) {
+        for _ in 0..256 {
+            if !executor
+                .try_tick()
+                .expect("test scheduler queue must remain connected")
+            {
+                return;
+            }
+        }
+
+        panic!("test scheduler did not quiesce after 256 callbacks");
     }
 
     fn test_tab_size() -> TerminalSize {

@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_executor::Executor;
-use flume::{bounded, unbounded, Receiver};
+use flume::{Receiver, bounded, unbounded};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -375,6 +375,26 @@ impl SimpleExecutor {
         };
         Ok(())
     }
+
+    /// Run one queued callback without waiting for work to arrive.
+    ///
+    /// Test harnesses that install this executor must drain it on the same
+    /// thread before replacing the process-global schedulers. A queued local
+    /// runnable can contain thread-affine state, so allowing a later test
+    /// thread to drop the final scheduler sender would destroy that state on
+    /// the wrong thread.
+    pub fn try_tick(&self) -> anyhow::Result<bool> {
+        match self.rx.try_recv() {
+            Ok(func) => {
+                func();
+                Ok(true)
+            }
+            Err(flume::TryRecvError::Empty) => Ok(false),
+            Err(flume::TryRecvError::Disconnected) => {
+                anyhow::bail!("while polling for events: scheduler queue disconnected")
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -677,6 +697,24 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         let _exec = SimpleExecutor::default();
         assert!(is_scheduler_configured());
+    }
+
+    #[test]
+    fn simple_executor_try_tick_is_nonblocking_and_drains_one_callback() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = SimpleExecutor::new();
+        assert!(!exec.try_tick().expect("empty queue remains connected"));
+
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_by_task = Arc::clone(&observed);
+        let task = spawn_into_main_thread(async move {
+            observed_by_task.store(true, Ordering::Release);
+        });
+        task.detach();
+
+        assert!(exec.try_tick().expect("queued callback must run"));
+        assert!(observed.load(Ordering::Acquire));
+        assert!(!exec.try_tick().expect("drained queue remains connected"));
     }
 
     #[test]
