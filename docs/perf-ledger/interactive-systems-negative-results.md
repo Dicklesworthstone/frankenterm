@@ -4279,21 +4279,27 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   construct two recorder instances with the same nonzero epoch value.
 - **Decision:** live marker snapshots are always diagnostic and inexact. Each
   retained marker event yields an opaque prepared receipt containing a weak
-  exact-recorder witness around the numeric platform payload; `emit` rejects a
-  receipt from another allocation before adapter work or marker accounting.
+  exact-recorder witness around the numeric platform payload. The receipt is
+  neither `Clone` nor `Copy`, and `emit` consumes it, so one recorded event
+  cannot be replayed into multiple marker attempts. Its adapter payload has no
+  public extraction surface, preventing callers from invoking the otherwise
+  public sealed adapter method around emitter accounting. `emit` rejects a
+  receipt from another allocation before adapter work or marker accounting and
+  consumes that misrouted authority fail-closed.
   Terminal `finish` likewise accepts only the opaque `FrozenBatch` minted by
   the exact originating recorder allocation, verifies exact internal accounting
   and retained-event cardinality, and then seals marker admission. Weak
   allocation identities preserve exact-instance comparison without retaining
   a strong recorder or adding another heap allocation. Wrong-recorder receipts
-  and batches fail without mutating authority, so a correct call remains
-  possible.
+  and batches fail without mutating marker counters; a misrouted single-use
+  receipt is deliberately lost and therefore prevents terminal exact authority.
 - **Planted negatives:** a same-epoch prepared receipt and a same-epoch frozen
   batch from distinct recorder allocations are both rejected as
   `WrongRecorder`; exact adapter delivery paired with exhausted internal
-  accounting remains marker-inexact; only exact-receipt emissions followed by
-  the exact frozen batch with matching recorded cardinality can produce
-  terminal exact marker authority.
+  accounting remains marker-inexact; compile-time capability assertions reject
+  cloning or copying a prepared receipt; only single-use exact-receipt emissions
+  followed by the exact frozen batch with matching recorded cardinality can
+  produce terminal exact marker authority.
 - **Primary retry condition:**
   > Any future distributed marker reconciliation must bind an authenticated recorder-instance and frozen-batch digest, not a caller-provided count or reusable numeric epoch alone, before it can upgrade marker-assisted certification.
 

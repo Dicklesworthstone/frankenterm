@@ -67,20 +67,22 @@ pub struct PlatformMarkerPayload {
 /// identifier from cross-crediting marker attempts, while the adapter-facing
 /// payload remains fixed-size and numeric. The receipt is deliberately neither
 /// `Clone` nor `Copy`, and [`PlatformMarkerEmitter::emit`] consumes it, so one
-/// retained recorder event cannot request multiple platform emissions.
+/// retained recorder event cannot request multiple platform emissions. Its
+/// adapter payload is private: callers cannot bypass emitter accounting by
+/// invoking a target adapter directly.
+///
+/// ```compile_fail
+/// use frankenterm_flight_recorder::platform_markers::PreparedPlatformMarker;
+///
+/// fn bypass_emitter_accounting(receipt: &PreparedPlatformMarker) {
+///     let _payload = receipt.payload();
+/// }
+/// ```
 #[must_use = "emit the prepared marker or explicitly discard it"]
 #[derive(Debug)]
 pub struct PreparedPlatformMarker {
     recorder_identity: Weak<FlightRecorder>,
     payload: PlatformMarkerPayload,
-}
-
-impl PreparedPlatformMarker {
-    /// Return the fixed numeric payload for diagnostics and target adapters.
-    #[must_use]
-    pub const fn payload(&self) -> PlatformMarkerPayload {
-        self.payload
-    }
 }
 
 impl PlatformMarkerPayload {
@@ -1072,7 +1074,7 @@ mod tests {
         assert_not_impl_any!(PreparedPlatformMarker: Clone, Copy);
         let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
         let prepared = recorded_payload(&recorder);
-        let payload = prepared.payload();
+        let payload = prepared.payload;
         assert_eq!(payload.static_name(), KEYPRESS_STAGE_MARKER_NAME);
         assert_eq!(payload.span_id(), 17);
         assert_eq!(payload.identity_words()[3], 17);
@@ -1147,6 +1149,10 @@ mod tests {
         }
 
         let off_recorder = test_recorder(RecorderMode::Off);
+        // Prepare the marker receipt before the explicit producer below claims
+        // this recorder's sole test shard. The handle intentionally keeps that
+        // claim until the off-mode cross-recorder assertion completes.
+        let off_payload = recorded_payload(&marker_recorder);
         let (foreign_producer, foreign_token, foreign_fields) = event_parts(&marker_recorder);
         let (outcome, prepared) = off_recorder
             .record_and_prepare_platform_marker(&foreign_producer, foreign_token, &foreign_fields)
@@ -1160,7 +1166,7 @@ mod tests {
             },
         );
         assert_eq!(
-            off_emitter.emit(recorded_payload(&marker_recorder)),
+            off_emitter.emit(off_payload),
             PlatformMarkerOutcome::NotRequested
         );
         assert_eq!(off_calls.load(Ordering::Relaxed), 0);
@@ -1186,7 +1192,7 @@ mod tests {
             recorder_identity: recorder.identity.clone(),
             payload: PlatformMarkerPayload {
                 local_epoch_id: RecorderEpochId::new(99, 100).expect("foreign epoch is valid"),
-                ..prepared.payload()
+                ..prepared.payload
             },
         };
         let (emitter, calls) = emitter(
@@ -1427,7 +1433,7 @@ mod tests {
         let worker_emitter = Arc::clone(&emitter);
         let post_close_payload = PreparedPlatformMarker {
             recorder_identity: recorder.identity.clone(),
-            payload: payload.payload(),
+            payload: payload.payload,
         };
         let worker = thread::spawn(move || worker_emitter.emit(payload));
         entered.wait();
@@ -1546,7 +1552,7 @@ mod tests {
 
         let recorder = test_recorder(RecorderMode::CertificationWithMarkers);
         let prepared = recorded_payload(&recorder);
-        let payload = prepared.payload();
+        let payload = prepared.payload;
         let adjacent_producer = PlatformMarkerPayload {
             producer_shard_index: payload.producer_shard_index + 1,
             ..payload
