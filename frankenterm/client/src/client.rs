@@ -473,6 +473,7 @@ impl ClientOutboundBudget {
         prepared: OwnedPreparedPduOutbound,
     ) -> Result<ClientOutboundLease, ClientOutboundAdmissionError> {
         let metadata = prepared.metadata();
+        let request = prepared.pdu().pdu_name();
         let noninteractive = matches!(metadata.queue_qos, PduQueueQos::Normal | PduQueueQos::Bulk);
         let planned_codec_bytes = prepared.codec_peak_bytes();
         let reservation = {
@@ -506,6 +507,15 @@ impl ClientOutboundBudget {
             "limit" => "none",
         )
         .increment(1);
+        metrics::counter!(
+            "mux.client.outbound.codec_bytes.total",
+            "outcome" => "reserved",
+            "qos" => client_outbound_qos_label(metadata.queue_qos),
+        )
+        .increment(
+            u64::try_from(planned_codec_bytes)
+                .expect("bounded client outbound codec bytes fit in u64"),
+        );
         Ok(ClientOutboundLease {
             state: Arc::new(ClientOutboundLeaseState {
                 phase: AtomicU8::new(ClientOutboundLeasePhase::Queued as u8),
@@ -513,6 +523,7 @@ impl ClientOutboundBudget {
                 budget: Arc::clone(self),
                 rpc_transport,
                 generation,
+                request,
                 ident: prepared.ident(),
                 planned_codec_bytes,
                 noninteractive,
@@ -542,7 +553,15 @@ const fn client_outbound_qos_label(qos: PduQueueQos) -> &'static str {
 enum ClientOutboundLeasePhase {
     Queued = 0,
     ReaderOwned = 1,
-    Settled = 2,
+    CanceledQueued = 2,
+    Settled = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientOutboundRelease {
+    Full,
+    PayloadOnly,
+    ShellOnly,
 }
 
 struct ClientOutboundLeaseState {
@@ -551,6 +570,7 @@ struct ClientOutboundLeaseState {
     budget: Arc<ClientOutboundBudget>,
     rpc_transport: Weak<RpcTransportState>,
     generation: NonZeroU64,
+    request: &'static str,
     ident: u64,
     planned_codec_bytes: usize,
     noninteractive: bool,
@@ -559,35 +579,56 @@ struct ClientOutboundLeaseState {
 }
 
 impl ClientOutboundLeaseState {
-    fn release_budget(&self) {
+    fn release_budget(&self, release: ClientOutboundRelease) {
+        let bytes = release != ClientOutboundRelease::ShellOnly;
+        let slots = release != ClientOutboundRelease::PayloadOnly;
         {
             let mut state = self.budget.state.lock();
-            state.codec_bytes = state
-                .codec_bytes
-                .checked_sub(self.planned_codec_bytes)
-                .expect("client outbound logical-codec reservation underflow");
-            state.slots = state
-                .slots
-                .checked_sub(1)
-                .expect("client outbound slot reservation underflow");
-            if self.noninteractive {
+            if bytes {
+                state.codec_bytes = state
+                    .codec_bytes
+                    .checked_sub(self.planned_codec_bytes)
+                    .expect("client outbound logical-codec reservation underflow");
+            }
+            if slots {
+                state.slots = state
+                    .slots
+                    .checked_sub(1)
+                    .expect("client outbound slot reservation underflow");
+            }
+            if bytes && self.noninteractive {
                 state.noninteractive_codec_bytes = state
                     .noninteractive_codec_bytes
                     .checked_sub(self.planned_codec_bytes)
                     .expect("client outbound noninteractive-byte reservation underflow");
+            }
+            if slots && self.noninteractive {
                 state.noninteractive_slots = state
                     .noninteractive_slots
                     .checked_sub(1)
                     .expect("client outbound noninteractive-slot reservation underflow");
             }
         }
-        metrics::counter!(
-            "mux.client.outbound.admission.total",
-            "outcome" => "released",
-            "qos" => client_outbound_qos_label(self.qos),
-            "limit" => "none",
-        )
-        .increment(1);
+        if bytes {
+            metrics::counter!(
+                "mux.client.outbound.codec_bytes.total",
+                "outcome" => "released",
+                "qos" => client_outbound_qos_label(self.qos),
+            )
+            .increment(
+                u64::try_from(self.planned_codec_bytes)
+                    .expect("bounded client outbound codec bytes fit in u64"),
+            );
+        }
+        if release != ClientOutboundRelease::PayloadOnly {
+            metrics::counter!(
+                "mux.client.outbound.admission.total",
+                "outcome" => "released",
+                "qos" => client_outbound_qos_label(self.qos),
+                "limit" => "none",
+            )
+            .increment(1);
+        }
     }
 
     fn rollback_protocol_if_armed(&self) {
@@ -608,13 +649,12 @@ impl ClientOutboundLeaseState {
         }
     }
 
-    fn finish_queued_settlement(&self) {
+    fn discard_queued_payload(&self) {
         // A canceled queue node retains only its tiny lease/control shell. The
         // potentially large PDU owner is destroyed before its budget is made
         // available to another request.
         drop(self.prepared.lock().take());
         self.rollback_protocol_if_armed();
-        self.release_budget();
     }
 
     fn cancel_if_queued(&self) {
@@ -622,13 +662,14 @@ impl ClientOutboundLeaseState {
             .phase
             .compare_exchange(
                 ClientOutboundLeasePhase::Queued as u8,
-                ClientOutboundLeasePhase::Settled as u8,
+                ClientOutboundLeasePhase::CanceledQueued as u8,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
             )
             .is_ok()
         {
-            self.finish_queued_settlement();
+            self.discard_queued_payload();
+            self.release_budget(ClientOutboundRelease::PayloadOnly);
         }
     }
 
@@ -645,12 +686,16 @@ impl ClientOutboundLeaseState {
         {
             return Ok(None);
         }
-        self.rollback_armed.store(false, AtomicOrdering::Release);
-        self.prepared
-            .lock()
-            .take()
-            .map(Some)
-            .ok_or_else(|| anyhow!("mux client outbound reader claim lost its exact PDU owner"))
+        let prepared = self.prepared.lock().take();
+        if let Some(prepared) = prepared {
+            self.rollback_armed.store(false, AtomicOrdering::Release);
+            Ok(Some(prepared))
+        } else {
+            self.rollback_protocol_if_armed();
+            Err(anyhow!(
+                "mux client outbound reader claim lost its exact PDU owner"
+            ))
+        }
     }
 
     fn settle(&self) {
@@ -660,9 +705,12 @@ impl ClientOutboundLeaseState {
         );
         if prior != ClientOutboundLeasePhase::Settled as u8 {
             if prior == ClientOutboundLeasePhase::Queued as u8 {
-                self.finish_queued_settlement();
+                self.discard_queued_payload();
+                self.release_budget(ClientOutboundRelease::Full);
+            } else if prior == ClientOutboundLeasePhase::CanceledQueued as u8 {
+                self.release_budget(ClientOutboundRelease::ShellOnly);
             } else {
-                self.release_budget();
+                self.release_budget(ClientOutboundRelease::Full);
             }
         }
     }
@@ -687,6 +735,7 @@ impl std::fmt::Debug for ClientOutboundLease {
         formatter
             .debug_struct("ClientOutboundLease")
             .field("generation", &self.state.generation)
+            .field("request", &self.state.request)
             .field("ident", &self.state.ident)
             .field("planned_codec_bytes", &self.state.planned_codec_bytes)
             .field("qos", &self.state.qos)
@@ -702,7 +751,7 @@ impl ClientOutboundLease {
     }
 
     fn matches(&self, binding: RpcBinding) -> bool {
-        self.state.generation == binding.generation
+        self.state.generation == binding.generation && self.state.request == binding.request
     }
 
     fn with_prepared<T>(
@@ -710,21 +759,23 @@ impl ClientOutboundLease {
         operation: impl FnOnce(&OwnedPreparedPduOutbound) -> T,
     ) -> anyhow::Result<T> {
         let prepared = self.state.prepared.lock();
-        let prepared = prepared
-            .as_deref()
-            .ok_or_else(|| anyhow!("mux client outbound lease lost its exact PDU before enqueue"))?;
+        let prepared = prepared.as_deref().ok_or_else(|| {
+            anyhow!("mux client outbound lease lost its exact PDU before enqueue")
+        })?;
         Ok(operation(prepared))
     }
 
     fn arm_protocol_rollback(&self) {
-        self.state
-            .rollback_armed
-            .store(true, AtomicOrdering::Release);
+        if self.state.ident == <GetCodecVersion as PduWireIdent>::IDENT
+            || self.state.ident == <SetClientId as PduWireIdent>::IDENT
+        {
+            self.state
+                .rollback_armed
+                .store(true, AtomicOrdering::Release);
+        }
     }
 
-    fn claim_for_reader(
-        &self,
-    ) -> anyhow::Result<Option<Box<OwnedPreparedPduOutbound>>> {
+    fn claim_for_reader(&self) -> anyhow::Result<Option<Box<OwnedPreparedPduOutbound>>> {
         self.state.claim_for_reader()
     }
 }
@@ -2965,11 +3016,7 @@ impl RpcGenerationScope {
                 }
                 let lease = rpc_transport
                     .outbound_budget
-                    .try_reserve(
-                        Arc::downgrade(&rpc_transport),
-                        binding.generation,
-                        prepared,
-                    )
+                    .try_reserve(Arc::downgrade(&rpc_transport), binding.generation, prepared)
                     .map_err(anyhow::Error::new)?;
                 Ok((binding, lease))
             });
@@ -9555,12 +9602,13 @@ mod tests {
                     .recv()
                     .await
                     .expect("a valid successor request must still enqueue");
-                let ReaderMessage::SendPdu {
-                    prepared, promise, ..
-                } = message
-                else {
+                let ReaderMessage::SendPdu { lease, promise, .. } = message else {
                     panic!("valid successor must enqueue as a reader PDU");
                 };
+                let prepared = lease
+                    .claim_for_reader()
+                    .expect("valid successor reader claim should remain coherent")
+                    .expect("valid successor request must retain its exact PDU");
                 assert!(matches!(prepared.pdu(), Pdu::Ping(_)));
                 promise
                     .send(Ok(Pdu::Pong(Pong {})))
@@ -9917,37 +9965,24 @@ mod tests {
         );
         drop(registration);
 
-        let ReaderMessage::SendPdu {
-            binding,
-            prepared,
-            lease,
-            promise,
-        } = receiver
+        let ReaderMessage::SendPdu { lease, promise, .. } = receiver
             .try_recv()
             .expect("registration must traverse the real reader queue")
         else {
             panic!("registration enqueued a non-PDU reader message");
         };
-        client
-            .rpc_transport
-            .validate_dequeued_outbound(generation, prepared.pdu())
-            .expect("registration remains valid at its exact dequeue gate");
-        let (metrics, probe) = RpcMetricProbe::new();
-        let mut pending =
-            PendingReplies::new(metrics, generation, Arc::clone(&client.rpc_transport));
-        assert_eq!(
-            pending
-                .admit(promise, binding, PendingRpcEffect::Ordinary)
-                .expect("preclosed dequeue is a normal admission disposition"),
-            None
+        assert!(promise.is_closed());
+        assert!(
+            lease.state.prepared.lock().is_none(),
+            "pre-reader cancellation must drop the potentially large queued PDU immediately"
         );
-        assert_eq!(RpcMetricProbe::counter(&probe.preclosed), 1);
-        assert_eq!(probe.pending(), 0.0);
-        assert_eq!(pending.highest_issued(), 0);
-        client
-            .rpc_transport
-            .rollback_unadmitted_outbound(generation, prepared.pdu())
-            .expect("preclosed registration must roll its transition back");
+        assert!(
+            lease
+                .claim_for_reader()
+                .expect("canceled registration lease state should remain valid")
+                .is_none(),
+            "pre-reader cancellation must destroy the queued PDU owner"
+        );
         drop(lease);
         assert_eq!(
             client
@@ -9968,8 +10003,7 @@ mod tests {
             async {
                 let ReaderMessage::SendPdu {
                     binding,
-                    prepared,
-                    lease: _lease,
+                    lease,
                     promise,
                 } = receiver
                     .recv()
@@ -9978,6 +10012,10 @@ mod tests {
                 else {
                     panic!("replacement registration enqueued a non-PDU message");
                 };
+                let prepared = lease
+                    .claim_for_reader()
+                    .expect("replacement registration reader claim should remain coherent")
+                    .expect("replacement registration must retain its exact PDU");
                 assert!(matches!(prepared.pdu(), Pdu::SetClientId(_)));
                 let response = Pdu::UnitResponse(UnitResponse {});
                 client
@@ -10004,7 +10042,6 @@ mod tests {
                 .phase,
             RpcProtocolPhase::Established
         );
-        probe.assert_balanced();
     }
 
     #[test]
@@ -11457,14 +11494,17 @@ mod tests {
 
     #[test]
     fn client_outbound_budget_reserves_capacity_for_small_key_input() {
-        let normal = Pdu::ListPanes(ListPanes {})
-            .prepare_outbound(
-                PduProducer::Client,
-                PduWireRole::Request,
-                None,
-                CompressionMode::Auto,
-            )
-            .expect("state-sync request should plan");
+        let prepare_normal = || {
+            Pdu::ListPanes(ListPanes {})
+                .prepare_outbound(
+                    PduProducer::Client,
+                    PduWireRole::Request,
+                    None,
+                    CompressionMode::Auto,
+                )
+                .expect("state-sync request should plan")
+        };
+        let normal = prepare_normal();
         let key = Pdu::WriteToPane(WriteToPane {
             pane_id: 1,
             data: vec![b'k'],
@@ -11478,41 +11518,38 @@ mod tests {
         .expect("one-byte key input should plan");
         assert_eq!(normal.metadata().queue_qos, PduQueueQos::Normal);
         assert_eq!(key.metadata().queue_qos, PduQueueQos::Interactive);
+        let normal_codec_bytes = normal.codec_peak_bytes();
 
-        let total_codec_bytes = normal
-            .codec_peak_bytes()
+        let total_codec_bytes = normal_codec_bytes
             .checked_mul(2)
             .and_then(|bytes| bytes.checked_add(key.codec_peak_bytes()))
             .expect("small test plans should not overflow");
         let budget = Arc::new(ClientOutboundBudget::with_limits(
             ClientOutboundBudgetLimits {
                 total_codec_bytes,
-                noninteractive_codec_bytes: normal.codec_peak_bytes(),
+                noninteractive_codec_bytes: normal_codec_bytes,
                 total_slots: 3,
                 noninteractive_slots: 1,
             },
         ));
         let generation = NonZeroU64::new(1).expect("test generation is nonzero");
         let normal_lease = budget
-            .try_reserve(generation, normal.plan())
+            .try_reserve(Weak::new(), generation, normal)
             .expect("first noninteractive request should fill its lane");
         let rejected = budget
-            .try_reserve(generation, normal.plan())
+            .try_reserve(Weak::new(), generation, prepare_normal())
             .expect_err("a second noninteractive request must not borrow the reserve");
         assert_eq!(
             rejected.limit,
             ClientOutboundBudgetLimit::NoninteractiveCodecBytes
         );
         let key_lease = budget
-            .try_reserve(generation, key.plan())
+            .try_reserve(Weak::new(), generation, key)
             .expect("small key input must retain reserved admission capacity");
         let saturated = budget.snapshot();
         assert_eq!(saturated.slots, 2);
         assert_eq!(saturated.noninteractive_slots, 1);
-        assert_eq!(
-            saturated.noninteractive_codec_bytes,
-            normal.codec_peak_bytes()
-        );
+        assert_eq!(saturated.noninteractive_codec_bytes, normal_codec_bytes);
 
         drop(normal_lease);
         drop(key_lease);
@@ -11610,9 +11647,9 @@ mod tests {
             .expect("queued request should await a response");
         assert_eq!(client.rpc_transport.outbound_budget.snapshot().slots, 1);
         drop(canceled);
-        let canceled_released = client.rpc_transport.outbound_budget.snapshot();
-        assert_eq!(canceled_released.slots, 0);
-        assert_eq!(canceled_released.codec_bytes, 0);
+        let canceled_payload_released = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(canceled_payload_released.slots, 1);
+        assert_eq!(canceled_payload_released.codec_bytes, 0);
         let message = receiver
             .try_recv()
             .expect("canceled request remains exactly once in the reader queue");
@@ -11621,14 +11658,23 @@ mod tests {
         };
         assert!(promise.is_closed());
         assert!(
-            !lease.claim_for_reader(),
+            lease.state.prepared.lock().is_none(),
+            "pre-reader cancellation must drop the potentially large queued PDU immediately"
+        );
+        assert!(
+            lease
+                .claim_for_reader()
+                .expect("canceled reader claim state should remain coherent")
+                .is_none(),
             "a pre-reader caller cancellation must revoke encoding authority"
         );
         drop(message);
+        let canceled_fully_released = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(canceled_fully_released.slots, 0);
+        assert_eq!(canceled_fully_released.codec_bytes, 0);
         assert_eq!(
-            client.rpc_transport.outbound_budget.snapshot(),
-            canceled_released,
-            "dropping the stale queue node must not settle its lease twice"
+            canceled_fully_released.peak_codec_bytes, canceled_payload_released.peak_codec_bytes,
+            "dropping the stale queue shell must not settle its byte lease twice"
         );
         assert_eq!(
             client
@@ -11641,6 +11687,65 @@ mod tests {
     }
 
     #[test]
+    fn canceled_queue_shells_remain_count_bounded_after_payload_release() {
+        let ping_plan = Pdu::Ping(Ping {})
+            .plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("ping should produce a reference plan");
+        let (client, receiver) =
+            client_with_idle_rpc_queue_and_limits(ClientOutboundBudgetLimits {
+                total_codec_bytes: ping_plan
+                    .codec_peak_bytes()
+                    .checked_mul(3)
+                    .expect("three ping plans fit in the test byte budget"),
+                noninteractive_codec_bytes: ping_plan
+                    .codec_peak_bytes()
+                    .checked_mul(3)
+                    .expect("three ping plans fit in the noninteractive test budget"),
+                total_slots: 2,
+                noninteractive_slots: 2,
+            });
+        let first = admit_interactive_rpc_now(client.ping())
+            .expect("first ping should enter the queue")
+            .expect("first ping should await a response");
+        let second = admit_interactive_rpc_now(client.ping())
+            .expect("second ping should enter the queue")
+            .expect("second ping should await a response");
+        drop(first);
+        drop(second);
+        let canceled = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(canceled.codec_bytes, 0);
+        assert_eq!(canceled.slots, 2);
+
+        let error = asupersync_block_on(client.ping())
+            .expect_err("canceled queue shells must continue to consume the count bound");
+        assert!(matches!(
+            error.downcast_ref::<ClientOutboundAdmissionError>(),
+            Some(ClientOutboundAdmissionError {
+                limit: ClientOutboundBudgetLimit::TotalSlots,
+                ..
+            })
+        ));
+        drop(
+            receiver
+                .try_recv()
+                .expect("first canceled queue shell should remain bounded and drainable"),
+        );
+        drop(
+            receiver
+                .try_recv()
+                .expect("second canceled queue shell should remain bounded and drainable"),
+        );
+        let drained = client.rpc_transport.outbound_budget.snapshot();
+        assert_eq!(drained.codec_bytes, 0);
+        assert_eq!(drained.slots, 0);
+    }
+
+    #[test]
     fn reader_claim_retains_outbound_budget_after_caller_abandonment() {
         let (client, receiver) = client_with_idle_rpc_queue();
         let waiter = admit_interactive_rpc_now(client.ping())
@@ -11648,7 +11753,6 @@ mod tests {
             .expect("queued request should await a response");
         let ReaderMessage::SendPdu {
             binding,
-            prepared,
             lease,
             promise,
         } = receiver
@@ -11657,7 +11761,10 @@ mod tests {
         else {
             panic!("admitted request enqueued a non-PDU message");
         };
-        assert!(lease.claim_for_reader());
+        let prepared = lease
+            .claim_for_reader()
+            .expect("active reader claim state should remain coherent")
+            .expect("active reader claim must retain the exact PDU");
         drop(waiter);
         assert!(promise.is_closed());
         assert_eq!(
@@ -11688,15 +11795,13 @@ mod tests {
         let message = receiver
             .try_recv()
             .expect("interactive admission must enqueue during the caller's turn");
-        let ReaderMessage::SendPdu {
-            prepared,
-            lease: _lease,
-            promise,
-            ..
-        } = message
-        else {
+        let ReaderMessage::SendPdu { lease, promise, .. } = message else {
             panic!("interactive admission enqueued a non-RPC reader message");
         };
+        let prepared = lease
+            .claim_for_reader()
+            .expect("interactive reader claim state should remain coherent")
+            .expect("interactive reader claim must retain the exact PDU");
         assert!(matches!(prepared.pdu(), Pdu::Ping(Ping {})));
         promise
             .try_send(Ok(Pdu::Pong(Pong {})))
@@ -13320,7 +13425,7 @@ mod tests {
             .expect("inbound protocol probe should produce an outbound plan");
         let lease = rpc_transport
             .outbound_budget
-            .try_reserve(generation, prepared.plan())
+            .try_reserve(Arc::downgrade(&rpc_transport), generation, prepared)
             .expect("inbound protocol probe should fit the outbound budget");
         sender
             .try_send(ReaderMessage::SendPdu {
@@ -13330,7 +13435,6 @@ mod tests {
                     request: "inbound-protocol-transport-probe",
                     expected_response_ident: NonZeroU64::new(ident),
                 },
-                prepared: Box::new(prepared),
                 lease,
                 promise: completion_tx,
             })
@@ -14283,13 +14387,16 @@ mod tests {
                     .expect("version gate must issue one bootstrap RPC");
                 let ReaderMessage::SendPdu {
                     binding,
-                    prepared,
-                    lease: _lease,
+                    lease,
                     promise,
                 } = first
                 else {
                     panic!("version gate must begin with GetCodecVersion");
                 };
+                let prepared = lease
+                    .claim_for_reader()
+                    .expect("version-gate reader claim should remain coherent")
+                    .expect("version-gate request must retain its exact PDU");
                 assert_eq!(binding.request, "GetCodecVersion");
                 assert!(matches!(prepared.pdu(), Pdu::GetCodecVersion(_)));
                 promise
