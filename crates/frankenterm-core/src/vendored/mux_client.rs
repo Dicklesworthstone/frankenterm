@@ -1251,10 +1251,7 @@ impl Drop for DirectMuxOutboundLease {
                 .expect("direct mux noninteractive request reservation underflow");
         }
         drop(state);
-        metrics::counter!(
-            "mux.direct_client.outbound.lease_release.total"
-        )
-        .increment(1);
+        metrics::counter!("mux.direct_client.outbound.lease_release.total").increment(1);
         metrics::counter!(
             "mux.direct_client.outbound.codec_bytes.total",
             "outcome" => "released"
@@ -5151,8 +5148,8 @@ mod tests {
     use crate::runtime_async::{CompatRuntime, Mutex, RuntimeBuilder, sleep};
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const COMPRESSED_MASK: u64 = 1 << 63;
 
@@ -7546,18 +7543,22 @@ mod tests {
         }
 
         run_async_test(async {
-            for case in [
+            for (case_index, case) in [
                 LocalSemanticCase::WrongLegacyPane,
                 LocalSemanticCase::WrongLivenessPane,
                 LocalSemanticCase::DeadPane,
                 LocalSemanticCase::RemovedBeforeLiveness,
                 LocalSemanticCase::UnexpectedPdu,
                 LocalSemanticCase::ErrorResponse,
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let temp_dir = tempfile::tempdir().expect("tempdir");
-                let socket_path = temp_dir
-                    .path()
-                    .join(format!("typed-sideband-semantic-{case:?}.sock"));
+                // Unix-domain socket paths have a small platform limit (108 bytes on
+                // Linux). Keep the leaf deliberately short because remote builders
+                // can provide a comparatively long temporary-directory prefix.
+                let socket_path = temp_dir.path().join(format!("s{case_index}.sock"));
                 let listener = compat_unix::bind(&socket_path)
                     .await
                     .expect("bind listener");
@@ -10947,8 +10948,7 @@ mod tests {
                 assert_eq!(budget.snapshot().codec_bytes, 0);
                 assert_eq!(budget.snapshot().requests, 0);
 
-                client.config.max_frame_bytes =
-                    crate::config::DEFAULT_VENDORED_MUX_MAX_FRAME_BYTES;
+                client.config.max_frame_bytes = crate::config::DEFAULT_VENDORED_MUX_MAX_FRAME_BYTES;
                 let follow_up_serial = client
                     .send_request_only_with_cx(&cx, Pdu::ListPanes(ListPanes {}))
                     .await
