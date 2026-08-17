@@ -468,12 +468,13 @@ impl ClientOutboundBudget {
 
     fn try_reserve(
         self: &Arc<Self>,
+        rpc_transport: Weak<RpcTransportState>,
         generation: NonZeroU64,
-        plan: &PduOutboundPlan,
+        prepared: OwnedPreparedPduOutbound,
     ) -> Result<ClientOutboundLease, ClientOutboundAdmissionError> {
-        let metadata = plan.metadata();
+        let metadata = prepared.metadata();
         let noninteractive = matches!(metadata.queue_qos, PduQueueQos::Normal | PduQueueQos::Bulk);
-        let planned_codec_bytes = plan.codec_peak_bytes();
+        let planned_codec_bytes = prepared.codec_peak_bytes();
         let reservation = {
             let mut state = self.state.lock();
             match self.checked_reservation_state(*state, planned_codec_bytes, noninteractive) {
@@ -493,7 +494,7 @@ impl ClientOutboundBudget {
             )
             .increment(1);
             return Err(ClientOutboundAdmissionError {
-                ident: plan.ident(),
+                ident: prepared.ident(),
                 planned_codec_bytes,
                 limit,
             });
@@ -508,12 +509,15 @@ impl ClientOutboundBudget {
         Ok(ClientOutboundLease {
             state: Arc::new(ClientOutboundLeaseState {
                 phase: AtomicU8::new(ClientOutboundLeasePhase::Queued as u8),
+                rollback_armed: AtomicBool::new(false),
                 budget: Arc::clone(self),
+                rpc_transport,
                 generation,
-                ident: plan.ident(),
+                ident: prepared.ident(),
                 planned_codec_bytes,
                 noninteractive,
                 qos: metadata.queue_qos,
+                prepared: ParkingMutex::new(Some(Box::new(prepared))),
             }),
         })
     }
@@ -543,12 +547,15 @@ enum ClientOutboundLeasePhase {
 
 struct ClientOutboundLeaseState {
     phase: AtomicU8,
+    rollback_armed: AtomicBool,
     budget: Arc<ClientOutboundBudget>,
+    rpc_transport: Weak<RpcTransportState>,
     generation: NonZeroU64,
     ident: u64,
     planned_codec_bytes: usize,
     noninteractive: bool,
     qos: PduQueueQos,
+    prepared: ParkingMutex<Option<Box<OwnedPreparedPduOutbound>>>,
 }
 
 impl ClientOutboundLeaseState {
@@ -583,6 +590,33 @@ impl ClientOutboundLeaseState {
         .increment(1);
     }
 
+    fn rollback_protocol_if_armed(&self) {
+        if !self.rollback_armed.swap(false, AtomicOrdering::AcqRel) {
+            return;
+        }
+        let Some(rpc_transport) = self.rpc_transport.upgrade() else {
+            return;
+        };
+        if rpc_transport
+            .rollback_unadmitted_outbound_ident(self.generation, self.ident)
+            .is_err()
+        {
+            log::trace!(
+                "discarding an outbound protocol rollback for retired mux RPC generation {}",
+                self.generation
+            );
+        }
+    }
+
+    fn finish_queued_settlement(&self) {
+        // A canceled queue node retains only its tiny lease/control shell. The
+        // potentially large PDU owner is destroyed before its budget is made
+        // available to another request.
+        drop(self.prepared.lock().take());
+        self.rollback_protocol_if_armed();
+        self.release_budget();
+    }
+
     fn cancel_if_queued(&self) {
         if self
             .phase
@@ -594,19 +628,29 @@ impl ClientOutboundLeaseState {
             )
             .is_ok()
         {
-            self.release_budget();
+            self.finish_queued_settlement();
         }
     }
 
-    fn claim_for_reader(&self) -> bool {
-        self.phase
+    fn claim_for_reader(&self) -> anyhow::Result<Option<Box<OwnedPreparedPduOutbound>>> {
+        if self
+            .phase
             .compare_exchange(
                 ClientOutboundLeasePhase::Queued as u8,
                 ClientOutboundLeasePhase::ReaderOwned as u8,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
             )
-            .is_ok()
+            .is_err()
+        {
+            return Ok(None);
+        }
+        self.rollback_armed.store(false, AtomicOrdering::Release);
+        self.prepared
+            .lock()
+            .take()
+            .map(Some)
+            .ok_or_else(|| anyhow!("mux client outbound reader claim lost its exact PDU owner"))
     }
 
     fn settle(&self) {
@@ -615,7 +659,11 @@ impl ClientOutboundLeaseState {
             AtomicOrdering::AcqRel,
         );
         if prior != ClientOutboundLeasePhase::Settled as u8 {
-            self.release_budget();
+            if prior == ClientOutboundLeasePhase::Queued as u8 {
+                self.finish_queued_settlement();
+            } else {
+                self.release_budget();
+            }
         }
     }
 }
@@ -653,14 +701,30 @@ impl ClientOutboundLease {
         }
     }
 
-    fn matches(&self, binding: RpcBinding, prepared: &OwnedPreparedPduOutbound) -> bool {
+    fn matches(&self, binding: RpcBinding) -> bool {
         self.state.generation == binding.generation
-            && self.state.ident == prepared.ident()
-            && self.state.planned_codec_bytes == prepared.codec_peak_bytes()
-            && self.state.qos == prepared.metadata().queue_qos
     }
 
-    fn claim_for_reader(&self) -> bool {
+    fn with_prepared<T>(
+        &self,
+        operation: impl FnOnce(&OwnedPreparedPduOutbound) -> T,
+    ) -> anyhow::Result<T> {
+        let prepared = self.state.prepared.lock();
+        let prepared = prepared
+            .as_deref()
+            .ok_or_else(|| anyhow!("mux client outbound lease lost its exact PDU before enqueue"))?;
+        Ok(operation(prepared))
+    }
+
+    fn arm_protocol_rollback(&self) {
+        self.state
+            .rollback_armed
+            .store(true, AtomicOrdering::Release);
+    }
+
+    fn claim_for_reader(
+        &self,
+    ) -> anyhow::Result<Option<Box<OwnedPreparedPduOutbound>>> {
         self.state.claim_for_reader()
     }
 }
@@ -1259,15 +1323,19 @@ impl RpcProtocolAuthority {
 
     fn rollback_unadmitted_outbound(&mut self, pdu: &Pdu) -> Result<(), OrdinaryMuxProtocolError> {
         let spec = assigned_pdu_spec(pdu, RpcProtocolDirection::Outbound)?;
-        let transition = if spec.ident == <GetCodecVersion as PduWireIdent>::IDENT {
+        self.rollback_unadmitted_outbound_ident(spec.ident);
+        Ok(())
+    }
+
+    fn rollback_unadmitted_outbound_ident(&mut self, ident: u64) {
+        let transition = if ident == <GetCodecVersion as PduWireIdent>::IDENT {
             RpcProtocolTransition::CodecRequest
-        } else if spec.ident == <SetClientId as PduWireIdent>::IDENT {
+        } else if ident == <SetClientId as PduWireIdent>::IDENT {
             RpcProtocolTransition::RegistrationRequest
         } else {
             RpcProtocolTransition::None
         };
         self.rollback_outbound(transition);
-        Ok(())
     }
 
     fn validate_inbound(
@@ -2092,6 +2160,18 @@ impl RpcTransportState {
             .rollback_unadmitted_outbound(pdu)
     }
 
+    fn rollback_unadmitted_outbound_ident(
+        &self,
+        generation: NonZeroU64,
+        ident: u64,
+    ) -> Result<(), OrdinaryMuxProtocolError> {
+        self.lifecycle
+            .lock()
+            .protocol_for_mut(generation)?
+            .rollback_unadmitted_outbound_ident(ident);
+        Ok(())
+    }
+
     fn complete_protocol_response(
         &self,
         generation: NonZeroU64,
@@ -2328,7 +2408,6 @@ enum TopologySnapshotDecisionAck {
 enum ReaderMessage {
     SendPdu {
         binding: RpcBinding,
-        prepared: Box<OwnedPreparedPduOutbound>,
         lease: ClientOutboundLease,
         promise: Sender<anyhow::Result<Pdu>>,
     },
@@ -2843,7 +2922,7 @@ impl RpcGenerationScope {
         // Planning and the worst-case logical-byte reservation both happen
         // synchronously, before this future can allocate a wire serial, touch
         // the pending map, enter the queue, serialize, compress, or write.
-        let admission: anyhow::Result<(RpcBinding, OwnedPreparedPduOutbound, ClientOutboundLease)> =
+        let admission: anyhow::Result<(RpcBinding, ClientOutboundLease)> =
             binding.and_then(|binding| {
                 let prepared = pdu
                     .prepare_outbound(
@@ -2886,56 +2965,16 @@ impl RpcGenerationScope {
                 }
                 let lease = rpc_transport
                     .outbound_budget
-                    .try_reserve(binding.generation, prepared.plan())
+                    .try_reserve(
+                        Arc::downgrade(&rpc_transport),
+                        binding.generation,
+                        prepared,
+                    )
                     .map_err(anyhow::Error::new)?;
-                // The reservation emits metrics, so it deliberately runs with
-                // no lifecycle lock held. Revalidate once more before handing
-                // the exact-generation lease to the lazy future; a concurrent
-                // retirement releases this lease without queue/codec effects.
-                let final_validation = {
-                    let lifecycle = rpc_transport.lifecycle.lock();
-                    if !matches!(
-                        lifecycle.phase,
-                        RpcTransportPhase::Live(observed) if observed == binding.generation
-                    ) || rpc_transport.live_generation.load(AtomicOrdering::Acquire)
-                        != binding.generation.get()
-                        || (!allow_unready
-                            && rpc_transport.ready_generation.load(AtomicOrdering::Acquire)
-                                != binding.generation.get())
-                    {
-                        Err(anyhow::Error::new(rpc_transport.retirement_error(
-                            binding,
-                            RpcRetirementStage::Admission,
-                            RpcDeliveryCertainty::DefinitelyNotSent,
-                            "exact-generation RPC retired during outbound budget admission",
-                        )))
-                    } else {
-                        lifecycle
-                            .protocol_for(binding.generation)
-                            .and_then(|protocol| {
-                                protocol.validate_outbound_pdu(
-                                    prepared.pdu(),
-                                    RpcOutboundAdmissionPoint::Preflight,
-                                )
-                            })
-                            .map_err(|error| {
-                                record_ordinary_mux_protocol_rejection(
-                                    &error,
-                                    "outbound",
-                                    "preflight",
-                                );
-                                anyhow::Error::new(error)
-                            })
-                    }
-                };
-                if let Err(error) = final_validation {
-                    drop(lease);
-                    return Err(error);
-                }
-                Ok((binding, prepared, lease))
+                Ok((binding, lease))
             });
         async move {
-            let (binding, prepared, lease) = match admission {
+            let (binding, lease) = match admission {
                 Ok(admission) => admission,
                 Err(error) => return Err(error),
             };
@@ -2969,19 +3008,20 @@ impl RpcGenerationScope {
                 let protocol = lifecycle
                     .protocol_for_mut(binding.generation)
                     .map_err(anyhow::Error::new)?;
-                let transition = protocol.admit_outbound(prepared.pdu()).map_err(|error| {
-                    record_ordinary_mux_protocol_rejection(&error, "outbound", "enqueue");
-                    anyhow::Error::new(error)
-                })?;
+                lease
+                    .with_prepared(|prepared| protocol.admit_outbound(prepared.pdu()))?
+                    .map_err(|error| {
+                        record_ordinary_mux_protocol_rejection(&error, "outbound", "enqueue");
+                        anyhow::Error::new(error)
+                    })?;
+                lease.arm_protocol_rollback();
                 match sender.try_send(ReaderMessage::SendPdu {
                     binding,
-                    prepared: Box::new(prepared),
                     lease,
                     promise,
                 }) {
                     Ok(()) => None,
                     Err(TrySendError::Closed(message) | TrySendError::Full(message)) => {
-                        protocol.rollback_outbound(transition);
                         Some(message)
                     }
                 }
@@ -6448,13 +6488,12 @@ async fn client_thread_async(
                 }
                 NextEvent::Message(Ok(ReaderMessage::SendPdu {
                     binding,
-                    prepared,
                     lease,
                     promise,
                 })) => {
-                    if !lease.matches(binding, prepared.as_ref()) {
+                    if !lease.matches(binding) {
                         return Err(anyhow!(
-                            "mux client outbound lease does not match its exact binding and PDU"
+                            "mux client outbound lease does not match its exact binding"
                         ));
                     }
                     if binding.generation != generation {
@@ -6476,6 +6515,15 @@ async fn client_thread_async(
                         complete_with_rpc_transport_error(&promise, error);
                         continue;
                     }
+                    let Some(prepared) = lease.claim_for_reader()? else {
+                        if !promise.is_closed() {
+                            bail!(
+                                "mux client outbound lease settled before reader claim while its \
+                                 completion channel remained open"
+                            );
+                        }
+                        continue;
+                    };
                     if let Err(error) = dispatch_authority
                         .rpc_transport
                         .validate_dequeued_outbound(generation, prepared.pdu())
@@ -6500,19 +6548,6 @@ async fn client_thread_async(
                     } else {
                         PendingRpcEffect::Ordinary
                     };
-                    if !lease.claim_for_reader() {
-                        if !promise.is_closed() {
-                            bail!(
-                                "mux client outbound lease settled before reader claim while its \
-                                 completion channel remained open"
-                            );
-                        }
-                        dispatch_authority
-                            .rpc_transport
-                            .rollback_unadmitted_outbound(generation, prepared.pdu())
-                            .map_err(anyhow::Error::new)?;
-                        continue;
-                    }
                     let serial = match pending.admit(promise, binding, effect) {
                         Ok(Some(serial)) => serial,
                         Ok(None) => {
@@ -8470,7 +8505,7 @@ impl Client {
         let lease = self
             .rpc_transport
             .outbound_budget
-            .try_reserve(generation, prepared.plan())
+            .try_reserve(Arc::downgrade(&self.rpc_transport), generation, prepared)
             .expect("test request should fit the client outbound budget");
         ReaderMessage::SendPdu {
             binding: RpcBinding {
@@ -8479,7 +8514,6 @@ impl Client {
                 request,
                 expected_response_ident: None,
             },
-            prepared: Box::new(prepared),
             lease,
             promise,
         }
