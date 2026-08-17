@@ -1960,8 +1960,8 @@ mod tests {
         assert_eq!(
             validate_event(&unavailable_pressure, |span_id| parent_span_id
                 == Some(span_id)),
-            Err(TraceContractError::InvalidSchedulerQueueEvidence {
-                field: "counter_availability"
+            Err(TraceContractError::UnavailableCounterHasValue {
+                field: InteractionTraceCounterField::QueueDepth
             })
         );
 
