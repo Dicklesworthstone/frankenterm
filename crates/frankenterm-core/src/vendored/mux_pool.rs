@@ -2081,7 +2081,7 @@ mod tests {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server(&temp_dir).await;
-            let pool = MuxPool::new(pool_config(socket_path, 1));
+            let pool = MuxPool::new(pool_config(socket_path, 2));
             let cx = crate::cx::for_testing();
 
             let (first, first_guard) = pool
@@ -2089,6 +2089,12 @@ mod tests {
                 .await
                 .expect("first connection");
             assert!(first.shares_outbound_budget(&pool.outbound_budget));
+
+            let (second, second_guard) = pool
+                .acquire_client_with_cx(&cx)
+                .await
+                .expect("simultaneously live second connection");
+            assert!(second.shares_outbound_budget(&pool.outbound_budget));
             drop(first);
             drop(first_guard);
 
@@ -2099,9 +2105,11 @@ mod tests {
             assert!(successor.shares_outbound_budget(&pool.outbound_budget));
             assert_eq!(
                 pool.stats().await.connections_created,
-                2,
+                3,
                 "discarded connection replacement must not create a second authority"
             );
+            drop(second);
+            drop(second_guard);
             drop(successor);
             drop(successor_guard);
         });

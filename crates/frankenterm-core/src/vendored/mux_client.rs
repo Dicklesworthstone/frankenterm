@@ -61,7 +61,8 @@ pub struct DirectMuxClientConfig {
     /// successor created by a [`super::mux_pool::MuxPool`] shares the pool's
     /// single authority. One sixteenth of this byte ceiling and one request
     /// slot (when more than one exists) remain reserved for control and
-    /// interactive traffic so bulk/query saturation cannot starve key input.
+    /// interactive traffic so bulk/query work cannot consume all codec-memory
+    /// admission capacity needed for a small key input.
     pub max_outbound_codec_bytes: usize,
     /// Shared count ceiling for requests that currently own codec memory.
     pub max_outbound_in_flight_requests: usize,

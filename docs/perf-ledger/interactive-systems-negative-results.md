@@ -4380,7 +4380,9 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   PDU/plan lease from pre-serial admission through bounded encoding and the
   completed write attempt. The root charges conservative codec peak bytes and
   in-flight request count; one sixteenth of bytes plus one slot remain outside
-  the noninteractive lane when the configured limits permit a reserve.
+  the noninteractive lane when the configured limits permit a reserve. This
+  preserves codec-memory admission capacity for small interactive input; it
+  does not by itself prove pool-acquisition or end-to-end scheduling fairness.
 - **Planted negatives:** cap-minus-one rejection in Never, Auto, and Always
   modes leaves the serial, socket-write witness, connection health, and root
   usage unchanged; two simulated connection incarnations exhaust one shared
