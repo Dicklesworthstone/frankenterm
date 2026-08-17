@@ -1370,6 +1370,7 @@ enum PaneRetirementExecution {
 /// until every operation that linearized before retirement has returned.
 struct PaneRegistrationGeneration {
     pane_id: PaneId,
+    wire_identity: [u8; 16],
     operation_state: AtomicUsize,
     reader_dead: Arc<AtomicBool>,
     retirement_tracker: Weak<PaneRetirementTracker>,
@@ -1394,6 +1395,7 @@ impl PaneRegistrationGeneration {
     ) -> Arc<Self> {
         Arc::new(Self {
             pane_id,
+            wire_identity: *uuid::Uuid::new_v4().as_bytes(),
             operation_state: AtomicUsize::new(0),
             reader_dead: Arc::new(AtomicBool::new(false)),
             retirement_tracker: Arc::downgrade(retirement_tracker),
@@ -2157,6 +2159,12 @@ mod pane_registration_handle {
             self.generation.pane_id
         }
 
+        /// Fresh UUID wire identity for this exact pane registration.
+        /// Clients must treat every same-ID successor as new authority.
+        pub fn wire_identity(&self) -> [u8; 16] {
+            self.generation.wire_identity
+        }
+
         pub fn same_registration(&self, other: &Self) -> bool {
             Arc::ptr_eq(&self.owner, &other.owner)
                 && Arc::ptr_eq(&self.pane, &other.pane)
@@ -2670,6 +2678,12 @@ mod pane_registration_handle {
 
         pub fn pane_id(&self) -> PaneId {
             self.generation.pane_id
+        }
+
+        /// Fresh UUID wire identity for this exact pane registration.
+        /// Clients must treat every same-ID successor as new authority.
+        pub fn wire_identity(&self) -> [u8; 16] {
+            self.generation.wire_identity
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -4364,6 +4378,7 @@ impl ReliableInputFingerprint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReliableInputTerminalOutcome {
+    NotApplied,
     Applied,
     OutcomeUnknown,
 }
@@ -4441,10 +4456,11 @@ pub enum ReliableInputClaimOutcome {
 
 /// Armed ownership of one client's sole pending reliable key transition.
 ///
-/// Dropping before [`Self::begin_side_effect`] rolls the claim back so a retry
-/// may execute. Dropping after the pane callback begins records an
-/// outcome-unknown terminal state: replay is then refused rather than risking
-/// a duplicate key effect after a panic or callback error.
+/// Dropping before [`Self::begin_side_effect`] records the exact request as not
+/// applied so only an identical retry may execute. Dropping after the pane
+/// callback begins records an outcome-unknown terminal state: replay is then
+/// refused rather than risking a duplicate key effect after a panic or callback
+/// error.
 pub struct ReliableInputCommitPermit {
     client: Arc<Mutex<ReliableInputClientLedger>>,
     claim_id: NonZeroU64,
@@ -4513,12 +4529,14 @@ impl Drop for ReliableInputCommitPermit {
             client.pending = Some(pending);
             return;
         }
-        if pending.side_effect_started {
-            client.terminal = Some(ReliableInputTerminal {
-                fingerprint: pending.fingerprint,
-                outcome: ReliableInputTerminalOutcome::OutcomeUnknown,
-            });
-        }
+        client.terminal = Some(ReliableInputTerminal {
+            fingerprint: pending.fingerprint,
+            outcome: if pending.side_effect_started {
+                ReliableInputTerminalOutcome::OutcomeUnknown
+            } else {
+                ReliableInputTerminalOutcome::NotApplied
+            },
+        });
     }
 }
 
@@ -5550,6 +5568,9 @@ impl Mux {
         kind: ReliableInputKeyKind,
         event: &KeyEvent,
     ) -> ReliableInputClaimOutcome {
+        if input_serial == 0 {
+            return ReliableInputClaimOutcome::IdentityConflict;
+        }
         let Some(client_id) = client_id else {
             return ReliableInputClaimOutcome::ClientNotRegistered;
         };
@@ -5591,14 +5612,19 @@ impl Mux {
                 {
                     return ReliableInputClaimOutcome::IdentityConflict;
                 }
-                return match terminal.outcome {
+                match terminal.outcome {
+                    ReliableInputTerminalOutcome::NotApplied => {
+                        // Preserve the exact pane/event fingerprint across a
+                        // pre-callback cancellation, but allow that identical
+                        // request to claim a new attempt below.
+                    }
                     ReliableInputTerminalOutcome::Applied => {
-                        ReliableInputClaimOutcome::DuplicateApplied
+                        return ReliableInputClaimOutcome::DuplicateApplied;
                     }
                     ReliableInputTerminalOutcome::OutcomeUnknown => {
-                        ReliableInputClaimOutcome::OutcomeUnknown
+                        return ReliableInputClaimOutcome::OutcomeUnknown;
                     }
-                };
+                }
             }
         }
         let Some(claim_id) = ledger.next_claim_id else {
@@ -11880,6 +11906,17 @@ mod tests {
         mux.register_client(Arc::clone(&original_client));
         let event = reliable_input_test_event('x');
 
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&original_client),
+                &registration,
+                0,
+                ReliableInputKeyKind::KeyDown,
+                &event,
+            ),
+            ReliableInputClaimOutcome::IdentityConflict
+        ));
+
         let ReliableInputClaimOutcome::Execute(mut permit) = mux.claim_reliable_key_event(
             Some(&original_client),
             &registration,
@@ -11937,6 +11974,33 @@ mod tests {
     }
 
     #[test]
+    fn pane_registration_wire_identity_changes_for_same_id_successor() {
+        let _global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (first, _first_kills) = KillCountingPane::new(304, test_size());
+        mux.add_pane(&first).expect("register first exact pane");
+        let first_registration = mux
+            .capture_pane_registration(&first)
+            .expect("capture first exact pane registration");
+        mux.remove_pane(304);
+
+        let (successor, _successor_kills) = KillCountingPane::new(304, test_size());
+        mux.add_pane(&successor)
+            .expect("same-ID successor should register after exact retirement");
+        let successor_registration = mux
+            .capture_pane_registration(&successor)
+            .expect("capture same-ID successor registration");
+
+        assert_ne!(first_registration.wire_identity(), [0; 16]);
+        assert_ne!(successor_registration.wire_identity(), [0; 16]);
+        assert_ne!(
+            first_registration.wire_identity(),
+            successor_registration.wire_identity(),
+            "this same-ID successor must not inherit stale wire authority"
+        );
+    }
+
+    #[test]
     fn reliable_input_ledger_rolls_back_before_callback_and_fails_closed_after_start() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
@@ -11959,6 +12023,22 @@ mod tests {
             panic!("first exact identity must own execution");
         };
         drop(permit);
+        let (replacement_pane, _replacement_kills) = KillCountingPane::new(303, test_size());
+        let (_replacement_tab, _replacement_window_id) =
+            register_attached_test_pane(&global_guard, &mux, &replacement_pane);
+        let replacement_registration = mux
+            .capture_pane_registration(&replacement_pane)
+            .expect("replacement pane registration");
+        assert!(matches!(
+            mux.claim_reliable_key_event(
+                Some(&client),
+                &replacement_registration,
+                21,
+                ReliableInputKeyKind::KeyDown,
+                &event,
+            ),
+            ReliableInputClaimOutcome::IdentityConflict
+        ));
         let ReliableInputClaimOutcome::Execute(mut retry) = mux.claim_reliable_key_event(
             Some(&client),
             &registration,
