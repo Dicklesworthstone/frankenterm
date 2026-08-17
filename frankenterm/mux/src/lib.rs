@@ -11871,7 +11871,7 @@ mod tests {
     fn reliable_input_ledger_deduplicates_commit_and_survives_client_reconnect() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
-        let pane = register_test_pane(&mux, 301);
+        let (pane, _kills) = KillCountingPane::new(301, test_size());
         let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
         let registration = mux
             .capture_pane_registration(&pane)
@@ -11940,7 +11940,7 @@ mod tests {
     fn reliable_input_ledger_rolls_back_before_callback_and_fails_closed_after_start() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
-        let pane = register_test_pane(&mux, 302);
+        let (pane, _kills) = KillCountingPane::new(302, test_size());
         let (_tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
         let registration = mux
             .capture_pane_registration(&pane)
