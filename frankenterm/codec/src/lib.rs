@@ -20546,6 +20546,23 @@ mod test {
     }
 
     #[test]
+    fn reliable_key_event_is_classified_as_user_input() {
+        assert!(
+            Pdu::ReliableKeyEventV1(ReliableKeyEventV1 {
+                pane_id: 7,
+                pane_registration: None,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(1),
+                kind: ReliableKeyEventKindV1::KeyDown,
+            })
+            .is_user_input()
+        );
+    }
+
+    #[test]
     fn reliable_key_event_rejects_zero_serial_and_malformed_retry_pressure_before_framing() {
         let mut encoded = Vec::new();
         Pdu::ReliableKeyEventV1(ReliableKeyEventV1 {
