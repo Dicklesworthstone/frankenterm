@@ -5522,17 +5522,6 @@ impl SessionHandler {
                                         match callback {
                                             Ok(Ok(())) => {
                                                 if permit.commit_applied() {
-                                                    if request.kind
-                                                        == ReliableKeyEventKindV1::KeyDown
-                                                    {
-                                                        push_input_dispatch_changes_after_committed_input(
-                                                            &pane,
-                                                            sender,
-                                                            per_pane,
-                                                            request.input_serial,
-                                                            "reliable-key-down",
-                                                        );
-                                                    }
                                                     ReliableKeyEventOutcomeV1::Applied
                                                 } else {
                                                     ReliableKeyEventOutcomeV1::Rejected(
@@ -5569,7 +5558,21 @@ impl SessionHandler {
                             },
                         ),
                     };
+                    let push_committed_key_down = request.kind
+                        == ReliableKeyEventKindV1::KeyDown
+                        && matches!(&outcome, ReliableKeyEventOutcomeV1::Applied);
                     send_response(Ok(reliable_key_response(&request, outcome)));
+                    if push_committed_key_down {
+                        let _ = registration.try_with_current(|pane| {
+                            push_input_dispatch_changes_after_committed_input(
+                                &pane,
+                                sender,
+                                per_pane,
+                                request.input_serial,
+                                "reliable-key-down",
+                            );
+                        });
+                    }
                 });
                 record_send_key_down_scheduler_receipt(spawned.initial_enqueue_receipt(), false);
                 spawned.detach();
@@ -6999,16 +7002,22 @@ mod tests {
         {
             let mut responses = captured.lock().unwrap();
             assert_eq!(responses.len(), 2);
-            assert!(responses.iter().any(|response| {
-                response.serial == 919
-                    && matches!(
-                        &response.pdu,
-                        Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
-                            outcome: ReliableKeyEventOutcomeV1::Applied,
-                            ..
-                        })
-                    )
-            }));
+            assert_eq!(responses[0].serial, 919);
+            assert!(matches!(
+                &responses[0].pdu,
+                Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                    outcome: ReliableKeyEventOutcomeV1::Applied,
+                    ..
+                })
+            ));
+            assert_eq!(
+                responses[1].serial, 0,
+                "the reliable ACK must enter the writer before post-input render preparation"
+            );
+            assert!(matches!(
+                &responses[1].pdu,
+                Pdu::GetPaneRenderChangesResponse(_)
+            ));
             responses.clear();
         }
         assert_eq!(pane.key_down_count(), 1);
