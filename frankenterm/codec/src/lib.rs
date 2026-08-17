@@ -1648,7 +1648,13 @@ std::thread_local! {
     static TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static TEST_BOUNDED_SERIALIZE_BUFFER_CONSTRUCTIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     static TEST_BOUNDED_SERIALIZE_MAX_REQUESTED_CAPACITY: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_COMPRESSION_INVOCATIONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     static TEST_EXACT_RENDER_VALIDATION_ROW_VISITS: std::cell::Cell<usize> = const {
@@ -1673,8 +1679,14 @@ fn record_test_serialize_invocation() {
 
 #[cfg(test)]
 fn reset_test_bounded_serialize_growth_events() {
+    TEST_BOUNDED_SERIALIZE_BUFFER_CONSTRUCTIONS.set(0);
     TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS.set(0);
     TEST_BOUNDED_SERIALIZE_MAX_REQUESTED_CAPACITY.set(0);
+}
+
+#[cfg(test)]
+fn test_bounded_serialize_buffer_constructions() -> usize {
+    TEST_BOUNDED_SERIALIZE_BUFFER_CONSTRUCTIONS.get()
 }
 
 #[cfg(test)]
@@ -1688,6 +1700,16 @@ fn test_bounded_serialize_max_requested_capacity() -> usize {
 }
 
 #[cfg(test)]
+fn reset_test_compression_invocations() {
+    TEST_COMPRESSION_INVOCATIONS.set(0);
+}
+
+#[cfg(test)]
+fn test_compression_invocations() -> usize {
+    TEST_COMPRESSION_INVOCATIONS.get()
+}
+
+#[cfg(test)]
 fn record_test_bounded_serialize_growth_event(requested_capacity: usize) {
     TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS
         .set(TEST_BOUNDED_SERIALIZE_GROWTH_EVENTS.get().saturating_add(1));
@@ -1696,6 +1718,20 @@ fn record_test_bounded_serialize_growth_event(requested_capacity: usize) {
             .get()
             .max(requested_capacity),
     );
+}
+
+#[cfg(test)]
+fn record_test_bounded_serialize_buffer_construction() {
+    TEST_BOUNDED_SERIALIZE_BUFFER_CONSTRUCTIONS.set(
+        TEST_BOUNDED_SERIALIZE_BUFFER_CONSTRUCTIONS
+            .get()
+            .saturating_add(1),
+    );
+}
+
+#[cfg(test)]
+fn record_test_compression_invocation() {
+    TEST_COMPRESSION_INVOCATIONS.set(TEST_COMPRESSION_INVOCATIONS.get().saturating_add(1));
 }
 
 #[cfg(test)]
@@ -1733,8 +1769,178 @@ struct BoundedSerializeBuffer {
     exceeded: bool,
 }
 
+#[derive(Debug)]
+enum CountingFailure {
+    Encoding(Error),
+    Overflow,
+    LimitExceeded {
+        declared_bytes: usize,
+        max_bytes: usize,
+    },
+}
+
+struct CheckedCountingWriter {
+    logical_len: usize,
+    max_bytes: usize,
+    failure: Option<CountingFailure>,
+}
+
+impl CheckedCountingWriter {
+    const fn new(max_bytes: usize) -> Self {
+        Self {
+            logical_len: 0,
+            max_bytes,
+            failure: None,
+        }
+    }
+}
+
+impl std::io::Write for CheckedCountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(next_len) = self.logical_len.checked_add(buffer.len()) else {
+            self.failure = Some(CountingFailure::Overflow);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "counted PDU body length overflow",
+            ));
+        };
+        self.logical_len = next_len;
+        if next_len > self.max_bytes {
+            self.failure = Some(CountingFailure::LimitExceeded {
+                declared_bytes: next_len,
+                max_bytes: self.max_bytes,
+            });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "counted PDU body exceeded its logical limit",
+            ));
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn count_varbincode_value_raw<T: serde::Serialize>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<usize, CountingFailure> {
+    let mut output = CheckedCountingWriter::new(max_bytes);
+    let serialize_result = {
+        let mut encoder = varbincode::Serializer::new(&mut output);
+        value.serialize(&mut encoder)
+    };
+    if let Some(failure) = output.failure {
+        return Err(failure);
+    }
+    serialize_result.map_err(|source| CountingFailure::Encoding(source.into()))?;
+    Ok(output.logical_len)
+}
+
+std::thread_local! {
+    /// Bytes elided only while the outbound counting serializer measures a
+    /// nested ordered-window byte section.  The ordinary encoder never enters
+    /// this scope and therefore retains byte-for-byte wire behavior.
+    static OUTBOUND_COUNTING_ELIDED_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+struct OutboundCountingScope {
+    active: bool,
+}
+
+impl OutboundCountingScope {
+    fn enter(ident: u64) -> Result<Self, PduOutboundPlanError> {
+        OUTBOUND_COUNTING_ELIDED_BYTES.with(|bytes| {
+            if let Some(previous) = bytes.replace(Some(0)) {
+                bytes.set(Some(previous));
+                return Err(PduOutboundPlanError::NestedCountingScope { ident });
+            }
+            Ok(Self { active: true })
+        })
+    }
+
+    fn finish(mut self, ident: u64) -> Result<usize, PduOutboundPlanError> {
+        let bytes = OUTBOUND_COUNTING_ELIDED_BYTES.with(|bytes| bytes.replace(None));
+        self.active = false;
+        bytes.ok_or(PduOutboundPlanError::NestedCountingScope { ident })
+    }
+}
+
+impl Drop for OutboundCountingScope {
+    fn drop(&mut self) {
+        if self.active {
+            OUTBOUND_COUNTING_ELIDED_BYTES.with(|bytes| bytes.set(None));
+        }
+    }
+}
+
+fn record_outbound_counting_elided_bytes(additional: usize) -> Result<bool, &'static str> {
+    OUTBOUND_COUNTING_ELIDED_BYTES.with(|bytes| {
+        let Some(current) = bytes.get() else {
+            return Ok(false);
+        };
+        let next = current
+            .checked_add(additional)
+            .ok_or("outbound counting elided-byte overflow")?;
+        bytes.set(Some(next));
+        Ok(true)
+    })
+}
+
+fn count_pdu_payload<T: serde::Serialize>(
+    value: &T,
+    max_payload_bytes: usize,
+    ident: u64,
+) -> Result<usize, PduOutboundPlanError> {
+    let scope = OutboundCountingScope::enter(ident)?;
+    let counted = count_varbincode_value_raw(value, max_payload_bytes);
+    let elided = scope.finish(ident)?;
+    let counted = match counted {
+        Ok(counted) => counted,
+        Err(CountingFailure::Encoding(cause)) => {
+            return Err(PduOutboundPlanError::CountingSerialization { ident, cause });
+        }
+        Err(CountingFailure::Overflow) => {
+            return Err(PduOutboundPlanError::ArithmeticOverflow {
+                ident,
+                field: "logical_payload_bytes",
+            });
+        }
+        Err(CountingFailure::LimitExceeded {
+            declared_bytes,
+            max_bytes,
+        }) => {
+            return Err(PduOutboundPlanError::LogicalPayloadLimitExceeded {
+                ident,
+                declared_payload_bytes: declared_bytes,
+                max_payload_bytes: max_bytes,
+            });
+        }
+    };
+    let logical_payload_bytes =
+        counted
+            .checked_add(elided)
+            .ok_or(PduOutboundPlanError::ArithmeticOverflow {
+                ident,
+                field: "logical_payload_bytes",
+            })?;
+    if logical_payload_bytes > max_payload_bytes {
+        return Err(PduOutboundPlanError::LogicalPayloadLimitExceeded {
+            ident,
+            declared_payload_bytes: logical_payload_bytes,
+            max_payload_bytes,
+        });
+    }
+    Ok(logical_payload_bytes)
+}
+
 impl BoundedSerializeBuffer {
     fn new(max_bytes: usize) -> Self {
+        #[cfg(test)]
+        record_test_bounded_serialize_buffer_construction();
         Self {
             bytes: Vec::with_capacity(64.min(max_bytes)),
             logical_len: 0,
@@ -1828,6 +2034,8 @@ fn finish_serialized_payload(
     }
 
     // Compress the one canonical serialization; never run serde a second time.
+    #[cfg(test)]
+    record_test_compression_invocation();
     let compressed =
         zstd::stream::encode_all(uncompressed.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)?;
 
@@ -2142,6 +2350,152 @@ pub enum PduOutboundMetadataError {
     },
 }
 
+/// Complete pre-allocation bound for one outbound PDU.
+///
+/// The plan reserves the maximum-width `u64` serial rather than a serial that
+/// has already been issued.  Its byte counts describe codec-owned logical
+/// storage, not allocator capacity, native zstd workspace, or process RSS.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PduOutboundPlan {
+    ident: u64,
+    metadata: PduOutboundMetadata,
+    compression_mode: CompressionMode,
+    logical_payload_bytes: usize,
+    maximum_compression_output_bytes: usize,
+    maximum_encoded_payload_bytes: usize,
+    maximum_frame_bytes: usize,
+    retained_frame_bytes: usize,
+    codec_peak_bytes: usize,
+}
+
+impl PduOutboundPlan {
+    #[must_use]
+    pub const fn ident(&self) -> u64 {
+        self.ident
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> PduOutboundMetadata {
+        self.metadata
+    }
+
+    #[must_use]
+    pub const fn compression_mode(&self) -> CompressionMode {
+        self.compression_mode
+    }
+
+    #[must_use]
+    pub const fn logical_payload_bytes(&self) -> usize {
+        self.logical_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn maximum_compression_output_bytes(&self) -> usize {
+        self.maximum_compression_output_bytes
+    }
+
+    #[must_use]
+    pub const fn maximum_encoded_payload_bytes(&self) -> usize {
+        self.maximum_encoded_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn maximum_frame_bytes(&self) -> usize {
+        self.maximum_frame_bytes
+    }
+
+    #[must_use]
+    pub const fn retained_frame_bytes(&self) -> usize {
+        self.retained_frame_bytes
+    }
+
+    #[must_use]
+    pub const fn codec_peak_bytes(&self) -> usize {
+        self.codec_peak_bytes
+    }
+}
+
+/// Exact-owner capability binding one immutable plan to the PDU it measured.
+///
+/// This type is intentionally neither `Clone` nor `Copy`, and its fields are
+/// private.  A later admitted encoder can consume it without accepting a plan
+/// measured from a different PDU value.
+///
+/// For a generic correlated response, this capability proves only the codec
+/// planning inputs.  The transport must still resolve the correlated request
+/// from its exact pending-request authority before admission; a caller-chosen
+/// canonical [`PduWireSpec`] is not a pending-request ownership witness.
+#[must_use = "a prepared outbound PDU must be admitted, encoded, or rejected"]
+pub struct PreparedPduOutbound<'pdu> {
+    pdu: &'pdu Pdu,
+    plan: PduOutboundPlan,
+}
+
+impl std::fmt::Debug for PreparedPduOutbound<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedPduOutbound")
+            .field("pdu_name", &self.pdu.pdu_name())
+            .field("plan", &self.plan)
+            .finish()
+    }
+}
+
+impl PreparedPduOutbound<'_> {
+    #[must_use]
+    pub const fn pdu(&self) -> &Pdu {
+        self.pdu
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> &PduOutboundPlan {
+        &self.plan
+    }
+}
+
+impl std::ops::Deref for PreparedPduOutbound<'_> {
+    type Target = PduOutboundPlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+/// Typed pre-allocation planning failure.
+///
+/// Every variant has *definitely not sent* delivery certainty.  Planning does
+/// not issue a serial, allocate a codec payload or compression destination,
+/// mutate a queue, or invoke a transport.
+#[derive(Debug, Error)]
+pub enum PduOutboundPlanError {
+    #[error(transparent)]
+    Metadata(#[from] PduOutboundMetadataError),
+    #[error("PDU {ident} failed outbound payload validation before codec allocation: {cause:#}")]
+    InvalidPayload { ident: u64, cause: Error },
+    #[error("PDU {ident} could not be measured by the canonical counting serializer: {cause:#}")]
+    CountingSerialization { ident: u64, cause: Error },
+    #[error(
+        "PDU {ident} logical payload size {declared_payload_bytes} exceeds maximum {max_payload_bytes}"
+    )]
+    LogicalPayloadLimitExceeded {
+        ident: u64,
+        declared_payload_bytes: usize,
+        max_payload_bytes: usize,
+    },
+    #[error(
+        "PDU {ident} maximum compressed payload size {maximum_compressed_bytes} exceeds maximum {max_payload_bytes}"
+    )]
+    CompressionBoundExceeded {
+        ident: u64,
+        maximum_compressed_bytes: usize,
+        max_payload_bytes: usize,
+    },
+    #[error("PDU {ident} outbound plan arithmetic overflowed while computing {field}")]
+    ArithmeticOverflow { ident: u64, field: &'static str },
+    #[error("PDU {ident} encountered a nested outbound counting scope")]
+    NestedCountingScope { ident: u64 },
+}
+
 /// Capability admission associated with a PDU family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PduCapabilityUse {
@@ -2346,6 +2700,127 @@ impl PduWireSpec {
                 request_ident: request.ident,
             },
         )
+    }
+}
+
+/// Serial value reserved by outbound planning before the connection allocates
+/// an actual request identity.  Its LEB128 encoding is the widest possible.
+pub const OUTBOUND_PLAN_RESERVED_SERIAL: u64 = u64::MAX;
+
+impl PduOutboundPlan {
+    fn checked_add(
+        ident: u64,
+        field: &'static str,
+        left: usize,
+        right: usize,
+    ) -> Result<usize, PduOutboundPlanError> {
+        left.checked_add(right)
+            .ok_or(PduOutboundPlanError::ArithmeticOverflow { ident, field })
+    }
+
+    fn frame_bound(
+        ident: u64,
+        payload_bytes: usize,
+        compressed: bool,
+    ) -> Result<usize, PduOutboundPlanError> {
+        encoded_frame_len(
+            ident,
+            OUTBOUND_PLAN_RESERVED_SERIAL,
+            payload_bytes,
+            compressed,
+        )
+        .map_err(|_| PduOutboundPlanError::ArithmeticOverflow {
+            ident,
+            field: "maximum_frame_bytes",
+        })
+    }
+
+    fn from_counted_payload(
+        spec: &PduWireSpec,
+        metadata: PduOutboundMetadata,
+        compression_mode: CompressionMode,
+        logical_payload_bytes: usize,
+    ) -> Result<Self, PduOutboundPlanError> {
+        let ident = spec.ident;
+        let uncompressed_frame_bytes = Self::frame_bound(ident, logical_payload_bytes, false)?;
+        let should_attempt_compression = compression_mode == CompressionMode::Always
+            || (compression_mode == CompressionMode::Auto
+                && logical_payload_bytes > COMPRESS_THRESH);
+        let maximum_compression_output_bytes = if should_attempt_compression {
+            zstd::zstd_safe::compress_bound(logical_payload_bytes)
+        } else {
+            0
+        };
+
+        let (maximum_encoded_payload_bytes, maximum_frame_bytes) = match compression_mode {
+            CompressionMode::Never => (logical_payload_bytes, uncompressed_frame_bytes),
+            CompressionMode::Always => {
+                let max_payload_bytes = spec.encoded_body_limit.maximum_encoded_payload_bytes(true);
+                if maximum_compression_output_bytes > max_payload_bytes {
+                    return Err(PduOutboundPlanError::CompressionBoundExceeded {
+                        ident,
+                        maximum_compressed_bytes: maximum_compression_output_bytes,
+                        max_payload_bytes,
+                    });
+                }
+                (
+                    maximum_compression_output_bytes,
+                    Self::frame_bound(ident, maximum_compression_output_bytes, true)?,
+                )
+            }
+            CompressionMode::Auto if should_attempt_compression => {
+                // Auto retains compressed bytes only when the payload is
+                // strictly smaller.  The zstd destination itself is charged at
+                // compressBound, while the possible wire result is capped at
+                // logical-1 and checked against the compressed schema limit.
+                let selected_compressed_bytes =
+                    maximum_compression_output_bytes.min(logical_payload_bytes.saturating_sub(1));
+                let max_payload_bytes = spec.encoded_body_limit.maximum_encoded_payload_bytes(true);
+                if selected_compressed_bytes > max_payload_bytes {
+                    return Err(PduOutboundPlanError::CompressionBoundExceeded {
+                        ident,
+                        maximum_compressed_bytes: selected_compressed_bytes,
+                        max_payload_bytes,
+                    });
+                }
+                let compressed_frame_bytes =
+                    Self::frame_bound(ident, selected_compressed_bytes, true)?;
+                (
+                    logical_payload_bytes,
+                    uncompressed_frame_bytes.max(compressed_frame_bytes),
+                )
+            }
+            CompressionMode::Auto => (logical_payload_bytes, uncompressed_frame_bytes),
+        };
+
+        // This intentionally charges all live codec-owned buffers at their
+        // conservative bounds, including allocator handoff while the final
+        // frame grows.  A later capacity-limited encoder may lower the peak,
+        // but admission must never depend on that future optimization.
+        let payload_and_compression = Self::checked_add(
+            ident,
+            "codec_peak_bytes",
+            logical_payload_bytes,
+            maximum_compression_output_bytes,
+        )?;
+        let codec_peak_bytes = Self::checked_add(
+            ident,
+            "codec_peak_bytes",
+            payload_and_compression,
+            maximum_frame_bytes,
+        )?;
+
+        Ok(Self {
+            ident,
+            metadata,
+            compression_mode,
+            logical_payload_bytes,
+            maximum_compression_output_bytes,
+            maximum_encoded_payload_bytes,
+            maximum_frame_bytes,
+            retained_frame_bytes: maximum_frame_bytes,
+            codec_peak_bytes,
+        })
     }
 }
 
@@ -2628,7 +3103,7 @@ macro_rules! pdu {
                         Pdu::$name(s) => {
                             let serialized = {
                                 let _scope =
-                                    ValidatedOrderedSnapshotSerializationScope::for_pdu(self)?;
+                                    ValidatedOrderedSerializationScope::for_pdu(self)?;
                                 serialize_pdu_payload(
                                     s,
                                     &<$name as PduWireIdent>::WIRE_SPEC,
@@ -2708,7 +3183,7 @@ macro_rules! pdu {
                         Pdu::$name(s) => {
                             let serialized = {
                                 let _scope =
-                                    ValidatedOrderedSnapshotSerializationScope::for_pdu(self)?;
+                                    ValidatedOrderedSerializationScope::for_pdu(self)?;
                                 serialize_pdu_payload(
                                     s,
                                     &<$name as PduWireIdent>::WIRE_SPEC,
@@ -2758,7 +3233,7 @@ macro_rules! pdu {
                         Pdu::$name(s) => {
                             let serialized = {
                                 let _scope =
-                                    ValidatedOrderedSnapshotSerializationScope::for_pdu(self)?;
+                                    ValidatedOrderedSerializationScope::for_pdu(self)?;
                                 serialize_pdu_payload(
                                     s,
                                     &<$name as PduWireIdent>::WIRE_SPEC,
@@ -2797,7 +3272,7 @@ macro_rules! pdu {
                             // executor thread after the payload is owned.
                             let serialized = {
                                 let _scope =
-                                    ValidatedOrderedSnapshotSerializationScope::for_pdu(self)?;
+                                    ValidatedOrderedSerializationScope::for_pdu(self)?;
                                 serialize_pdu_payload(
                                     s,
                                     &<$name as PduWireIdent>::WIRE_SPEC,
@@ -2874,6 +3349,61 @@ macro_rules! pdu {
                     )*
                 };
                 spec.resolve_canonical_outbound_metadata(producer, role, correlated_request)
+            }
+
+            /// Validate and measure one outbound PDU before serial allocation,
+            /// codec payload allocation, compression, queueing, or wire work.
+            pub fn plan_outbound(
+                &self,
+                producer: PduProducer,
+                role: PduWireRole,
+                correlated_request: Option<&PduWireSpec>,
+                compression_mode: CompressionMode,
+            ) -> Result<PreparedPduOutbound<'_>, PduOutboundPlanError> {
+                let spec = match self {
+                    Pdu::Invalid { ident } => {
+                        return Err(PduOutboundMetadataError::InvalidPdu { ident: *ident }.into());
+                    }
+                    $(
+                        Pdu::$name(_) => &<$name as PduWireIdent>::WIRE_SPEC,
+                    )*
+                };
+                let metadata = spec.resolve_canonical_outbound_metadata(
+                    producer,
+                    role,
+                    correlated_request,
+                )?;
+                self.validate_before_encode().map_err(|cause| {
+                    PduOutboundPlanError::InvalidPayload {
+                        ident: spec.ident,
+                        cause,
+                    }
+                })?;
+                let _validated_snapshot =
+                    ValidatedOrderedSerializationScope::for_pdu(self).map_err(|cause| {
+                        PduOutboundPlanError::CountingSerialization {
+                            ident: spec.ident,
+                            cause,
+                        }
+                    })?;
+                let max_payload_bytes = spec
+                    .encoded_body_limit
+                    .maximum_encoded_payload_bytes(false);
+                let logical_payload_bytes = match self {
+                    Pdu::Invalid { .. } => unreachable!("invalid PDU returned before counting"),
+                    $(
+                        Pdu::$name(value) => {
+                            count_pdu_payload(value, max_payload_bytes, spec.ident)?
+                        }
+                    )*
+                };
+                let plan = PduOutboundPlan::from_counted_payload(
+                    spec,
+                    metadata,
+                    compression_mode,
+                    logical_payload_bytes,
+                )?;
+                Ok(PreparedPduOutbound { pdu: self, plan })
             }
 
             /// Capabilities that must already be established for this PDU.
@@ -5130,43 +5660,48 @@ impl ValidatedListPanesOrderedV1Response {
 }
 
 #[derive(Clone, Copy)]
-struct ValidatedOrderedSnapshotSerializationTarget {
-    panes: *const PaneArena,
+struct ValidatedOrderedSerializationTarget {
+    panes: Option<*const PaneArena>,
     windows: *const OrderedWindowStateV1,
     windows_len: usize,
 }
 
 std::thread_local! {
     /// Exact-object capability active only during the synchronous serde pass
-    /// of an already validated PDU 87. Raw pointers are compared but never
-    /// dereferenced; the borrowed PDU outlives the scope that installs them.
-    static VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION:
-        std::cell::Cell<Option<ValidatedOrderedSnapshotSerializationTarget>> =
+    /// of an already validated PDU 87 snapshot or PDU 90 order event. Raw
+    /// pointers are compared but never dereferenced; the borrowed PDU outlives
+    /// the scope that installs them.
+    static VALIDATED_ORDERED_SERIALIZATION:
+        std::cell::Cell<Option<ValidatedOrderedSerializationTarget>> =
             const { std::cell::Cell::new(None) };
 }
 
 /// Synchronous, thread-affine capability for eliding field-level validation
-/// of one exact snapshot. It never crosses an async write await point.
-struct ValidatedOrderedSnapshotSerializationScope;
+/// of one exact ordered value. It never crosses an async write await point.
+struct ValidatedOrderedSerializationScope;
 
-impl ValidatedOrderedSnapshotSerializationScope {
+impl ValidatedOrderedSerializationScope {
     fn for_pdu(pdu: &Pdu) -> Result<Option<Self>, Error> {
-        let Pdu::ListPanesOrderedV1Response(ListPanesOrderedV1Response {
-            outcome: ListPanesOrderedV1Outcome::Snapshot(snapshot),
-            ..
-        }) = pdu
-        else {
-            return Ok(None);
+        let target = match pdu {
+            Pdu::ListPanesOrderedV1Response(ListPanesOrderedV1Response {
+                outcome: ListPanesOrderedV1Outcome::Snapshot(snapshot),
+                ..
+            }) => ValidatedOrderedSerializationTarget {
+                panes: Some(std::ptr::from_ref(&snapshot.panes)),
+                windows: snapshot.ordered_windows.as_ptr(),
+                windows_len: snapshot.ordered_windows.len(),
+            },
+            Pdu::WindowOrderEventV1(event) => ValidatedOrderedSerializationTarget {
+                panes: None,
+                windows: event.windows.as_ptr(),
+                windows_len: event.windows.len(),
+            },
+            _ => return Ok(None),
         };
-        let target = ValidatedOrderedSnapshotSerializationTarget {
-            panes: std::ptr::from_ref(&snapshot.panes),
-            windows: snapshot.ordered_windows.as_ptr(),
-            windows_len: snapshot.ordered_windows.len(),
-        };
-        VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
+        VALIDATED_ORDERED_SERIALIZATION.with(|active| {
             if let Some(previous) = active.replace(Some(target)) {
                 active.set(Some(previous));
-                bail!("nested validated ordered-snapshot serialization is not supported");
+                bail!("nested validated ordered serialization is not supported");
             }
             Ok(())
         })?;
@@ -5174,27 +5709,29 @@ impl ValidatedOrderedSnapshotSerializationScope {
     }
 }
 
-impl Drop for ValidatedOrderedSnapshotSerializationScope {
+impl Drop for ValidatedOrderedSerializationScope {
     fn drop(&mut self) {
-        VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
+        VALIDATED_ORDERED_SERIALIZATION.with(|active| {
             debug_assert!(
                 active.replace(None).is_some(),
-                "validated ordered-snapshot serialization scope lost its exact-object target"
+                "validated ordered serialization scope lost its exact-object target"
             );
         });
     }
 }
 
 fn ordered_pane_arena_has_serialization_proof(panes: &PaneArena) -> bool {
-    VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
-        active
-            .get()
-            .is_some_and(|target| std::ptr::eq(target.panes, panes))
+    VALIDATED_ORDERED_SERIALIZATION.with(|active| {
+        active.get().is_some_and(|target| {
+            target
+                .panes
+                .is_some_and(|target_panes| std::ptr::eq(target_panes, panes))
+        })
     })
 }
 
 fn ordered_windows_have_serialization_proof(windows: &[OrderedWindowStateV1]) -> bool {
-    VALIDATED_ORDERED_SNAPSHOT_SERIALIZATION.with(|active| {
+    VALIDATED_ORDERED_SERIALIZATION.with(|active| {
         active.get().is_some_and(|target| {
             target.windows_len == windows.len() && std::ptr::eq(target.windows, windows.as_ptr())
         })
@@ -6799,6 +7336,17 @@ impl Serialize for OrderedWindowSectionWireBytes<'_> {
     }
 }
 
+struct OrderedWindowsWireRef<'a>(&'a [OrderedWindowStateV1]);
+
+impl Serialize for OrderedWindowsWireRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serialize_ordered_windows(self.0, serializer)
+    }
+}
+
 struct OrderedWindowSectionBytesVisitor;
 
 impl<'de> serde::de::Visitor<'de> for OrderedWindowSectionBytesVisitor {
@@ -6903,6 +7451,32 @@ where
 {
     if !ordered_windows_have_serialization_proof(values) {
         validate_ordered_windows_structure(values, false).map_err(serde::ser::Error::custom)?;
+    }
+
+    // PDU outbound planning uses a stack-only counting writer.  The ordinary
+    // wire serializer must first materialize this nested byte section because
+    // serde's bytes API accepts a concrete slice.  During counting only, count
+    // the canonical nested value independently and charge its exact byte-slice
+    // prefix plus contents to the outer scope; serializing unit contributes no
+    // varbincode bytes.  This avoids falsely allocating a section Vec merely to
+    // discover its length.
+    if OUTBOUND_COUNTING_ELIDED_BYTES.with(|bytes| bytes.get().is_some()) {
+        let section_len = count_varbincode_value_raw(
+            &OrderedWindowsWireRef(values),
+            MAX_ORDERED_WINDOW_SECTION_BYTES,
+        )
+        .map_err(|failure| {
+            serde::ser::Error::custom(format_args!(
+                "counting ordered-window section failed: {failure:?}"
+            ))
+        })?;
+        let section_len_u64 = u64::try_from(section_len).map_err(serde::ser::Error::custom)?;
+        let encoded_section_bytes = encoded_length(section_len_u64)
+            .checked_add(section_len)
+            .ok_or_else(|| serde::ser::Error::custom("ordered-window section counting overflow"))?;
+        record_outbound_counting_elided_bytes(encoded_section_bytes)
+            .map_err(serde::ser::Error::custom)?;
+        return serializer.serialize_unit();
     }
 
     let mut section = BoundedSerializeBuffer::new(MAX_ORDERED_WINDOW_SECTION_BYTES);
@@ -19616,6 +20190,392 @@ mod test {
                 queue_qos: PduQueueQos::Control,
             }),
         );
+    }
+
+    fn assert_never_plan_matches_canonical_frame(
+        pdu: Pdu,
+        producer: PduProducer,
+        role: PduWireRole,
+        expected_class: PduSemanticClass,
+    ) {
+        reset_test_serialize_invocations();
+        reset_test_bounded_serialize_growth_events();
+        reset_test_compression_invocations();
+
+        let plan = pdu
+            .plan_outbound(producer, role, None, CompressionMode::Never)
+            .expect("outbound sample must have a definitely-not-sent plan");
+        assert!(std::ptr::eq(plan.pdu(), &pdu));
+        assert_eq!(plan.metadata.semantic_class, expected_class);
+        assert_eq!(plan.compression_mode, CompressionMode::Never);
+        assert_eq!(plan.maximum_compression_output_bytes, 0);
+        assert_eq!(
+            plan.maximum_encoded_payload_bytes,
+            plan.logical_payload_bytes
+        );
+        assert_eq!(test_serialize_invocations(), 0);
+        assert_eq!(test_bounded_serialize_buffer_constructions(), 0);
+        assert_eq!(test_bounded_serialize_growth_events(), 0);
+        assert_eq!(test_compression_invocations(), 0);
+
+        let frame = pdu
+            .encode_frame_with_mode(OUTBOUND_PLAN_RESERVED_SERIAL, CompressionMode::Never)
+            .expect("canonical comparison frame must encode");
+        let decoded = decode_raw(frame.as_slice()).expect("canonical comparison frame must decode");
+        assert_eq!(decoded.data.len(), plan.logical_payload_bytes);
+        assert_eq!(frame.len(), plan.maximum_frame_bytes);
+        assert_eq!(plan.retained_frame_bytes, plan.maximum_frame_bytes);
+        assert!(plan.codec_peak_bytes >= plan.maximum_frame_bytes);
+    }
+
+    #[test]
+    fn outbound_plan_counting_matches_every_semantic_class_without_codec_allocation() {
+        let samples = vec![
+            (
+                Pdu::Ping(Ping {}),
+                PduProducer::Client,
+                PduWireRole::Request,
+                PduSemanticClass::ConnectionControl,
+            ),
+            (
+                Pdu::WriteToPane(WriteToPane {
+                    pane_id: 1,
+                    data: b"keypress".to_vec(),
+                }),
+                PduProducer::Client,
+                PduWireRole::Request,
+                PduSemanticClass::InteractiveInput,
+            ),
+            (
+                Pdu::SetPaneZoomed(SetPaneZoomed {
+                    containing_tab_id: 1,
+                    pane_id: 2,
+                    zoomed: true,
+                }),
+                PduProducer::Client,
+                PduWireRole::Request,
+                PduSemanticClass::InteractiveState,
+            ),
+            (
+                Pdu::ListPanes(ListPanes {}),
+                PduProducer::Client,
+                PduWireRole::Request,
+                PduSemanticClass::StateSync,
+            ),
+            (
+                Pdu::RenderApplicationUpdate(sample_render_application_update()),
+                PduProducer::Server,
+                PduWireRole::Unilateral,
+                PduSemanticClass::Render,
+            ),
+            (
+                Pdu::GetSemanticZones(GetSemanticZones { pane_id: 3 }),
+                PduProducer::Client,
+                PduWireRole::Request,
+                PduSemanticClass::Query,
+            ),
+            (
+                Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse {
+                    pane_id: 3,
+                    zones: Vec::new(),
+                    zone_texts: Vec::new(),
+                    last_exit_code: None,
+                }),
+                PduProducer::Server,
+                PduWireRole::CorrelatedReply,
+                PduSemanticClass::BulkData,
+            ),
+        ];
+
+        for (pdu, producer, role, expected_class) in samples {
+            assert_never_plan_matches_canonical_frame(pdu, producer, role, expected_class);
+        }
+    }
+
+    #[test]
+    fn outbound_plan_counts_nested_ordered_window_sections_without_materializing_them() {
+        for (expected_ident, role) in IntoIterator::into_iter([
+            (
+                ListPanesOrderedV1Response::IDENT,
+                PduWireRole::CorrelatedReply,
+            ),
+            (WindowOrderEventV1::IDENT, PduWireRole::Unilateral),
+        ]) {
+            let (_, pdu) = sample_ordered_window_pdus()
+                .into_iter()
+                .find(|(ident, _)| *ident == expected_ident)
+                .expect("ordered sample must include every nested-section PDU");
+            assert_never_plan_matches_canonical_frame(
+                pdu,
+                PduProducer::Server,
+                role,
+                PduSemanticClass::StateSync,
+            );
+        }
+    }
+
+    #[test]
+    fn outbound_counting_fails_at_limit_plus_one_and_restores_nested_scope() {
+        let value = WriteToPane {
+            pane_id: 9,
+            data: vec![0x5a; 64],
+        };
+        let exact = count_pdu_payload(&value, usize::MAX, WriteToPane::IDENT)
+            .expect("unbounded control count must succeed");
+        assert!(exact > 0);
+        assert!(matches!(
+            count_pdu_payload(&value, exact - 1, WriteToPane::IDENT),
+            Err(PduOutboundPlanError::LogicalPayloadLimitExceeded {
+                ident: WriteToPane::IDENT,
+                declared_payload_bytes,
+                max_payload_bytes,
+            }) if declared_payload_bytes == exact && max_payload_bytes == exact - 1
+        ));
+        assert_eq!(
+            count_pdu_payload(&value, exact, WriteToPane::IDENT)
+                .expect("exact logical limit must admit the payload"),
+            exact
+        );
+
+        let outer = OutboundCountingScope::enter(WriteToPane::IDENT)
+            .expect("test outer counting scope must install");
+        let pdu = Pdu::WriteToPane(value);
+        assert!(matches!(
+            pdu.plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Never,
+            ),
+            Err(PduOutboundPlanError::NestedCountingScope {
+                ident: WriteToPane::IDENT,
+            })
+        ));
+        drop(outer);
+        assert!(OUTBOUND_COUNTING_ELIDED_BYTES.with(|bytes| bytes.get().is_none()));
+    }
+
+    #[test]
+    fn outbound_counting_fails_closed_on_checked_length_overflow() {
+        let mut writer = CheckedCountingWriter {
+            logical_len: usize::MAX,
+            max_bytes: usize::MAX,
+            failure: None,
+        };
+        let error = std::io::Write::write(&mut writer, &[0])
+            .expect_err("one byte beyond usize::MAX must fail before wrapping");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(matches!(writer.failure, Some(CountingFailure::Overflow)));
+        assert_eq!(writer.logical_len, usize::MAX);
+    }
+
+    #[test]
+    fn outbound_plan_rejects_direction_and_payload_before_codec_work() {
+        reset_test_serialize_invocations();
+        reset_test_bounded_serialize_growth_events();
+        reset_test_compression_invocations();
+
+        let ping = Pdu::Ping(Ping {});
+        assert!(matches!(
+            ping.plan_outbound(
+                PduProducer::Server,
+                PduWireRole::Unilateral,
+                None,
+                CompressionMode::Always,
+            ),
+            Err(PduOutboundPlanError::Metadata(
+                PduOutboundMetadataError::DirectionNotAuthorized {
+                    ident: Ping::IDENT,
+                    producer: PduProducer::Server,
+                    role: PduWireRole::Unilateral,
+                }
+            ))
+        ));
+
+        let empty = Pdu::GetPaneTieredScrollbackStatusesV1(GetPaneTieredScrollbackStatusesV1 {
+            pane_ids: Vec::new(),
+        });
+        let error = empty
+            .plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Always,
+            )
+            .expect_err("an invalid bounded request must fail before codec work");
+        assert!(matches!(
+            &error,
+            PduOutboundPlanError::InvalidPayload {
+                ident,
+                ..
+            } if *ident == GetPaneTieredScrollbackStatusesV1::IDENT
+        ));
+        assert!(error.to_string().contains("at least one pane"));
+
+        assert_eq!(test_serialize_invocations(), 0);
+        assert_eq!(test_bounded_serialize_buffer_constructions(), 0);
+        assert_eq!(test_bounded_serialize_growth_events(), 0);
+        assert_eq!(test_compression_invocations(), 0);
+    }
+
+    #[test]
+    fn generic_response_plan_inherits_correlated_request_metadata() {
+        let pdu = Pdu::ErrorResponse(ErrorResponse {
+            reason: "bounded failure".to_string(),
+        });
+        let request = <GetPaneTieredScrollbackStatusesV1 as PduWireIdent>::WIRE_SPEC;
+        let plan = pdu
+            .plan_outbound(
+                PduProducer::Server,
+                PduWireRole::CorrelatedReply,
+                Some(&request),
+                CompressionMode::Never,
+            )
+            .expect("generic response must inherit its exact request class");
+        assert_eq!(plan.metadata(), request.fixed_outbound_metadata().unwrap());
+        assert_eq!(plan.ident(), ErrorResponse::IDENT);
+    }
+
+    #[test]
+    fn outbound_compression_plan_uses_bound_without_serializing_or_invoking_zstd() {
+        let pdu = Pdu::WriteToPane(WriteToPane {
+            pane_id: 11,
+            data: vec![b'x'; 4 * 1024],
+        });
+        reset_test_serialize_invocations();
+        reset_test_bounded_serialize_growth_events();
+        reset_test_compression_invocations();
+
+        let plan = pdu
+            .plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Always,
+            )
+            .expect("compressible input must admit a bounded plan");
+        assert!(plan.maximum_compression_output_bytes >= plan.logical_payload_bytes);
+        assert_eq!(
+            plan.maximum_encoded_payload_bytes,
+            plan.maximum_compression_output_bytes
+        );
+        assert_eq!(test_serialize_invocations(), 0);
+        assert_eq!(test_bounded_serialize_buffer_constructions(), 0);
+        assert_eq!(test_bounded_serialize_growth_events(), 0);
+        assert_eq!(test_compression_invocations(), 0);
+
+        let frame = pdu
+            .encode_frame_with_mode(OUTBOUND_PLAN_RESERVED_SERIAL, CompressionMode::Always)
+            .expect("planned compressed frame must encode");
+        assert!(frame.len() <= plan.maximum_frame_bytes);
+        assert_eq!(test_compression_invocations(), 1);
+    }
+
+    fn deterministic_incompressible_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outbound_auto_plan_bounds_threshold_and_incompressible_paths_without_codec_work() {
+        let small = Pdu::Ping(Ping {});
+        reset_test_serialize_invocations();
+        reset_test_bounded_serialize_growth_events();
+        reset_test_compression_invocations();
+        let small_plan = small
+            .plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("small auto payload must admit an uncompressed plan");
+        assert!(small_plan.logical_payload_bytes() <= COMPRESS_THRESH);
+        assert_eq!(small_plan.maximum_compression_output_bytes(), 0);
+        let small_frame = small
+            .encode_frame_with_mode(OUTBOUND_PLAN_RESERVED_SERIAL, CompressionMode::Auto)
+            .expect("small planned frame must encode");
+        assert_eq!(small_frame.len(), small_plan.maximum_frame_bytes());
+        assert!(!decode_raw(small_frame.as_slice()).unwrap().is_compressed);
+        assert_eq!(test_compression_invocations(), 0);
+
+        let pdu = Pdu::WriteToPane(WriteToPane {
+            pane_id: 13,
+            data: deterministic_incompressible_bytes(4 * 1024),
+        });
+        reset_test_serialize_invocations();
+        reset_test_bounded_serialize_growth_events();
+        reset_test_compression_invocations();
+        let auto_plan = pdu
+            .plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Auto,
+            )
+            .expect("incompressible auto payload must admit a conservative plan");
+        let always_plan = pdu
+            .plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Always,
+            )
+            .expect("incompressible always payload must admit a compress-bound plan");
+        assert!(auto_plan.maximum_compression_output_bytes() >= auto_plan.logical_payload_bytes());
+        assert_eq!(
+            always_plan.maximum_encoded_payload_bytes(),
+            always_plan.maximum_compression_output_bytes()
+        );
+        assert_eq!(test_serialize_invocations(), 0);
+        assert_eq!(test_bounded_serialize_buffer_constructions(), 0);
+        assert_eq!(test_bounded_serialize_growth_events(), 0);
+        assert_eq!(test_compression_invocations(), 0);
+
+        let auto_frame = pdu
+            .encode_frame_with_mode(OUTBOUND_PLAN_RESERVED_SERIAL, CompressionMode::Auto)
+            .expect("incompressible auto frame must encode");
+        let auto_raw = decode_raw(auto_frame.as_slice()).expect("auto frame must decode raw");
+        assert!(
+            !auto_raw.is_compressed,
+            "fixed high-entropy fixture must exercise Auto's uncompressed retention path"
+        );
+        assert!(auto_frame.len() <= auto_plan.maximum_frame_bytes());
+
+        let always_frame = pdu
+            .encode_frame_with_mode(OUTBOUND_PLAN_RESERVED_SERIAL, CompressionMode::Always)
+            .expect("incompressible always frame must encode");
+        assert!(decode_raw(always_frame.as_slice()).unwrap().is_compressed);
+        assert!(always_frame.len() <= always_plan.maximum_frame_bytes());
+        assert_eq!(test_compression_invocations(), 2);
+    }
+
+    #[test]
+    fn prepared_outbound_debug_is_content_free() {
+        let secret = "OUTBOUND-PLAN-MUST-NOT-LOG-THIS-CONTENT";
+        let pdu = Pdu::SendPaste(SendPaste {
+            pane_id: 12,
+            data: secret.to_string(),
+            input_serial: InputSerial::from_millis_since_epoch(1),
+        });
+        let prepared = pdu
+            .plan_outbound(
+                PduProducer::Client,
+                PduWireRole::Request,
+                None,
+                CompressionMode::Never,
+            )
+            .expect("paste must produce an exact-owner plan");
+        let debug = format!("{prepared:?}");
+        assert!(debug.contains("SendPaste"));
+        assert!(!debug.contains(secret));
     }
 
     #[test]
