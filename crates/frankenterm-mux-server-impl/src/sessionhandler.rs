@@ -15,8 +15,11 @@ use codec::{
     ListPanesCoherentOutcome, ListPanesCoherentResponse, ListPanesResponse, ListPanesTabStackEntry,
     ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse, MoveFloatingPane,
     MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert, PaneTieredScrollbackStatusEntryV1,
-    PaneTieredScrollbackStatusOutcomeV1, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace,
-    Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown,
+    PaneTieredScrollbackStatusOutcomeV1, Pdu, Ping, Pong, ReliableInputSchedulerPressureV1,
+    ReliableKeyEventKindV1, ReliableKeyEventOutcomeV1, ReliableKeyEventRejectionV1,
+    ReliableKeyEventRetryV1, ReliableKeyEventV1, ReliableKeyEventV1Response,
+    ReliablePaneRegistrationIdentityV1, RemoveFloatingPane, RenameWorkspace, Resize,
+    SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown,
     SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId,
     SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
     SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
@@ -40,10 +43,12 @@ use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::client::ClientId;
 use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
-use mux::{CurrentPane, Mux, PaneRegistrationHandle};
+use mux::{
+    CurrentPane, Mux, PaneRegistrationHandle, ReliableInputClaimOutcome, ReliableInputKeyKind,
+};
 use promise::spawn::{
-    MainThreadEnqueueReceipt, MainThreadReservationOutcome, MainThreadServiceClass,
-    spawn_into_main_thread, try_reserve_main_thread,
+    MainThreadAdmissionRejection, MainThreadEnqueueReceipt, MainThreadReservationOutcome,
+    MainThreadServiceClass, spawn_into_main_thread, try_reserve_main_thread,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -61,6 +66,7 @@ use wezterm_term::StableRowIndex;
 use wezterm_term::terminal::Alert;
 
 const SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
+const RELIABLE_INPUT_RETRY_AFTER_NS: u64 = 1_000_000;
 
 fn record_send_key_down_scheduler_receipt(receipt: MainThreadEnqueueReceipt, sampled: bool) {
     let snapshot = receipt.snapshot_after_enqueue;
@@ -165,6 +171,118 @@ fn reject_send_key_down_scheduler_admission(
     };
     metrics::counter!("mux.server.input_scheduler_admission", "outcome" => label).increment(1);
     Err(anyhow!(detail))
+}
+
+fn reliable_input_scheduler_pressure(
+    rejection: MainThreadAdmissionRejection,
+) -> Option<ReliableInputSchedulerPressureV1> {
+    Some(ReliableInputSchedulerPressureV1 {
+        queue_id: rejection.queue_id.get(),
+        scheduler_generation: rejection.scheduler_generation.get(),
+        active_tasks: u64::try_from(rejection.snapshot.active_tasks).ok()?,
+        task_capacity: u64::try_from(rejection.snapshot.task_capacity).ok()?,
+        active_estimated_bytes: u64::try_from(rejection.snapshot.active_estimated_bytes).ok()?,
+        estimated_byte_capacity: u64::try_from(rejection.snapshot.estimated_byte_capacity).ok()?,
+        requested_estimated_bytes: u64::try_from(rejection.requested_estimated_bytes).ok()?,
+        retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+    })
+}
+
+fn reliable_input_scheduler_rejection(
+    outcome: MainThreadReservationOutcome,
+) -> ReliableKeyEventOutcomeV1 {
+    match outcome {
+        MainThreadReservationOutcome::Reserved(_) => {
+            unreachable!("reserved reliable input must be spawned instead of rejected")
+        }
+        MainThreadReservationOutcome::RetryableFull(rejection) => {
+            reliable_input_scheduler_pressure(rejection).map_or(
+                ReliableKeyEventOutcomeV1::Rejected(
+                    ReliableKeyEventRejectionV1::InvalidSchedulerConfiguration,
+                ),
+                |pressure| {
+                    ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerFull(
+                        pressure,
+                    ))
+                },
+            )
+        }
+        MainThreadReservationOutcome::RetiredGeneration(rejection) => {
+            reliable_input_scheduler_pressure(rejection).map_or(
+                ReliableKeyEventOutcomeV1::Rejected(
+                    ReliableKeyEventRejectionV1::InvalidSchedulerConfiguration,
+                ),
+                |pressure| {
+                    ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerRetired(
+                        pressure,
+                    ))
+                },
+            )
+        }
+        MainThreadReservationOutcome::SchedulerUnavailable => {
+            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerUnavailable {
+                retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+            })
+        }
+        MainThreadReservationOutcome::Coalesced(_)
+        | MainThreadReservationOutcome::InvalidSize(_)
+        | MainThreadReservationOutcome::AuthorityExhausted(_) => {
+            ReliableKeyEventOutcomeV1::Rejected(
+                ReliableKeyEventRejectionV1::InvalidSchedulerConfiguration,
+            )
+        }
+    }
+}
+
+fn reliable_key_response(request: &ReliableKeyEventV1, outcome: ReliableKeyEventOutcomeV1) -> Pdu {
+    Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+        pane_id: request.pane_id,
+        input_serial: request.input_serial,
+        outcome,
+    })
+}
+
+fn reliable_input_claim_outcome(
+    outcome: ReliableInputClaimOutcome,
+) -> Result<mux::ReliableInputCommitPermit, ReliableKeyEventOutcomeV1> {
+    match outcome {
+        ReliableInputClaimOutcome::Execute(permit) => Ok(permit),
+        ReliableInputClaimOutcome::DuplicateApplied => {
+            Err(ReliableKeyEventOutcomeV1::DuplicateApplied)
+        }
+        ReliableInputClaimOutcome::DuplicatePending => Err(ReliableKeyEventOutcomeV1::Retry(
+            ReliableKeyEventRetryV1::DuplicatePending {
+                retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+            },
+        )),
+        ReliableInputClaimOutcome::OutcomeUnknown => Err(ReliableKeyEventOutcomeV1::Rejected(
+            ReliableKeyEventRejectionV1::OutcomeUnknown,
+        )),
+        ReliableInputClaimOutcome::ClientNotRegistered
+        | ReliableInputClaimOutcome::ClientRegistrationRetired => {
+            Err(ReliableKeyEventOutcomeV1::Retry(
+                ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                    retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                },
+            ))
+        }
+        ReliableInputClaimOutcome::ClientLedgerUnavailable => {
+            Err(ReliableKeyEventOutcomeV1::Rejected(
+                ReliableKeyEventRejectionV1::ClientLedgerUnavailable,
+            ))
+        }
+        ReliableInputClaimOutcome::IdentityAuthorityExhausted => {
+            Err(ReliableKeyEventOutcomeV1::Rejected(
+                ReliableKeyEventRejectionV1::IdentityAuthorityExhausted,
+            ))
+        }
+        ReliableInputClaimOutcome::StaleSerial => Err(ReliableKeyEventOutcomeV1::Rejected(
+            ReliableKeyEventRejectionV1::StaleSerial,
+        )),
+        ReliableInputClaimOutcome::IdentityConflict => Err(ReliableKeyEventOutcomeV1::Rejected(
+            ReliableKeyEventRejectionV1::IdentityConflict,
+        )),
+    }
 }
 
 /// Explicit, process-owned recorder authority for mux-server connections.
@@ -5295,6 +5413,168 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::ReliableKeyEventV1(request) => {
+                let registration = match authority.capture_current_pane(request.pane_id) {
+                    Ok(registration) => registration,
+                    Err(_) => {
+                        send_response(Ok(reliable_key_response(
+                            &request,
+                            ReliableKeyEventOutcomeV1::Rejected(
+                                ReliableKeyEventRejectionV1::PaneUnavailable,
+                            ),
+                        )));
+                        return;
+                    }
+                };
+                let current_pane_registration =
+                    ReliablePaneRegistrationIdentityV1::from_bytes(registration.wire_identity());
+                match request.pane_registration {
+                    None => {
+                        send_response(Ok(reliable_key_response(
+                            &request,
+                            ReliableKeyEventOutcomeV1::Retry(
+                                ReliableKeyEventRetryV1::PaneAuthorityRequired {
+                                    pane_registration: current_pane_registration,
+                                },
+                            ),
+                        )));
+                        return;
+                    }
+                    Some(expected) if expected != current_pane_registration => {
+                        send_response(Ok(reliable_key_response(
+                            &request,
+                            ReliableKeyEventOutcomeV1::Rejected(
+                                ReliableKeyEventRejectionV1::PaneRegistrationMismatch,
+                            ),
+                        )));
+                        return;
+                    }
+                    Some(_) => {}
+                }
+                let mux_kind = match request.kind {
+                    ReliableKeyEventKindV1::KeyDown => ReliableInputKeyKind::KeyDown,
+                    ReliableKeyEventKindV1::KeyUp => ReliableInputKeyKind::KeyUp,
+                };
+                let claim = match authority.acquire() {
+                    Ok(session) => session.claim_reliable_key_event(
+                        self.client_id.as_ref(),
+                        &registration,
+                        request.input_serial.get(),
+                        mux_kind,
+                        &request.event,
+                    ),
+                    Err(_) => ReliableInputClaimOutcome::ClientRegistrationRetired,
+                };
+                let mut permit = match reliable_input_claim_outcome(claim) {
+                    Ok(permit) => permit,
+                    Err(outcome) => {
+                        send_response(Ok(reliable_key_response(&request, outcome)));
+                        return;
+                    }
+                };
+                let reservation = match try_reserve_main_thread(
+                    MainThreadServiceClass::Input,
+                    SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
+                ) {
+                    MainThreadReservationOutcome::Reserved(reservation) => reservation,
+                    rejected => {
+                        let outcome = reliable_input_scheduler_rejection(rejected);
+                        drop(permit);
+                        send_response(Ok(reliable_key_response(&request, outcome)));
+                        return;
+                    }
+                };
+                let sender = self.to_write_tx.clone();
+                let per_pane = self.per_pane_for_registration(&registration);
+                let client_id = self.client_id.clone();
+                let spawned = reservation.spawn_local(async move {
+                    let outcome = match authority.acquire() {
+                        Ok(session) => {
+                            if !client_id.as_ref().is_some_and(|client_id| {
+                                session.client_registration_is_current(client_id)
+                            }) {
+                                ReliableKeyEventOutcomeV1::Retry(
+                                    ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                                        retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                                    },
+                                )
+                            } else {
+                                registration
+                                    .try_with_current(|pane| {
+                                        if !permit.begin_side_effect() {
+                                            return ReliableKeyEventOutcomeV1::Rejected(
+                                                ReliableKeyEventRejectionV1::OutcomeUnknown,
+                                            );
+                                        }
+                                        let callback = catch_recoverable(
+                                            RecoverablePanicSite::MuxPaneCallback,
+                                            AssertUnwindSafe(|| match request.kind {
+                                                ReliableKeyEventKindV1::KeyDown => pane.key_down(
+                                                    request.event.key,
+                                                    request.event.modifiers,
+                                                ),
+                                                ReliableKeyEventKindV1::KeyUp => pane.key_up(
+                                                    request.event.key,
+                                                    request.event.modifiers,
+                                                ),
+                                            }),
+                                        );
+                                        match callback {
+                                            Ok(Ok(())) => {
+                                                if permit.commit_applied() {
+                                                    if request.kind
+                                                        == ReliableKeyEventKindV1::KeyDown
+                                                    {
+                                                        push_input_dispatch_changes_after_committed_input(
+                                                            &pane,
+                                                            sender,
+                                                            per_pane,
+                                                            request.input_serial,
+                                                            "reliable-key-down",
+                                                        );
+                                                    }
+                                                    ReliableKeyEventOutcomeV1::Applied
+                                                } else {
+                                                    ReliableKeyEventOutcomeV1::Rejected(
+                                                        ReliableKeyEventRejectionV1::OutcomeUnknown,
+                                                    )
+                                                }
+                                            }
+                                            Ok(Err(error)) => {
+                                                log::warn!(
+                                                    "reliable key pane callback failed after invocation: {error:#}"
+                                                );
+                                                ReliableKeyEventOutcomeV1::Rejected(
+                                                    ReliableKeyEventRejectionV1::OutcomeUnknown,
+                                                )
+                                            }
+                                            Err(_panic) => {
+                                                log::warn!(
+                                                    "reliable key pane callback panicked after invocation"
+                                                );
+                                                ReliableKeyEventOutcomeV1::Rejected(
+                                                    ReliableKeyEventRejectionV1::OutcomeUnknown,
+                                                )
+                                            }
+                                        }
+                                    })
+                                    .unwrap_or(ReliableKeyEventOutcomeV1::Rejected(
+                                        ReliableKeyEventRejectionV1::PaneUnavailable,
+                                    ))
+                            }
+                        }
+                        Err(_) => ReliableKeyEventOutcomeV1::Retry(
+                            ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                                retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                            },
+                        ),
+                    };
+                    send_response(Ok(reliable_key_response(&request, outcome)));
+                });
+                record_send_key_down_scheduler_receipt(spawned.initial_enqueue_receipt(), false);
+                spawned.detach();
+            }
+
             Pdu::SendKeyDown(SendKeyDown {
                 pane_id,
                 event,
@@ -6110,6 +6390,7 @@ impl SessionHandler {
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
             | Pdu::GetPaneTieredScrollbackStatusesV1Response { .. }
+            | Pdu::ReliableKeyEventV1Response { .. }
             | Pdu::ErrorResponse { .. }) => {
                 send_response(Err(anyhow!("expected a request, got {unexpected:?}")));
             }
@@ -6623,6 +6904,158 @@ mod tests {
         assert!(executor.try_tick().unwrap());
         assert_eq!(executor.queue_snapshot().depth, 0);
         assert_eq!(executor.admission_snapshot().active_tasks, 0);
+    }
+
+    #[test]
+    fn reliable_key_saturation_retries_the_same_identity_and_applies_exactly_once() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let blocker = match try_spawn_with_admission(
+            MainThreadServiceClass::Topology,
+            4 * 1024,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected test blocker admission, got {outcome:?}"),
+        };
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane = Arc::new(FakePane::new_with_id(7_008, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register reliable-input saturation pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        handler.process_one(DecodedPdu {
+            serial: 916,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("reliable-saturation", 41_009),
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+
+        let mut request = ReliableKeyEventV1 {
+            pane_id: pane.pane_id(),
+            pane_registration: None,
+            event: termwiz::input::KeyEvent {
+                key: KeyCode::Char('r'),
+                modifiers: KeyModifiers::CTRL,
+            },
+            input_serial: InputSerial::now(),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        handler.process_one(DecodedPdu {
+            serial: 917,
+            pdu: Pdu::ReliableKeyEventV1(request.clone()),
+        });
+        let authority = take_response(&captured);
+        assert_eq!(authority.serial, 917);
+        let Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+            outcome:
+                ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::PaneAuthorityRequired {
+                    pane_registration,
+                }),
+            ..
+        }) = authority.pdu
+        else {
+            panic!("first reliable request must receive exact pane authority")
+        };
+        request.pane_registration = Some(pane_registration);
+        assert_eq!(pane.key_down_count(), 0);
+
+        handler.process_one(DecodedPdu {
+            serial: 918,
+            pdu: Pdu::ReliableKeyEventV1(request.clone()),
+        });
+        let saturated = take_response(&captured);
+        assert_eq!(saturated.serial, 918);
+        assert!(matches!(
+            saturated.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerFull(
+                    _
+                )),
+                ..
+            })
+        ));
+        assert_eq!(pane.key_down_count(), 0);
+
+        drop(blocker);
+        assert!(executor.try_tick().unwrap());
+        handler.process_one(DecodedPdu {
+            serial: 919,
+            pdu: Pdu::ReliableKeyEventV1(request.clone()),
+        });
+        tick_until_response(&executor, &captured, 2);
+        {
+            let mut responses = captured.lock().unwrap();
+            assert_eq!(responses.len(), 2);
+            assert!(responses.iter().any(|response| {
+                response.serial == 919
+                    && matches!(
+                        &response.pdu,
+                        Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                            outcome: ReliableKeyEventOutcomeV1::Applied,
+                            ..
+                        })
+                    )
+            }));
+            responses.clear();
+        }
+        assert_eq!(pane.key_down_count(), 1);
+
+        handler.process_one(DecodedPdu {
+            serial: 920,
+            pdu: Pdu::ReliableKeyEventV1(request.clone()),
+        });
+        let duplicate = take_response(&captured);
+        assert_eq!(duplicate.serial, 920);
+        assert!(matches!(
+            duplicate.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::DuplicateApplied,
+                ..
+            })
+        ));
+        assert_eq!(pane.key_down_count(), 1);
+
+        mux.remove_pane(pane.pane_id());
+        let successor = Arc::new(FakePane::new_with_id(7_008, None));
+        let successor_for_mux: Arc<dyn Pane> = successor.clone();
+        mux.add_pane(&successor_for_mux)
+            .expect("register same-ID reliable-input successor pane");
+
+        let mut stale_registration = request;
+        stale_registration.input_serial = InputSerial::now();
+        handler.process_one(DecodedPdu {
+            serial: 921,
+            pdu: Pdu::ReliableKeyEventV1(stale_registration),
+        });
+        let stale = take_response(&captured);
+        assert_eq!(stale.serial, 921);
+        assert!(matches!(
+            stale.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Rejected(
+                    ReliableKeyEventRejectionV1::PaneRegistrationMismatch
+                ),
+                ..
+            })
+        ));
+        assert_eq!(
+            successor.key_down_count(),
+            0,
+            "the prior registration token must not redirect input to a same-ID successor"
+        );
     }
 
     #[test]

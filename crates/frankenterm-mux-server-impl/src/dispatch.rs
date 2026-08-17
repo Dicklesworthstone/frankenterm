@@ -6273,6 +6273,7 @@ where
     process_async_with_mux(stream, config, mux).await
 }
 
+#[cfg(test)]
 fn dispatch_client_request(
     handler: &mut SessionHandler,
     topology: &TopologyStreamCoordinator,
