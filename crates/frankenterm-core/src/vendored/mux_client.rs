@@ -13853,7 +13853,7 @@ mod tests {
     }
 
     #[test]
-    fn tiered_scrollback_bulk_rejects_old_peer_and_invalid_batches_before_wire() {
+    fn tiered_scrollback_bulk_rejects_invalid_batches_before_wire() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir
@@ -13861,7 +13861,12 @@ mod tests {
                 .join("mux-tiered-scrollback-prewrite-rejections.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
             let server = task::spawn(async move {
-                let mut stream = accept_direct_mux_handshake(listener, 56, 56).await;
+                let mut stream = accept_direct_mux_handshake(
+                    listener,
+                    CODEC_VERSION,
+                    CODEC_VERSION_MIN_SUPPORTED,
+                )
+                .await;
                 let mut read_buf = StreamingPduBuffer::new();
                 let decoded = read_test_request_pdu(&mut stream, &mut read_buf).await;
                 assert!(
@@ -13878,12 +13883,7 @@ mod tests {
             let mut client =
                 DirectMuxClient::connect_with_cx(&cx, direct_mux_client_config(socket_path))
                     .await
-                    .expect("connect v56 peer");
-            let old_peer = client
-                .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11])
-                .await
-                .expect_err("v56 peer must reject PDU93 locally");
-            assert!(old_peer.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1"));
+                    .expect("connect current peer");
 
             for invalid in [
                 Vec::new(),
@@ -14044,15 +14044,9 @@ mod tests {
     #[test]
     fn ordered_window_outbound_gate_precedes_serial_encode_and_batch_prefix() {
         run_async_test(async {
-            for (case_idx, explicit_cx, remote_max, expected_dialect_rejection) in [
-                (0, false, 50, true),
-                (1, true, 50, true),
-                (2, false, 52, true),
-                (3, true, 52, true),
-                (4, false, 53, true),
-                (5, true, 53, true),
-                (6, false, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION, false),
-                (7, true, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION, false),
+            for (case_idx, explicit_cx, remote_max) in [
+                (0, false, CODEC_VERSION_MIN_SUPPORTED),
+                (1, true, CODEC_VERSION_MIN_SUPPORTED),
             ] {
                 let temp_dir = tempfile::tempdir().expect("tempdir");
                 let socket_path = temp_dir
@@ -14116,24 +14110,10 @@ mod tests {
                         .await
                         .expect_err("inactive ordered-window request must be rejected")
                 };
-                if expected_dialect_rejection {
-                    match direct_error {
-                        DirectMuxError::OutboundPduRequiresCodec {
-                            agreed, required, ..
-                        } => {
-                            assert_eq!(agreed, remote_max);
-                            assert_eq!(required, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION);
-                        }
-                        other => {
-                            panic!("expected ordered-window codec rejection, got {other}")
-                        }
-                    }
-                } else {
-                    assert!(matches!(
-                        direct_error,
-                        DirectMuxError::OutboundCapabilityNotNegotiated { .. }
-                    ));
-                }
+                assert!(matches!(
+                    direct_error,
+                    DirectMuxError::OutboundCapabilityNotNegotiated { .. }
+                ));
                 assert_eq!(client.serial, 2);
                 assert!(client.outstanding_requests.is_empty());
 
@@ -14173,14 +14153,10 @@ mod tests {
     fn ordered_window_inbound_gate_precedes_correlation_and_poisons_both_readers() {
         run_async_test(async {
             for (case_idx, explicit_cx, remote_max, correlated_reply) in [
-                (0, false, 50, false),
-                (1, true, 50, false),
-                (2, false, 52, false),
-                (3, true, 52, false),
-                (4, false, 53, false),
-                (5, true, 53, false),
-                (6, false, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION, true),
-                (7, true, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION, true),
+                (0, false, CODEC_VERSION_MIN_SUPPORTED, false),
+                (1, true, CODEC_VERSION_MIN_SUPPORTED, false),
+                (2, false, CODEC_VERSION_MIN_SUPPORTED, true),
+                (3, true, CODEC_VERSION_MIN_SUPPORTED, true),
             ] {
                 let temp_dir = tempfile::tempdir().expect("tempdir");
                 let socket_path = temp_dir
@@ -14241,24 +14217,10 @@ mod tests {
                         .await
                         .expect_err("forbidden ordered-window PDU must fail")
                 };
-                if remote_max < codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION {
-                    match error {
-                        DirectMuxError::InboundPduRequiresCodec {
-                            agreed, required, ..
-                        } => {
-                            assert_eq!(agreed, remote_max);
-                            assert_eq!(required, codec::ORDERED_WINDOW_V1_MIN_CODEC_VERSION);
-                        }
-                        other => {
-                            panic!("expected ordered-window codec rejection, got {other}")
-                        }
-                    }
-                } else {
-                    assert!(matches!(
-                        error,
-                        DirectMuxError::InboundCapabilityNotNegotiated { .. }
-                    ));
-                }
+                assert!(matches!(
+                    error,
+                    DirectMuxError::InboundCapabilityNotNegotiated { .. }
+                ));
                 assert!(client.connection_poisoned);
                 assert!(matches!(
                     client.protocol_state,
