@@ -9,15 +9,22 @@ use codec::{
     ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse,
     MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu, Ping,
     Pong, RemoteTabId, RemoteWindowId, RemoveFloatingPane, RenameWorkspace, ReorderWindowTabsV1,
-    Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown,
-    SendKeyUp, SendMouseEvent, SendPaste, SerializedLines, SetActiveWorkspace, SetClientId,
-    SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
-    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabAddedToWindow,
-    TabResized, TabTitleChanged, ToggleFloatingPane, TopologyStreamId, UnitResponse,
-    UpdatePaneConstraints, WindowOrderMutationId, WindowOrderRevision, WindowReorderDigest,
-    WindowTitleChanged, WindowWorkspaceChanged, WriteToPane, ORDERED_WINDOW_PROTOCOL_VERSION,
+    Resize, SampledTraceContextV1, SearchScrollbackRequest, SearchScrollbackResponse,
+    SelectStackPane, SendKeyDown, SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste,
+    SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
+    SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed, SetWindowWorkspace, SpawnResponse,
+    SpawnV2, SplitPane, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
+    ToggleFloatingPane, TopologyStreamId, UnitResponse, UpdatePaneConstraints,
+    WindowOrderMutationId, WindowOrderRevision, WindowReorderDigest, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane, ORDERED_WINDOW_PROTOCOL_VERSION,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
+use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
+    RecorderEpochId, RecorderSamplerAlgorithm, SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+};
+use frankenterm_core_audit_types::interaction_trace_v2::{
+    InteractionTraceId, InteractionTracePath, InteractionTraceRunId,
+};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
     Alert, ClipboardSelection, MouseButton, MouseEvent as TermMouseEvent, MouseEventKind, Progress,
@@ -532,6 +539,45 @@ fn arb_send_key_down() -> impl Strategy<Value = SendKeyDown> {
         pane_id,
         event,
         input_serial: InputSerial::from_millis_since_epoch(millis),
+    })
+}
+
+fn arb_sampled_trace_context() -> impl Strategy<Value = SampledTraceContextV1> {
+    (
+        1_u64..u64::MAX,
+        any::<u64>(),
+        1_u64..u64::MAX,
+        1_u64..u64::MAX,
+        any::<u64>(),
+    )
+        .prop_map(
+            |(run_nonce_hi, run_nonce_lo, sequence, epoch_nonce_hi, epoch_nonce_lo)| {
+                SampledTraceContextV1 {
+                    schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+                    trace_id: InteractionTraceId {
+                        run_id: InteractionTraceRunId {
+                            epoch_nonce_hi: run_nonce_hi,
+                            epoch_nonce_lo: run_nonce_lo,
+                        },
+                        sequence,
+                    },
+                    path: InteractionTracePath::Keypress,
+                    origin_recorder_epoch_id: RecorderEpochId {
+                        nonce_hi: epoch_nonce_hi,
+                        nonce_lo: epoch_nonce_lo,
+                    },
+                    sampler_algorithm: RecorderSamplerAlgorithm::SplitMix64V1,
+                }
+            },
+        )
+}
+
+fn arb_send_key_down_traced_v1() -> impl Strategy<Value = SendKeyDownTracedV1> {
+    (arb_send_key_down(), arb_sampled_trace_context()).prop_map(|(request, trace_context)| {
+        SendKeyDownTracedV1 {
+            request,
+            trace_context,
+        }
     })
 }
 
@@ -1356,6 +1402,18 @@ proptest! {
         prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SendKeyDown(payload));
+    }
+
+    #[test]
+    fn sampled_send_key_down_json_and_pdu_roundtrip(
+        payload in arb_send_key_down_traced_v1(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SendKeyDownTracedV1 = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload.clone());
+
+        assert_pdu_roundtrip(serial, Pdu::SendKeyDownTracedV1(payload));
     }
 
     #[test]

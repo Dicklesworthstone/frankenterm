@@ -17,11 +17,13 @@ use codec::{
     MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert, PaneTieredScrollbackStatusEntryV1,
     PaneTieredScrollbackStatusOutcomeV1, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace,
     Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown,
-    SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId, SetFloatingPaneZ,
-    SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed, SetWindowWorkspace, SpawnResponse,
-    SpawnV2, SplitPane, SwapToLayout, TabTitleChanged, ToggleFloatingPane, TopologyCapabilities,
-    TopologyStreamId, UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
+    SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId,
+    SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
+    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
+    ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
+use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceContextV1;
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::client::ClientId;
 use mux::pane::{CachePolicy, PaneId};
@@ -732,6 +734,88 @@ struct SessionOperationLease {
 impl Drop for SessionOperationLease {
     fn drop(&mut self) {
         self.incarnation.release_operation();
+    }
+}
+
+/// Sampled input context admitted by one exact server connection generation.
+///
+/// This contains only the frozen numeric trace context, the unpredictable
+/// topology-stream identity allocated for this connection, and the existing
+/// content-free pane/input-serial request identity. Key-event content never
+/// enters the authority object. The intentionally non-`Clone` token is
+/// constructed and revalidated before client-activity bookkeeping or pane
+/// mutation, then consumed by the one admitted dispatch.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedInputTraceV1 {
+    context: SampledTraceContextV1,
+    stream_id: TopologyStreamId,
+    pane_id: PaneId,
+    input_serial: InputSerial,
+}
+
+impl AdmittedInputTraceV1 {
+    pub(crate) fn admit(
+        request: &SendKeyDownTracedV1,
+        stream_id: TopologyStreamId,
+        local_codec_version: usize,
+    ) -> anyhow::Result<Self> {
+        if local_codec_version < codec::SAMPLED_INPUT_TRACE_V1_MIN_CODEC_VERSION {
+            return Err(anyhow!(
+                "sampled key input is unavailable in this codec dialect"
+            ));
+        }
+        if stream_id.as_bytes() == [0; 16] {
+            return Err(anyhow!(
+                "sampled key input has no live connection-generation authority"
+            ));
+        }
+        request
+            .validate()
+            .context("validating sampled key input context")?;
+        Ok(Self {
+            context: request.trace_context,
+            stream_id,
+            pane_id: request.request.pane_id,
+            input_serial: request.request.input_serial,
+        })
+    }
+
+    fn validate_for_request(
+        &self,
+        request: &SendKeyDownTracedV1,
+        current_stream_id: TopologyStreamId,
+    ) -> anyhow::Result<()> {
+        request
+            .validate()
+            .context("revalidating sampled key input context")?;
+        if self.stream_id != current_stream_id {
+            return Err(anyhow!(
+                "sampled key input belongs to a stale connection generation"
+            ));
+        }
+        if self.context != request.trace_context {
+            return Err(anyhow!(
+                "sampled key input context differs from its admission authority"
+            ));
+        }
+        if self.pane_id != request.request.pane_id
+            || self.input_serial != request.request.input_serial
+        {
+            return Err(anyhow!(
+                "sampled key input request identity differs from its admission authority"
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn context(&self) -> SampledTraceContextV1 {
+        self.context
+    }
+
+    #[must_use]
+    pub(crate) const fn stream_id(&self) -> TopologyStreamId {
+        self.stream_id
     }
 }
 
@@ -4025,17 +4109,47 @@ impl SessionHandler {
     }
 
     pub fn process_one(&mut self, decoded: DecodedPdu) {
-        self.process_one_with_dispatch_authority(decoded, None);
+        self.process_one_with_dispatch_authority(decoded, None, None);
     }
 
     pub(crate) fn process_one_with_dispatch_authority(
         &mut self,
         decoded: DecodedPdu,
         ordered_window_authority: Option<EstablishedOrderedWindowAuthority>,
+        input_trace_authority: Option<AdmittedInputTraceV1>,
     ) {
         let start = Instant::now();
         let sender = self.to_write_tx.clone();
         let serial = decoded.serial;
+        let authority = self.owner.authority();
+        let response_authority = authority.clone();
+        let send_response = move |result: anyhow::Result<Pdu>| {
+            let pdu = match result {
+                Ok(pdu) => pdu,
+                Err(err) => Pdu::ErrorResponse(ErrorResponse {
+                    reason: format!("Error: {err:#}"),
+                }),
+            };
+            log::trace!("{} processing time {:?}", serial, start.elapsed());
+            let _ = response_authority.try_run(|| sender.send_control(DecodedPdu { pdu, serial }));
+        };
+
+        let trace_validation = match (&decoded.pdu, input_trace_authority.as_ref()) {
+            (Pdu::SendKeyDownTracedV1(request), Some(admission)) => {
+                admission.validate_for_request(request, self.topology_stream_id)
+            }
+            (Pdu::SendKeyDownTracedV1(_), None) => Err(anyhow!(
+                "sampled key input lacks server admission authority"
+            )),
+            (_, Some(_)) => Err(anyhow!(
+                "sampled key input authority was attached to an unrelated request"
+            )),
+            (_, None) => Ok(()),
+        };
+        if let Err(err) = trace_validation {
+            send_response(Err(err));
+            return;
+        }
 
         if let Some(client_id) = &self.client_id {
             if decoded.pdu.is_user_input() && !matches!(&decoded.pdu, Pdu::ReorderWindowTabsV1(_)) {
@@ -4062,19 +4176,6 @@ impl SessionHandler {
                 }
             }
         }
-
-        let authority = self.owner.authority();
-        let response_authority = authority.clone();
-        let send_response = move |result: anyhow::Result<Pdu>| {
-            let pdu = match result {
-                Ok(pdu) => pdu,
-                Err(err) => Pdu::ErrorResponse(ErrorResponse {
-                    reason: format!("Error: {err:#}"),
-                }),
-            };
-            log::trace!("{} processing time {:?}", serial, start.elapsed());
-            let _ = response_authority.try_run(|| sender.send_control(DecodedPdu { pdu, serial }));
-        };
 
         fn catch<F, SND>(f: F, send_response: SND)
         where
@@ -4125,7 +4226,23 @@ impl SessionHandler {
             }
         }
 
-        match decoded.pdu {
+        let (pdu, admitted_input_trace) = match decoded.pdu {
+            Pdu::SendKeyDownTracedV1(traced) => {
+                let (request, trace_context) = traced.into_parts();
+                let Some(admission) = input_trace_authority else {
+                    send_response(Err(anyhow!(
+                        "sampled key input admission authority vanished before dispatch"
+                    )));
+                    return;
+                };
+                debug_assert_eq!(admission.context(), trace_context);
+                debug_assert_eq!(admission.stream_id(), self.topology_stream_id);
+                (Pdu::SendKeyDown(request), Some(admission))
+            }
+            pdu => (pdu, None),
+        };
+
+        match pdu {
             Pdu::Ping(Ping {}) => send_response(Ok(Pdu::Pong(Pong {}))),
             Pdu::SetWindowWorkspace(SetWindowWorkspace {
                 window_id,
@@ -4629,10 +4746,17 @@ impl SessionHandler {
                 };
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
+                let trace_authority = admitted_input_trace;
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
+                                // Retain the exact K4 connection-generation
+                                // authority through the mux-main handoff. The
+                                // K5/K6 instrumentation child consumes it here;
+                                // this plumbing bead intentionally records no
+                                // timing event yet.
+                                let _ = trace_authority;
                                 pane.key_down(event.key, event.modifiers)?;
                                 push_input_dispatch_changes_after_committed_input(
                                     pane,
@@ -5358,8 +5482,10 @@ impl SessionHandler {
                      settlement coordinator was activated for this connection"
                 )));
             }
-            Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
-            Pdu::Pong { .. }
+            Pdu::Invalid { ident } => {
+                send_response(Err(anyhow!("invalid PDU identifier {ident}")));
+            }
+            unexpected @ (Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
             | Pdu::ListPanesCoherentResponse { .. }
             | Pdu::ListPanesTabStacksResponse { .. }
@@ -5391,15 +5517,17 @@ impl SessionHandler {
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
             | Pdu::GetPaneTieredScrollbackStatusesV1Response { .. }
-            | Pdu::ErrorResponse { .. } => {
-                send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)));
+            | Pdu::ErrorResponse { .. }) => {
+                send_response(Err(anyhow!("expected a request, got {unexpected:?}")));
             }
-            Pdu::TopologyEvent { .. } => {
+            unexpected @ Pdu::TopologyEvent { .. } => {
                 send_response(Err(anyhow!(
-                    "expected a request, got server-unilateral topology event {:?}",
-                    decoded.pdu
+                    "expected a request, got server-unilateral topology event {unexpected:?}",
                 )));
             }
+            Pdu::SendKeyDownTracedV1(_) => unreachable!(
+                "sampled key input is normalized only after exact trace admission validation"
+            ),
         }
     }
 }
@@ -5566,6 +5694,12 @@ async fn move_pane(
 mod tests {
     use super::*;
     use config::keyassignment::PaneDirection;
+    use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
+        RecorderEpochId, RecorderSamplerAlgorithm, SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+    };
+    use frankenterm_core_audit_types::interaction_trace_v2::{
+        InteractionTraceId, InteractionTracePath, InteractionTraceRunId,
+    };
     use mux::domain::DomainId;
     use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use parking_lot::{MappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
@@ -5581,6 +5715,39 @@ mod tests {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::terminal::Progress;
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
+
+    fn sampled_key_context() -> SampledTraceContextV1 {
+        SampledTraceContextV1 {
+            schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+            trace_id: InteractionTraceId {
+                run_id: InteractionTraceRunId {
+                    epoch_nonce_hi: 0x4142_4344_4546_4748,
+                    epoch_nonce_lo: 0x5152_5354_5556_5758,
+                },
+                sequence: 17,
+            },
+            path: InteractionTracePath::Keypress,
+            origin_recorder_epoch_id: RecorderEpochId {
+                nonce_hi: 0x6162_6364_6566_6768,
+                nonce_lo: 0x7172_7374_7576_7778,
+            },
+            sampler_algorithm: RecorderSamplerAlgorithm::SplitMix64V1,
+        }
+    }
+
+    fn sampled_key_request() -> SendKeyDownTracedV1 {
+        SendKeyDownTracedV1 {
+            request: SendKeyDown {
+                pane_id: 7_007,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(11),
+            },
+            trace_context: sampled_key_context(),
+        }
+    }
 
     struct ScopedMux(Option<Arc<Mux>>);
 
@@ -6239,6 +6406,59 @@ mod tests {
         assert!(handler.client_id.is_none());
         assert!(handler.proxy_client_id.is_none());
         assert!(handler.per_pane.is_empty());
+    }
+
+    #[test]
+    fn sampled_input_admission_binds_exact_context_and_connection_generation() {
+        let request = sampled_key_request();
+        let stream_id = TopologyStreamId::from_bytes([0x91; 16]);
+        let admission = AdmittedInputTraceV1::admit(&request, stream_id, codec::CODEC_VERSION)
+            .expect("valid sampled key input should gain server admission authority");
+        assert_eq!(admission.context(), request.trace_context);
+        assert_eq!(admission.stream_id(), stream_id);
+        admission
+            .validate_for_request(&request, stream_id)
+            .expect("exact request and stream should remain current");
+    }
+
+    #[test]
+    fn sampled_input_admission_rejects_old_codec_zero_and_stale_generations() {
+        let request = sampled_key_request();
+        let current_stream = TopologyStreamId::from_bytes([0x92; 16]);
+        let prior_dialect = codec::SAMPLED_INPUT_TRACE_V1_MIN_CODEC_VERSION - 1;
+        let error = AdmittedInputTraceV1::admit(&request, current_stream, prior_dialect)
+            .expect_err("pre-v59 dialect must reject the traced-input PDU");
+        assert!(format!("{error:#}").contains("unavailable in this codec dialect"));
+
+        let error = AdmittedInputTraceV1::admit(
+            &request,
+            TopologyStreamId::from_bytes([0; 16]),
+            codec::CODEC_VERSION,
+        )
+        .expect_err("zero stream identity must fail closed");
+        assert!(format!("{error:#}").contains("no live connection-generation authority"));
+
+        let admission = AdmittedInputTraceV1::admit(&request, current_stream, codec::CODEC_VERSION)
+            .expect("current stream should admit the sampled input");
+        let successor_stream = TopologyStreamId::from_bytes([0x93; 16]);
+        let error = admission
+            .validate_for_request(&request, successor_stream)
+            .expect_err("reconnect must retire the prior stream authority");
+        assert!(format!("{error:#}").contains("stale connection generation"));
+
+        let mut different_context = request.clone();
+        different_context.trace_context.trace_id.sequence += 1;
+        let error = admission
+            .validate_for_request(&different_context, current_stream)
+            .expect_err("admission cannot be transplanted to a different trace context");
+        assert!(format!("{error:#}").contains("differs from its admission authority"));
+
+        let mut different_request = request.clone();
+        different_request.request.input_serial = InputSerial::from_millis_since_epoch(12);
+        let error = admission
+            .validate_for_request(&different_request, current_stream)
+            .expect_err("admission cannot be transplanted to another input request");
+        assert!(format!("{error:#}").contains("request identity differs"));
     }
 
     #[test]
@@ -7023,6 +7243,105 @@ mod tests {
             responses.remove(index)
         };
         assert_eq!(written.pdu, Pdu::UnitResponse(UnitResponse {}));
+    }
+
+    #[test]
+    fn sampled_key_input_rejects_missing_and_stale_authority_before_any_mutation() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane = Arc::new(FakePane::new_with_id(7_007, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register sampled-input test pane");
+
+        let current_stream = TopologyStreamId::from_bytes([0xa1; 16]);
+        let client = test_client_id("sampled-input-admission", 41_010);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(Arc::clone(&mux)),
+            current_stream,
+        );
+        handler.process_one(DecodedPdu {
+            serial: 910,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client,
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+
+        let request = sampled_key_request();
+        handler.process_one_with_dispatch_authority(
+            DecodedPdu {
+                serial: 911,
+                pdu: Pdu::SendKeyDownTracedV1(request.clone()),
+            },
+            None,
+            None,
+        );
+        let rejected = take_response(&captured);
+        assert!(matches!(rejected.pdu, Pdu::ErrorResponse(_)));
+        assert_eq!(handler.client_input_activity_updates, 0);
+        assert_eq!(pane.key_down_count(), 0);
+        assert!(handler.per_pane.is_empty());
+
+        let stale_stream = TopologyStreamId::from_bytes([0xa2; 16]);
+        let stale = AdmittedInputTraceV1::admit(&request, stale_stream, codec::CODEC_VERSION)
+            .expect("prior connection should have admitted its own request");
+        handler.process_one_with_dispatch_authority(
+            DecodedPdu {
+                serial: 912,
+                pdu: Pdu::SendKeyDownTracedV1(request.clone()),
+            },
+            None,
+            Some(stale),
+        );
+        let rejected = take_response(&captured);
+        match rejected.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(reason.contains("stale connection generation"));
+            }
+            other => panic!("expected stale-generation error, got {other:?}"),
+        }
+        assert_eq!(handler.client_input_activity_updates, 0);
+        assert_eq!(pane.key_down_count(), 0);
+        assert!(handler.per_pane.is_empty());
+
+        let admitted = AdmittedInputTraceV1::admit(&request, current_stream, codec::CODEC_VERSION)
+            .expect("current connection should admit the sampled request");
+        handler.process_one_with_dispatch_authority(
+            DecodedPdu {
+                serial: 913,
+                pdu: Pdu::SendKeyDownTracedV1(request),
+            },
+            None,
+            Some(admitted),
+        );
+        assert_eq!(handler.client_input_activity_updates, 1);
+        for _ in 0..32 {
+            if pane.key_down_count() == 1
+                && captured
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .iter()
+                    .any(|response| response.serial == 913)
+            {
+                break;
+            }
+            executor.tick().expect("drive sampled key input");
+        }
+        assert_eq!(pane.key_down_count(), 1);
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
     }
 
     #[test]

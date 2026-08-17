@@ -18,6 +18,11 @@
 
 use anyhow::{bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
+pub use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceContextV1;
+use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
+    RecorderContractError, RecorderSamplerAlgorithm,
+};
+use frankenterm_core_audit_types::interaction_trace_v2::InteractionTracePath;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, SemanticZone, StableRowIndex, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
@@ -3350,6 +3355,12 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    (SendKeyDownTracedV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_SEND_KEY_DOWN_TRACED_V1_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_SEND_KEY_DOWN_TRACED_V1_ZSTD_ENCODED_BYTES,
+        }
+    };
     (GetPaneTieredScrollbackStatusesV1, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_TIERED_SCROLLBACK_STATUS_REQUEST_DECOMPRESSED_BYTES,
@@ -4110,7 +4121,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 58;
+pub const CODEC_VERSION: usize = 59;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4405,6 +4416,9 @@ pdu! {
     GetPaneTieredScrollbackStatusesV1Response: 94, 57, server_reply, none,
         bulk_data, bulk_data, bulk
         => deserialize_get_pane_tiered_scrollback_statuses_v1_response;
+    SendKeyDownTracedV1: 95, 59, client_request, none,
+        interactive_input, interactive_input, interactive
+        => deserialize_send_key_down_traced_v1;
 }
 
 impl Pdu {
@@ -4420,6 +4434,7 @@ impl Pdu {
             Self::GetPaneRenderDeliveryV1Response(value) => value.validate()?,
             Self::GetPaneTieredScrollbackStatusesV1(value) => value.validate()?,
             Self::GetPaneTieredScrollbackStatusesV1Response(value) => value.validate()?,
+            Self::SendKeyDownTracedV1(value) => value.validate()?,
             _ => {}
         }
         Ok(())
@@ -4679,6 +4694,7 @@ impl Pdu {
             self,
             Self::WriteToPane(_)
                 | Self::SendKeyDown(_)
+                | Self::SendKeyDownTracedV1(_)
                 | Self::SendKeyUp(_)
                 | Self::SendMouseEvent(_)
                 | Self::SendPaste(_)
@@ -5051,6 +5067,20 @@ fn deserialize_exact_payload_with_limit<T: serde::de::DeserializeOwned>(
         bail!("{payload_name} payload has trailing compressed frame bytes");
     }
     Ok(decoded)
+}
+
+fn deserialize_send_key_down_traced_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<SendKeyDownTracedV1, Error> {
+    let request: SendKeyDownTracedV1 = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "SendKeyDownTracedV1",
+        MAX_SEND_KEY_DOWN_TRACED_V1_DECOMPRESSED_BYTES,
+    )?;
+    request.validate()?;
+    Ok(request)
 }
 
 fn deserialize_list_panes_coherent(
@@ -11254,6 +11284,59 @@ pub struct SendKeyDown {
     pub input_serial: InputSerial,
 }
 
+/// Additive, sampled-only key-input envelope for the K3-to-K4 trace seam.
+///
+/// Unsampled input continues to use [`SendKeyDown`] byte-for-byte. A sampled
+/// request uses a distinct PDU identifier so an older peer never interprets a
+/// positional schema extension as the legacy request. The trace context is
+/// fixed-shape and content-free; the key event remains only in the operational
+/// request and is never copied into trace metadata.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct SendKeyDownTracedV1 {
+    pub request: SendKeyDown,
+    pub trace_context: SampledTraceContextV1,
+}
+
+/// Maximum decompressed body admitted for one sampled key-input request.
+///
+/// The trace context itself is fixed-size. This ceiling also prevents a
+/// hostile variable-width key representation from borrowing the historical
+/// 256 MiB global frame budget before semantic validation.
+pub const MAX_SEND_KEY_DOWN_TRACED_V1_DECOMPRESSED_BYTES: usize = 64 * 1024;
+/// Conservative compressed-body ceiling for the sampled key-input schema.
+pub const MAX_SEND_KEY_DOWN_TRACED_V1_ZSTD_ENCODED_BYTES: usize = 128 * 1024;
+/// First codec dialect that knows the additive sampled key-input PDU.
+pub const SAMPLED_INPUT_TRACE_V1_MIN_CODEC_VERSION: usize = 59;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SampledInputTraceContextError {
+    #[error(transparent)]
+    Contract(#[from] RecorderContractError),
+    #[error("sampled key input requires the keypress trace path")]
+    WrongPath,
+}
+
+impl SendKeyDownTracedV1 {
+    pub fn validate(&self) -> Result<(), SampledInputTraceContextError> {
+        self.trace_context.validate()?;
+        if self.trace_context.path != InteractionTracePath::Keypress {
+            return Err(SampledInputTraceContextError::WrongPath);
+        }
+        // Keep sampler support an exhaustive compile-time decision. If the
+        // frozen vocabulary grows, this seam must explicitly decide whether a
+        // new algorithm can cross the wire before the build can pass.
+        match self.trace_context.sampler_algorithm {
+            RecorderSamplerAlgorithm::SplitMix64V1 => {}
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (SendKeyDown, SampledTraceContextV1) {
+        (self.request, self.trace_context)
+    }
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SendKeyUp {
     pub pane_id: TabId,
@@ -13293,7 +13376,32 @@ fn deserialize_get_image_cell_response(
 #[cfg(test)]
 mod test {
     use super::*;
+    use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
+        RecorderEpochId, SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+    };
+    use frankenterm_core_audit_types::interaction_trace_v2::{
+        InteractionTraceId, InteractionTraceRunId,
+    };
     use proptest::prelude::*;
+
+    fn sampled_key_trace_context() -> SampledTraceContextV1 {
+        SampledTraceContextV1 {
+            schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+            trace_id: InteractionTraceId {
+                run_id: InteractionTraceRunId {
+                    epoch_nonce_hi: 0x0102_0304_0506_0708,
+                    epoch_nonce_lo: 0x1112_1314_1516_1718,
+                },
+                sequence: 19,
+            },
+            path: InteractionTracePath::Keypress,
+            origin_recorder_epoch_id: RecorderEpochId {
+                nonce_hi: 0x2122_2324_2526_2728,
+                nonce_lo: 0x3132_3334_3536_3738,
+            },
+            sampler_algorithm: RecorderSamplerAlgorithm::SplitMix64V1,
+        }
+    }
 
     thread_local! {
         static BOUNDED_OVERFLOW_VALUE_DESERIALIZATIONS: std::cell::Cell<usize> =
@@ -19055,8 +19163,8 @@ mod test {
     }
 
     #[test]
-    fn codec_v58_requires_atomic_floating_snapshot_redeploy_and_retains_feature_minima() {
-        assert_eq!(CODEC_VERSION, 58);
+    fn codec_v59_adds_sampled_input_and_retains_atomic_v58_minimum() {
+        assert_eq!(CODEC_VERSION, 59);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 58);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -19074,6 +19182,11 @@ mod test {
             check_compat(58, 58, 57, 56).is_err(),
             "the authoritative floating snapshot schema requires an atomic v58 redeploy"
         );
+        assert_eq!(
+            check_compat(59, 58, 58, 58),
+            Ok(CompatDecision::Compatible { agreed: 58 }),
+            "the additive traced-input PDU must preserve the v58 compatibility window"
+        );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
         assert_eq!(
@@ -19083,6 +19196,10 @@ mod test {
         assert_eq!(
             <GetPaneRenderDeliveryV1Response as PduWireIdent>::WIRE_SPEC.min_codec_version,
             52
+        );
+        assert_eq!(
+            <SendKeyDownTracedV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            SAMPLED_INPUT_TRACE_V1_MIN_CODEC_VERSION
         );
         assert_eq!(
             <ListPanesOrderedV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
@@ -20013,8 +20130,215 @@ mod test {
     // --- CODEC_VERSION test ---
 
     #[test]
+    fn sampled_key_input_roundtrips_under_its_additive_wire_identity() {
+        let request = SendKeyDownTracedV1 {
+            request: SendKeyDown {
+                pane_id: 7,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::CTRL,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(11),
+            },
+            trace_context: sampled_key_trace_context(),
+        };
+        let pdu = Pdu::SendKeyDownTracedV1(request);
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let mut encoded = Vec::new();
+            pdu.encode_with_mode(&mut encoded, 23, mode)
+                .expect("valid sampled key input should encode");
+            let decoded = Pdu::decode(encoded.as_slice()).expect("sampled key input should decode");
+            assert_eq!(decoded.serial, 23);
+            assert_eq!(decoded.pdu, pdu);
+        }
+        assert_eq!(<SendKeyDownTracedV1 as PduWireIdent>::IDENT, 95);
+        assert_eq!(
+            <SendKeyDownTracedV1 as PduWireIdent>::WIRE_SPEC.encoded_body_limit,
+            PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+                max_decompressed_bytes: MAX_SEND_KEY_DOWN_TRACED_V1_DECOMPRESSED_BYTES,
+                max_zstd_encoded_bytes: MAX_SEND_KEY_DOWN_TRACED_V1_ZSTD_ENCODED_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn sampled_key_input_rejects_wrong_path_and_schema_before_wire_mutation() {
+        let mut wrong_path = sampled_key_trace_context();
+        wrong_path.path = InteractionTracePath::ResizeZoom;
+        let mut output = Vec::new();
+        let error = Pdu::SendKeyDownTracedV1(SendKeyDownTracedV1 {
+            request: SendKeyDown {
+                pane_id: 7,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(11),
+            },
+            trace_context: wrong_path,
+        })
+        .encode(&mut output, 23)
+        .expect_err("resize trace context must not authorize a key-input request");
+        assert!(format!("{error:#}").contains("keypress trace path"));
+        assert!(output.is_empty());
+
+        let mut wrong_schema = sampled_key_trace_context();
+        wrong_schema.schema_version = SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION + 1;
+        let malformed = SendKeyDownTracedV1 {
+            request: SendKeyDown {
+                pane_id: 7,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(11),
+            },
+            trace_context: wrong_schema,
+        };
+        let (payload, compressed) = serialize_with_mode(&malformed, CompressionMode::Never)
+            .expect("malformed sampled context should remain serializable as a hostile fixture");
+        assert!(!compressed);
+        let mut frame = Vec::new();
+        encode_raw(
+            <SendKeyDownTracedV1 as PduWireIdent>::IDENT,
+            23,
+            &payload,
+            false,
+            &mut frame,
+        )
+        .expect("hostile sampled input fixture should frame");
+        let error = Pdu::decode(frame.as_slice())
+            .expect_err("sampled context schema mismatch must fail during decode");
+        assert!(format!("{error:#}").contains("unsupported schema version"));
+    }
+
+    #[test]
+    fn sampled_key_input_rejects_invalid_trace_and_epoch_identities_before_wire_mutation() {
+        for malformed_context in [
+            SampledTraceContextV1 {
+                trace_id: InteractionTraceId {
+                    run_id: InteractionTraceRunId {
+                        epoch_nonce_hi: 0,
+                        epoch_nonce_lo: 0,
+                    },
+                    sequence: 19,
+                },
+                ..sampled_key_trace_context()
+            },
+            SampledTraceContextV1 {
+                origin_recorder_epoch_id: RecorderEpochId {
+                    nonce_hi: 0,
+                    nonce_lo: 0,
+                },
+                ..sampled_key_trace_context()
+            },
+        ] {
+            let mut output = Vec::new();
+            Pdu::SendKeyDownTracedV1(SendKeyDownTracedV1 {
+                request: SendKeyDown {
+                    pane_id: 7,
+                    event: termwiz::input::KeyEvent {
+                        key: termwiz::input::KeyCode::Char('x'),
+                        modifiers: termwiz::input::Modifiers::NONE,
+                    },
+                    input_serial: InputSerial::from_millis_since_epoch(11),
+                },
+                trace_context: malformed_context,
+            })
+            .encode(&mut output, 23)
+            .expect_err("invalid sampled authority identity must fail before framing");
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn sampled_trace_context_is_fixed_shape_and_content_free() {
+        assert!(!std::mem::needs_drop::<SampledTraceContextV1>());
+        let encoded = serde_json::to_value(sampled_key_trace_context())
+            .expect("sampled trace context should serialize");
+        let object = encoded
+            .as_object()
+            .expect("sampled trace context should be an object");
+        let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "origin_recorder_epoch_id",
+                "path",
+                "sampler_algorithm",
+                "schema_version",
+                "trace_id",
+            ]
+        );
+    }
+
+    #[test]
+    fn sampled_key_input_rejects_oversized_body_at_header_admission() {
+        let oversized = vec![0_u8; MAX_SEND_KEY_DOWN_TRACED_V1_DECOMPRESSED_BYTES + 1];
+        let mut frame = Vec::new();
+        encode_raw(
+            <SendKeyDownTracedV1 as PduWireIdent>::IDENT,
+            23,
+            &oversized,
+            false,
+            &mut frame,
+        )
+        .expect("oversized sampled input fixture should frame");
+        let error = Pdu::decode(frame.as_slice())
+            .expect_err("oversized sampled input body must fail before deserialization");
+        assert!(
+            error
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .is_some(),
+            "unexpected oversized-body error: {error:#}"
+        );
+
+        let oversized_compressed = vec![0_u8; MAX_SEND_KEY_DOWN_TRACED_V1_ZSTD_ENCODED_BYTES + 1];
+        let mut compressed_frame = Vec::new();
+        encode_raw(
+            <SendKeyDownTracedV1 as PduWireIdent>::IDENT,
+            23,
+            &oversized_compressed,
+            true,
+            &mut compressed_frame,
+        )
+        .expect("oversized compressed sampled-input fixture should frame");
+        let error = Pdu::decode(compressed_frame.as_slice())
+            .expect_err("oversized compressed body must fail before zstd decoding");
+        assert!(
+            error
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .is_some(),
+            "unexpected compressed-body rejection: {error:#}"
+        );
+    }
+
+    #[test]
+    fn legacy_unsampled_key_input_retains_original_wire_identity() {
+        let pdu = Pdu::SendKeyDown(SendKeyDown {
+            pane_id: 7,
+            event: termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Char('x'),
+                modifiers: termwiz::input::Modifiers::NONE,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(11),
+        });
+        let mut encoded = Vec::new();
+        pdu.encode_with_mode(&mut encoded, 23, CompressionMode::Never)
+            .expect("legacy unsampled key input should encode");
+        let decoded = Pdu::decode(encoded.as_slice()).expect("legacy key input should decode");
+        assert_eq!(decoded.pdu, pdu);
+        assert_eq!(<SendKeyDown as PduWireIdent>::IDENT, 11);
+        assert_eq!(
+            <SendKeyDown as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            46
+        );
+    }
+
+    #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 58);
+        assert_eq!(CODEC_VERSION, 59);
     }
 
     #[test]
@@ -20303,7 +20627,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=94 {
+        for ident in 0..=95 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -20317,9 +20641,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(95).is_none());
+        assert!(Pdu::wire_spec_for_ident(96).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 95 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 96 - GAPS.len());
     }
 
     #[test]
@@ -20353,6 +20677,7 @@ mod test {
                 86..=90 => 54,
                 91..=92 => 52,
                 93..=94 => 57,
+                95 => 59,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -20387,7 +20712,7 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93,
+            77, 80, 81, 85, 86, 88, 91, 93, 95,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
@@ -20471,7 +20796,7 @@ mod test {
 
             let expected_class = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Class::ConnectionControl,
-                9 | 11..=13 | 73 => Class::InteractiveInput,
+                9 | 11..=13 | 73 | 95 => Class::InteractiveInput,
                 8
                 | 14
                 | 20
@@ -20495,7 +20820,7 @@ mod test {
             };
             let expected_cap = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Cap::Control,
-                9 | 11 | 12 | 73 => Cap::InteractiveInput,
+                9 | 11 | 12 | 73 | 95 => Cap::InteractiveInput,
                 8 | 14 | 33..=36 | 38 | 43 | 45 | 48..=50 | 56..=59 | 62..=72 | 74 | 88 | 89 => {
                     Cap::InteractiveState
                 }
@@ -20519,7 +20844,8 @@ mod test {
                 | 56..=59
                 | 62..=74
                 | 88
-                | 89 => Qos::Interactive,
+                | 89
+                | 95 => Qos::Interactive,
                 3
                 | 22
                 | 24
@@ -21485,12 +21811,12 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_requires_atomic_v58_floating_snapshot_schema() {
+    fn check_compat_current_build_retains_atomic_v58_minimum_through_additive_v59() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 58);
-        assert_eq!(CODEC_VERSION, 58);
+        assert_eq!(CODEC_VERSION, 59);
         assert!(check_compat(58, 58, 57, 56).is_err());
         assert_eq!(
-            check_compat(58, 58, 58, 58),
+            check_compat(59, 58, 58, 58),
             Ok(CompatDecision::Compatible { agreed: 58 })
         );
     }

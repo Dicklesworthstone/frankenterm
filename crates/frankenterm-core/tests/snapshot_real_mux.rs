@@ -576,9 +576,11 @@ fn no_mock_spawn_send_resize_read_loopback() {
         "direct mux resize",
         Box::pin(direct.resize(source.tab_id, source.pane_id, resized)),
     );
-    let render = block_on_mux_operation(&runtime, "render changes after resize", async {
-        direct.get_pane_render_changes(source.pane_id).await
-    });
+    let render = block_on_mux_operation(
+        &runtime,
+        "render changes after resize",
+        Box::pin(direct.get_pane_render_changes(source.pane_id)),
+    );
     log(
         "loopback",
         "resized",

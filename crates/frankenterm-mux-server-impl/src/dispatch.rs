@@ -1,8 +1,8 @@
 #![allow(clippy::future_not_send)]
 #![allow(clippy::type_repetition_in_bounds)]
 use crate::sessionhandler::{
-    PduDeliveryClass, PduSender, PerPane, SessionAuthority, SessionHandler, SessionOwner,
-    frozen_window_order_to_codec, retire_poisoned_pane_render,
+    AdmittedInputTraceV1, PduDeliveryClass, PduSender, PerPane, SessionAuthority, SessionHandler,
+    SessionOwner, frozen_window_order_to_codec, retire_poisoned_pane_render,
     validate_ordered_snapshot_projection,
 };
 use anyhow::Context;
@@ -6269,6 +6269,36 @@ fn dispatch_client_request(
             anyhow::bail!("mux client request used reserved server-unilateral serial zero");
         }
 
+        let wire_spec = decoded
+            .pdu
+            .wire_spec()
+            .context("mux client request has no registered wire identity")?;
+        if !wire_spec.authorizes(codec::PduProducer::Client, codec::PduWireRole::Request) {
+            anyhow::bail!(
+                "mux client sent PDU {} ({}) without client-request direction authority",
+                wire_spec.name,
+                wire_spec.ident
+            );
+        }
+        if wire_spec.min_codec_version > codec::CODEC_VERSION {
+            anyhow::bail!(
+                "mux client PDU {} ({}) requires codec dialect {} above local dialect {}",
+                wire_spec.name,
+                wire_spec.ident,
+                wire_spec.min_codec_version,
+                codec::CODEC_VERSION
+            );
+        }
+
+        let input_trace_authority = match &decoded.pdu {
+            Pdu::SendKeyDownTracedV1(request) => Some(AdmittedInputTraceV1::admit(
+                request,
+                topology.stream_id,
+                codec::CODEC_VERSION,
+            )?),
+            _ => None,
+        };
+
         let ordered_authority = match &decoded.pdu {
             Pdu::ListPanesCoherent(request) => {
                 topology.begin_fence(decoded.serial, request)?;
@@ -6281,7 +6311,11 @@ fn dispatch_client_request(
             Pdu::ReorderWindowTabsV1(request) => Some(topology.admit_ordered_reorder(request)?),
             _ => None,
         };
-        handler.process_one_with_dispatch_authority(decoded, ordered_authority);
+        handler.process_one_with_dispatch_authority(
+            decoded,
+            ordered_authority,
+            input_trace_authority,
+        );
         Ok(())
     })();
     if result.is_err() {
@@ -6840,7 +6874,16 @@ mod tests {
     use super::*;
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
     use async_channel::unbounded;
-    use codec::{CompressionMode, Ping, Pong, WriteToPane};
+    use codec::{
+        CompressionMode, InputSerial, Ping, Pong, SampledTraceContextV1, SendKeyDown,
+        SendKeyDownTracedV1, WriteToPane,
+    };
+    use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
+        RecorderEpochId, RecorderSamplerAlgorithm, SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+    };
+    use frankenterm_core_audit_types::interaction_trace_v2::{
+        InteractionTraceId, InteractionTracePath, InteractionTraceRunId,
+    };
     use mux::domain::DomainId;
     use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
@@ -6849,6 +6892,35 @@ mod tests {
     use rangeset::RangeSet;
     use std::io;
     use std::io::Cursor;
+
+    fn sampled_key_request() -> SendKeyDownTracedV1 {
+        SendKeyDownTracedV1 {
+            request: SendKeyDown {
+                pane_id: 7_007,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(11),
+            },
+            trace_context: SampledTraceContextV1 {
+                schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+                trace_id: InteractionTraceId {
+                    run_id: InteractionTraceRunId {
+                        epoch_nonce_hi: 0x8182_8384_8586_8788,
+                        epoch_nonce_lo: 0x9192_9394_9596_9798,
+                    },
+                    sequence: 29,
+                },
+                path: InteractionTracePath::Keypress,
+                origin_recorder_epoch_id: RecorderEpochId {
+                    nonce_hi: 0xa1a2_a3a4_a5a6_a7a8,
+                    nonce_lo: 0xb1b2_b3b4_b5b6_b7b8,
+                },
+                sampler_algorithm: RecorderSamplerAlgorithm::SplitMix64V1,
+            },
+        }
+    }
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     use std::io::Write;
     use std::ops::Range;
@@ -9014,6 +9086,63 @@ mod tests {
         );
         assert_eq!(captured[0].serial, 1);
         assert_eq!(captured[0].pdu, Pdu::Pong(Pong {}));
+    }
+
+    #[test]
+    fn dispatch_rejects_wrong_wire_direction_before_handler_mutation() {
+        let mux = Arc::new(Mux::new(None));
+        let (sender, captured) = capturing_pdu_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let topology = idle_topology_coordinator();
+
+        let error = dispatch_client_request(
+            &mut handler,
+            &topology,
+            DecodedPdu {
+                serial: 2,
+                pdu: Pdu::Pong(Pong {}),
+            },
+        )
+        .expect_err("server reply on the client request lane must fail closed");
+        assert!(format!("{error:#}").contains("without client-request direction authority"));
+        assert!(captured.lock().is_empty());
+        assert!(mux.iter_clients().is_empty());
+    }
+
+    #[test]
+    fn dispatch_binds_sampled_input_to_its_exact_connection_stream() {
+        let mux = Arc::new(Mux::new(None));
+        let (sender, captured) = capturing_pdu_sender();
+        let stream_id = TopologyStreamId::from_bytes([0x94; 16]);
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(mux),
+            stream_id,
+        );
+        let (item_tx, _item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
+        let (terminal, _terminal_rx) = DispatchTerminal::channel();
+        let topology = TopologyStreamCoordinator::new(item_tx, terminal, stream_id);
+
+        dispatch_client_request(
+            &mut handler,
+            &topology,
+            DecodedPdu {
+                serial: 3,
+                pdu: Pdu::SendKeyDownTracedV1(sampled_key_request()),
+            },
+        )
+        .expect("valid sampled input should reach the session handler");
+
+        let response = captured.lock();
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].serial, 3);
+        match &response[0].pdu {
+            Pdu::ErrorResponse(codec::ErrorResponse { reason }) => assert!(
+                reason.contains("no such pane"),
+                "trace admission should succeed before the expected missing-pane fixture: {reason}"
+            ),
+            other => panic!("expected missing-pane response after trace admission, got {other:?}"),
+        }
     }
 
     #[test]

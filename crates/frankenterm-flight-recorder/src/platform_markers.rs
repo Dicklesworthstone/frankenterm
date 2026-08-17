@@ -34,8 +34,8 @@ pub const KEYPRESS_STAGE_MARKER_NAME: &str = "frankenterm_keypress_stage";
 /// Static Linux `user_events` name for a resize or zoom stage.
 pub const RESIZE_ZOOM_STAGE_MARKER_NAME: &str = "frankenterm_resize_zoom_stage";
 
-// `signpost` routes this through kdebug's 14-bit code field, so path and stage
-// must remain below 0x4000. Trace and span identity travel in the four words.
+// Keep path and stage within a compact, stable numeric namespace. Trace and
+// span identity travel in the four fixed payload words.
 const KEYPRESS_STAGE_NAMESPACE: u32 = 1 << 8;
 const RESIZE_ZOOM_STAGE_NAMESPACE: u32 = 2 << 8;
 const MARKER_ADMISSION_SEALED: u64 = 1 << 63;
@@ -44,8 +44,9 @@ const MARKER_IN_FLIGHT_MASK: u64 = MARKER_ADMISSION_SEALED - 1;
 /// Fixed-shape numeric identity passed to a target-specific marker adapter.
 ///
 /// The stage namespace and ordinal form the marker site code. The remaining
-/// four words fit macOS `kdebug_trace`'s numeric argument surface; Linux
-/// `user_events` sites carry the same representation without serialization.
+/// Linux `user_events` sites carry the four identity words without
+/// serialization. A future target adapter must preserve the same content-free
+/// representation without weakening its acceptance authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformMarkerPayload {
     local_epoch_id: RecorderEpochId,
@@ -488,37 +489,6 @@ impl PlatformMarkerAdapter for LinuxUserEventsMarkerAdapter {
                 PlatformMarkerAdapterOutcome::Unavailable(MarkerUnavailableReason::Disabled)
             }
             _ => PlatformMarkerAdapterOutcome::Dropped(MarkerDropReason::EmissionRejected),
-        }
-    }
-}
-
-/// macOS numeric kdebug adapter. The safe dependency accepts a 14-bit site
-/// code and four machine words, which preserves the complete trace-run,
-/// sequence, and span identity without formatting. Its void API cannot prove
-/// downstream buffer retention, so every accepted call remains inexact.
-#[cfg(all(feature = "platform-markers", target_os = "macos"))]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MacOsKdebugMarkerAdapter;
-
-#[cfg(all(feature = "platform-markers", target_os = "macos"))]
-impl sealed::Sealed for MacOsKdebugMarkerAdapter {}
-
-#[cfg(all(feature = "platform-markers", target_os = "macos"))]
-impl PlatformMarkerAdapter for MacOsKdebugMarkerAdapter {
-    fn emit(&self, payload: PlatformMarkerPayload) -> PlatformMarkerAdapterOutcome {
-        let [trace_run_hi, trace_run_lo, trace_sequence, span_id] = payload.identity_words();
-        let (Ok(trace_run_hi), Ok(trace_run_lo), Ok(trace_sequence), Ok(span_id)) = (
-            usize::try_from(trace_run_hi),
-            usize::try_from(trace_run_lo),
-            usize::try_from(trace_sequence),
-            usize::try_from(span_id),
-        ) else {
-            return PlatformMarkerAdapterOutcome::Dropped(MarkerDropReason::EmissionRejected);
-        };
-        let args = [trace_run_hi, trace_run_lo, trace_sequence, span_id];
-        signpost::trace(payload.stage_code(), &args);
-        PlatformMarkerAdapterOutcome::Emitted {
-            delivery: MarkerDeliveryAuthority::ExternalLossUnknown,
         }
     }
 }

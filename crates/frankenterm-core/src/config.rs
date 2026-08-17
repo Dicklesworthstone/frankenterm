@@ -7491,18 +7491,20 @@ max_sender_id_len = 0
 
     #[test]
     fn validate_rejects_zero_vendored_mux_pool_bounds() {
-        let cases: [(&str, fn(&mut Config)); 5] = [
+        type ZeroMuxPoolBound = (&'static str, fn(&mut Config));
+
+        let cases: [ZeroMuxPoolBound; 5] = [
             ("max_connections", |config: &mut Config| {
-                config.vendored.mux_pool.max_connections = 0
+                config.vendored.mux_pool.max_connections = 0;
             }),
             ("pipeline_depth", |config: &mut Config| {
-                config.vendored.mux_pool.pipeline_depth = 0
+                config.vendored.mux_pool.pipeline_depth = 0;
             }),
             ("max_frame_bytes", |config: &mut Config| {
-                config.vendored.mux_pool.max_frame_bytes = 0
+                config.vendored.mux_pool.max_frame_bytes = 0;
             }),
             ("max_outbound_codec_bytes", |config: &mut Config| {
-                config.vendored.mux_pool.max_outbound_codec_bytes = 0
+                config.vendored.mux_pool.max_outbound_codec_bytes = 0;
             }),
             ("max_outbound_in_flight_requests", |config: &mut Config| {
                 config.vendored.mux_pool.max_outbound_in_flight_requests = 0;

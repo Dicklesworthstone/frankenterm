@@ -4173,17 +4173,21 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Classification:** external-loss-domain rejection; independent internal
   recorder authority retained
 - **Bead:** `ft-interactive-systems-performance-4tenz.2.2.4`
-- **Rejected inference:** returning from a safe macOS kdebug or Linux
-  `user_events` API
+- **Rejected inference:** returning from a safe platform-marker API
   proves that the marker reached the retained Instruments/DTrace/perf/ftrace
   artifact, or can strengthen the internal interaction trace.
-- **Dependency/source audit:** `signpost 0.1.0` exposes a safe Rust call over
-  its private `kdebug_trace` FFI and accepts one 14-bit site code plus four
-  machine words, but exposes no enabled, permission, buffer-loss, or delivery
-  result. `eventheader_dynamic 0.5.0` safely owns Linux `user_events`
+- **Dependency/source audit:** the previously selected macOS `signpost 0.1.0`
+  crate is not admissible authority. Its private FFI declares a void,
+  five-argument `kdebug_trace` surface, while Apple's current XNU syscall
+  contract returns an integer from a code-plus-four-arguments surface. It
+  therefore cannot safely distinguish acceptance from rejection, and the
+  adapter incorrectly reported every return as `Emitted`. That dependency and
+  adapter have been removed; macOS now has no production marker adapter and
+  must use the typed `UnsupportedPlatform` path until a safe API can report a
+  trustworthy synchronous outcome. `eventheader_dynamic 0.5.0` safely owns Linux `user_events`
   registration and exposes enabled state plus immediate `writev` errno, but a
   successful write still does not prove downstream consumer retention. Both
-  dependencies stay target-specific behind the non-default `platform-markers`
+  marker mode and the Linux dependency stay behind the non-default `platform-markers`
   feature and outside ordinary Off, Low, and internal-only Certification modes.
   First-party marker code contains no unsafe block, string formatting, blocking
   lock, unbounded queue, or dynamic dispatch. The Linux adapter preallocates a
@@ -4211,8 +4215,9 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   diagnostic-mode latency.
   The overhead matrix must measure that cost; no ordinary recorder mode enables
   the adapter.
-- **Decision:** preserve platform acceptance as a useful correlation signal,
-  but mark every production adapter emission `loss_unknown`. Exact marker
+- **Decision:** preserve Linux platform acceptance as a useful correlation
+  signal, but mark every production adapter emission `loss_unknown`; fail
+  closed as unavailable on macOS. Exact marker
   authority is available only to a reconciled adapter whose retained artifact
   accounts for every recorded event. Disabled, registration-failed, dropped,
   and exhausted paths remain typed and independent; none invalidates or

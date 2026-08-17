@@ -16,7 +16,7 @@ workspace = true
 
 [features]
 default = []
-platform-markers = ["dep:eventheader_dynamic", "dep:signpost"]
+platform-markers = ["dep:eventheader_dynamic"]
 
 [dependencies]
 crossbeam-queue.workspace = true
@@ -27,9 +27,6 @@ thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eventheader_dynamic = { workspace = true, optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-signpost = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1.11.0"
