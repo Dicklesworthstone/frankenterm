@@ -13377,6 +13377,17 @@ mod test {
         }
     }
 
+    struct EmptyFloatingPaneSnapshot;
+
+    impl Serialize for EmptyFloatingPaneSnapshot {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serialize_floating_pane_snapshot(&[], serializer)
+        }
+    }
+
     #[derive(Serialize)]
     struct UncheckedOrderedWindowWithDeclaredTabs {
         window_id: RemoteWindowId,
@@ -13395,7 +13406,7 @@ mod test {
         where
             S: serde::Serializer,
         {
-            let mut state = serializer.serialize_struct("OrderedPaneSnapshotV1", 4)?;
+            let mut state = serializer.serialize_struct("OrderedPaneSnapshotV1", 5)?;
             serde::ser::SerializeStruct::serialize_field(
                 &mut state,
                 "session_incarnation",
@@ -13410,6 +13421,11 @@ mod test {
                 &mut state,
                 "panes",
                 &HostileOrderedPanes(self.field),
+            )?;
+            serde::ser::SerializeStruct::serialize_field(
+                &mut state,
+                "floating_panes",
+                &EmptyFloatingPaneSnapshot,
             )?;
             if self.field == HostileOrderedSnapshotField::OrderedSectionBytes {
                 serde::ser::SerializeStruct::serialize_field(
@@ -19387,7 +19403,7 @@ mod test {
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Class::Render,
                 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 77 | 93 => Class::Query,
                 23 | 32 | 42 | 47 | 78 | 94 => Class::BulkData,
-                ident => panic!("PDU {ident} is missing from the semantic-class census"),
+                ident => panic!("PDU {} is missing from the semantic-class census", ident),
             };
             let expected_cap = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Cap::Control,
@@ -19399,7 +19415,7 @@ mod test {
                 24 | 25 | 79 | 80 | 84 | 85 | 91 | 92 => Cap::Render,
                 3 | 22 | 31 | 41 | 46 | 51 | 52 | 60 | 61 | 75 | 77 | 81 | 86 | 93 => Cap::Query,
                 4 | 13 | 20 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 => Cap::BulkData,
-                ident => panic!("PDU {ident} is missing from the admission-cap census"),
+                ident => panic!("PDU {} is missing from the admission-cap census", ident),
             };
             let expected_qos = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Qos::Control,
@@ -19435,7 +19451,7 @@ mod test {
                 | 83..=86
                 | 90..=93 => Qos::Normal,
                 4 | 23 | 32 | 42 | 47 | 76 | 78 | 82 | 87 | 94 => Qos::Bulk,
-                ident => panic!("PDU {ident} is missing from the queue-QoS census"),
+                ident => panic!("PDU {} is missing from the queue-QoS census", ident),
             };
 
             assert_eq!(
