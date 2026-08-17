@@ -3355,6 +3355,18 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    (ReliableKeyEventV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_RELIABLE_KEY_EVENT_V1_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_RELIABLE_KEY_EVENT_V1_ZSTD_ENCODED_BYTES,
+        }
+    };
+    (ReliableKeyEventV1Response, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (SendKeyDownTracedV1, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_SEND_KEY_DOWN_TRACED_V1_DECOMPRESSED_BYTES,
@@ -4121,7 +4133,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 59;
+pub const CODEC_VERSION: usize = 60;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4419,6 +4431,12 @@ pdu! {
     SendKeyDownTracedV1: 95, 59, client_request, none,
         interactive_input, interactive_input, interactive
         => deserialize_send_key_down_traced_v1;
+    ReliableKeyEventV1: 96, 60, client_request, none,
+        interactive_input, interactive_input, interactive
+        => deserialize_reliable_key_event_v1;
+    ReliableKeyEventV1Response: 97, 60, server_reply, none,
+        interactive_input, interactive_input, interactive
+        => deserialize_reliable_key_event_v1_response;
 }
 
 impl Pdu {
@@ -4435,6 +4453,8 @@ impl Pdu {
             Self::GetPaneTieredScrollbackStatusesV1(value) => value.validate()?,
             Self::GetPaneTieredScrollbackStatusesV1Response(value) => value.validate()?,
             Self::SendKeyDownTracedV1(value) => value.validate()?,
+            Self::ReliableKeyEventV1(value) => value.validate()?,
+            Self::ReliableKeyEventV1Response(value) => value.validate()?,
             _ => {}
         }
         Ok(())
@@ -4695,6 +4715,7 @@ impl Pdu {
             Self::WriteToPane(_)
                 | Self::SendKeyDown(_)
                 | Self::SendKeyDownTracedV1(_)
+                | Self::ReliableKeyEventV1(_)
                 | Self::SendKeyUp(_)
                 | Self::SendMouseEvent(_)
                 | Self::SendPaste(_)
@@ -5081,6 +5102,34 @@ fn deserialize_send_key_down_traced_v1(
     )?;
     request.validate()?;
     Ok(request)
+}
+
+fn deserialize_reliable_key_event_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ReliableKeyEventV1, Error> {
+    let request: ReliableKeyEventV1 = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ReliableKeyEventV1",
+        MAX_RELIABLE_KEY_EVENT_V1_DECOMPRESSED_BYTES,
+    )?;
+    request.validate()?;
+    Ok(request)
+}
+
+fn deserialize_reliable_key_event_v1_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ReliableKeyEventV1Response, Error> {
+    let response: ReliableKeyEventV1Response = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ReliableKeyEventV1Response",
+        MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_DECOMPRESSED_BYTES,
+    )?;
+    response.validate()?;
+    Ok(response)
 }
 
 fn deserialize_list_panes_coherent(
@@ -11335,6 +11384,183 @@ impl SendKeyDownTracedV1 {
     }
 }
 
+/// One key transition with a client-incarnation-stable identity.
+///
+/// The server retains the latest committed identity per client for the mux
+/// lifetime. A client may therefore retry this exact request after a response
+/// loss or transport-generation replacement without applying the transition a
+/// second time. Key-down and key-up share this envelope so one ordered client
+/// lane cannot let a release overtake a retried press.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ReliableKeyEventV1 {
+    pub pane_id: PaneId,
+    pub event: termwiz::input::KeyEvent,
+    pub input_serial: InputSerial,
+    pub kind: ReliableKeyEventKindV1,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum ReliableKeyEventKindV1 {
+    KeyDown,
+    KeyUp,
+}
+
+/// Callback-free scheduler pressure returned for a retryable input attempt.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub struct ReliableInputSchedulerPressureV1 {
+    pub queue_id: u64,
+    pub scheduler_generation: u64,
+    pub active_tasks: u64,
+    pub task_capacity: u64,
+    pub active_estimated_bytes: u64,
+    pub estimated_byte_capacity: u64,
+    pub requested_estimated_bytes: u64,
+    pub retry_after_ns: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum ReliableKeyEventRetryV1 {
+    SchedulerFull(ReliableInputSchedulerPressureV1),
+    SchedulerRetired(ReliableInputSchedulerPressureV1),
+    SchedulerUnavailable { retry_after_ns: u64 },
+    DuplicatePending { retry_after_ns: u64 },
+}
+
+/// Terminal refusal reasons. None authorize redirecting the serial to a
+/// replacement pane or changing its key payload.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum ReliableKeyEventRejectionV1 {
+    ClientNotRegistered,
+    ClientRegistrationRetired,
+    ClientLedgerUnavailable,
+    IdentityAuthorityExhausted,
+    PaneUnavailable,
+    StaleSerial,
+    IdentityConflict,
+    OutcomeUnknown,
+    InvalidSchedulerConfiguration,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum ReliableKeyEventOutcomeV1 {
+    Applied,
+    DuplicateApplied,
+    Retry(ReliableKeyEventRetryV1),
+    Rejected(ReliableKeyEventRejectionV1),
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub struct ReliableKeyEventV1Response {
+    pub pane_id: PaneId,
+    pub input_serial: InputSerial,
+    pub outcome: ReliableKeyEventOutcomeV1,
+}
+
+pub const RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION: usize = 60;
+pub const MAX_RELIABLE_KEY_EVENT_V1_DECOMPRESSED_BYTES: usize = 64 * 1024;
+pub const MAX_RELIABLE_KEY_EVENT_V1_ZSTD_ENCODED_BYTES: usize = 128 * 1024;
+pub const MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_DECOMPRESSED_BYTES: usize = 4 * 1024;
+pub const MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_ZSTD_ENCODED_BYTES: usize = 8 * 1024;
+pub const MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS: u64 = 1_000_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ReliableKeyEventProtocolError {
+    #[error("reliable key event input serial must be nonzero")]
+    ZeroInputSerial,
+    #[error("reliable key event retry delay must be in 1..={maximum_ns} ns; got {actual_ns}")]
+    InvalidRetryDelay { actual_ns: u64, maximum_ns: u64 },
+    #[error("reliable key event scheduler field {field} must be nonzero")]
+    ZeroSchedulerField { field: &'static str },
+    #[error("reliable key event scheduler pressure {active} exceeds {capacity} for {resource}")]
+    SchedulerPressureExceedsCapacity {
+        resource: &'static str,
+        active: u64,
+        capacity: u64,
+    },
+}
+
+impl ReliableKeyEventV1 {
+    pub fn validate(&self) -> Result<(), ReliableKeyEventProtocolError> {
+        validate_reliable_input_serial(self.input_serial)
+    }
+}
+
+impl ReliableKeyEventV1Response {
+    pub fn validate(&self) -> Result<(), ReliableKeyEventProtocolError> {
+        validate_reliable_input_serial(self.input_serial)?;
+        match self.outcome {
+            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerFull(pressure))
+            | ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerRetired(
+                pressure,
+            )) => validate_reliable_scheduler_pressure(pressure),
+            ReliableKeyEventOutcomeV1::Retry(
+                ReliableKeyEventRetryV1::SchedulerUnavailable { retry_after_ns }
+                | ReliableKeyEventRetryV1::DuplicatePending { retry_after_ns },
+            ) => validate_reliable_retry_delay(retry_after_ns),
+            ReliableKeyEventOutcomeV1::Applied
+            | ReliableKeyEventOutcomeV1::DuplicateApplied
+            | ReliableKeyEventOutcomeV1::Rejected(_) => Ok(()),
+        }
+    }
+}
+
+fn validate_reliable_input_serial(
+    input_serial: InputSerial,
+) -> Result<(), ReliableKeyEventProtocolError> {
+    if input_serial.is_empty() {
+        return Err(ReliableKeyEventProtocolError::ZeroInputSerial);
+    }
+    Ok(())
+}
+
+fn validate_reliable_retry_delay(retry_after_ns: u64) -> Result<(), ReliableKeyEventProtocolError> {
+    if retry_after_ns == 0 || retry_after_ns > MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS {
+        return Err(ReliableKeyEventProtocolError::InvalidRetryDelay {
+            actual_ns: retry_after_ns,
+            maximum_ns: MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS,
+        });
+    }
+    Ok(())
+}
+
+fn validate_reliable_scheduler_pressure(
+    pressure: ReliableInputSchedulerPressureV1,
+) -> Result<(), ReliableKeyEventProtocolError> {
+    for (field, value) in [
+        ("queue_id", pressure.queue_id),
+        ("scheduler_generation", pressure.scheduler_generation),
+        ("task_capacity", pressure.task_capacity),
+        ("estimated_byte_capacity", pressure.estimated_byte_capacity),
+        (
+            "requested_estimated_bytes",
+            pressure.requested_estimated_bytes,
+        ),
+    ] {
+        if value == 0 {
+            return Err(ReliableKeyEventProtocolError::ZeroSchedulerField { field });
+        }
+    }
+    if pressure.active_tasks > pressure.task_capacity {
+        return Err(
+            ReliableKeyEventProtocolError::SchedulerPressureExceedsCapacity {
+                resource: "tasks",
+                active: pressure.active_tasks,
+                capacity: pressure.task_capacity,
+            },
+        );
+    }
+    if pressure.active_estimated_bytes > pressure.estimated_byte_capacity {
+        return Err(
+            ReliableKeyEventProtocolError::SchedulerPressureExceedsCapacity {
+                resource: "estimated_bytes",
+                active: pressure.active_estimated_bytes,
+                capacity: pressure.estimated_byte_capacity,
+            },
+        );
+    }
+    validate_reliable_retry_delay(pressure.retry_after_ns)
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SendKeyUp {
     pub pane_id: TabId,
@@ -11367,6 +11593,16 @@ impl InputSerial {
     /// `SystemTime`.
     pub const fn from_millis_since_epoch(millis: u64) -> Self {
         Self(millis)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
     }
 
     pub fn now() -> Self {
@@ -19177,8 +19413,8 @@ mod test {
     }
 
     #[test]
-    fn codec_v59_adds_sampled_input_and_retains_atomic_v58_minimum() {
-        assert_eq!(CODEC_VERSION, 59);
+    fn codec_v60_adds_reliable_input_and_retains_atomic_v58_minimum() {
+        assert_eq!(CODEC_VERSION, 60);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 58);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -19197,9 +19433,9 @@ mod test {
             "the authoritative floating snapshot schema requires an atomic v58 redeploy"
         );
         assert_eq!(
-            check_compat(59, 58, 58, 58),
+            check_compat(60, 58, 58, 58),
             Ok(CompatDecision::Compatible { agreed: 58 }),
-            "the additive traced-input PDU must preserve the v58 compatibility window"
+            "additive traced and reliable input PDUs must preserve the v58 compatibility window"
         );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
@@ -20176,6 +20412,135 @@ mod test {
     }
 
     #[test]
+    fn reliable_key_event_request_and_typed_outcomes_roundtrip_under_v60() {
+        let request = ReliableKeyEventV1 {
+            pane_id: 7,
+            event: termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Char('x'),
+                modifiers: termwiz::input::Modifiers::CTRL,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(11),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        let pressure = ReliableInputSchedulerPressureV1 {
+            queue_id: 2,
+            scheduler_generation: 3,
+            active_tasks: 4,
+            task_capacity: 8,
+            active_estimated_bytes: 16_384,
+            estimated_byte_capacity: 32_768,
+            requested_estimated_bytes: 4_096,
+            retry_after_ns: 1_000_000,
+        };
+        let responses = [
+            ReliableKeyEventOutcomeV1::Applied,
+            ReliableKeyEventOutcomeV1::DuplicateApplied,
+            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerFull(pressure)),
+            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerRetired(pressure)),
+            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerUnavailable {
+                retry_after_ns: 1_000_000,
+            }),
+            ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::DuplicatePending {
+                retry_after_ns: 1_000_000,
+            }),
+            ReliableKeyEventOutcomeV1::Rejected(ReliableKeyEventRejectionV1::IdentityConflict),
+        ];
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let request_pdu = Pdu::ReliableKeyEventV1(request.clone());
+            let mut encoded = Vec::new();
+            request_pdu
+                .encode_with_mode(&mut encoded, 31, mode)
+                .expect("valid reliable key request should encode");
+            let decoded = Pdu::decode(encoded.as_slice()).expect("request should decode");
+            assert_eq!(decoded.serial, 31);
+            assert_eq!(decoded.pdu, request_pdu);
+
+            for outcome in responses {
+                let response_pdu = Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                    pane_id: request.pane_id,
+                    input_serial: request.input_serial,
+                    outcome,
+                });
+                let mut encoded = Vec::new();
+                response_pdu
+                    .encode_with_mode(&mut encoded, 31, mode)
+                    .expect("valid typed reliable key response should encode");
+                let decoded = Pdu::decode(encoded.as_slice()).expect("response should decode");
+                assert_eq!(decoded.serial, 31);
+                assert_eq!(decoded.pdu, response_pdu);
+            }
+        }
+        assert_eq!(<ReliableKeyEventV1 as PduWireIdent>::IDENT, 96);
+        assert_eq!(<ReliableKeyEventV1Response as PduWireIdent>::IDENT, 97);
+        assert_eq!(
+            <ReliableKeyEventV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION
+        );
+    }
+
+    #[test]
+    fn reliable_key_event_rejects_zero_serial_and_malformed_retry_pressure_before_framing() {
+        let mut encoded = Vec::new();
+        Pdu::ReliableKeyEventV1(ReliableKeyEventV1 {
+            pane_id: 7,
+            event: termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Char('x'),
+                modifiers: termwiz::input::Modifiers::NONE,
+            },
+            input_serial: InputSerial::empty(),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        })
+        .encode(&mut encoded, 31)
+        .expect_err("zero cannot authorize a reliable input identity");
+        assert!(encoded.is_empty());
+
+        for malformed in [
+            ReliableInputSchedulerPressureV1 {
+                queue_id: 0,
+                scheduler_generation: 3,
+                active_tasks: 4,
+                task_capacity: 8,
+                active_estimated_bytes: 16_384,
+                estimated_byte_capacity: 32_768,
+                requested_estimated_bytes: 4_096,
+                retry_after_ns: 1_000_000,
+            },
+            ReliableInputSchedulerPressureV1 {
+                queue_id: 2,
+                scheduler_generation: 3,
+                active_tasks: 9,
+                task_capacity: 8,
+                active_estimated_bytes: 16_384,
+                estimated_byte_capacity: 32_768,
+                requested_estimated_bytes: 4_096,
+                retry_after_ns: 1_000_000,
+            },
+            ReliableInputSchedulerPressureV1 {
+                queue_id: 2,
+                scheduler_generation: 3,
+                active_tasks: 4,
+                task_capacity: 8,
+                active_estimated_bytes: 16_384,
+                estimated_byte_capacity: 32_768,
+                requested_estimated_bytes: 4_096,
+                retry_after_ns: 0,
+            },
+        ] {
+            let mut encoded = Vec::new();
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                pane_id: 7,
+                input_serial: InputSerial::from_millis_since_epoch(11),
+                outcome: ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerFull(
+                    malformed,
+                )),
+            })
+            .encode(&mut encoded, 31)
+            .expect_err("malformed scheduler pressure must fail before framing");
+            assert!(encoded.is_empty());
+        }
+    }
+
+    #[test]
     fn sampled_key_input_rejects_wrong_path_and_schema_before_wire_mutation() {
         let mut wrong_path = sampled_key_trace_context();
         wrong_path.path = InteractionTracePath::ResizeZoom;
@@ -20360,7 +20725,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 59);
+        assert_eq!(CODEC_VERSION, 60);
     }
 
     #[test]
@@ -21839,12 +22204,12 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_retains_atomic_v58_minimum_through_additive_v59() {
+    fn check_compat_current_build_retains_atomic_v58_minimum_through_additive_v60() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 58);
-        assert_eq!(CODEC_VERSION, 59);
+        assert_eq!(CODEC_VERSION, 60);
         assert!(check_compat(58, 58, 57, 56).is_err());
         assert_eq!(
-            check_compat(59, 58, 58, 58),
+            check_compat(60, 58, 58, 58),
             Ok(CompatDecision::Compatible { agreed: 58 })
         );
     }
