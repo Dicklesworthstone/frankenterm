@@ -4195,7 +4195,8 @@ fn budgeted_floating_pane_snapshot_entry(
             tty_name.capacity(),
         )?,
         None => {
-            metadata_ledger.admit_optional_none(mux::tab::PaneSnapshotMetadataField::PaneTtyName)?
+            metadata_ledger
+                .admit_optional_none(mux::tab::PaneSnapshotMetadataField::PaneTtyName)?;
         }
     }
 
