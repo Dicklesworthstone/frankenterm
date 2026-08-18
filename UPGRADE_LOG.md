@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-**Started:** 2026-06-14  |  **Updated:** 2026-08-16  |  **Project:** frankenterm  |  **Language:** Rust + GitHub Actions
+**Started:** 2026-06-14  |  **Updated:** 2026-08-18  |  **Project:** frankenterm  |  **Language:** Rust + GitHub Actions
 
 ## Summary
 
@@ -8,7 +8,7 @@
 - **Corrected:** workspace MSRV `1.85 -> 1.95` to match the resolved graph's
   declared maximum: `sysinfo 0.39.5`, pulled by Asupersync 0.3.10; this changes
   no dependency identity
-- **Deferred:** Asupersync 0.4.5 and FrankenSQLite 0.3.4 until the single-runtime
+- **Deferred:** Asupersync 0.4.7 and FrankenSQLite 0.3.5 until the single-runtime
   dependency cohort and storage-transaction prerequisites below are satisfied
 - **Failed:** no code migration currently known failed
 - **Needs attention:** coordinated Asupersync ecosystem convergence; exact
@@ -84,10 +84,10 @@ The remaining crates known to be behind latest are transitive-only in this lockf
   semantic proof is retained under `ft-ifgm7`; its closing evidence must also
   be the authority for workspace check, Clippy, and exact formatting proof.
 - **Why 0.3.10:** it is the newest release accepted by the pinned FastMCP, FastAPI, and current FrankenSearch dependency graph. It is a completed compatibility waypoint, not the latest upstream runtime.
-- **Latest-stable boundary (re-audited 2026-08-16):** official crates.io and tagged-release evidence identify `asupersync 0.4.5` and `asupersync-macros 0.4.5` as latest stable. Adopting them now would resolve incompatible 0.3.x and 0.4.x runtime/type universes because FrankenTerm's pinned FastMCP and FastAPI revisions still require 0.3.x and its pinned FrankenSearch revision explicitly requires `<0.4`. Current upstream FastMCP still requires exact 0.4.4 and current FrankenSearch requires `>=0.4.4,<0.5`, but current upstream FastAPI still declares `asupersync = "0.3.9"`; FastMCP and FastAPI therefore block a single exact 0.4.5 ecosystem. Repinning only the ready consumers cannot solve that graph. Coordinated convergence remains tracked by `ft-wc3uc`; a split runtime graph or relaxed-constraint bypass is not acceptable.
+- **Latest-stable boundary (re-audited 2026-08-18):** official crates.io and tagged-release evidence identify `asupersync 0.4.7` and `asupersync-macros 0.4.7` as latest stable. Adopting them now would resolve incompatible 0.3.x and 0.4.x runtime/type universes because FrankenTerm's pinned FastMCP and FastAPI revisions still require 0.3.x and its pinned FrankenSearch revision explicitly requires `<0.4`. The latest stable FastMCP v0.3.2 and FastAPI v0.3.0 tags still declare the 0.3 family, while stable FrankenSearch v1.6.0 requires `>=0.4.3,<0.5`. FastMCP and FastAPI therefore block a single 0.4.7 ecosystem. Repinning only the ready consumers cannot solve that graph. Coordinated convergence remains tracked by `ft-wc3uc`; a split runtime graph or relaxed-constraint bypass is not acceptable.
 - **Stable ecosystem gate:** the latest stable FastMCP v0.3.2 and FastAPI v0.3.0 tags still require the Asupersync 0.3 family, and FrankenTerm's pinned revisions are ahead of those tags. Downgrading to the tags would discard fixes without removing the blocker. Conversely, stable FrankenSearch v1.6.0 requires `>=0.4.3,<0.5`, so repinning it alone would create the same forbidden split graph. Wait for new stable FastMCP and FastAPI releases that accept one 0.4.x family, then migrate the runtime pair and all three consumers as one reviewed cohort.
-- **Official 0.4.5 identity:** crate checksum `58465f2cbc04317c79f29b2a595901c935deccdbe6bb9c9268280ea6e289385d`; annotated tag `v0.4.5` resolves to commit `8522f9411c7652accf3996b215fca8df901c1489`. The macro crate checksum is `ab5d220ba0636e58e4ed749dda9dcabc34392d0f42c94b2ade66854970ffcb72`.
-- **0.4.x migration surface:** the tracked-channel signature changes were already present in 0.3.10, and FrankenTerm has no direct `TrackedSender`/`TrackedPermit` callers. The remaining work is semantic: native-task abort/join behavior, cancellation acknowledgement, blocking-driver refusal/parking, panic containment, timers, channels, and `runtime_async` capability identity all require focused proof. Upstream release notes alone do not establish a FrankenTerm performance improvement.
+- **Official 0.4.7 identity:** crate checksum `0c59fbc3c5482db3bc443254ea87c99aa7030359779b61662cb3dc14ea1aa91d`; annotated tag object `f8dbbb1b4aa7e572f3c2f45030ee8ed3123cf601` resolves to commit `3c3f13034970f24fd72a3208c656deca80f79fd6`. The macro crate checksum is `67d2e70be08f2021020b0b4e700782e8812a2af455a2c6547c921d6bdedabd84`.
+- **0.4.x migration surface:** the tracked-channel signature changes were already present in 0.3.10, and FrankenTerm has no direct `TrackedSender`/`TrackedPermit` callers. The remaining work is semantic: native-task abort/join behavior, typed checked-join shutdown outcomes, bounded/background runtime shutdown, cancellation acknowledgement, blocking-driver refusal/parking, panic containment, timers, channels, and `runtime_async` capability identity all require focused proof. Upstream release notes alone do not establish a FrankenTerm performance improvement.
 - **Upstream rationale:** releases 0.3.6 through 0.3.10 include the current-thread timer-floor repair, ARM blocking-pool ordering fences, watch lost-update repair, merge busy-spin elimination, long-timer and cancellation-validator repairs, and cancellation-waker ownership isolation. These are upstream correctness/performance motivations, not evidence of a FrankenTerm mux, input, or rendering speedup.
 - **Resolved transitive changes:** AES-GCM `0.10.3 -> 0.11.0`, ChaCha20Poly1305 `0.10.1 -> 0.11.0` alongside the retained 0.10.1 consumer, Base64 adds `0.23.1`, `franken-{kernel,evidence,decision} 0.3.5 -> 0.3.10`, and the macro crate adds Syn `3.0.3` alongside existing Syn versions.
 - **Lock generation:** RCH rejected `cargo update` as non-compilation with `[RCH-E301]`, so local Cargo was used only to resolve `Cargo.lock`; no local compilation or test output counts as proof. All validation remains remote, fail-closed, and `--locked`.
@@ -95,17 +95,17 @@ The remaining crates known to be behind latest are transitive-only in this lockf
 - **Negative evidence:** the retired `runtime_async_tests` and `integration_asupersync_migration_validation` archives each reported zero tests and are not counted as proof. The live replacements above were identified from their own audit headers and executed instead. The first replacement run's 63/64 property result is retained because it demonstrated that asupersync preserves the latest watch value across a zero-receiver gap for future subscribers; commit `038ae0c02` pins that stronger contract rather than preserving the stale Tokio error expectation.
 - **Required proof before closure:** one resolved asupersync package, `runtime_async`/timer/watch/cancellation/blocking-pool/channel/LabRuntime coverage, no direct Tokio regression, workspace all-target check, warnings-denied Clippy, and exact committed-source format proof.
 
-### FrankenSQLite / fsqlite 0.3.4
+### FrankenSQLite / fsqlite 0.3.5
 
 - **Status:** researched, not yet integrated. FrankenTerm currently has no `fsqlite` dependency to update; the two FrankenSQLite features are empty default-off scaffolds and the named recorder implementation still uses rusqlite. This is new backend architecture work, not a version bump.
-- **Stable target (re-audited 2026-08-16):** crates.io `fsqlite 0.3.4`, published from annotated tag `v0.3.4` at commit `bc189a5429bc153cd2160a8ff002544f63bfcda6`; crate checksum `2889cd2124262a044075c9919a81bd3eafce1c4a884e2d37b7de63742d9a05cc`. FrankenTerm has no `fsqlite` package today, so this remains a new backend integration rather than an updater bump.
-- **Runtime boundary:** `fsqlite 0.3.4` requires `asupersync >=0.4.3,<0.5` and exposes runtime types publicly. Adding it before the coordinated 0.4.x migration would create the forbidden split runtime universe.
+- **Stable target (re-audited 2026-08-18):** crates.io `fsqlite 0.3.5` is the latest non-yanked stable crate at checksum `0d5c359d988d336716ac1fe84f032a392cbd4b299ca17c2c01ab10c5d8179367`; lightweight tag `v0.3.5` resolves to commit `92a4e4e735483be136b8a73cc6bf3a5d6263dcf8`. GitHub Releases still ends at v0.3.4 and the tagged changelog has no 0.3.5 section, so adoption must review the exact tag-to-crate diff rather than infer release semantics from the Releases page. FrankenTerm has no `fsqlite` package today, so this remains a new backend integration rather than an updater bump.
+- **Runtime boundary:** `fsqlite 0.3.5` requires `asupersync >=0.4.3,<0.5` and exposes runtime types publicly. Adding it before the coordinated 0.4.x migration would create the forbidden split runtime universe.
 - **Concurrency/API boundary:** the direct `fsqlite::Connection` is deliberately `!Send + !Sync`, while FrankenTerm's synchronous object-safe `StorageBackend` is `Send + Sync`. A reviewed `AsyncConnection` worker/actor adapter is the plausible canary, but it cannot make the current transaction guard exclusive: `ft-ig9lh` must first ensure one owner retains a transaction from begin through commit or rollback.
 - **Supported-envelope boundary:** upstream documents verification for at most eight concurrent writers and does not support ten or more implicit-autocommit writers. Adoption therefore cannot justify a 128-core scaling claim. Default features also include native, io_uring, JSON, FTS5, and RTree; the canary must use an explicit minimal reviewed feature set.
 - **Sequencing:** finish the exact 0.3.10 proof; obtain new stable FastMCP and
   FastAPI releases compatible with one 0.4.x runtime family; review and pin
   those releases together with the stable FrankenSearch target; move the
-  Asupersync pair to 0.4.5 with one resolved family; repair transaction
+  Asupersync pair to 0.4.7 with one resolved family; repair transaction
   ownership under `ft-ig9lh`; then implement the default-off Fsqlite canary
   under `ft-kcdqp`.
 - **Safety/rollback:** use isolated temporary databases only, retain rusqlite as the rollback backend, require schema/FTS/type equivalence plus explicit close, worker reaping, cancellation, commit-race, no-late-write, rollback, reopen, and crash proof, and do not promote or claim performance without retained Apple Silicon and Threadripper A/B evidence.
