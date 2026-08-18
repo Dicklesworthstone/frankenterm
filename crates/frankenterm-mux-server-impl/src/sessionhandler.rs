@@ -46,6 +46,8 @@ use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCu
 use mux::{
     CurrentPane, Mux, PaneRegistrationHandle, ReliableInputClaimOutcome, ReliableInputKeyKind,
 };
+#[cfg(test)]
+use promise::spawn::block_on;
 use promise::spawn::{
     MainThreadAdmissionRejection, MainThreadEnqueueReceipt, MainThreadReservationOutcome,
     MainThreadServiceClass, spawn_into_main_thread, try_reserve_main_thread,
@@ -3731,6 +3733,52 @@ fn new_pane_snapshot_census_ledger() -> anyhow::Result<mux::tab::PaneSnapshotCen
     )
 }
 
+/// Maximum admitted census work between main-thread executor yield checks.
+///
+/// A single tab append is intentionally indivisible: its callback-free census,
+/// callback observation, and final callback-free coherence cut form one
+/// transaction.  The tab-local census ceiling bounds that indivisible work;
+/// this request-scoped quantum prevents a large collection of individually
+/// small tabs from monopolizing the main-thread executor.
+const PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM: usize = 4 * 1024;
+
+struct PaneSnapshotCooperator {
+    family: &'static str,
+    completed_quanta: usize,
+    yields: usize,
+}
+
+impl PaneSnapshotCooperator {
+    fn new(family: &'static str) -> Self {
+        Self {
+            family,
+            completed_quanta: 0,
+            yields: 0,
+        }
+    }
+
+    async fn after_tab(&mut self, ledger: &mux::tab::PaneSnapshotCensusLedger) {
+        let total = ledger.request_stats().total().unwrap_or(usize::MAX);
+        let completed_quanta = total / PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM;
+        if completed_quanta <= self.completed_quanta {
+            return;
+        }
+
+        self.completed_quanta = completed_quanta;
+        self.yields = self.yields.saturating_add(1);
+        metrics::counter!(
+            "mux.server.pane_snapshot_census.cooperative_yields",
+            "family" => self.family
+        )
+        .increment(1);
+        frankenterm_core::runtime_async::yield_now().await;
+    }
+
+    fn yields(&self) -> usize {
+        self.yields
+    }
+}
+
 fn record_pane_snapshot_census_metrics(
     family: &'static str,
     ledger: &mux::tab::PaneSnapshotCensusLedger,
@@ -3916,22 +3964,31 @@ fn append_floating_pane_snapshot(
     Ok(())
 }
 
-fn collect_list_panes_snapshot_with_stage_observer(
+async fn collect_list_panes_snapshot_with_stage_observer(
     mux: &Mux,
     observer: &mut impl FnMut(ListPanesSnapshotStage),
 ) -> anyhow::Result<ListPanesResponse> {
     let mut ledger = new_pane_snapshot_census_ledger()?;
+    let mut cooperator = PaneSnapshotCooperator::new("pdu82");
     ledger.begin_attempt();
-    let response =
-        collect_list_panes_snapshot_with_stage_observer_and_census(mux, observer, &mut ledger);
+    let response = collect_list_panes_snapshot_with_stage_observer_and_census(
+        mux,
+        observer,
+        &mut ledger,
+        &mut cooperator,
+    )
+    .await;
     record_pane_snapshot_census_metrics("pdu82", &ledger);
+    metrics::histogram!("mux.server.pane_snapshot_census.yields", "family" => "pdu82")
+        .record(cooperator.yields() as f64);
     response
 }
 
-fn collect_list_panes_snapshot_with_stage_observer_and_census(
+async fn collect_list_panes_snapshot_with_stage_observer_and_census(
     mux: &Mux,
     observer: &mut impl FnMut(ListPanesSnapshotStage),
     ledger: &mut mux::tab::PaneSnapshotCensusLedger,
+    cooperator: &mut PaneSnapshotCooperator,
 ) -> anyhow::Result<ListPanesResponse> {
     let mut tabs = Vec::new();
     let mut tab_titles = Vec::new();
@@ -3984,6 +4041,8 @@ fn collect_list_panes_snapshot_with_stage_observer_and_census(
             )?;
             observer(ListPanesSnapshotStage::TabTreeCaptured);
             tab_titles.push(tab_title);
+            // No mux/window/tab lock or pane callback is live at this await.
+            cooperator.after_tab(ledger).await;
         }
     }
     observer(ListPanesSnapshotStage::TitlesCaptured);
@@ -4001,11 +4060,10 @@ fn collect_list_panes_snapshot_with_stage_observer_and_census(
     })
 }
 
-fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
-    let response = collect_list_panes_snapshot_with_stage_observer(
-        mux,
-        &mut ignore_list_panes_snapshot_stage,
-    )?;
+async fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
+    let response =
+        collect_list_panes_snapshot_with_stage_observer(mux, &mut ignore_list_panes_snapshot_stage)
+            .await?;
     response
         .validate_floating_panes()
         .context("validating collected floating-pane snapshot")?;
@@ -4014,20 +4072,24 @@ fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
 
 const COHERENT_SNAPSHOT_ATTEMPTS: u8 = 3;
 
-fn collect_coherent_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesCoherentOutcome> {
+async fn collect_coherent_list_panes_snapshot(
+    mux: &Mux,
+) -> anyhow::Result<ListPanesCoherentOutcome> {
     collect_coherent_list_panes_snapshot_with_stage_observer(
         mux,
         &mut ignore_list_panes_snapshot_stage,
     )
+    .await
 }
 
-fn collect_coherent_list_panes_snapshot_with_stage_observer(
+async fn collect_coherent_list_panes_snapshot_with_stage_observer(
     mux: &Mux,
     observer: &mut impl FnMut(ListPanesSnapshotStage),
 ) -> anyhow::Result<ListPanesCoherentOutcome> {
     let mut first_revision = None;
     let mut last_revision = None;
     let mut ledger = new_pane_snapshot_census_ledger()?;
+    let mut cooperator = PaneSnapshotCooperator::new("pdu82");
 
     for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
         ledger.begin_attempt();
@@ -4051,8 +4113,13 @@ fn collect_coherent_list_panes_snapshot_with_stage_observer(
             return Ok(ListPanesCoherentOutcome::RevisionExhausted);
         }
 
-        let panes =
-            collect_list_panes_snapshot_with_stage_observer_and_census(mux, observer, &mut ledger);
+        let panes = collect_list_panes_snapshot_with_stage_observer_and_census(
+            mux,
+            observer,
+            &mut ledger,
+            &mut cooperator,
+        )
+        .await;
         record_pane_snapshot_census_metrics("pdu82", &ledger);
         let panes = panes?;
 
@@ -4303,22 +4370,24 @@ pub(crate) fn validate_ordered_snapshot_projection(
     Ok(())
 }
 
-fn collect_ordered_list_panes_snapshot(
+async fn collect_ordered_list_panes_snapshot(
     mux: &Mux,
 ) -> anyhow::Result<codec::ListPanesOrderedV1Outcome> {
     collect_ordered_list_panes_snapshot_with_stage_observer(
         mux,
         &mut ignore_list_panes_snapshot_stage,
     )
+    .await
 }
 
-fn collect_ordered_list_panes_snapshot_with_stage_observer(
+async fn collect_ordered_list_panes_snapshot_with_stage_observer(
     mux: &Mux,
     observer: &mut impl FnMut(ListPanesSnapshotStage),
 ) -> anyhow::Result<codec::ListPanesOrderedV1Outcome> {
     let mut first_revision = None;
     let mut last_revision = None;
     let mut ledger = new_pane_snapshot_census_ledger()?;
+    let mut cooperator = PaneSnapshotCooperator::new("pdu87");
 
     for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
         ledger.begin_attempt();
@@ -4372,7 +4441,7 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
         let mut pane_nodes = Vec::new();
         let mut pane_window_titles = Vec::with_capacity(frozen_windows.len());
         let mut floating_panes = Vec::new();
-        let collection = (|| -> anyhow::Result<()> {
+        let collection = async {
             for (frozen, ordered_window) in frozen_windows.iter().zip(&ordered_windows) {
                 let window_id = frozen.order.window_id();
                 pane_window_titles.push(mux::tab::PaneArenaWindowTitle {
@@ -4405,10 +4474,14 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
                         &mut ledger,
                     )?;
                     observer(ListPanesSnapshotStage::TabTreeCaptured);
+                    // The tab transaction and its arbitrary pane callbacks are
+                    // complete before yielding to queued interactive work.
+                    cooperator.after_tab(&ledger).await;
                 }
             }
-            Ok(())
-        })();
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
         record_pane_snapshot_census_metrics("pdu87", &ledger);
         collection?;
         observer(ListPanesSnapshotStage::TitlesCaptured);
@@ -4522,7 +4595,7 @@ fn authorize_reorder_identity(
     ReorderAuthorization::Proceed
 }
 
-fn process_list_panes_ordered_request(
+async fn process_list_panes_ordered_request(
     mux: &Mux,
     stream_id: TopologyStreamId,
     runtime_supported: TopologyCapabilities,
@@ -4538,7 +4611,7 @@ fn process_list_panes_ordered_request(
     let outcome = if negotiated.contains(ordered_snapshot_foundation())
         && negotiated.contains(request.required)
     {
-        collect_ordered_list_panes_snapshot(mux)?
+        collect_ordered_list_panes_snapshot(mux).await?
     } else {
         codec::ListPanesOrderedV1Outcome::Unsupported {
             supported: runtime_supported,
@@ -5216,13 +5289,14 @@ impl SessionHandler {
             }
             Pdu::ListPanes(ListPanes {}) => {
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = session_mux(&authority)?;
-                            Ok(Pdu::ListPanesResponse(collect_list_panes_snapshot(&mux)?))
-                        },
-                        send_response,
-                    );
+                    let response = async {
+                        let mux = session_mux(&authority)?;
+                        Ok(Pdu::ListPanesResponse(
+                            collect_list_panes_snapshot(&mux).await?,
+                        ))
+                    }
+                    .await;
+                    send_response(response);
                 })
                 .detach();
             }
@@ -5232,48 +5306,47 @@ impl SessionHandler {
             }) => {
                 let stream_id = self.topology_stream_id;
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let negotiated =
-                                supported.intersection(TopologyCapabilities::SERVER_SUPPORTED);
-                            let outcome = if negotiated
-                                .contains(TopologyCapabilities::FENCED_SNAPSHOT_V1)
-                                && negotiated.contains(required)
-                            {
-                                let mux = session_mux(&authority)?;
-                                collect_coherent_list_panes_snapshot(&mux)?
-                            } else {
-                                ListPanesCoherentOutcome::Unsupported {
-                                    supported: TopologyCapabilities::SERVER_SUPPORTED,
-                                }
-                            };
-                            Ok(Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
-                                negotiated,
-                                stream_id,
-                                outcome,
-                            }))
-                        },
-                        send_response,
-                    );
+                    let response = async {
+                        let negotiated =
+                            supported.intersection(TopologyCapabilities::SERVER_SUPPORTED);
+                        let outcome = if negotiated
+                            .contains(TopologyCapabilities::FENCED_SNAPSHOT_V1)
+                            && negotiated.contains(required)
+                        {
+                            let mux = session_mux(&authority)?;
+                            collect_coherent_list_panes_snapshot(&mux).await?
+                        } else {
+                            ListPanesCoherentOutcome::Unsupported {
+                                supported: TopologyCapabilities::SERVER_SUPPORTED,
+                            }
+                        };
+                        Ok(Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                            negotiated,
+                            stream_id,
+                            outcome,
+                        }))
+                    }
+                    .await;
+                    send_response(response);
                 })
                 .detach();
             }
             Pdu::ListPanesOrderedV1(request) => {
                 let stream_id = self.topology_stream_id;
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = session_mux(&authority)?;
-                            let response = process_list_panes_ordered_request(
-                                &mux,
-                                stream_id,
-                                TopologyCapabilities::SERVER_SUPPORTED,
-                                &request,
-                            )?;
-                            Ok(Pdu::ListPanesOrderedV1Response(response))
-                        },
-                        send_response,
-                    );
+                    let response = async {
+                        let mux = session_mux(&authority)?;
+                        let response = process_list_panes_ordered_request(
+                            &mux,
+                            stream_id,
+                            TopologyCapabilities::SERVER_SUPPORTED,
+                            &request,
+                        )
+                        .await?;
+                        Ok(Pdu::ListPanesOrderedV1Response(response))
+                    }
+                    .await;
+                    send_response(response);
                 })
                 .detach();
             }
@@ -7848,12 +7921,14 @@ mod tests {
 
         let mut short = mux::tab::PaneSnapshotCensusLedger::new(26, 26)
             .expect("valid short PDU82 census ledger");
+        let mut short_cooperator = PaneSnapshotCooperator::new("test-pdu82");
         short.begin_attempt();
-        let error = collect_list_panes_snapshot_with_stage_observer_and_census(
+        let error = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
             &mux,
             &mut ignore_list_panes_snapshot_stage,
             &mut short,
-        )
+            &mut short_cooperator,
+        ))
         .expect_err("the second tab must not receive a fresh census allowance");
         assert!(format!("{error:#}").contains("attempt census work budget exhausted"));
         assert_eq!(
@@ -7864,16 +7939,60 @@ mod tests {
 
         let mut exact = mux::tab::PaneSnapshotCensusLedger::new(38, 38)
             .expect("valid exact PDU82 census ledger");
+        let mut exact_cooperator = PaneSnapshotCooperator::new("test-pdu82");
         exact.begin_attempt();
-        let snapshot = collect_list_panes_snapshot_with_stage_observer_and_census(
+        let snapshot = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
             &mux,
             &mut ignore_list_panes_snapshot_stage,
             &mut exact,
-        )
+            &mut exact_cooperator,
+        ))
         .expect("two one-pane tabs consume the exact cumulative allowance");
         assert_eq!(snapshot.tabs.len(), 2);
         assert_eq!(snapshot.tab_titles.len(), 2);
         assert_eq!(exact.attempt_stats().total(), Some(38));
+    }
+
+    #[test]
+    fn pane_snapshot_census_quantum_yields_to_queued_main_thread_work() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let collector_order = Arc::clone(&order);
+        spawn_into_main_thread(async move {
+            let mut ledger = mux::tab::PaneSnapshotCensusLedger::new(
+                PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM,
+                PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM,
+            )
+            .expect("cooperative test ledger is valid");
+            ledger.begin_attempt();
+            ledger
+                .reserve_pane_callbacks(PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM)
+                .expect("exact cooperative quantum is admitted");
+            let mut cooperator = PaneSnapshotCooperator::new("test-pdu82");
+
+            collector_order.lock().unwrap().push("collector-before");
+            cooperator.after_tab(&ledger).await;
+            collector_order.lock().unwrap().push("collector-after");
+            assert_eq!(cooperator.yields(), 1);
+        })
+        .detach();
+
+        let input_order = Arc::clone(&order);
+        spawn_into_main_thread(async move {
+            input_order.lock().unwrap().push("queued-input");
+        })
+        .detach();
+
+        drain_simple_executor(&executor);
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["collector-before", "queued-input", "collector-after"],
+            "the census self-wake must requeue behind already-queued interactive work"
+        );
     }
 
     fn expect_current_coherent_snapshot(
@@ -8143,12 +8262,12 @@ mod tests {
         let stream_id = TopologyStreamId::from_bytes([0x85; 16]);
         let request = ordered_snapshot_request(true);
 
-        let response = process_list_panes_ordered_request(
+        let response = block_on(process_list_panes_ordered_request(
             &mux,
             stream_id,
             ordered_window_capabilities(true),
             &request,
-        )
+        ))
         .expect("future-enabled PDU86 must produce one request-correlated PDU87");
         response
             .validate_for_request(&request)
@@ -9411,7 +9530,7 @@ mod tests {
 
         let snapshot = expect_current_ordered_snapshot(
             &mux,
-            collect_ordered_list_panes_snapshot(&mux)
+            block_on(collect_ordered_list_panes_snapshot(&mux))
                 .expect("stable mux must yield an ordered pane snapshot"),
         );
         snapshot
@@ -9594,19 +9713,18 @@ mod tests {
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome =
-            collect_ordered_list_panes_snapshot_with_stage_observer(
-                &mux,
-                &mut |stage| match stage {
-                    ListPanesSnapshotStage::BeforeOrderedAuthorityRead => {
-                        barrier_for_collector.collector_arrive();
-                    }
-                    ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                    ListPanesSnapshotStage::WindowsEnumerated
-                    | ListPanesSnapshotStage::OrderedWindowsFrozen
-                    | ListPanesSnapshotStage::TabTreeCaptured => {}
-                },
-            );
+        let outcome = block_on(collect_ordered_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| match stage {
+                ListPanesSnapshotStage::BeforeOrderedAuthorityRead => {
+                    barrier_for_collector.collector_arrive();
+                }
+                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                ListPanesSnapshotStage::WindowsEnumerated
+                | ListPanesSnapshotStage::OrderedWindowsFrozen
+                | ListPanesSnapshotStage::TabTreeCaptured => {}
+            },
+        ));
         let reorder_result = mutator
             .join()
             .expect("before-authority-cut mutator must not panic");
@@ -9678,19 +9796,18 @@ mod tests {
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome =
-            collect_ordered_list_panes_snapshot_with_stage_observer(
-                &mux,
-                &mut |stage| match stage {
-                    ListPanesSnapshotStage::OrderedWindowsFrozen => {
-                        barrier_for_collector.collector_arrive();
-                    }
-                    ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                    ListPanesSnapshotStage::BeforeOrderedAuthorityRead
-                    | ListPanesSnapshotStage::WindowsEnumerated
-                    | ListPanesSnapshotStage::TabTreeCaptured => {}
-                },
-            );
+        let outcome = block_on(collect_ordered_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| match stage {
+                ListPanesSnapshotStage::OrderedWindowsFrozen => {
+                    barrier_for_collector.collector_arrive();
+                }
+                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                ListPanesSnapshotStage::BeforeOrderedAuthorityRead
+                | ListPanesSnapshotStage::WindowsEnumerated
+                | ListPanesSnapshotStage::TabTreeCaptured => {}
+            },
+        ));
         let reorder_result = mutator
             .join()
             .expect("post-frozen-window-cut mutator must not panic");
@@ -9747,19 +9864,18 @@ mod tests {
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome =
-            collect_ordered_list_panes_snapshot_with_stage_observer(
-                &mux,
-                &mut |stage| match stage {
-                    ListPanesSnapshotStage::TabTreeCaptured => {
-                        barrier_for_collector.collector_arrive();
-                    }
-                    ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
-                    ListPanesSnapshotStage::BeforeOrderedAuthorityRead
-                    | ListPanesSnapshotStage::WindowsEnumerated
-                    | ListPanesSnapshotStage::OrderedWindowsFrozen => {}
-                },
-            );
+        let outcome = block_on(collect_ordered_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| match stage {
+                ListPanesSnapshotStage::TabTreeCaptured => {
+                    barrier_for_collector.collector_arrive();
+                }
+                ListPanesSnapshotStage::TitlesCaptured => completed_attempts += 1,
+                ListPanesSnapshotStage::BeforeOrderedAuthorityRead
+                | ListPanesSnapshotStage::WindowsEnumerated
+                | ListPanesSnapshotStage::OrderedWindowsFrozen => {}
+            },
+        ));
         mutator
             .join()
             .expect("ordered snapshot mutator must not panic")
@@ -10126,7 +10242,7 @@ mod tests {
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome = collect_coherent_list_panes_snapshot_with_stage_observer(
+        let outcome = block_on(collect_coherent_list_panes_snapshot_with_stage_observer(
             &mux,
             &mut |stage| match stage {
                 ListPanesSnapshotStage::WindowsEnumerated => {
@@ -10137,7 +10253,7 @@ mod tests {
                 | ListPanesSnapshotStage::OrderedWindowsFrozen
                 | ListPanesSnapshotStage::TabTreeCaptured => {}
             },
-        );
+        ));
         let mutator_result = mutator
             .join()
             .expect("window-enumeration mutator must finish without panic");
@@ -10191,12 +10307,14 @@ mod tests {
             .expect("attach floating snapshot pane");
         assert!(tab.set_floating_pane_z_order(floating.pane_id(), 71));
 
-        let legacy = collect_list_panes_snapshot(&mux).expect("collect legacy pane snapshot");
+        let legacy =
+            block_on(collect_list_panes_snapshot(&mux)).expect("collect legacy pane snapshot");
         let coherent = expect_current_coherent_snapshot(
             &mux,
-            collect_coherent_list_panes_snapshot(&mux).expect("collect coherent pane snapshot"),
+            block_on(collect_coherent_list_panes_snapshot(&mux))
+                .expect("collect coherent pane snapshot"),
         );
-        let ordered = match collect_ordered_list_panes_snapshot(&mux)
+        let ordered = match block_on(collect_ordered_list_panes_snapshot(&mux))
             .expect("collect ordered pane snapshot")
         {
             codec::ListPanesOrderedV1Outcome::Snapshot(snapshot) => snapshot,
@@ -10265,12 +10383,14 @@ mod tests {
         });
 
         let mut completed_attempts = 0usize;
-        let outcome =
-            collect_coherent_list_panes_snapshot_with_stage_observer(&mux, &mut |stage| {
+        let outcome = block_on(collect_coherent_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| {
                 if stage == ListPanesSnapshotStage::TitlesCaptured {
                     completed_attempts += 1;
                 }
-            });
+            },
+        ));
         assert!(
             mutator
                 .join()
@@ -10315,7 +10435,7 @@ mod tests {
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome = collect_coherent_list_panes_snapshot_with_stage_observer(
+        let outcome = block_on(collect_coherent_list_panes_snapshot_with_stage_observer(
             &mux,
             &mut |stage| match stage {
                 ListPanesSnapshotStage::TabTreeCaptured => {
@@ -10326,7 +10446,7 @@ mod tests {
                 | ListPanesSnapshotStage::WindowsEnumerated
                 | ListPanesSnapshotStage::OrderedWindowsFrozen => {}
             },
-        );
+        ));
         let attach_result = mutator
             .join()
             .expect("tab-tree mutator must finish without panic");
@@ -10387,12 +10507,14 @@ mod tests {
 
         armed.store(1, Ordering::Release);
         let mut completed_attempts = 0usize;
-        let outcome =
-            collect_coherent_list_panes_snapshot_with_stage_observer(&mux, &mut |stage| {
+        let outcome = block_on(collect_coherent_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| {
                 if stage == ListPanesSnapshotStage::TitlesCaptured {
                     completed_attempts += 1;
                 }
-            });
+            },
+        ));
         armed.store(0, Ordering::Release);
         let title_changed = mutator
             .join()
@@ -10435,13 +10557,15 @@ mod tests {
 
         let barrier_for_collector = Arc::clone(&barrier);
         let mut completed_attempts = 0usize;
-        let outcome =
-            collect_coherent_list_panes_snapshot_with_stage_observer(&mux, &mut |stage| {
+        let outcome = block_on(collect_coherent_list_panes_snapshot_with_stage_observer(
+            &mux,
+            &mut |stage| {
                 if stage == ListPanesSnapshotStage::TitlesCaptured {
                     completed_attempts += 1;
                     barrier_for_collector.collector_arrive();
                 }
-            });
+            },
+        ));
         let title_changed = mutator
             .join()
             .expect("title-capture mutator must finish without panic");
