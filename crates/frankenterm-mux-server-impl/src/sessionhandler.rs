@@ -8068,7 +8068,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_snapshot_census_metrics_cover_every_category_and_prior_retry_work() {
+    fn pane_snapshot_census_metrics_cover_every_category_and_retry_work() {
         let attempt = mux::tab::PaneSnapshotCensusStats {
             tree_nodes: 1,
             stack_containers: 2,
