@@ -11673,6 +11673,48 @@ mod test {
     }
 
     #[test]
+    fn flat_codec_snapshot_retries_same_id_exact_pane_replacement_during_census() {
+        let original_size = TerminalSize::default();
+        let replacement_size = TerminalSize {
+            rows: original_size.rows + 7,
+            cols: original_size.cols + 11,
+            pixel_width: original_size.pixel_width + 110,
+            pixel_height: original_size.pixel_height + 70,
+            dpi: original_size.dpi,
+        };
+        let tab = Arc::new(Tab::new(&original_size));
+        let replacement = FakePane::new(946, replacement_size);
+        let replacements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let weak_tab = Arc::downgrade(&tab);
+        let replacement_for_probe = Arc::clone(&replacement);
+        let replacements_for_probe = Arc::clone(&replacements);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if replacements_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                let tab = weak_tab.upgrade().expect("test retains tab");
+                tab.inner.lock().pane = Some(Tree::Leaf(Arc::clone(&replacement_for_probe)));
+            }
+        });
+        tab.inner.lock().pane = Some(Tree::Leaf(FakePane::new_with_pane_id_probe(
+            946,
+            original_size,
+            probe,
+        )));
+        let mut arena = Vec::new();
+
+        let descriptor = tab
+            .append_codec_pane_arena_in_window(110, "same-id-retry", &mut arena, 64, 16, 64)
+            .expect("same-ID exact pane replacement must retry to the successor generation");
+
+        assert_eq!(replacements.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(descriptor.node_count, 1);
+        let [PaneArenaNode::Leaf(entry)] = arena.as_slice() else {
+            panic!("same-ID replacement snapshot must encode one leaf");
+        };
+        assert_eq!(entry.pane_id, 946);
+        assert_eq!(entry.size, replacement_size);
+    }
+
+    #[test]
     fn flat_codec_snapshot_retries_normal_rendering_getter_focus_change() {
         let size = TerminalSize::default();
         let tab = Arc::new(Tab::new(&size));

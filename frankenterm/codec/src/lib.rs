@@ -5696,11 +5696,12 @@ pub const MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE: usize = 32_767;
 pub const MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT: usize = 16_384;
 pub const MAX_ORDERED_PANE_NODES_PER_SNAPSHOT: usize = 32_767;
 /// Whole-attempt pane census and callback work ceiling shared by live PDU82
-/// and dormant PDU87 producers. Thirty-two units per maximum tiled leaf cover
-/// both callback-free coherence cuts, identity checks, the fixed pane getter
-/// bundle, and final assembly while leaving bounded capacity for stack,
-/// floating, and zoom carriers. Unlike the per-tree defense, this limit is
-/// never reset for each tab.
+/// and dormant PDU87 producers. Deterministic production-path measurements at
+/// q1/q20/q50/q200 freeze the ordinary one-leaf cost at nineteen units: two
+/// tree visits, nine identity checks, seven pane callbacks, and one assembly
+/// node. Thirty-two units per maximum tiled leaf therefore leave thirteen
+/// units of bounded carrier headroom per leaf for stack, floating, and zoom
+/// state. Unlike the per-tree defense, this limit is never reset for each tab.
 pub const MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_ATTEMPT: usize =
     MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT * 32;
 /// A coherent request makes at most three attempts. The request ledger remains

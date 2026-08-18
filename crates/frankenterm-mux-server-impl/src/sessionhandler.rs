@@ -7899,24 +7899,32 @@ mod tests {
     }
 
     #[test]
-    fn pane_snapshot_census_live_pdu82_uses_one_cumulative_ledger_across_tabs() {
+    fn pane_snapshot_census_live_pdu82_uses_one_cumulative_ledger_across_windows() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mux = Arc::new(Mux::new(None));
-        let first = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(8_101, None)));
+        let first_callback_count = Arc::new(AtomicUsize::new(0));
+        let first_callback_count_for_probe = Arc::clone(&first_callback_count);
+        let first_probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            first_callback_count_for_probe.fetch_add(1, Ordering::AcqRel);
+        });
+        let first = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_callback_probe(8_101, first_probe)),
+        );
         let second_callback_count = Arc::new(AtomicUsize::new(0));
         let second_callback_count_for_probe = Arc::clone(&second_callback_count);
-        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let second_probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             second_callback_count_for_probe.fetch_add(1, Ordering::AcqRel);
         });
         let second = register_snapshot_tab(
             &mux,
-            Arc::new(FakePane::new_with_callback_probe(8_102, probe)),
+            Arc::new(FakePane::new_with_callback_probe(8_102, second_probe)),
         );
-        let window_id = attach_snapshot_tab_to_new_window(&mux, &first);
-        mux.add_tab_to_window(&second, window_id)
-            .expect("attach second cumulative-census tab");
+        attach_snapshot_tab_to_new_window(&mux, &first);
+        attach_snapshot_tab_to_new_window(&mux, &second);
+        first_callback_count.store(0, Ordering::Release);
         second_callback_count.store(0, Ordering::Release);
 
         let mut short = mux::tab::PaneSnapshotCensusLedger::new(26, 26)
@@ -7932,14 +7940,17 @@ mod tests {
         .expect_err("the second tab must not receive a fresh census allowance");
         assert!(format!("{error:#}").contains("attempt census work budget exhausted"));
         assert_eq!(
-            second_callback_count.load(Ordering::Acquire),
-            0,
-            "the rejected tab's callback bundle must not begin"
+            first_callback_count.load(Ordering::Acquire)
+                + second_callback_count.load(Ordering::Acquire),
+            1,
+            "exactly one window's tab may reach callbacks before the shared budget rejects the other"
         );
 
         let mut exact = mux::tab::PaneSnapshotCensusLedger::new(38, 38)
             .expect("valid exact PDU82 census ledger");
         let mut exact_cooperator = PaneSnapshotCooperator::new("test-pdu82");
+        first_callback_count.store(0, Ordering::Release);
+        second_callback_count.store(0, Ordering::Release);
         exact.begin_attempt();
         let snapshot = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
             &mux,
@@ -7950,7 +7961,132 @@ mod tests {
         .expect("two one-pane tabs consume the exact cumulative allowance");
         assert_eq!(snapshot.tabs.len(), 2);
         assert_eq!(snapshot.tab_titles.len(), 2);
+        assert_eq!(snapshot.window_titles.len(), 2);
         assert_eq!(exact.attempt_stats().total(), Some(38));
+        assert_eq!(first_callback_count.load(Ordering::Acquire), 1);
+        assert_eq!(second_callback_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn pane_snapshot_census_q_scale_measurements_justify_attempt_ceiling() {
+        const ORDINARY_WORK_PER_ONE_LEAF_TAB: usize = 19;
+        const BUDGETED_WORK_PER_LEAF: usize = 32;
+
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            codec::MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_ATTEMPT,
+            codec::MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT * BUDGETED_WORK_PER_LEAF
+        );
+
+        for (series, tab_count) in [1_usize, 20, 50, 200].into_iter().enumerate() {
+            let mux = Arc::new(Mux::new(None));
+            let window = mux.new_empty_window(None, None);
+            let window_id = *window;
+            drop(window);
+            for tab_index in 0..tab_count {
+                let pane_id = 20_000 + series * 1_000 + tab_index;
+                let tab = register_snapshot_tab(
+                    &mux,
+                    Arc::new(FakePane::new_with_id(pane_id, None)),
+                );
+                mux.add_tab_to_window(&tab, window_id)
+                    .expect("attach q-scale census tab");
+            }
+
+            let mut ledger = new_pane_snapshot_census_ledger()
+                .expect("production census limits must remain internally valid");
+            let mut cooperator = PaneSnapshotCooperator::new("test-pdu82-q-scale");
+            ledger.begin_attempt();
+            let snapshot = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
+                &mux,
+                &mut ignore_list_panes_snapshot_stage,
+                &mut ledger,
+                &mut cooperator,
+            ))
+            .unwrap_or_else(|error| panic!("q{tab_count} census failed: {error:#}"));
+
+            let stats = ledger.attempt_stats();
+            let measured_work = tab_count * ORDINARY_WORK_PER_ONE_LEAF_TAB;
+            let budgeted_work = tab_count * BUDGETED_WORK_PER_LEAF;
+            assert_eq!(snapshot.tabs.len(), tab_count);
+            assert_eq!(stats.tree_nodes, tab_count * 2);
+            assert_eq!(stats.identity_checks, tab_count * 9);
+            assert_eq!(stats.pane_callbacks, tab_count * 7);
+            assert_eq!(stats.assembly_nodes, tab_count);
+            assert_eq!(stats.total(), Some(measured_work));
+            assert_eq!(budgeted_work - measured_work, tab_count * 13);
+            assert!(budgeted_work <= codec::MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_ATTEMPT);
+            assert_eq!(ledger.last_rejection(), None);
+        }
+    }
+
+    #[test]
+    fn pane_snapshot_census_contains_floating_callback_panic_before_output() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(8_201, None)));
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &tab);
+        let first: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(8_202, None));
+        let panic_armed = Arc::new(AtomicBool::new(false));
+        let panic_armed_for_probe = Arc::clone(&panic_armed);
+        let panic_probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            assert!(
+                !panic_armed_for_probe.load(Ordering::Acquire),
+                "injected floating snapshot callback panic"
+            );
+        });
+        let second: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(
+            8_203,
+            panic_probe,
+        ));
+        let first_rect = mux::tab::FloatingPaneRect {
+            left: 1,
+            top: 1,
+            width: 20,
+            height: 5,
+        };
+        let second_rect = mux::tab::FloatingPaneRect {
+            left: 3,
+            top: 2,
+            width: 24,
+            height: 7,
+        };
+        for (pane, rect) in [
+            (Arc::clone(&first), first_rect),
+            (Arc::clone(&second), second_rect),
+        ] {
+            mux.add_pane(&pane).expect("register floating test pane");
+            tab.add_floating_pane(pane, rect)
+                .expect("attach floating test pane before arming panic");
+        }
+        assert!(tab.set_floating_pane_z_order(first.pane_id(), 1));
+        assert!(tab.set_floating_pane_z_order(second.pane_id(), 2));
+        panic_armed.store(true, Ordering::Release);
+
+        let mut ledger = new_pane_snapshot_census_ledger()
+            .expect("production census limits must remain internally valid");
+        ledger.begin_attempt();
+        let mut output = Vec::new();
+        let error = append_floating_pane_snapshot(
+            &mut output,
+            window_id,
+            tab.as_ref(),
+            "floating-panic-workspace",
+            &mut ledger,
+        )
+        .expect_err("a floating getter panic must fail the provisional projection");
+
+        assert!(format!("{error:#}").contains("floating-pane callback panicked"));
+        assert!(
+            output.is_empty(),
+            "no earlier floating entry may publish when a later getter panics"
+        );
+        assert_eq!(ledger.attempt_stats().pane_callbacks, 12);
     }
 
     #[test]
