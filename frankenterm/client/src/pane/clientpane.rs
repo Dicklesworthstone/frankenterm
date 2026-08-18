@@ -1047,7 +1047,7 @@ fn validate_render_application_resources(
         ));
     }
     if let Some(working_dir) = &update.surface.working_dir {
-        let requested = working_dir.url.as_str().len();
+        let requested = working_dir.as_str().len();
         if requested > limits.working_dir_bytes {
             return Err(bounded_resource_rejection(
                 RenderApplicationResource::WorkingDirectory,

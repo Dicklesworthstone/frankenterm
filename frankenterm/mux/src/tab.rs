@@ -22,6 +22,7 @@ use std::convert::TryFrom;
 use std::panic::catch_unwind;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use thiserror::Error;
 use url::Url;
 
 pub type Tree = bintree::Tree<Arc<dyn Pane>, SplitDirectionAndSize>;
@@ -330,7 +331,10 @@ struct TabInner {
     size_before_zoom: TerminalSize,
     active: usize,
     zoomed: Option<Arc<dyn Pane>>,
-    title: String,
+    /// Shared so callback-free snapshot coherence can retain exact title
+    /// identity without cloning an attacker-controlled string before metadata
+    /// byte admission.
+    title: Arc<str>,
     recency: Recency,
     /// Set of pane IDs that have been collapsed because the terminal
     /// shrank below the aggregate minimum constraints.  Collapsed panes
@@ -463,6 +467,552 @@ pub struct PaneSnapshotCensusLedger {
     callbacks_avoided: usize,
 }
 
+/// Authority-bearing UTF-8 fields emitted by PDU82/PDU87 pane snapshots.
+///
+/// The finite variants are also safe metric labels. Rejection errors expose
+/// only one of these labels and numeric limits; rejected content is never
+/// formatted or logged.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum PaneSnapshotMetadataField {
+    WindowTitle,
+    WindowWorkspace,
+    TabTitle,
+    PaneTitle,
+    PaneWorkingDir,
+    PaneWorkspace,
+    PaneTtyName,
+}
+
+impl PaneSnapshotMetadataField {
+    const COUNT: usize = 7;
+
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::WindowTitle,
+        Self::WindowWorkspace,
+        Self::TabTitle,
+        Self::PaneTitle,
+        Self::PaneWorkingDir,
+        Self::PaneWorkspace,
+        Self::PaneTtyName,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::WindowTitle => 0,
+            Self::WindowWorkspace => 1,
+            Self::TabTitle => 2,
+            Self::PaneTitle => 3,
+            Self::PaneWorkingDir => 4,
+            Self::PaneWorkspace => 5,
+            Self::PaneTtyName => 6,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::WindowTitle => "window_title",
+            Self::WindowWorkspace => "window_workspace",
+            Self::TabTitle => "tab_title",
+            Self::PaneTitle => "pane_title",
+            Self::PaneWorkingDir => "pane_working_dir",
+            Self::PaneWorkspace => "pane_workspace",
+            Self::PaneTtyName => "pane_tty_name",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct PaneSnapshotMetadataUsage {
+    pub values: usize,
+    /// Exact dynamic allocation capacity retained by admitted snapshot fields.
+    pub retained_bytes: usize,
+    /// Exact varbincode bytes attributable to those fields, including each
+    /// string length and optional-value tag.
+    pub encoded_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct PaneSnapshotMetadataStats {
+    fields: [PaneSnapshotMetadataUsage; PaneSnapshotMetadataField::COUNT],
+}
+
+impl PaneSnapshotMetadataStats {
+    pub const fn field(self, field: PaneSnapshotMetadataField) -> PaneSnapshotMetadataUsage {
+        self.fields[field.index()]
+    }
+
+    pub fn total(self) -> Option<PaneSnapshotMetadataUsage> {
+        self.fields.iter().copied().try_fold(
+            PaneSnapshotMetadataUsage::default(),
+            |total, field| {
+                Some(PaneSnapshotMetadataUsage {
+                    values: total.values.checked_add(field.values)?,
+                    retained_bytes: total.retained_bytes.checked_add(field.retained_bytes)?,
+                    encoded_bytes: total.encoded_bytes.checked_add(field.encoded_bytes)?,
+                })
+            },
+        )
+    }
+
+    fn checked_delta(self, prior: Self) -> anyhow::Result<PaneSnapshotMetadataUsage> {
+        for (current, prior) in self.fields.iter().zip(prior.fields.iter()) {
+            current
+                .values
+                .checked_sub(prior.values)
+                .context("pane-snapshot metadata field value count regressed")?;
+            current
+                .retained_bytes
+                .checked_sub(prior.retained_bytes)
+                .context("pane-snapshot metadata field retained bytes regressed")?;
+            current
+                .encoded_bytes
+                .checked_sub(prior.encoded_bytes)
+                .context("pane-snapshot metadata field encoded bytes regressed")?;
+        }
+        let current = self
+            .total()
+            .context("pane-snapshot metadata totals overflowed")?;
+        let prior = prior
+            .total()
+            .context("pane-snapshot prior metadata totals overflowed")?;
+        Ok(PaneSnapshotMetadataUsage {
+            values: current
+                .values
+                .checked_sub(prior.values)
+                .context("pane-snapshot metadata value count regressed")?,
+            retained_bytes: current
+                .retained_bytes
+                .checked_sub(prior.retained_bytes)
+                .context("pane-snapshot retained metadata bytes regressed")?,
+            encoded_bytes: current
+                .encoded_bytes
+                .checked_sub(prior.encoded_bytes)
+                .context("pane-snapshot encoded metadata bytes regressed")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PaneSnapshotMetadataLimits {
+    per_field_bytes: [usize; PaneSnapshotMetadataField::COUNT],
+    pub attempt_retained_bytes: usize,
+    pub attempt_encoded_bytes: usize,
+    pub request_retained_bytes: usize,
+    pub request_encoded_bytes: usize,
+}
+
+impl PaneSnapshotMetadataLimits {
+    pub const fn new(
+        per_field_bytes: [usize; PaneSnapshotMetadataField::COUNT],
+        attempt_retained_bytes: usize,
+        attempt_encoded_bytes: usize,
+        request_retained_bytes: usize,
+        request_encoded_bytes: usize,
+    ) -> Self {
+        Self {
+            per_field_bytes,
+            attempt_retained_bytes,
+            attempt_encoded_bytes,
+            request_retained_bytes,
+            request_encoded_bytes,
+        }
+    }
+
+    pub const fn per_field_bytes(self, field: PaneSnapshotMetadataField) -> usize {
+        self.per_field_bytes[field.index()]
+    }
+
+    const fn unbounded() -> Self {
+        Self::new(
+            [usize::MAX; PaneSnapshotMetadataField::COUNT],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, Error, PartialEq)]
+pub enum PaneSnapshotMetadataRejection {
+    #[error("pane-snapshot {field} metadata exceeds its per-field byte limit")]
+    FieldLimit { field: &'static str },
+    #[error("pane-snapshot metadata accounting overflowed")]
+    ArithmeticOverflow,
+    #[error("pane-snapshot attempt retained-metadata byte budget exhausted")]
+    AttemptRetainedLimit,
+    #[error("pane-snapshot attempt encoded-metadata byte budget exhausted")]
+    AttemptEncodedLimit,
+    #[error("pane-snapshot request retained-metadata byte budget exhausted")]
+    RequestRetainedLimit,
+    #[error("pane-snapshot request encoded-metadata byte budget exhausted")]
+    RequestEncodedLimit,
+}
+
+/// One request-scoped UTF-8 metadata authority shared across coherence retries.
+///
+/// Failed-attempt values are dropped by the producer, while request totals stay
+/// monotonic. This simultaneously bounds live attempt retention and adversarial
+/// retry work. The accounting is content-free and does not inspect code points:
+/// Rust string length is already the exact canonical UTF-8 byte length.
+#[derive(Debug)]
+pub struct PaneSnapshotMetadataLedger {
+    limits: PaneSnapshotMetadataLimits,
+    attempt: PaneSnapshotMetadataStats,
+    request: PaneSnapshotMetadataStats,
+    last_rejection: Option<PaneSnapshotMetadataRejection>,
+    retry_released_bytes: usize,
+    attempt_peak_retained_bytes: usize,
+    attempt_peak_encoded_bytes: usize,
+    unreported_admitted_values: [usize; PaneSnapshotMetadataField::COUNT],
+}
+
+impl PaneSnapshotMetadataLedger {
+    pub fn new(limits: PaneSnapshotMetadataLimits) -> anyhow::Result<Self> {
+        if limits.per_field_bytes.contains(&0)
+            || limits.attempt_retained_bytes == 0
+            || limits.attempt_encoded_bytes == 0
+            || limits.request_retained_bytes < limits.attempt_retained_bytes
+            || limits.request_encoded_bytes < limits.attempt_encoded_bytes
+        {
+            anyhow::bail!(
+                "pane-snapshot metadata limits require nonzero field/attempt limits not exceeding request limits"
+            );
+        }
+        Ok(Self {
+            limits,
+            attempt: PaneSnapshotMetadataStats::default(),
+            request: PaneSnapshotMetadataStats::default(),
+            last_rejection: None,
+            retry_released_bytes: 0,
+            attempt_peak_retained_bytes: 0,
+            attempt_peak_encoded_bytes: 0,
+            unreported_admitted_values: [0; PaneSnapshotMetadataField::COUNT],
+        })
+    }
+
+    pub fn begin_attempt(&mut self) {
+        self.attempt = PaneSnapshotMetadataStats::default();
+        self.last_rejection = None;
+        self.attempt_peak_retained_bytes = 0;
+        self.attempt_peak_encoded_bytes = 0;
+    }
+
+    pub const fn attempt_stats(&self) -> PaneSnapshotMetadataStats {
+        self.attempt
+    }
+
+    pub const fn request_stats(&self) -> PaneSnapshotMetadataStats {
+        self.request
+    }
+
+    pub const fn last_rejection(&self) -> Option<PaneSnapshotMetadataRejection> {
+        self.last_rejection
+    }
+
+    pub const fn attempt_peak_retained_bytes(&self) -> usize {
+        self.attempt_peak_retained_bytes
+    }
+
+    pub const fn attempt_peak_encoded_bytes(&self) -> usize {
+        self.attempt_peak_encoded_bytes
+    }
+
+    pub const fn attempt_checkpoint(&self) -> PaneSnapshotMetadataStats {
+        self.attempt
+    }
+
+    /// Release values retained by a failed coherence attempt while preserving
+    /// monotonic request accounting. This keeps the attempt total equal to live
+    /// response ownership rather than cumulative retry work.
+    pub fn release_attempt_to(
+        &mut self,
+        checkpoint: PaneSnapshotMetadataStats,
+    ) -> anyhow::Result<PaneSnapshotMetadataUsage> {
+        let released = self.attempt.checked_delta(checkpoint)?;
+        self.retry_released_bytes = self
+            .retry_released_bytes
+            .checked_add(released.retained_bytes)
+            .context("pane-snapshot released metadata byte accounting overflow")?;
+        self.attempt = checkpoint;
+        Ok(released)
+    }
+
+    pub fn take_retry_released_bytes(&mut self) -> usize {
+        std::mem::take(&mut self.retry_released_bytes)
+    }
+
+    pub fn take_unreported_admitted_values(
+        &mut self,
+    ) -> [(PaneSnapshotMetadataField, usize); PaneSnapshotMetadataField::COUNT] {
+        let values = std::mem::take(&mut self.unreported_admitted_values);
+        PaneSnapshotMetadataField::ALL.map(|field| (field, values[field.index()]))
+    }
+
+    /// Reject a field whose logical UTF-8 payload is too large before the
+    /// producer allocates its owned snapshot copy. Aggregate admission still
+    /// happens after allocation so retained bytes use the copy's actual
+    /// capacity rather than assuming capacity equals length.
+    pub fn preflight_field(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        value: &str,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        let result = if value.len() > self.limits.per_field_bytes(field) {
+            Err(PaneSnapshotMetadataRejection::FieldLimit {
+                field: field.label(),
+            })
+        } else {
+            Ok(())
+        };
+        if let Err(rejection) = result {
+            self.last_rejection = Some(rejection);
+        }
+        result
+    }
+
+    pub fn preflight_required_string(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        value: &str,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        let encoded = encoded_string_bytes(value.len()).inspect_err(|rejection| {
+            self.last_rejection = Some(*rejection);
+        })?;
+        self.preflight_admission(field, value.len(), value.len(), encoded)
+    }
+
+    pub fn preflight_retained_only_string(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        value: &str,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        self.preflight_admission(field, value.len(), value.len(), 0)
+    }
+
+    pub fn preflight_optional_string(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        value: &str,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        let encoded = encoded_string_bytes(value.len())
+            .and_then(|encoded| {
+                encoded
+                    .checked_add(1)
+                    .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)
+            })
+            .inspect_err(|rejection| {
+                self.last_rejection = Some(*rejection);
+            })?;
+        self.preflight_admission(field, value.len(), value.len(), encoded)
+    }
+
+    /// Prove that the minimum one-byte option tag can still be admitted before
+    /// invoking an optional-string getter whose presence and length are not yet
+    /// known. A fully exhausted encoded-byte budget therefore stops the getter
+    /// rather than performing work for a value that cannot be represented.
+    pub fn preflight_optional_value(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        self.preflight_admission(field, 0, 0, 1)
+    }
+
+    fn preflight_admission(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        utf8_bytes: usize,
+        minimum_retained_bytes: usize,
+        encoded_bytes: usize,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        let result = self
+            .checked_admission(field, utf8_bytes, minimum_retained_bytes, encoded_bytes)
+            .map(|_| ());
+        if let Err(rejection) = result {
+            self.last_rejection = Some(rejection);
+        }
+        result
+    }
+
+    pub fn admit_required_owned(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        value: &str,
+        retained_capacity: usize,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        let encoded = encoded_string_bytes(value.len()).inspect_err(|rejection| {
+            self.last_rejection = Some(*rejection);
+        })?;
+        self.admit(field, value.len(), retained_capacity, encoded)
+    }
+
+    /// Charge an owned producer-side source string that is not itself emitted.
+    /// Window workspace is retained once to provide the owner value later
+    /// copied into each pane entry; those emitted copies are charged separately.
+    pub fn admit_retained_only_owned(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        value: &str,
+        retained_capacity: usize,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        self.admit(field, value.len(), retained_capacity, 0)
+    }
+
+    pub fn admit_optional_owned(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        value: &str,
+        retained_capacity: usize,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        let encoded = encoded_string_bytes(value.len())
+            .and_then(|encoded| {
+                encoded
+                    .checked_add(1)
+                    .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)
+            })
+            .inspect_err(|rejection| {
+                self.last_rejection = Some(*rejection);
+            })?;
+        self.admit(field, value.len(), retained_capacity, encoded)
+    }
+
+    /// Charge the one-byte varbincode option tag even when no UTF-8 payload is
+    /// present, so admitted encoded metadata remains exact.
+    pub fn admit_optional_none(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        self.admit(field, 0, 0, 1)
+    }
+
+    /// Release a temporary producer-owned source after all response copies
+    /// have been assembled. Request accounting intentionally remains
+    /// monotonic; only the exact live-attempt retention drops.
+    pub fn release_retained_only(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        retained_capacity: usize,
+    ) -> anyhow::Result<()> {
+        let usage = &mut self.attempt.fields[field.index()];
+        usage.retained_bytes = usage
+            .retained_bytes
+            .checked_sub(retained_capacity)
+            .context("pane-snapshot temporary metadata retention regressed")?;
+        Ok(())
+    }
+
+    fn admit(
+        &mut self,
+        field: PaneSnapshotMetadataField,
+        utf8_bytes: usize,
+        retained_bytes: usize,
+        encoded_bytes: usize,
+    ) -> Result<(), PaneSnapshotMetadataRejection> {
+        let result = (|| {
+            let field_index = field.index();
+            let (next_attempt, next_request) =
+                self.checked_admission(field, utf8_bytes, retained_bytes, encoded_bytes)?;
+            let next_attempt_total = next_attempt
+                .total()
+                .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+            let next_unreported_values = self.unreported_admitted_values[field_index]
+                .checked_add(1)
+                .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+            self.attempt = next_attempt;
+            self.request = next_request;
+            self.attempt_peak_retained_bytes = self
+                .attempt_peak_retained_bytes
+                .max(next_attempt_total.retained_bytes);
+            self.attempt_peak_encoded_bytes = self
+                .attempt_peak_encoded_bytes
+                .max(next_attempt_total.encoded_bytes);
+            self.unreported_admitted_values[field_index] = next_unreported_values;
+            Ok(())
+        })();
+        if let Err(rejection) = result {
+            self.last_rejection = Some(rejection);
+        }
+        result
+    }
+
+    fn checked_admission(
+        &self,
+        field: PaneSnapshotMetadataField,
+        utf8_bytes: usize,
+        retained_bytes: usize,
+        encoded_bytes: usize,
+    ) -> Result<(PaneSnapshotMetadataStats, PaneSnapshotMetadataStats), PaneSnapshotMetadataRejection>
+    {
+        if utf8_bytes > self.limits.per_field_bytes(field) || retained_bytes < utf8_bytes {
+            return Err(PaneSnapshotMetadataRejection::FieldLimit {
+                field: field.label(),
+            });
+        }
+        let field_index = field.index();
+        let next_attempt =
+            checked_metadata_admission(self.attempt, field_index, retained_bytes, encoded_bytes)?;
+        let next_request =
+            checked_metadata_admission(self.request, field_index, retained_bytes, encoded_bytes)?;
+        let attempt_total = next_attempt
+            .total()
+            .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+        let request_total = next_request
+            .total()
+            .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+        if attempt_total.retained_bytes > self.limits.attempt_retained_bytes {
+            return Err(PaneSnapshotMetadataRejection::AttemptRetainedLimit);
+        }
+        if attempt_total.encoded_bytes > self.limits.attempt_encoded_bytes {
+            return Err(PaneSnapshotMetadataRejection::AttemptEncodedLimit);
+        }
+        if request_total.retained_bytes > self.limits.request_retained_bytes {
+            return Err(PaneSnapshotMetadataRejection::RequestRetainedLimit);
+        }
+        if request_total.encoded_bytes > self.limits.request_encoded_bytes {
+            return Err(PaneSnapshotMetadataRejection::RequestEncodedLimit);
+        }
+        Ok((next_attempt, next_request))
+    }
+}
+
+fn checked_metadata_admission(
+    mut stats: PaneSnapshotMetadataStats,
+    field_index: usize,
+    retained_bytes: usize,
+    encoded_bytes: usize,
+) -> Result<PaneSnapshotMetadataStats, PaneSnapshotMetadataRejection> {
+    let field = &mut stats.fields[field_index];
+    field.values = field
+        .values
+        .checked_add(1)
+        .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+    field.retained_bytes = field
+        .retained_bytes
+        .checked_add(retained_bytes)
+        .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+    field.encoded_bytes = field
+        .encoded_bytes
+        .checked_add(encoded_bytes)
+        .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+    Ok(stats)
+}
+
+fn encoded_string_bytes(len: usize) -> Result<usize, PaneSnapshotMetadataRejection> {
+    let len_u64 =
+        u64::try_from(len).map_err(|_| PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+    let mut prefix = 1usize;
+    let mut remaining = len_u64 >> 7;
+    while remaining != 0 {
+        prefix = prefix
+            .checked_add(1)
+            .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)?;
+        remaining >>= 7;
+    }
+    prefix
+        .checked_add(len)
+        .ok_or(PaneSnapshotMetadataRejection::ArithmeticOverflow)
+}
+
 impl PaneSnapshotCensusLedger {
     pub fn new(per_attempt_limit: usize, request_limit: usize) -> anyhow::Result<Self> {
         if per_attempt_limit == 0 || request_limit < per_attempt_limit {
@@ -509,6 +1059,42 @@ impl PaneSnapshotCensusLedger {
 
     pub fn reserve_pane_callbacks(&mut self, count: usize) -> anyhow::Result<()> {
         self.reserve(PaneSnapshotCensusKind::PaneCallback, count)
+    }
+
+    /// Prove that an indivisible callback sequence fits without charging work
+    /// that has not happened yet. Callers then reserve each callback as it is
+    /// invoked, preserving exact actual-work telemetry when metadata admission
+    /// stops a partially observed entry.
+    pub fn preflight_pane_callbacks(&mut self, count: usize) -> anyhow::Result<()> {
+        let Some(next_attempt) = self
+            .attempt
+            .total()
+            .and_then(|total| total.checked_add(count))
+        else {
+            self.last_rejection = Some(PaneSnapshotCensusRejection::AttemptOverflow);
+            self.callbacks_avoided = count;
+            anyhow::bail!("pane-snapshot attempt census work overflow");
+        };
+        let Some(next_request) = self
+            .request
+            .total()
+            .and_then(|total| total.checked_add(count))
+        else {
+            self.last_rejection = Some(PaneSnapshotCensusRejection::RequestOverflow);
+            self.callbacks_avoided = count;
+            anyhow::bail!("pane-snapshot request census work overflow");
+        };
+        if next_attempt > self.per_attempt_limit {
+            self.last_rejection = Some(PaneSnapshotCensusRejection::AttemptLimit);
+            self.callbacks_avoided = count;
+            anyhow::bail!("pane-snapshot attempt census work budget exhausted");
+        }
+        if next_request > self.request_limit {
+            self.last_rejection = Some(PaneSnapshotCensusRejection::RequestLimit);
+            self.callbacks_avoided = count;
+            anyhow::bail!("pane-snapshot request census work budget exhausted");
+        }
+        Ok(())
     }
 
     pub fn reserve_assembly_nodes(&mut self, count: usize) -> anyhow::Result<()> {
@@ -716,7 +1302,7 @@ struct OrderedPaneCoherence {
     floating: Vec<OrderedFloatingPaneCoherence>,
     floating_focus: Option<PaneId>,
     zoomed: Option<PaneIdentity>,
-    title: String,
+    title: Arc<str>,
 }
 
 struct OrderedPaneEntryObservation {
@@ -727,6 +1313,7 @@ struct OrderedPaneEntryObservation {
     alt_screen_active: bool,
     cursor_pos: StableCursorPosition,
     physical_top: StableRowIndex,
+    workspace: String,
     tty_name: Option<String>,
 }
 
@@ -739,7 +1326,9 @@ fn observe_ordered_panes_bounded(
     tab_id: TabId,
     panes: Vec<Arc<dyn Pane>>,
     tree_leaf_count: usize,
-    ledger: &mut PaneSnapshotCensusLedger,
+    workspace: &str,
+    census_ledger: &mut PaneSnapshotCensusLedger,
+    metadata_ledger: &mut PaneSnapshotMetadataLedger,
 ) -> anyhow::Result<OrderedPaneObservation> {
     if tree_leaf_count > panes.len() {
         anyhow::bail!(
@@ -753,7 +1342,7 @@ fn observe_ordered_panes_bounded(
         .checked_mul(2)
         .and_then(|work| work.checked_add(tree_leaf_count))
         .context("ordered pane-observation identity work overflow")?;
-    ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, identity_work)?;
+    census_ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, identity_work)?;
     let mut pane_ids = HashMap::new();
     pane_ids
         .try_reserve(panes.len())
@@ -768,53 +1357,104 @@ fn observe_ordered_panes_bounded(
         .map_err(|error| anyhow::anyhow!("reserve ordered tree-pane observations: {error}"))?;
 
     for (pane_index, pane) in panes.into_iter().enumerate() {
-        let callback_count = if pane_index < tree_leaf_count { 7 } else { 1 };
-        ledger.reserve(PaneSnapshotCensusKind::PaneCallback, callback_count)?;
         let identity = pane_identity(&pane);
-        let observation = match catch_recoverable(
-            RecoverablePanicSite::MuxPaneCallback,
-            AssertUnwindSafe(|| {
-                let pane_id = pane.pane_id();
-                let tree_entry = if pane_index < tree_leaf_count {
-                    // Pane implementations are arbitrary external code. Observe
-                    // every field needed by the wire entry inside the same unwind
-                    // boundary, before taking the final topology/focus coherence
-                    // cut. Assembly after that cut must be callback-free.
-                    let dims = pane.get_dimensions();
-                    let working_dir = pane
-                        .get_current_working_dir(CachePolicy::AllowStale)
-                        .map(Into::into);
-                    let cursor_pos = pane.get_cursor_position();
-                    Some(OrderedPaneEntryObservation {
-                        pane_id,
-                        title: pane.get_title(),
-                        size: TerminalSize {
-                            cols: dims.cols,
-                            rows: dims.viewport_rows,
-                            pixel_height: dims.pixel_height,
-                            pixel_width: dims.pixel_width,
-                            dpi: dims.dpi,
-                        },
-                        working_dir,
-                        alt_screen_active: pane.is_alt_screen_active(),
-                        cursor_pos,
-                        physical_top: dims.physical_top,
-                        tty_name: pane.tty_name(),
-                    })
-                } else {
-                    None
-                };
-                (pane_id, tree_entry)
-            }),
-        ) {
-            Ok(observation) => observation,
-            Err(_) => {
-                anyhow::bail!(
-                    "a pane callback panicked while tab {tab_id} was being observed for ordered encoding"
-                );
-            }
+        census_ledger.preflight_pane_callbacks(if pane_index < tree_leaf_count { 7 } else { 1 })?;
+        let workspace = if pane_index < tree_leaf_count {
+            // Workspace is already borrowed from the window. Admit the exact
+            // per-leaf copy before invoking arbitrary pane code so exhaustion
+            // cannot trigger even the first metadata callback for this entry.
+            metadata_ledger
+                .preflight_required_string(PaneSnapshotMetadataField::PaneWorkspace, workspace)?;
+            let workspace = workspace.to_string();
+            metadata_ledger.admit_required_owned(
+                PaneSnapshotMetadataField::PaneWorkspace,
+                &workspace,
+                workspace.capacity(),
+            )?;
+            Some(workspace)
+        } else {
+            None
         };
-        let (pane_id, tree_entry) = observation;
+        let pane_id =
+            observe_snapshot_pane_callback(tab_id, &pane, census_ledger, |pane| pane.pane_id())?;
+        let tree_entry = if pane_index < tree_leaf_count {
+            // Admit each owned UTF-8 result immediately. No subsequent getter
+            // runs after a field or cumulative budget rejection.
+            metadata_ledger.preflight_required_string(PaneSnapshotMetadataField::PaneTitle, "")?;
+            let title = observe_snapshot_pane_callback(tab_id, &pane, census_ledger, |pane| {
+                pane.get_title()
+            })?;
+            metadata_ledger.admit_required_owned(
+                PaneSnapshotMetadataField::PaneTitle,
+                &title,
+                title.capacity(),
+            )?;
+            let dims = observe_snapshot_pane_callback(tab_id, &pane, census_ledger, |pane| {
+                pane.get_dimensions()
+            })?;
+            metadata_ledger.preflight_optional_value(PaneSnapshotMetadataField::PaneWorkingDir)?;
+            let working_dir =
+                observe_snapshot_pane_callback(tab_id, &pane, census_ledger, |pane| {
+                    pane.get_current_working_dir(CachePolicy::AllowStale)
+                })?;
+            if let Some(url) = working_dir.as_ref() {
+                metadata_ledger.preflight_optional_string(
+                    PaneSnapshotMetadataField::PaneWorkingDir,
+                    url.as_str(),
+                )?;
+            }
+            let working_dir = working_dir.map(SerdeUrl::from);
+            match working_dir.as_ref() {
+                Some(url) => metadata_ledger.admit_optional_owned(
+                    PaneSnapshotMetadataField::PaneWorkingDir,
+                    url.as_str(),
+                    url.capacity(),
+                )?,
+                None => metadata_ledger
+                    .admit_optional_none(PaneSnapshotMetadataField::PaneWorkingDir)?,
+            }
+            let alt_screen_active =
+                observe_snapshot_pane_callback(tab_id, &pane, census_ledger, |pane| {
+                    pane.is_alt_screen_active()
+                })?;
+            let cursor_pos =
+                observe_snapshot_pane_callback(tab_id, &pane, census_ledger, |pane| {
+                    pane.get_cursor_position()
+                })?;
+            metadata_ledger.preflight_optional_value(PaneSnapshotMetadataField::PaneTtyName)?;
+            let tty_name = observe_snapshot_pane_callback(tab_id, &pane, census_ledger, |pane| {
+                pane.tty_name()
+            })?;
+            match tty_name.as_ref() {
+                Some(tty_name) => metadata_ledger.admit_optional_owned(
+                    PaneSnapshotMetadataField::PaneTtyName,
+                    tty_name,
+                    tty_name.capacity(),
+                )?,
+                None => {
+                    metadata_ledger.admit_optional_none(PaneSnapshotMetadataField::PaneTtyName)?
+                }
+            }
+            Some(OrderedPaneEntryObservation {
+                pane_id,
+                title,
+                size: TerminalSize {
+                    cols: dims.cols,
+                    rows: dims.viewport_rows,
+                    pixel_height: dims.pixel_height,
+                    pixel_width: dims.pixel_width,
+                    dpi: dims.dpi,
+                },
+                working_dir,
+                alt_screen_active,
+                cursor_pos,
+                physical_top: dims.physical_top,
+                workspace: workspace.expect("tree pane workspace was prepared before callbacks"),
+                tty_name,
+            })
+        } else {
+            None
+        };
         if pane_ids.insert(identity, pane_id).is_some() {
             anyhow::bail!(
                 "an exact pane identity appears more than once while tab {tab_id} is being observed for ordered encoding"
@@ -841,6 +1481,24 @@ fn observe_ordered_panes_bounded(
     Ok(OrderedPaneObservation {
         pane_ids,
         tree_entries,
+    })
+}
+
+fn observe_snapshot_pane_callback<T>(
+    tab_id: TabId,
+    pane: &Arc<dyn Pane>,
+    ledger: &mut PaneSnapshotCensusLedger,
+    callback: impl FnOnce(&Arc<dyn Pane>) -> T,
+) -> anyhow::Result<T> {
+    ledger.reserve(PaneSnapshotCensusKind::PaneCallback, 1)?;
+    catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| callback(pane)),
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "a pane callback panicked while tab {tab_id} was being observed for ordered encoding"
+        )
     })
 }
 
@@ -1691,7 +2349,6 @@ fn pane_entry_from_ordered_observation(
     window_id: WindowId,
     is_active_pane: bool,
     is_zoomed_pane: bool,
-    workspace: &str,
     left_col: usize,
     top_row: usize,
 ) -> PaneEntry {
@@ -1705,7 +2362,7 @@ fn pane_entry_from_ordered_observation(
         size: observed.size,
         working_dir: observed.working_dir,
         alt_screen_active: observed.alt_screen_active,
-        workspace: workspace.to_string(),
+        workspace: observed.workspace,
         cursor_pos: observed.cursor_pos,
         physical_top: observed.physical_top,
         left_col,
@@ -3279,7 +3936,7 @@ impl Tab {
     }
 
     pub fn get_title(&self) -> String {
-        self.inner.lock().title.clone()
+        self.inner.lock().title.to_string()
     }
 
     pub fn set_title(&self, title: &str) {
@@ -3296,15 +3953,15 @@ impl Tab {
         mux: Option<&Mux>,
     ) -> (bool, Option<MuxNotificationEnvelope>) {
         let mut inner = self.inner.lock();
-        if inner.title == title {
+        if inner.title.as_ref() == title {
             return (false, None);
         }
-        let title = title.to_string();
-        inner.title = title.clone();
+        let title: Arc<str> = Arc::from(title);
+        inner.title = Arc::clone(&title);
         let notification = mux.map(|mux| {
             mux.envelope_notification(MuxNotification::TabTitleChanged {
                 tab_id: self.tab_id,
-                title,
+                title: title.to_string(),
             })
         });
         (true, notification)
@@ -3468,6 +4125,35 @@ impl Tab {
         max_census_work: usize,
         ledger: &mut PaneSnapshotCensusLedger,
     ) -> anyhow::Result<PaneArenaAppendReceipt> {
+        let mut metadata_ledger =
+            PaneSnapshotMetadataLedger::new(PaneSnapshotMetadataLimits::unbounded())?;
+        metadata_ledger.begin_attempt();
+        self.append_codec_pane_arena_in_window_with_ledgers(
+            window_id,
+            workspace,
+            arena,
+            max_depth,
+            max_total_nodes,
+            max_census_work,
+            ledger,
+            &mut metadata_ledger,
+        )
+    }
+
+    /// Append one ordered pane tree while charging the shared work and UTF-8
+    /// metadata authorities. Neither ledger is reset here: callers own the
+    /// attempt boundary so all tabs and internal coherence retries share it.
+    pub fn append_codec_pane_arena_in_window_with_ledgers(
+        &self,
+        window_id: WindowId,
+        workspace: &str,
+        arena: &mut Vec<PaneArenaNode>,
+        max_depth: usize,
+        max_total_nodes: usize,
+        max_census_work: usize,
+        ledger: &mut PaneSnapshotCensusLedger,
+        metadata_ledger: &mut PaneSnapshotMetadataLedger,
+    ) -> anyhow::Result<PaneArenaAppendReceipt> {
         const SNAPSHOT_ATTEMPTS: usize = 3;
         let work_before = ledger.attempt_stats();
         let arena_start = arena.len();
@@ -3478,6 +4164,7 @@ impl Tab {
         })?;
 
         for _ in 0..SNAPSHOT_ATTEMPTS {
+            let metadata_checkpoint = metadata_ledger.attempt_checkpoint();
             let callback_free_snapshot = self.inner.lock().snapshot_panes_callback_free_bounded(
                 max_depth,
                 max_tree_nodes,
@@ -3495,8 +4182,14 @@ impl Tab {
             // Keep callback failures provisional until the final callback-free
             // census proves that the callbacks did not replace or rearrange
             // the topology/focus authority that they were observing.
-            let observed =
-                observe_ordered_panes_bounded(self.tab_id, panes, tree_leaf_count, ledger);
+            let observed = observe_ordered_panes_bounded(
+                self.tab_id,
+                panes,
+                tree_leaf_count,
+                workspace,
+                ledger,
+                metadata_ledger,
+            );
 
             let captured = {
                 let inner = self.inner.lock();
@@ -3512,14 +4205,22 @@ impl Tab {
                     // until a subsequent attempt observes it before invoking
                     // pane code, so retry instead of leaking this post-callback
                     // error across the coherence fence.
-                    Err(_) => continue,
+                    Err(_) => {
+                        drop(observed);
+                        metadata_ledger.release_attempt_to(metadata_checkpoint)?;
+                        continue;
+                    }
                 };
                 if current.coherence != coherence {
+                    drop(observed);
+                    metadata_ledger.release_attempt_to(metadata_checkpoint)?;
                     continue;
                 }
 
                 let observed = observed?;
                 if !callback_snapshot_matches_bounded(&current.panes, &observed.pane_ids, ledger)? {
+                    drop(observed);
+                    metadata_ledger.release_attempt_to(metadata_checkpoint)?;
                     continue;
                 }
                 {
@@ -3531,12 +4232,22 @@ impl Tab {
                         PaneSnapshotCensusKind::AssemblyNode,
                         current.coherence.tree.len(),
                     )?;
+                    metadata_ledger.preflight_required_string(
+                        PaneSnapshotMetadataField::TabTitle,
+                        &inner.title,
+                    )?;
+                    let tab_title = inner.title.to_string();
+                    metadata_ledger.admit_required_owned(
+                        PaneSnapshotMetadataField::TabTitle,
+                        &tab_title,
+                        tab_title.capacity(),
+                    )?;
                     let captured = capture_pane_arena_tree(
                         inner.pane.as_ref(),
                         Some(active),
                         inner.zoomed.as_ref().map(Arc::clone),
                         &observed.pane_ids,
-                        inner.title.clone(),
+                        tab_title,
                         arena.len(),
                         max_depth,
                         max_total_nodes,
@@ -3611,7 +4322,6 @@ impl Tab {
                             zoomed
                                 .as_ref()
                                 .is_some_and(|pane| pane_identity(pane) == identity),
-                            workspace,
                             left_col,
                             top_row,
                         ))
@@ -4187,8 +4897,32 @@ impl Tab {
     pub fn empty_pane_tree_title_callback_free(&self) -> Option<String> {
         let inner = self.inner.lock();
         match inner.pane.as_ref() {
-            None | Some(Tree::Empty) => Some(inner.title.clone()),
+            None | Some(Tree::Empty) => Some(inner.title.to_string()),
             Some(Tree::Leaf(_) | Tree::Node { .. }) => None,
+        }
+    }
+
+    /// Budgeted empty-tree title projection used by authoritative snapshot
+    /// producers. Admission happens while the title is still borrowed and
+    /// before the only owned copy is created.
+    pub fn empty_pane_tree_title_callback_free_with_metadata(
+        &self,
+        metadata_ledger: &mut PaneSnapshotMetadataLedger,
+    ) -> anyhow::Result<Option<String>> {
+        let inner = self.inner.lock();
+        match inner.pane.as_ref() {
+            None | Some(Tree::Empty) => {
+                metadata_ledger
+                    .preflight_required_string(PaneSnapshotMetadataField::TabTitle, &inner.title)?;
+                let title = inner.title.to_string();
+                metadata_ledger.admit_required_owned(
+                    PaneSnapshotMetadataField::TabTitle,
+                    &title,
+                    title.capacity(),
+                )?;
+                Ok(Some(title))
+            }
+            Some(Tree::Leaf(_) | Tree::Node { .. }) => Ok(None),
         }
     }
 
@@ -6016,7 +6750,7 @@ impl TabInner {
             size_before_zoom: *size,
             active: 0,
             zoomed: None,
-            title: String::new(),
+            title: Arc::from(""),
             recency: Recency::default(),
             collapsed_panes: HashSet::new(),
             layout_cycle: Some(crate::layout::default_cycle()),
@@ -7475,7 +8209,7 @@ impl TabInner {
                 floating: floating_coherence,
                 floating_focus: self.floating_focus,
                 zoomed: self.zoomed.as_ref().map(pane_identity),
-                title: self.title.clone(),
+                title: Arc::clone(&self.title),
             },
             stats: ledger.attempt_stats().checked_delta(stats_before)?,
         })
@@ -9433,35 +10167,58 @@ pub struct PaneEntry {
     pub tty_name: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Serialize, PartialEq, Debug)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+#[serde(try_from = "String")]
 pub struct SerdeUrl {
-    pub url: Url,
+    value: String,
+}
+
+impl SerdeUrl {
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.value.capacity()
+    }
 }
 
 impl std::convert::TryFrom<String> for SerdeUrl {
     type Error = url::ParseError;
     fn try_from(s: String) -> Result<SerdeUrl, url::ParseError> {
         let url = Url::parse(&s)?;
-        Ok(SerdeUrl { url })
+        if url.as_str() == s.as_str() {
+            Ok(SerdeUrl { value: s })
+        } else {
+            Ok(SerdeUrl { value: url.into() })
+        }
     }
 }
 
 impl From<Url> for SerdeUrl {
     fn from(url: Url) -> SerdeUrl {
-        SerdeUrl { url }
+        SerdeUrl { value: url.into() }
     }
 }
 
-impl Into<Url> for SerdeUrl {
-    fn into(self) -> Url {
-        self.url
+impl From<SerdeUrl> for Url {
+    fn from(value: SerdeUrl) -> Self {
+        Url::parse(&value.value).expect("SerdeUrl stores a previously validated canonical URL")
     }
 }
 
-impl Into<String> for SerdeUrl {
-    fn into(self) -> String {
-        self.url.as_str().into()
+impl From<SerdeUrl> for String {
+    fn from(value: SerdeUrl) -> Self {
+        value.value
+    }
+}
+
+impl Serialize for SerdeUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.value)
     }
 }
 
@@ -9706,6 +10463,8 @@ mod test {
         )>,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         pane_id_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+        title_override: Option<String>,
+        working_dir_override: Option<Url>,
         kills: std::sync::atomic::AtomicUsize,
     }
 
@@ -9724,6 +10483,8 @@ mod test {
                 panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: None,
+                title_override: None,
+                working_dir_override: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -9742,6 +10503,8 @@ mod test {
                 panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: None,
+                title_override: None,
+                working_dir_override: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -9764,6 +10527,8 @@ mod test {
                 panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: None,
+                title_override: None,
+                working_dir_override: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -9787,6 +10552,8 @@ mod test {
                 panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: None,
+                title_override: None,
+                working_dir_override: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -9811,6 +10578,8 @@ mod test {
                 panic_in_ordered_observation: None,
                 callback_probe: Some(callback_probe),
                 pane_id_probe: None,
+                title_override: None,
+                working_dir_override: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -9833,6 +10602,8 @@ mod test {
                 panic_in_ordered_observation: None,
                 callback_probe: None,
                 pane_id_probe: Some(pane_id_probe),
+                title_override: None,
+                working_dir_override: None,
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -9856,6 +10627,58 @@ mod test {
                 panic_in_ordered_observation: Some((callback, armed)),
                 callback_probe: None,
                 pane_id_probe: None,
+                title_override: None,
+                working_dir_override: None,
+                kills: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn new_with_title_and_later_callback_probe(
+            id: PaneId,
+            size: TerminalSize,
+            title: String,
+            callback_probe: Arc<dyn Fn() + Send + Sync>,
+        ) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                domain_id: 1,
+                constraints: PaneConstraints::default(),
+                priority: CollapsePriority::default(),
+                writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead: false,
+                panic_in_is_dead: false,
+                panic_in_ordered_observation: None,
+                callback_probe: Some(callback_probe),
+                pane_id_probe: None,
+                title_override: Some(title),
+                working_dir_override: None,
+                kills: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn new_with_working_dir_and_later_callback_panic(
+            id: PaneId,
+            size: TerminalSize,
+            working_dir: Url,
+            armed: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                domain_id: 1,
+                constraints: PaneConstraints::default(),
+                priority: CollapsePriority::default(),
+                writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead: false,
+                panic_in_is_dead: false,
+                panic_in_ordered_observation: Some((OrderedObservationCallback::AltScreen, armed)),
+                callback_probe: None,
+                pane_id_probe: None,
+                title_override: None,
+                working_dir_override: Some(working_dir),
                 kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -9953,7 +10776,9 @@ mod test {
 
         fn get_title(&self) -> String {
             self.panic_if_ordered_observation_callback(OrderedObservationCallback::Title);
-            format!("fake-pane-{}", self.id)
+            self.title_override
+                .clone()
+                .unwrap_or_else(|| format!("fake-pane-{}", self.id))
         }
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
             Ok(())
@@ -10020,7 +10845,7 @@ mod test {
             self.panic_if_ordered_observation_callback(
                 OrderedObservationCallback::WorkingDirectory,
             );
-            None
+            self.working_dir_override.clone()
         }
         fn tty_name(&self) -> Option<String> {
             self.panic_if_ordered_observation_callback(OrderedObservationCallback::TtyName);
@@ -10829,6 +11654,594 @@ mod test {
             short.last_rejection(),
             Some(PaneSnapshotCensusRejection::AttemptLimit)
         );
+    }
+
+    #[test]
+    fn pane_snapshot_metadata_ledger_preserves_exact_utf8_and_framing() {
+        let limits = PaneSnapshotMetadataLimits::new([4; 7], 16, 32, 32, 64);
+        let mut ledger = PaneSnapshotMetadataLedger::new(limits).expect("valid metadata limits");
+        ledger.begin_attempt();
+
+        let title_value = "éé".to_string();
+        ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::PaneTitle,
+                &title_value,
+                title_value.capacity(),
+            )
+            .expect("four UTF-8 bytes fit the exact field limit");
+        ledger
+            .admit_optional_none(PaneSnapshotMetadataField::PaneTtyName)
+            .expect("absent optional field still charges its tag");
+        let empty = String::new();
+        ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::WindowTitle,
+                &empty,
+                empty.capacity(),
+            )
+            .expect("an empty required string still charges its length prefix");
+        ledger
+            .admit_optional_owned(
+                PaneSnapshotMetadataField::PaneWorkingDir,
+                &empty,
+                empty.capacity(),
+            )
+            .expect("an empty present optional string charges tag and length prefix");
+        let title = ledger
+            .attempt_stats()
+            .field(PaneSnapshotMetadataField::PaneTitle);
+        assert_eq!(title.values, 1);
+        assert_eq!(title.retained_bytes, 4);
+        assert_eq!(title.encoded_bytes, 5);
+        let tty = ledger
+            .attempt_stats()
+            .field(PaneSnapshotMetadataField::PaneTtyName);
+        assert_eq!(tty.values, 1);
+        assert_eq!(tty.retained_bytes, 0);
+        assert_eq!(tty.encoded_bytes, 1);
+        let empty_required = ledger
+            .attempt_stats()
+            .field(PaneSnapshotMetadataField::WindowTitle);
+        assert_eq!(empty_required.retained_bytes, 0);
+        assert_eq!(empty_required.encoded_bytes, 1);
+        let empty_optional = ledger
+            .attempt_stats()
+            .field(PaneSnapshotMetadataField::PaneWorkingDir);
+        assert_eq!(empty_optional.retained_bytes, 0);
+        assert_eq!(empty_optional.encoded_bytes, 2);
+        assert_eq!(ledger.attempt_stats().total().unwrap().encoded_bytes, 9);
+        let admitted = ledger.take_unreported_admitted_values();
+        assert_eq!(
+            admitted[PaneSnapshotMetadataField::PaneTitle.index()],
+            (PaneSnapshotMetadataField::PaneTitle, 1)
+        );
+        assert_eq!(
+            admitted[PaneSnapshotMetadataField::PaneTtyName.index()],
+            (PaneSnapshotMetadataField::PaneTtyName, 1)
+        );
+        assert!(ledger
+            .take_unreported_admitted_values()
+            .iter()
+            .all(|(_, values)| *values == 0));
+
+        let before = ledger.attempt_stats();
+        let rejected = "xxxxx".to_string();
+        let error = ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::PaneTitle,
+                &rejected,
+                rejected.capacity(),
+            )
+            .expect_err("field limit plus one must fail");
+        assert_eq!(
+            error,
+            PaneSnapshotMetadataRejection::FieldLimit {
+                field: "pane_title"
+            }
+        );
+        assert_eq!(ledger.attempt_stats(), before);
+        assert!(!error.to_string().contains(&rejected));
+    }
+
+    #[test]
+    fn pane_snapshot_metadata_field_and_varint_boundaries_are_exact() {
+        let very_long = "long-metadata".repeat(80_000);
+        for field in PaneSnapshotMetadataField::ALL {
+            let limits = PaneSnapshotMetadataLimits::new([8; 7], 64, 256, 64, 256);
+            let mut ledger =
+                PaneSnapshotMetadataLedger::new(limits).expect("field limits are valid");
+            ledger.begin_attempt();
+            let exact = "12345678".to_string();
+            ledger
+                .preflight_field(field, &exact)
+                .unwrap_or_else(|error| panic!("{} exact limit failed: {error}", field.label()));
+            let plus_one = "123456789";
+            let error = ledger
+                .preflight_field(field, plus_one)
+                .expect_err("field limit plus one must fail");
+            assert_eq!(
+                error,
+                PaneSnapshotMetadataRejection::FieldLimit {
+                    field: field.label()
+                }
+            );
+            assert!(!error.to_string().contains(plus_one));
+            let very_long_error = ledger
+                .preflight_field(field, &very_long)
+                .expect_err("very long authority-bearing metadata must fail finitely");
+            assert_eq!(
+                very_long_error,
+                PaneSnapshotMetadataRejection::FieldLimit {
+                    field: field.label()
+                }
+            );
+            assert!(very_long_error.to_string().len() < 128);
+        }
+
+        let mut ledger = PaneSnapshotMetadataLedger::new(PaneSnapshotMetadataLimits::new(
+            [128; 7], 256, 512, 256, 512,
+        ))
+        .expect("varint boundary limits are valid");
+        ledger.begin_attempt();
+        let below = "x".repeat(127);
+        ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::PaneTitle,
+                &below,
+                below.capacity(),
+            )
+            .expect("127-byte string fits");
+        assert_eq!(
+            ledger
+                .attempt_stats()
+                .field(PaneSnapshotMetadataField::PaneTitle)
+                .encoded_bytes,
+            128
+        );
+        let at = "y".repeat(128);
+        ledger
+            .admit_optional_owned(PaneSnapshotMetadataField::PaneTtyName, &at, at.capacity())
+            .expect("128-byte optional string fits");
+        assert_eq!(
+            ledger
+                .attempt_stats()
+                .field(PaneSnapshotMetadataField::PaneTtyName)
+                .encoded_bytes,
+            131,
+            "two-byte varint length plus payload plus option tag"
+        );
+    }
+
+    #[test]
+    fn pane_snapshot_metadata_ledger_bounds_attempts_requests_and_overflow() {
+        let limits = PaneSnapshotMetadataLimits::new([16; 7], 4, 8, 7, 16);
+        let mut ledger = PaneSnapshotMetadataLedger::new(limits).expect("valid retry limits");
+        ledger.begin_attempt();
+        let first = "1234".to_string();
+        ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::WindowTitle,
+                &first,
+                first.capacity(),
+            )
+            .expect("first exact attempt fits");
+        assert_eq!(ledger.attempt_stats().total().unwrap().retained_bytes, 4);
+        let released = ledger
+            .release_attempt_to(Default::default())
+            .expect("failed-attempt ownership releases to its empty checkpoint");
+        assert_eq!(released.retained_bytes, 4);
+        assert_eq!(ledger.take_retry_released_bytes(), 4);
+        assert_eq!(ledger.attempt_stats(), PaneSnapshotMetadataStats::default());
+        assert_eq!(ledger.request_stats().total().unwrap().retained_bytes, 4);
+        ledger.begin_attempt();
+        let prior_request = ledger.request_stats();
+        let second = "5678".to_string();
+        let error = ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::WindowTitle,
+                &second,
+                second.capacity(),
+            )
+            .expect_err("retry must not receive a fresh request allowance");
+        assert_eq!(error, PaneSnapshotMetadataRejection::RequestRetainedLimit);
+        assert_eq!(ledger.attempt_stats(), PaneSnapshotMetadataStats::default());
+        assert_eq!(ledger.request_stats(), prior_request);
+
+        let mut overflow = PaneSnapshotMetadataLedger::new(PaneSnapshotMetadataLimits::new(
+            [usize::MAX; 7],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        ))
+        .expect("maximum checked metadata limits are valid");
+        overflow.begin_attempt();
+        overflow
+            .admit(
+                PaneSnapshotMetadataField::PaneTitle,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("exact maximum first admission fits");
+        let error = overflow
+            .admit(PaneSnapshotMetadataField::PaneTitle, 1, 1, 1)
+            .expect_err("value-count and byte totals must not wrap");
+        assert_eq!(error, PaneSnapshotMetadataRejection::ArithmeticOverflow);
+        assert_eq!(
+            overflow.last_rejection(),
+            Some(PaneSnapshotMetadataRejection::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn pane_snapshot_metadata_cumulative_exact_and_plus_one_are_atomic() {
+        let mut ledger =
+            PaneSnapshotMetadataLedger::new(PaneSnapshotMetadataLimits::new([8; 7], 8, 10, 8, 10))
+                .expect("exact cumulative limits are valid");
+        ledger.begin_attempt();
+        let first = "1234".to_string();
+        let second = "5678".to_string();
+        ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::PaneTitle,
+                &first,
+                first.capacity(),
+            )
+            .expect("first half fits");
+        ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::WindowTitle,
+                &second,
+                second.capacity(),
+            )
+            .expect("exact aggregate retained and encoded boundary fits");
+        let exact = ledger.attempt_stats();
+        assert_eq!(exact.total().unwrap().retained_bytes, 8);
+        assert_eq!(exact.total().unwrap().encoded_bytes, 10);
+
+        let preflight_error = ledger
+            .preflight_required_string(PaneSnapshotMetadataField::TabTitle, "x")
+            .expect_err("minimum aggregate boundary plus one must reject before cloning");
+        assert_eq!(
+            preflight_error,
+            PaneSnapshotMetadataRejection::AttemptRetainedLimit
+        );
+        assert_eq!(ledger.attempt_stats(), exact);
+        let plus_one = "x".to_string();
+        let error = ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::TabTitle,
+                &plus_one,
+                plus_one.capacity(),
+            )
+            .expect_err("aggregate boundary plus one must fail atomically");
+        assert_eq!(error, PaneSnapshotMetadataRejection::AttemptRetainedLimit);
+        assert_eq!(ledger.attempt_stats(), exact);
+        assert_eq!(ledger.request_stats(), exact);
+    }
+
+    #[test]
+    fn pane_snapshot_metadata_encoded_overhead_reaches_exact_producer_boundary() {
+        const ATTEMPT_BYTES: usize = 4 * 1024 * 1024;
+        const FULL_VALUE_BYTES: usize = 64 * 1024;
+        const FULL_VALUE_ENCODED_BYTES: usize = FULL_VALUE_BYTES + 3;
+        const FULL_VALUE_COUNT: usize = 63;
+        const TAIL_VALUE_BYTES: usize = 65_344;
+        const TAIL_VALUE_ENCODED_BYTES: usize = TAIL_VALUE_BYTES + 3;
+        const _: () = assert!(
+            FULL_VALUE_COUNT * FULL_VALUE_ENCODED_BYTES + TAIL_VALUE_ENCODED_BYTES == ATTEMPT_BYTES
+        );
+
+        let mut ledger = PaneSnapshotMetadataLedger::new(PaneSnapshotMetadataLimits::new(
+            [FULL_VALUE_BYTES; PaneSnapshotMetadataField::COUNT],
+            ATTEMPT_BYTES,
+            ATTEMPT_BYTES,
+            ATTEMPT_BYTES,
+            ATTEMPT_BYTES,
+        ))
+        .expect("production-sized exact encoded boundary is valid");
+        ledger.begin_attempt();
+        let mut owners = Vec::new();
+        owners
+            .try_reserve_exact(FULL_VALUE_COUNT + 1)
+            .expect("reserve bounded metadata owners");
+        for _ in 0..FULL_VALUE_COUNT {
+            let value = "x".repeat(FULL_VALUE_BYTES);
+            ledger
+                .admit_required_owned(
+                    PaneSnapshotMetadataField::PaneTitle,
+                    &value,
+                    value.capacity(),
+                )
+                .expect("full field fits before the exact aggregate boundary");
+            owners.push(value);
+        }
+        let tail = "y".repeat(TAIL_VALUE_BYTES);
+        ledger
+            .admit_required_owned(PaneSnapshotMetadataField::PaneTitle, &tail, tail.capacity())
+            .expect("tail framing reaches the exact aggregate encoded boundary");
+        owners.push(tail);
+
+        let usage = ledger.attempt_stats().total().expect("bounded total");
+        assert_eq!(usage.values, FULL_VALUE_COUNT + 1);
+        assert_eq!(usage.encoded_bytes, ATTEMPT_BYTES);
+        assert!(usage.retained_bytes < ATTEMPT_BYTES);
+        assert_eq!(ledger.attempt_peak_encoded_bytes(), ATTEMPT_BYTES);
+        let before = ledger.attempt_stats();
+        assert_eq!(
+            ledger
+                .preflight_optional_value(PaneSnapshotMetadataField::PaneTtyName)
+                .expect_err("one option-tag byte beyond the boundary must fail"),
+            PaneSnapshotMetadataRejection::AttemptEncodedLimit
+        );
+        assert_eq!(ledger.attempt_stats(), before);
+        assert_eq!(owners.len(), FULL_VALUE_COUNT + 1);
+    }
+
+    #[test]
+    fn pane_snapshot_metadata_ledger_accounts_owned_capacity_and_temporary_release() {
+        let limits = PaneSnapshotMetadataLimits::new([16; 7], 8, 32, 32, 64);
+        let mut ledger = PaneSnapshotMetadataLedger::new(limits).expect("valid capacity limits");
+        ledger.begin_attempt();
+
+        let mut workspace = String::with_capacity(8);
+        workspace.push_str("four");
+        assert_eq!(workspace.len(), 4);
+        assert_eq!(workspace.capacity(), 8);
+        ledger
+            .preflight_field(PaneSnapshotMetadataField::WindowWorkspace, &workspace)
+            .expect("logical bytes fit the field ceiling");
+        ledger
+            .admit_retained_only_owned(
+                PaneSnapshotMetadataField::WindowWorkspace,
+                &workspace,
+                workspace.capacity(),
+            )
+            .expect("actual allocation capacity fits the attempt ceiling");
+        assert_eq!(ledger.attempt_stats().total().unwrap().retained_bytes, 8);
+        assert_eq!(ledger.request_stats().total().unwrap().retained_bytes, 8);
+        assert_eq!(ledger.attempt_peak_retained_bytes(), 8);
+        assert_eq!(ledger.attempt_peak_encoded_bytes(), 0);
+
+        ledger
+            .release_retained_only(
+                PaneSnapshotMetadataField::WindowWorkspace,
+                workspace.capacity(),
+            )
+            .expect("temporary source retention releases exactly once");
+        assert_eq!(ledger.attempt_stats().total().unwrap().retained_bytes, 0);
+        assert_eq!(ledger.request_stats().total().unwrap().retained_bytes, 8);
+        assert_eq!(
+            ledger.attempt_peak_retained_bytes(),
+            8,
+            "temporary release must not erase the observed live high-water"
+        );
+
+        let mut overallocated = String::with_capacity(9);
+        overallocated.push_str("four");
+        let error = ledger
+            .admit_required_owned(
+                PaneSnapshotMetadataField::PaneTitle,
+                &overallocated,
+                overallocated.capacity(),
+            )
+            .expect_err("owned capacity, not logical length, must drive retention rejection");
+        assert_eq!(error, PaneSnapshotMetadataRejection::AttemptRetainedLimit);
+        assert_eq!(ledger.attempt_stats().total().unwrap().retained_bytes, 0);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn pane_snapshot_metadata_utf8_accounting_matches_owned_generated_strings(
+            chars in proptest::collection::vec(any::<char>(), 1..=128),
+            extra_capacity in 0_usize..=64,
+        ) {
+            let logical = chars.into_iter().collect::<String>();
+            let mut owned = String::with_capacity(
+                logical
+                    .len()
+                    .checked_add(extra_capacity)
+                    .expect("bounded generated capacity cannot overflow"),
+            );
+            owned.push_str(&logical);
+            let retained = owned.capacity();
+            let encoded = encoded_string_bytes(owned.len())
+                .expect("bounded generated string encoding is representable");
+            let limits = PaneSnapshotMetadataLimits::new(
+                [owned.len(); PaneSnapshotMetadataField::COUNT],
+                retained.max(1),
+                encoded,
+                retained.max(1),
+                encoded,
+            );
+            let mut ledger = PaneSnapshotMetadataLedger::new(limits)
+                .expect("generated metadata limits are valid");
+            ledger.begin_attempt();
+            ledger
+                .preflight_field(PaneSnapshotMetadataField::PaneTitle, &owned)
+                .expect("exact generated UTF-8 field limit is admitted");
+            ledger
+                .admit_required_owned(
+                    PaneSnapshotMetadataField::PaneTitle,
+                    &owned,
+                    owned.capacity(),
+                )
+                .expect("exact generated retained and encoded limits are admitted");
+            let usage = ledger
+                .attempt_stats()
+                .field(PaneSnapshotMetadataField::PaneTitle);
+            prop_assert_eq!(usage.values, 1);
+            prop_assert_eq!(usage.retained_bytes, retained);
+            prop_assert_eq!(usage.encoded_bytes, encoded);
+
+            let mut plus_one = owned.clone();
+            plus_one.push('x');
+            let prior = ledger.attempt_stats();
+            let rejection = ledger
+                .preflight_field(PaneSnapshotMetadataField::PaneTitle, &plus_one)
+                .expect_err("logical UTF-8 limit plus one must fail before admission");
+            prop_assert_eq!(
+                rejection,
+                PaneSnapshotMetadataRejection::FieldLimit { field: "pane_title" }
+            );
+            prop_assert_eq!(ledger.attempt_stats(), prior);
+            prop_assert!(!rejection.to_string().contains(&plus_one));
+        }
+    }
+
+    #[test]
+    fn ordered_snapshot_metadata_rejection_stops_later_pane_callbacks() {
+        let size = TerminalSize::default();
+        let later_callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let later_callbacks_for_probe = Arc::clone(&later_callbacks);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            later_callbacks_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        let rejected_title = "secret-title".to_string();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_title_and_later_callback_probe(
+            7_201,
+            size,
+            rejected_title.clone(),
+            probe,
+        ));
+        let mut census = PaneSnapshotCensusLedger::new(64, 64).expect("valid census ledger");
+        census.begin_attempt();
+        let mut metadata = PaneSnapshotMetadataLedger::new(PaneSnapshotMetadataLimits::new(
+            [128, 128, 128, 4, 128, 128, 128],
+            512,
+            512,
+            512,
+            512,
+        ))
+        .expect("valid narrow pane-title limit");
+        metadata.begin_attempt();
+        let mut arena = Vec::new();
+
+        let error = tab
+            .append_codec_pane_arena_in_window_with_ledgers(
+                9,
+                "ledger-workspace",
+                &mut arena,
+                64,
+                1,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut census,
+                &mut metadata,
+            )
+            .expect_err("oversized title must fail before dimensions and later getters");
+
+        assert!(arena.is_empty());
+        assert_eq!(
+            later_callbacks.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(census.attempt_stats().pane_callbacks, 2);
+        assert_eq!(
+            metadata.last_rejection(),
+            Some(PaneSnapshotMetadataRejection::FieldLimit {
+                field: "pane_title"
+            })
+        );
+        assert!(!format!("{error:#}").contains(&rejected_title));
+    }
+
+    #[test]
+    fn ordered_snapshot_metadata_exhausted_aggregate_stops_next_getter() {
+        let size = TerminalSize::default();
+        let title_panic_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_ordered_observation_panic(
+            7_203,
+            size,
+            OrderedObservationCallback::Title,
+            title_panic_armed,
+        ));
+        let mut census = PaneSnapshotCensusLedger::new(64, 64).expect("valid census ledger");
+        census.begin_attempt();
+        let mut metadata = PaneSnapshotMetadataLedger::new(PaneSnapshotMetadataLimits::new(
+            [128; PaneSnapshotMetadataField::COUNT],
+            512,
+            2,
+            512,
+            2,
+        ))
+        .expect("valid exact encoded-byte limit");
+        metadata.begin_attempt();
+        let mut arena = Vec::new();
+
+        let error = tab
+            .append_codec_pane_arena_in_window_with_ledgers(
+                9,
+                "w",
+                &mut arena,
+                64,
+                1,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut census,
+                &mut metadata,
+            )
+            .expect_err("workspace framing must exhaust the encoded-byte authority");
+
+        assert!(arena.is_empty());
+        assert_eq!(census.attempt_stats().pane_callbacks, 1);
+        assert_eq!(
+            metadata.last_rejection(),
+            Some(PaneSnapshotMetadataRejection::AttemptEncodedLimit)
+        );
+        assert!(format!("{error:#}").contains("encoded-metadata byte budget exhausted"));
+    }
+
+    #[test]
+    fn ordered_snapshot_cwd_rejection_stops_all_later_pane_callbacks() {
+        let size = TerminalSize::default();
+        let later_callback_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let rejected_cwd = Url::parse("file:///secret-working-directory")
+            .expect("test working directory is a valid URL");
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_working_dir_and_later_callback_panic(
+            7_202,
+            size,
+            rejected_cwd.clone(),
+            later_callback_armed,
+        ));
+        let mut census = PaneSnapshotCensusLedger::new(64, 64).expect("valid census ledger");
+        census.begin_attempt();
+        let mut per_field = [128; PaneSnapshotMetadataField::COUNT];
+        per_field[PaneSnapshotMetadataField::PaneWorkingDir.index()] = 8;
+        let mut metadata = PaneSnapshotMetadataLedger::new(PaneSnapshotMetadataLimits::new(
+            per_field, 512, 512, 512, 512,
+        ))
+        .expect("valid narrow cwd limit");
+        metadata.begin_attempt();
+        let mut arena = Vec::new();
+
+        let error = tab
+            .append_codec_pane_arena_in_window_with_ledgers(
+                9,
+                "ledger-workspace",
+                &mut arena,
+                64,
+                1,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut census,
+                &mut metadata,
+            )
+            .expect_err("oversized cwd must fail before alt-screen and later getters");
+
+        assert!(arena.is_empty());
+        assert_eq!(census.attempt_stats().pane_callbacks, 4);
+        assert_eq!(
+            metadata.last_rejection(),
+            Some(PaneSnapshotMetadataRejection::FieldLimit {
+                field: "pane_working_dir"
+            })
+        );
+        assert!(!format!("{error:#}").contains(rejected_cwd.as_str()));
     }
 
     #[test]
@@ -13956,14 +15369,23 @@ mod test {
     fn serde_url_from_url() {
         let url = Url::parse("https://example.com").unwrap();
         let serde_url = SerdeUrl::from(url.clone());
-        assert_eq!(serde_url.url, url);
+        assert_eq!(serde_url.as_str(), url.as_str());
     }
 
     #[test]
     fn serde_url_try_from_string() {
         let serde_url = SerdeUrl::try_from("https://example.com".to_string());
         assert!(serde_url.is_ok());
-        assert_eq!(serde_url.unwrap().url.as_str(), "https://example.com/");
+        assert_eq!(serde_url.unwrap().as_str(), "https://example.com/");
+    }
+
+    #[test]
+    fn serde_url_preserves_canonical_owned_string_capacity() {
+        let mut canonical = String::with_capacity(64);
+        canonical.push_str("https://example.com/");
+        let serde_url = SerdeUrl::try_from(canonical).expect("canonical URL is valid");
+        assert_eq!(serde_url.as_str(), "https://example.com/");
+        assert_eq!(serde_url.capacity(), 64);
     }
 
     #[test]

@@ -1009,7 +1009,7 @@ impl From<&mux::tab::PaneEntry> for PaneInfo {
             rows: None,
             cols: None,
             title: Some(entry.title.clone()),
-            cwd: entry.working_dir.as_ref().map(|u| u.url.to_string()),
+            cwd: entry.working_dir.as_ref().map(|u| u.as_str().to_string()),
             tty_name: entry.tty_name.clone(),
             cursor_x: Some(mux_usize_to_u32_saturating(entry.cursor_pos.x)),
             cursor_y: Some(mux_stable_row_to_u32_saturating(entry.cursor_pos.y)),

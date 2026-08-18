@@ -12524,7 +12524,7 @@ impl RenderApplicationUpdate {
             });
         }
         if let Some(working_dir) = &self.surface.working_dir {
-            let requested = working_dir.url.as_str().len();
+            let requested = working_dir.as_str().len();
             if requested > MAX_RENDER_APPLICATION_WORKING_DIR_BYTES {
                 return Err(RenderApplicationContractError::ResourceLimitExceeded {
                     resource: RenderApplicationResource::WorkingDirectory,
@@ -19870,14 +19870,19 @@ mod test {
         assert_eq!(decoded.pdu, request);
 
         let stream_id = TopologyStreamId::from_bytes([0x5a; 16]);
+        let metadata_pane = sample_pane_entry(0);
+        let metadata_window_id = metadata_pane.window_id;
         let outcomes = [
             ListPanesCoherentOutcome::Snapshot(CoherentPaneSnapshot {
                 session_incarnation: MuxSessionIncarnation::from_bytes([0xa5; 16]),
                 snapshot_revision: TopologyRevision::new(41),
                 panes: ListPanesResponse {
-                    tabs: Vec::new(),
-                    tab_titles: Vec::new(),
-                    window_titles: HashMap::new(),
+                    tabs: vec![PaneNode::Leaf(metadata_pane)],
+                    tab_titles: vec!["metadata-tab-é".to_string()],
+                    window_titles: HashMap::from([(
+                        metadata_window_id,
+                        "metadata-window-é".to_string(),
+                    )]),
                     floating_panes: Vec::new(),
                 },
             }),
@@ -19893,20 +19898,26 @@ mod test {
         ];
 
         for (offset, outcome) in outcomes.iter().cloned().enumerate() {
-            let response = Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
-                negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
-                stream_id,
-                outcome,
-            });
-            let serial = 1200 + offset as u64;
-            let mut encoded = Vec::new();
-            response
-                .encode_with_mode(&mut encoded, serial, CompressionMode::Never)
-                .expect("encode coherent snapshot response");
-            let decoded =
-                Pdu::decode(encoded.as_slice()).expect("decode coherent snapshot response");
-            assert_eq!(decoded.serial, serial);
-            assert_eq!(decoded.pdu, response);
+            for (mode_offset, mode) in [CompressionMode::Never, CompressionMode::Always]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                let response = Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                    negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                    stream_id,
+                    outcome: outcome.clone(),
+                });
+                let serial = 1200 + (offset * 2 + mode_offset) as u64;
+                let mut encoded = Vec::new();
+                response
+                    .encode_with_mode(&mut encoded, serial, mode)
+                    .expect("encode coherent snapshot response");
+                let decoded =
+                    Pdu::decode(encoded.as_slice()).expect("decode coherent snapshot response");
+                assert_eq!(decoded.serial, serial);
+                assert_eq!(decoded.pdu, response);
+            }
         }
     }
 

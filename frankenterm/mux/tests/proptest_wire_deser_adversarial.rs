@@ -261,7 +261,7 @@ fn serde_url_rejects_scheme_only() {
 #[test]
 fn serde_url_accepts_file_scheme_with_path() {
     let ok: SerdeUrl = serde_json::from_str("\"file:///tmp/foo.txt\"").unwrap();
-    assert_eq!(ok.url.scheme(), "file");
+    assert_eq!(url::Url::parse(ok.as_str()).unwrap().scheme(), "file");
 }
 
 #[test]

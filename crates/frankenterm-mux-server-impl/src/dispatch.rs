@@ -76,7 +76,8 @@ const PANE_ALERT_BACKLOG_FAILURE: &str =
 const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
 const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 /// Accounted topology values retain their original 4 MiB connection ceiling;
-/// an ordered snapshot has a separate complete-frame ceiling. Their aggregate
+/// a complete snapshot frame has a separate ceiling shared by PDU82 and PDU87.
+/// Their aggregate
 /// permits one maximum snapshot to coexist with the separately bounded
 /// successor queue, while each class remains unable to borrow the other's
 /// tranche. This retained-owner budget begins when the complete encoded frame
@@ -269,7 +270,7 @@ enum OutboundClass {
     Control,
     Bulk,
     Topology,
-    OrderedSnapshot,
+    Snapshot,
 }
 
 impl OutboundClass {
@@ -278,7 +279,7 @@ impl OutboundClass {
             Self::Control => "control",
             Self::Bulk => "bulk",
             Self::Topology => "topology",
-            Self::OrderedSnapshot => "ordered_snapshot",
+            Self::Snapshot => "snapshot",
         }
     }
 
@@ -290,7 +291,7 @@ impl OutboundClass {
         match self {
             Self::Control | Self::Bulk => OutboundBatchClass::Control,
             Self::Topology => OutboundBatchClass::Topology,
-            Self::OrderedSnapshot => OutboundBatchClass::OrderedSnapshot,
+            Self::Snapshot => OutboundBatchClass::Snapshot,
         }
     }
 
@@ -298,7 +299,7 @@ impl OutboundClass {
         match self {
             Self::Control | Self::Bulk => OutboundRetainedClass::None,
             Self::Topology => OutboundRetainedClass::Topology,
-            Self::OrderedSnapshot => OutboundRetainedClass::OrderedSnapshot,
+            Self::Snapshot => OutboundRetainedClass::Snapshot,
         }
     }
 }
@@ -307,14 +308,14 @@ impl OutboundClass {
 enum OutboundBatchClass {
     Control,
     Topology,
-    OrderedSnapshot,
+    Snapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutboundRetainedClass {
     None,
     Topology,
-    OrderedSnapshot,
+    Snapshot,
 }
 
 impl OutboundRetainedClass {
@@ -322,7 +323,7 @@ impl OutboundRetainedClass {
         match self {
             Self::None => "none",
             Self::Topology => "topology",
-            Self::OrderedSnapshot => "ordered_snapshot",
+            Self::Snapshot => "snapshot",
         }
     }
 
@@ -330,7 +331,7 @@ impl OutboundRetainedClass {
         match self {
             Self::None => 0,
             Self::Topology => TOPOLOGY_FENCE_MAX_RETAINED_BYTES,
-            Self::OrderedSnapshot => codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
+            Self::Snapshot => codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
         }
     }
 }
@@ -342,7 +343,7 @@ enum OutboundBudgetLimit {
     BulkSlots,
     RetainedBytes,
     TopologyRetainedBytes,
-    OrderedSnapshotRetainedBytes,
+    SnapshotRetainedBytes,
     MixedConnection,
     MixedRetainedClass,
 }
@@ -355,7 +356,7 @@ impl OutboundBudgetLimit {
             Self::BulkSlots => "bulk_slots",
             Self::RetainedBytes => "retained_bytes",
             Self::TopologyRetainedBytes => "topology_retained_bytes",
-            Self::OrderedSnapshotRetainedBytes => "ordered_snapshot_retained_bytes",
+            Self::SnapshotRetainedBytes => "snapshot_retained_bytes",
             Self::MixedConnection => "mixed_connection",
             Self::MixedRetainedClass => "mixed_retained_class",
         }
@@ -366,7 +367,7 @@ impl OutboundBudgetLimit {
 struct OutboundBudgetState {
     retained_bytes: usize,
     topology_retained_bytes: usize,
-    ordered_snapshot_retained_bytes: usize,
+    snapshot_retained_bytes: usize,
     total_slots: usize,
     bulk_slots: usize,
     peak_retained_bytes: usize,
@@ -383,7 +384,7 @@ impl OutboundBudget {
         class: OutboundClass,
         retained_bytes: usize,
     ) -> Result<OutboundBudgetState, OutboundBudgetLimit> {
-        if (class.retained_class() != OutboundRetainedClass::None) != (retained_bytes != 0) {
+        if class.retained_class() == OutboundRetainedClass::None && retained_bytes != 0 {
             return Err(OutboundBudgetLimit::Arithmetic);
         }
         state.total_slots = state
@@ -419,21 +420,19 @@ impl OutboundBudget {
                     .ok_or(OutboundBudgetLimit::Arithmetic)?;
                 state.topology_retained_bytes
             }
-            OutboundRetainedClass::OrderedSnapshot => {
-                state.ordered_snapshot_retained_bytes = state
-                    .ordered_snapshot_retained_bytes
+            OutboundRetainedClass::Snapshot => {
+                state.snapshot_retained_bytes = state
+                    .snapshot_retained_bytes
                     .checked_add(retained_bytes)
                     .ok_or(OutboundBudgetLimit::Arithmetic)?;
-                state.ordered_snapshot_retained_bytes
+                state.snapshot_retained_bytes
             }
         };
         if class_bytes > class.retained_class().maximum() {
             return Err(match class.retained_class() {
                 OutboundRetainedClass::None => OutboundBudgetLimit::Arithmetic,
                 OutboundRetainedClass::Topology => OutboundBudgetLimit::TopologyRetainedBytes,
-                OutboundRetainedClass::OrderedSnapshot => {
-                    OutboundBudgetLimit::OrderedSnapshotRetainedBytes
-                }
+                OutboundRetainedClass::Snapshot => OutboundBudgetLimit::SnapshotRetainedBytes,
             });
         }
         state.peak_retained_bytes = state.peak_retained_bytes.max(state.retained_bytes);
@@ -511,7 +510,7 @@ impl OutboundBudget {
         let current_class_total = match retained_class {
             OutboundRetainedClass::None => return Err(OutboundBudgetLimit::Arithmetic),
             OutboundRetainedClass::Topology => state.topology_retained_bytes,
-            OutboundRetainedClass::OrderedSnapshot => state.ordered_snapshot_retained_bytes,
+            OutboundRetainedClass::Snapshot => state.snapshot_retained_bytes,
         };
         let other_class_bytes = current_class_total
             .checked_sub(current_batch_bytes)
@@ -523,9 +522,7 @@ impl OutboundBudget {
             return Err(match retained_class {
                 OutboundRetainedClass::None => OutboundBudgetLimit::Arithmetic,
                 OutboundRetainedClass::Topology => OutboundBudgetLimit::TopologyRetainedBytes,
-                OutboundRetainedClass::OrderedSnapshot => {
-                    OutboundBudgetLimit::OrderedSnapshotRetainedBytes
-                }
+                OutboundRetainedClass::Snapshot => OutboundBudgetLimit::SnapshotRetainedBytes,
             });
         }
         match retained_class {
@@ -533,8 +530,8 @@ impl OutboundBudget {
             OutboundRetainedClass::Topology => {
                 state.topology_retained_bytes = next_class_bytes;
             }
-            OutboundRetainedClass::OrderedSnapshot => {
-                state.ordered_snapshot_retained_bytes = next_class_bytes;
+            OutboundRetainedClass::Snapshot => {
+                state.snapshot_retained_bytes = next_class_bytes;
             }
         }
         state.retained_bytes = next_retained_bytes;
@@ -588,11 +585,11 @@ impl Drop for OutboundReservation {
                     .checked_sub(self.retained_bytes)
                     .expect("outbound topology reservation underflow");
             }
-            OutboundRetainedClass::OrderedSnapshot => {
-                state.ordered_snapshot_retained_bytes = state
-                    .ordered_snapshot_retained_bytes
+            OutboundRetainedClass::Snapshot => {
+                state.snapshot_retained_bytes = state
+                    .snapshot_retained_bytes
                     .checked_sub(self.retained_bytes)
-                    .expect("outbound ordered-snapshot reservation underflow");
+                    .expect("outbound snapshot reservation underflow");
             }
         }
         state.total_slots = state
@@ -1230,9 +1227,12 @@ impl AuthorizedOrderedSnapshotFrame {
             ServerEmissionAuthority::OrderedSnapshotFence,
         );
         authority.validate(terminal)?;
-        let bytes = response
-            .encode_frame(serial)
-            .context("encoding request-correlated PDU87 outside the coordinator lock")?;
+        let encoded = response.encode_frame(serial);
+        if let Err(error) = &encoded {
+            record_snapshot_body_limit_mismatch("pdu87", error);
+        }
+        let bytes =
+            encoded.context("encoding request-correlated PDU87 outside the coordinator lock")?;
         Ok(Self { bytes, authority })
     }
 
@@ -1242,17 +1242,26 @@ impl AuthorizedOrderedSnapshotFrame {
         budget: &Arc<OutboundBudget>,
     ) -> anyhow::Result<EncodedOutboundFrame> {
         let retained_bytes = self.bytes.capacity();
-        let reservation = reserve_outbound(
-            terminal,
-            budget,
-            OutboundClass::OrderedSnapshot,
-            retained_bytes,
-        )?;
+        let reservation =
+            reserve_outbound(terminal, budget, OutboundClass::Snapshot, retained_bytes)?;
         Ok(EncodedOutboundFrame {
             bytes: self.bytes,
             reservation,
             authority: self.authority,
         })
+    }
+}
+
+fn record_snapshot_body_limit_mismatch(family: &'static str, error: &anyhow::Error) {
+    if error
+        .downcast_ref::<codec::PduEncodedBodyLimitExceeded>()
+        .is_some()
+    {
+        metrics::counter!(
+            "mux.server.pane_snapshot_metadata.body_limit_mismatch_total",
+            "family" => family,
+        )
+        .increment(1);
     }
 }
 
@@ -1434,6 +1443,32 @@ fn queue_response_pdu_with_emission_authority(
     delivery_class: PduDeliveryClass,
     emission_authority: ServerEmissionAuthority,
 ) -> anyhow::Result<()> {
+    let class = match delivery_class {
+        PduDeliveryClass::Control => OutboundClass::Control,
+        PduDeliveryClass::Bulk => OutboundClass::Bulk,
+    };
+    queue_response_pdu_with_accounting(
+        item_tx,
+        terminal,
+        budget,
+        pdu,
+        serial,
+        class,
+        0,
+        emission_authority,
+    )
+}
+
+fn queue_response_pdu_with_accounting(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    budget: &Arc<OutboundBudget>,
+    pdu: Pdu,
+    serial: u64,
+    class: OutboundClass,
+    retained_bytes: usize,
+    emission_authority: ServerEmissionAuthority,
+) -> anyhow::Result<()> {
     validate_server_emission_authority(&pdu, serial, terminal, emission_authority)?;
     // Avoid even the outbound Box allocation on an already-dead connection;
     // `admit` below remains the authoritative race-closing check.
@@ -1445,15 +1480,11 @@ fn queue_response_pdu_with_emission_authority(
     // with allocator work. Admission, budget reservation, and FIFO publication
     // form one linearization section so concurrent producers cannot consume
     // headroom in one order and publish in another.
-    let class = match delivery_class {
-        PduDeliveryClass::Control => OutboundClass::Control,
-        PduDeliveryClass::Bulk => OutboundClass::Bulk,
-    };
     let decoded = Box::new(DecodedPdu { pdu, serial });
     let Some(admission) = terminal.admit() else {
         anyhow::bail!("mux dispatch connection is already terminal");
     };
-    let reservation = match reserve_outbound_admitted(budget, class, 0) {
+    let reservation = match reserve_outbound_admitted(budget, class, retained_bytes) {
         Ok(reservation) => reservation,
         Err(limit) => {
             admission.trip(OUTBOUND_BUDGET_OVERFLOW);
@@ -1482,6 +1513,81 @@ fn queue_response_pdu_with_emission_authority(
             Err(anyhow::anyhow!("mux dispatch item queue is closed"))
         }
     }
+}
+
+fn pane_entry_metadata_retained_bytes(entry: &mux::tab::PaneEntry) -> anyhow::Result<usize> {
+    [
+        entry.title.capacity(),
+        entry
+            .working_dir
+            .as_ref()
+            .map_or(0, mux::tab::SerdeUrl::capacity),
+        entry.workspace.capacity(),
+        entry.tty_name.as_ref().map_or(0, String::capacity),
+    ]
+    .iter()
+    .try_fold(0usize, |total, bytes| {
+        total
+            .checked_add(*bytes)
+            .ok_or_else(|| anyhow::anyhow!("coherent snapshot metadata byte accounting overflow"))
+    })
+}
+
+fn pane_node_metadata_retained_bytes(
+    node: &mux::tab::PaneNode,
+    depth: usize,
+) -> anyhow::Result<usize> {
+    if depth > codec::MAX_ORDERED_PANE_TREE_DEPTH {
+        anyhow::bail!("coherent snapshot metadata tree exceeds its depth bound");
+    }
+    match node {
+        mux::tab::PaneNode::Empty => Ok(0),
+        mux::tab::PaneNode::Leaf(entry) => pane_entry_metadata_retained_bytes(entry),
+        mux::tab::PaneNode::Split { left, right, .. } => {
+            let next_depth = depth
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("coherent snapshot metadata tree depth overflow"))?;
+            pane_node_metadata_retained_bytes(left, next_depth)?
+                .checked_add(pane_node_metadata_retained_bytes(right, next_depth)?)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("coherent snapshot metadata byte accounting overflow")
+                })
+        }
+    }
+}
+
+/// Exact dynamic allocation capacity retained by one complete PDU82 response.
+///
+/// The producer ledger already bounds each field and the aggregate. Recounting
+/// borrowed response values here is allocation-free and transfers that exact
+/// ownership into the connection's dedicated complete-snapshot byte tranche.
+fn coherent_snapshot_metadata_retained_bytes(
+    response: &ListPanesCoherentResponse,
+) -> anyhow::Result<usize> {
+    let ListPanesCoherentOutcome::Snapshot(snapshot) = &response.outcome else {
+        return Ok(0);
+    };
+    let panes = &snapshot.panes;
+    let mut total = 0usize;
+    let mut add = |bytes: usize| -> anyhow::Result<()> {
+        total = total.checked_add(bytes).ok_or_else(|| {
+            anyhow::anyhow!("coherent snapshot metadata byte accounting overflow")
+        })?;
+        Ok(())
+    };
+    for tab in &panes.tabs {
+        add(pane_node_metadata_retained_bytes(tab, 1)?)?;
+    }
+    for title in &panes.tab_titles {
+        add(title.capacity())?;
+    }
+    for title in panes.window_titles.values() {
+        add(title.capacity())?;
+    }
+    for floating in &panes.floating_panes {
+        add(pane_entry_metadata_retained_bytes(&floating.pane)?)?;
+    }
+    Ok(total)
 }
 
 #[derive(Debug)]
@@ -1517,13 +1623,10 @@ fn preflight_ordered_snapshot_response(
              {DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY}); applying client backpressure"
         );
     }
-    if let Err(limit) = budget.preflight(OutboundClass::OrderedSnapshot, 1) {
+    if let Err(limit) = budget.preflight(OutboundClass::Snapshot, 1) {
         admission.trip(OUTBOUND_BUDGET_OVERFLOW);
         drop(admission);
-        return Err(outbound_budget_rejection(
-            OutboundClass::OrderedSnapshot,
-            limit,
-        ));
+        return Err(outbound_budget_rejection(OutboundClass::Snapshot, limit));
     }
     Ok(())
 }
@@ -3148,13 +3251,16 @@ impl TopologyStreamCoordinator {
                         "coherent mux snapshot authority did not match the connection subscription"
                     );
                 }
-                queue_response_pdu(
+                let retained_metadata = coherent_snapshot_metadata_retained_bytes(&response)?;
+                queue_response_pdu_with_accounting(
                     &self.item_tx,
                     &self.terminal,
                     &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
-                    PduDeliveryClass::Control,
+                    OutboundClass::Snapshot,
+                    retained_metadata,
+                    ServerEmissionAuthority::Ordinary,
                 )?;
                 *response_was_published = true;
 
@@ -5175,17 +5281,29 @@ fn encode_write_payload(
             Ok(frame)
         }
         WritePayload::Typed(mut typed) => {
+            let is_coherent_snapshot = matches!(
+                &typed.decoded.pdu,
+                Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                    outcome: ListPanesCoherentOutcome::Snapshot(_),
+                    ..
+                })
+            );
             let authority = EncodedPduAuthority::capture(
                 &typed.decoded.pdu,
                 typed.decoded.serial,
                 typed.emission_authority,
             );
             authority.validate(terminal)?;
-            let bytes = typed
+            let encoded = typed
                 .decoded
                 .pdu
-                .encode_frame_with_mode(typed.decoded.serial, compression_mode)
-                .context("encoding PDU frame")?;
+                .encode_frame_with_mode(typed.decoded.serial, compression_mode);
+            if is_coherent_snapshot {
+                if let Err(error) = &encoded {
+                    record_snapshot_body_limit_mismatch("pdu82", error);
+                }
+            }
+            let bytes = encoded.context("encoding PDU frame")?;
             let encoded_capacity = bytes.capacity();
             if typed.reservation.accounts_retained_bytes() {
                 let transition_bytes = typed
@@ -7338,6 +7456,22 @@ mod tests {
         }
     }
 
+    fn coherent_snapshot_response_with_tab_titles(
+        stream_id: TopologyStreamId,
+        session_incarnation: MuxSessionIncarnation,
+        snapshot_revision: TopologyRevision,
+        tab_titles: Vec<String>,
+    ) -> ListPanesCoherentResponse {
+        let mut response =
+            coherent_snapshot_response(stream_id, session_incarnation, snapshot_revision);
+        let ListPanesCoherentOutcome::Snapshot(snapshot) = &mut response.outcome else {
+            unreachable!("coherent response helper always returns a snapshot");
+        };
+        snapshot.panes.tabs = vec![mux::tab::PaneNode::Empty; tab_titles.len()];
+        snapshot.panes.tab_titles = tab_titles;
+        response
+    }
+
     fn ordered_window_capabilities(include_reorder: bool) -> TopologyCapabilities {
         let mut bits = ordered_snapshot_foundation().bits();
         if include_reorder {
@@ -7565,7 +7699,7 @@ mod tests {
             "terminal topology cleanup must release the topology tranche"
         );
         assert_eq!(
-            released.ordered_snapshot_retained_bytes, 0,
+            released.snapshot_retained_bytes, 0,
             "terminal topology cleanup must release the ordered-snapshot tranche"
         );
         assert_eq!(
@@ -8540,14 +8674,14 @@ mod tests {
     }
 
     #[test]
-    fn topology_and_ordered_snapshot_retained_tranches_cannot_borrow() {
+    fn topology_and_snapshot_frame_retained_tranches_cannot_borrow() {
         let budget = Arc::new(OutboundBudget::default());
         let topology = budget
             .try_reserve(OutboundClass::Topology, TOPOLOGY_FENCE_MAX_RETAINED_BYTES)
             .expect("the exact topology tranche must be legal");
         let snapshot = budget
             .try_reserve(
-                OutboundClass::OrderedSnapshot,
+                OutboundClass::Snapshot,
                 codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
             )
             .expect("the exact snapshot tranche must coexist with topology");
@@ -8558,7 +8692,7 @@ mod tests {
             TOPOLOGY_FENCE_MAX_RETAINED_BYTES
         );
         assert_eq!(
-            exact.ordered_snapshot_retained_bytes,
+            exact.snapshot_retained_bytes,
             codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES
         );
 
@@ -8573,15 +8707,15 @@ mod tests {
 
         let snapshot = budget
             .try_reserve(
-                OutboundClass::OrderedSnapshot,
+                OutboundClass::Snapshot,
                 codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES,
             )
             .expect("reacquire exact snapshot tranche");
         assert_eq!(
             budget
-                .try_reserve(OutboundClass::OrderedSnapshot, 1)
+                .try_reserve(OutboundClass::Snapshot, 1)
                 .expect_err("snapshot must not borrow the free topology tranche"),
-            OutboundBudgetLimit::OrderedSnapshotRetainedBytes,
+            OutboundBudgetLimit::SnapshotRetainedBytes,
         );
         drop(snapshot);
         assert_outbound_budget_live_counters_zero(&budget);
@@ -9439,6 +9573,112 @@ mod tests {
     }
 
     #[test]
+    fn coherent_snapshot_metadata_owns_exact_snapshot_retention_and_bounds_queued_refreshes() {
+        const TITLE_BYTES: usize = 64 * 1024;
+        const TITLE_COUNT: usize = 48;
+        let expected_retained = TITLE_BYTES * TITLE_COUNT;
+        let snapshot_limit = OutboundRetainedClass::Snapshot.maximum();
+        let admitted_snapshots = snapshot_limit / expected_retained;
+        assert!(expected_retained < snapshot_limit);
+        assert!(admitted_snapshots >= 2);
+        assert!(expected_retained * admitted_snapshots <= snapshot_limit);
+        assert!(expected_retained * (admitted_snapshots + 1) > snapshot_limit);
+
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        coordinator
+            .begin_fence(4_101, &fenced_snapshot_request())
+            .expect("begin first metadata-retained fence");
+        let first = coherent_snapshot_response_with_tab_titles(
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+            (0..TITLE_COUNT).map(|_| "x".repeat(TITLE_BYTES)).collect(),
+        );
+        assert_eq!(
+            coherent_snapshot_metadata_retained_bytes(&first)
+                .expect("exact metadata recount must fit"),
+            expected_retained
+        );
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 4_101,
+                    pdu: Pdu::ListPanesCoherentResponse(first),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("first bounded snapshot must enter the writer queue");
+        let retained = coordinator.outbound_budget.snapshot();
+        assert_eq!(retained.snapshot_retained_bytes, expected_retained);
+        assert_eq!(retained.topology_retained_bytes, 0);
+        assert_eq!(retained.retained_bytes, expected_retained);
+        assert_eq!(retained.total_slots, 1);
+        assert_eq!(retained.bulk_slots, 0);
+
+        for snapshot_index in 1..admitted_snapshots {
+            let serial = 4_101 + u64::try_from(snapshot_index).unwrap();
+            coordinator
+                .begin_fence(serial, &fenced_snapshot_request())
+                .expect("begin bounded refresh while prior snapshots remain queued");
+            let fill = char::from(b'a' + u8::try_from(snapshot_index % 26).unwrap());
+            let response = coherent_snapshot_response_with_tab_titles(
+                stream_id,
+                session_incarnation,
+                TopologyRevision::INITIAL,
+                (0..TITLE_COUNT)
+                    .map(|_| fill.to_string().repeat(TITLE_BYTES))
+                    .collect(),
+            );
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        serial,
+                        pdu: Pdu::ListPanesCoherentResponse(response),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect("snapshot frame tranche must admit its exact remaining capacity");
+        }
+
+        let overflow_serial = 4_101 + u64::try_from(admitted_snapshots).unwrap();
+        coordinator
+            .begin_fence(overflow_serial, &fenced_snapshot_request())
+            .expect("begin the first refresh beyond the snapshot-frame tranche");
+        let overflow = coherent_snapshot_response_with_tab_titles(
+            stream_id,
+            session_incarnation,
+            TopologyRevision::INITIAL,
+            (0..TITLE_COUNT).map(|_| "z".repeat(TITLE_BYTES)).collect(),
+        );
+        let error = coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: overflow_serial,
+                    pdu: Pdu::ListPanesCoherentResponse(overflow),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("queued metadata snapshots must share one finite snapshot-frame tranche");
+        assert!(format!("{error:#}").contains("snapshot_retained_bytes"));
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("metadata retention overflow must terminate the stream"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+        assert_eq!(
+            item_rx.len(),
+            admitted_snapshots,
+            "rejected refresh must never publish"
+        );
+        for _ in 0..admitted_snapshots {
+            let _snapshot = take_written_pdu(&item_rx);
+        }
+        assert_outbound_live_counters_zero(&coordinator);
+    }
+
+    #[test]
     fn future_enabled_ordered_fence_emits_pdu87_before_exact_pdu90_state() {
         let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
@@ -9504,11 +9744,11 @@ mod tests {
             queued.retained_bytes > 0,
             "encoded PDU87 and retained PDU90 must both own accounted bytes"
         );
-        assert!(queued.ordered_snapshot_retained_bytes > 0);
+        assert!(queued.snapshot_retained_bytes > 0);
         assert!(queued.topology_retained_bytes > 0);
         assert_eq!(
             queued.retained_bytes,
-            queued.ordered_snapshot_retained_bytes + queued.topology_retained_bytes,
+            queued.snapshot_retained_bytes + queued.topology_retained_bytes,
         );
 
         let snapshot = take_written_pdu(&item_rx);
@@ -9522,7 +9762,7 @@ mod tests {
         let after_snapshot = coordinator.outbound_budget.snapshot();
         assert_eq!(after_snapshot.total_slots, 1);
         assert_eq!(after_snapshot.bulk_slots, 1);
-        assert_eq!(after_snapshot.ordered_snapshot_retained_bytes, 0);
+        assert_eq!(after_snapshot.snapshot_retained_bytes, 0);
         assert!(after_snapshot.topology_retained_bytes > 0);
         assert_eq!(
             after_snapshot.retained_bytes,
@@ -9608,7 +9848,7 @@ mod tests {
         assert_eq!(queued.total_slots, 2);
         assert_eq!(queued.bulk_slots, 1);
         assert!(queued.retained_bytes > 0);
-        assert!(queued.ordered_snapshot_retained_bytes > 0);
+        assert!(queued.snapshot_retained_bytes > 0);
         assert!(queued.topology_retained_bytes > 0);
 
         let first = item_rx.try_recv().expect("queued PDU87 control response");
@@ -9673,7 +9913,7 @@ mod tests {
         let after_pdu87 = coordinator.outbound_budget.snapshot();
         assert_eq!(after_pdu87.total_slots, 1);
         assert_eq!(after_pdu87.bulk_slots, 1);
-        assert_eq!(after_pdu87.ordered_snapshot_retained_bytes, 0);
+        assert_eq!(after_pdu87.snapshot_retained_bytes, 0);
         assert!(after_pdu87.topology_retained_bytes > 0);
         assert_eq!(
             after_pdu87.retained_bytes,
@@ -9918,7 +10158,7 @@ mod tests {
         let prior_snapshot = coordinator
             .outbound_budget
             .try_reserve(
-                OutboundClass::OrderedSnapshot,
+                OutboundClass::Snapshot,
                 codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES - 1,
             )
             .expect("reserve all but one byte of the snapshot-specific tranche");
@@ -9938,7 +10178,7 @@ mod tests {
             )
             .expect_err("the exact encoded PDU87 allocation must not borrow topology headroom");
         assert!(
-            format!("{error:#}").contains("ordered_snapshot_retained_bytes"),
+            format!("{error:#}").contains("snapshot_retained_bytes"),
             "unexpected ordered-snapshot budget rejection: {error:#}"
         );
         assert_eq!(
@@ -9957,7 +10197,7 @@ mod tests {
         assert_eq!(retained.bulk_slots, 0);
         assert_eq!(retained.topology_retained_bytes, 0);
         assert_eq!(
-            retained.ordered_snapshot_retained_bytes,
+            retained.snapshot_retained_bytes,
             codec::MAX_LIST_PANES_ORDERED_V1_RESPONSE_FRAME_BYTES - 1,
         );
         drop(prior_snapshot);
@@ -10200,7 +10440,7 @@ mod tests {
         assert_eq!(only_snapshot.total_slots, 1);
         assert_eq!(only_snapshot.bulk_slots, 0);
         assert_eq!(only_snapshot.topology_retained_bytes, 0);
-        assert!(only_snapshot.ordered_snapshot_retained_bytes > 0);
+        assert!(only_snapshot.snapshot_retained_bytes > 0);
 
         let snapshot = take_written_pdu(&item_rx);
         assert_eq!(snapshot.serial, 190);
@@ -10407,7 +10647,7 @@ mod tests {
         let only_unrelated = coordinator.outbound_budget.snapshot();
         assert_eq!(only_unrelated.total_slots, 1);
         assert_eq!(only_unrelated.bulk_slots, 1);
-        assert_eq!(only_unrelated.ordered_snapshot_retained_bytes, 0);
+        assert_eq!(only_unrelated.snapshot_retained_bytes, 0);
         assert_eq!(
             only_unrelated.topology_retained_bytes,
             TOPOLOGY_FENCE_MAX_RETAINED_BYTES - retained_event_bytes - 1,
@@ -10547,7 +10787,7 @@ mod tests {
         assert_eq!(queued.bulk_slots, 0);
         assert_eq!(queued.topology_retained_bytes, 0);
         assert_eq!(
-            queued.ordered_snapshot_retained_bytes, expected_frame_capacity,
+            queued.snapshot_retained_bytes, expected_frame_capacity,
             "PDU87 must own exactly its sole encoded Vec allocation",
         );
         let snapshot = take_written_pdu(&item_rx);
@@ -10603,7 +10843,7 @@ mod tests {
         let budget = Arc::new(OutboundBudget::default());
         let bytes = vec![0x87];
         let reservation = budget
-            .try_reserve(OutboundClass::OrderedSnapshot, bytes.capacity())
+            .try_reserve(OutboundClass::Snapshot, bytes.capacity())
             .expect("reserve one raw test byte");
         let (raw_terminal, raw_terminal_rx) = DispatchTerminal::channel();
         encode_write_payload(
@@ -15350,7 +15590,7 @@ mod tests {
 
     #[test]
     fn same_class_retained_frames_stay_segmented_below_the_write_quantum() {
-        for class in [OutboundClass::Topology, OutboundClass::OrderedSnapshot] {
+        for class in [OutboundClass::Topology, OutboundClass::Snapshot] {
             let budget = Arc::new(OutboundBudget::default());
             let terminal = test_terminal();
             let mut first_bytes = Vec::with_capacity(32);

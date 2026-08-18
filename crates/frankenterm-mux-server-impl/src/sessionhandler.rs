@@ -3733,6 +3733,81 @@ fn new_pane_snapshot_census_ledger() -> anyhow::Result<mux::tab::PaneSnapshotCen
     )
 }
 
+const PANE_SNAPSHOT_METADATA_ATTEMPT_BYTES: usize = 4 * 1024 * 1024;
+const PANE_SNAPSHOT_METADATA_REQUEST_BYTES: usize =
+    PANE_SNAPSHOT_METADATA_ATTEMPT_BYTES * COHERENT_SNAPSHOT_ATTEMPTS as usize;
+
+fn new_pane_snapshot_metadata_ledger() -> anyhow::Result<mux::tab::PaneSnapshotMetadataLedger> {
+    use mux::tab::PaneSnapshotMetadataLimits;
+
+    // Field order is the frozen PaneSnapshotMetadataField::ALL order. These
+    // ceilings protect the producer allocation boundary; the aggregate body
+    // codec limit remains a separate final invariant.
+    let limits = PaneSnapshotMetadataLimits::new(
+        [
+            64 * 1024,  // window title
+            16 * 1024,  // window workspace source
+            64 * 1024,  // tab title
+            64 * 1024,  // pane title
+            256 * 1024, // pane working-directory URL
+            16 * 1024,  // pane workspace copy
+            16 * 1024,  // pane tty name
+        ],
+        PANE_SNAPSHOT_METADATA_ATTEMPT_BYTES,
+        PANE_SNAPSHOT_METADATA_ATTEMPT_BYTES,
+        PANE_SNAPSHOT_METADATA_REQUEST_BYTES,
+        PANE_SNAPSHOT_METADATA_REQUEST_BYTES,
+    );
+    mux::tab::PaneSnapshotMetadataLedger::new(limits)
+}
+
+/// Releases provisional response metadata when collection errors or its
+/// future is cancelled. Successful callers disarm only after every owned value
+/// has moved into the returned response.
+struct PaneSnapshotMetadataAttempt<'a> {
+    ledger: &'a mut mux::tab::PaneSnapshotMetadataLedger,
+    checkpoint: mux::tab::PaneSnapshotMetadataStats,
+    armed: bool,
+}
+
+impl<'a> PaneSnapshotMetadataAttempt<'a> {
+    fn new(ledger: &'a mut mux::tab::PaneSnapshotMetadataLedger) -> Self {
+        Self {
+            checkpoint: ledger.attempt_checkpoint(),
+            ledger,
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl std::ops::Deref for PaneSnapshotMetadataAttempt<'_> {
+    type Target = mux::tab::PaneSnapshotMetadataLedger;
+
+    fn deref(&self) -> &Self::Target {
+        self.ledger
+    }
+}
+
+impl std::ops::DerefMut for PaneSnapshotMetadataAttempt<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.ledger
+    }
+}
+
+impl Drop for PaneSnapshotMetadataAttempt<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = self.ledger.release_attempt_to(self.checkpoint) {
+                log::error!("pane-snapshot metadata attempt rollback failed: {error}");
+            }
+        }
+    }
+}
+
 /// Maximum admitted census work between main-thread executor yield checks.
 ///
 /// A single tab append is intentionally indivisible: its callback-free census,
@@ -3828,6 +3903,138 @@ fn record_pane_snapshot_census_metrics(
     }
 }
 
+fn record_pane_snapshot_metadata_metrics(
+    family: &'static str,
+    ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
+) {
+    for (field, admitted_values) in ledger.take_unreported_admitted_values() {
+        metrics::counter!(
+            "mux.server.pane_snapshot_metadata.admitted_values_total",
+            "family" => family,
+            "field" => field.label(),
+        )
+        .increment(u64::try_from(admitted_values).unwrap_or(u64::MAX));
+    }
+    for (scope, stats) in [
+        ("attempt", ledger.attempt_stats()),
+        ("request", ledger.request_stats()),
+    ] {
+        for field in mux::tab::PaneSnapshotMetadataField::ALL {
+            let usage = stats.field(field);
+            metrics::histogram!(
+                "mux.server.pane_snapshot_metadata.retained_bytes",
+                "family" => family,
+                "scope" => scope,
+                "field" => field.label(),
+            )
+            .record(usage.retained_bytes as f64);
+            metrics::histogram!(
+                "mux.server.pane_snapshot_metadata.encoded_bytes",
+                "family" => family,
+                "scope" => scope,
+                "field" => field.label(),
+            )
+            .record(usage.encoded_bytes as f64);
+        }
+        let total = stats
+            .total()
+            .unwrap_or(mux::tab::PaneSnapshotMetadataUsage {
+                values: usize::MAX,
+                retained_bytes: usize::MAX,
+                encoded_bytes: usize::MAX,
+            });
+        metrics::histogram!(
+            "mux.server.pane_snapshot_metadata.total_retained_bytes",
+            "family" => family,
+            "scope" => scope,
+        )
+        .record(total.retained_bytes as f64);
+        metrics::histogram!(
+            "mux.server.pane_snapshot_metadata.total_encoded_bytes",
+            "family" => family,
+            "scope" => scope,
+        )
+        .record(total.encoded_bytes as f64);
+    }
+    let request_high_water =
+        ledger
+            .request_stats()
+            .total()
+            .unwrap_or(mux::tab::PaneSnapshotMetadataUsage {
+                values: usize::MAX,
+                retained_bytes: usize::MAX,
+                encoded_bytes: usize::MAX,
+            });
+    for (scope, retained_bytes, encoded_bytes) in [
+        (
+            "attempt",
+            ledger.attempt_peak_retained_bytes(),
+            ledger.attempt_peak_encoded_bytes(),
+        ),
+        (
+            "request",
+            request_high_water.retained_bytes,
+            request_high_water.encoded_bytes,
+        ),
+    ] {
+        metrics::histogram!(
+            "mux.server.pane_snapshot_metadata.retained_bytes_high_water",
+            "family" => family,
+            "scope" => scope,
+        )
+        .record(retained_bytes as f64);
+        metrics::histogram!(
+            "mux.server.pane_snapshot_metadata.encoded_bytes_high_water",
+            "family" => family,
+            "scope" => scope,
+        )
+        .record(encoded_bytes as f64);
+    }
+    if let Some(rejection) = ledger.last_rejection() {
+        let (reason, field) = match rejection {
+            mux::tab::PaneSnapshotMetadataRejection::FieldLimit { field } => ("field_limit", field),
+            mux::tab::PaneSnapshotMetadataRejection::ArithmeticOverflow => {
+                ("arithmetic", "aggregate")
+            }
+            mux::tab::PaneSnapshotMetadataRejection::AttemptRetainedLimit => {
+                ("attempt_retained", "aggregate")
+            }
+            mux::tab::PaneSnapshotMetadataRejection::AttemptEncodedLimit => {
+                ("attempt_encoded", "aggregate")
+            }
+            mux::tab::PaneSnapshotMetadataRejection::RequestRetainedLimit => {
+                ("request_retained", "aggregate")
+            }
+            mux::tab::PaneSnapshotMetadataRejection::RequestEncodedLimit => {
+                ("request_encoded", "aggregate")
+            }
+        };
+        metrics::counter!(
+            "mux.server.pane_snapshot_metadata.rejections",
+            "family" => family,
+            "reason" => reason,
+            "field" => field,
+        )
+        .increment(1);
+    }
+    record_pane_snapshot_metadata_retry_release(family, ledger);
+}
+
+fn record_pane_snapshot_metadata_retry_release(
+    family: &'static str,
+    ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
+) {
+    let released = ledger.take_retry_released_bytes();
+    if released == 0 {
+        return;
+    }
+    metrics::counter!(
+        "mux.server.pane_snapshot_metadata.retry_released_bytes_total",
+        "family" => family,
+    )
+    .increment(u64::try_from(released).unwrap_or(u64::MAX));
+}
+
 fn pane_snapshot_census_category_work(
     stats: mux::tab::PaneSnapshotCensusStats,
 ) -> [(&'static str, usize); 8] {
@@ -3918,20 +4125,86 @@ fn pane_arena_tree_into_legacy(
     Ok((root, tab_title))
 }
 
-fn floating_pane_snapshot_entry(
+fn budgeted_floating_pane_snapshot_entry(
     window_id: mux::window::WindowId,
     tab_id: mux::tab::TabId,
     workspace: &str,
     positioned: mux::tab::PositionedFloatingPane,
-) -> codec::FloatingPaneSnapshotEntry {
+    census_ledger: &mut mux::tab::PaneSnapshotCensusLedger,
+    metadata_ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
+) -> anyhow::Result<codec::FloatingPaneSnapshotEntry> {
+    census_ledger.preflight_pane_callbacks(6)?;
+    metadata_ledger.preflight_required_string(
+        mux::tab::PaneSnapshotMetadataField::PaneWorkspace,
+        workspace,
+    )?;
+    let workspace = workspace.to_string();
+    metadata_ledger.admit_required_owned(
+        mux::tab::PaneSnapshotMetadataField::PaneWorkspace,
+        &workspace,
+        workspace.capacity(),
+    )?;
     let pane = positioned.pane;
-    let dimensions = pane.get_dimensions();
-    codec::FloatingPaneSnapshotEntry {
+    metadata_ledger
+        .preflight_required_string(mux::tab::PaneSnapshotMetadataField::PaneTitle, "")?;
+    let title =
+        observe_floating_snapshot_pane_callback(&pane, census_ledger, |pane| pane.get_title())?;
+    metadata_ledger.admit_required_owned(
+        mux::tab::PaneSnapshotMetadataField::PaneTitle,
+        &title,
+        title.capacity(),
+    )?;
+    let dimensions = observe_floating_snapshot_pane_callback(&pane, census_ledger, |pane| {
+        pane.get_dimensions()
+    })?;
+    metadata_ledger
+        .preflight_optional_value(mux::tab::PaneSnapshotMetadataField::PaneWorkingDir)?;
+    let working_dir = observe_floating_snapshot_pane_callback(&pane, census_ledger, |pane| {
+        pane.get_current_working_dir(CachePolicy::AllowStale)
+    })?;
+    if let Some(url) = working_dir.as_ref() {
+        metadata_ledger.preflight_optional_string(
+            mux::tab::PaneSnapshotMetadataField::PaneWorkingDir,
+            url.as_str(),
+        )?;
+    }
+    let working_dir = working_dir.map(mux::tab::SerdeUrl::from);
+    match working_dir.as_ref() {
+        Some(url) => metadata_ledger.admit_optional_owned(
+            mux::tab::PaneSnapshotMetadataField::PaneWorkingDir,
+            url.as_str(),
+            url.capacity(),
+        )?,
+        None => metadata_ledger
+            .admit_optional_none(mux::tab::PaneSnapshotMetadataField::PaneWorkingDir)?,
+    }
+    let alt_screen_active =
+        observe_floating_snapshot_pane_callback(&pane, census_ledger, |pane| {
+            pane.is_alt_screen_active()
+        })?;
+    let cursor_pos = observe_floating_snapshot_pane_callback(&pane, census_ledger, |pane| {
+        pane.get_cursor_position()
+    })?;
+    metadata_ledger.preflight_optional_value(mux::tab::PaneSnapshotMetadataField::PaneTtyName)?;
+    let tty_name =
+        observe_floating_snapshot_pane_callback(&pane, census_ledger, |pane| pane.tty_name())?;
+    match tty_name.as_ref() {
+        Some(tty_name) => metadata_ledger.admit_optional_owned(
+            mux::tab::PaneSnapshotMetadataField::PaneTtyName,
+            tty_name,
+            tty_name.capacity(),
+        )?,
+        None => {
+            metadata_ledger.admit_optional_none(mux::tab::PaneSnapshotMetadataField::PaneTtyName)?
+        }
+    }
+
+    Ok(codec::FloatingPaneSnapshotEntry {
         pane: mux::tab::PaneEntry {
             window_id,
             tab_id,
             pane_id: positioned.pane_id,
-            title: pane.get_title(),
+            title,
             size: wezterm_term::TerminalSize {
                 cols: dimensions.cols,
                 rows: dimensions.viewport_rows,
@@ -3939,18 +4212,16 @@ fn floating_pane_snapshot_entry(
                 pixel_width: dimensions.pixel_width,
                 dpi: dimensions.dpi,
             },
-            working_dir: pane
-                .get_current_working_dir(CachePolicy::AllowStale)
-                .map(Into::into),
-            alt_screen_active: pane.is_alt_screen_active(),
+            working_dir,
+            alt_screen_active,
             is_active_pane: positioned.is_focused,
             is_zoomed_pane: false,
-            workspace: workspace.to_string(),
-            cursor_pos: pane.get_cursor_position(),
+            workspace,
+            cursor_pos,
             physical_top: dimensions.physical_top,
             top_row: positioned.top,
             left_col: positioned.left,
-            tty_name: pane.tty_name(),
+            tty_name,
         },
         rect: mux::tab::FloatingPaneRect {
             left: positioned.left,
@@ -3963,7 +4234,20 @@ fn floating_pane_snapshot_entry(
         pinned: positioned.pinned,
         opacity: positioned.opacity,
         focused: positioned.is_focused,
-    }
+    })
+}
+
+fn observe_floating_snapshot_pane_callback<T>(
+    pane: &Arc<dyn mux::pane::Pane>,
+    ledger: &mut mux::tab::PaneSnapshotCensusLedger,
+    callback: impl FnOnce(&Arc<dyn mux::pane::Pane>) -> T,
+) -> anyhow::Result<T> {
+    ledger.reserve_pane_callbacks(1)?;
+    catch_recoverable(
+        RecoverablePanicSite::MuxPaneCallback,
+        AssertUnwindSafe(|| callback(pane)),
+    )
+    .map_err(|_| anyhow!("a floating-pane callback panicked during snapshot collection"))
 }
 
 fn append_floating_pane_snapshot(
@@ -3972,6 +4256,7 @@ fn append_floating_pane_snapshot(
     tab: &mux::tab::Tab,
     workspace: &str,
     ledger: &mut mux::tab::PaneSnapshotCensusLedger,
+    metadata_ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
 ) -> anyhow::Result<()> {
     let remaining = codec::MAX_FLOATING_PANES_PER_SNAPSHOT.saturating_sub(output.len());
     let positioned = tab.snapshot_floating_panes_with_census_ledger(remaining, ledger)?;
@@ -3985,23 +4270,19 @@ fn append_floating_pane_snapshot(
             codec::MAX_FLOATING_PANES_PER_SNAPSHOT
         );
     }
-    let callback_count = positioned
-        .len()
-        .checked_mul(6)
-        .context("counting floating-pane snapshot callbacks")?;
-    ledger.reserve_pane_callbacks(callback_count)?;
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(positioned.len())
         .context("reserving bounded floating pane snapshot")?;
     for positioned in positioned {
-        let entry = catch_recoverable(
-            RecoverablePanicSite::MuxPaneCallback,
-            AssertUnwindSafe(|| {
-                floating_pane_snapshot_entry(window_id, tab.tab_id(), workspace, positioned)
-            }),
-        )
-        .map_err(|_| anyhow!("a floating-pane callback panicked during snapshot collection"))?;
+        let entry = budgeted_floating_pane_snapshot_entry(
+            window_id,
+            tab.tab_id(),
+            workspace,
+            positioned,
+            ledger,
+            metadata_ledger,
+        )?;
         entries.push(entry);
     }
     output
@@ -4016,16 +4297,20 @@ async fn collect_list_panes_snapshot_with_stage_observer(
     observer: &mut impl FnMut(ListPanesSnapshotStage),
 ) -> anyhow::Result<ListPanesResponse> {
     let mut ledger = new_pane_snapshot_census_ledger()?;
+    let mut metadata_ledger = new_pane_snapshot_metadata_ledger()?;
     let mut cooperator = PaneSnapshotCooperator::new("pdu82");
     ledger.begin_attempt();
+    metadata_ledger.begin_attempt();
     let response = collect_list_panes_snapshot_with_stage_observer_and_census(
         mux,
         observer,
         &mut ledger,
+        &mut metadata_ledger,
         &mut cooperator,
     )
     .await;
     record_pane_snapshot_census_metrics("pdu82", &ledger, false);
+    record_pane_snapshot_metadata_metrics("pdu82", &mut metadata_ledger);
     metrics::histogram!("mux.server.pane_snapshot_census.yields", "family" => "pdu82")
         .record(cooperator.yields() as f64);
     response
@@ -4035,8 +4320,11 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
     mux: &Mux,
     observer: &mut impl FnMut(ListPanesSnapshotStage),
     ledger: &mut mux::tab::PaneSnapshotCensusLedger,
+    metadata_ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
     cooperator: &mut PaneSnapshotCooperator,
 ) -> anyhow::Result<ListPanesResponse> {
+    let mut metadata_attempt = PaneSnapshotMetadataAttempt::new(metadata_ledger);
+    let metadata_ledger = &mut *metadata_attempt;
     let mut tabs = Vec::new();
     let mut tab_titles = Vec::new();
     let mut window_titles = HashMap::new();
@@ -4044,13 +4332,32 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
     let window_ids = mux.iter_windows();
     observer(ListPanesSnapshotStage::WindowsEnumerated);
     for window_id in window_ids {
-        let window_snapshot = mux.get_window(window_id).map(|window| {
-            (
-                window.get_title().to_string(),
-                window.get_workspace().to_string(),
-                window.iter().cloned().collect::<Vec<_>>(),
-            )
-        });
+        let window_snapshot = mux
+            .get_window(window_id)
+            .map(|window| -> anyhow::Result<_> {
+                metadata_ledger.preflight_required_string(
+                    mux::tab::PaneSnapshotMetadataField::WindowTitle,
+                    window.get_title(),
+                )?;
+                metadata_ledger.preflight_retained_only_string(
+                    mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+                    window.get_workspace(),
+                )?;
+                let title = window.get_title().to_string();
+                metadata_ledger.admit_required_owned(
+                    mux::tab::PaneSnapshotMetadataField::WindowTitle,
+                    &title,
+                    title.capacity(),
+                )?;
+                let workspace = window.get_workspace().to_string();
+                metadata_ledger.admit_retained_only_owned(
+                    mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+                    &workspace,
+                    workspace.capacity(),
+                )?;
+                Ok((title, workspace, window.iter().cloned().collect::<Vec<_>>()))
+            })
+            .transpose()?;
         let Some((window_title, workspace, window_tabs)) = window_snapshot else {
             log::warn!(
                 "ListPanes skipped stale window id {} from iter_windows",
@@ -4060,24 +4367,26 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
         };
         window_titles.insert(window_id, window_title);
         for tab in window_tabs {
-            let (tree, tab_title) =
-                if let Some(tab_title) = tab.empty_pane_tree_title_callback_free() {
-                    ledger.reserve_assembly_nodes(1)?;
-                    (mux::tab::PaneNode::Empty, tab_title)
-                } else {
-                    let mut arena = Vec::new();
-                    let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
-                        window_id,
-                        &workspace,
-                        &mut arena,
-                        codec::MAX_ORDERED_PANE_TREE_DEPTH,
-                        codec::MAX_ORDERED_PANE_NODES_PER_TREE,
-                        codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
-                        ledger,
-                    )?;
-                    debug_assert!(receipt.work.total().is_some());
-                    pane_arena_tree_into_legacy(receipt.tree, arena)?
-                };
+            let (tree, tab_title) = if let Some(tab_title) =
+                tab.empty_pane_tree_title_callback_free_with_metadata(metadata_ledger)?
+            {
+                ledger.reserve_assembly_nodes(1)?;
+                (mux::tab::PaneNode::Empty, tab_title)
+            } else {
+                let mut arena = Vec::new();
+                let receipt = tab.append_codec_pane_arena_in_window_with_ledgers(
+                    window_id,
+                    &workspace,
+                    &mut arena,
+                    codec::MAX_ORDERED_PANE_TREE_DEPTH,
+                    codec::MAX_ORDERED_PANE_NODES_PER_TREE,
+                    codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
+                    ledger,
+                    metadata_ledger,
+                )?;
+                debug_assert!(receipt.work.total().is_some());
+                pane_arena_tree_into_legacy(receipt.tree, arena)?
+            };
             tabs.push(tree);
             append_floating_pane_snapshot(
                 &mut floating_panes,
@@ -4085,12 +4394,18 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
                 tab.as_ref(),
                 &workspace,
                 ledger,
+                metadata_ledger,
             )?;
             observer(ListPanesSnapshotStage::TabTreeCaptured);
             tab_titles.push(tab_title);
             // No mux/window/tab lock or pane callback is live at this await.
             cooperator.after_tab(ledger).await;
         }
+        metadata_ledger.release_retained_only(
+            mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+            workspace.capacity(),
+        )?;
+        drop(workspace);
     }
     observer(ListPanesSnapshotStage::TitlesCaptured);
     log::trace!(
@@ -4099,12 +4414,14 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
         tab_titles.len(),
         window_titles.len()
     );
-    Ok(ListPanesResponse {
+    let response = ListPanesResponse {
         tabs,
         tab_titles,
         window_titles,
         floating_panes,
-    })
+    };
+    metadata_attempt.commit();
+    Ok(response)
 }
 
 async fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
@@ -4136,10 +4453,12 @@ async fn collect_coherent_list_panes_snapshot_with_stage_observer(
     let mut first_revision = None;
     let mut last_revision = None;
     let mut ledger = new_pane_snapshot_census_ledger()?;
+    let mut metadata_ledger = new_pane_snapshot_metadata_ledger()?;
     let mut cooperator = PaneSnapshotCooperator::new("pdu82");
 
     for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
         ledger.begin_attempt();
+        metadata_ledger.begin_attempt();
         let (before_session, before_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
             Err(_) => {
@@ -4164,10 +4483,12 @@ async fn collect_coherent_list_panes_snapshot_with_stage_observer(
             mux,
             observer,
             &mut ledger,
+            &mut metadata_ledger,
             &mut cooperator,
         )
         .await;
         record_pane_snapshot_census_metrics("pdu82", &ledger, attempt > 1);
+        record_pane_snapshot_metadata_metrics("pdu82", &mut metadata_ledger);
         let panes = panes?;
 
         let (after_session, after_revision) = match mux.topology_snapshot_authority() {
@@ -4210,6 +4531,9 @@ async fn collect_coherent_list_panes_snapshot_with_stage_observer(
 
         first_revision.get_or_insert(before_revision);
         last_revision = Some(after_revision);
+        drop(panes);
+        metadata_ledger.release_attempt_to(Default::default())?;
+        record_pane_snapshot_metadata_retry_release("pdu82", &mut metadata_ledger);
         metrics::counter!(
             "mux.server.coherent_snapshot.total",
             "outcome" => "retry"
@@ -4434,10 +4758,12 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
     let mut first_revision = None;
     let mut last_revision = None;
     let mut ledger = new_pane_snapshot_census_ledger()?;
+    let mut metadata_ledger = new_pane_snapshot_metadata_ledger()?;
     let mut cooperator = PaneSnapshotCooperator::new("pdu87");
 
     for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
         ledger.begin_attempt();
+        metadata_ledger.begin_attempt();
         observer(ListPanesSnapshotStage::BeforeOrderedAuthorityRead);
         let (before_session, before_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
@@ -4455,14 +4781,36 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
         let mut frozen_windows = Vec::with_capacity(window_ids.len());
         let mut total_tabs = 0usize;
         for window_id in window_ids {
-            let frozen = mux.get_window(window_id).map(|window| {
-                let order = window.order_snapshot()?;
-                Ok::<_, mux::window::WindowOrderSnapshotError>(FrozenOrderedSnapshotWindow {
-                    title: window.get_title().to_string(),
-                    workspace: window.get_workspace().to_string(),
-                    order,
-                })
-            });
+            let frozen = mux
+                .get_window(window_id)
+                .map(|window| -> anyhow::Result<_> {
+                    let order = window.order_snapshot()?;
+                    metadata_ledger.preflight_required_string(
+                        mux::tab::PaneSnapshotMetadataField::WindowTitle,
+                        window.get_title(),
+                    )?;
+                    metadata_ledger.preflight_retained_only_string(
+                        mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+                        window.get_workspace(),
+                    )?;
+                    let title = window.get_title().to_string();
+                    metadata_ledger.admit_required_owned(
+                        mux::tab::PaneSnapshotMetadataField::WindowTitle,
+                        &title,
+                        title.capacity(),
+                    )?;
+                    let workspace = window.get_workspace().to_string();
+                    metadata_ledger.admit_retained_only_owned(
+                        mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+                        &workspace,
+                        workspace.capacity(),
+                    )?;
+                    Ok(FrozenOrderedSnapshotWindow {
+                        title,
+                        workspace,
+                        order,
+                    })
+                });
             let Some(frozen) = frozen else {
                 // A concurrent removal advances the topology revision. The
                 // final authority read rejects this partial attempt.
@@ -4489,11 +4837,11 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
         let mut pane_window_titles = Vec::with_capacity(frozen_windows.len());
         let mut floating_panes = Vec::new();
         let collection = async {
-            for (frozen, ordered_window) in frozen_windows.iter().zip(&ordered_windows) {
+            for (frozen, ordered_window) in frozen_windows.iter_mut().zip(&ordered_windows) {
                 let window_id = frozen.order.window_id();
                 pane_window_titles.push(mux::tab::PaneArenaWindowTitle {
                     window_id: ordered_window.window_id.get(),
-                    title: frozen.title.clone(),
+                    title: std::mem::take(&mut frozen.title),
                 });
                 for tab in frozen.order.ordered_tabs() {
                     // Admit no more than one tree's wire budget from the current
@@ -4502,7 +4850,7 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
                     // oversized tab from walking and allocating toward the much
                     // larger whole-snapshot ceiling before it is rejected.
                     let tab_node_ceiling = ordered_snapshot_tab_node_ceiling(pane_nodes.len())?;
-                    let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
+                    let receipt = tab.append_codec_pane_arena_in_window_with_ledgers(
                         window_id,
                         &frozen.workspace,
                         &mut pane_nodes,
@@ -4510,6 +4858,7 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
                         tab_node_ceiling,
                         codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
                         &mut ledger,
+                        &mut metadata_ledger,
                     )?;
                     debug_assert!(receipt.work.total().is_some());
                     pane_trees.push(receipt.tree);
@@ -4519,17 +4868,25 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
                         tab.as_ref(),
                         &frozen.workspace,
                         &mut ledger,
+                        &mut metadata_ledger,
                     )?;
                     observer(ListPanesSnapshotStage::TabTreeCaptured);
                     // The tab transaction and its arbitrary pane callbacks are
                     // complete before yielding to queued interactive work.
                     cooperator.after_tab(&ledger).await;
                 }
+                let workspace = std::mem::take(&mut frozen.workspace);
+                metadata_ledger.release_retained_only(
+                    mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+                    workspace.capacity(),
+                )?;
+                drop(workspace);
             }
             Ok::<(), anyhow::Error>(())
         }
         .await;
         record_pane_snapshot_census_metrics("pdu87", &ledger, attempt > 1);
+        record_pane_snapshot_metadata_metrics("pdu87", &mut metadata_ledger);
         collection?;
         observer(ListPanesSnapshotStage::TitlesCaptured);
 
@@ -4574,6 +4931,14 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
 
         first_revision.get_or_insert(before_revision);
         last_revision = Some(after_revision);
+        drop(pane_trees);
+        drop(pane_nodes);
+        drop(pane_window_titles);
+        drop(floating_panes);
+        drop(ordered_windows);
+        drop(frozen_windows);
+        metadata_ledger.release_attempt_to(Default::default())?;
+        record_pane_snapshot_metadata_retry_release("pdu87", &mut metadata_ledger);
         metrics::counter!(
             "mux.server.ordered_snapshot.total",
             "outcome" => "retry"
@@ -7977,11 +8342,15 @@ mod tests {
         let mut short = mux::tab::PaneSnapshotCensusLedger::new(26, 26)
             .expect("valid short PDU82 census ledger");
         let mut short_cooperator = PaneSnapshotCooperator::new("test-pdu82");
+        let mut short_metadata =
+            new_pane_snapshot_metadata_ledger().expect("valid production metadata ledger");
         short.begin_attempt();
+        short_metadata.begin_attempt();
         let error = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
             &mux,
             &mut ignore_list_panes_snapshot_stage,
             &mut short,
+            &mut short_metadata,
             &mut short_cooperator,
         ))
         .expect_err("the second tab must not receive a fresh census allowance");
@@ -7996,13 +8365,17 @@ mod tests {
         let mut exact = mux::tab::PaneSnapshotCensusLedger::new(38, 38)
             .expect("valid exact PDU82 census ledger");
         let mut exact_cooperator = PaneSnapshotCooperator::new("test-pdu82");
+        let mut exact_metadata =
+            new_pane_snapshot_metadata_ledger().expect("valid production metadata ledger");
         first_callback_count.store(0, Ordering::Release);
         second_callback_count.store(0, Ordering::Release);
         exact.begin_attempt();
+        exact_metadata.begin_attempt();
         let snapshot = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
             &mux,
             &mut ignore_list_panes_snapshot_stage,
             &mut exact,
+            &mut exact_metadata,
             &mut exact_cooperator,
         ))
         .expect("two one-pane tabs consume the exact cumulative allowance");
@@ -8012,6 +8385,76 @@ mod tests {
         assert_eq!(exact.attempt_stats().total(), Some(38));
         assert_eq!(first_callback_count.load(Ordering::Acquire), 1);
         assert_eq!(second_callback_count.load(Ordering::Acquire), 1);
+    }
+
+    fn test_snapshot_string_encoded_bytes(value: &str) -> usize {
+        let mut remaining = value.len();
+        let mut length_bytes = 1usize;
+        while remaining >= 0x80 {
+            remaining >>= 7;
+            length_bytes += 1;
+        }
+        length_bytes + value.len()
+    }
+
+    fn test_pane_entry_metadata_usage(entry: &mux::tab::PaneEntry) -> (usize, usize, usize) {
+        let retained = entry.title.capacity()
+            + entry
+                .working_dir
+                .as_ref()
+                .map_or(0, mux::tab::SerdeUrl::capacity)
+            + entry.workspace.capacity()
+            + entry.tty_name.as_ref().map_or(0, String::capacity);
+        let encoded = test_snapshot_string_encoded_bytes(&entry.title)
+            + entry.working_dir.as_ref().map_or(1, |url| {
+                1 + test_snapshot_string_encoded_bytes(url.as_str())
+            })
+            + test_snapshot_string_encoded_bytes(&entry.workspace)
+            + entry
+                .tty_name
+                .as_ref()
+                .map_or(1, |tty| 1 + test_snapshot_string_encoded_bytes(tty));
+        (4, retained, encoded)
+    }
+
+    fn test_pane_node_metadata_usage(node: &mux::tab::PaneNode) -> (usize, usize, usize) {
+        match node {
+            mux::tab::PaneNode::Empty => (0, 0, 0),
+            mux::tab::PaneNode::Leaf(entry) => test_pane_entry_metadata_usage(entry),
+            mux::tab::PaneNode::Split { left, right, .. } => {
+                let left = test_pane_node_metadata_usage(left);
+                let right = test_pane_node_metadata_usage(right);
+                (left.0 + right.0, left.1 + right.1, left.2 + right.2)
+            }
+        }
+    }
+
+    fn test_snapshot_response_metadata_usage(
+        snapshot: &ListPanesResponse,
+    ) -> (usize, usize, usize) {
+        let mut usage = (snapshot.window_titles.len(), 0usize, 0usize);
+        for title in snapshot.window_titles.values() {
+            usage.1 += title.capacity();
+            usage.2 += test_snapshot_string_encoded_bytes(title);
+        }
+        usage.0 += snapshot.tab_titles.len();
+        for title in &snapshot.tab_titles {
+            usage.1 += title.capacity();
+            usage.2 += test_snapshot_string_encoded_bytes(title);
+        }
+        for tree in &snapshot.tabs {
+            let tree_usage = test_pane_node_metadata_usage(tree);
+            usage.0 += tree_usage.0;
+            usage.1 += tree_usage.1;
+            usage.2 += tree_usage.2;
+        }
+        for floating in &snapshot.floating_panes {
+            let pane_usage = test_pane_entry_metadata_usage(&floating.pane);
+            usage.0 += pane_usage.0;
+            usage.1 += pane_usage.1;
+            usage.2 += pane_usage.2;
+        }
+        usage
     }
 
     #[test]
@@ -8043,11 +8486,15 @@ mod tests {
             let mut ledger = new_pane_snapshot_census_ledger()
                 .expect("production census limits must remain internally valid");
             let mut cooperator = PaneSnapshotCooperator::new("test-pdu82-q-scale");
+            let mut metadata =
+                new_pane_snapshot_metadata_ledger().expect("valid production metadata ledger");
             ledger.begin_attempt();
+            metadata.begin_attempt();
             let snapshot = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
                 &mux,
                 &mut ignore_list_panes_snapshot_stage,
                 &mut ledger,
+                &mut metadata,
                 &mut cooperator,
             ))
             .unwrap_or_else(|error| panic!("q{tab_count} census failed: {error:#}"));
@@ -8064,7 +8511,89 @@ mod tests {
             assert_eq!(budgeted_work - measured_work, tab_count * 13);
             assert!(budgeted_work <= codec::MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_ATTEMPT);
             assert_eq!(ledger.last_rejection(), None);
+
+            let response_usage = test_snapshot_response_metadata_usage(&snapshot);
+            let attempt_metadata = metadata
+                .attempt_stats()
+                .total()
+                .expect("q-scale metadata totals remain representable");
+            assert_eq!(
+                attempt_metadata.values,
+                response_usage.0 + 1,
+                "q{tab_count} owns exactly one additional temporary window-workspace admission"
+            );
+            assert_eq!(
+                attempt_metadata.retained_bytes, response_usage.1,
+                "q{tab_count} live producer retention must equal response-owned string capacity"
+            );
+            assert_eq!(
+                attempt_metadata.encoded_bytes, response_usage.2,
+                "q{tab_count} encoded accounting must equal exact response string/tag framing"
+            );
+            assert_eq!(metadata.last_rejection(), None);
         }
+    }
+
+    #[test]
+    fn pane_snapshot_metadata_cancellation_releases_provisional_attempt_retention() {
+        const TAB_COUNT: usize = 220;
+
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        drop(window);
+        for tab_index in 0..TAB_COUNT {
+            let tab = register_snapshot_tab(
+                &mux,
+                Arc::new(FakePane::new_with_id(40_000 + tab_index, None)),
+            );
+            mux.add_tab_to_window(&tab, window_id)
+                .expect("attach cancellation-test tab");
+        }
+
+        let mut ledger =
+            new_pane_snapshot_census_ledger().expect("production census limits remain valid");
+        let mut metadata =
+            new_pane_snapshot_metadata_ledger().expect("production metadata limits remain valid");
+        let mut cooperator = PaneSnapshotCooperator::new("test-pdu82-cancel");
+        ledger.begin_attempt();
+        metadata.begin_attempt();
+        let mut observer = ignore_list_panes_snapshot_stage;
+        let mut collection = Box::pin(collect_list_panes_snapshot_with_stage_observer_and_census(
+            &mux,
+            &mut observer,
+            &mut ledger,
+            &mut metadata,
+            &mut cooperator,
+        ));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(
+            std::future::Future::poll(collection.as_mut(), &mut context).is_pending(),
+            "q{TAB_COUNT} must suspend at the first cooperative census yield"
+        );
+
+        drop(collection);
+        assert_eq!(
+            metadata.attempt_stats(),
+            mux::tab::PaneSnapshotMetadataStats::default(),
+            "dropping the pending producer must release every provisional response string"
+        );
+        assert!(
+            metadata
+                .request_stats()
+                .total()
+                .is_some_and(|usage| usage.retained_bytes > 0),
+            "cancellation must preserve monotonic request work authority"
+        );
+        assert!(
+            metadata.take_retry_released_bytes() > 0,
+            "cancellation must expose its prompt retained-byte release"
+        );
+        assert_eq!(cooperator.yields(), 1);
     }
 
     #[test]
@@ -8154,12 +8683,16 @@ mod tests {
             .expect("production census limits must remain internally valid");
         ledger.begin_attempt();
         let mut output = Vec::new();
+        let mut metadata =
+            new_pane_snapshot_metadata_ledger().expect("valid production metadata ledger");
+        metadata.begin_attempt();
         let error = append_floating_pane_snapshot(
             &mut output,
             window_id,
             tab.as_ref(),
             "floating-panic-workspace",
             &mut ledger,
+            &mut metadata,
         )
         .expect_err("a floating getter panic must fail the provisional projection");
 
@@ -8168,7 +8701,34 @@ mod tests {
             output.is_empty(),
             "no earlier floating entry may publish when a later getter panics"
         );
-        assert_eq!(ledger.attempt_stats().pane_callbacks, 12);
+        assert_eq!(
+            ledger.attempt_stats().pane_callbacks,
+            8,
+            "the first float consumes six callbacks; the second admits its title before the injected dimensions panic"
+        );
+
+        metadata
+            .release_attempt_to(Default::default())
+            .expect("direct helper test releases its failed provisional metadata");
+        let _ = metadata.take_retry_released_bytes();
+        ledger.begin_attempt();
+        metadata.begin_attempt();
+        let mut cooperator = PaneSnapshotCooperator::new("test-pdu82-floating-panic");
+        let error = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
+            &mux,
+            &mut ignore_list_panes_snapshot_stage,
+            &mut ledger,
+            &mut metadata,
+            &mut cooperator,
+        ))
+        .expect_err("the full producer must contain the floating getter panic");
+        assert!(format!("{error:#}").contains("floating-pane callback panicked"));
+        assert_eq!(
+            metadata.attempt_stats(),
+            mux::tab::PaneSnapshotMetadataStats::default(),
+            "failed collection must release every provisional owned metadata value"
+        );
+        assert!(metadata.take_retry_released_bytes() > 0);
     }
 
     #[test]
