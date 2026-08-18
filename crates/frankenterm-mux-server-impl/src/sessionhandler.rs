@@ -7899,7 +7899,7 @@ mod tests {
     }
 
     #[test]
-    fn live_pdu82_uses_one_cumulative_census_ledger_across_tabs() {
+    fn pane_snapshot_census_live_pdu82_uses_one_cumulative_ledger_across_tabs() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -7982,10 +7982,12 @@ mod tests {
         .detach();
 
         let input_order = Arc::clone(&order);
-        spawn_into_main_thread(async move {
+        match try_spawn_with_admission(MainThreadServiceClass::Input, 1, async move {
             input_order.lock().unwrap().push("queued-input");
-        })
-        .detach();
+        }) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned.detach(),
+            outcome => panic!("expected queued input admission, got {outcome:?}"),
+        }
 
         drain_simple_executor(&executor);
         assert_eq!(
