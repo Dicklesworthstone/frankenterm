@@ -1764,8 +1764,7 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should complete handshake");
 
-        let err = client
-            .get_pane_render_changes_with_cx(&cancelled_cx, 27)
+        let err = Box::pin(client.get_pane_render_changes_with_cx(&cancelled_cx, 27))
             .await
             .expect_err(
                 "get_pane_render_changes_with_cx should fail fast for a pre-cancelled context",
@@ -2462,8 +2461,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
         let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
-        let err = client
-            .get_pane_render_changes_with_cx(&cx, 77)
+        let err = Box::pin(client.get_pane_render_changes_with_cx(&cx, 77))
             .await
             .expect_err("get_pane_render_changes_with_cx should time out when the peer stalls");
         assert!(
