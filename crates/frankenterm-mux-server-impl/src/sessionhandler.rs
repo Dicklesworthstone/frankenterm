@@ -3782,9 +3782,18 @@ impl PaneSnapshotCooperator {
 fn record_pane_snapshot_census_metrics(
     family: &'static str,
     ledger: &mux::tab::PaneSnapshotCensusLedger,
+    is_retry: bool,
 ) {
     let attempt = ledger.attempt_stats();
     let request = ledger.request_stats();
+    for (category, work) in pane_snapshot_census_category_work(attempt) {
+        metrics::counter!(
+            "mux.server.pane_snapshot_census.category_work_total",
+            "family" => family,
+            "category" => category
+        )
+        .increment(u64::try_from(work).unwrap_or(u64::MAX));
+    }
     for (scope, stats) in [("attempt", attempt), ("request", request)] {
         for (category, work) in pane_snapshot_census_category_work(stats) {
             metrics::histogram!(
@@ -3800,8 +3809,11 @@ fn record_pane_snapshot_census_metrics(
         .record(attempt.total().unwrap_or(usize::MAX) as f64);
     metrics::histogram!("mux.server.pane_snapshot_census.request_work", "family" => family)
         .record(request.total().unwrap_or(usize::MAX) as f64);
+    let retry_work = pane_snapshot_census_retry_work(is_retry, attempt);
+    metrics::counter!("mux.server.pane_snapshot_census.retry_work_total", "family" => family)
+        .increment(u64::try_from(retry_work).unwrap_or(u64::MAX));
     metrics::histogram!("mux.server.pane_snapshot_census.retry_work", "family" => family)
-        .record(pane_snapshot_census_retry_work(attempt, request) as f64);
+        .record(retry_work as f64);
     if let Some(rejection) = ledger.last_rejection() {
         let reason = match rejection {
             mux::tab::PaneSnapshotCensusRejection::AttemptOverflow => "attempt_overflow",
@@ -3832,17 +3844,14 @@ fn pane_snapshot_census_category_work(
 }
 
 fn pane_snapshot_census_retry_work(
+    is_retry: bool,
     attempt: mux::tab::PaneSnapshotCensusStats,
-    request: mux::tab::PaneSnapshotCensusStats,
 ) -> usize {
-    request
-        .total()
-        .and_then(|request| {
-            attempt
-                .total()
-                .and_then(|attempt| request.checked_sub(attempt))
-        })
-        .unwrap_or(usize::MAX)
+    if is_retry {
+        attempt.total().unwrap_or(usize::MAX)
+    } else {
+        0
+    }
 }
 
 fn pane_arena_tree_into_legacy(
@@ -4016,7 +4025,7 @@ async fn collect_list_panes_snapshot_with_stage_observer(
         &mut cooperator,
     )
     .await;
-    record_pane_snapshot_census_metrics("pdu82", &ledger);
+    record_pane_snapshot_census_metrics("pdu82", &ledger, false);
     metrics::histogram!("mux.server.pane_snapshot_census.yields", "family" => "pdu82")
         .record(cooperator.yields() as f64);
     response
@@ -4158,7 +4167,7 @@ async fn collect_coherent_list_panes_snapshot_with_stage_observer(
             &mut cooperator,
         )
         .await;
-        record_pane_snapshot_census_metrics("pdu82", &ledger);
+        record_pane_snapshot_census_metrics("pdu82", &ledger, attempt > 1);
         let panes = panes?;
 
         let (after_session, after_revision) = match mux.topology_snapshot_authority() {
@@ -4520,7 +4529,7 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
             Ok::<(), anyhow::Error>(())
         }
         .await;
-        record_pane_snapshot_census_metrics("pdu87", &ledger);
+        record_pane_snapshot_census_metrics("pdu87", &ledger, attempt > 1);
         collection?;
         observer(ListPanesSnapshotStage::TitlesCaptured);
 
@@ -8094,12 +8103,8 @@ mod tests {
                 ("assembly_nodes", 8),
             ]
         );
-        assert_eq!(pane_snapshot_census_retry_work(attempt, request), 8);
-        assert_eq!(
-            pane_snapshot_census_retry_work(request, attempt),
-            usize::MAX,
-            "an impossible regressing cumulative total must fail closed in telemetry"
-        );
+        assert_eq!(pane_snapshot_census_retry_work(false, request), 0);
+        assert_eq!(pane_snapshot_census_retry_work(true, attempt), 36);
     }
 
     #[test]
