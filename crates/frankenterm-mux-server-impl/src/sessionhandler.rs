@@ -4035,6 +4035,23 @@ fn record_pane_snapshot_metadata_retry_release(
     .increment(u64::try_from(released).unwrap_or(u64::MAX));
 }
 
+/// Preserve rejection and high-water observability for failures that happen
+/// before an ordered snapshot reaches its common pane-collection metrics
+/// boundary. Window/order freezing is independently fallible and must report
+/// through the same request-scoped ledgers.
+fn record_ordered_snapshot_precollection_result<T>(
+    result: anyhow::Result<T>,
+    census_ledger: &mux::tab::PaneSnapshotCensusLedger,
+    metadata_ledger: &mut mux::tab::PaneSnapshotMetadataLedger,
+    is_retry: bool,
+) -> anyhow::Result<T> {
+    if result.is_err() {
+        record_pane_snapshot_census_metrics("pdu87", census_ledger, is_retry);
+        record_pane_snapshot_metadata_metrics("pdu87", metadata_ledger);
+    }
+    result
+}
+
 fn pane_snapshot_census_category_work(
     stats: mux::tab::PaneSnapshotCensusStats,
 ) -> [(&'static str, usize); 8] {
@@ -4774,64 +4791,80 @@ async fn collect_ordered_list_panes_snapshot_with_stage_observer(
             return Ok(codec::ListPanesOrderedV1Outcome::RevisionExhausted);
         }
 
-        let mut window_ids = mux.iter_windows();
-        window_ids.sort_unstable();
-        checked_ordered_snapshot_window_count(window_ids.len())?;
-        observer(ListPanesSnapshotStage::WindowsEnumerated);
+        // Freeze every fallible precollection step behind one metrics boundary.
+        // Future fields added to this phase therefore cannot accidentally
+        // bypass rejection/high-water reporting by using `?`.
+        let preparation: anyhow::Result<_> = (|| {
+            let mut window_ids = mux.iter_windows();
+            window_ids.sort_unstable();
+            checked_ordered_snapshot_window_count(window_ids.len())?;
+            observer(ListPanesSnapshotStage::WindowsEnumerated);
 
-        let mut frozen_windows = Vec::with_capacity(window_ids.len());
-        let mut total_tabs = 0usize;
-        for window_id in window_ids {
-            let frozen = mux
-                .get_window(window_id)
-                .map(|window| -> anyhow::Result<_> {
-                    let order = window.order_snapshot()?;
-                    metadata_ledger.preflight_required_string(
-                        mux::tab::PaneSnapshotMetadataField::WindowTitle,
-                        window.get_title(),
-                    )?;
-                    metadata_ledger.preflight_retained_only_string(
-                        mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
-                        window.get_workspace(),
-                    )?;
-                    let title = window.get_title().to_string();
-                    metadata_ledger.admit_required_owned(
-                        mux::tab::PaneSnapshotMetadataField::WindowTitle,
-                        &title,
-                        title.capacity(),
-                    )?;
-                    let workspace = window.get_workspace().to_string();
-                    metadata_ledger.admit_retained_only_owned(
-                        mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
-                        &workspace,
-                        workspace.capacity(),
-                    )?;
-                    Ok(FrozenOrderedSnapshotWindow {
-                        title,
-                        workspace,
-                        order,
-                    })
-                });
-            let Some(frozen) = frozen else {
-                // A concurrent removal advances the topology revision. The
-                // final authority read rejects this partial attempt.
-                continue;
-            };
-            let frozen = frozen
-                .with_context(|| format!("freezing ordered state for mux window {window_id}"))?;
-            total_tabs =
-                checked_ordered_snapshot_tab_total(total_tabs, frozen.order.ordered_tabs().len())?;
-            frozen_windows.push(frozen);
-        }
-        observer(ListPanesSnapshotStage::OrderedWindowsFrozen);
+            let mut frozen_windows = Vec::with_capacity(window_ids.len());
+            let mut total_tabs = 0usize;
+            for window_id in window_ids {
+                let frozen = mux
+                    .get_window(window_id)
+                    .map(|window| -> anyhow::Result<_> {
+                        let order = window.order_snapshot()?;
+                        metadata_ledger.preflight_required_string(
+                            mux::tab::PaneSnapshotMetadataField::WindowTitle,
+                            window.get_title(),
+                        )?;
+                        metadata_ledger.preflight_retained_only_string(
+                            mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+                            window.get_workspace(),
+                        )?;
+                        let title = window.get_title().to_string();
+                        metadata_ledger.admit_required_owned(
+                            mux::tab::PaneSnapshotMetadataField::WindowTitle,
+                            &title,
+                            title.capacity(),
+                        )?;
+                        let workspace = window.get_workspace().to_string();
+                        metadata_ledger.admit_retained_only_owned(
+                            mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+                            &workspace,
+                            workspace.capacity(),
+                        )?;
+                        Ok(FrozenOrderedSnapshotWindow {
+                            title,
+                            workspace,
+                            order,
+                        })
+                    });
+                let Some(frozen) = frozen else {
+                    // A concurrent removal advances the topology revision. The
+                    // final authority read rejects this partial attempt.
+                    continue;
+                };
+                let frozen = frozen.with_context(|| {
+                    format!("freezing ordered state for mux window {window_id}")
+                })?;
+                total_tabs = checked_ordered_snapshot_tab_total(
+                    total_tabs,
+                    frozen.order.ordered_tabs().len(),
+                )?;
+                frozen_windows.push(frozen);
+            }
+            observer(ListPanesSnapshotStage::OrderedWindowsFrozen);
 
-        let mut ordered_windows = Vec::with_capacity(frozen_windows.len());
-        for frozen in &frozen_windows {
-            ordered_windows.push(
-                ordered_window_adapter::mux_frozen_window_order_to_codec(&frozen.order)
-                    .context("converting frozen mux window order for PDU87")?,
-            );
-        }
+            let mut ordered_windows = Vec::with_capacity(frozen_windows.len());
+            for frozen in &frozen_windows {
+                ordered_windows.push(
+                    ordered_window_adapter::mux_frozen_window_order_to_codec(&frozen.order)
+                        .context("converting frozen mux window order for PDU87")?,
+                );
+            }
+            Ok((frozen_windows, ordered_windows, total_tabs))
+        })();
+        let (mut frozen_windows, ordered_windows, total_tabs) =
+            record_ordered_snapshot_precollection_result(
+                preparation,
+                &ledger,
+                &mut metadata_ledger,
+                attempt > 1,
+            )?;
 
         let mut pane_trees = Vec::with_capacity(total_tabs);
         let mut pane_nodes = Vec::new();
@@ -8309,6 +8342,54 @@ mod tests {
             .expect("attach snapshot-stage tab to its window");
         drop(window);
         window_id
+    }
+
+    #[test]
+    fn ordered_snapshot_precollection_error_crosses_metadata_metrics_boundary() {
+        let limits = mux::tab::PaneSnapshotMetadataLimits::new([4; 7], 16, 32, 32, 64);
+        let mut metadata = mux::tab::PaneSnapshotMetadataLedger::new(limits)
+            .expect("test metadata limits are valid");
+        metadata.begin_attempt();
+        let admitted = "ok".to_string();
+        metadata
+            .admit_required_owned(
+                mux::tab::PaneSnapshotMetadataField::WindowTitle,
+                &admitted,
+                admitted.capacity(),
+            )
+            .expect("seed one unreported admitted value");
+        let rejection = metadata
+            .preflight_required_string(
+                mux::tab::PaneSnapshotMetadataField::WindowWorkspace,
+                "12345",
+            )
+            .expect_err("the precollection field must exceed its four-byte ceiling");
+        let mut census =
+            mux::tab::PaneSnapshotCensusLedger::new(8, 16).expect("test census limits are valid");
+        census.begin_attempt();
+
+        let returned = record_ordered_snapshot_precollection_result::<()>(
+            Err(rejection.into()),
+            &census,
+            &mut metadata,
+            false,
+        )
+        .expect_err("the metrics boundary must preserve the original failure");
+
+        assert!(
+            returned
+                .downcast_ref::<mux::tab::PaneSnapshotMetadataRejection>()
+                .is_some(),
+            "the content-free typed rejection must survive metrics recording"
+        );
+        assert_eq!(metadata.last_rejection(), Some(rejection));
+        assert!(
+            metadata
+                .take_unreported_admitted_values()
+                .into_iter()
+                .all(|(_, count)| count == 0),
+            "the error path must emit and drain pending admission counters exactly once"
+        );
     }
 
     #[test]
