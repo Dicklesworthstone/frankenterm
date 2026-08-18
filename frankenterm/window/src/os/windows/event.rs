@@ -25,15 +25,19 @@ impl EventHandle {
         Ok(Self(handle))
     }
 
-    pub fn set_event(&self) {
-        unsafe {
-            SetEvent(self.0);
+    pub fn set_event(&self) -> std::io::Result<()> {
+        if unsafe { SetEvent(self.0) } == 0 {
+            Err(IoError::last_os_error())
+        } else {
+            Ok(())
         }
     }
 
-    pub fn reset_event(&self) {
-        unsafe {
-            ResetEvent(self.0);
+    pub fn reset_event(&self) -> std::io::Result<()> {
+        if unsafe { ResetEvent(self.0) } == 0 {
+            Err(IoError::last_os_error())
+        } else {
+            Ok(())
         }
     }
 }

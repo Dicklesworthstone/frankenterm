@@ -431,7 +431,6 @@ impl<R> MainThreadSpawnedTask<R> {
         self.initial_enqueue
     }
 
-    #[must_use]
     pub fn into_task(self) -> Task<R> {
         self.task
     }
@@ -1527,11 +1526,22 @@ const SIMPLE_EXECUTOR_HIGH_PRIORITY_BURST: usize = 16;
 const SIMPLE_EXECUTOR_IDLE_POLL: Duration = Duration::from_millis(250);
 
 lazy_static::lazy_static! {
-    static ref SIMPLE_EXECUTOR_IDENTITIES: MainThreadSchedulerIdentityAuthority =
+    static ref MAIN_THREAD_SCHEDULER_IDENTITIES: MainThreadSchedulerIdentityAuthority =
         MainThreadSchedulerIdentityAuthority::new(
             NonZeroU64::new(1).expect("one is nonzero"),
             NonZeroU64::new(1).expect("one is nonzero"),
         );
+}
+
+/// Allocate one process-unique, nonwrapping main-thread scheduler identity.
+///
+/// Every scheduler implementation must draw from this shared authority.  A
+/// GUI queue replacing a headless executor (or the reverse) must not be able
+/// to reuse the retired queue/generation pair and make stale receipts appear
+/// current again.
+pub fn try_allocate_main_thread_scheduler_identity()
+-> std::result::Result<MainThreadSchedulerIdentity, MainThreadSchedulerIdentityExhausted> {
+    MAIN_THREAD_SCHEDULER_IDENTITIES.try_allocate()
 }
 
 struct SimpleExecutorBoundedItem {
@@ -1762,7 +1772,7 @@ impl SimpleExecutor {
     pub fn try_with_limits(
         limits: MainThreadAdmissionLimits,
     ) -> std::result::Result<Self, MainThreadSchedulerIdentityExhausted> {
-        let identity = SIMPLE_EXECUTOR_IDENTITIES.try_allocate()?;
+        let identity = try_allocate_main_thread_scheduler_identity()?;
         let queue = Arc::new(SimpleExecutorQueue::new(identity, limits));
 
         let legacy_high = Arc::clone(&queue);
@@ -2045,6 +2055,14 @@ mod tests {
             Err(MainThreadSchedulerIdentityExhausted),
             "identity exhaustion must remain terminal without wrapping"
         );
+    }
+
+    #[test]
+    fn process_scheduler_identity_authority_never_reuses_a_cross_executor_generation() {
+        let first = try_allocate_main_thread_scheduler_identity().unwrap();
+        let second = try_allocate_main_thread_scheduler_identity().unwrap();
+        assert_ne!(first.queue_id, second.queue_id);
+        assert_ne!(first.scheduler_generation, second.scheduler_generation);
     }
 
     #[test]
