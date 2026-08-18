@@ -11005,7 +11005,10 @@ mod test {
                 &mut ledger,
             )
             .unwrap_or_else(|error| {
-                panic!("one-leaf tab {pane_id} exceeded the aggregate budget: {error:#}")
+                panic!(
+                    "one-leaf tab {} exceeded the aggregate budget: {:#}",
+                    pane_id, error
+                )
             });
         }
 
