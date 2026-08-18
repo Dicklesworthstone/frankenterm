@@ -10975,6 +10975,88 @@ mod test {
         );
     }
 
+    #[test]
+    fn pane_snapshot_census_ledger_bounds_sixteen_thousand_one_leaf_tabs() {
+        const TAB_COUNT: usize = 16_384;
+        const WORK_PER_TAB: usize = 19;
+
+        let size = TerminalSize::default();
+        let exact_work = TAB_COUNT
+            .checked_mul(WORK_PER_TAB)
+            .expect("large-session census work fits usize");
+        let mut ledger =
+            PaneSnapshotCensusLedger::new(exact_work, exact_work).expect("valid scale ledger");
+        ledger.begin_attempt();
+        let mut arena = Vec::new();
+        arena
+            .try_reserve_exact(TAB_COUNT)
+            .expect("reserve bounded scale-test arena");
+
+        for pane_id in 0..TAB_COUNT {
+            let tab = Tab::new(&size);
+            tab.assign_pane(&FakePane::new(100_000 + pane_id, size));
+            tab.append_codec_pane_arena_in_window_with_census_ledger(
+                11,
+                "large-session-ledger-workspace",
+                &mut arena,
+                64,
+                TAB_COUNT,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut ledger,
+            )
+            .unwrap_or_else(|error| {
+                panic!("one-leaf tab {pane_id} exceeded the aggregate budget: {error:#}")
+            });
+        }
+
+        assert_eq!(arena.len(), TAB_COUNT);
+        assert_eq!(ledger.attempt_stats().total(), Some(exact_work));
+        assert_eq!(ledger.request_stats().total(), Some(exact_work));
+        assert_eq!(ledger.last_rejection(), None);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn pane_snapshot_census_work_is_linear_across_generated_one_leaf_tabs(
+            tab_count in 1_usize..=128,
+        ) {
+            const WORK_PER_TAB: usize = 19;
+
+            let size = TerminalSize::default();
+            let exact_work = tab_count * WORK_PER_TAB;
+            let mut ledger = PaneSnapshotCensusLedger::new(exact_work, exact_work)
+                .expect("generated ledger limits are valid");
+            ledger.begin_attempt();
+            let mut arena = Vec::new();
+
+            for pane_id in 0..tab_count {
+                let tab = Tab::new(&size);
+                tab.assign_pane(&FakePane::new(200_000 + pane_id, size));
+                let result = tab.append_codec_pane_arena_in_window_with_census_ledger(
+                    12,
+                    "generated-ledger-workspace",
+                    &mut arena,
+                    64,
+                    tab_count,
+                    TEST_ORDERED_PANE_CENSUS_WORK,
+                    &mut ledger,
+                );
+                prop_assert!(
+                    result.is_ok(),
+                    "generated one-leaf tab {pane_id} failed: {:#}",
+                    result.expect_err("failed result carries its error")
+                );
+            }
+
+            prop_assert_eq!(arena.len(), tab_count);
+            prop_assert_eq!(ledger.attempt_stats().total(), Some(exact_work));
+            prop_assert_eq!(ledger.request_stats().total(), Some(exact_work));
+            prop_assert_eq!(ledger.last_rejection(), None);
+        }
+    }
+
     fn flatten_legacy_pane_node_for_test(node: &PaneNode, arena: &mut Vec<PaneArenaNode>) -> u32 {
         let index = u32::try_from(arena.len()).expect("test arena fits u32");
         arena.push(PaneArenaNode::Empty);
