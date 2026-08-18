@@ -5156,6 +5156,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const COMPRESSED_MASK: u64 = 1 << 63;
+    // Stay below the default 4 MiB frame limit while exceeding ordinary Unix
+    // socket send buffers, so timeout/cancellation tests reach transport
+    // backpressure instead of failing at pre-write frame admission.
+    const TRANSPORT_BACKPRESSURE_PASTE_BYTES: usize = 3 * 1024 * 1024;
 
     fn decode_u64_leb128_prefix(bytes: &[u8]) -> Option<u64> {
         let mut value = 0u64;
@@ -12374,7 +12378,7 @@ mod tests {
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             client.config.write_timeout = Duration::from_millis(5);
 
-            let payload = "x".repeat(32 * 1024 * 1024);
+            let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
             let err = client
                 .send_paste(0, payload)
                 .await
@@ -12465,7 +12469,7 @@ mod tests {
                 .expect("connect with cx");
             client.config.write_timeout = Duration::from_millis(5);
 
-            let payload = "x".repeat(32 * 1024 * 1024);
+            let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
             let err = client
                 .send_paste_with_cx(&cx, 0, payload)
                 .await
@@ -12557,7 +12561,7 @@ mod tests {
                 );
             });
 
-            let payload = "x".repeat(32 * 1024 * 1024);
+            let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
             let err = client
                 .send_paste_with_cx(&cx, 0, payload)
                 .await

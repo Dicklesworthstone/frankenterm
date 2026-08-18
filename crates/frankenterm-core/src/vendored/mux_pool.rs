@@ -1489,6 +1489,16 @@ mod tests {
         }
     }
 
+    /// Exercise caller cancellation without simultaneously exhausting a
+    /// separate capability. A zero poll quota has its own typed authority
+    /// (`PoolError::PollQuotaExhausted`) and is not a proxy for user
+    /// cancellation.
+    fn user_cancelled_test_cx(message: &'static str) -> Cx {
+        let cx = Cx::for_testing();
+        cx.cancel_with(CancelKind::User, Some(message));
+        cx
+    }
+
     #[test]
     fn mux_pool_telemetry_counter_saturates_instead_of_wrapping() {
         let counter = AtomicU64::new(u64::MAX - 1);
@@ -4429,12 +4439,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("pre-cancelled mux pool list"),
-            );
+            let cx = user_cancelled_test_cx("pre-cancelled mux pool list");
 
             let err = pool
                 .list_panes_with_cx(&cx)
@@ -4639,12 +4644,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("pre-cancelled mux pool health check"),
-            );
+            let cx = user_cancelled_test_cx("pre-cancelled mux pool health check");
 
             let err = pool
                 .health_check_with_cx(&cx)
@@ -4682,12 +4682,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("pre-cancelled mux pool get_lines"),
-            );
+            let cx = user_cancelled_test_cx("pre-cancelled mux pool get_lines");
 
             let err = pool
                 .get_lines_with_cx(&cx, 9, std::iter::once(0..5).collect())
@@ -4725,12 +4720,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("pre-cancelled mux pool write_to_pane"),
-            );
+            let cx = user_cancelled_test_cx("pre-cancelled mux pool write_to_pane");
 
             let err = pool
                 .write_to_pane_with_cx(&cx, 21, b"echo from cancelled cx\n".to_vec())
@@ -4768,12 +4758,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("pre-cancelled mux pool send_paste"),
-            );
+            let cx = user_cancelled_test_cx("pre-cancelled mux pool send_paste");
 
             let err = pool
                 .send_paste_with_cx(&cx, 22, "cancelled paste\n".to_string())
@@ -5119,12 +5104,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("precancelled get_lines recovery-enabled"),
-            );
+            let cx = user_cancelled_test_cx("precancelled get_lines recovery-enabled");
 
             let err = pool
                 .get_lines_with_cx(&cx, 42, std::iter::once(0..10).collect())
@@ -5171,12 +5151,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("precancelled write_to_pane recovery-enabled"),
-            );
+            let cx = user_cancelled_test_cx("precancelled write_to_pane recovery-enabled");
 
             let err = pool
                 .write_to_pane_with_cx(&cx, 7, b"recovery test\n".to_vec())
@@ -5222,12 +5197,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("precancelled send_paste recovery-enabled"),
-            );
+            let cx = user_cancelled_test_cx("precancelled send_paste recovery-enabled");
 
             let err = pool
                 .send_paste_with_cx(&cx, 8, "paste recovery test\n".to_string())
@@ -5273,12 +5243,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("precancelled multi-op"),
-            );
+            let cx = user_cancelled_test_cx("precancelled multi-op");
 
             // Run all three precancelled operations in sequence.
             let _ = pool
@@ -5324,12 +5289,7 @@ mod tests {
             assert_eq!(stats_after_success.pool.total_returned, 1);
 
             // Now run precancelled operations — they must not touch the pool.
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let bad_cx = Cx::for_testing_with_budget(budget);
-            bad_cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("precancelled after success"),
-            );
+            let bad_cx = user_cancelled_test_cx("precancelled after success");
 
             let _ = pool
                 .get_lines_with_cx(&bad_cx, 1, std::iter::once(0..5).collect())
@@ -5381,12 +5341,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("precancelled get_pane_render_changes"),
-            );
+            let cx = user_cancelled_test_cx("precancelled get_pane_render_changes");
 
             let err = pool
                 .get_pane_render_changes_with_cx(&cx, 99)
@@ -5427,12 +5382,7 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(
-                crate::outcome::CancelKind::User,
-                Some("precancelled batch render"),
-            );
+            let cx = user_cancelled_test_cx("precancelled batch render");
 
             let err = pool
                 .get_pane_render_changes_batch_with_cx(&cx, vec![1, 2, 3])
@@ -5565,15 +5515,12 @@ mod tests {
             })
         }
 
-        /// Construct a cancelled Cx suitable for short-circuit tests.
-        /// Uses `for_testing_with_budget` rather than the LabRuntime Cx
-        /// because the short-circuit path must observe a pre-cancelled
-        /// Cx that was never running inside a runtime.
+        /// Construct a cancelled Cx suitable for short-circuit tests. The
+        /// outer helper deliberately uses a standalone test context rather
+        /// than the LabRuntime context, while preserving user cancellation as
+        /// the sole interruption authority.
         fn pre_cancelled_cx(msg: &'static str) -> Cx {
-            let budget = crate::cx::Budget::new().with_poll_quota(0);
-            let cx = Cx::for_testing_with_budget(budget);
-            cx.cancel_with(crate::outcome::CancelKind::User, Some(msg));
-            cx
+            user_cancelled_test_cx(msg)
         }
 
         /// 1. Config defaults are stable and match MuxPool's advertised

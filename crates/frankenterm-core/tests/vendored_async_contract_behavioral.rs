@@ -43,6 +43,12 @@ use frankenterm_core::{
         SubscriptionConfig, subscribe_pane_output_with_inherited_cx,
     },
 };
+
+// Stay below the default 4 MiB frame limit while exceeding ordinary Unix
+// socket send buffers, so the write-timeout scenario reaches transport
+// backpressure instead of failing at pre-write frame admission.
+#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+const TRANSPORT_BACKPRESSURE_PASTE_BYTES: usize = 3 * 1024 * 1024;
 #[cfg(all(feature = "vendored", unix))]
 use frankenterm_core::{
     pool::PoolError,
@@ -1117,7 +1123,7 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
             .await
             .expect("connect_with_cx");
 
-        let payload = "x".repeat(32 * 1024 * 1024);
+        let payload = "x".repeat(TRANSPORT_BACKPRESSURE_PASTE_BYTES);
         let err = Box::pin(client.send_paste_with_cx(&cx, 0, payload))
             .await
             .expect_err("send_paste_with_cx should time out when the peer stops reading");
