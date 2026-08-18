@@ -361,7 +361,7 @@ fn pane_identity(pane: &Arc<dyn Pane>) -> PaneIdentity {
     Arc::as_ptr(pane).cast::<()>()
 }
 
-/// Exact callback-free and callback work charged while producing pane snapshots.
+/// Exact callback-free and callback work admitted while producing pane snapshots.
 ///
 /// These fields are intentionally numeric and content-free so callers can retain
 /// high-water telemetry without exposing pane titles, working directories, or
@@ -660,6 +660,9 @@ fn callback_snapshot_matches_bounded(
     observed: &HashMap<PaneIdentity, PaneId>,
     ledger: &mut PaneSnapshotCensusLedger,
 ) -> anyhow::Result<bool> {
+    if current.len() != observed.len() {
+        return Ok(false);
+    }
     let identity_work = current
         .len()
         .checked_mul(2)
@@ -3516,11 +3519,7 @@ impl Tab {
                 }
 
                 let observed = observed?;
-                if !callback_snapshot_matches_bounded(
-                    &current.panes,
-                    &observed.pane_ids,
-                    ledger,
-                )? {
+                if !callback_snapshot_matches_bounded(&current.panes, &observed.pane_ids, ledger)? {
                     continue;
                 }
                 {
@@ -7099,13 +7098,13 @@ impl TabInner {
     /// Fallibly census one ordered-snapshot tab before invoking pane code.
     ///
     /// The tree limit counts every `Tree` node, including `Empty`; the census
-    /// limit counts every raw carrier visited across tree leaves, stack
-    /// containers and members, floating panes, and the zoom carrier; it also
-    /// caps the smaller set of unique pane identities. Both are deliberately
-    /// enforced while `Tab::inner` is held and before `Pane::pane_id` or any
-    /// rendering callback can run. This prevents a topology that will be
-    /// rejected by the wire contract from first consuming unbounded native
-    /// traversal, callback, or identity-snapshot work.
+    /// limit counts every raw carrier visited across empty/split/leaf tree
+    /// nodes, stack containers and members, floating panes, and the zoom
+    /// carrier; it also caps the smaller set of unique pane identities. Both
+    /// are deliberately enforced while `Tab::inner` is held and before
+    /// `Pane::pane_id` or any rendering callback can run. This prevents a
+    /// topology that will be rejected by the wire contract from first consuming
+    /// unbounded native traversal, callback, or identity-snapshot work.
     fn snapshot_panes_callback_free_bounded(
         &self,
         max_depth: usize,
@@ -10785,7 +10784,7 @@ mod test {
         let tab = Tab::new(&size);
         tab.assign_pane(&FakePane::new(71, size));
 
-        let mut exact = PaneSnapshotCensusLedger::new(18, 18).expect("valid exact ledger");
+        let mut exact = PaneSnapshotCensusLedger::new(19, 19).expect("valid exact ledger");
         exact.begin_attempt();
         let mut exact_arena = Vec::new();
         let receipt = tab
@@ -10798,13 +10797,17 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
                 &mut exact,
             )
-            .expect("one leaf consumes exactly eighteen work units");
-        assert_eq!(receipt.work.total(), Some(18));
-        assert_eq!(exact.attempt_stats().total(), Some(18));
-        assert_eq!(exact.request_stats().total(), Some(18));
+            .expect("one leaf consumes exactly nineteen work units");
+        assert_eq!(receipt.work.total(), Some(19));
+        assert_eq!(receipt.work.tree_nodes, 2);
+        assert_eq!(receipt.work.identity_checks, 9);
+        assert_eq!(receipt.work.pane_callbacks, 7);
+        assert_eq!(receipt.work.assembly_nodes, 1);
+        assert_eq!(exact.attempt_stats().total(), Some(19));
+        assert_eq!(exact.request_stats().total(), Some(19));
         assert_eq!(exact_arena.len(), 1);
 
-        let mut short = PaneSnapshotCensusLedger::new(17, 17).expect("valid short ledger");
+        let mut short = PaneSnapshotCensusLedger::new(18, 18).expect("valid short ledger");
         short.begin_attempt();
         let mut rejected_arena = Vec::new();
         let error = tab
@@ -10820,6 +10823,12 @@ mod test {
             .expect_err("limit plus one must fail before arena publication");
         assert!(format!("{error:#}").contains("attempt census work budget exhausted"));
         assert!(rejected_arena.is_empty());
+        assert_eq!(short.attempt_stats().total(), Some(18));
+        assert_eq!(short.request_stats().total(), Some(18));
+        assert_eq!(
+            short.last_rejection(),
+            Some(PaneSnapshotCensusRejection::AttemptLimit)
+        );
     }
 
     #[test]
@@ -10831,7 +10840,9 @@ mod test {
             callback_count_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         });
         let tab = Tab::new(&size);
-        tab.assign_pane(&FakePane::new_with_callback_probe(72, size, false, false, probe));
+        tab.assign_pane(&FakePane::new_with_callback_probe(
+            72, size, false, false, probe,
+        ));
         let mut ledger = PaneSnapshotCensusLedger::new(10, 10).expect("valid callback ledger");
         ledger.begin_attempt();
         let mut arena = Vec::new();
@@ -10861,7 +10872,7 @@ mod test {
         let size = TerminalSize::default();
         let tab = Tab::new(&size);
         tab.assign_pane(&FakePane::new(73, size));
-        let mut ledger = PaneSnapshotCensusLedger::new(18, 35).expect("valid retry ledger");
+        let mut ledger = PaneSnapshotCensusLedger::new(19, 37).expect("valid retry ledger");
 
         for attempt in 0..2 {
             ledger.begin_attempt();
@@ -10885,6 +10896,8 @@ mod test {
                     ledger.last_rejection(),
                     Some(PaneSnapshotCensusRejection::RequestLimit)
                 );
+                assert_eq!(ledger.attempt_stats().total(), Some(18));
+                assert_eq!(ledger.request_stats().total(), Some(37));
             }
         }
 
@@ -10912,7 +10925,7 @@ mod test {
         let second = Tab::new(&size);
         second.assign_pane(&FakePane::new(75, size));
 
-        let mut exact = PaneSnapshotCensusLedger::new(36, 36).expect("valid two-tab ledger");
+        let mut exact = PaneSnapshotCensusLedger::new(38, 38).expect("valid two-tab ledger");
         exact.begin_attempt();
         let mut exact_arena = Vec::new();
         for tab in [&first, &second] {
@@ -10928,9 +10941,9 @@ mod test {
             .expect("both ordered-style tabs fit the exact shared budget");
         }
         assert_eq!(exact_arena.len(), 2);
-        assert_eq!(exact.attempt_stats().total(), Some(36));
+        assert_eq!(exact.attempt_stats().total(), Some(38));
 
-        let mut short = PaneSnapshotCensusLedger::new(35, 35).expect("valid short two-tab ledger");
+        let mut short = PaneSnapshotCensusLedger::new(37, 37).expect("valid short two-tab ledger");
         short.begin_attempt();
         let mut short_arena = Vec::new();
         first
@@ -10956,7 +10969,10 @@ mod test {
                 &mut short,
             )
             .expect_err("second ordered-style tab cannot reset the shared budget");
-        assert_eq!(short_arena, prefix, "failed tab append must preserve its arena prefix");
+        assert_eq!(
+            short_arena, prefix,
+            "failed tab append must preserve its arena prefix"
+        );
     }
 
     fn flatten_legacy_pane_node_for_test(node: &PaneNode, arena: &mut Vec<PaneArenaNode>) -> u32 {

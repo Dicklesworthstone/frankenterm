@@ -5689,9 +5689,9 @@ pub const MAX_ORDERED_PANE_TREE_DEPTH: usize = 64;
 pub const MAX_ORDERED_PANE_LEAVES_PER_TREE: usize = 4_096;
 pub const MAX_ORDERED_PANE_NODES_PER_TREE: usize = 8_191;
 /// Producer-side ceiling for raw pane carriers inspected per tab before any
-/// pane callback runs. This includes tree leaves, stack containers and stack
-/// members, floating panes, and zoom state; it is deliberately independent of
-/// the tab's position in the aggregate pane-node arena.
+/// pane callback runs. This includes every empty/split/leaf tree node, stack
+/// containers and members, floating panes, and zoom state; it is deliberately
+/// independent of the tab's position in the aggregate pane-node arena.
 pub const MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE: usize = 32_767;
 pub const MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT: usize = 16_384;
 pub const MAX_ORDERED_PANE_NODES_PER_SNAPSHOT: usize = 32_767;

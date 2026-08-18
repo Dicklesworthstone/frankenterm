@@ -3769,12 +3769,13 @@ fn pane_arena_tree_into_legacy(
         depth: usize,
     ) -> anyhow::Result<mux::tab::PaneNode> {
         if depth > codec::MAX_ORDERED_PANE_TREE_DEPTH {
-            return Err(anyhow!("bounded legacy pane-tree conversion exceeded its depth limit"));
+            return Err(anyhow!(
+                "bounded legacy pane-tree conversion exceeded its depth limit"
+            ));
         }
-        let node = slots
-            .get_mut(index)
-            .and_then(Option::take)
-            .ok_or_else(|| anyhow!("bounded legacy pane-tree conversion found an invalid or repeated node"))?;
+        let node = slots.get_mut(index).and_then(Option::take).ok_or_else(|| {
+            anyhow!("bounded legacy pane-tree conversion found an invalid or repeated node")
+        })?;
         Ok(match node {
             mux::tab::PaneArenaNode::Empty => mux::tab::PaneNode::Empty,
             mux::tab::PaneArenaNode::Leaf(entry) => mux::tab::PaneNode::Leaf(entry),
@@ -3797,10 +3798,12 @@ fn pane_arena_tree_into_legacy(
         node_count,
         tab_title,
     } = tree;
-    let node_count = usize::try_from(node_count)
-        .context("narrowing bounded legacy pane-tree node count")?;
+    let node_count =
+        usize::try_from(node_count).context("narrowing bounded legacy pane-tree node count")?;
     if node_count != nodes.len() {
-        return Err(anyhow!("bounded legacy pane-tree descriptor length mismatch"));
+        return Err(anyhow!(
+            "bounded legacy pane-tree descriptor length mismatch"
+        ));
     }
     let Some(root_index) = root_index else {
         if nodes.is_empty() {
@@ -3808,12 +3811,14 @@ fn pane_arena_tree_into_legacy(
         }
         return Err(anyhow!("bounded legacy pane-tree has nodes without a root"));
     };
-    let root_index = usize::try_from(root_index)
-        .context("narrowing bounded legacy pane-tree root")?;
+    let root_index =
+        usize::try_from(root_index).context("narrowing bounded legacy pane-tree root")?;
     let mut slots = nodes.into_iter().map(Some).collect::<Vec<_>>();
     let root = take_node(&mut slots, root_index, 1)?;
     if slots.iter().any(Option::is_some) {
-        return Err(anyhow!("bounded legacy pane-tree contains unreachable nodes"));
+        return Err(anyhow!(
+            "bounded legacy pane-tree contains unreachable nodes"
+        ));
     }
     Ok((root, tab_title))
 }
@@ -3917,11 +3922,8 @@ fn collect_list_panes_snapshot_with_stage_observer(
 ) -> anyhow::Result<ListPanesResponse> {
     let mut ledger = new_pane_snapshot_census_ledger()?;
     ledger.begin_attempt();
-    let response = collect_list_panes_snapshot_with_stage_observer_and_census(
-        mux,
-        observer,
-        &mut ledger,
-    );
+    let response =
+        collect_list_panes_snapshot_with_stage_observer_and_census(mux, observer, &mut ledger);
     record_pane_snapshot_census_metrics("pdu82", &ledger);
     response
 }
@@ -3954,25 +3956,24 @@ fn collect_list_panes_snapshot_with_stage_observer_and_census(
         };
         window_titles.insert(window_id, window_title);
         for tab in window_tabs {
-            let (tree, tab_title) = if let Some(tab_title) =
-                tab.empty_pane_tree_title_callback_free()
-            {
-                ledger.reserve_assembly_nodes(1)?;
-                (mux::tab::PaneNode::Empty, tab_title)
-            } else {
-                let mut arena = Vec::new();
-                let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
-                    window_id,
-                    &workspace,
-                    &mut arena,
-                    codec::MAX_ORDERED_PANE_TREE_DEPTH,
-                    codec::MAX_ORDERED_PANE_NODES_PER_TREE,
-                    codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
-                    ledger,
-                )?;
-                debug_assert!(receipt.work.total().is_some());
-                pane_arena_tree_into_legacy(receipt.tree, arena)?
-            };
+            let (tree, tab_title) =
+                if let Some(tab_title) = tab.empty_pane_tree_title_callback_free() {
+                    ledger.reserve_assembly_nodes(1)?;
+                    (mux::tab::PaneNode::Empty, tab_title)
+                } else {
+                    let mut arena = Vec::new();
+                    let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
+                        window_id,
+                        &workspace,
+                        &mut arena,
+                        codec::MAX_ORDERED_PANE_TREE_DEPTH,
+                        codec::MAX_ORDERED_PANE_NODES_PER_TREE,
+                        codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
+                        ledger,
+                    )?;
+                    debug_assert!(receipt.work.total().is_some());
+                    pane_arena_tree_into_legacy(receipt.tree, arena)?
+                };
             tabs.push(tree);
             append_floating_pane_snapshot(
                 &mut floating_panes,
@@ -4050,11 +4051,8 @@ fn collect_coherent_list_panes_snapshot_with_stage_observer(
             return Ok(ListPanesCoherentOutcome::RevisionExhausted);
         }
 
-        let panes = collect_list_panes_snapshot_with_stage_observer_and_census(
-            mux,
-            observer,
-            &mut ledger,
-        );
+        let panes =
+            collect_list_panes_snapshot_with_stage_observer_and_census(mux, observer, &mut ledger);
         record_pane_snapshot_census_metrics("pdu82", &ledger);
         let panes = panes?;
 
@@ -7864,7 +7862,7 @@ mod tests {
             "the rejected tab's callback bundle must not begin"
         );
 
-        let mut exact = mux::tab::PaneSnapshotCensusLedger::new(36, 36)
+        let mut exact = mux::tab::PaneSnapshotCensusLedger::new(38, 38)
             .expect("valid exact PDU82 census ledger");
         exact.begin_attempt();
         let snapshot = collect_list_panes_snapshot_with_stage_observer_and_census(
@@ -7875,7 +7873,7 @@ mod tests {
         .expect("two one-pane tabs consume the exact cumulative allowance");
         assert_eq!(snapshot.tabs.len(), 2);
         assert_eq!(snapshot.tab_titles.len(), 2);
-        assert_eq!(exact.attempt_stats().total(), Some(36));
+        assert_eq!(exact.attempt_stats().total(), Some(38));
     }
 
     fn expect_current_coherent_snapshot(
