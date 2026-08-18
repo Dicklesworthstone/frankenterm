@@ -10195,9 +10195,7 @@ mod tests {
             )
             .expect("topology events activate only after the fenced snapshot");
 
-        for inactive in [
-            79, 80, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,
-        ] {
+        for inactive in [79, 80, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95] {
             let spec = Pdu::wire_spec_for_ident(inactive).expect("inactive PDU remains assigned");
             let authority = spec
                 .authorities

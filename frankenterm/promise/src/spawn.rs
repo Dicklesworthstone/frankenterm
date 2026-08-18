@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_executor::Executor;
 use flume::bounded;
 #[cfg(test)]
@@ -1539,8 +1539,8 @@ lazy_static::lazy_static! {
 /// GUI queue replacing a headless executor (or the reverse) must not be able
 /// to reuse the retired queue/generation pair and make stale receipts appear
 /// current again.
-pub fn try_allocate_main_thread_scheduler_identity()
--> std::result::Result<MainThreadSchedulerIdentity, MainThreadSchedulerIdentityExhausted> {
+pub fn try_allocate_main_thread_scheduler_identity(
+) -> std::result::Result<MainThreadSchedulerIdentity, MainThreadSchedulerIdentityExhausted> {
     MAIN_THREAD_SCHEDULER_IDENTITIES.try_allocate()
 }
 
@@ -2251,11 +2251,9 @@ mod tests {
             NonZeroU64::new(18).unwrap(),
             MainThreadAdmissionLimits::new(2, 32, 0, 0).unwrap(),
         );
-        assert!(
-            replacement
-                .try_admit(MainThreadServiceClass::Input, 8)
-                .is_ok()
-        );
+        assert!(replacement
+            .try_admit(MainThreadServiceClass::Input, 8)
+            .is_ok());
     }
 
     #[test]
