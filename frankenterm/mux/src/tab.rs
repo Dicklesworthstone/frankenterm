@@ -440,6 +440,14 @@ enum PaneSnapshotCensusKind {
     AssemblyNode,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PaneSnapshotCensusRejection {
+    AttemptOverflow,
+    RequestOverflow,
+    AttemptLimit,
+    RequestLimit,
+}
+
 /// One request-scoped pane-snapshot work authority.
 ///
 /// `begin_attempt` resets only the per-attempt counter. The request counter is
@@ -451,6 +459,8 @@ pub struct PaneSnapshotCensusLedger {
     request_limit: usize,
     attempt: PaneSnapshotCensusStats,
     request: PaneSnapshotCensusStats,
+    last_rejection: Option<PaneSnapshotCensusRejection>,
+    callbacks_avoided: usize,
 }
 
 impl PaneSnapshotCensusLedger {
@@ -465,11 +475,15 @@ impl PaneSnapshotCensusLedger {
             request_limit,
             attempt: PaneSnapshotCensusStats::default(),
             request: PaneSnapshotCensusStats::default(),
+            last_rejection: None,
+            callbacks_avoided: 0,
         })
     }
 
     pub fn begin_attempt(&mut self) {
         self.attempt = PaneSnapshotCensusStats::default();
+        self.last_rejection = None;
+        self.callbacks_avoided = 0;
     }
 
     pub fn attempt_stats(&self) -> PaneSnapshotCensusStats {
@@ -485,25 +499,51 @@ impl PaneSnapshotCensusLedger {
             .saturating_sub(self.attempt.total().unwrap_or(usize::MAX))
     }
 
+    pub fn last_rejection(&self) -> Option<PaneSnapshotCensusRejection> {
+        self.last_rejection
+    }
+
+    pub fn callbacks_avoided(&self) -> usize {
+        self.callbacks_avoided
+    }
+
     pub fn reserve_pane_callbacks(&mut self, count: usize) -> anyhow::Result<()> {
         self.reserve(PaneSnapshotCensusKind::PaneCallback, count)
     }
 
+    pub fn reserve_assembly_nodes(&mut self, count: usize) -> anyhow::Result<()> {
+        self.reserve(PaneSnapshotCensusKind::AssemblyNode, count)
+    }
+
     fn reserve(&mut self, kind: PaneSnapshotCensusKind, count: usize) -> anyhow::Result<()> {
-        let next_attempt = self
+        let Some(next_attempt) = self
             .attempt
             .total()
             .and_then(|total| total.checked_add(count))
-            .context("pane-snapshot attempt census work overflow")?;
-        let next_request = self
+        else {
+            self.last_rejection = Some(PaneSnapshotCensusRejection::AttemptOverflow);
+            anyhow::bail!("pane-snapshot attempt census work overflow");
+        };
+        let Some(next_request) = self
             .request
             .total()
             .and_then(|total| total.checked_add(count))
-            .context("pane-snapshot request census work overflow")?;
+        else {
+            self.last_rejection = Some(PaneSnapshotCensusRejection::RequestOverflow);
+            anyhow::bail!("pane-snapshot request census work overflow");
+        };
         if next_attempt > self.per_attempt_limit {
+            self.last_rejection = Some(PaneSnapshotCensusRejection::AttemptLimit);
+            if matches!(kind, PaneSnapshotCensusKind::PaneCallback) {
+                self.callbacks_avoided = count;
+            }
             anyhow::bail!("pane-snapshot attempt census work budget exhausted");
         }
         if next_request > self.request_limit {
+            self.last_rejection = Some(PaneSnapshotCensusRejection::RequestLimit);
+            if matches!(kind, PaneSnapshotCensusKind::PaneCallback) {
+                self.callbacks_avoided = count;
+            }
             anyhow::bail!("pane-snapshot request census work budget exhausted");
         }
 
@@ -708,6 +748,7 @@ fn observe_ordered_panes_bounded(
     let identity_work = panes
         .len()
         .checked_mul(2)
+        .and_then(|work| work.checked_add(tree_leaf_count))
         .context("ordered pane-observation identity work overflow")?;
     ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, identity_work)?;
     let mut pane_ids = HashMap::new();
@@ -1781,7 +1822,7 @@ pub struct PaneArenaTree {
 
 /// One successfully appended tree plus the exact work consumed by all of its
 /// coherence attempts.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaneArenaAppendReceipt {
     pub tree: PaneArenaTree,
     pub work: PaneSnapshotCensusStats,
@@ -4139,6 +4180,17 @@ impl Tab {
 
     pub fn iter_floating_panes(&self) -> Vec<PositionedFloatingPane> {
         self.inner.lock().iter_floating_panes()
+    }
+
+    /// Return the title only when this tab currently has no tiled pane tree.
+    /// This preserves the legacy PDU82 empty-tab representation without
+    /// invoking pane code or weakening the ordered producer's stricter rules.
+    pub fn empty_pane_tree_title_callback_free(&self) -> Option<String> {
+        let inner = self.inner.lock();
+        match inner.pane.as_ref() {
+            None | Some(Tree::Empty) => Some(inner.title.clone()),
+            Some(Tree::Leaf(_) | Tree::Node { .. }) => None,
+        }
     }
 
     /// Snapshot a bounded floating-pane projection without invoking `Pane`
@@ -7227,6 +7279,7 @@ impl TabInner {
                     tree_leaf_identities.len()
                 )
             })?;
+        ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, 1)?;
         if owners.get(&active_identity) != Some(&CallbackFreePaneOwner::TreeLeaf(self.active)) {
             anyhow::bail!(
                 "tab {} ordered active pane index {} does not own its tree leaf",
@@ -7305,6 +7358,7 @@ impl TabInner {
                 )?;
                 members.push(identity);
                 if stack_index == active_index {
+                    ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, 1)?;
                     if identity != expected_active
                         || owners.get(&identity)
                             != Some(&CallbackFreePaneOwner::TreeLeaf(*slot_index))
@@ -10587,6 +10641,20 @@ mod test {
     }
 
     #[test]
+    fn callback_free_empty_tree_title_preserves_legacy_snapshot_shape() {
+        let size = TerminalSize::default();
+        let tab = Tab::new(&size);
+        tab.set_title("empty-legacy-tab");
+        assert_eq!(
+            tab.empty_pane_tree_title_callback_free().as_deref(),
+            Some("empty-legacy-tab")
+        );
+
+        tab.assign_pane(&FakePane::new(290, size));
+        assert_eq!(tab.empty_pane_tree_title_callback_free(), None);
+    }
+
+    #[test]
     fn codec_snapshot_uses_explicit_owner_metadata_and_observes_after_unlock() {
         let size = TerminalSize {
             rows: 24,
@@ -10717,7 +10785,7 @@ mod test {
         let tab = Tab::new(&size);
         tab.assign_pane(&FakePane::new(71, size));
 
-        let mut exact = PaneSnapshotCensusLedger::new(16, 16).expect("valid exact ledger");
+        let mut exact = PaneSnapshotCensusLedger::new(18, 18).expect("valid exact ledger");
         exact.begin_attempt();
         let mut exact_arena = Vec::new();
         let receipt = tab
@@ -10730,13 +10798,13 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
                 &mut exact,
             )
-            .expect("one leaf consumes exactly sixteen work units");
-        assert_eq!(receipt.work.total(), Some(16));
-        assert_eq!(exact.attempt_stats().total(), Some(16));
-        assert_eq!(exact.request_stats().total(), Some(16));
+            .expect("one leaf consumes exactly eighteen work units");
+        assert_eq!(receipt.work.total(), Some(18));
+        assert_eq!(exact.attempt_stats().total(), Some(18));
+        assert_eq!(exact.request_stats().total(), Some(18));
         assert_eq!(exact_arena.len(), 1);
 
-        let mut short = PaneSnapshotCensusLedger::new(15, 15).expect("valid short ledger");
+        let mut short = PaneSnapshotCensusLedger::new(17, 17).expect("valid short ledger");
         short.begin_attempt();
         let mut rejected_arena = Vec::new();
         let error = tab
@@ -10781,6 +10849,11 @@ mod test {
 
         assert_eq!(callback_count.load(std::sync::atomic::Ordering::Acquire), 0);
         assert!(arena.is_empty());
+        assert_eq!(
+            ledger.last_rejection(),
+            Some(PaneSnapshotCensusRejection::AttemptLimit)
+        );
+        assert_eq!(ledger.callbacks_avoided(), 7);
     }
 
     #[test]
@@ -10788,7 +10861,7 @@ mod test {
         let size = TerminalSize::default();
         let tab = Tab::new(&size);
         tab.assign_pane(&FakePane::new(73, size));
-        let mut ledger = PaneSnapshotCensusLedger::new(16, 31).expect("valid retry ledger");
+        let mut ledger = PaneSnapshotCensusLedger::new(18, 35).expect("valid retry ledger");
 
         for attempt in 0..2 {
             ledger.begin_attempt();
@@ -10808,6 +10881,10 @@ mod test {
                 let error = result.expect_err("second attempt exceeds aggregate request budget");
                 assert!(format!("{error:#}").contains("request census work budget exhausted"));
                 assert!(arena.is_empty());
+                assert_eq!(
+                    ledger.last_rejection(),
+                    Some(PaneSnapshotCensusRejection::RequestLimit)
+                );
             }
         }
 
@@ -10821,6 +10898,65 @@ mod test {
             .reserve_pane_callbacks(1)
             .expect_err("maximum plus one must fail checked");
         assert!(format!("{error:#}").contains("attempt census work overflow"));
+        assert_eq!(
+            overflow.last_rejection(),
+            Some(PaneSnapshotCensusRejection::AttemptOverflow)
+        );
+    }
+
+    #[test]
+    fn ordered_snapshot_style_shared_arena_uses_one_cross_tab_ledger() {
+        let size = TerminalSize::default();
+        let first = Tab::new(&size);
+        first.assign_pane(&FakePane::new(74, size));
+        let second = Tab::new(&size);
+        second.assign_pane(&FakePane::new(75, size));
+
+        let mut exact = PaneSnapshotCensusLedger::new(36, 36).expect("valid two-tab ledger");
+        exact.begin_attempt();
+        let mut exact_arena = Vec::new();
+        for tab in [&first, &second] {
+            tab.append_codec_pane_arena_in_window_with_census_ledger(
+                10,
+                "ordered-ledger-workspace",
+                &mut exact_arena,
+                64,
+                2,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut exact,
+            )
+            .expect("both ordered-style tabs fit the exact shared budget");
+        }
+        assert_eq!(exact_arena.len(), 2);
+        assert_eq!(exact.attempt_stats().total(), Some(36));
+
+        let mut short = PaneSnapshotCensusLedger::new(35, 35).expect("valid short two-tab ledger");
+        short.begin_attempt();
+        let mut short_arena = Vec::new();
+        first
+            .append_codec_pane_arena_in_window_with_census_ledger(
+                10,
+                "ordered-ledger-workspace",
+                &mut short_arena,
+                64,
+                2,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut short,
+            )
+            .expect("first ordered-style tab fits");
+        let prefix = short_arena.clone();
+        second
+            .append_codec_pane_arena_in_window_with_census_ledger(
+                10,
+                "ordered-ledger-workspace",
+                &mut short_arena,
+                64,
+                2,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut short,
+            )
+            .expect_err("second ordered-style tab cannot reset the shared budget");
+        assert_eq!(short_arena, prefix, "failed tab append must preserve its arena prefix");
     }
 
     fn flatten_legacy_pane_node_for_test(node: &PaneNode, arena: &mut Vec<PaneArenaNode>) -> u32 {

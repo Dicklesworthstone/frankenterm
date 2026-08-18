@@ -3745,6 +3745,18 @@ fn record_pane_snapshot_census_metrics(
         .record(attempt.pane_callbacks as f64);
     metrics::histogram!("mux.server.pane_snapshot_census.identity_checks", "family" => family)
         .record(attempt.identity_checks as f64);
+    if let Some(rejection) = ledger.last_rejection() {
+        let reason = match rejection {
+            mux::tab::PaneSnapshotCensusRejection::AttemptOverflow => "attempt_overflow",
+            mux::tab::PaneSnapshotCensusRejection::RequestOverflow => "request_overflow",
+            mux::tab::PaneSnapshotCensusRejection::AttemptLimit => "attempt_limit",
+            mux::tab::PaneSnapshotCensusRejection::RequestLimit => "request_limit",
+        };
+        metrics::counter!("mux.server.pane_snapshot_census.rejections", "family" => family, "reason" => reason)
+            .increment(1);
+        metrics::counter!("mux.server.pane_snapshot_census.callbacks_avoided", "family" => family)
+            .increment(u64::try_from(ledger.callbacks_avoided()).unwrap_or(u64::MAX));
+    }
 }
 
 fn pane_arena_tree_into_legacy(
@@ -3942,18 +3954,25 @@ fn collect_list_panes_snapshot_with_stage_observer_and_census(
         };
         window_titles.insert(window_id, window_title);
         for tab in window_tabs {
-            let mut arena = Vec::new();
-            let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
-                window_id,
-                &workspace,
-                &mut arena,
-                codec::MAX_ORDERED_PANE_TREE_DEPTH,
-                codec::MAX_ORDERED_PANE_NODES_PER_TREE,
-                codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
-                ledger,
-            )?;
-            debug_assert!(receipt.work.total().is_some());
-            let (tree, tab_title) = pane_arena_tree_into_legacy(receipt.tree, arena)?;
+            let (tree, tab_title) = if let Some(tab_title) =
+                tab.empty_pane_tree_title_callback_free()
+            {
+                ledger.reserve_assembly_nodes(1)?;
+                (mux::tab::PaneNode::Empty, tab_title)
+            } else {
+                let mut arena = Vec::new();
+                let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
+                    window_id,
+                    &workspace,
+                    &mut arena,
+                    codec::MAX_ORDERED_PANE_TREE_DEPTH,
+                    codec::MAX_ORDERED_PANE_NODES_PER_TREE,
+                    codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
+                    ledger,
+                )?;
+                debug_assert!(receipt.work.total().is_some());
+                pane_arena_tree_into_legacy(receipt.tree, arena)?
+            };
             tabs.push(tree);
             append_floating_pane_snapshot(
                 &mut floating_panes,
@@ -4035,8 +4054,9 @@ fn collect_coherent_list_panes_snapshot_with_stage_observer(
             mux,
             observer,
             &mut ledger,
-        )?;
+        );
         record_pane_snapshot_census_metrics("pdu82", &ledger);
+        let panes = panes?;
 
         let (after_session, after_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
@@ -4354,42 +4374,46 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
         let mut pane_nodes = Vec::new();
         let mut pane_window_titles = Vec::with_capacity(frozen_windows.len());
         let mut floating_panes = Vec::new();
-        for (frozen, ordered_window) in frozen_windows.iter().zip(&ordered_windows) {
-            let window_id = frozen.order.window_id();
-            pane_window_titles.push(mux::tab::PaneArenaWindowTitle {
-                window_id: ordered_window.window_id.get(),
-                title: frozen.title.clone(),
-            });
-            for tab in frozen.order.ordered_tabs() {
-                // Admit no more than one tree's wire budget from the current
-                // arena position. The codec validator remains authoritative,
-                // but enforcing its per-tree ceiling here prevents a single
-                // oversized tab from walking and allocating toward the much
-                // larger whole-snapshot ceiling before it is rejected.
-                let tab_node_ceiling = ordered_snapshot_tab_node_ceiling(pane_nodes.len())?;
-                let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
-                    window_id,
-                    &frozen.workspace,
-                    &mut pane_nodes,
-                    codec::MAX_ORDERED_PANE_TREE_DEPTH,
-                    tab_node_ceiling,
-                    codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
-                    &mut ledger,
-                )?;
-                debug_assert!(receipt.work.total().is_some());
-                pane_trees.push(receipt.tree);
-                append_floating_pane_snapshot(
-                    &mut floating_panes,
-                    window_id,
-                    tab.as_ref(),
-                    &frozen.workspace,
-                    &mut ledger,
-                )?;
-                observer(ListPanesSnapshotStage::TabTreeCaptured);
+        let collection = (|| -> anyhow::Result<()> {
+            for (frozen, ordered_window) in frozen_windows.iter().zip(&ordered_windows) {
+                let window_id = frozen.order.window_id();
+                pane_window_titles.push(mux::tab::PaneArenaWindowTitle {
+                    window_id: ordered_window.window_id.get(),
+                    title: frozen.title.clone(),
+                });
+                for tab in frozen.order.ordered_tabs() {
+                    // Admit no more than one tree's wire budget from the current
+                    // arena position. The codec validator remains authoritative,
+                    // but enforcing its per-tree ceiling here prevents a single
+                    // oversized tab from walking and allocating toward the much
+                    // larger whole-snapshot ceiling before it is rejected.
+                    let tab_node_ceiling = ordered_snapshot_tab_node_ceiling(pane_nodes.len())?;
+                    let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
+                        window_id,
+                        &frozen.workspace,
+                        &mut pane_nodes,
+                        codec::MAX_ORDERED_PANE_TREE_DEPTH,
+                        tab_node_ceiling,
+                        codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
+                        &mut ledger,
+                    )?;
+                    debug_assert!(receipt.work.total().is_some());
+                    pane_trees.push(receipt.tree);
+                    append_floating_pane_snapshot(
+                        &mut floating_panes,
+                        window_id,
+                        tab.as_ref(),
+                        &frozen.workspace,
+                        &mut ledger,
+                    )?;
+                    observer(ListPanesSnapshotStage::TabTreeCaptured);
+                }
             }
-        }
-        observer(ListPanesSnapshotStage::TitlesCaptured);
+            Ok(())
+        })();
         record_pane_snapshot_census_metrics("pdu87", &ledger);
+        collection?;
+        observer(ListPanesSnapshotStage::TitlesCaptured);
 
         let (after_session, after_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
@@ -7840,7 +7864,7 @@ mod tests {
             "the rejected tab's callback bundle must not begin"
         );
 
-        let mut exact = mux::tab::PaneSnapshotCensusLedger::new(32, 32)
+        let mut exact = mux::tab::PaneSnapshotCensusLedger::new(36, 36)
             .expect("valid exact PDU82 census ledger");
         exact.begin_attempt();
         let snapshot = collect_list_panes_snapshot_with_stage_observer_and_census(
@@ -7851,7 +7875,7 @@ mod tests {
         .expect("two one-pane tabs consume the exact cumulative allowance");
         assert_eq!(snapshot.tabs.len(), 2);
         assert_eq!(snapshot.tab_titles.len(), 2);
-        assert_eq!(exact.attempt_stats().total(), Some(32));
+        assert_eq!(exact.attempt_stats().total(), Some(36));
     }
 
     fn expect_current_coherent_snapshot(
