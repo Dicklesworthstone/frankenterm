@@ -7803,6 +7803,57 @@ mod tests {
         window_id
     }
 
+    #[test]
+    fn live_pdu82_uses_one_cumulative_census_ledger_across_tabs() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let first = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(8_101, None)));
+        let second_callback_count = Arc::new(AtomicUsize::new(0));
+        let second_callback_count_for_probe = Arc::clone(&second_callback_count);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            second_callback_count_for_probe.fetch_add(1, Ordering::AcqRel);
+        });
+        let second = register_snapshot_tab(
+            &mux,
+            Arc::new(FakePane::new_with_callback_probe(8_102, probe)),
+        );
+        let window_id = attach_snapshot_tab_to_new_window(&mux, &first);
+        mux.add_tab_to_window(&second, window_id)
+            .expect("attach second cumulative-census tab");
+        second_callback_count.store(0, Ordering::Release);
+
+        let mut short = mux::tab::PaneSnapshotCensusLedger::new(26, 26)
+            .expect("valid short PDU82 census ledger");
+        short.begin_attempt();
+        let error = collect_list_panes_snapshot_with_stage_observer_and_census(
+            &mux,
+            &mut ignore_list_panes_snapshot_stage,
+            &mut short,
+        )
+        .expect_err("the second tab must not receive a fresh census allowance");
+        assert!(format!("{error:#}").contains("attempt census work budget exhausted"));
+        assert_eq!(
+            second_callback_count.load(Ordering::Acquire),
+            0,
+            "the rejected tab's callback bundle must not begin"
+        );
+
+        let mut exact = mux::tab::PaneSnapshotCensusLedger::new(32, 32)
+            .expect("valid exact PDU82 census ledger");
+        exact.begin_attempt();
+        let snapshot = collect_list_panes_snapshot_with_stage_observer_and_census(
+            &mux,
+            &mut ignore_list_panes_snapshot_stage,
+            &mut exact,
+        )
+        .expect("two one-pane tabs consume the exact cumulative allowance");
+        assert_eq!(snapshot.tabs.len(), 2);
+        assert_eq!(snapshot.tab_titles.len(), 2);
+        assert_eq!(exact.attempt_stats().total(), Some(32));
+    }
+
     fn expect_current_coherent_snapshot(
         mux: &Mux,
         outcome: ListPanesCoherentOutcome,

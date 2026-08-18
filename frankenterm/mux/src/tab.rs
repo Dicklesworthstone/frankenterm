@@ -10696,7 +10696,7 @@ mod test {
                     &mut arena,
                     64,
                     node_count,
-                    leaf_count,
+                    node_count,
                 )
                 .unwrap_or_else(|error| {
                     panic!("q={} full flat append failed: {:#}", leaf_count, error)
@@ -10709,6 +10709,118 @@ mod test {
             );
             assert_eq!(descriptor.tab_title, format!("q-{leaf_count}"));
         }
+    }
+
+    #[test]
+    fn pane_snapshot_census_ledger_admits_exact_work_and_rejects_plus_one_atomically() {
+        let size = TerminalSize::default();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(71, size));
+
+        let mut exact = PaneSnapshotCensusLedger::new(16, 16).expect("valid exact ledger");
+        exact.begin_attempt();
+        let mut exact_arena = Vec::new();
+        let receipt = tab
+            .append_codec_pane_arena_in_window_with_census_ledger(
+                9,
+                "ledger-workspace",
+                &mut exact_arena,
+                64,
+                1,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut exact,
+            )
+            .expect("one leaf consumes exactly sixteen work units");
+        assert_eq!(receipt.work.total(), Some(16));
+        assert_eq!(exact.attempt_stats().total(), Some(16));
+        assert_eq!(exact.request_stats().total(), Some(16));
+        assert_eq!(exact_arena.len(), 1);
+
+        let mut short = PaneSnapshotCensusLedger::new(15, 15).expect("valid short ledger");
+        short.begin_attempt();
+        let mut rejected_arena = Vec::new();
+        let error = tab
+            .append_codec_pane_arena_in_window_with_census_ledger(
+                9,
+                "ledger-workspace",
+                &mut rejected_arena,
+                64,
+                1,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut short,
+            )
+            .expect_err("limit plus one must fail before arena publication");
+        assert!(format!("{error:#}").contains("attempt census work budget exhausted"));
+        assert!(rejected_arena.is_empty());
+    }
+
+    #[test]
+    fn pane_snapshot_census_ledger_rejects_before_unadmitted_callbacks() {
+        let size = TerminalSize::default();
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count_for_probe = Arc::clone(&callback_count);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            callback_count_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_callback_probe(72, size, false, false, probe));
+        let mut ledger = PaneSnapshotCensusLedger::new(10, 10).expect("valid callback ledger");
+        ledger.begin_attempt();
+        let mut arena = Vec::new();
+
+        tab.append_codec_pane_arena_in_window_with_census_ledger(
+            9,
+            "ledger-workspace",
+            &mut arena,
+            64,
+            1,
+            TEST_ORDERED_PANE_CENSUS_WORK,
+            &mut ledger,
+        )
+        .expect_err("the full callback bundle must be admitted before its first callback");
+
+        assert_eq!(callback_count.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(arena.is_empty());
+    }
+
+    #[test]
+    fn pane_snapshot_census_ledger_bounds_retries_and_checked_overflow() {
+        let size = TerminalSize::default();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(73, size));
+        let mut ledger = PaneSnapshotCensusLedger::new(16, 31).expect("valid retry ledger");
+
+        for attempt in 0..2 {
+            ledger.begin_attempt();
+            let mut arena = Vec::new();
+            let result = tab.append_codec_pane_arena_in_window_with_census_ledger(
+                9,
+                "ledger-workspace",
+                &mut arena,
+                64,
+                1,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                &mut ledger,
+            );
+            if attempt == 0 {
+                result.expect("first exact attempt fits request ledger");
+            } else {
+                let error = result.expect_err("second attempt exceeds aggregate request budget");
+                assert!(format!("{error:#}").contains("request census work budget exhausted"));
+                assert!(arena.is_empty());
+            }
+        }
+
+        let mut overflow = PaneSnapshotCensusLedger::new(usize::MAX, usize::MAX)
+            .expect("maximum checked ledger is valid");
+        overflow.begin_attempt();
+        overflow
+            .reserve_pane_callbacks(usize::MAX)
+            .expect("exact maximum reservation succeeds");
+        let error = overflow
+            .reserve_pane_callbacks(1)
+            .expect_err("maximum plus one must fail checked");
+        assert!(format!("{error:#}").contains("attempt census work overflow"));
     }
 
     fn flatten_legacy_pane_node_for_test(node: &PaneNode, arena: &mut Vec<PaneArenaNode>) -> u32 {
@@ -10976,7 +11088,7 @@ mod test {
         let mut arena = Vec::new();
 
         let descriptor = tab
-            .append_codec_pane_arena_in_window(95, "exact-depth", &mut arena, 64, 127, 64)
+            .append_codec_pane_arena_in_window(95, "exact-depth", &mut arena, 64, 127, 127)
             .expect("a depth-64, 127-node tree must fit exact declared limits");
 
         assert_eq!(descriptor.root_index, Some(0));
