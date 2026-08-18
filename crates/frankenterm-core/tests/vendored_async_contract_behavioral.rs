@@ -82,6 +82,16 @@ fn emit_behavioral_log(scenario_id: &str, contract_id: &str, check: &str, outcom
     eprintln!("{payload}");
 }
 
+#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+// The configured read timeout also covers the codec handshake. Keep it wide
+// enough for a contended full-suite scheduler, then make the intentional peer
+// stall three times longer so the post-handshake timeout remains causal.
+const BEHAVIORAL_REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+const BEHAVIORAL_PEER_STALL: Duration = Duration::from_millis(750);
+#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+const BEHAVIORAL_SERVER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[cfg(all(feature = "vendored", unix))]
 fn collect_error_chain_messages(err: &dyn StdError) -> Vec<String> {
     let mut chain = vec![err.to_string()];
@@ -1003,7 +1013,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
                             .await;
                         }
                         Pdu::ListPanes(_) => {
-                            runtime_async::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                             return;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -1014,7 +1024,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
 
         let config = DirectMuxClientConfig {
             socket_path: Some(socket_path),
-            read_timeout: Duration::from_millis(25),
+            read_timeout: BEHAVIORAL_REQUEST_READ_TIMEOUT,
             ..DirectMuxClientConfig::default()
         };
 
@@ -1030,7 +1040,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
         );
 
         drop(client);
-        runtime_async::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(BEHAVIORAL_SERVER_JOIN_TIMEOUT, server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2449,7 +2459,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
                             .await;
                         }
                         Pdu::GetPaneRenderChanges(_) => {
-                            runtime_async::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                             return;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -2460,7 +2470,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
 
         let config = DirectMuxClientConfig {
             socket_path: Some(socket_path),
-            read_timeout: Duration::from_millis(25),
+            read_timeout: BEHAVIORAL_REQUEST_READ_TIMEOUT,
             ..DirectMuxClientConfig::default()
         };
 
@@ -2476,7 +2486,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
         );
 
         drop(client);
-        runtime_async::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(BEHAVIORAL_SERVER_JOIN_TIMEOUT, server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2548,7 +2558,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
                             .await;
                         }
                         Pdu::GetLines(_) => {
-                            runtime_async::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                             return;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -2559,7 +2569,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
 
         let config = DirectMuxClientConfig {
             socket_path: Some(socket_path),
-            read_timeout: Duration::from_millis(25),
+            read_timeout: BEHAVIORAL_REQUEST_READ_TIMEOUT,
             ..DirectMuxClientConfig::default()
         };
 
@@ -2576,7 +2586,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
         );
 
         drop(client);
-        runtime_async::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(BEHAVIORAL_SERVER_JOIN_TIMEOUT, server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2649,7 +2659,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
                             .await;
                         }
                         Pdu::WriteToPane(_) => {
-                            runtime_async::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                             return;
                         }
                         other => panic!("unexpected handshake PDU: {}", other.pdu_name()),
@@ -2660,7 +2670,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
 
         let config = DirectMuxClientConfig {
             socket_path: Some(socket_path),
-            read_timeout: Duration::from_millis(25),
+            read_timeout: BEHAVIORAL_REQUEST_READ_TIMEOUT,
             ..DirectMuxClientConfig::default()
         };
 
@@ -2678,7 +2688,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
         );
 
         drop(client);
-        runtime_async::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(BEHAVIORAL_SERVER_JOIN_TIMEOUT, server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3040,7 +3050,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
                                 )
                                 .await;
                             } else {
-                                runtime_async::sleep(Duration::from_millis(150)).await;
+                                runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                                 return list_panes_requests;
                             }
                         }
@@ -3054,7 +3064,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
 
         let mut config = behavioral_mux_pool_config(socket_path);
         config.recovery.enabled = false;
-        config.mux.read_timeout = Duration::from_millis(25);
+        config.mux.read_timeout = BEHAVIORAL_REQUEST_READ_TIMEOUT;
         let pool = MuxPool::new(config);
         let warmup = Box::pin(pool.list_panes())
             .await
@@ -3070,7 +3080,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
         assert_read_timeout_mux_pool_error(&err);
 
         drop(pool);
-        let list_panes_requests = runtime_async::timeout(Duration::from_millis(500), server)
+        let list_panes_requests = runtime_async::timeout(BEHAVIORAL_SERVER_JOIN_TIMEOUT, server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3174,7 +3184,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
                         }
                         Pdu::GetPaneRenderChanges(_) => {
                             render_requests += 1;
-                            runtime_async::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                             return render_requests;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -3187,7 +3197,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
 
         let mut config = behavioral_mux_pool_config(socket_path);
         config.recovery.enabled = false;
-        config.mux.read_timeout = Duration::from_millis(25);
+        config.mux.read_timeout = BEHAVIORAL_REQUEST_READ_TIMEOUT;
         let pool = MuxPool::new(config);
         let warmup = Box::pin(pool.list_panes())
             .await
@@ -3205,7 +3215,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
         assert_read_timeout_mux_pool_error(&err);
 
         drop(pool);
-        let render_requests = runtime_async::timeout(Duration::from_millis(500), server)
+        let render_requests = runtime_async::timeout(BEHAVIORAL_SERVER_JOIN_TIMEOUT, server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3432,7 +3442,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
                                 )
                                 .await;
                             } else {
-                                runtime_async::sleep(Duration::from_millis(150)).await;
+                                runtime_async::sleep(BEHAVIORAL_PEER_STALL).await;
                                 return list_panes_requests;
                             }
                         }
@@ -3446,7 +3456,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
 
         let mut config = behavioral_mux_pool_config(socket_path);
         config.recovery.enabled = false;
-        config.mux.read_timeout = Duration::from_millis(25);
+        config.mux.read_timeout = BEHAVIORAL_REQUEST_READ_TIMEOUT;
         let pool = MuxPool::new(config);
         Box::pin(pool.list_panes())
             .await
@@ -3458,7 +3468,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
         assert_read_timeout_mux_pool_error(&err);
 
         drop(pool);
-        let list_panes_requests = runtime_async::timeout(Duration::from_millis(500), server)
+        let list_panes_requests = runtime_async::timeout(BEHAVIORAL_SERVER_JOIN_TIMEOUT, server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
