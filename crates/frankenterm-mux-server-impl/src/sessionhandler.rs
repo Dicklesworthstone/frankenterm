@@ -3785,14 +3785,23 @@ fn record_pane_snapshot_census_metrics(
 ) {
     let attempt = ledger.attempt_stats();
     let request = ledger.request_stats();
+    for (scope, stats) in [("attempt", attempt), ("request", request)] {
+        for (category, work) in pane_snapshot_census_category_work(stats) {
+            metrics::histogram!(
+                "mux.server.pane_snapshot_census.category_work",
+                "family" => family,
+                "scope" => scope,
+                "category" => category
+            )
+            .record(work as f64);
+        }
+    }
     metrics::histogram!("mux.server.pane_snapshot_census.attempt_work", "family" => family)
         .record(attempt.total().unwrap_or(usize::MAX) as f64);
     metrics::histogram!("mux.server.pane_snapshot_census.request_work", "family" => family)
         .record(request.total().unwrap_or(usize::MAX) as f64);
-    metrics::histogram!("mux.server.pane_snapshot_census.callbacks", "family" => family)
-        .record(attempt.pane_callbacks as f64);
-    metrics::histogram!("mux.server.pane_snapshot_census.identity_checks", "family" => family)
-        .record(attempt.identity_checks as f64);
+    metrics::histogram!("mux.server.pane_snapshot_census.retry_work", "family" => family)
+        .record(pane_snapshot_census_retry_work(attempt, request) as f64);
     if let Some(rejection) = ledger.last_rejection() {
         let reason = match rejection {
             mux::tab::PaneSnapshotCensusRejection::AttemptOverflow => "attempt_overflow",
@@ -3805,6 +3814,35 @@ fn record_pane_snapshot_census_metrics(
         metrics::counter!("mux.server.pane_snapshot_census.callbacks_avoided", "family" => family)
             .increment(u64::try_from(ledger.callbacks_avoided()).unwrap_or(u64::MAX));
     }
+}
+
+fn pane_snapshot_census_category_work(
+    stats: mux::tab::PaneSnapshotCensusStats,
+) -> [(&'static str, usize); 8] {
+    [
+        ("tree_nodes", stats.tree_nodes),
+        ("stack_containers", stats.stack_containers),
+        ("stack_members", stats.stack_members),
+        ("floating_panes", stats.floating_panes),
+        ("zoom_carriers", stats.zoom_carriers),
+        ("identity_checks", stats.identity_checks),
+        ("pane_callbacks", stats.pane_callbacks),
+        ("assembly_nodes", stats.assembly_nodes),
+    ]
+}
+
+fn pane_snapshot_census_retry_work(
+    attempt: mux::tab::PaneSnapshotCensusStats,
+    request: mux::tab::PaneSnapshotCensusStats,
+) -> usize {
+    request
+        .total()
+        .and_then(|request| {
+            attempt
+                .total()
+                .and_then(|attempt| request.checked_sub(attempt))
+        })
+        .unwrap_or(usize::MAX)
 }
 
 fn pane_arena_tree_into_legacy(
@@ -8018,6 +8056,50 @@ mod tests {
             assert!(budgeted_work <= codec::MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_ATTEMPT);
             assert_eq!(ledger.last_rejection(), None);
         }
+    }
+
+    #[test]
+    fn pane_snapshot_census_metrics_cover_every_category_and_prior_retry_work() {
+        let attempt = mux::tab::PaneSnapshotCensusStats {
+            tree_nodes: 1,
+            stack_containers: 2,
+            stack_members: 3,
+            floating_panes: 4,
+            zoom_carriers: 5,
+            identity_checks: 6,
+            pane_callbacks: 7,
+            assembly_nodes: 8,
+        };
+        let request = mux::tab::PaneSnapshotCensusStats {
+            tree_nodes: 2,
+            stack_containers: 3,
+            stack_members: 4,
+            floating_panes: 5,
+            zoom_carriers: 6,
+            identity_checks: 7,
+            pane_callbacks: 8,
+            assembly_nodes: 9,
+        };
+
+        assert_eq!(
+            pane_snapshot_census_category_work(attempt),
+            [
+                ("tree_nodes", 1),
+                ("stack_containers", 2),
+                ("stack_members", 3),
+                ("floating_panes", 4),
+                ("zoom_carriers", 5),
+                ("identity_checks", 6),
+                ("pane_callbacks", 7),
+                ("assembly_nodes", 8),
+            ]
+        );
+        assert_eq!(pane_snapshot_census_retry_work(attempt, request), 8);
+        assert_eq!(
+            pane_snapshot_census_retry_work(request, attempt),
+            usize::MAX,
+            "an impossible regressing cumulative total must fail closed in telemetry"
+        );
     }
 
     #[test]
