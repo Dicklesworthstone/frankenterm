@@ -7987,10 +7987,8 @@ mod tests {
             drop(window);
             for tab_index in 0..tab_count {
                 let pane_id = 20_000 + series * 1_000 + tab_index;
-                let tab = register_snapshot_tab(
-                    &mux,
-                    Arc::new(FakePane::new_with_id(pane_id, None)),
-                );
+                let tab =
+                    register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(pane_id, None)));
                 mux.add_tab_to_window(&tab, window_id)
                     .expect("attach q-scale census tab");
             }
@@ -8040,10 +8038,7 @@ mod tests {
                 "injected floating snapshot callback panic"
             );
         });
-        let second: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(
-            8_203,
-            panic_probe,
-        ));
+        let second: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(8_203, panic_probe));
         let first_rect = mux::tab::FloatingPaneRect {
             left: 1,
             top: 1,
