@@ -7981,6 +7981,18 @@ mod tests {
         })
         .detach();
 
+        assert!(
+            executor
+                .try_tick()
+                .expect("collector's first main-thread poll remains connected"),
+            "the collector must reach its cooperative yield"
+        );
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["collector-before"],
+            "the first poll must stop at the census yield before input is queued"
+        );
+
         let input_order = Arc::clone(&order);
         match try_spawn_with_admission(MainThreadServiceClass::Input, 1, async move {
             input_order.lock().unwrap().push("queued-input");
