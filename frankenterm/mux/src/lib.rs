@@ -11056,11 +11056,10 @@ mod tests {
     fn pane_snapshot_bounded_window_census_accepts_exact_limit_and_rejects_before_vector_growth() {
         let _lock = global_test_lock();
         let mux = Arc::new(Mux::new(None));
-        assert!(
-            mux.iter_windows_bounded(0)
-                .expect("an empty mux must fit a zero-window limit")
-                .is_empty()
-        );
+        assert!(mux
+            .iter_windows_bounded(0)
+            .expect("an empty mux must fit a zero-window limit")
+            .is_empty());
         let first = mux.new_empty_window(None, None);
         let first_id = *first;
         drop(first);
