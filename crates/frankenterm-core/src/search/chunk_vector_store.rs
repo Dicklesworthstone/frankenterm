@@ -867,7 +867,7 @@ fn decode_f32_embedding_blob(blob: &[u8], dimension: usize) -> Result<Vec<f32>> 
 
     let mut out = Vec::with_capacity(dimension);
     let (chunks, remainder) = blob.as_chunks::<4>();
-    debug_assert_eq!(remainder, []);
+    debug_assert_eq!(remainder, &[] as &[u8]);
     for &bytes in chunks {
         let value = f32::from_le_bytes(bytes);
         if !value.is_finite() {
