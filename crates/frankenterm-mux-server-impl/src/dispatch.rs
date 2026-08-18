@@ -9164,7 +9164,7 @@ mod tests {
         .expect_err("server reply on the client request lane must fail closed");
         assert!(format!("{error:#}").contains("without client-request direction authority"));
         assert!(captured.lock().is_empty());
-        assert!(mux.iter_clients().is_empty());
+        assert_eq!(mux.iter_clients().len(), 0);
     }
 
     #[test]
