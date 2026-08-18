@@ -3724,6 +3724,88 @@ enum ListPanesSnapshotStage {
 
 fn ignore_list_panes_snapshot_stage(_: ListPanesSnapshotStage) {}
 
+fn new_pane_snapshot_census_ledger() -> anyhow::Result<mux::tab::PaneSnapshotCensusLedger> {
+    mux::tab::PaneSnapshotCensusLedger::new(
+        codec::MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_ATTEMPT,
+        codec::MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_REQUEST,
+    )
+}
+
+fn record_pane_snapshot_census_metrics(
+    family: &'static str,
+    ledger: &mux::tab::PaneSnapshotCensusLedger,
+) {
+    let attempt = ledger.attempt_stats();
+    let request = ledger.request_stats();
+    metrics::histogram!("mux.server.pane_snapshot_census.attempt_work", "family" => family)
+        .record(attempt.total().unwrap_or(usize::MAX) as f64);
+    metrics::histogram!("mux.server.pane_snapshot_census.request_work", "family" => family)
+        .record(request.total().unwrap_or(usize::MAX) as f64);
+    metrics::histogram!("mux.server.pane_snapshot_census.callbacks", "family" => family)
+        .record(attempt.pane_callbacks as f64);
+    metrics::histogram!("mux.server.pane_snapshot_census.identity_checks", "family" => family)
+        .record(attempt.identity_checks as f64);
+}
+
+fn pane_arena_tree_into_legacy(
+    tree: mux::tab::PaneArenaTree,
+    nodes: Vec<mux::tab::PaneArenaNode>,
+) -> anyhow::Result<(mux::tab::PaneNode, String)> {
+    fn take_node(
+        slots: &mut [Option<mux::tab::PaneArenaNode>],
+        index: usize,
+        depth: usize,
+    ) -> anyhow::Result<mux::tab::PaneNode> {
+        if depth > codec::MAX_ORDERED_PANE_TREE_DEPTH {
+            return Err(anyhow!("bounded legacy pane-tree conversion exceeded its depth limit"));
+        }
+        let node = slots
+            .get_mut(index)
+            .and_then(Option::take)
+            .ok_or_else(|| anyhow!("bounded legacy pane-tree conversion found an invalid or repeated node"))?;
+        Ok(match node {
+            mux::tab::PaneArenaNode::Empty => mux::tab::PaneNode::Empty,
+            mux::tab::PaneArenaNode::Leaf(entry) => mux::tab::PaneNode::Leaf(entry),
+            mux::tab::PaneArenaNode::Split { left, right, node } => {
+                let left = usize::try_from(left)
+                    .context("narrowing bounded legacy pane-tree left child")?;
+                let right = usize::try_from(right)
+                    .context("narrowing bounded legacy pane-tree right child")?;
+                mux::tab::PaneNode::Split {
+                    left: Box::new(take_node(slots, left, depth + 1)?),
+                    right: Box::new(take_node(slots, right, depth + 1)?),
+                    node,
+                }
+            }
+        })
+    }
+
+    let mux::tab::PaneArenaTree {
+        root_index,
+        node_count,
+        tab_title,
+    } = tree;
+    let node_count = usize::try_from(node_count)
+        .context("narrowing bounded legacy pane-tree node count")?;
+    if node_count != nodes.len() {
+        return Err(anyhow!("bounded legacy pane-tree descriptor length mismatch"));
+    }
+    let Some(root_index) = root_index else {
+        if nodes.is_empty() {
+            return Ok((mux::tab::PaneNode::Empty, tab_title));
+        }
+        return Err(anyhow!("bounded legacy pane-tree has nodes without a root"));
+    };
+    let root_index = usize::try_from(root_index)
+        .context("narrowing bounded legacy pane-tree root")?;
+    let mut slots = nodes.into_iter().map(Some).collect::<Vec<_>>();
+    let root = take_node(&mut slots, root_index, 1)?;
+    if slots.iter().any(Option::is_some) {
+        return Err(anyhow!("bounded legacy pane-tree contains unreachable nodes"));
+    }
+    Ok((root, tab_title))
+}
+
 fn floating_pane_snapshot_entry(
     window_id: mux::window::WindowId,
     tab_id: mux::tab::TabId,
@@ -3777,8 +3859,10 @@ fn append_floating_pane_snapshot(
     window_id: mux::window::WindowId,
     tab: &mux::tab::Tab,
     workspace: &str,
+    ledger: &mut mux::tab::PaneSnapshotCensusLedger,
 ) -> anyhow::Result<()> {
-    let positioned = tab.iter_floating_panes();
+    let remaining = codec::MAX_FLOATING_PANES_PER_SNAPSHOT.saturating_sub(output.len());
+    let positioned = tab.snapshot_floating_panes_with_census_ledger(remaining, ledger)?;
     let next_len = output
         .len()
         .checked_add(positioned.len())
@@ -3789,18 +3873,51 @@ fn append_floating_pane_snapshot(
             codec::MAX_FLOATING_PANES_PER_SNAPSHOT
         );
     }
-    output
-        .try_reserve(positioned.len())
+    let callback_count = positioned
+        .len()
+        .checked_mul(6)
+        .context("counting floating-pane snapshot callbacks")?;
+    ledger.reserve_pane_callbacks(callback_count)?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(positioned.len())
         .context("reserving bounded floating pane snapshot")?;
-    output.extend(positioned.into_iter().map(|positioned| {
-        floating_pane_snapshot_entry(window_id, tab.tab_id(), workspace, positioned)
-    }));
+    for positioned in positioned {
+        let entry = catch_recoverable(
+            RecoverablePanicSite::MuxPaneCallback,
+            AssertUnwindSafe(|| {
+                floating_pane_snapshot_entry(window_id, tab.tab_id(), workspace, positioned)
+            }),
+        )
+        .map_err(|_| anyhow!("a floating-pane callback panicked during snapshot collection"))?;
+        entries.push(entry);
+    }
+    output
+        .try_reserve(entries.len())
+        .context("reserving authoritative floating pane snapshot")?;
+    output.extend(entries);
     Ok(())
 }
 
 fn collect_list_panes_snapshot_with_stage_observer(
     mux: &Mux,
     observer: &mut impl FnMut(ListPanesSnapshotStage),
+) -> anyhow::Result<ListPanesResponse> {
+    let mut ledger = new_pane_snapshot_census_ledger()?;
+    ledger.begin_attempt();
+    let response = collect_list_panes_snapshot_with_stage_observer_and_census(
+        mux,
+        observer,
+        &mut ledger,
+    );
+    record_pane_snapshot_census_metrics("pdu82", &ledger);
+    response
+}
+
+fn collect_list_panes_snapshot_with_stage_observer_and_census(
+    mux: &Mux,
+    observer: &mut impl FnMut(ListPanesSnapshotStage),
+    ledger: &mut mux::tab::PaneSnapshotCensusLedger,
 ) -> anyhow::Result<ListPanesResponse> {
     let mut tabs = Vec::new();
     let mut tab_titles = Vec::new();
@@ -3825,15 +3942,28 @@ fn collect_list_panes_snapshot_with_stage_observer(
         };
         window_titles.insert(window_id, window_title);
         for tab in window_tabs {
-            tabs.push(tab.codec_pane_tree_in_window(window_id, &workspace)?);
+            let mut arena = Vec::new();
+            let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
+                window_id,
+                &workspace,
+                &mut arena,
+                codec::MAX_ORDERED_PANE_TREE_DEPTH,
+                codec::MAX_ORDERED_PANE_NODES_PER_TREE,
+                codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
+                ledger,
+            )?;
+            debug_assert!(receipt.work.total().is_some());
+            let (tree, tab_title) = pane_arena_tree_into_legacy(receipt.tree, arena)?;
+            tabs.push(tree);
             append_floating_pane_snapshot(
                 &mut floating_panes,
                 window_id,
                 tab.as_ref(),
                 &workspace,
+                ledger,
             )?;
             observer(ListPanesSnapshotStage::TabTreeCaptured);
-            tab_titles.push(tab.get_title());
+            tab_titles.push(tab_title);
         }
     }
     observer(ListPanesSnapshotStage::TitlesCaptured);
@@ -3877,8 +4007,10 @@ fn collect_coherent_list_panes_snapshot_with_stage_observer(
 ) -> anyhow::Result<ListPanesCoherentOutcome> {
     let mut first_revision = None;
     let mut last_revision = None;
+    let mut ledger = new_pane_snapshot_census_ledger()?;
 
     for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
+        ledger.begin_attempt();
         let (before_session, before_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
             Err(_) => {
@@ -3899,7 +4031,12 @@ fn collect_coherent_list_panes_snapshot_with_stage_observer(
             return Ok(ListPanesCoherentOutcome::RevisionExhausted);
         }
 
-        let panes = collect_list_panes_snapshot_with_stage_observer(mux, observer)?;
+        let panes = collect_list_panes_snapshot_with_stage_observer_and_census(
+            mux,
+            observer,
+            &mut ledger,
+        )?;
+        record_pane_snapshot_census_metrics("pdu82", &ledger);
 
         let (after_session, after_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
@@ -4163,8 +4300,10 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
 ) -> anyhow::Result<codec::ListPanesOrderedV1Outcome> {
     let mut first_revision = None;
     let mut last_revision = None;
+    let mut ledger = new_pane_snapshot_census_ledger()?;
 
     for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
+        ledger.begin_attempt();
         observer(ListPanesSnapshotStage::BeforeOrderedAuthorityRead);
         let (before_session, before_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
@@ -4228,24 +4367,29 @@ fn collect_ordered_list_panes_snapshot_with_stage_observer(
                 // oversized tab from walking and allocating toward the much
                 // larger whole-snapshot ceiling before it is rejected.
                 let tab_node_ceiling = ordered_snapshot_tab_node_ceiling(pane_nodes.len())?;
-                pane_trees.push(tab.append_codec_pane_arena_in_window(
+                let receipt = tab.append_codec_pane_arena_in_window_with_census_ledger(
                     window_id,
                     &frozen.workspace,
                     &mut pane_nodes,
                     codec::MAX_ORDERED_PANE_TREE_DEPTH,
                     tab_node_ceiling,
                     codec::MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE,
-                )?);
+                    &mut ledger,
+                )?;
+                debug_assert!(receipt.work.total().is_some());
+                pane_trees.push(receipt.tree);
                 append_floating_pane_snapshot(
                     &mut floating_panes,
                     window_id,
                     tab.as_ref(),
                     &frozen.workspace,
+                    &mut ledger,
                 )?;
                 observer(ListPanesSnapshotStage::TabTreeCaptured);
             }
         }
         observer(ListPanesSnapshotStage::TitlesCaptured);
+        record_pane_snapshot_census_metrics("pdu87", &ledger);
 
         let (after_session, after_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,

@@ -7,6 +7,7 @@ use crate::{
     FrozenFloatingPaneSpawn, Mux, MuxNotification, MuxNotificationEnvelope, PaneOperationGuard,
     PaneRegistrationHandle, WindowId,
 };
+use anyhow::Context;
 use bintree::PathBranch;
 use config::configuration;
 use config::keyassignment::PaneDirection;
@@ -360,6 +361,182 @@ fn pane_identity(pane: &Arc<dyn Pane>) -> PaneIdentity {
     Arc::as_ptr(pane).cast::<()>()
 }
 
+/// Exact callback-free and callback work charged while producing pane snapshots.
+///
+/// These fields are intentionally numeric and content-free so callers can retain
+/// high-water telemetry without exposing pane titles, working directories, or
+/// terminal contents.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct PaneSnapshotCensusStats {
+    pub tree_nodes: usize,
+    pub stack_containers: usize,
+    pub stack_members: usize,
+    pub floating_panes: usize,
+    pub zoom_carriers: usize,
+    pub identity_checks: usize,
+    pub pane_callbacks: usize,
+    pub assembly_nodes: usize,
+}
+
+impl PaneSnapshotCensusStats {
+    pub fn total(self) -> Option<usize> {
+        self.tree_nodes
+            .checked_add(self.stack_containers)?
+            .checked_add(self.stack_members)?
+            .checked_add(self.floating_panes)?
+            .checked_add(self.zoom_carriers)?
+            .checked_add(self.identity_checks)?
+            .checked_add(self.pane_callbacks)?
+            .checked_add(self.assembly_nodes)
+    }
+
+    fn checked_delta(self, prior: Self) -> anyhow::Result<Self> {
+        Ok(Self {
+            tree_nodes: self
+                .tree_nodes
+                .checked_sub(prior.tree_nodes)
+                .context("pane-snapshot tree work regressed")?,
+            stack_containers: self
+                .stack_containers
+                .checked_sub(prior.stack_containers)
+                .context("pane-snapshot stack-container work regressed")?,
+            stack_members: self
+                .stack_members
+                .checked_sub(prior.stack_members)
+                .context("pane-snapshot stack-member work regressed")?,
+            floating_panes: self
+                .floating_panes
+                .checked_sub(prior.floating_panes)
+                .context("pane-snapshot floating work regressed")?,
+            zoom_carriers: self
+                .zoom_carriers
+                .checked_sub(prior.zoom_carriers)
+                .context("pane-snapshot zoom work regressed")?,
+            identity_checks: self
+                .identity_checks
+                .checked_sub(prior.identity_checks)
+                .context("pane-snapshot identity work regressed")?,
+            pane_callbacks: self
+                .pane_callbacks
+                .checked_sub(prior.pane_callbacks)
+                .context("pane-snapshot callback work regressed")?,
+            assembly_nodes: self
+                .assembly_nodes
+                .checked_sub(prior.assembly_nodes)
+                .context("pane-snapshot assembly work regressed")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PaneSnapshotCensusKind {
+    TreeNode,
+    StackContainer,
+    StackMember,
+    FloatingPane,
+    ZoomCarrier,
+    IdentityCheck,
+    PaneCallback,
+    AssemblyNode,
+}
+
+/// One request-scoped pane-snapshot work authority.
+///
+/// `begin_attempt` resets only the per-attempt counter. The request counter is
+/// monotonic across coherence retries, preventing a moving topology from
+/// multiplying an otherwise finite snapshot budget without limit.
+#[derive(Debug)]
+pub struct PaneSnapshotCensusLedger {
+    per_attempt_limit: usize,
+    request_limit: usize,
+    attempt: PaneSnapshotCensusStats,
+    request: PaneSnapshotCensusStats,
+}
+
+impl PaneSnapshotCensusLedger {
+    pub fn new(per_attempt_limit: usize, request_limit: usize) -> anyhow::Result<Self> {
+        if per_attempt_limit == 0 || request_limit < per_attempt_limit {
+            anyhow::bail!(
+                "pane-snapshot census limits require a nonzero attempt limit not exceeding the request limit"
+            );
+        }
+        Ok(Self {
+            per_attempt_limit,
+            request_limit,
+            attempt: PaneSnapshotCensusStats::default(),
+            request: PaneSnapshotCensusStats::default(),
+        })
+    }
+
+    pub fn begin_attempt(&mut self) {
+        self.attempt = PaneSnapshotCensusStats::default();
+    }
+
+    pub fn attempt_stats(&self) -> PaneSnapshotCensusStats {
+        self.attempt
+    }
+
+    pub fn request_stats(&self) -> PaneSnapshotCensusStats {
+        self.request
+    }
+
+    pub fn remaining_in_attempt(&self) -> usize {
+        self.per_attempt_limit
+            .saturating_sub(self.attempt.total().unwrap_or(usize::MAX))
+    }
+
+    pub fn reserve_pane_callbacks(&mut self, count: usize) -> anyhow::Result<()> {
+        self.reserve(PaneSnapshotCensusKind::PaneCallback, count)
+    }
+
+    fn reserve(&mut self, kind: PaneSnapshotCensusKind, count: usize) -> anyhow::Result<()> {
+        let next_attempt = self
+            .attempt
+            .total()
+            .and_then(|total| total.checked_add(count))
+            .context("pane-snapshot attempt census work overflow")?;
+        let next_request = self
+            .request
+            .total()
+            .and_then(|total| total.checked_add(count))
+            .context("pane-snapshot request census work overflow")?;
+        if next_attempt > self.per_attempt_limit {
+            anyhow::bail!("pane-snapshot attempt census work budget exhausted");
+        }
+        if next_request > self.request_limit {
+            anyhow::bail!("pane-snapshot request census work budget exhausted");
+        }
+
+        let attempt = match kind {
+            PaneSnapshotCensusKind::TreeNode => &mut self.attempt.tree_nodes,
+            PaneSnapshotCensusKind::StackContainer => &mut self.attempt.stack_containers,
+            PaneSnapshotCensusKind::StackMember => &mut self.attempt.stack_members,
+            PaneSnapshotCensusKind::FloatingPane => &mut self.attempt.floating_panes,
+            PaneSnapshotCensusKind::ZoomCarrier => &mut self.attempt.zoom_carriers,
+            PaneSnapshotCensusKind::IdentityCheck => &mut self.attempt.identity_checks,
+            PaneSnapshotCensusKind::PaneCallback => &mut self.attempt.pane_callbacks,
+            PaneSnapshotCensusKind::AssemblyNode => &mut self.attempt.assembly_nodes,
+        };
+        *attempt = attempt
+            .checked_add(count)
+            .context("pane-snapshot attempt category overflow")?;
+        let request = match kind {
+            PaneSnapshotCensusKind::TreeNode => &mut self.request.tree_nodes,
+            PaneSnapshotCensusKind::StackContainer => &mut self.request.stack_containers,
+            PaneSnapshotCensusKind::StackMember => &mut self.request.stack_members,
+            PaneSnapshotCensusKind::FloatingPane => &mut self.request.floating_panes,
+            PaneSnapshotCensusKind::ZoomCarrier => &mut self.request.zoom_carriers,
+            PaneSnapshotCensusKind::IdentityCheck => &mut self.request.identity_checks,
+            PaneSnapshotCensusKind::PaneCallback => &mut self.request.pane_callbacks,
+            PaneSnapshotCensusKind::AssemblyNode => &mut self.request.assembly_nodes,
+        };
+        *request = request
+            .checked_add(count)
+            .context("pane-snapshot request category overflow")?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallbackFreePaneOwner {
     TreeLeaf(usize),
@@ -371,13 +548,17 @@ fn admit_ordered_pane_census_work(
     work: &mut usize,
     max_census_work: usize,
     tab_id: TabId,
+    ledger: &mut PaneSnapshotCensusLedger,
+    kind: PaneSnapshotCensusKind,
 ) -> anyhow::Result<()> {
-    *work = work
+    let next = work
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("tab {tab_id} ordered pane census work overflows usize"))?;
-    if *work > max_census_work {
+    if next > max_census_work {
         anyhow::bail!("tab {tab_id} ordered pane census exceeds {max_census_work} carrier entries");
     }
+    ledger.reserve(kind, 1)?;
+    *work = next;
     Ok(())
 }
 
@@ -388,7 +569,9 @@ fn push_bounded_callback_free_pane(
     owner: CallbackFreePaneOwner,
     max_census_panes: usize,
     tab_id: TabId,
+    ledger: &mut PaneSnapshotCensusLedger,
 ) -> anyhow::Result<Option<CallbackFreePaneOwner>> {
+    ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, 1)?;
     let identity = pane_identity(pane);
     if let Some(prior) = owners.get(&identity).copied() {
         return Ok(Some(prior));
@@ -432,6 +615,19 @@ fn callback_snapshot_matches(
     }))
 }
 
+fn callback_snapshot_matches_bounded(
+    current: &[Arc<dyn Pane>],
+    observed: &HashMap<PaneIdentity, PaneId>,
+    ledger: &mut PaneSnapshotCensusLedger,
+) -> anyhow::Result<bool> {
+    let identity_work = current
+        .len()
+        .checked_mul(2)
+        .context("callback-coherence identity work overflow")?;
+    ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, identity_work)?;
+    callback_snapshot_matches(current, observed)
+}
+
 #[derive(Clone)]
 struct ObservedPane {
     pane: Arc<dyn Pane>,
@@ -443,6 +639,7 @@ struct BoundedCallbackFreePaneCensus {
     tree_leaf_count: usize,
     tree_active: Arc<dyn Pane>,
     coherence: OrderedPaneCoherence,
+    stats: PaneSnapshotCensusStats,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -499,6 +696,7 @@ fn observe_ordered_panes_bounded(
     tab_id: TabId,
     panes: Vec<Arc<dyn Pane>>,
     tree_leaf_count: usize,
+    ledger: &mut PaneSnapshotCensusLedger,
 ) -> anyhow::Result<OrderedPaneObservation> {
     if tree_leaf_count > panes.len() {
         anyhow::bail!(
@@ -507,6 +705,11 @@ fn observe_ordered_panes_bounded(
         );
     }
 
+    let identity_work = panes
+        .len()
+        .checked_mul(2)
+        .context("ordered pane-observation identity work overflow")?;
+    ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, identity_work)?;
     let mut pane_ids = HashMap::new();
     pane_ids
         .try_reserve(panes.len())
@@ -521,6 +724,8 @@ fn observe_ordered_panes_bounded(
         .map_err(|error| anyhow::anyhow!("reserve ordered tree-pane observations: {error}"))?;
 
     for (pane_index, pane) in panes.into_iter().enumerate() {
+        let callback_count = if pane_index < tree_leaf_count { 7 } else { 1 };
+        ledger.reserve(PaneSnapshotCensusKind::PaneCallback, callback_count)?;
         let identity = pane_identity(&pane);
         let observation = match catch_recoverable(
             RecoverablePanicSite::MuxPaneCallback,
@@ -1572,6 +1777,14 @@ pub struct PaneArenaTree {
     pub root_index: Option<u32>,
     pub node_count: u32,
     pub tab_title: String,
+}
+
+/// One successfully appended tree plus the exact work consumed by all of its
+/// coherence attempts.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PaneArenaAppendReceipt {
+    pub tree: PaneArenaTree,
+    pub work: PaneSnapshotCensusStats,
 }
 
 /// One canonical remote window title carried beside a [`PaneArena`].
@@ -3184,7 +3397,35 @@ impl Tab {
         max_total_nodes: usize,
         max_census_work: usize,
     ) -> anyhow::Result<PaneArenaTree> {
+        let mut ledger = PaneSnapshotCensusLedger::new(usize::MAX, usize::MAX)?;
+        ledger.begin_attempt();
+        Ok(self
+            .append_codec_pane_arena_in_window_with_census_ledger(
+                window_id,
+                workspace,
+                arena,
+                max_depth,
+                max_total_nodes,
+                max_census_work,
+                &mut ledger,
+            )?
+            .tree)
+    }
+
+    /// Append one ordered pane tree while charging one request-scoped work
+    /// ledger shared by every tab and every coherence retry.
+    pub fn append_codec_pane_arena_in_window_with_census_ledger(
+        &self,
+        window_id: WindowId,
+        workspace: &str,
+        arena: &mut Vec<PaneArenaNode>,
+        max_depth: usize,
+        max_total_nodes: usize,
+        max_census_work: usize,
+        ledger: &mut PaneSnapshotCensusLedger,
+    ) -> anyhow::Result<PaneArenaAppendReceipt> {
         const SNAPSHOT_ATTEMPTS: usize = 3;
+        let work_before = ledger.attempt_stats();
         let arena_start = arena.len();
         let max_tree_nodes = max_total_nodes.checked_sub(arena_start).ok_or_else(|| {
             anyhow::anyhow!(
@@ -3197,17 +3438,21 @@ impl Tab {
                 max_depth,
                 max_tree_nodes,
                 max_census_work,
+                ledger,
             )?;
             let BoundedCallbackFreePaneCensus {
                 panes,
                 tree_leaf_count,
                 coherence,
+                stats: preflight_stats,
                 ..
             } = callback_free_snapshot;
+            debug_assert!(preflight_stats.total().is_some());
             // Keep callback failures provisional until the final callback-free
             // census proves that the callbacks did not replace or rearrange
             // the topology/focus authority that they were observing.
-            let observed = observe_ordered_panes_bounded(self.tab_id, panes, tree_leaf_count);
+            let observed =
+                observe_ordered_panes_bounded(self.tab_id, panes, tree_leaf_count, ledger);
 
             let captured = {
                 let inner = self.inner.lock();
@@ -3215,6 +3460,7 @@ impl Tab {
                     max_depth,
                     max_tree_nodes,
                     max_census_work,
+                    ledger,
                 ) {
                     Ok(current) => current,
                     // A callback may transiently replace valid topology with
@@ -3229,7 +3475,11 @@ impl Tab {
                 }
 
                 let observed = observed?;
-                if !callback_snapshot_matches(&current.panes, &observed.pane_ids)? {
+                if !callback_snapshot_matches_bounded(
+                    &current.panes,
+                    &observed.pane_ids,
+                    ledger,
+                )? {
                     continue;
                 }
                 {
@@ -3237,6 +3487,10 @@ impl Tab {
                         &observed.pane_ids,
                         current.tree_active,
                     );
+                    ledger.reserve(
+                        PaneSnapshotCensusKind::AssemblyNode,
+                        current.coherence.tree.len(),
+                    )?;
                     let captured = capture_pane_arena_tree(
                         inner.pane.as_ref(),
                         Some(active),
@@ -3325,10 +3579,13 @@ impl Tab {
                 });
             }
             append.commit();
-            return Ok(PaneArenaTree {
-                root_index,
-                node_count,
-                tab_title,
+            return Ok(PaneArenaAppendReceipt {
+                tree: PaneArenaTree {
+                    root_index,
+                    node_count,
+                    tab_title,
+                },
+                work: ledger.attempt_stats().checked_delta(work_before)?,
             });
         }
 
@@ -3882,6 +4139,37 @@ impl Tab {
 
     pub fn iter_floating_panes(&self) -> Vec<PositionedFloatingPane> {
         self.inner.lock().iter_floating_panes()
+    }
+
+    /// Snapshot a bounded floating-pane projection without invoking `Pane`
+    /// callbacks. Work is admitted before allocating the output vector.
+    pub fn snapshot_floating_panes_with_census_ledger(
+        &self,
+        max_panes: usize,
+        ledger: &mut PaneSnapshotCensusLedger,
+    ) -> anyhow::Result<Vec<PositionedFloatingPane>> {
+        let inner = self.inner.lock();
+        let count = inner.floating_panes.len();
+        if count > max_panes {
+            anyhow::bail!("floating pane snapshot exceeds its pane-count budget");
+        }
+        ledger.reserve(PaneSnapshotCensusKind::AssemblyNode, count)?;
+        let mut panes = Vec::new();
+        panes
+            .try_reserve_exact(count)
+            .context("reserving bounded floating-pane projection")?;
+        panes.extend(
+            inner
+                .floating_panes
+                .iter()
+                .map(|floating| inner.positioned_floating_pane(floating)),
+        );
+        panes.sort_by(|left, right| {
+            let left_key = (left.z_order, u8::from(left.is_focused));
+            let right_key = (right.z_order, u8::from(right.is_focused));
+            left_key.cmp(&right_key)
+        });
+        Ok(panes)
     }
 
     pub fn has_panes_in_domain(&self, domain_id: DomainId) -> bool {
@@ -6771,7 +7059,9 @@ impl TabInner {
         max_depth: usize,
         max_tree_nodes: usize,
         max_census_work: usize,
+        ledger: &mut PaneSnapshotCensusLedger,
     ) -> anyhow::Result<BoundedCallbackFreePaneCensus> {
+        let stats_before = ledger.attempt_stats();
         let tree = self.pane.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "tab {} ordered pane snapshot has no pane tree; empty tabs lack size authority",
@@ -6836,6 +7126,13 @@ impl TabInner {
                     self.id
                 );
             }
+            admit_ordered_pane_census_work(
+                &mut census_work,
+                max_census_work,
+                self.id,
+                ledger,
+                PaneSnapshotCensusKind::TreeNode,
+            )?;
 
             reserve_pane_arena_stack_push(
                 &mut tree_coherence,
@@ -6847,7 +7144,6 @@ impl TabInner {
                 Tree::Empty => tree_coherence.push(OrderedPaneTreeCoherenceNode::Empty),
                 Tree::Leaf(pane) => {
                     tree_coherence.push(OrderedPaneTreeCoherenceNode::Leaf(pane_identity(pane)));
-                    admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
                     let leaf_index = tree_leaf_identities.len();
                     if push_bounded_callback_free_pane(
                         &mut owners,
@@ -6856,6 +7152,7 @@ impl TabInner {
                         CallbackFreePaneOwner::TreeLeaf(leaf_index),
                         max_census_work,
                         self.id,
+                        ledger,
                     )?
                     .is_some()
                     {
@@ -6951,7 +7248,13 @@ impl TabInner {
             .try_reserve(self.pane_stacks.len().min(max_census_work))
             .map_err(|error| anyhow::anyhow!("reserve ordered pane stack coherence: {error}"))?;
         for (slot_index, stack) in &self.pane_stacks {
-            admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
+            admit_ordered_pane_census_work(
+                &mut census_work,
+                max_census_work,
+                self.id,
+                ledger,
+                PaneSnapshotCensusKind::StackContainer,
+            )?;
             if stack.is_empty() {
                 anyhow::bail!(
                     "tab {} ordered pane census contains an empty stack at slot {slot_index}",
@@ -6986,7 +7289,13 @@ impl TabInner {
                 })?;
 
             for (stack_index, pane) in stack.panes().iter().enumerate() {
-                admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
+                admit_ordered_pane_census_work(
+                    &mut census_work,
+                    max_census_work,
+                    self.id,
+                    ledger,
+                    PaneSnapshotCensusKind::StackMember,
+                )?;
                 let identity = pane_identity(pane);
                 reserve_pane_arena_stack_push(
                     &mut members,
@@ -7014,6 +7323,7 @@ impl TabInner {
                     CallbackFreePaneOwner::HiddenStack,
                     max_census_work,
                     self.id,
+                    ledger,
                 )? {
                     anyhow::bail!(
                         "tab {} ordered pane stack {slot_index} hidden member aliases {prior_owner:?}",
@@ -7042,7 +7352,13 @@ impl TabInner {
             .try_reserve_exact(self.floating_panes.len().min(max_census_work))
             .map_err(|error| anyhow::anyhow!("reserve ordered floating pane coherence: {error}"))?;
         for floating in &self.floating_panes {
-            admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
+            admit_ordered_pane_census_work(
+                &mut census_work,
+                max_census_work,
+                self.id,
+                ledger,
+                PaneSnapshotCensusKind::FloatingPane,
+            )?;
             reserve_pane_arena_stack_push(
                 &mut floating_coherence,
                 1,
@@ -7064,6 +7380,7 @@ impl TabInner {
                 CallbackFreePaneOwner::Floating,
                 max_census_work,
                 self.id,
+                ledger,
             )? {
                 anyhow::bail!(
                     "tab {} ordered floating pane aliases {prior_owner:?}",
@@ -7072,7 +7389,14 @@ impl TabInner {
             }
         }
         if let Some(zoomed) = &self.zoomed {
-            admit_ordered_pane_census_work(&mut census_work, max_census_work, self.id)?;
+            admit_ordered_pane_census_work(
+                &mut census_work,
+                max_census_work,
+                self.id,
+                ledger,
+                PaneSnapshotCensusKind::ZoomCarrier,
+            )?;
+            ledger.reserve(PaneSnapshotCensusKind::IdentityCheck, 1)?;
             match owners.get(&pane_identity(zoomed)) {
                 Some(CallbackFreePaneOwner::TreeLeaf(_) | CallbackFreePaneOwner::Floating) => {}
                 Some(CallbackFreePaneOwner::HiddenStack) => anyhow::bail!(
@@ -7100,6 +7424,7 @@ impl TabInner {
                 zoomed: self.zoomed.as_ref().map(pane_identity),
                 title: self.title.clone(),
             },
+            stats: ledger.attempt_stats().checked_delta(stats_before)?,
         })
     }
 

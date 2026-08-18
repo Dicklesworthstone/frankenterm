@@ -5695,6 +5695,18 @@ pub const MAX_ORDERED_PANE_NODES_PER_TREE: usize = 8_191;
 pub const MAX_ORDERED_PANE_CENSUS_WORK_PER_TREE: usize = 32_767;
 pub const MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT: usize = 16_384;
 pub const MAX_ORDERED_PANE_NODES_PER_SNAPSHOT: usize = 32_767;
+/// Whole-attempt pane census and callback work ceiling shared by live PDU82
+/// and dormant PDU87 producers. Thirty-two units per maximum tiled leaf cover
+/// both callback-free coherence cuts, identity checks, the fixed pane getter
+/// bundle, and final assembly while leaving bounded capacity for stack,
+/// floating, and zoom carriers. Unlike the per-tree defense, this limit is
+/// never reset for each tab.
+pub const MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_ATTEMPT: usize =
+    MAX_ORDERED_PANE_LEAVES_PER_SNAPSHOT * 32;
+/// A coherent request makes at most three attempts. The request ledger remains
+/// monotonic across them so contention cannot exceed this aggregate.
+pub const MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_REQUEST: usize =
+    MAX_PANE_SNAPSHOT_CENSUS_WORK_PER_ATTEMPT * 3;
 /// A legal v1 section is bounded below 332 KiB by the frozen cardinality and
 /// integer-only schema. The 512 KiB ceiling leaves explicit headroom while
 /// keeping a hostile temporary byte buffer eight times smaller than the
