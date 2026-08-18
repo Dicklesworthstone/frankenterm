@@ -452,6 +452,18 @@ pub enum PaneSnapshotCensusRejection {
     RequestLimit,
 }
 
+#[derive(Debug, Clone, Copy, Eq, Error, PartialEq)]
+pub enum PaneSnapshotStructureRejection {
+    #[error("pane-snapshot tree depth {count} exceeds limit {max}")]
+    TreeDepthLimit { count: usize, max: usize },
+    #[error("pane-snapshot tree node count {count} exceeds limit {max}")]
+    TreeNodeLimit { count: usize, max: usize },
+    #[error("pane-snapshot tree leaf count {count} exceeds limit {max}")]
+    TreeLeafLimit { count: usize, max: usize },
+    #[error("pane-snapshot {counter} counter overflowed")]
+    ArithmeticOverflow { counter: &'static str },
+}
+
 /// One request-scoped pane-snapshot work authority.
 ///
 /// `begin_attempt` resets only the per-attempt counter. The request counter is
@@ -2485,6 +2497,7 @@ pub struct PaneArenaTree {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaneArenaAppendReceipt {
     pub tree: PaneArenaTree,
+    pub leaf_count: usize,
     pub work: PaneSnapshotCensusStats,
 }
 
@@ -4084,8 +4097,9 @@ impl Tab {
     /// a recursive [`PaneNode`] or a temporary `Box` per split. The tab lock
     /// is held only while its existing mux tree is projected into an iterative
     /// callback-free capture; pane observations happen afterward. The caller
-    /// supplies the protocol depth/node ceilings and a stable per-tab census
-    /// work ceiling so the dependency-lower mux crate does not own wire policy.
+    /// supplies the protocol depth/node/leaf ceilings and a stable per-tab
+    /// census work ceiling so the dependency-lower mux crate does not own wire
+    /// policy.
     /// The census ceiling is intentionally independent of the arena prefix:
     /// the same tab cannot become invalid merely because earlier tabs consumed
     /// more of the whole-snapshot node budget.
@@ -4108,6 +4122,7 @@ impl Tab {
                 max_depth,
                 max_total_nodes,
                 max_census_work,
+                usize::MAX,
                 &mut ledger,
             )?
             .tree)
@@ -4123,6 +4138,7 @@ impl Tab {
         max_depth: usize,
         max_total_nodes: usize,
         max_census_work: usize,
+        max_tree_leaves: usize,
         ledger: &mut PaneSnapshotCensusLedger,
     ) -> anyhow::Result<PaneArenaAppendReceipt> {
         let mut metadata_ledger =
@@ -4135,14 +4151,17 @@ impl Tab {
             max_depth,
             max_total_nodes,
             max_census_work,
+            max_tree_leaves,
             ledger,
             &mut metadata_ledger,
         )
     }
 
     /// Append one ordered pane tree while charging the shared work and UTF-8
-    /// metadata authorities. Neither ledger is reset here: callers own the
-    /// attempt boundary so all tabs and internal coherence retries share it.
+    /// metadata authorities. The leaf allowance is enforced in the
+    /// callback-free census before any pane method runs. Neither ledger is
+    /// reset here: callers own the attempt boundary so all tabs and internal
+    /// coherence retries share it.
     pub fn append_codec_pane_arena_in_window_with_ledgers(
         &self,
         window_id: WindowId,
@@ -4151,17 +4170,19 @@ impl Tab {
         max_depth: usize,
         max_total_nodes: usize,
         max_census_work: usize,
+        max_tree_leaves: usize,
         ledger: &mut PaneSnapshotCensusLedger,
         metadata_ledger: &mut PaneSnapshotMetadataLedger,
     ) -> anyhow::Result<PaneArenaAppendReceipt> {
         const SNAPSHOT_ATTEMPTS: usize = 3;
         let work_before = ledger.attempt_stats();
         let arena_start = arena.len();
-        let max_tree_nodes = max_total_nodes.checked_sub(arena_start).ok_or_else(|| {
-            anyhow::anyhow!(
-                "ordered pane arena already has {arena_start} nodes, above limit {max_total_nodes}"
-            )
-        })?;
+        let max_tree_nodes = max_total_nodes.checked_sub(arena_start).ok_or(
+            PaneSnapshotStructureRejection::TreeNodeLimit {
+                count: arena_start,
+                max: max_total_nodes,
+            },
+        )?;
 
         for _ in 0..SNAPSHOT_ATTEMPTS {
             let metadata_checkpoint = metadata_ledger.attempt_checkpoint();
@@ -4169,6 +4190,7 @@ impl Tab {
                 max_depth,
                 max_tree_nodes,
                 max_census_work,
+                max_tree_leaves,
                 ledger,
             )?;
             let BoundedCallbackFreePaneCensus {
@@ -4197,6 +4219,7 @@ impl Tab {
                     max_depth,
                     max_tree_nodes,
                     max_census_work,
+                    max_tree_leaves,
                     ledger,
                 ) {
                     Ok(current) => current,
@@ -4335,6 +4358,7 @@ impl Tab {
                     node_count,
                     tab_title,
                 },
+                leaf_count: tree_leaf_count,
                 work: ledger.attempt_stats().checked_delta(work_before)?,
             });
         }
@@ -7844,6 +7868,7 @@ impl TabInner {
         max_depth: usize,
         max_tree_nodes: usize,
         max_census_work: usize,
+        max_tree_leaves: usize,
         ledger: &mut PaneSnapshotCensusLedger,
     ) -> anyhow::Result<BoundedCallbackFreePaneCensus> {
         let stats_before = ledger.attempt_stats();
@@ -7858,6 +7883,9 @@ impl TabInner {
                 "tab {} ordered pane snapshot has an empty root; empty tabs lack size authority",
                 self.id
             );
+        }
+        if max_tree_leaves == 0 {
+            return Err(PaneSnapshotStructureRejection::TreeLeafLimit { count: 1, max: 0 }.into());
         }
 
         let initial_census_capacity = max_census_work.min(64);
@@ -7894,22 +7922,23 @@ impl TabInner {
 
         while let Some((tree, depth)) = pending.pop() {
             if depth > max_depth {
-                anyhow::bail!(
-                    "tab {} pane tree depth {depth} exceeds ordered snapshot limit {max_depth}",
-                    self.id
-                );
+                return Err(PaneSnapshotStructureRejection::TreeDepthLimit {
+                    count: depth,
+                    max: max_depth,
+                }
+                .into());
             }
-            tree_nodes = tree_nodes.checked_add(1).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tab {} ordered pane tree node count overflows usize",
-                    self.id
-                )
-            })?;
+            tree_nodes = tree_nodes.checked_add(1).ok_or(
+                PaneSnapshotStructureRejection::ArithmeticOverflow {
+                    counter: "tree_nodes",
+                },
+            )?;
             if tree_nodes > max_tree_nodes {
-                anyhow::bail!(
-                    "tab {} ordered pane tree has more than {max_tree_nodes} nodes",
-                    self.id
-                );
+                return Err(PaneSnapshotStructureRejection::TreeNodeLimit {
+                    count: tree_nodes,
+                    max: max_tree_nodes,
+                }
+                .into());
             }
             admit_ordered_pane_census_work(
                 &mut census_work,
@@ -7928,6 +7957,18 @@ impl TabInner {
             match tree {
                 Tree::Empty => tree_coherence.push(OrderedPaneTreeCoherenceNode::Empty),
                 Tree::Leaf(pane) => {
+                    let next_leaf_count = tree_leaf_identities.len().checked_add(1).ok_or(
+                        PaneSnapshotStructureRejection::ArithmeticOverflow {
+                            counter: "tree_leaves",
+                        },
+                    )?;
+                    if next_leaf_count > max_tree_leaves {
+                        return Err(PaneSnapshotStructureRejection::TreeLeafLimit {
+                            count: next_leaf_count,
+                            max: max_tree_leaves,
+                        }
+                        .into());
+                    }
                     tree_coherence.push(OrderedPaneTreeCoherenceNode::Leaf(pane_identity(pane)));
                     let leaf_index = tree_leaf_identities.len();
                     if push_bounded_callback_free_pane(
@@ -7962,29 +8003,30 @@ impl TabInner {
                         )
                     })?;
                     tree_coherence.push(OrderedPaneTreeCoherenceNode::Split(node));
-                    let next_depth = depth.checked_add(1).ok_or_else(|| {
-                        anyhow::anyhow!("tab {} ordered pane tree depth overflows usize", self.id)
-                    })?;
+                    let next_depth = depth.checked_add(1).ok_or(
+                        PaneSnapshotStructureRejection::ArithmeticOverflow {
+                            counter: "tree_depth",
+                        },
+                    )?;
                     if next_depth > max_depth {
-                        anyhow::bail!(
-                            "tab {} pane tree depth {next_depth} exceeds ordered snapshot limit {max_depth}",
-                            self.id
-                        );
+                        return Err(PaneSnapshotStructureRejection::TreeDepthLimit {
+                            count: next_depth,
+                            max: max_depth,
+                        }
+                        .into());
                     }
                     let discovered_nodes = tree_nodes
                         .checked_add(pending.len())
                         .and_then(|count| count.checked_add(2))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "tab {} ordered pane tree node count overflows usize",
-                                self.id
-                            )
+                        .ok_or(PaneSnapshotStructureRejection::ArithmeticOverflow {
+                            counter: "tree_nodes",
                         })?;
                     if discovered_nodes > max_tree_nodes {
-                        anyhow::bail!(
-                            "tab {} ordered pane tree has more than {max_tree_nodes} nodes",
-                            self.id
-                        );
+                        return Err(PaneSnapshotStructureRejection::TreeNodeLimit {
+                            count: discovered_nodes,
+                            max: max_tree_nodes,
+                        }
+                        .into());
                     }
                     reserve_pane_arena_stack_push(
                         &mut pending,
@@ -11620,6 +11662,7 @@ mod test {
                 64,
                 1,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut exact,
             )
             .expect("one leaf consumes exactly nineteen work units");
@@ -11628,6 +11671,7 @@ mod test {
         assert_eq!(receipt.work.identity_checks, 9);
         assert_eq!(receipt.work.pane_callbacks, 7);
         assert_eq!(receipt.work.assembly_nodes, 1);
+        assert_eq!(receipt.leaf_count, 1);
         assert_eq!(exact.attempt_stats().total(), Some(19));
         assert_eq!(exact.request_stats().total(), Some(19));
         assert_eq!(exact_arena.len(), 1);
@@ -11643,6 +11687,7 @@ mod test {
                 64,
                 1,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut short,
             )
             .expect_err("limit plus one must fail before arena publication");
@@ -11654,6 +11699,45 @@ mod test {
             short.last_rejection(),
             Some(PaneSnapshotCensusRejection::AttemptLimit)
         );
+    }
+
+    #[test]
+    fn pane_snapshot_leaf_limit_rejects_before_any_pane_callback() {
+        let size = TerminalSize::default();
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count_for_probe = Arc::clone(&callback_count);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            callback_count_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_callback_probe(
+            7_111, size, false, false, probe,
+        ));
+        callback_count.store(0, std::sync::atomic::Ordering::Release);
+        let mut ledger = PaneSnapshotCensusLedger::new(64, 64).expect("valid leaf-limit ledger");
+        ledger.begin_attempt();
+        let mut arena = Vec::new();
+
+        let error = tab
+            .append_codec_pane_arena_in_window_with_census_ledger(
+                9,
+                "leaf-limit-workspace",
+                &mut arena,
+                64,
+                1,
+                TEST_ORDERED_PANE_CENSUS_WORK,
+                0,
+                &mut ledger,
+            )
+            .expect_err("one leaf must exceed a zero-leaf tab allowance");
+
+        assert_eq!(
+            error.downcast_ref::<PaneSnapshotStructureRejection>(),
+            Some(&PaneSnapshotStructureRejection::TreeLeafLimit { count: 1, max: 0 })
+        );
+        assert_eq!(callback_count.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(arena.is_empty());
+        assert_eq!(ledger.attempt_stats().pane_callbacks, 0);
     }
 
     #[test]
@@ -12130,6 +12214,7 @@ mod test {
                 64,
                 1,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut census,
                 &mut metadata,
             )
@@ -12182,6 +12267,7 @@ mod test {
                 64,
                 1,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut census,
                 &mut metadata,
             )
@@ -12228,6 +12314,7 @@ mod test {
                 64,
                 1,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut census,
                 &mut metadata,
             )
@@ -12267,6 +12354,7 @@ mod test {
             64,
             1,
             TEST_ORDERED_PANE_CENSUS_WORK,
+            usize::MAX,
             &mut ledger,
         )
         .expect_err("the full callback bundle must be admitted before its first callback");
@@ -12297,6 +12385,7 @@ mod test {
                 64,
                 1,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut ledger,
             );
             if attempt == 0 {
@@ -12349,6 +12438,7 @@ mod test {
                 64,
                 2,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut exact,
             )
             .expect("both ordered-style tabs fit the exact shared budget");
@@ -12367,6 +12457,7 @@ mod test {
                 64,
                 2,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut short,
             )
             .expect("first ordered-style tab fits");
@@ -12379,6 +12470,7 @@ mod test {
                 64,
                 2,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut short,
             )
             .expect_err("second ordered-style tab cannot reset the shared budget");
@@ -12415,6 +12507,7 @@ mod test {
                 64,
                 TAB_COUNT,
                 TEST_ORDERED_PANE_CENSUS_WORK,
+                usize::MAX,
                 &mut ledger,
             )
             .unwrap_or_else(|error| {
@@ -12457,6 +12550,7 @@ mod test {
                     64,
                     tab_count,
                     TEST_ORDERED_PANE_CENSUS_WORK,
+                    usize::MAX,
                     &mut ledger,
                 );
                 prop_assert!(
@@ -12643,7 +12737,10 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("depth-three tree must exceed a depth-two ceiling");
-        assert!(format!("{depth_error:#}").contains("depth 3"));
+        assert_eq!(
+            depth_error.downcast_ref::<PaneSnapshotStructureRejection>(),
+            Some(&PaneSnapshotStructureRejection::TreeDepthLimit { count: 3, max: 2 })
+        );
         assert_eq!(depth_limited.as_slice(), std::slice::from_ref(&prefix));
 
         let mut node_limited = vec![prefix.clone()];
@@ -12657,7 +12754,10 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("five tree nodes plus one prefix must exceed a five-node ceiling");
-        assert!(format!("{node_error:#}").contains("more than 4 nodes"));
+        assert_eq!(
+            node_error.downcast_ref::<PaneSnapshotStructureRejection>(),
+            Some(&PaneSnapshotStructureRejection::TreeNodeLimit { count: 5, max: 4 })
+        );
         assert_eq!(node_limited, [prefix]);
     }
 

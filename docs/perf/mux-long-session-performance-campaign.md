@@ -2164,16 +2164,40 @@ substrate, but the user-level result promised above has not yet been proved:
   resource-bound, and hot-path-work candidates, not proof of improved native
   key-to-photon or resize latency.
 - The current mux snapshot producer performs callback-free bounded preflight
-  before pane callbacks or arena mutation. The audited pane/tab/window cleanup
+  before pane callbacks or arena mutation. Live PDU4/PDU82 and dormant PDU87
+  share ceilings of 4,096 windows, 4,096 tabs per window, 16,384 tabs per
+  snapshot, depth 64, 4,096 tiled leaves and 8,191 nodes per tree, 32,767 nodes
+  per snapshot, and 16,384 tiled leaves per snapshot. One attempt admits at
+  most 524,288 census work units and one three-attempt coherent request at most
+  1,572,864. Metadata has content-free per-value ceilings of 64 KiB for
+  window/tab/pane titles, 16 KiB for window/pane workspace and tty name, and
+  256 KiB for working-directory URLs, plus 4 MiB retained/encoded attempt
+  ceilings and 12 MiB request ceilings.
+  The window-ID census checks cardinality before allocating its vector, tree
+  depth/node/leaf overflow is typed and rejected during callback-free traversal,
+  and producer vector reservations are fallible and bounded by admitted
+  cardinality. The legacy recursive projection's final bounded `Box` ownership
+  shape remains wire-compatible rather than claiming allocator-failure recovery.
+  Cooperative scheduling uses a 512-work quantum: the frozen ordinary one-leaf
+  measurements leave q20 uninterrupted, yield once at q50, and yield seven
+  times at q200; window metadata carries a separate charge so an all-empty
+  maximum window set cannot bypass yielding. Family-labeled metrics expose
+  queue/wall time, cardinalities, census categories, callback work, metadata
+  retention, attempts, retries, yields, and finite rejection reasons. The
+  audited pane/tab/window cleanup
   paths use exact registration witnesses, the server alert backlog has exact
   entry/byte limits with protected terminal outcomes, and key/paste dispatch
   carries process-local causal input serials whose terminal identity can be
   issued once before later allocation fails closed. The legacy render path now
   gives one exact per-pane baseline revision exclusive enqueue authority
   through queue admission, with exact acknowledge/rollback/drop settlement and
-  visible detached-task errors. This still is not a client application ACK:
-  transport admission cannot prove that a peer applied the delta, and remote
-  Cargo proof cannot establish LAN input-to-present latency.
+  visible detached-task errors. These source bounds and synthetic scheduling
+  tests are not a client application ACK or native latency proof: transport
+  admission cannot prove that a peer applied the delta, and remote Cargo proof
+  cannot establish LAN input-to-present, M4/M5, or Threadripper performance.
+  One tab remains an indivisible coherence chunk capped at 32,767 census units;
+  no source-only test claims a wall-time deadline for one pathological external
+  pane getter.
 - Decoded-image trust in the current source is private, revision-bound
   authority: untrusted wire content retains the 64 MiB ceiling while explicitly
   trusted local decoded content has a separate 256 MiB ceiling. Validation,

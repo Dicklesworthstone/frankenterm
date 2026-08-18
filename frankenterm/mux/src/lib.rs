@@ -185,6 +185,12 @@ impl TopologyRevision {
 pub struct TopologyRevisionExhausted;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MuxSnapshotCardinalityRejection {
+    #[error("mux snapshot window count {count} exceeds limit {max}")]
+    WindowLimit { count: usize, max: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum TopologySubscriptionError {
     #[error(transparent)]
     RevisionExhausted(#[from] TopologyRevisionExhausted),
@@ -10076,6 +10082,26 @@ impl Mux {
         self.windows.read().keys().cloned().collect()
     }
 
+    /// Capture a bounded callback-free window-ID census without first
+    /// allocating an unbounded intermediate vector.
+    pub fn iter_windows_bounded(&self, max_windows: usize) -> anyhow::Result<Vec<WindowId>> {
+        let windows = self.windows.read();
+        let window_count = windows.len();
+        if window_count > max_windows {
+            return Err(MuxSnapshotCardinalityRejection::WindowLimit {
+                count: window_count,
+                max: max_windows,
+            }
+            .into());
+        }
+        let mut window_ids = Vec::new();
+        window_ids
+            .try_reserve_exact(window_count)
+            .context("reserving bounded mux snapshot window IDs")?;
+        window_ids.extend(windows.keys().copied());
+        Ok(window_ids)
+    }
+
     pub fn iter_domains(&self) -> Vec<Arc<dyn Domain>> {
         self.domains.read().values().cloned().collect()
     }
@@ -11024,6 +11050,38 @@ mod tests {
         crate::MUX_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn pane_snapshot_bounded_window_census_accepts_exact_limit_and_rejects_before_vector_growth() {
+        let _lock = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        assert!(
+            mux.iter_windows_bounded(0)
+                .expect("an empty mux must fit a zero-window limit")
+                .is_empty()
+        );
+        let first = mux.new_empty_window(None, None);
+        let first_id = *first;
+        drop(first);
+        let second = mux.new_empty_window(None, None);
+        let second_id = *second;
+        drop(second);
+
+        let exact = mux
+            .iter_windows_bounded(2)
+            .expect("two windows must fit the exact census limit");
+        assert_eq!(exact.len(), 2);
+        assert!(exact.contains(&first_id));
+        assert!(exact.contains(&second_id));
+
+        let error = mux
+            .iter_windows_bounded(1)
+            .expect_err("two windows must exceed a one-window census limit");
+        assert_eq!(
+            error.downcast_ref::<MuxSnapshotCardinalityRejection>(),
+            Some(&MuxSnapshotCardinalityRejection::WindowLimit { count: 2, max: 1 })
+        );
     }
 
     struct ScopedMuxOverride {
