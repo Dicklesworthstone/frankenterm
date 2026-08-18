@@ -4582,6 +4582,10 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
     let window_ids =
         bounded_pane_snapshot_window_ids(mux, cardinality_limits.windows, cardinality)?;
     preflight_pane_snapshot_cardinality(mux, &window_ids, cardinality_limits, cardinality)?;
+    if cardinality.tabs != 0 {
+        pane_snapshot_tab_node_allowance(0, cardinality_limits.pane_nodes)?;
+        ledger.preflight_work(1)?;
+    }
     tabs.try_reserve_exact(cardinality.tabs)
         .context("reserving bounded pane snapshot tab trees")?;
     tab_titles
@@ -4609,6 +4613,13 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
                         max: cardinality_limits.tabs_per_snapshot,
                     }
                     .into());
+                }
+                if window_tab_count != 0 {
+                    pane_snapshot_tab_node_allowance(
+                        captured_nodes,
+                        cardinality_limits.pane_nodes,
+                    )?;
+                    ledger.preflight_work(1)?;
                 }
                 let window_title = window.get_title();
                 let window_workspace = window.get_workspace();
@@ -4654,10 +4665,9 @@ async fn collect_list_panes_snapshot_with_stage_observer_and_census(
             .context("reserving changed pane snapshot tab titles")?;
         window_titles.insert(window_id, window_title);
         for tab in window_tabs {
-            let max_tree_nodes = pane_snapshot_tab_node_allowance(
-                captured_nodes,
-                cardinality_limits.pane_nodes,
-            )?;
+            let max_tree_nodes =
+                pane_snapshot_tab_node_allowance(captured_nodes, cardinality_limits.pane_nodes)?;
+            ledger.preflight_work(1)?;
             let (tree, tab_title) = if let Some(tab_title) =
                 tab.empty_pane_tree_title_callback_free_with_metadata(metadata_ledger)?
             {
@@ -8807,7 +8817,7 @@ mod tests {
         first_callback_count.store(0, Ordering::Release);
         second_callback_count.store(0, Ordering::Release);
 
-        let mut short = mux::tab::PaneSnapshotCensusLedger::new(26, 26)
+        let mut short = mux::tab::PaneSnapshotCensusLedger::new(19, 19)
             .expect("valid short PDU82 census ledger");
         let mut short_cooperator = PaneSnapshotCooperator::new("test-pdu82");
         let mut short_metadata =
@@ -8831,6 +8841,52 @@ mod tests {
                 + second_callback_count.load(Ordering::Acquire),
             1,
             "exactly one window's tab may reach callbacks before the shared budget rejects the other"
+        );
+        assert_eq!(
+            short_metadata
+                .request_stats()
+                .field(mux::tab::PaneSnapshotMetadataField::WindowTitle)
+                .values,
+            1,
+            "an exhausted pane-work budget must reject the next window before title allocation"
+        );
+        assert_eq!(
+            short.callbacks_avoided(),
+            0,
+            "minimum-work preflight must not misreport metadata avoidance as a pane callback"
+        );
+        short.begin_attempt();
+        short_metadata.begin_attempt();
+        let callback_total_before_retry = first_callback_count.load(Ordering::Acquire)
+            + second_callback_count.load(Ordering::Acquire);
+        let retry_error = block_on(collect_list_panes_snapshot_with_stage_observer_and_census(
+            &mux,
+            &mut ignore_list_panes_snapshot_stage,
+            &mut short,
+            &mut short_metadata,
+            &mut short_cooperator,
+            PaneSnapshotCardinalityLimits::PRODUCTION,
+            &mut short_cardinality,
+        ))
+        .expect_err("an exhausted request budget must reject a later retry before allocation");
+        assert!(format!("{retry_error:#}").contains("request census work budget exhausted"));
+        assert_eq!(
+            first_callback_count.load(Ordering::Acquire)
+                + second_callback_count.load(Ordering::Acquire),
+            callback_total_before_retry,
+            "an exhausted retry must invoke no pane callback"
+        );
+        assert_eq!(
+            short_metadata
+                .request_stats()
+                .field(mux::tab::PaneSnapshotMetadataField::WindowTitle)
+                .values,
+            1,
+            "an exhausted retry must retain no additional window title"
+        );
+        assert_eq!(
+            short_metadata.attempt_stats(),
+            mux::tab::PaneSnapshotMetadataStats::default()
         );
 
         let mut exact = mux::tab::PaneSnapshotCensusLedger::new(38, 38)

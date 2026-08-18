@@ -1078,13 +1078,30 @@ impl PaneSnapshotCensusLedger {
     /// invoked, preserving exact actual-work telemetry when metadata admission
     /// stops a partially observed entry.
     pub fn preflight_pane_callbacks(&mut self, count: usize) -> anyhow::Result<()> {
+        self.preflight_work_inner(count, true)
+    }
+
+    /// Prove that a minimum amount of subsequent snapshot work remains
+    /// admissible without charging it before it happens. This lets callers
+    /// reject an exhausted request before cloning unrelated metadata.
+    pub fn preflight_work(&mut self, count: usize) -> anyhow::Result<()> {
+        self.preflight_work_inner(count, false)
+    }
+
+    fn preflight_work_inner(
+        &mut self,
+        count: usize,
+        counts_as_avoided_callbacks: bool,
+    ) -> anyhow::Result<()> {
         let Some(next_attempt) = self
             .attempt
             .total()
             .and_then(|total| total.checked_add(count))
         else {
             self.last_rejection = Some(PaneSnapshotCensusRejection::AttemptOverflow);
-            self.callbacks_avoided = count;
+            if counts_as_avoided_callbacks {
+                self.callbacks_avoided = count;
+            }
             anyhow::bail!("pane-snapshot attempt census work overflow");
         };
         let Some(next_request) = self
@@ -1093,17 +1110,23 @@ impl PaneSnapshotCensusLedger {
             .and_then(|total| total.checked_add(count))
         else {
             self.last_rejection = Some(PaneSnapshotCensusRejection::RequestOverflow);
-            self.callbacks_avoided = count;
+            if counts_as_avoided_callbacks {
+                self.callbacks_avoided = count;
+            }
             anyhow::bail!("pane-snapshot request census work overflow");
         };
         if next_attempt > self.per_attempt_limit {
             self.last_rejection = Some(PaneSnapshotCensusRejection::AttemptLimit);
-            self.callbacks_avoided = count;
+            if counts_as_avoided_callbacks {
+                self.callbacks_avoided = count;
+            }
             anyhow::bail!("pane-snapshot attempt census work budget exhausted");
         }
         if next_request > self.request_limit {
             self.last_rejection = Some(PaneSnapshotCensusRejection::RequestLimit);
-            self.callbacks_avoided = count;
+            if counts_as_avoided_callbacks {
+                self.callbacks_avoided = count;
+            }
             anyhow::bail!("pane-snapshot request census work budget exhausted");
         }
         Ok(())
