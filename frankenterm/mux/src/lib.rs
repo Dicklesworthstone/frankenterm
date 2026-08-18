@@ -2715,9 +2715,7 @@ mod pane_registration_handle {
             expected_owner: &Mux,
         ) -> Option<PaneRegistrationOperationLease> {
             let lease = self.generation.try_acquire()?;
-            let Some(owner) = self.generation.owner.upgrade() else {
-                return None;
-            };
+            let owner = self.generation.owner.upgrade()?;
             if !std::ptr::eq(owner.as_ref(), expected_owner) || self.pane.upgrade().is_none() {
                 return None;
             }
