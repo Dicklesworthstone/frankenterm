@@ -527,8 +527,11 @@ pub enum MuxOperation {
     ReadTieredScrollbackStatus,
     Spawn,
     SplitPane,
+    MovePaneToNewTab,
     ReadRenderChanges,
+    ReportRenderApplicationResult,
     ReadPaneText,
+    ReadPaneRenderableDimensions,
     ReadSemanticZones,
     SendText,
     ResizePane,
@@ -546,10 +549,10 @@ pub enum MuxOperation {
     ActivatePane,
     KillPane,
     SetPaneZoomed,
-    SetFocusedPane,
     SetTabTitle,
     SetWindowTitle,
     SetWindowWorkspace,
+    ReorderWindowTabs,
     SetActiveWorkspace,
     RenameWorkspace,
     EraseScrollback,
@@ -574,8 +577,11 @@ impl MuxOperation {
             Self::ReadTieredScrollbackStatus => "read_tiered_scrollback_status",
             Self::Spawn => "spawn",
             Self::SplitPane => "split_pane",
+            Self::MovePaneToNewTab => "move_pane_to_new_tab",
             Self::ReadRenderChanges => "read_render_changes",
+            Self::ReportRenderApplicationResult => "report_render_application_result",
             Self::ReadPaneText => "read_pane_text",
+            Self::ReadPaneRenderableDimensions => "read_pane_renderable_dimensions",
             Self::ReadSemanticZones => "read_semantic_zones",
             Self::SendText => "send_text",
             Self::ResizePane => "resize_pane",
@@ -593,10 +599,10 @@ impl MuxOperation {
             Self::ActivatePane => "activate_pane",
             Self::KillPane => "kill_pane",
             Self::SetPaneZoomed => "set_pane_zoomed",
-            Self::SetFocusedPane => "set_focused_pane",
             Self::SetTabTitle => "set_tab_title",
             Self::SetWindowTitle => "set_window_title",
             Self::SetWindowWorkspace => "set_window_workspace",
+            Self::ReorderWindowTabs => "reorder_window_tabs",
             Self::SetActiveWorkspace => "set_active_workspace",
             Self::RenameWorkspace => "rename_workspace",
             Self::EraseScrollback => "erase_scrollback",
@@ -801,6 +807,11 @@ impl MuxRejection {
     /// internally consistent authority statement.
     #[must_use]
     pub const fn has_consistent_authority(self) -> bool {
+        if !matches!(self.code, MuxRejectionCode::UnknownFuture)
+            && matches!(self.operation, MuxOperation::UnknownRequest)
+        {
+            return false;
+        }
         let object_matches = match self.code {
             MuxRejectionCode::PaneNotFound => matches!(
                 self.object,

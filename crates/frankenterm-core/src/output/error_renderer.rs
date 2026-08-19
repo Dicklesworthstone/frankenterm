@@ -1107,10 +1107,8 @@ mod tests {
     fn mux_rejection_json_is_finite_structured_and_content_free() {
         use crate::error::{MuxOperation, MuxRejection, WeztermError};
 
-        let error = Error::Wezterm(WeztermError::MuxRejection(MuxRejection::pane_not_found(
-            MuxOperation::ReadPaneText,
-            42,
-        )));
+        let rejection = MuxRejection::pane_not_found(MuxOperation::ReadPaneText, 42);
+        let error = Error::Wezterm(WeztermError::MuxRejection(rejection));
         let output = ErrorRenderer::new(OutputFormat::Json).render(&error);
         let parsed: Value = serde_json::from_str(&output).expect("mux rejection JSON output");
 
@@ -1123,6 +1121,16 @@ mod tests {
         assert_eq!(parsed["object"]["kind"], "pane");
         assert_eq!(parsed["object"]["id"], 42);
         assert!(!output.contains("backend-canary"));
+
+        let toon = toon_rust::encode(
+            serde_json::to_value(rejection).expect("mux rejection TOON source"),
+            None,
+        );
+        assert!(toon.contains("pane_not_found"));
+        assert!(toon.contains("read_pane_text"));
+        assert!(toon.contains("not_applied"));
+        assert!(toon.contains("never"));
+        assert!(!toon.contains("backend-canary"));
     }
 
     #[test]

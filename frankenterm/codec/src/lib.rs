@@ -5240,7 +5240,7 @@ impl ErrorResponse {
         } else {
             let request = Pdu::wire_spec_for_ident(self.request_ident)
                 .ok_or_else(|| anyhow!("mux error response names an unknown request"))?;
-            if request.producer != PduProducer::Client {
+            if !request.authorizes(PduProducer::Client, PduWireRole::Request) {
                 bail!("mux error response does not name a client request");
             }
         }
@@ -22976,6 +22976,19 @@ mod test {
             assert_eq!(decoded.serial, 31);
             assert_eq!(decoded.pdu, pdu);
         }
+    }
+
+    #[test]
+    fn mux_error_response_accepts_only_registry_authorized_client_requests() {
+        ErrorResponse::invalid_request(TabTitleChanged::IDENT)
+            .validate()
+            .expect("bidirectional PDU must retain its client-request authority");
+
+        let server_reply = ErrorResponse::invalid_request(UnitResponse::IDENT);
+        assert!(
+            server_reply.validate().is_err(),
+            "server-only reply identity must not authorize a rejection"
+        );
     }
 
     #[test]

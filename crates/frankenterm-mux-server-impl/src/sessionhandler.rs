@@ -18,7 +18,7 @@ use codec::{
     ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse, MoveFloatingPane,
     MovePaneToNewTab, MovePaneToNewTabResponse, MuxErrorCode, MuxErrorEffect, MuxErrorObject,
     MuxErrorObjectKind, MuxErrorRetry, NotifyAlert, PaneTieredScrollbackStatusEntryV1,
-    PaneTieredScrollbackStatusOutcomeV1, Pdu, PduProducer, Ping, Pong,
+    PaneTieredScrollbackStatusOutcomeV1, Pdu, PduProducer, PduWireRole, Ping, Pong,
     ReliableInputSchedulerPressureV1, ReliableKeyEventKindV1, ReliableKeyEventOutcomeV1,
     ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventV1,
     ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1, RemoveFloatingPane,
@@ -1645,7 +1645,7 @@ struct MuxRequestErrorContext {
 impl MuxRequestErrorContext {
     fn from_request(request: &Pdu) -> Self {
         let request_ident = request.wire_spec().map_or(0, |spec| {
-            if spec.producer == PduProducer::Client {
+            if spec.authorizes(PduProducer::Client, PduWireRole::Request) {
                 spec.ident
             } else {
                 0
@@ -8968,6 +8968,23 @@ mod tests {
         invalid_direction
             .validate()
             .expect("invalid request direction has canonical zero-identity authority");
+
+        let bidirectional_request =
+            MuxRequestErrorContext::from_request(&Pdu::TabTitleChanged(TabTitleChanged {
+                tab_id: 19,
+                title: "bounded-title".to_string(),
+            }));
+        assert_eq!(bidirectional_request.request_ident, TabTitleChanged::IDENT);
+        assert!(bidirectional_request.may_mutate);
+        let bidirectional_failure =
+            bidirectional_request.response_for_error(&anyhow!("backend canary"));
+        assert_eq!(
+            bidirectional_failure.code,
+            MuxErrorCode::INDETERMINATE_MUTATION
+        );
+        bidirectional_failure
+            .validate()
+            .expect("bidirectional client request must retain exact rejection correlation");
     }
 
     fn tick_until_response(

@@ -3107,15 +3107,30 @@ impl WeztermClient {
         matches!(
             (method, operation),
             ("ping", MuxOperation::ProtocolHandshake)
-                | ("list_panes", MuxOperation::ListPanes)
+                | (
+                    "list_panes"
+                        | "list_panes_coherent"
+                        | "list_panes_ordered_v1"
+                        | "list_panes_tab_stacks",
+                    MuxOperation::ListPanes
+                )
                 | (
                     "get_pane_tiered_scrollback_statuses",
                     MuxOperation::ReadTieredScrollbackStatus
                 )
                 | ("spawn_v2", MuxOperation::Spawn)
                 | ("split_pane", MuxOperation::SplitPane)
-                | ("get_pane_render_changes", MuxOperation::ReadRenderChanges)
+                | ("move_pane_to_new_tab", MuxOperation::MovePaneToNewTab)
+                | (
+                    "get_pane_render_changes" | "get_pane_render_delivery_v1",
+                    MuxOperation::ReadRenderChanges
+                )
+                | (
+                    "render_application_result_v1" | "render_application_result",
+                    MuxOperation::ReportRenderApplicationResult
+                )
                 | ("get_lines", MuxOperation::ReadPaneText)
+                | ("get_dimensions", MuxOperation::ReadPaneRenderableDimensions)
                 | ("get_semantic_zones", MuxOperation::ReadSemanticZones)
                 | ("write_to_pane" | "send_paste", MuxOperation::SendText)
                 | ("resize", MuxOperation::ResizePane)
@@ -3142,11 +3157,15 @@ impl WeztermClient {
                 | ("set_tab_title", MuxOperation::SetTabTitle)
                 | ("set_window_title", MuxOperation::SetWindowTitle)
                 | ("set_window_workspace", MuxOperation::SetWindowWorkspace)
+                | ("reorder_window_tabs_v1", MuxOperation::ReorderWindowTabs)
                 | ("set_active_workspace", MuxOperation::SetActiveWorkspace)
                 | ("rename_workspace", MuxOperation::RenameWorkspace)
                 | ("erase_scrollback", MuxOperation::EraseScrollback)
                 | ("search_scrollback", MuxOperation::SearchScrollback)
-                | ("key_down" | "key_up", MuxOperation::KeyInput)
+                | (
+                    "key_down" | "key_up" | "reliable_key_event_v1" | "send_key_down_traced_v1",
+                    MuxOperation::KeyInput
+                )
                 | ("mouse_event", MuxOperation::MouseInput)
                 | ("get_image_cell", MuxOperation::ReadImage)
                 | ("get_pane_direction", MuxOperation::ReadPaneDirection)
@@ -3397,7 +3416,7 @@ impl WeztermClient {
     #[cfg(all(feature = "vendored", unix))]
     fn mux_operation_from_request_ident(request_ident: u64) -> MuxOperation {
         match codec::Pdu::pdu_name_for_ident(request_ident) {
-            Some("GetCodecVersion") => MuxOperation::ProtocolHandshake,
+            Some("Ping" | "GetCodecVersion") => MuxOperation::ProtocolHandshake,
             Some("SetClientId") => MuxOperation::ClientRegistration,
             Some("ListPanes" | "ListPanesCoherent" | "ListPanesOrderedV1") => {
                 MuxOperation::ListPanes
@@ -3405,10 +3424,15 @@ impl WeztermClient {
             Some("GetPaneTieredScrollbackStatusesV1") => MuxOperation::ReadTieredScrollbackStatus,
             Some("SpawnV2") => MuxOperation::Spawn,
             Some("SplitPane") => MuxOperation::SplitPane,
+            Some("MovePaneToNewTab") => MuxOperation::MovePaneToNewTab,
             Some("GetPaneRenderChanges" | "GetPaneRenderDeliveryV1") => {
                 MuxOperation::ReadRenderChanges
             }
+            Some("RenderApplicationResultV1" | "RenderApplicationResult") => {
+                MuxOperation::ReportRenderApplicationResult
+            }
             Some("GetLines") => MuxOperation::ReadPaneText,
+            Some("GetPaneRenderableDimensions") => MuxOperation::ReadPaneRenderableDimensions,
             Some("GetSemanticZones") => MuxOperation::ReadSemanticZones,
             Some("WriteToPane" | "SendPaste") => MuxOperation::SendText,
             Some("Resize") => MuxOperation::ResizePane,
@@ -3426,10 +3450,11 @@ impl WeztermClient {
             Some("ActivatePaneDirection") => MuxOperation::ActivatePane,
             Some("KillPane") => MuxOperation::KillPane,
             Some("SetPaneZoomed") => MuxOperation::SetPaneZoomed,
-            Some("SetFocusedPane") => MuxOperation::SetFocusedPane,
+            Some("SetFocusedPane") => MuxOperation::ActivatePane,
             Some("TabTitleChanged") => MuxOperation::SetTabTitle,
             Some("WindowTitleChanged") => MuxOperation::SetWindowTitle,
             Some("SetWindowWorkspace") => MuxOperation::SetWindowWorkspace,
+            Some("ReorderWindowTabsV1") => MuxOperation::ReorderWindowTabs,
             Some("SetActiveWorkspace") => MuxOperation::SetActiveWorkspace,
             Some("RenameWorkspace") => MuxOperation::RenameWorkspace,
             Some("EraseScrollbackRequest") => MuxOperation::EraseScrollback,
@@ -3443,6 +3468,7 @@ impl WeztermClient {
             Some("SetPalette") => MuxOperation::SetPalette,
             Some("GetClientList") => MuxOperation::ListClients,
             Some("GetTlsCreds") => MuxOperation::GetTlsCredentials,
+            Some("ListPanesTabStacks") => MuxOperation::ListPanes,
             _ => MuxOperation::UnknownRequest,
         }
     }
@@ -3450,7 +3476,7 @@ impl WeztermClient {
     #[cfg(all(feature = "vendored", unix))]
     fn mux_rejection_from_wire(response: &codec::ErrorResponse) -> MuxRejection {
         let operation = Self::mux_operation_from_request_ident(response.request_ident);
-        if response.validate().is_err() {
+        if response.validate().is_err() || operation == MuxOperation::UnknownRequest {
             return MuxRejection {
                 code: MuxRejectionCode::UnknownFuture,
                 operation,
@@ -7480,6 +7506,23 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
+    fn every_client_request_pdu_has_a_finite_mux_operation_identity() {
+        for spec in codec::Pdu::all_wire_specs()
+            .iter()
+            .filter(|spec| spec.authorizes(codec::PduProducer::Client, codec::PduWireRole::Request))
+        {
+            assert_ne!(
+                WeztermClient::mux_operation_from_request_ident(spec.ident),
+                MuxOperation::UnknownRequest,
+                "client request PDU {} ({}) lacks a transport-independent operation",
+                spec.ident,
+                spec.name,
+            );
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
     fn mux_remote_rejection_maps_to_finite_project_rejection() {
         let err =
             crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteRejection(
@@ -7549,6 +7592,60 @@ mod tests {
         )
         .expect("versioned CLI indeterminate authority");
         assert_eq!(direct_indeterminate, cli_indeterminate);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn every_finite_mux_rejection_has_direct_and_cli_parity() {
+        let request_ident = <codec::WriteToPane as codec::PduWireIdent>::IDENT;
+        let cases = [
+            codec::ErrorResponse::pane_not_found(request_ident, 77),
+            codec::ErrorResponse::tab_not_found(request_ident, 2),
+            codec::ErrorResponse::window_not_found(request_ident, 3),
+            codec::ErrorResponse::domain_not_found(request_ident, Some(4)),
+            codec::ErrorResponse::domain_not_found(request_ident, None),
+            codec::ErrorResponse::invalid_request(request_ident),
+            codec::ErrorResponse::policy_rejected(request_ident),
+            codec::ErrorResponse::cancelled(request_ident),
+            codec::ErrorResponse::deadline_exceeded(request_ident),
+            codec::ErrorResponse::quota_exceeded(request_ident),
+            codec::ErrorResponse::backend_failure(request_ident),
+            codec::ErrorResponse::indeterminate_mutation(
+                request_ident,
+                Some(codec::MuxErrorObject {
+                    kind: codec::MuxErrorObjectKind::PANE,
+                    id: 77,
+                }),
+            ),
+        ];
+        let cli_effect = CliEffect::Mutation {
+            operation: MuxOperation::SendText,
+            object: Some(MuxObjectIdentity {
+                kind: MuxObjectKind::Pane,
+                id: 77,
+            }),
+        };
+
+        for response in cases {
+            response.validate().expect("canonical wire authority");
+            let object = response.object.map_or_else(
+                || "none".to_string(),
+                |object| format!("{}:{}", object.kind.label(), object.id),
+            );
+            let cli = WeztermClient::parse_cli_mux_rejection(
+                &format!(
+                    "FRANKENTERM_MUX_ERROR_V1 request_ident={request_ident} response_request_ident={request_ident} operation=write_to_pane code={} object={object} effect={} retry={}",
+                    response.code.label(),
+                    response.effect.label(),
+                    response.retry.label(),
+                ),
+                cli_effect,
+            )
+            .expect("canonical CLI authority");
+            let direct = WeztermClient::mux_rejection_from_wire(&response);
+            assert_eq!(direct, cli, "wire code {}", response.code.label());
+            assert!(direct.has_consistent_authority());
+        }
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -7725,7 +7822,7 @@ mod tests {
 
         for (code, object, effect, retry, expected_code) in cases {
             let stderr = format!(
-                "Error: FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code={code} object={object} effect={effect} retry={retry}"
+                "Error: FRANKENTERM_MUX_ERROR_V1 request_ident=9 response_request_ident=9 operation=write_to_pane code={code} object={object} effect={effect} retry={retry}"
             );
             let rejection = WeztermClient::parse_cli_mux_rejection(&stderr, cli_effect)
                 .expect("versioned CLI mux envelope");
@@ -7738,7 +7835,7 @@ mod tests {
             synthetic_cli_output(
                 false,
                 "",
-                "Error: FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code=policy_rejected object=none effect=not_applied retry=never",
+                "Error: FRANKENTERM_MUX_ERROR_V1 request_ident=9 response_request_ident=9 operation=write_to_pane code=policy_rejected object=none effect=not_applied retry=never",
             ),
             cli_effect,
         )
@@ -7755,12 +7852,12 @@ mod tests {
         ));
 
         for malformed in [
-            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=82 operation=write_to_pane code=backend_failure object=none effect=not_applied retry=safe_after_backoff",
-            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code=policy_rejected object=none effect=indeterminate retry=never",
-            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code=policy_rejected object=pane:77 effect=not_applied retry=never",
-            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code=backend_failure object=none effect=not_applied retry=safe_after_backoff extra=forbidden",
-            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=list_panes code=backend_failure object=none effect=not_applied retry=safe_after_backoff",
-            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=future_operation code=future_code object=none effect=future_effect retry=future_retry",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=9 response_request_ident=10 operation=write_to_pane code=backend_failure object=none effect=not_applied retry=safe_after_backoff",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=9 response_request_ident=9 operation=write_to_pane code=policy_rejected object=none effect=indeterminate retry=never",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=9 response_request_ident=9 operation=write_to_pane code=policy_rejected object=pane:77 effect=not_applied retry=never",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=9 response_request_ident=9 operation=write_to_pane code=backend_failure object=none effect=not_applied retry=safe_after_backoff extra=forbidden",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=9 response_request_ident=9 operation=list_panes code=backend_failure object=none effect=not_applied retry=safe_after_backoff",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=9 response_request_ident=9 operation=future_operation code=future_code object=none effect=future_effect retry=future_retry",
         ] {
             let rejection = WeztermClient::parse_cli_mux_rejection(malformed, cli_effect)
                 .expect("recognized version prefix must fail closed, not fall back to heuristics");

@@ -5194,6 +5194,7 @@ mod tests {
     use super::*;
     use crate::runtime_async::unix as compat_unix;
     use crate::runtime_async::{CompatRuntime, Mutex, RuntimeBuilder, sleep};
+    use codec::{PduWireIdent, Ping};
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -8726,7 +8727,7 @@ mod tests {
                 assert!(
                     client
                         .outstanding_requests
-                        .contains(&unrelated_response_serial),
+                        .contains_key(&unrelated_response_serial),
                     "{case:?}"
                 );
                 assert_eq!(client.pending_responses.len(), 1, "{case:?}");
