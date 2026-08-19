@@ -2307,7 +2307,13 @@ impl ClientDomain {
 
         for StagedPaneArenaTab { prepared, tab } in staged_tabs {
             mux.set_tab_title(tab.tab_id(), &prepared.tab_title);
-            tab.sync_with_prepared_pane_tree(prepared.plan.root_size, prepared.tree);
+            tab.sync_with_prepared_pane_tree(prepared.plan.root_size, prepared.tree)
+                .with_context(|| {
+                    format!(
+                        "install ordered remote pane tree in local tab {}",
+                        tab.tab_id()
+                    )
+                })?;
         }
 
         for (pane, alt_screen_active) in pending.existing_sync {

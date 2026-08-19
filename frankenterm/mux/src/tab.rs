@@ -4,8 +4,9 @@ use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{
-    FrozenFloatingPaneSpawn, Mux, MuxNotification, MuxNotificationEnvelope, PaneOperationGuard,
-    PaneRegistrationHandle, PaneStructuralLane, WindowId,
+    DesiredPaneStructuralState, ExactPaneStructuralState, FrozenFloatingPaneSpawn, Mux,
+    MuxNotification, MuxNotificationEnvelope, PaneOperationGuard, PaneRegistrationHandle,
+    PaneStructuralLane, WindowId,
 };
 use anyhow::Context;
 use bintree::PathBranch;
@@ -21,6 +22,7 @@ use std::convert::TryFrom;
 #[cfg(test)]
 use std::panic::catch_unwind;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use thiserror::Error;
 use url::Url;
@@ -305,7 +307,7 @@ impl TabStackState {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Recency {
     count: usize,
     by_idx: HashMap<usize, usize>,
@@ -322,6 +324,7 @@ impl Recency {
     }
 }
 
+#[derive(Clone)]
 struct TabInner {
     id: TabId,
     /// Exact mux authority for this tab allocation. A tab may be retired and
@@ -364,6 +367,7 @@ struct TabInner {
 pub struct Tab {
     inner: Mutex<TabInner>,
     tab_id: TabId,
+    mux_owner_generation: AtomicU64,
 }
 
 type PaneIdentity = *const ();
@@ -1584,6 +1588,19 @@ struct ExactPaneRemovalCandidate {
     pane: Arc<dyn Pane>,
     pane_id: PaneId,
     expected_registration: Option<PaneRegistrationHandle>,
+    expected_lane: Option<PaneStructuralLane>,
+}
+
+struct PreparedFloatingPaneAddition {
+    replacement: Vec<FloatingPane>,
+    floating_focus: Option<PaneId>,
+    positioned: PositionedFloatingPane,
+    callbacks: DeferredTabCallbacks,
+}
+
+struct PreparedExactPaneRemoval {
+    replacement: TabInner,
+    callbacks: DeferredTabCallbacks,
 }
 
 #[derive(Default)]
@@ -1623,6 +1640,55 @@ impl DeferredTabCallbacks {
                     .push(mux.envelope_notification(MuxNotification::PaneFocused(pane_id)));
             }
         }
+    }
+
+    /// Build and reserve the exact topology notification sequence before the
+    /// associated tab mutation is made visible. The returned vector has all
+    /// storage allocated before the mux revision is advanced, so installing it
+    /// into the callback bundle is an infallible commit step.
+    fn prepare_topology_notifications(
+        &self,
+        mux: &Mux,
+        tab_id: TabId,
+    ) -> anyhow::Result<Vec<MuxNotificationEnvelope>> {
+        let focus_notification_count = usize::from(
+            self.focus_changed() && self.current_focus_id.is_some(),
+        );
+        let notification_count = usize::from(self.changed)
+            .checked_add(focus_notification_count)
+            .ok_or_else(|| anyhow::anyhow!("tab topology notification count overflow"))?;
+        let mut notifications = Vec::new();
+        notifications
+            .try_reserve_exact(notification_count)
+            .map_err(|error| anyhow::anyhow!("reserve tab topology notifications: {error}"))?;
+        if notification_count == 0 {
+            return Ok(notifications);
+        }
+
+        let mut topology = mux.topology.lock();
+        let first_revision = topology
+            .reserve_revisions(notification_count)
+            .map_err(anyhow::Error::new)?;
+        notifications.push(MuxNotificationEnvelope {
+            notification: MuxNotification::TabResized(tab_id),
+            topology: crate::MuxTopologyStamp::Revision(first_revision),
+        });
+        if focus_notification_count != 0 {
+            let pane_id = self
+                .current_focus_id
+                .expect("prepared focus notification retains its pane id");
+            let revision = crate::TopologyRevision::new(
+                first_revision
+                    .get()
+                    .checked_add(1)
+                    .expect("reserved two-revision tab range cannot overflow"),
+            );
+            notifications.push(MuxNotificationEnvelope {
+                notification: MuxNotification::PaneFocused(pane_id),
+                topology: crate::MuxTopologyStamp::Revision(revision),
+            });
+        }
+        Ok(notifications)
     }
 
     fn execute(self, mux: Option<&Mux>) {
@@ -1918,6 +1984,52 @@ struct FloatingPane {
     visible: bool,
     pinned: bool,
     opacity: f32,
+}
+
+fn next_floating_z_order_in_replacement(
+    floating_panes: &mut [FloatingPane],
+) -> anyhow::Result<u32> {
+    let max = floating_panes
+        .iter()
+        .map(|floating| floating.z_order)
+        .max()
+        .unwrap_or(0);
+    if max != u32::MAX {
+        return Ok(max + 1);
+    }
+
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(floating_panes.len())
+        .map_err(|error| anyhow::anyhow!("reserve floating z-order compaction: {error}"))?;
+    order.extend(0..floating_panes.len());
+    order.sort_by_key(|index| (floating_panes[*index].z_order, *index));
+    for (lane, index) in order.into_iter().enumerate() {
+        floating_panes[index].z_order = u32::try_from(lane).map_err(|_| {
+            anyhow::anyhow!("floating pane count exceeds the representable z-order range")
+        })?;
+    }
+    u32::try_from(floating_panes.len())
+        .map_err(|_| anyhow::anyhow!("floating pane count exceeds the representable z-order range"))
+}
+
+fn positioned_floating_pane_with_focus(
+    floating: &FloatingPane,
+    floating_focus: Option<PaneId>,
+) -> PositionedFloatingPane {
+    PositionedFloatingPane {
+        pane_id: floating.pane_id,
+        is_focused: floating_focus == Some(floating.pane_id),
+        left: floating.rect.left,
+        top: floating.rect.top,
+        width: floating.rect.width,
+        height: floating.rect.height,
+        z_order: floating.z_order,
+        visible: floating.visible,
+        pinned: floating.pinned,
+        opacity: floating.opacity,
+        pane: Arc::clone(&floating.pane),
+    }
 }
 
 /// One authoritative floating-pane state supplied by a client-domain
@@ -2632,6 +2744,59 @@ pub struct PreparedPaneTree {
     tree: Tree,
     active: Option<Arc<dyn Pane>>,
     zoomed: Option<Arc<dyn Pane>>,
+}
+
+impl PreparedPaneTree {
+    fn snapshot_panes_callback_free(&self) -> Vec<Arc<dyn Pane>> {
+        let mut panes = Vec::new();
+        collect_raw_tree_panes(&self.tree, &mut panes);
+        panes
+    }
+
+    fn into_install(
+        self,
+        size: TerminalSize,
+        panes: &[Arc<dyn Pane>],
+    ) -> anyhow::Result<PreparedPaneTreeInstall> {
+        let Self {
+            tree,
+            active,
+            zoomed,
+        } = self;
+        let active_index = active.as_ref().and_then(|active| {
+            panes
+                .iter()
+                .position(|candidate| Arc::ptr_eq(candidate, active))
+        });
+        let mut resize_work = Vec::new();
+        resize_work
+            .try_reserve_exact(panes.len().max(usize::from(zoomed.is_some())))
+            .map_err(|error| anyhow::anyhow!("reserve prepared-tree resize work: {error}"))?;
+        if size.rows != 0 && size.cols != 0 {
+            if let Some(zoomed) = zoomed.as_ref() {
+                resize_work.push((Arc::clone(zoomed), size));
+            } else {
+                collect_pane_resize_work(&tree, &size, &mut resize_work);
+            }
+        }
+        Ok(PreparedPaneTreeInstall {
+            tree,
+            active_index: active_index.unwrap_or(0),
+            tag_active: active_index.is_some(),
+            zoomed,
+            size,
+            resize_work,
+        })
+    }
+}
+
+struct PreparedPaneTreeInstall {
+    tree: Tree,
+    active_index: usize,
+    tag_active: bool,
+    zoomed: Option<Arc<dyn Pane>>,
+    size: TerminalSize,
+    resize_work: Vec<(Arc<dyn Pane>, TerminalSize)>,
 }
 
 /// Deterministic work and allocation-growth accounting for direct pane-arena
@@ -3975,6 +4140,7 @@ impl Tab {
         Self {
             inner: Mutex::new(inner),
             tab_id,
+            mux_owner_generation: AtomicU64::new(0),
         }
     }
 
@@ -3986,11 +4152,78 @@ impl Tab {
     /// fallible step and prevents a rejected registration from poisoning an
     /// otherwise reusable tab allocation.
     pub(crate) fn bind_mux_owner(&self, mux: &Arc<Mux>) -> anyhow::Result<()> {
-        self.inner.lock().bind_mux_owner(mux)
+        let mut inner = self.inner.lock();
+        inner.bind_mux_owner(mux)?;
+        self.mux_owner_generation
+            .store(inner.mux_owner_generation, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn bind_mux_owner_if_structurally_empty(
+        &self,
+        mux: &Arc<Mux>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        anyhow::ensure!(
+            inner.snapshot_non_floating_panes_callback_free().is_empty()
+                && inner.floating_panes.is_empty(),
+            "tab {} is not structurally empty",
+            self.tab_id
+        );
+        inner.bind_mux_owner(mux)?;
+        self.mux_owner_generation
+            .store(inner.mux_owner_generation, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn bind_mux_owner_with_exact_single_tiled_pane(
+        &self,
+        mux: &Arc<Mux>,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        let (tiled, floating) = inner.snapshot_structural_panes_callback_free_checked()?;
+        anyhow::ensure!(
+            tiled.len() == 1 && floating.is_empty() && Arc::ptr_eq(&tiled[0], pane),
+            "tab {} does not contain exactly the admitted tiled pane",
+            self.tab_id
+        );
+        inner.bind_mux_owner(mux)?;
+        self.mux_owner_generation
+            .store(inner.mux_owner_generation, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn active_mux_owner_generation(&self) -> Option<u64> {
+        let generation = self.mux_owner_generation.load(Ordering::Acquire);
+        (generation != 0).then_some(generation)
     }
 
     pub(crate) fn has_active_mux_owner(&self, mux: &Mux) -> bool {
         self.inner.lock().is_active_mux_owner(mux)
+    }
+
+    pub(crate) fn is_structurally_empty_for_mux(&self, mux: &Mux) -> bool {
+        let inner = self.inner.lock();
+        inner.is_active_mux_owner(mux)
+            && inner.snapshot_non_floating_panes_callback_free().is_empty()
+            && inner.floating_panes.is_empty()
+    }
+
+    pub(crate) fn contains_exact_single_tiled_pane_for_mux(
+        &self,
+        mux: &Mux,
+        pane: &Arc<dyn Pane>,
+    ) -> bool {
+        let inner = self.inner.lock();
+        if !inner.is_active_mux_owner(mux) {
+            return false;
+        }
+        inner
+            .snapshot_structural_panes_callback_free_checked()
+            .is_ok_and(|(tiled, floating)| {
+                tiled.len() == 1 && floating.is_empty() && Arc::ptr_eq(&tiled[0], pane)
+            })
     }
 
     fn exact_registered_arc(&self, mux: &Mux) -> Option<Arc<Self>> {
@@ -4011,7 +4244,11 @@ impl Tab {
     /// but those edits no longer publish into the former mux.
     #[cfg(test)]
     pub(crate) fn retire_mux_owner(&self, mux: &Mux) -> bool {
-        self.inner.lock().retire_mux_owner(mux)
+        let retired = self.inner.lock().retire_mux_owner(mux);
+        if retired {
+            self.mux_owner_generation.store(0, Ordering::Release);
+        }
+        retired
     }
 
     pub fn get_title(&self) -> String {
@@ -4092,7 +4329,7 @@ impl Tab {
                 active,
                 zoomed,
             },
-        );
+        )?;
         Ok(())
     }
 
@@ -4101,17 +4338,150 @@ impl Tab {
     /// Preparation may happen in reverse arena order while a client consumes
     /// one global node vector; installation can then remain in the snapshot's
     /// forward tab order.
-    pub fn sync_with_prepared_pane_tree(&self, size: TerminalSize, prepared: PreparedPaneTree) {
-        let (mux, callbacks) = {
-            let mut inner = self.inner.lock();
-            let mux = inner.notification_owner();
-            let mut callbacks = inner.install_prepared_pane_tree(size, prepared);
-            if let Some(mux) = mux.as_deref() {
-                callbacks.reserve_topology_notifications(mux, self.tab_id);
+    pub fn sync_with_prepared_pane_tree(
+        &self,
+        size: TerminalSize,
+        prepared: PreparedPaneTree,
+    ) -> anyhow::Result<()> {
+        let desired_panes = prepared.snapshot_panes_callback_free();
+        let mut desired_observed = Vec::new();
+        desired_observed
+            .try_reserve_exact(desired_panes.len())
+            .map_err(|error| anyhow::anyhow!("reserve prepared pane identities: {error}"))?;
+        for pane in &desired_panes {
+            desired_observed.push((observe_pane_id_for_mutation(pane)?, Arc::clone(pane)));
+        }
+        let install = prepared.into_install(size, &desired_panes)?;
+        let mut topology_notifications = Vec::new();
+        topology_notifications
+            .try_reserve_exact(1)
+            .map_err(|error| anyhow::anyhow!("reserve prepared-tree topology envelope: {error}"))?;
+        let expected_mux = self.inner.lock().notification_owner();
+        let current = expected_mux
+            .as_ref()
+            .map(|_| self.snapshot_structural_states_for_authority())
+            .transpose()?;
+        let (mux, callbacks) = match expected_mux {
+            Some(mux) => {
+                let current = current.expect("bound tabs retain a structural snapshot");
+                let _registration = mux.pane_registration.lock();
+                let mut authority = mux.pane_authority.lock();
+                let registered_tab = self.exact_registered_arc(&mux).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tab {} lost exact mux registration before prepared-tree installation",
+                        self.tab_id
+                    )
+                })?;
+                let mut desired = Vec::new();
+                desired
+                    .try_reserve_exact(desired_observed.len())
+                    .map_err(|error| {
+                        anyhow::anyhow!("reserve desired prepared-tree authority: {error}")
+                    })?;
+                {
+                    let panes = mux.panes.read();
+                    for (pane_id, pane) in desired_observed {
+                        let registered = panes.get(&pane_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "prepared tree pane {pane_id} is not registered in the owning mux"
+                            )
+                        })?;
+                        anyhow::ensure!(
+                            Arc::ptr_eq(&registered.pane, &pane),
+                            "prepared tree pane id {pane_id} names another exact mux allocation"
+                        );
+                        let registration = PaneRegistrationHandle::new(
+                            &registered.pane,
+                            &registered.generation,
+                        );
+                        anyhow::ensure!(
+                            authority.contains_live_registration(
+                                pane_id,
+                                registered.domain_id,
+                                &registration,
+                            ),
+                            "prepared tree pane {pane_id} lacks exact domain-registration authority"
+                        );
+                        desired.push(DesiredPaneStructuralState {
+                            pane_id,
+                            pane,
+                            lane: PaneStructuralLane::Tiled,
+                            registration,
+                            domain_id: registered.domain_id,
+                        });
+                    }
+                }
+                let structural = authority.prepare_tab_structural_replacement(
+                    Arc::clone(&registered_tab),
+                    &current,
+                    desired,
+                )?;
+                let mut inner = self.inner.lock();
+                anyhow::ensure!(
+                    inner.is_active_mux_owner(&mux),
+                    "tab {} lost mux-owner authority before prepared-tree installation",
+                    self.tab_id
+                );
+                let (current_tiled, current_floating) =
+                    inner.snapshot_structural_panes_callback_free_checked()?;
+                let expected_tiled = current
+                    .iter()
+                    .filter(|state| state.lane == PaneStructuralLane::Tiled)
+                    .collect::<Vec<_>>();
+                let expected_floating = current
+                    .iter()
+                    .filter(|state| state.lane == PaneStructuralLane::Floating)
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    current_tiled.len() == expected_tiled.len()
+                        && current_tiled
+                            .iter()
+                            .zip(&expected_tiled)
+                            .all(|(pane, expected)| Arc::ptr_eq(pane, &expected.pane))
+                        && current_floating.len() == expected_floating.len()
+                        && current_floating
+                            .iter()
+                            .zip(&expected_floating)
+                            .all(|((pane_id, pane), expected)| {
+                                *pane_id == expected.pane_id
+                                    && Arc::ptr_eq(pane, &expected.pane)
+                            }),
+                    "tab {} topology changed during prepared-tree installation",
+                    self.tab_id
+                );
+                if install.tag_active {
+                    inner.recency.by_idx.try_reserve(1).map_err(|error| {
+                        anyhow::anyhow!("reserve prepared-tree recency authority: {error}")
+                    })?;
+                }
+                let mut topology = mux.topology.lock();
+                let revision = topology.reserve_revision().map_err(anyhow::Error::new)?;
+                topology_notifications.push(MuxNotificationEnvelope {
+                    notification: MuxNotification::TabResized(self.tab_id),
+                    topology: crate::MuxTopologyStamp::Revision(revision),
+                });
+                let mut callbacks = inner.commit_prepared_pane_tree_install(install);
+                authority.commit_tab_structural_replacement(structural);
+                callbacks.topology_notifications = topology_notifications;
+                (Some(Arc::clone(&mux)), callbacks)
             }
-            (mux, callbacks)
+            None => {
+                let mut inner = self.inner.lock();
+                anyhow::ensure!(
+                    inner.notification_owner().is_none(),
+                    "tab {} acquired mux-owner authority during prepared-tree installation",
+                    self.tab_id
+                );
+                if install.tag_active {
+                    inner.recency.by_idx.try_reserve(1).map_err(|error| {
+                        anyhow::anyhow!("reserve prepared-tree recency state: {error}")
+                    })?;
+                }
+                (None, inner.commit_prepared_pane_tree_install(install))
+            }
         };
         callbacks.execute(mux.as_deref());
+        Ok(())
     }
 
     /// Encode one coherent tab snapshot using caller-supplied owner metadata.
@@ -4498,6 +4868,43 @@ impl Tab {
         self.snapshot_panes_callback_free()
     }
 
+    pub(crate) fn snapshot_structural_states_for_authority(
+        &self,
+    ) -> anyhow::Result<Vec<ExactPaneStructuralState>> {
+        let (tiled, floating) = {
+            let inner = self.inner.lock();
+            inner.snapshot_structural_panes_callback_free_checked()?
+        };
+        let capacity = tiled
+            .len()
+            .checked_add(floating.len())
+            .ok_or_else(|| anyhow::anyhow!("tab structural snapshot count overflow"))?;
+        let mut states = Vec::new();
+        states
+            .try_reserve_exact(capacity)
+            .map_err(|error| anyhow::anyhow!("reserve tab structural snapshot: {error}"))?;
+        for pane in tiled {
+            states.push(ExactPaneStructuralState {
+                pane_id: observe_pane_id_for_mutation(&pane)?,
+                pane,
+                lane: PaneStructuralLane::Tiled,
+            });
+        }
+        for (stored_id, pane) in floating {
+            let pane_id = observe_pane_id_for_mutation(&pane)?;
+            anyhow::ensure!(
+                pane_id == stored_id,
+                "floating pane stored id {stored_id} disagrees with exact pane id {pane_id}"
+            );
+            states.push(ExactPaneStructuralState {
+                pane_id,
+                pane,
+                lane: PaneStructuralLane::Floating,
+            });
+        }
+        Ok(states)
+    }
+
     pub fn add_floating_pane(
         &self,
         pane: Arc<dyn Pane>,
@@ -4507,7 +4914,27 @@ impl Tab {
         let pane_id = observe_pane_id_for_mutation(&pane)?;
 
         for _ in 0..ADMISSION_ATTEMPTS {
-            let snapshot = self.snapshot_panes_callback_free();
+            let (expected_mux, expected_tiled, expected_floating) = {
+                let inner = self.inner.lock();
+                let expected_mux = inner.notification_owner();
+                let (expected_tiled, expected_floating) =
+                    inner.snapshot_structural_panes_callback_free_checked()?;
+                (expected_mux, expected_tiled, expected_floating)
+            };
+            let snapshot_len = expected_tiled
+                .len()
+                .checked_add(expected_floating.len())
+                .ok_or_else(|| anyhow::anyhow!("floating-pane snapshot count overflow"))?;
+            let mut snapshot = Vec::new();
+            snapshot
+                .try_reserve_exact(snapshot_len)
+                .map_err(|error| anyhow::anyhow!("reserve floating-pane snapshot: {error}"))?;
+            snapshot.extend(expected_tiled.iter().cloned());
+            snapshot.extend(
+                expected_floating
+                    .iter()
+                    .map(|(_, floating)| Arc::clone(floating)),
+            );
             let observed = Self::observe_panes(snapshot.clone());
             if observed.iter().any(|candidate| candidate.pane_id.is_none()) {
                 anyhow::bail!(
@@ -4524,21 +4951,116 @@ impl Tab {
                 );
             }
 
-            let expected_identities = exact_pane_identity_set(&snapshot);
-            let (mux, positioned, callbacks) = {
-                let mut inner = self.inner.lock();
-                let mux = inner.notification_owner();
-                let current = inner.snapshot_panes_callback_free();
-                if exact_pane_identity_set(&current) != expected_identities {
-                    continue;
+            let (mux, positioned, callbacks, retired_floating) = match expected_mux {
+                Some(mux) => {
+                    let _registration = mux.pane_registration.lock();
+                    let mut authority = mux.pane_authority.lock();
+                    let registered_tab = self.exact_registered_arc(&mux).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "tab {} lost exact mux registration during floating-pane admission",
+                            self.tab_id
+                        )
+                    })?;
+                    let (pane_registration, domain_id) = {
+                        let panes = mux.panes.read();
+                        let registered = panes.get(&pane_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "floating pane {pane_id} is not registered in the owning mux"
+                            )
+                        })?;
+                        anyhow::ensure!(
+                            Arc::ptr_eq(&registered.pane, &pane),
+                            "floating pane id {pane_id} names another exact mux allocation"
+                        );
+                        (
+                            PaneRegistrationHandle::new(
+                                &registered.pane,
+                                &registered.generation,
+                            ),
+                            registered.domain_id,
+                        )
+                    };
+                    anyhow::ensure!(
+                        authority.contains_live_registration(
+                            pane_id,
+                            domain_id,
+                            &pane_registration,
+                        ),
+                        "floating pane {pane_id} lacks exact domain-registration authority"
+                    );
+                    let structural = authority.prepare_new_structural_bind(
+                        pane_id,
+                        Arc::clone(&pane),
+                        registered_tab,
+                        PaneStructuralLane::Floating,
+                        Some((pane_registration, domain_id)),
+                    )?;
+                    let mut inner = self.inner.lock();
+                    anyhow::ensure!(
+                        inner.is_active_mux_owner(&mux),
+                        "tab {} lost mux-owner authority during floating-pane admission",
+                        self.tab_id
+                    );
+                    let (current_tiled, current_floating) =
+                        inner.snapshot_structural_panes_callback_free_checked()?;
+                    if current_tiled.len() != expected_tiled.len()
+                        || !current_tiled
+                            .iter()
+                            .zip(&expected_tiled)
+                            .all(|(current, expected)| Arc::ptr_eq(current, expected))
+                        || current_floating.len() != expected_floating.len()
+                        || !current_floating.iter().zip(&expected_floating).all(
+                            |((current_id, current), (expected_id, expected))| {
+                                current_id == expected_id && Arc::ptr_eq(current, expected)
+                            },
+                        )
+                    {
+                        continue;
+                    }
+                    let mut prepared =
+                        inner.prepare_add_floating_pane(Arc::clone(&pane), pane_id, rect)?;
+                    prepared.callbacks.topology_notifications = prepared
+                        .callbacks
+                        .prepare_topology_notifications(&mux, self.tab_id)?;
+                    let (positioned, callbacks, retired_floating) =
+                        inner.commit_prepared_floating_pane_addition(prepared);
+                    authority.commit_structural_bind(structural);
+                    (
+                        Some(Arc::clone(&mux)),
+                        positioned,
+                        callbacks,
+                        retired_floating,
+                    )
                 }
-                let (positioned, mut callbacks) =
-                    inner.prepare_add_floating_pane(pane.clone(), pane_id, rect);
-                if let Some(mux) = mux.as_deref() {
-                    callbacks.reserve_topology_notifications(mux, self.tab_id);
+                None => {
+                    let mut inner = self.inner.lock();
+                    if inner.notification_owner().is_some() {
+                        continue;
+                    }
+                    let (current_tiled, current_floating) =
+                        inner.snapshot_structural_panes_callback_free_checked()?;
+                    if current_tiled.len() != expected_tiled.len()
+                        || !current_tiled
+                            .iter()
+                            .zip(&expected_tiled)
+                            .all(|(current, expected)| Arc::ptr_eq(current, expected))
+                        || current_floating.len() != expected_floating.len()
+                        || !current_floating.iter().zip(&expected_floating).all(
+                            |((current_id, current), (expected_id, expected))| {
+                                current_id == expected_id && Arc::ptr_eq(current, expected)
+                            },
+                        )
+                    {
+                        continue;
+                    }
+                    let prepared =
+                        inner.prepare_add_floating_pane(Arc::clone(&pane), pane_id, rect)?;
+                    let (positioned, callbacks, retired_floating) =
+                        inner.commit_prepared_floating_pane_addition(prepared);
+                    (None, positioned, callbacks, retired_floating)
                 }
-                (mux, positioned, callbacks)
             };
+            drop(retired_floating);
             callbacks.execute(mux.as_deref());
             return Ok(positioned);
         }
@@ -4566,11 +5088,11 @@ impl Tab {
     /// floating layer in one structural cut.
     ///
     /// All pane callbacks and fallible reader preparation finish first. The
-    /// final lock order is `domain_registration -> pane_registration -> tabs
-    /// -> windows -> Tab::inner (stable pointer order) -> pane_preparations ->
-    /// panes -> clients -> pending_pane_lifecycle -> topology`. No callback or
-    /// subscriber runs inside that cut, and a rejected commit emits no pane
-    /// lifecycle edge.
+    /// final lock order is `domain_registration -> pane_registration ->
+    /// pane_authority -> tabs -> windows -> Tab::inner (stable pointer order)
+    /// -> pane_preparations -> panes -> clients -> pending_pane_lifecycle ->
+    /// topology`. No callback or subscriber runs inside that cut, and a
+    /// rejected commit emits no pane lifecycle edge.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_unpublished_floating_pane(
         self: &Arc<Self>,
@@ -4733,6 +5255,7 @@ impl Tab {
             );
 
             let _registration = mux.pane_registration.lock();
+            let mut authority = mux.pane_authority.lock();
             let registered_tabs = mux.tabs.read();
             anyhow::ensure!(
                 registered_tabs
@@ -4778,6 +5301,41 @@ impl Tab {
                 .get(&expected_window_id)
                 .and_then(|window| window.get_active())
                 .is_some_and(|active| Arc::ptr_eq(active, self));
+            let target_pane = {
+                let panes = mux.panes.read();
+                let registered = panes
+                    .get(&target_registration.pane_id())
+                    .filter(|registered| {
+                        target_registration.matches_live_registration(registered)
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("floating-pane target registration retired before commit")
+                    })?;
+                Arc::clone(&registered.pane)
+            };
+            authority.validate_structural_owner_exact(
+                target_registration.pane_id(),
+                &target_pane,
+                self,
+                None,
+                Some(target_registration),
+            )?;
+
+            let registration =
+                PaneRegistrationHandle::new(&pane, &preparation_claim.generation);
+            let prepared_authority = authority.prepare_live_registration_insert(
+                spawned_id,
+                &pane,
+                expected_domain_id,
+                Some(expected_domain),
+            )?;
+            let structural = authority.prepare_new_structural_bind(
+                spawned_id,
+                Arc::clone(&pane),
+                Arc::clone(self),
+                PaneStructuralLane::Floating,
+                Some((registration.clone(), expected_domain_id)),
+            )?;
 
             let mut tab_guards = observed_tabs
                 .iter()
@@ -4877,10 +5435,12 @@ impl Tab {
                     && inner.floating_pane_size(current_rect) == geometry.size,
                 "destination geometry changed while floating pane was spawning"
             );
-            inner
-                .floating_panes
-                .try_reserve(1)
-                .map_err(|error| anyhow::anyhow!("reserve floating-pane slot: {error}"))?;
+            let prepared_floating = inner.prepare_add_presized_floating_pane(
+                Arc::clone(&pane),
+                spawned_id,
+                geometry.rect,
+                focus,
+            )?;
             let lifecycle_enqueue = mux.prepare_pane_lifecycle_enqueue(spawned_id)?;
 
             let mut topology = mux.topology.lock();
@@ -4895,7 +5455,6 @@ impl Tab {
             let commit_guard = registration_reservation
                 .commit()
                 .expect("validated exclusive pane registration reservation must commit");
-            let registration = PaneRegistrationHandle::new(&pane, &preparation_claim.generation);
             let prior = panes.insert(
                 spawned_id,
                 crate::LivePaneRegistration {
@@ -4905,12 +5464,16 @@ impl Tab {
                 },
             );
             debug_assert!(prior.is_none());
-            let (positioned, callbacks) = inner.prepare_add_presized_floating_pane(
-                Arc::clone(&pane),
+            let (positioned, callbacks, retired_floating) =
+                inner.commit_prepared_floating_pane_addition(prepared_floating);
+            authority.insert_live_registration(
                 spawned_id,
-                geometry.rect,
-                focus,
+                &pane,
+                expected_domain_id,
+                registration.clone(),
+                prepared_authority,
             );
+            authority.commit_structural_bind(structural);
             if focus {
                 if let Some(info) = client_info {
                     info.replace_focused_pane(spawned_id, Some(registration.clone()));
@@ -4932,7 +5495,13 @@ impl Tab {
             let finalized = commit_guard.finalize();
             debug_assert!(registration.same_registration(&finalized));
             preparation_claim.retire_locked();
-            (positioned, callbacks, registration, lifecycle_ticket)
+            (
+                positioned,
+                callbacks,
+                retired_floating,
+                registration,
+                lifecycle_ticket,
+            )
         };
 
         // The exact registration and structural owner are now committed. Disarm
@@ -4940,6 +5509,7 @@ impl Tab {
         // rollback after this linearization point belongs to normal mux pane
         // retirement, never to construction-time RAII.
         let pane = unpublished.into_pane();
+        drop(retired_floating);
         callbacks.execute(None);
         mux.recompute_pane_count();
         mux.complete_pane_lifecycle_notification(lifecycle_ticket);
@@ -4986,7 +5556,21 @@ impl Tab {
     }
 
     pub fn remove_floating_pane(&self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
-        self.inner.lock().remove_floating_pane(pane_id)
+        let (mux, pane) = {
+            let inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            let pane = inner
+                .floating_panes
+                .iter()
+                .find(|floating| floating.pane_id == pane_id)
+                .map(|floating| Arc::clone(&floating.pane));
+            (mux, pane)
+        };
+        let pane = pane?;
+        match mux {
+            Some(mux) => self.remove_exact_pane_for_move(&mux, &pane),
+            None => self.inner.lock().remove_floating_pane(pane_id),
+        }
     }
 
     pub fn iter_floating_panes(&self) -> Vec<PositionedFloatingPane> {
@@ -5396,6 +5980,7 @@ impl Tab {
         let result = f(inner.snapshot_panes_callback_free())?;
         let retired = inner.retire_mux_owner(mux);
         debug_assert!(retired);
+        self.mux_owner_generation.store(0, Ordering::Release);
         Some(result)
     }
 
@@ -5445,9 +6030,10 @@ impl Tab {
         }
 
         let result = f(snapshots)?;
-        for inner in &mut guards {
+        for (inner, (_, tab)) in guards.iter_mut().zip(&lock_order) {
             let retired = inner.retire_mux_owner(mux);
             debug_assert!(retired);
+            tab.mux_owner_generation.store(0, Ordering::Release);
         }
         Some(result)
     }
@@ -5480,6 +6066,7 @@ impl Tab {
         let result = f()?;
         let retired = inner.retire_mux_owner(mux);
         debug_assert!(retired);
+        self.mux_owner_generation.store(0, Ordering::Release);
         Some(result)
     }
 
@@ -5508,6 +6095,7 @@ impl Tab {
         let result = f(panes)?;
         let retired = inner.retire_mux_owner(mux);
         debug_assert!(retired);
+        self.mux_owner_generation.store(0, Ordering::Release);
         Some(result)
     }
 
@@ -5548,12 +6136,19 @@ impl Tab {
             // Registry publication/retirement is serialized before topology
             // mutation. No pane trait method is invoked in this scope.
             let _registration = mux.pane_registration.lock();
-            let registered = mux.panes.read();
-            let authorized = candidates
-                .iter()
-                .filter(|candidate| {
+            let mut authority = mux.pane_authority.lock();
+            let Some(registered_tab) = self.exact_registered_arc(mux) else {
+                return (false, Vec::new());
+            };
+            let mut authorized = Vec::new();
+            if authorized.try_reserve_exact(candidates.len()).is_err() {
+                return (false, Vec::new());
+            }
+            {
+                let registered = mux.panes.read();
+                for candidate in candidates {
                     let current = registered.get(&candidate.pane_id);
-                    match &candidate.expected_registration {
+                    let registration_matches = match &candidate.expected_registration {
                         Some(expected) => current.is_some_and(|current| {
                             Arc::ptr_eq(&current.pane, &candidate.pane)
                                 && expected.same_registration(&PaneRegistrationHandle::new(
@@ -5563,19 +6158,47 @@ impl Tab {
                         }),
                         None => current
                             .is_none_or(|current| !Arc::ptr_eq(&current.pane, &candidate.pane)),
+                    };
+                    if !registration_matches
+                        || authority
+                            .validate_structural_owner_exact(
+                                candidate.pane_id,
+                                &candidate.pane,
+                                &registered_tab,
+                                None,
+                                candidate.expected_registration.as_ref(),
+                            )
+                            .is_err()
+                    {
+                        continue;
                     }
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+                    authorized.push(candidate.clone());
+                }
+            }
+            let mut registrations = Vec::new();
+            if registrations.try_reserve_exact(authorized.len()).is_err() {
+                return (false, Vec::new());
+            }
 
             let mut inner = self.inner.lock();
+            if !inner.is_active_mux_owner(mux) {
+                return (false, Vec::new());
+            }
             let mut callbacks = inner.remove_exact_panes_callback_free(observed, &authorized);
             callbacks.reserve_topology_notifications(mux, self.tab_id);
-            let registrations = authorized
-                .iter()
-                .filter(|candidate| callbacks.removed.contains(&pane_identity(&candidate.pane)))
-                .filter_map(|candidate| candidate.expected_registration.clone())
-                .collect::<Vec<_>>();
+            for candidate in &authorized {
+                if callbacks.removed.contains(&pane_identity(&candidate.pane)) {
+                    if let Some(registration) = &candidate.expected_registration {
+                        registrations.push(registration.clone());
+                    }
+                    let removed = authority.remove_structural_owner_exact(
+                        candidate.pane_id,
+                        &candidate.pane,
+                        &registered_tab,
+                    );
+                    debug_assert!(removed);
+                }
+            }
             (callbacks, registrations)
         };
 
@@ -5791,7 +6414,14 @@ impl Tab {
     /// The pane is still live in the mux; the intent is for the pane to
     /// be added to a different tab.
     pub fn remove_pane(&self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
-        self.inner.lock().remove_pane(pane_id)
+        let Some(mux) = self.inner.lock().notification_owner() else {
+            return self.inner.lock().remove_pane(pane_id);
+        };
+        let pane = Self::observe_panes(self.snapshot_panes_callback_free())
+            .into_iter()
+            .find(|observed| observed.pane_id == Some(pane_id))?
+            .pane;
+        self.remove_exact_pane_for_move(&mux, &pane)
     }
 
     /// Remove only the supplied pane allocation for an admitted move.
@@ -5804,6 +6434,22 @@ impl Tab {
         mux: &Mux,
         expected: &Arc<dyn Pane>,
     ) -> Option<Arc<dyn Pane>> {
+        let lane = {
+            let inner = self.inner.lock();
+            let tiled = inner
+                .snapshot_non_floating_panes_callback_free()
+                .iter()
+                .any(|pane| Arc::ptr_eq(pane, expected));
+            let floating = inner
+                .floating_panes
+                .iter()
+                .any(|pane| Arc::ptr_eq(&pane.pane, expected));
+            match (tiled, floating) {
+                (true, false) => PaneStructuralLane::Tiled,
+                (false, true) => PaneStructuralLane::Floating,
+                _ => return None,
+            }
+        };
         let observed = Self::observe_panes(self.snapshot_panes_callback_free());
         let candidate = observed.iter().find_map(|observed| {
             observed
@@ -5815,12 +6461,57 @@ impl Tab {
                     expected_registration: None,
                 })
         })?;
+        let _registration = mux.pane_registration.lock();
+        let mut authority = mux.pane_authority.lock();
+        let registered_tab = self.exact_registered_arc(mux)?;
+        let pane_registration = {
+            let panes = mux.panes.read();
+            let registered = panes.get(&candidate.pane_id)?;
+            if !Arc::ptr_eq(&registered.pane, &candidate.pane) {
+                return None;
+            }
+            let registration =
+                PaneRegistrationHandle::new(&registered.pane, &registered.generation);
+            if !authority.contains_live_registration(
+                candidate.pane_id,
+                registered.domain_id,
+                &registration,
+            ) {
+                return None;
+            }
+            registration
+        };
+        if authority
+            .validate_structural_owner_exact(
+                candidate.pane_id,
+                &candidate.pane,
+                &registered_tab,
+                Some(lane),
+                Some(&pane_registration),
+            )
+            .is_err()
+        {
+            return None;
+        }
         let mut inner = self.inner.lock();
+        if !inner.is_active_mux_owner(mux) {
+            return None;
+        }
         let mut callbacks =
             inner.remove_exact_panes_callback_free(&observed, std::slice::from_ref(&candidate));
         callbacks.reserve_topology_notifications(mux, self.tab_id);
-        drop(inner);
         let removed = callbacks.removed.contains(&pane_identity(&candidate.pane));
+        if removed {
+            let index_removed = authority.remove_structural_owner_exact(
+                candidate.pane_id,
+                &candidate.pane,
+                &registered_tab,
+            );
+            debug_assert!(index_removed);
+        }
+        drop(inner);
+        drop(authority);
+        drop(_registration);
         callbacks.execute(Some(mux));
         removed.then_some(candidate.pane)
     }
@@ -6005,7 +6696,7 @@ impl Tab {
             );
             return;
         }
-        let structural = match authority.prepare_structural_bind(
+        let structural = match authority.prepare_new_structural_bind(
             pane_id,
             Arc::clone(pane),
             registered_tab,
@@ -6100,7 +6791,7 @@ impl Tab {
             ),
             "split pane {pane_id} lacks exact domain-registration authority"
         );
-        let structural = authority.prepare_structural_bind(
+        let structural = authority.prepare_new_structural_bind(
             pane_id,
             Arc::clone(&pane),
             registered_tab,
@@ -7215,43 +7906,23 @@ impl TabInner {
         }
     }
 
-    fn install_prepared_pane_tree(
+    fn commit_prepared_pane_tree_install(
         &mut self,
-        size: TerminalSize,
-        prepared: PreparedPaneTree,
+        prepared: PreparedPaneTreeInstall,
     ) -> DeferredTabCallbacks {
-        let PreparedPaneTree {
+        let PreparedPaneTreeInstall {
             tree,
-            active,
+            active_index,
+            tag_active,
             zoomed,
+            size,
+            resize_work,
         } = prepared;
-        let mut cursor = tree.cursor();
-
-        self.active = 0;
-        if let Some(active) = active {
-            // Resolve the active pane to its index
-            let mut index = 0;
-            loop {
-                if let Some(pane) = cursor.leaf_mut() {
-                    if Arc::ptr_eq(&active, pane) {
-                        // Found it
-                        self.active = index;
-                        self.recency.tag(index);
-                        break;
-                    }
-                    index += 1;
-                }
-                match cursor.preorder_next() {
-                    Ok(c) => cursor = c,
-                    Err(c) => {
-                        // Didn't find it
-                        cursor = c;
-                        break;
-                    }
-                }
-            }
+        self.active = active_index;
+        if tag_active {
+            self.recency.tag(active_index);
         }
-        self.pane.replace(cursor.tree());
+        self.pane.replace(tree);
         self.floating_panes.clear();
         self.floating_focus = None;
         self.pane_stacks.clear();
@@ -7264,20 +7935,13 @@ impl TabInner {
         // invoke arbitrary Pane observations while `Tab::inner` is locked.
         // Freeze only the callbacks implied by the prepared geometry; execute
         // them after the outer synchronization boundary releases this lock.
-        let mut callbacks = DeferredTabCallbacks {
+        let callbacks = DeferredTabCallbacks {
             changed: true,
+            resize_work,
             ..DeferredTabCallbacks::default()
         };
-        if size.rows != 0 && size.cols != 0 {
-            if let Some(zoomed) = self.zoomed.as_ref() {
-                callbacks.resize_work.push((Arc::clone(zoomed), size));
-            } else if let Some(tree) = self.pane.as_ref() {
-                collect_pane_resize_work(tree, &size, &mut callbacks.resize_work);
-            }
-        }
 
         log::debug!("sync tab: {:#?} zoomed: {}", size, self.zoomed.is_some(),);
-        assert!(self.pane.is_some());
         callbacks
     }
 
@@ -7507,46 +8171,56 @@ impl TabInner {
     }
 
     fn prepare_add_floating_pane(
-        &mut self,
+        &self,
         pane: Arc<dyn Pane>,
         pane_id: PaneId,
         rect: FloatingPaneRect,
-    ) -> (PositionedFloatingPane, DeferredTabCallbacks) {
+    ) -> anyhow::Result<PreparedFloatingPaneAddition> {
         self.prepare_add_floating_pane_with_focus(pane, pane_id, rect, true)
     }
 
     fn prepare_add_floating_pane_with_focus(
-        &mut self,
+        &self,
         pane: Arc<dyn Pane>,
         pane_id: PaneId,
         rect: FloatingPaneRect,
         focus: bool,
-    ) -> (PositionedFloatingPane, DeferredTabCallbacks) {
+    ) -> anyhow::Result<PreparedFloatingPaneAddition> {
         self.prepare_add_floating_pane_impl(pane, pane_id, rect, focus, true)
     }
 
     fn prepare_add_presized_floating_pane(
-        &mut self,
+        &self,
         pane: Arc<dyn Pane>,
         pane_id: PaneId,
         rect: FloatingPaneRect,
         focus: bool,
-    ) -> (PositionedFloatingPane, DeferredTabCallbacks) {
+    ) -> anyhow::Result<PreparedFloatingPaneAddition> {
         self.prepare_add_floating_pane_impl(pane, pane_id, rect, focus, false)
     }
 
     fn prepare_add_floating_pane_impl(
-        &mut self,
+        &self,
         pane: Arc<dyn Pane>,
         pane_id: PaneId,
         rect: FloatingPaneRect,
         focus: bool,
         resize: bool,
-    ) -> (PositionedFloatingPane, DeferredTabCallbacks) {
+    ) -> anyhow::Result<PreparedFloatingPaneAddition> {
         let prior = self.raw_active_pane_retained_id();
         let rect = self.clamp_floating_rect(rect);
         let pane_size = resize.then(|| self.floating_pane_size(rect));
-        let z_order = self.next_floating_z_order();
+        let replacement_len = self
+            .floating_panes
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("floating pane count overflow"))?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(replacement_len)
+            .map_err(|error| anyhow::anyhow!("reserve floating pane replacement: {error}"))?;
+        replacement.extend(self.floating_panes.iter().cloned());
+        let z_order = next_floating_z_order_in_replacement(&mut replacement)?;
 
         let floating = FloatingPane {
             pane: Arc::clone(&pane),
@@ -7557,12 +8231,18 @@ impl TabInner {
             pinned: false,
             opacity: 1.0,
         };
-        self.floating_panes.push(floating);
-        if focus {
-            self.floating_focus = Some(pane_id);
-        }
-        let positioned =
-            self.positioned_floating_pane(self.floating_panes.last().expect("floating pane added"));
+        replacement.push(floating);
+        let floating_focus = if focus {
+            Some(pane_id)
+        } else {
+            self.floating_focus
+        };
+        let positioned = positioned_floating_pane_with_focus(
+            replacement
+                .last()
+                .expect("pre-reserved floating replacement retains the added pane"),
+            floating_focus,
+        );
         let mut callbacks = DeferredTabCallbacks {
             changed: true,
             prior_focus: prior.clone(),
@@ -7575,9 +8255,37 @@ impl TabInner {
             ..DeferredTabCallbacks::default()
         };
         if let Some(pane_size) = pane_size {
+            callbacks
+                .resize_work
+                .try_reserve_exact(1)
+                .map_err(|error| anyhow::anyhow!("reserve floating pane resize work: {error}"))?;
             callbacks.resize_work.push((pane, pane_size));
         }
-        (positioned, callbacks)
+        Ok(PreparedFloatingPaneAddition {
+            replacement,
+            floating_focus,
+            positioned,
+            callbacks,
+        })
+    }
+
+    fn commit_prepared_floating_pane_addition(
+        &mut self,
+        prepared: PreparedFloatingPaneAddition,
+    ) -> (
+        PositionedFloatingPane,
+        DeferredTabCallbacks,
+        Vec<FloatingPane>,
+    ) {
+        let PreparedFloatingPaneAddition {
+            replacement,
+            floating_focus,
+            positioned,
+            callbacks,
+        } = prepared;
+        let retired = std::mem::replace(&mut self.floating_panes, replacement);
+        self.floating_focus = floating_focus;
+        (positioned, callbacks, retired)
     }
 
     fn prepare_set_floating_pane_rect(
@@ -7739,6 +8447,103 @@ impl TabInner {
         }
 
         panes
+    }
+
+    fn snapshot_structural_panes_callback_free_checked(
+        &self,
+    ) -> anyhow::Result<(Vec<Arc<dyn Pane>>, Vec<(PaneId, Arc<dyn Pane>)>)> {
+        let mut tiled = Vec::new();
+        if let Some(tree) = &self.pane {
+            collect_raw_tree_panes(tree, &mut tiled);
+        }
+        let mut tree_identities = HashSet::new();
+        tree_identities
+            .try_reserve(tiled.len())
+            .map_err(|error| anyhow::anyhow!("reserve raw tree identity census: {error}"))?;
+        for pane in &tiled {
+            anyhow::ensure!(
+                tree_identities.insert(pane_identity(pane)),
+                "one exact pane allocation occupies multiple tiled tree leaves"
+            );
+        }
+
+        let stack_member_count = self
+            .pane_stacks
+            .values()
+            .try_fold(0usize, |count, stack| {
+                count
+                    .checked_add(stack.len())
+                    .ok_or_else(|| anyhow::anyhow!("pane stack member count overflow"))
+            })?;
+        tiled
+            .try_reserve(stack_member_count)
+            .map_err(|error| anyhow::anyhow!("reserve hidden stack pane census: {error}"))?;
+        let mut stack_identities = HashSet::new();
+        stack_identities
+            .try_reserve(stack_member_count)
+            .map_err(|error| anyhow::anyhow!("reserve stack identity census: {error}"))?;
+        for stack in self.pane_stacks.values() {
+            let active_identity = pane_identity(stack.active_pane());
+            anyhow::ensure!(
+                tree_identities.contains(&active_identity),
+                "pane stack active allocation is absent from the tiled tree"
+            );
+            for pane in stack.panes() {
+                let identity = pane_identity(pane);
+                anyhow::ensure!(
+                    stack_identities.insert(identity),
+                    "one exact pane allocation belongs to multiple pane stacks"
+                );
+                if identity == active_identity {
+                    continue;
+                }
+                anyhow::ensure!(
+                    !tree_identities.contains(&identity),
+                    "hidden pane stack allocation also occupies a tiled tree leaf"
+                );
+                tiled.push(Arc::clone(pane));
+            }
+        }
+
+        let mut floating = Vec::new();
+        floating
+            .try_reserve_exact(self.floating_panes.len())
+            .map_err(|error| anyhow::anyhow!("reserve floating structural census: {error}"))?;
+        let mut floating_identities = HashSet::new();
+        floating_identities
+            .try_reserve(self.floating_panes.len())
+            .map_err(|error| anyhow::anyhow!("reserve floating identity census: {error}"))?;
+        for pane in &self.floating_panes {
+            let identity = pane_identity(&pane.pane);
+            anyhow::ensure!(
+                floating_identities.insert(identity),
+                "one exact pane allocation appears in multiple floating entries"
+            );
+            anyhow::ensure!(
+                !tree_identities.contains(&identity) && !stack_identities.contains(&identity),
+                "one exact pane allocation is simultaneously tiled and floating"
+            );
+            floating.push((pane.pane_id, Arc::clone(&pane.pane)));
+        }
+        if let Some(zoomed) = &self.zoomed {
+            let identity = pane_identity(zoomed);
+            let logical_owner_count = tiled
+                .iter()
+                .filter(|pane| pane_identity(pane) == identity)
+                .count()
+                .checked_add(
+                    floating
+                        .iter()
+                        .filter(|(_, pane)| pane_identity(pane) == identity)
+                        .count(),
+                )
+                .ok_or_else(|| anyhow::anyhow!("zoom owner count overflow"))?;
+            anyhow::ensure!(
+                logical_owner_count == 1,
+                "zoom carrier has {logical_owner_count} logical structural owners"
+            );
+        }
+        Ok((tiled, floating))
     }
 
     fn count_floating_panes(&self) -> usize {
@@ -15480,7 +16285,8 @@ mod test {
         assert_eq!(made, [42, 41], "reverse consumption is deliberate");
 
         let tab = Tab::new(&size);
-        tab.sync_with_prepared_pane_tree(size, prepared);
+        tab.sync_with_prepared_pane_tree(size, prepared)
+            .expect("install prepared pane tree");
         assert_eq!(
             tab.iter_panes_ignoring_zoom()
                 .into_iter()
@@ -15519,7 +16325,8 @@ mod test {
         armed.store(true, std::sync::atomic::Ordering::Release);
 
         let tab = Tab::new(&size);
-        tab.sync_with_prepared_pane_tree(size, prepared);
+        tab.sync_with_prepared_pane_tree(size, prepared)
+            .expect("install prepared pane tree");
 
         assert_eq!(tab.get_active_idx(), 0);
         let active = tab
