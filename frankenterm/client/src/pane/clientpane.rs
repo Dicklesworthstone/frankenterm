@@ -493,21 +493,27 @@ impl ReliableInputQueue {
         {
             return Err(());
         }
-        let trace_context = front.trace_context.take();
         let mut request = front.request.clone();
         request.pane_registration = pane_registration;
-        let attempt = if disposition == ReliableInputCodecDisposition::ReliableTraced {
-            match trace_context {
-                Some(trace_context) => {
-                    ReliableInputWireAttempt::Traced(ReliableKeyEventTracedV1 {
-                        request,
-                        trace_context,
-                    })
-                }
-                None => ReliableInputWireAttempt::Unsampled(request),
-            }
+        // A missing pane-registration identity is a no-effect authority probe,
+        // not the first effect-eligible wire attempt. Keep the sampled context
+        // queued until the exact authority is bound. Once an authority-bound
+        // attempt can reach the pane callback, consume the context exactly
+        // once even if this peer is too old for PDU98: a later reconnect must
+        // never add K4/K5 to an ambiguous v61 retry.
+        let trace_context = if request.pane_registration.is_some() {
+            front.trace_context.take()
         } else {
-            ReliableInputWireAttempt::Unsampled(request)
+            None
+        };
+        let attempt = match (disposition, trace_context) {
+            (ReliableInputCodecDisposition::ReliableTraced, Some(trace_context)) => {
+                ReliableInputWireAttempt::Traced(ReliableKeyEventTracedV1 {
+                    request,
+                    trace_context,
+                })
+            }
+            _ => ReliableInputWireAttempt::Unsampled(request),
         };
         Ok((attempt, trace_context))
     }
@@ -1416,8 +1422,8 @@ impl ClientPane {
     }
 
     /// Enqueue one sampled key-down on the same reliable lane as ordinary
-    /// PDU96 input. The context is eligible only for the first wire attempt;
-    /// retries retain the operational request and serial but use PDU96.
+    /// PDU96 input. The context is eligible only for the first effect-capable
+    /// wire attempt; no-effect authority probes and later retries use PDU96.
     pub fn key_down_with_trace_context(
         &self,
         key: KeyCode,
@@ -2580,7 +2586,7 @@ mod tests {
     }
 
     #[test]
-    fn reliable_input_trace_context_is_first_wire_attempt_only_and_restorable_only_before_send() {
+    fn reliable_input_trace_context_waits_for_authority_then_is_consumed_once() {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
@@ -2595,7 +2601,7 @@ mod tests {
             state.worker_running = true;
         }
         let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x71; 16]);
-        let pane_authority = Arc::new(Mutex::new(Some(pane_registration)));
+        let pane_authority = Arc::new(Mutex::new(None));
         let request = ReliableKeyEventV1 {
             pane_id: 32,
             pane_registration: None,
@@ -2626,13 +2632,37 @@ mod tests {
             .expect("queued input exists")
             .clone();
 
+        let (probe, consumed) = inner
+            .reliable_input_queue
+            .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::ReliableTraced)
+            .expect("no-effect authority probe must remain operationally reliable");
+        assert!(consumed.is_none());
+        let ReliableInputWireAttempt::Unsampled(probe) = probe else {
+            panic!("authority probe must use byte-identical PDU96");
+        };
+        assert!(probe.pane_registration.is_none());
+        assert_eq!(
+            inner
+                .reliable_input_queue
+                .state
+                .lock()
+                .pending
+                .front()
+                .and_then(|queued| queued.trace_context),
+            Some(context),
+            "authority probe must retain context for the first effect-eligible attempt"
+        );
+        assert!(inner
+            .reliable_input_queue
+            .bind_front_pane_authority(&expected, pane_registration));
+
         let (first, consumed) = inner
             .reliable_input_queue
             .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::ReliableTraced)
-            .expect("first exact attempt must claim its trace context");
+            .expect("first authority-bound attempt must claim its trace context");
         assert_eq!(consumed, Some(context));
         let ReliableInputWireAttempt::Traced(first) = first else {
-            panic!("v62 first attempt must use the traced wrapper");
+            panic!("v62 first effect-eligible attempt must use the traced wrapper");
         };
         assert_eq!(first.request.pane_registration, Some(pane_registration));
         assert_eq!(first.trace_context, context);
@@ -2657,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn definitely_not_sent_attempt_restores_trace_context_but_v61_never_emits_pdu98() {
+    fn v61_effect_eligible_attempt_consumes_context_before_a_v62_retry() {
         let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
@@ -2679,12 +2709,64 @@ mod tests {
             kind: ReliableKeyEventKindV1::KeyUp,
         };
         let context = sampled_reliable_key_context();
+        let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x72; 16]);
         inner
             .reliable_input_queue
             .enqueue_with_trace_context(
                 &inner,
                 registration,
-                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(Some(pane_registration))),
+                request,
+                Some(context),
+            )
+            .expect("sampled input should queue");
+        let expected = inner.reliable_input_queue.state.lock().pending[0].clone();
+
+        let (v61_attempt, consumed) = inner
+            .reliable_input_queue
+            .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::Reliable)
+            .expect("v61 attempt should retain reliable operational semantics");
+        assert!(matches!(v61_attempt, ReliableInputWireAttempt::Unsampled(_)));
+        assert_eq!(consumed, Some(context));
+
+        let (v62_attempt, consumed_again) = inner
+            .reliable_input_queue
+            .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::ReliableTraced)
+            .expect("an ambiguous v61 attempt remains retryable after an upgrade");
+        assert!(matches!(v62_attempt, ReliableInputWireAttempt::Unsampled(_)));
+        assert!(consumed_again.is_none());
+    }
+
+    #[test]
+    fn definitely_not_sent_effect_eligible_attempt_may_restore_trace_context() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane: Arc<dyn Pane> = test_client_pane(&inner, 48, 34);
+        mux.add_pane(&pane).expect("register trace restoration pane");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("capture trace restoration registration");
+        inner.reliable_input_queue.state.lock().worker_running = true;
+        let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x73; 16]);
+        let request = ReliableKeyEventV1 {
+            pane_id: 34,
+            pane_registration: None,
+            event: KeyEvent {
+                key: KeyCode::Char('s'),
+                modifiers: KeyModifiers::SHIFT,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(43),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        let context = sampled_reliable_key_context();
+        inner
+            .reliable_input_queue
+            .enqueue_with_trace_context(
+                &inner,
+                registration,
+                Arc::new(Mutex::new(Some(pane_registration))),
                 request,
                 Some(context),
             )
@@ -2704,7 +2786,7 @@ mod tests {
         let (v62_attempt, consumed_again) = inner
             .reliable_input_queue
             .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::ReliableTraced)
-            .expect("a definitely-not-sent attempt may preserve first-wire context");
+            .expect("definitely-not-sent restoration preserves first effect-eligible context");
         assert!(matches!(v62_attempt, ReliableInputWireAttempt::Traced(_)));
         assert_eq!(consumed_again, Some(context));
     }
