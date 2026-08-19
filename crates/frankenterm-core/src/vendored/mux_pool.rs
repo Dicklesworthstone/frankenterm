@@ -103,13 +103,6 @@ impl MuxPoolError {
             Self::Pool(_) | Self::IndeterminateMutation(_) => false,
         }
     }
-
-    /// Whether local wire admission proved that the negotiated peer dialect
-    /// cannot understand one named additive PDU.
-    #[must_use]
-    pub fn is_unsupported_pdu(&self, expected_pdu: &str) -> bool {
-        matches!(self, Self::Mux(error) if error.is_unsupported_pdu(expected_pdu))
-    }
 }
 
 /// Recovery settings for mux protocol errors.
@@ -976,7 +969,7 @@ impl MuxPool {
         &self,
         cx: &Cx,
         pane_ids: Vec<usize>,
-    ) -> Result<Option<GetPaneTieredScrollbackStatusesV1Response>, MuxPoolError> {
+    ) -> Result<GetPaneTieredScrollbackStatusesV1Response, MuxPoolError> {
         codec::GetPaneTieredScrollbackStatusesV1 {
             pane_ids: pane_ids.clone(),
         }
@@ -994,13 +987,9 @@ impl MuxPool {
                 let op_cx = op_cx.clone();
                 let pane_ids = pane_ids.clone();
                 Box::pin(async move {
-                    if !client.supports_tiered_scrollback_status_batch()? {
-                        return Ok(None);
-                    }
                     client
                         .get_pane_tiered_scrollback_statuses_with_cx(&op_cx, pane_ids)
                         .await
-                        .map(Some)
                 })
             },
         )
@@ -1649,6 +1638,22 @@ mod tests {
                                         },
                                     )
                                 }
+                                Pdu::GetPaneTieredScrollbackStatusesV1(req) => {
+                                    Pdu::GetPaneTieredScrollbackStatusesV1Response(
+                                        codec::GetPaneTieredScrollbackStatusesV1Response {
+                                            entries: req
+                                                .pane_ids
+                                                .into_iter()
+                                                .map(|pane_id| {
+                                                    codec::PaneTieredScrollbackStatusEntryV1 {
+                                                        pane_id,
+                                                        outcome: codec::PaneTieredScrollbackStatusOutcomeV1::Unavailable,
+                                                    }
+                                                })
+                                                .collect(),
+                                        },
+                                    )
+                                }
                                 Pdu::WriteToPane(_) => Pdu::UnitResponse(UnitResponse {}),
                                 Pdu::SendPaste(_) => Pdu::UnitResponse(UnitResponse {}),
                                 _ => continue,
@@ -2170,10 +2175,10 @@ mod tests {
     }
 
     #[test]
-    fn pool_old_peer_bulk_capability_fallback_keeps_connection_healthy() {
+    fn pool_current_peer_bulk_request_reuses_connection() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = spawn_mock_server_with_codec_version(&temp_dir, 56).await;
+            let socket_path = spawn_mock_server(&temp_dir).await;
             let pool = MuxPool::new(pool_config(socket_path, 4));
             let cx = crate::cx::for_testing();
 
@@ -2185,7 +2190,7 @@ mod tests {
                 let error = pool
                     .get_pane_tiered_scrollback_statuses_with_cx(&cx, invalid)
                     .await
-                    .expect_err("invalid batches must fail before old-peer negotiation");
+                    .expect_err("invalid batches must fail before connection acquisition");
                 assert!(
                     matches!(
                         &error,
@@ -2198,12 +2203,19 @@ mod tests {
             let statuses = pool
                 .get_pane_tiered_scrollback_statuses_with_cx(&cx, vec![7, 11])
                 .await
-                .expect("v56 capability fallback must be a healthy pool result");
-            assert!(statuses.is_none());
+                .expect("current peer must return bounded tiered-scrollback statuses");
+            assert_eq!(
+                statuses
+                    .entries
+                    .iter()
+                    .map(|entry| entry.pane_id)
+                    .collect::<Vec<_>>(),
+                vec![7, 11]
+            );
 
             pool.list_panes_with_cx(&cx)
                 .await
-                .expect("the old-peer capability probe must leave the connection reusable");
+                .expect("the bulk request must leave the connection reusable");
             let stats = pool.stats_with_cx(&cx).await.expect("pool stats");
             assert_eq!(stats.connections_created, 1);
             assert_eq!(stats.recovery_attempts, 0);

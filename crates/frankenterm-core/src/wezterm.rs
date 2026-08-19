@@ -1932,10 +1932,10 @@ impl WeztermClient {
 
     /// Fetch lightweight mux-owned scrollback health for a bounded pane batch.
     ///
-    /// The v57 operation avoids `GetPaneRenderChanges` and therefore never
-    /// materializes row deltas merely to read health counters. A negotiated
-    /// v56 peer returns `Ok(None)` from local pre-write admission, authorizing
-    /// the runtime's bounded legacy fallback without poisoning the connection.
+    /// The operation avoids `GetPaneRenderChanges` and therefore never
+    /// materializes row deltas merely to read health counters. Every currently
+    /// compatible peer supports this request; `Ok(None)` is reserved for a
+    /// build or platform without a vendored mux pool.
     #[cfg(all(feature = "vendored", unix))]
     pub async fn pane_tiered_scrollback_summaries_bulk_with_cx(
         &self,
@@ -1958,7 +1958,7 @@ impl WeztermClient {
             .get_pane_tiered_scrollback_statuses_with_cx(cx, mux_pane_ids)
             .await
         {
-            Ok(Some(response)) => {
+            Ok(response) => {
                 let entries = response
                     .entries
                     .into_iter()
@@ -1988,18 +1988,6 @@ impl WeztermClient {
                     .collect();
                 self.mux_circuit_record_success();
                 Ok(Some(entries))
-            }
-            Ok(None) => {
-                // Unsupported is an expected capability result from a healthy,
-                // aligned transport. Clear prior transient mux failures so an
-                // old peer cannot strand the legacy health path behind an open
-                // circuit merely because it lacks this additive PDU.
-                self.mux_circuit_record_success();
-                Ok(None)
-            }
-            Err(error) if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") => {
-                self.mux_circuit_record_success();
-                Ok(None)
             }
             Err(error) => {
                 self.mux_circuit_record_error(&error);

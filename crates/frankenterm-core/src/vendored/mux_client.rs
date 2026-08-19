@@ -392,24 +392,31 @@ impl DirectMuxError {
             }
         )
     }
-
-    /// Whether local codec admission proved that this peer cannot understand
-    /// one named additive PDU. This is the only condition under which a
-    /// higher-level read may take its bounded compatibility fallback.
-    #[must_use]
-    pub(crate) fn is_unsupported_pdu(&self, expected_pdu: &str) -> bool {
-        match self {
-            Self::OutboundPduRequiresCodec { pdu, .. } => *pdu == expected_pdu,
-            Self::ProvenPreWriteRejection(source) => source.is_unsupported_pdu(expected_pdu),
-            _ => false,
-        }
-    }
 }
 
 fn cancelled_mux_error(phase: &'static str, detail: impl std::fmt::Display) -> DirectMuxError {
     DirectMuxError::Cancelled {
         phase,
         detail: detail.to_string(),
+    }
+}
+
+fn is_disconnected_io_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn disconnected_or_io(error: std::io::Error) -> DirectMuxError {
+    if is_disconnected_io_kind(error.kind()) {
+        DirectMuxError::Disconnected
+    } else {
+        DirectMuxError::Io(error)
     }
 }
 
@@ -1817,6 +1824,18 @@ impl<'a> RenderBatchGuard<'a> {
         }
         let local_sideband = self.local_sidebands.take(pane_id)?;
         let (reserved_count, reserved_bytes) = self.local_sidebands.totals()?;
+        if self.in_flight.is_empty() {
+            if !self.in_flight_panes.is_empty() || !self.local_sidebands.is_empty()? {
+                return Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "render batch terminal sideband ownership",
+                });
+            }
+            // The response frame is fully decoded and correlated. Subsequent
+            // semantic/retention failure must discard the connection when its
+            // own recovery authority says so, but it is not an abandoned
+            // in-flight request and must retain its precise error identity.
+            self.transport_ambiguous = false;
+        }
         let resolved =
             DirectMuxClient::response_from_pdu(decoded.pdu, request_ident).and_then(|pdu| {
                 self.client.resolve_render_change_response_with_sideband(
@@ -1853,14 +1872,6 @@ impl<'a> RenderBatchGuard<'a> {
                 .ok_or(DirectMuxError::RetainedStateAccounting {
                     resource: "render batch settled response count",
                 })?;
-        if self.in_flight.is_empty() {
-            if !self.in_flight_panes.is_empty() || !self.local_sidebands.is_empty()? {
-                return Err(DirectMuxError::RetainedStateAccounting {
-                    resource: "render batch terminal sideband ownership",
-                });
-            }
-            self.transport_ambiguous = false;
-        }
         Ok(true)
     }
 
@@ -2223,20 +2234,6 @@ impl DirectMuxClient {
         match response {
             Pdu::ListPanesResponse(payload) => Ok(payload),
             other => self.unexpected_response("ListPanesResponse", &other, true),
-        }
-    }
-
-    /// Check whether the negotiated peer dialect admits the additive batch PDU.
-    pub(crate) fn supports_tiered_scrollback_status_batch(&self) -> Result<bool, DirectMuxError> {
-        let probe = Pdu::GetPaneTieredScrollbackStatusesV1(GetPaneTieredScrollbackStatusesV1 {
-            pane_ids: vec![0],
-        });
-        match self.authorize_outbound_pdu(&probe) {
-            Ok(()) => Ok(true),
-            Err(error) if error.is_unsupported_pdu("GetPaneTieredScrollbackStatusesV1") => {
-                Ok(false)
-            }
-            Err(error) => Err(error),
         }
     }
 
@@ -4431,7 +4428,7 @@ impl DirectMuxClient {
                         error = %err,
                         "mux response read failed"
                     );
-                    let error = DirectMuxError::Io(err);
+                    let error = disconnected_or_io(err);
                     self.apply_error_disposition(&error, "response read I/O failure", false);
                     return Err(error);
                 }
@@ -4523,7 +4520,7 @@ impl DirectMuxClient {
                     let error = if cx.is_cancel_requested() {
                         cancelled_mux_error("response_read_wait", err)
                     } else {
-                        DirectMuxError::Io(err)
+                        disconnected_or_io(err)
                     };
                     self.apply_error_disposition(&error, "response read interruption", true);
                     return Err(error);
@@ -5240,6 +5237,23 @@ mod tests {
             }
         }
         out
+    }
+
+    async fn write_until_oversized_frame_rejection(
+        stream: &mut compat_unix::UnixStream,
+        prefix: &[u8],
+        chunk_size: usize,
+    ) -> std::io::Result<()> {
+        for chunk in prefix.chunks(chunk_size) {
+            match stream.write_all(chunk).await {
+                Ok(()) => sleep(Duration::from_millis(5)).await,
+                Err(error) if is_disconnected_io_kind(error.kind()) => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn run_async_test<F>(future: F)
@@ -9620,7 +9634,11 @@ mod tests {
                 .get_pane_render_changes_batch(&[11], 1, Duration::from_secs(1))
                 .await
                 .expect_err("peer close after request write must fail batch");
-            assert!(matches!(error, DirectMuxError::Disconnected));
+            assert!(matches!(
+                error,
+                DirectMuxError::InFlightScopeAbandoned(source)
+                    if matches!(*source, DirectMuxError::Disconnected)
+            ));
             assert!(client.connection_poisoned);
             assert!(client.outstanding_requests.is_empty());
             assert!(client.pending_responses.is_empty());
@@ -11853,6 +11871,26 @@ mod tests {
     }
 
     #[test]
+    fn connection_close_read_errors_normalize_to_disconnected() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(matches!(
+                disconnected_or_io(std::io::Error::from(kind)),
+                DirectMuxError::Disconnected
+            ));
+        }
+        assert!(matches!(
+            disconnected_or_io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            DirectMuxError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
     fn protocol_error_kind_treats_other_io_as_transient() {
         for kind in [
             std::io::ErrorKind::TimedOut,
@@ -13673,10 +13711,13 @@ mod tests {
 
                                     let prefix = &out[..=max_frame_bytes];
                                     let chunk_size = (max_frame_bytes / 2).max(1);
-                                    for chunk in prefix.chunks(chunk_size) {
-                                        stream.write_all(chunk).await.expect("write frame chunk");
-                                        sleep(Duration::from_millis(5)).await;
-                                    }
+                                    write_until_oversized_frame_rejection(
+                                        &mut stream,
+                                        prefix,
+                                        chunk_size,
+                                    )
+                                    .await
+                                    .expect("write oversized prefix or observe peer rejection");
                                     return;
                                 }
                                 _ => {}
@@ -13796,10 +13837,13 @@ mod tests {
 
                                     let prefix = &out[..=max_frame_bytes];
                                     let chunk_size = (max_frame_bytes / 2).max(1);
-                                    for chunk in prefix.chunks(chunk_size) {
-                                        stream.write_all(chunk).await.expect("write frame chunk");
-                                        sleep(Duration::from_millis(5)).await;
-                                    }
+                                    write_until_oversized_frame_rejection(
+                                        &mut stream,
+                                        prefix,
+                                        chunk_size,
+                                    )
+                                    .await
+                                    .expect("write oversized prefix or observe peer rejection");
                                     return;
                                 }
                                 _ => {}
@@ -14115,7 +14159,7 @@ mod tests {
     }
 
     #[test]
-    fn tiered_scrollback_bulk_order_mismatch_poisons_aligned_connection() {
+    fn tiered_scrollback_bulk_order_mismatch_preserves_aligned_connection() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("mux-tiered-scrollback-reordered.sock");
@@ -14151,6 +14195,11 @@ mod tests {
                 )
                 .await
                 .expect("write reordered response");
+                let decoded = read_test_request_pdu(&mut stream, &mut read_buf).await;
+                assert!(matches!(decoded.pdu, Pdu::ListPanes(_)));
+                write_response_pdu(&mut stream, &empty_list_panes_response(), decoded.serial)
+                    .await
+                    .expect("write aligned-connection reuse response");
             });
 
             let cx = crate::cx::for_testing();
@@ -14166,7 +14215,11 @@ mod tests {
                 error,
                 DirectMuxError::AlignedUnexpectedResponse { .. }
             ));
-            assert!(client.is_connection_poisoned());
+            assert!(!client.is_connection_poisoned());
+            client
+                .list_panes_with_cx(&cx)
+                .await
+                .expect("aligned semantic mismatch must leave the connection reusable");
             server.await.expect("server task");
         });
     }
@@ -15019,91 +15072,81 @@ mod tests {
 
     #[test]
     fn subscription_with_cx_receives_output_delta() {
-        let runtime = crate::cx::CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
-        let cx = crate::cx::for_testing();
-        let handle = runtime.handle();
-
-        runtime.block_on(async {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let handle = crate::runtime_async::current_runtime_handle()
+                .expect("canonical test runtime handle");
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("subscription-with-cx.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
 
-            std::mem::drop(crate::cx::spawn_with_cx(
-                &handle,
-                &cx,
-                |_child_cx| async move {
-                    let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = StreamingPduBuffer::new();
-                    let mut emitted_output = false;
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = StreamingPduBuffer::new();
+                let mut emitted_output = false;
 
-                    loop {
-                        let mut temp = vec![0u8; 4096];
-                        let read = match unix_stream_read(&mut stream, &mut temp).await {
-                            Ok(0) => break,
-                            Ok(n) => n,
-                            Err(_) => break,
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                let dirty_lines = if emitted_output {
+                                    Vec::new()
+                                } else {
+                                    emitted_output = true;
+                                    std::iter::once(0isize..2isize).collect()
+                                };
+
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 31,
+                                    mouse_grabbed: false,
+                                    alt_screen_active: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    tiered_scrollback_status: None,
+                                    dirty_lines,
+                                    title: "with-cx".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno: 1,
+                                })
+                            }
+                            _ => continue,
                         };
-                        read_buf.extend_from_slice(&temp[..read]);
-                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                            let response = match decoded.pdu {
-                                Pdu::GetCodecVersion(_) => {
-                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                        codec_vers: CODEC_VERSION,
-                                        version_string: "test".to_string(),
-                                        executable_path: PathBuf::from("/bin/wezterm"),
-                                        config_file_path: None,
-                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
-                                    })
-                                }
-                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                                Pdu::GetPaneRenderChanges(_) => {
-                                    let dirty_lines = if emitted_output {
-                                        Vec::new()
-                                    } else {
-                                        emitted_output = true;
-                                        std::iter::once(0isize..2isize).collect()
-                                    };
-
-                                    Pdu::GetPaneRenderChangesResponse(
-                                        GetPaneRenderChangesResponse {
-                                            pane_id: 31,
-                                            mouse_grabbed: false,
-                                            alt_screen_active: false,
-                                            cursor_position:
-                                                mux::renderable::StableCursorPosition::default(),
-                                            dimensions: mux::renderable::RenderableDimensions {
-                                                cols: 80,
-                                                viewport_rows: 24,
-                                                scrollback_rows: 0,
-                                                physical_top: 0,
-                                                scrollback_top: 0,
-                                                dpi: 96,
-                                                pixel_width: 0,
-                                                pixel_height: 0,
-                                                reverse_video: false,
-                                            },
-                                            tiered_scrollback_status: None,
-                                            dirty_lines,
-                                            title: "with-cx".to_string(),
-                                            working_dir: None,
-                                            bonus_lines: Vec::new().into(),
-                                            input_serial: None,
-                                            seqno: 1,
-                                        },
-                                    )
-                                }
-                                _ => continue,
-                            };
-                            let mut out = Vec::new();
-                            response.encode(&mut out, decoded.serial).expect("encode");
-                            stream.write_all(&out).await.expect("write");
-                        }
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        stream.write_all(&out).await.expect("write");
                     }
-                },
-            ));
-
+                }
+            });
             let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
             let client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
@@ -15143,6 +15186,7 @@ mod tests {
             timeout(Duration::from_millis(500), sub.shutdown())
                 .await
                 .expect("shutdown should finish promptly");
+            server.await.expect("server task");
         });
     }
 
@@ -15265,13 +15309,10 @@ mod tests {
 
     #[test]
     fn subscription_with_cx_shutdown_waits_for_poller_exit() {
-        let runtime = crate::cx::CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
-        let cx = crate::cx::for_testing();
-        let handle = runtime.handle();
-
-        runtime.block_on(async {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let handle = crate::runtime_async::current_runtime_handle()
+                .expect("canonical test runtime handle");
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("subscription-with-cx-shutdown.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
@@ -15279,88 +15320,81 @@ mod tests {
             let server_request_count = Arc::clone(&render_request_count);
             let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
-            std::mem::drop(crate::cx::spawn_with_cx(
-                &handle,
-                &cx,
-                |_child_cx| async move {
-                    let mut closed_tx = Some(closed_tx);
-                    let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = StreamingPduBuffer::new();
+            let server = task::spawn(async move {
+                let mut closed_tx = Some(closed_tx);
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = StreamingPduBuffer::new();
 
-                    loop {
-                        let mut temp = vec![0u8; 4096];
-                        let read = match unix_stream_read(&mut stream, &mut temp).await {
-                            Ok(0) => {
-                                if let Some(tx) = closed_tx.take() {
-                                    // br-ft-x2oyy: intentional best-effort test close signal;
-                                    // failure means the waiting assertion side already exited.
-                                    notify_test_server_closed_best_effort(tx);
-                                }
-                                break;
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => {
+                            if let Some(tx) = closed_tx.take() {
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
-                            Ok(n) => n,
-                            Err(_) => break,
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                server_request_count.fetch_add(1, Ordering::SeqCst);
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 31,
+                                    mouse_grabbed: false,
+                                    alt_screen_active: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    tiered_scrollback_status: None,
+                                    dirty_lines: Vec::new(),
+                                    title: "with-cx-shutdown".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno: 1,
+                                })
+                            }
+                            _ => continue,
                         };
-                        read_buf.extend_from_slice(&temp[..read]);
-                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                            let response = match decoded.pdu {
-                                Pdu::GetCodecVersion(_) => {
-                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                        codec_vers: CODEC_VERSION,
-                                        version_string: "test".to_string(),
-                                        executable_path: PathBuf::from("/bin/wezterm"),
-                                        config_file_path: None,
-                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
-                                    })
-                                }
-                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                                Pdu::GetPaneRenderChanges(_) => {
-                                    server_request_count.fetch_add(1, Ordering::SeqCst);
-                                    Pdu::GetPaneRenderChangesResponse(
-                                        GetPaneRenderChangesResponse {
-                                            pane_id: 31,
-                                            mouse_grabbed: false,
-                                            alt_screen_active: false,
-                                            cursor_position:
-                                                mux::renderable::StableCursorPosition::default(),
-                                            dimensions: mux::renderable::RenderableDimensions {
-                                                cols: 80,
-                                                viewport_rows: 24,
-                                                scrollback_rows: 0,
-                                                physical_top: 0,
-                                                scrollback_top: 0,
-                                                dpi: 96,
-                                                pixel_width: 0,
-                                                pixel_height: 0,
-                                                reverse_video: false,
-                                            },
-                                            tiered_scrollback_status: None,
-                                            dirty_lines: Vec::new(),
-                                            title: "with-cx-shutdown".to_string(),
-                                            working_dir: None,
-                                            bonus_lines: Vec::new().into(),
-                                            input_serial: None,
-                                            seqno: 1,
-                                        },
-                                    )
-                                }
-                                _ => continue,
-                            };
-                            let mut out = Vec::new();
-                            response.encode(&mut out, decoded.serial).expect("encode");
-                            if stream.write_all(&out).await.is_err() {
-                                if let Some(tx) = closed_tx.take() {
-                                    // br-ft-x2oyy: intentional best-effort test close signal;
-                                    // failure means the waiting assertion side already exited.
-                                    notify_test_server_closed_best_effort(tx);
-                                }
-                                return;
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        if stream.write_all(&out).await.is_err() {
+                            if let Some(tx) = closed_tx.take() {
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
+                            return;
                         }
                     }
-                },
-            ));
-
+                }
+            });
             let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
             let client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
@@ -15399,6 +15433,7 @@ mod tests {
             .await
             .expect("shutdown should await server-observed socket close");
             closed.expect("server close signal should complete");
+            server.await.expect("server task");
         });
     }
 
@@ -15929,13 +15964,10 @@ mod tests {
 
     #[test]
     fn subscription_with_cx_cancel_closes_connection_when_channel_full() {
-        let runtime = crate::cx::CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
-        let cx = crate::cx::for_testing();
-        let handle = runtime.handle();
-
-        runtime.block_on(async {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let handle = crate::runtime_async::current_runtime_handle()
+                .expect("canonical test runtime handle");
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir.path().join("cancel-full-channel-with-cx.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
@@ -15944,89 +15976,81 @@ mod tests {
             let server_request_count = Arc::clone(&render_request_count);
             let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
-            std::mem::drop(crate::cx::spawn_with_cx(
-                &handle,
-                &cx,
-                |_child_cx| async move {
-                    let mut closed_tx = Some(closed_tx);
-                    let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = StreamingPduBuffer::new();
+            let server = task::spawn(async move {
+                let mut closed_tx = Some(closed_tx);
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = StreamingPduBuffer::new();
 
-                    loop {
-                        let mut temp = vec![0u8; 4096];
-                        let read = match unix_stream_read(&mut stream, &mut temp).await {
-                            Ok(0) => {
-                                if let Some(tx) = closed_tx.take() {
-                                    // br-ft-x2oyy: intentional best-effort test close signal;
-                                    // failure means the waiting assertion side already exited.
-                                    notify_test_server_closed_best_effort(tx);
-                                }
-                                break;
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => {
+                            if let Some(tx) = closed_tx.take() {
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
-                            Ok(n) => n,
-                            Err(_) => break,
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                let seqno = server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 13,
+                                    mouse_grabbed: false,
+                                    alt_screen_active: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    tiered_scrollback_status: None,
+                                    dirty_lines: std::iter::once(0isize..1isize).collect(),
+                                    title: "cancel-full-channel-with-cx".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno,
+                                })
+                            }
+                            _ => continue,
                         };
-                        read_buf.extend_from_slice(&temp[..read]);
-                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                            let response = match decoded.pdu {
-                                Pdu::GetCodecVersion(_) => {
-                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                        codec_vers: CODEC_VERSION,
-                                        version_string: "test".to_string(),
-                                        executable_path: PathBuf::from("/bin/wezterm"),
-                                        config_file_path: None,
-                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
-                                    })
-                                }
-                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                                Pdu::GetPaneRenderChanges(_) => {
-                                    let seqno =
-                                        server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                    Pdu::GetPaneRenderChangesResponse(
-                                        GetPaneRenderChangesResponse {
-                                            pane_id: 13,
-                                            mouse_grabbed: false,
-                                            alt_screen_active: false,
-                                            cursor_position:
-                                                mux::renderable::StableCursorPosition::default(),
-                                            dimensions: mux::renderable::RenderableDimensions {
-                                                cols: 80,
-                                                viewport_rows: 24,
-                                                scrollback_rows: 0,
-                                                physical_top: 0,
-                                                scrollback_top: 0,
-                                                dpi: 96,
-                                                pixel_width: 0,
-                                                pixel_height: 0,
-                                                reverse_video: false,
-                                            },
-                                            tiered_scrollback_status: None,
-                                            dirty_lines: std::iter::once(0isize..1isize).collect(),
-                                            title: "cancel-full-channel-with-cx".to_string(),
-                                            working_dir: None,
-                                            bonus_lines: Vec::new().into(),
-                                            input_serial: None,
-                                            seqno,
-                                        },
-                                    )
-                                }
-                                _ => continue,
-                            };
-                            let mut out = Vec::new();
-                            response.encode(&mut out, decoded.serial).expect("encode");
-                            if stream.write_all(&out).await.is_err() {
-                                if let Some(tx) = closed_tx.take() {
-                                    // br-ft-x2oyy: intentional best-effort test close signal;
-                                    // failure means the waiting assertion side already exited.
-                                    notify_test_server_closed_best_effort(tx);
-                                }
-                                return;
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        if stream.write_all(&out).await.is_err() {
+                            if let Some(tx) = closed_tx.take() {
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
+                            return;
                         }
                     }
-                },
-            ));
-
+                }
+            });
             let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
             let client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
@@ -16066,6 +16090,7 @@ mod tests {
             .await
             .expect("server should observe connection close after cancellation");
             closed.expect("server close signal should complete");
+            server.await.expect("server task");
         });
     }
 
@@ -16208,13 +16233,10 @@ mod tests {
 
     #[test]
     fn subscription_with_cx_cancel_closes_connection_when_output_channel_is_full() {
-        let runtime = crate::cx::CxRuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime");
-        let cx = crate::cx::for_testing();
-        let handle = runtime.handle();
-
-        runtime.block_on(async {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let handle = crate::runtime_async::current_runtime_handle()
+                .expect("canonical test runtime handle");
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = temp_dir
                 .path()
@@ -16225,94 +16247,87 @@ mod tests {
             let server_request_count = Arc::clone(&render_request_count);
             let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
-            std::mem::drop(crate::cx::spawn_with_cx(
-                &handle,
-                &cx,
-                |_child_cx| async move {
-                    let mut closed_tx = Some(closed_tx);
-                    let (mut stream, _) = listener.accept().await.expect("accept");
-                    let mut read_buf = StreamingPduBuffer::new();
+            let server = task::spawn(async move {
+                let mut closed_tx = Some(closed_tx);
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = StreamingPduBuffer::new();
 
-                    loop {
-                        let mut temp = vec![0u8; 4096];
-                        let read = match unix_stream_read(&mut stream, &mut temp).await {
-                            Ok(0) => {
-                                if let Some(tx) = closed_tx.take() {
-                                    // br-ft-x2oyy: intentional best-effort test close signal;
-                                    // failure means the waiting assertion side already exited.
-                                    notify_test_server_closed_best_effort(tx);
-                                }
-                                break;
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => {
+                            if let Some(tx) = closed_tx.take() {
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
-                            Ok(n) => n,
-                            Err(_) => break,
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                let request_number =
+                                    server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                let (seqno, dirty_lines) = if request_number == 1 {
+                                    (1, std::iter::once(0isize..1isize).collect())
+                                } else {
+                                    (2, Vec::new())
+                                };
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 13,
+                                    mouse_grabbed: false,
+                                    alt_screen_active: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    tiered_scrollback_status: None,
+                                    dirty_lines,
+                                    title: "cancel-full-output-channel-with-cx".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno,
+                                })
+                            }
+                            _ => continue,
                         };
-                        read_buf.extend_from_slice(&temp[..read]);
-                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                            let response = match decoded.pdu {
-                                Pdu::GetCodecVersion(_) => {
-                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                        codec_vers: CODEC_VERSION,
-                                        version_string: "test".to_string(),
-                                        executable_path: PathBuf::from("/bin/wezterm"),
-                                        config_file_path: None,
-                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
-                                    })
-                                }
-                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                                Pdu::GetPaneRenderChanges(_) => {
-                                    let request_number =
-                                        server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                    let (seqno, dirty_lines) = if request_number == 1 {
-                                        (1, std::iter::once(0isize..1isize).collect())
-                                    } else {
-                                        (2, Vec::new())
-                                    };
-                                    Pdu::GetPaneRenderChangesResponse(
-                                        GetPaneRenderChangesResponse {
-                                            pane_id: 13,
-                                            mouse_grabbed: false,
-                                            alt_screen_active: false,
-                                            cursor_position:
-                                                mux::renderable::StableCursorPosition::default(),
-                                            dimensions: mux::renderable::RenderableDimensions {
-                                                cols: 80,
-                                                viewport_rows: 24,
-                                                scrollback_rows: 0,
-                                                physical_top: 0,
-                                                scrollback_top: 0,
-                                                dpi: 96,
-                                                pixel_width: 0,
-                                                pixel_height: 0,
-                                                reverse_video: false,
-                                            },
-                                            tiered_scrollback_status: None,
-                                            dirty_lines,
-                                            title: "cancel-full-output-channel-with-cx".to_string(),
-                                            working_dir: None,
-                                            bonus_lines: Vec::new().into(),
-                                            input_serial: None,
-                                            seqno,
-                                        },
-                                    )
-                                }
-                                _ => continue,
-                            };
-                            let mut out = Vec::new();
-                            response.encode(&mut out, decoded.serial).expect("encode");
-                            if stream.write_all(&out).await.is_err() {
-                                if let Some(tx) = closed_tx.take() {
-                                    // br-ft-x2oyy: intentional best-effort test close signal;
-                                    // failure means the waiting assertion side already exited.
-                                    notify_test_server_closed_best_effort(tx);
-                                }
-                                return;
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        if stream.write_all(&out).await.is_err() {
+                            if let Some(tx) = closed_tx.take() {
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
+                            return;
                         }
                     }
-                },
-            ));
-
+                }
+            });
             let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
             let client = DirectMuxClient::connect_with_cx(&cx, config)
                 .await
@@ -16352,6 +16367,7 @@ mod tests {
             .await
             .expect("server should observe connection close after cancellation");
             closed.expect("server close signal should complete");
+            server.await.expect("server task");
         });
     }
 
