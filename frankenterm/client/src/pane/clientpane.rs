@@ -179,16 +179,16 @@ impl ReliableInputQueue {
         request: ReliableKeyEventV1,
         trace_context: Option<SampledTraceContextV1>,
     ) -> anyhow::Result<()> {
-        match trace_context {
-            Some(trace_context) => ReliableKeyEventTracedV1 {
-                request: request.clone(),
-                trace_context,
-            }
+        request
             .validate()
-            .context("validating sampled reliable key input before queue admission")?,
-            None => request
-                .validate()
-                .context("validating reliable key input before queue admission")?,
+            .context("validating reliable key input before queue admission")?;
+        if let Some(trace_context) = trace_context {
+            // The queued request intentionally has no pane authority until its
+            // no-effect PDU96 probe completes. Validate the content-free
+            // context here; the PDU98 validator enforces exact authority once
+            // the first effect-eligible wire attempt is constructed.
+            validate_sampled_keypress_trace_context(&trace_context)
+                .context("validating sampled reliable key input before queue admission")?;
         }
         let start_worker = {
             let mut state = self.state.lock();

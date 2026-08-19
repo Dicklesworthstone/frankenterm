@@ -11826,21 +11826,32 @@ pub enum SampledInputTraceContextError {
     ReliableKeyEvent(#[from] ReliableKeyEventProtocolError),
     #[error("sampled key input requires the keypress trace path")]
     WrongPath,
+    #[error("sampled reliable key input requires an exact pane registration identity")]
+    MissingPaneRegistration,
+}
+
+/// Validate the fixed, content-free context shared by sampled key-input
+/// envelopes. This does not authorize an operational request; PDU98 performs
+/// the additional exact pane-registration check in its own validator.
+pub fn validate_sampled_keypress_trace_context(
+    trace_context: &SampledTraceContextV1,
+) -> Result<(), SampledInputTraceContextError> {
+    trace_context.validate()?;
+    if trace_context.path != InteractionTracePath::Keypress {
+        return Err(SampledInputTraceContextError::WrongPath);
+    }
+    // Keep sampler support an exhaustive compile-time decision. If the
+    // frozen vocabulary grows, this seam must explicitly decide whether a
+    // new algorithm can cross the wire before the build can pass.
+    match trace_context.sampler_algorithm {
+        RecorderSamplerAlgorithm::SplitMix64V1 => {}
+    }
+    Ok(())
 }
 
 impl SendKeyDownTracedV1 {
     pub fn validate(&self) -> Result<(), SampledInputTraceContextError> {
-        self.trace_context.validate()?;
-        if self.trace_context.path != InteractionTracePath::Keypress {
-            return Err(SampledInputTraceContextError::WrongPath);
-        }
-        // Keep sampler support an exhaustive compile-time decision. If the
-        // frozen vocabulary grows, this seam must explicitly decide whether a
-        // new algorithm can cross the wire before the build can pass.
-        match self.trace_context.sampler_algorithm {
-            RecorderSamplerAlgorithm::SplitMix64V1 => {}
-        }
-        Ok(())
+        validate_sampled_keypress_trace_context(&self.trace_context)
     }
 
     #[must_use]
@@ -12010,14 +12021,10 @@ impl ReliableKeyEventV1 {
 impl ReliableKeyEventTracedV1 {
     pub fn validate(&self) -> Result<(), SampledInputTraceContextError> {
         self.request.validate()?;
-        self.trace_context.validate()?;
-        if self.trace_context.path != InteractionTracePath::Keypress {
-            return Err(SampledInputTraceContextError::WrongPath);
+        if self.request.pane_registration.is_none() {
+            return Err(SampledInputTraceContextError::MissingPaneRegistration);
         }
-        match self.trace_context.sampler_algorithm {
-            RecorderSamplerAlgorithm::SplitMix64V1 => {}
-        }
-        Ok(())
+        validate_sampled_keypress_trace_context(&self.trace_context)
     }
 
     #[must_use]
