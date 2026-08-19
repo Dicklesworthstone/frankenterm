@@ -14,7 +14,7 @@ use config::configuration;
 use config::keyassignment::PaneDirection;
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{StableRowIndex, TerminalSize};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -368,6 +368,30 @@ pub struct Tab {
     inner: Mutex<TabInner>,
     tab_id: TabId,
     mux_owner_generation: AtomicU64,
+}
+
+pub(crate) struct PreparedTabMuxOwnerBinding<'a> {
+    tab: &'a Tab,
+    inner: MutexGuard<'a, TabInner>,
+    mux: Arc<Mux>,
+    next_generation: u64,
+}
+
+impl PreparedTabMuxOwnerBinding<'_> {
+    /// Commit the already validated binding without allocating or failing.
+    /// Keeping `Tab::inner` locked in the token closes the prepare/commit race.
+    pub(crate) fn commit(mut self, mux: &Arc<Mux>) -> u64 {
+        assert!(
+            Arc::ptr_eq(&self.mux, mux),
+            "prepared tab binding committed against another mux authority"
+        );
+        self.inner
+            .commit_mux_owner_binding(mux, self.next_generation);
+        self.tab
+            .mux_owner_generation
+            .store(self.next_generation, Ordering::Release);
+        self.next_generation
+    }
 }
 
 type PaneIdentity = *const ();
@@ -4115,6 +4139,26 @@ fn exact_pane_identity_set(panes: &[Arc<dyn Pane>]) -> HashSet<PaneIdentity> {
     panes.iter().map(pane_identity).collect()
 }
 
+fn exact_structural_lane_in_snapshot(
+    tiled: &[Arc<dyn Pane>],
+    floating: &[(PaneId, Arc<dyn Pane>)],
+    pane: &Arc<dyn Pane>,
+) -> Option<PaneStructuralLane> {
+    let tiled_matches = tiled
+        .iter()
+        .filter(|candidate| Arc::ptr_eq(candidate, pane))
+        .count();
+    let floating_matches = floating
+        .iter()
+        .filter(|(_, candidate)| Arc::ptr_eq(candidate, pane))
+        .count();
+    match (tiled_matches, floating_matches) {
+        (1, 0) => Some(PaneStructuralLane::Tiled),
+        (0, 1) => Some(PaneStructuralLane::Floating),
+        _ => None,
+    }
+}
+
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
     TerminalSize {
         rows: 1,
@@ -5242,7 +5286,7 @@ impl Tab {
         );
         anyhow::ensure!(spawned_owners == 0, "unpublished pane already has an owner");
 
-        let (positioned, callbacks, registration, lifecycle_ticket) = {
+        let (positioned, callbacks, retired_floating, registration, lifecycle_ticket) = {
             let _domain_registration = mux.domain_registration.lock();
             anyhow::ensure!(
                 !mux.retired_domain_ids.lock().contains(&expected_domain_id)
@@ -5568,8 +5612,15 @@ impl Tab {
         };
         let pane = pane?;
         match mux {
-            Some(mux) => self.remove_exact_pane_for_move(&mux, &pane),
-            None => self.inner.lock().remove_floating_pane(pane_id),
+            Some(mux) => self.remove_exact_pane_for_move_in_lane(
+                &mux,
+                &pane,
+                Some(PaneStructuralLane::Floating),
+            ),
+            None => self.remove_exact_pane_without_mux(
+                &pane,
+                Some(PaneStructuralLane::Floating),
+            ),
         }
     }
 
@@ -6132,7 +6183,7 @@ impl Tab {
             return (false, Vec::new());
         }
 
-        let (callbacks, registrations) = {
+        let (callbacks, registrations, retired_inner) = {
             // Registry publication/retirement is serialized before topology
             // mutation. No pane trait method is invoked in this scope.
             let _registration = mux.pane_registration.lock();
@@ -6140,8 +6191,11 @@ impl Tab {
             let Some(registered_tab) = self.exact_registered_arc(mux) else {
                 return (false, Vec::new());
             };
-            let mut authorized = Vec::new();
-            if authorized.try_reserve_exact(candidates.len()).is_err() {
+            let mut registration_authorized = Vec::new();
+            if registration_authorized
+                .try_reserve_exact(candidates.len())
+                .is_err()
+            {
                 return (false, Vec::new());
             }
             {
@@ -6155,28 +6209,22 @@ impl Tab {
                                     &current.pane,
                                     &current.generation,
                                 ))
+                                && authority.contains_live_registration(
+                                    candidate.pane_id,
+                                    current.domain_id,
+                                    expected,
+                                )
                         }),
                         None => current
                             .is_none_or(|current| !Arc::ptr_eq(&current.pane, &candidate.pane)),
                     };
-                    if !registration_matches
-                        || authority
-                            .validate_structural_owner_exact(
-                                candidate.pane_id,
-                                &candidate.pane,
-                                &registered_tab,
-                                None,
-                                candidate.expected_registration.as_ref(),
-                            )
-                            .is_err()
-                    {
+                    if !registration_matches {
                         continue;
                     }
-                    authorized.push(candidate.clone());
+                    registration_authorized.push(candidate.clone());
                 }
             }
-            let mut registrations = Vec::new();
-            if registrations.try_reserve_exact(authorized.len()).is_err() {
+            if registration_authorized.is_empty() {
                 return (false, Vec::new());
             }
 
@@ -6184,25 +6232,140 @@ impl Tab {
             if !inner.is_active_mux_owner(mux) {
                 return (false, Vec::new());
             }
-            let mut callbacks = inner.remove_exact_panes_callback_free(observed, &authorized);
-            callbacks.reserve_topology_notifications(mux, self.tab_id);
-            for candidate in &authorized {
-                if callbacks.removed.contains(&pane_identity(&candidate.pane)) {
-                    if let Some(registration) = &candidate.expected_registration {
-                        registrations.push(registration.clone());
+            let (current_tiled, current_floating) =
+                match inner.snapshot_structural_panes_callback_free_checked() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        log::error!(
+                            "refusing exact removal from structurally invalid tab {}: {error:#}",
+                            self.tab_id
+                        );
+                        return (false, Vec::new());
                     }
-                    let removed = authority.remove_structural_owner_exact(
+                };
+            let current_count = match current_tiled.len().checked_add(current_floating.len()) {
+                Some(count) => count,
+                None => return (false, Vec::new()),
+            };
+            let mut current_identities = HashSet::new();
+            if current_identities.try_reserve(current_count).is_err() {
+                return (false, Vec::new());
+            }
+            current_identities.extend(current_tiled.iter().map(pane_identity));
+            current_identities.extend(
+                current_floating
+                    .iter()
+                    .map(|(_, pane)| pane_identity(pane)),
+            );
+            let mut observed_identities = HashSet::new();
+            if observed_identities.try_reserve(observed.len()).is_err() {
+                return (false, Vec::new());
+            }
+            observed_identities.extend(
+                observed
+                    .iter()
+                    .map(|observed| pane_identity(&observed.pane)),
+            );
+            if current_identities != observed_identities {
+                return (false, Vec::new());
+            }
+
+            let mut authorized = Vec::new();
+            if authorized
+                .try_reserve_exact(registration_authorized.len())
+                .is_err()
+            {
+                return (false, Vec::new());
+            }
+            for candidate in registration_authorized {
+                let Some(lane) = exact_structural_lane_in_snapshot(
+                    &current_tiled,
+                    &current_floating,
+                    &candidate.pane,
+                ) else {
+                    continue;
+                };
+                if candidate
+                    .expected_lane
+                    .is_some_and(|expected| expected != lane)
+                {
+                    continue;
+                }
+                if let Err(error) = authority.validate_structural_owner_exact(
+                    candidate.pane_id,
+                    &candidate.pane,
+                    &registered_tab,
+                    Some(lane),
+                    candidate.expected_registration.as_ref(),
+                ) {
+                    log::error!(
+                        "refusing exact removal of pane {} from tab {}: {error:#}",
                         candidate.pane_id,
-                        &candidate.pane,
-                        &registered_tab,
+                        self.tab_id
                     );
-                    debug_assert!(removed);
+                    continue;
+                }
+                authorized.push(candidate);
+            }
+            if authorized.is_empty() {
+                return (false, Vec::new());
+            }
+
+            let mut registrations = Vec::new();
+            if registrations.try_reserve_exact(authorized.len()).is_err() {
+                return (false, Vec::new());
+            }
+            for candidate in &authorized {
+                if let Some(registration) = &candidate.expected_registration {
+                    registrations.push(registration.clone());
                 }
             }
-            (callbacks, registrations)
+
+            let mut prepared = inner.prepare_exact_pane_removal(observed, &authorized);
+            if !prepared.callbacks.changed
+                || authorized.iter().any(|candidate| {
+                    !prepared
+                        .callbacks
+                        .removed
+                        .contains(&pane_identity(&candidate.pane))
+                })
+            {
+                log::error!(
+                    "refusing incomplete exact-removal successor for tab {}",
+                    self.tab_id
+                );
+                return (false, Vec::new());
+            }
+            prepared.callbacks.topology_notifications =
+                match prepared
+                    .callbacks
+                    .prepare_topology_notifications(mux, self.tab_id)
+                {
+                    Ok(notifications) => notifications,
+                    Err(error) => {
+                        log::error!(
+                            "refusing exact removal from tab {} without topology revision: {error:#}",
+                            self.tab_id
+                        );
+                        return (false, Vec::new());
+                    }
+                };
+
+            let (callbacks, retired_inner) =
+                inner.commit_prepared_exact_pane_removal(prepared);
+            for candidate in &authorized {
+                let removed = authority.remove_structural_owner_exact(
+                    candidate.pane_id,
+                    &candidate.pane,
+                    &registered_tab,
+                );
+                debug_assert!(removed);
+            }
+            (callbacks, registrations, retired_inner)
         };
 
         let changed = callbacks.changed;
+        drop(retired_inner);
         callbacks.execute(Some(mux));
         (changed, registrations)
     }
@@ -6223,6 +6386,7 @@ impl Tab {
                         pane: Arc::clone(&observed.pane),
                         pane_id,
                         expected_registration: None,
+                        expected_lane: None,
                     }),
                     Ok(false) => None,
                     Err(_) => {
@@ -6235,9 +6399,12 @@ impl Tab {
             })
             .collect::<Vec<_>>();
         let mut inner = self.inner.lock();
-        let callbacks = inner.remove_exact_panes_callback_free(&observed, &candidates);
+        let prepared = inner.prepare_exact_pane_removal(&observed, &candidates);
+        let (callbacks, retired_inner) =
+            inner.commit_prepared_exact_pane_removal(prepared);
         let changed = callbacks.changed;
         drop(inner);
+        drop(retired_inner);
         callbacks.execute(None);
         changed
     }
@@ -6335,6 +6502,7 @@ impl Tab {
                 pane: Arc::clone(&observed.pane),
                 pane_id,
                 expected_registration,
+                expected_lane: None,
             });
         }
 
@@ -6382,6 +6550,7 @@ impl Tab {
                 pane: Arc::clone(&observed.pane),
                 pane_id,
                 expected_registration,
+                expected_lane: None,
             });
         }
         self.apply_exact_removal_plan(mux, &observed, &candidates)
@@ -6398,6 +6567,7 @@ impl Tab {
                     pane: Arc::clone(&observed.pane),
                     pane_id,
                     expected_registration: Some(registration.clone()),
+                    expected_lane: None,
                 })
         });
         let Some(candidate) = candidate else {
@@ -6434,22 +6604,45 @@ impl Tab {
         mux: &Mux,
         expected: &Arc<dyn Pane>,
     ) -> Option<Arc<dyn Pane>> {
-        let lane = {
-            let inner = self.inner.lock();
-            let tiled = inner
-                .snapshot_non_floating_panes_callback_free()
-                .iter()
-                .any(|pane| Arc::ptr_eq(pane, expected));
-            let floating = inner
-                .floating_panes
-                .iter()
-                .any(|pane| Arc::ptr_eq(&pane.pane, expected));
-            match (tiled, floating) {
-                (true, false) => PaneStructuralLane::Tiled,
-                (false, true) => PaneStructuralLane::Floating,
-                _ => return None,
+        self.remove_exact_pane_for_move_in_lane(mux, expected, None)
+    }
+
+    fn remove_exact_pane_for_move_in_lane(
+        &self,
+        mux: &Mux,
+        expected: &Arc<dyn Pane>,
+        expected_lane: Option<PaneStructuralLane>,
+    ) -> Option<Arc<dyn Pane>> {
+        let observed = Self::observe_panes(self.snapshot_panes_callback_free());
+        let mut candidate = observed.iter().find_map(|observed| {
+            observed
+                .pane_id
+                .filter(|_| Arc::ptr_eq(&observed.pane, expected))
+                .map(|pane_id| ExactPaneRemovalCandidate {
+                    pane: Arc::clone(&observed.pane),
+                    pane_id,
+                    expected_registration: None,
+                    expected_lane,
+                })
+        })?;
+        candidate.expected_registration = Some({
+            let panes = mux.panes.read();
+            let registered = panes.get(&candidate.pane_id)?;
+            if !Arc::ptr_eq(&registered.pane, &candidate.pane) {
+                return None;
             }
-        };
+            PaneRegistrationHandle::new(&registered.pane, &registered.generation)
+        });
+        let (changed, _) =
+            self.apply_exact_removal_plan(mux, &observed, std::slice::from_ref(&candidate));
+        changed.then_some(candidate.pane)
+    }
+
+    fn remove_exact_pane_without_mux(
+        &self,
+        expected: &Arc<dyn Pane>,
+        expected_lane: Option<PaneStructuralLane>,
+    ) -> Option<Arc<dyn Pane>> {
         let observed = Self::observe_panes(self.snapshot_panes_callback_free());
         let candidate = observed.iter().find_map(|observed| {
             observed
@@ -6459,61 +6652,63 @@ impl Tab {
                     pane: Arc::clone(&observed.pane),
                     pane_id,
                     expected_registration: None,
+                    expected_lane,
                 })
         })?;
-        let _registration = mux.pane_registration.lock();
-        let mut authority = mux.pane_authority.lock();
-        let registered_tab = self.exact_registered_arc(mux)?;
-        let pane_registration = {
-            let panes = mux.panes.read();
-            let registered = panes.get(&candidate.pane_id)?;
-            if !Arc::ptr_eq(&registered.pane, &candidate.pane) {
+        let (callbacks, retired_inner) = {
+            let mut inner = self.inner.lock();
+            if inner.notification_owner().is_some() {
                 return None;
             }
-            let registration =
-                PaneRegistrationHandle::new(&registered.pane, &registered.generation);
-            if !authority.contains_live_registration(
-                candidate.pane_id,
-                registered.domain_id,
-                &registration,
-            ) {
+            let (current_tiled, current_floating) = inner
+                .snapshot_structural_panes_callback_free_checked()
+                .ok()?;
+            let lane = exact_structural_lane_in_snapshot(
+                &current_tiled,
+                &current_floating,
+                &candidate.pane,
+            )?;
+            if candidate
+                .expected_lane
+                .is_some_and(|expected| expected != lane)
+            {
                 return None;
             }
-            registration
-        };
-        if authority
-            .validate_structural_owner_exact(
-                candidate.pane_id,
-                &candidate.pane,
-                &registered_tab,
-                Some(lane),
-                Some(&pane_registration),
-            )
-            .is_err()
-        {
-            return None;
-        }
-        let mut inner = self.inner.lock();
-        if !inner.is_active_mux_owner(mux) {
-            return None;
-        }
-        let mut callbacks =
-            inner.remove_exact_panes_callback_free(&observed, std::slice::from_ref(&candidate));
-        callbacks.reserve_topology_notifications(mux, self.tab_id);
-        let removed = callbacks.removed.contains(&pane_identity(&candidate.pane));
-        if removed {
-            let index_removed = authority.remove_structural_owner_exact(
-                candidate.pane_id,
-                &candidate.pane,
-                &registered_tab,
+            let current_count = current_tiled.len().checked_add(current_floating.len())?;
+            let mut current_identities = HashSet::new();
+            current_identities.try_reserve(current_count).ok()?;
+            current_identities.extend(current_tiled.iter().map(pane_identity));
+            current_identities.extend(
+                current_floating
+                    .iter()
+                    .map(|(_, pane)| pane_identity(pane)),
             );
-            debug_assert!(index_removed);
-        }
-        drop(inner);
-        drop(authority);
-        drop(_registration);
-        callbacks.execute(Some(mux));
-        removed.then_some(candidate.pane)
+            let mut observed_identities = HashSet::new();
+            observed_identities.try_reserve(observed.len()).ok()?;
+            observed_identities.extend(
+                observed
+                    .iter()
+                    .map(|observed| pane_identity(&observed.pane)),
+            );
+            if current_identities != observed_identities {
+                return None;
+            }
+
+            let prepared =
+                inner.prepare_exact_pane_removal(&observed, std::slice::from_ref(&candidate));
+            if !prepared.callbacks.changed
+                || !prepared
+                    .callbacks
+                    .removed
+                    .contains(&pane_identity(&candidate.pane))
+            {
+                return None;
+            }
+            inner.commit_prepared_exact_pane_removal(prepared)
+        };
+        drop(retired_inner);
+        callbacks.execute(None);
+        Some(candidate.pane)
     }
 
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
@@ -9620,6 +9815,35 @@ impl TabInner {
     /// This method must remain callback-free: callers hold mux registration
     /// authority while entering it. All values needed from pane trait methods
     /// were observed before acquiring `Tab::inner`.
+    fn prepare_exact_pane_removal(
+        &self,
+        observed: &[ObservedPane],
+        candidates: &[ExactPaneRemovalCandidate],
+    ) -> PreparedExactPaneRemoval {
+        // Build the complete successor away from the authoritative tab. Tree,
+        // stack, set, map, and callback-work allocation therefore all happen
+        // before the structural commit. The clone contains only callback-free
+        // mux state and retained `Arc` handles; it invokes no `Pane` method.
+        let mut replacement = self.clone();
+        let callbacks = replacement.remove_exact_panes_callback_free(observed, candidates);
+        PreparedExactPaneRemoval {
+            replacement,
+            callbacks,
+        }
+    }
+
+    fn commit_prepared_exact_pane_removal(
+        &mut self,
+        prepared: PreparedExactPaneRemoval,
+    ) -> (DeferredTabCallbacks, TabInner) {
+        let PreparedExactPaneRemoval {
+            replacement,
+            callbacks,
+        } = prepared;
+        let retired = std::mem::replace(self, replacement);
+        (callbacks, retired)
+    }
+
     fn remove_exact_panes_callback_free(
         &mut self,
         observed: &[ObservedPane],
