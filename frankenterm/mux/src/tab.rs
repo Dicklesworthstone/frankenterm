@@ -21,7 +21,7 @@ use std::convert::TryFrom;
 #[cfg(test)]
 use std::panic::catch_unwind;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use thiserror::Error;
 use url::Url;
 
@@ -324,6 +324,13 @@ impl Recency {
 
 struct TabInner {
     id: TabId,
+    /// Exact mux authority for this tab allocation. A tab may be retired and
+    /// re-registered with the same mux, but it must never acquire authority
+    /// from a different process-global singleton.
+    mux_owner: Weak<Mux>,
+    mux_owner_bound: bool,
+    mux_owner_active: bool,
+    mux_owner_generation: u64,
     pane: Option<Tree>,
     floating_panes: Vec<FloatingPane>,
     floating_focus: Option<PaneId>,
@@ -3971,13 +3978,55 @@ impl Tab {
         }
     }
 
+    /// Bind a successful serialized tab registration to one exact mux.
+    ///
+    /// Callers must complete every other fallible registration step before
+    /// invoking this method and must retain their tab-registry write guard
+    /// through publication. That makes the owner transition the final
+    /// fallible step and prevents a rejected registration from poisoning an
+    /// otherwise reusable tab allocation.
+    pub(crate) fn bind_mux_owner(&self, mux: &Arc<Mux>) -> anyhow::Result<()> {
+        self.inner.lock().bind_mux_owner(mux)
+    }
+
+    pub(crate) fn has_active_mux_owner(&self, mux: &Mux) -> bool {
+        self.inner.lock().is_active_mux_owner(mux)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mux_owner_generation_for_test(&self) -> u64 {
+        self.inner.lock().mux_owner_generation
+    }
+
+    /// Retire the active owner generation while the exact tab registration is
+    /// still topology-locked. Detached holders can continue to edit the tab,
+    /// but those edits no longer publish into the former mux.
+    #[cfg(test)]
+    pub(crate) fn retire_mux_owner(&self, mux: &Mux) -> bool {
+        self.inner.lock().retire_mux_owner(mux)
+    }
+
     pub fn get_title(&self) -> String {
         self.inner.lock().title.to_string()
     }
 
     pub fn set_title(&self, title: &str) {
-        let mux = Mux::try_get();
-        let (_, notification) = self.set_title_for_mux(title, mux.as_deref());
+        let (mux, notification) = {
+            let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            if inner.title.as_ref() == title {
+                return;
+            }
+            let title: Arc<str> = Arc::from(title);
+            inner.title = Arc::clone(&title);
+            let notification = mux.as_deref().map(|mux| {
+                mux.envelope_notification(MuxNotification::TabTitleChanged {
+                    tab_id: self.tab_id,
+                    title: title.to_string(),
+                })
+            });
+            (mux, notification)
+        };
         if let (Some(mux), Some(notification)) = (mux, notification) {
             mux.dispatch_notification_envelope(notification);
         }
@@ -3986,20 +4035,18 @@ impl Tab {
     pub(crate) fn set_title_for_mux(
         &self,
         title: &str,
-        mux: Option<&Mux>,
+        mux: &Mux,
     ) -> (bool, Option<MuxNotificationEnvelope>) {
         let mut inner = self.inner.lock();
-        if inner.title.as_ref() == title {
+        if !inner.is_active_mux_owner(mux) || inner.title.as_ref() == title {
             return (false, None);
         }
         let title: Arc<str> = Arc::from(title);
         inner.title = Arc::clone(&title);
-        let notification = mux.map(|mux| {
-            mux.envelope_notification(MuxNotification::TabTitleChanged {
-                tab_id: self.tab_id,
-                title: title.to_string(),
-            })
-        });
+        let notification = Some(mux.envelope_notification(MuxNotification::TabTitleChanged {
+            tab_id: self.tab_id,
+            title: title.to_string(),
+        }));
         (true, notification)
     }
 
@@ -4047,14 +4094,14 @@ impl Tab {
     /// one global node vector; installation can then remain in the snapshot's
     /// forward tab order.
     pub fn sync_with_prepared_pane_tree(&self, size: TerminalSize, prepared: PreparedPaneTree) {
-        let mux = Mux::try_get();
-        let callbacks = {
+        let (mux, callbacks) = {
             let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
             let mut callbacks = inner.install_prepared_pane_tree(size, prepared);
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
-            callbacks
+            (mux, callbacks)
         };
         callbacks.execute(mux.as_deref());
     }
@@ -4399,28 +4446,28 @@ impl Tab {
 
     /// Sets the zoom state, returns the prior state
     pub fn set_zoomed(&self, zoomed: bool) -> bool {
-        let mux = Mux::try_get();
-        let (prior, callbacks) = {
+        let (mux, prior, callbacks) = {
             let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
             let (prior, mut callbacks) = inner.prepare_set_zoomed(zoomed);
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
-            (prior, callbacks)
+            (mux, prior, callbacks)
         };
         callbacks.execute(mux.as_deref());
         prior
     }
 
     pub fn toggle_zoom(&self) {
-        let mux = Mux::try_get();
-        let callbacks = {
+        let (mux, callbacks) = {
             let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
             let mut callbacks = inner.prepare_toggle_zoom();
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
-            callbacks
+            (mux, callbacks)
         };
         callbacks.execute(mux.as_deref());
     }
@@ -4470,9 +4517,9 @@ impl Tab {
             }
 
             let expected_identities = exact_pane_identity_set(&snapshot);
-            let mux = Mux::try_get();
-            let (positioned, callbacks) = {
+            let (mux, positioned, callbacks) = {
                 let mut inner = self.inner.lock();
+                let mux = inner.notification_owner();
                 let current = inner.snapshot_panes_callback_free();
                 if exact_pane_identity_set(&current) != expected_identities {
                     continue;
@@ -4482,7 +4529,7 @@ impl Tab {
                 if let Some(mux) = mux.as_deref() {
                     callbacks.reserve_topology_notifications(mux, self.tab_id);
                 }
-                (positioned, callbacks)
+                (mux, positioned, callbacks)
             };
             callbacks.execute(mux.as_deref());
             return Ok(positioned);
@@ -4897,14 +4944,14 @@ impl Tab {
         pane_id: PaneId,
         rect: FloatingPaneRect,
     ) -> Option<PositionedFloatingPane> {
-        let mux = Mux::try_get();
-        let (positioned, callbacks) = {
+        let (mux, positioned, callbacks) = {
             let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
             let (positioned, mut callbacks) = inner.prepare_set_floating_pane_rect(pane_id, rect);
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
-            (positioned, callbacks)
+            (mux, positioned, callbacks)
         };
         callbacks.execute(mux.as_deref());
         positioned
@@ -5017,11 +5064,29 @@ impl Tab {
     }
 
     pub fn rotate_counter_clockwise(&self) {
-        self.inner.lock().rotate_counter_clockwise()
+        let (mux, callbacks) = {
+            let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            let mut callbacks = inner.prepare_rotate_counter_clockwise();
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (mux, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
     }
 
     pub fn rotate_clockwise(&self) {
-        self.inner.lock().rotate_clockwise()
+        let (mux, callbacks) = {
+            let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            let mut callbacks = inner.prepare_rotate_clockwise();
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (mux, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
     }
 
     pub fn iter_splits(&self) -> Vec<PositionedSplit> {
@@ -5043,14 +5108,14 @@ impl Tab {
     /// first.  For large resizes this tends to proportionally adjust
     /// the relative sizes of the elements in a split.
     pub fn resize(&self, size: TerminalSize) {
-        let mux = Mux::try_get();
-        let callbacks = {
+        let (mux, callbacks) = {
             let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
             let mut callbacks = inner.prepare_resize(size);
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
-            callbacks
+            (mux, callbacks)
         };
         callbacks.execute(mux.as_deref());
     }
@@ -5069,9 +5134,21 @@ impl Tab {
     /// the GUI to use stale size information for the window it spawns
     /// to attach this tab.
     pub fn rebuild_splits_sizes_from_contained_panes(&self) {
-        self.inner
-            .lock()
-            .rebuild_splits_sizes_from_contained_panes()
+        let (mux, notification) = {
+            let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            let changed = inner.rebuild_splits_sizes_from_contained_panes();
+            let notification = if changed {
+                mux.as_deref()
+                    .map(|mux| mux.envelope_notification(MuxNotification::TabResized(self.tab_id)))
+            } else {
+                None
+            };
+            (mux, notification)
+        };
+        if let (Some(mux), Some(notification)) = (mux, notification) {
+            mux.dispatch_notification_envelope(notification);
+        }
     }
 
     /// Given split_index, the topological index of a split returned by
@@ -5081,14 +5158,14 @@ impl Tab {
     /// The adjusted size is propogated downwards to contained children and
     /// their panes are resized accordingly.
     pub fn resize_split_by(&self, split_index: usize, delta: isize) {
-        let mux = Mux::try_get();
-        let callbacks = {
+        let (mux, callbacks) = {
             let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
             let mut callbacks = inner.prepare_resize_split_by(split_index, delta);
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
-            callbacks
+            (mux, callbacks)
         };
         callbacks.execute(mux.as_deref());
     }
@@ -5118,16 +5195,16 @@ impl Tab {
         min_height: Option<usize>,
         max_height: Option<usize>,
     ) -> Option<PaneConstraints> {
-        let mux = Mux::try_get();
-        let (updated, callbacks) = {
+        let (mux, updated, callbacks) = {
             let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
             let (updated, mut callbacks) = inner.prepare_update_pane_constraints(
                 pane_id, min_width, max_width, min_height, max_height,
             );
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
-            (updated, callbacks)
+            (mux, updated, callbacks)
         };
         callbacks.execute(mux.as_deref());
         updated
@@ -5141,17 +5218,47 @@ impl Tab {
     /// Swap to the next layout in the cycle.
     /// Returns the name of the new layout, or None if no cycle is configured.
     pub fn swap_to_next_layout(&self) -> Option<String> {
-        self.inner.lock().swap_to_next_layout()
+        let (mux, name, callbacks) = {
+            let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            let (name, mut callbacks) = inner.prepare_swap_to_next_layout();
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (mux, name, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
+        name
     }
 
     /// Swap to the previous layout in the cycle.
     pub fn swap_to_prev_layout(&self) -> Option<String> {
-        self.inner.lock().swap_to_prev_layout()
+        let (mux, name, callbacks) = {
+            let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            let (name, mut callbacks) = inner.prepare_swap_to_prev_layout();
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (mux, name, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
+        name
     }
 
     /// Swap to a specific layout by index in the cycle.
     pub fn swap_to_layout_index(&self, index: usize) -> Option<String> {
-        self.inner.lock().swap_to_layout_index(index)
+        let (mux, name, callbacks) = {
+            let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            let (name, mut callbacks) = inner.prepare_swap_to_layout_index(index);
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (mux, name, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
+        name
     }
 
     /// Cycle to the next pane in a stack at the given slot index.
@@ -5201,14 +5308,14 @@ impl Tab {
     /// Adjusts the size of the active pane in the specified direction
     /// by the specified amount.
     pub fn adjust_pane_size(&self, direction: PaneDirection, amount: usize) {
-        let mux = Mux::try_get();
-        let callbacks = {
+        let (mux, callbacks) = {
             let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
             let mut callbacks = inner.prepare_adjust_pane_size(direction, amount);
             if let Some(mux) = mux.as_deref() {
                 callbacks.reserve_topology_notifications(mux, self.tab_id);
             }
-            callbacks
+            (mux, callbacks)
         };
         callbacks.execute(mux.as_deref());
     }
@@ -5218,7 +5325,31 @@ impl Tab {
     /// intended direction, we take the pane that has the largest
     /// edge intersection.
     pub fn activate_pane_direction(&self, direction: PaneDirection) {
-        self.inner.lock().activate_pane_direction(direction)
+        if self.get_zoomed_pane().is_some() {
+            if !configuration().unzoom_on_switch_pane {
+                return;
+            }
+            self.toggle_zoom();
+        }
+        let target = {
+            let mut inner = self.inner.lock();
+            inner
+                .get_pane_direction(direction, false)
+                .and_then(|index| inner.raw_tree_pane_at_index(index))
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if !self.set_active_pane(&target) {
+            return;
+        }
+
+        let mux = self.inner.lock().notification_owner();
+        if let Some(mux) = mux {
+            if let Some(window_id) = mux.window_containing_tab(self.tab_id) {
+                mux.notify(MuxNotification::WindowInvalidated(window_id));
+            }
+        }
     }
 
     /// Returns an adjacent pane in the specified direction.
@@ -5241,16 +5372,23 @@ impl Tab {
             .contains_exact_pane_callback_free(expected)
     }
 
-    /// Freeze the structural pane pointers and retain the topology lock while
-    /// `f` commits a callback-free mux transaction derived from that snapshot.
-    /// Any mux registry guards must be acquired before entering; the callback
-    /// must not invoke pane code or attempt to reacquire this tab.
-    pub(crate) fn with_pane_snapshot_callback_free<R>(
+    /// Commit exact tab retirement while retaining both structural state and
+    /// owner-generation authority. Any mux registry guards must be acquired
+    /// before entering, and the callback must remain callback-free. Returning
+    /// `None` aborts with the owner generation still active.
+    pub(crate) fn with_pane_snapshot_for_retirement<R>(
         &self,
-        f: impl FnOnce(Vec<Arc<dyn Pane>>) -> R,
-    ) -> R {
-        let inner = self.inner.lock();
-        f(inner.snapshot_panes_callback_free())
+        mux: &Mux,
+        f: impl FnOnce(Vec<Arc<dyn Pane>>) -> Option<R>,
+    ) -> Option<R> {
+        let mut inner = self.inner.lock();
+        if !inner.is_active_mux_owner(mux) {
+            return None;
+        }
+        let result = f(inner.snapshot_panes_callback_free())?;
+        let retired = inner.retire_mux_owner(mux);
+        debug_assert!(retired);
+        Some(result)
     }
 
     /// Freeze several exact tabs in a stable identity order and execute one
@@ -5262,21 +5400,27 @@ impl Tab {
     /// pane-registry census. `tabs` must not contain the same exact `Arc<Tab>`
     /// more than once. Any mux registry guards must be acquired before calling
     /// this method, and `f` must not invoke pane code or reacquire any tab.
-    pub(crate) fn with_pane_snapshots_callback_free<R>(
+    /// Multi-tab retirement variant that retires every exact owner generation
+    /// in the same frozen cut as the caller's window/tab registry commit.
+    pub(crate) fn with_pane_snapshots_for_retirement<R>(
+        mux: &Mux,
         tabs: &[Arc<Self>],
         expected: Option<(&Arc<Self>, &PaneOperationGuard)>,
-        f: impl FnOnce(Vec<Vec<Arc<dyn Pane>>>) -> R,
+        f: impl FnOnce(Vec<Vec<Arc<dyn Pane>>>) -> Option<R>,
     ) -> Option<R> {
         let mut lock_order = tabs.iter().enumerate().collect::<Vec<_>>();
         lock_order.sort_unstable_by_key(|(_, tab)| Arc::as_ptr(tab) as usize);
         debug_assert!(lock_order
             .windows(2)
-            .all(|pair| { !Arc::ptr_eq(pair[0].1, pair[1].1) }));
+            .all(|pair| !Arc::ptr_eq(pair[0].1, pair[1].1)));
 
-        let guards = lock_order
+        let mut guards = lock_order
             .iter()
             .map(|(_, tab)| tab.inner.lock())
             .collect::<Vec<_>>();
+        if guards.iter().any(|inner| !inner.is_active_mux_owner(mux)) {
+            return None;
+        }
         let mut snapshots = vec![Vec::new(); tabs.len()];
         for ((original_index, _), guard) in lock_order.iter().zip(&guards) {
             snapshots[*original_index] = guard.snapshot_panes_callback_free();
@@ -5292,8 +5436,11 @@ impl Tab {
             }
         }
 
-        let result = f(snapshots);
-        drop(guards);
+        let result = f(snapshots)?;
+        for inner in &mut guards {
+            let retired = inner.retire_mux_owner(mux);
+            debug_assert!(retired);
+        }
         Some(result)
     }
 
@@ -5311,6 +5458,23 @@ impl Tab {
         }
     }
 
+    /// Empty-tab retirement variant that deactivates the exact owner only
+    /// after the registry callback commits successfully.
+    pub(crate) fn with_structurally_empty_for_retirement<R>(
+        &self,
+        mux: &Mux,
+        f: impl FnOnce() -> Option<R>,
+    ) -> Option<R> {
+        let mut inner = self.inner.lock();
+        if !inner.is_active_mux_owner(mux) || !inner.snapshot_panes_callback_free().is_empty() {
+            return None;
+        }
+        let result = f()?;
+        let retired = inner.retire_mux_owner(mux);
+        debug_assert!(retired);
+        Some(result)
+    }
+
     /// Execute `f` only while this tab still structurally contains the exact
     /// pane held by `operation`.
     ///
@@ -5319,18 +5483,24 @@ impl Tab {
     /// pane-generation authority. Any mux registry guards must be acquired
     /// before entering; the callback must not invoke pane code or attempt to
     /// reacquire this tab.
-    pub(crate) fn with_exact_pane_operation<R>(
+    pub(crate) fn with_exact_pane_operation_for_retirement<R>(
         &self,
+        mux: &Mux,
         operation: &PaneOperationGuard,
-        f: impl FnOnce(Vec<Arc<dyn Pane>>) -> R,
+        f: impl FnOnce(Vec<Arc<dyn Pane>>) -> Option<R>,
     ) -> Option<R> {
-        let inner = self.inner.lock();
-        let panes = inner.snapshot_panes_callback_free();
-        if panes.iter().any(|pane| operation.is_same_pane(pane)) {
-            Some(f(panes))
-        } else {
-            None
+        let mut inner = self.inner.lock();
+        if !inner.is_active_mux_owner(mux) {
+            return None;
         }
+        let panes = inner.snapshot_panes_callback_free();
+        if !panes.iter().any(|pane| operation.is_same_pane(pane)) {
+            return None;
+        }
+        let result = f(panes)?;
+        let retired = inner.retire_mux_owner(mux);
+        debug_assert!(retired);
+        Some(result)
     }
 
     fn observe_panes(panes: Vec<Arc<dyn Pane>>) -> Vec<ObservedPane> {
@@ -5709,18 +5879,63 @@ impl Tab {
     }
 
     pub fn set_active_pane(&self, pane: &Arc<dyn Pane>) -> bool {
-        let mux = Mux::try_get();
-        self.inner.lock().set_active_pane(pane, mux.as_deref())
+        let pane_id = match observe_pane_id_for_mutation(pane) {
+            Ok(pane_id) => pane_id,
+            Err(error) => {
+                log::error!("refusing to focus a pane whose identity callback failed: {error:#}");
+                return false;
+            }
+        };
+        let (mux, selected, callbacks) = {
+            let mut inner = self.inner.lock();
+            let mux = inner.notification_owner();
+            let (selected, mut callbacks) = inner.prepare_set_active_pane(pane, pane_id);
+            if let Some(mux) = mux.as_deref() {
+                callbacks.reserve_topology_notifications(mux, self.tab_id);
+            }
+            (mux, selected, callbacks)
+        };
+        callbacks.execute(mux.as_deref());
+        selected
     }
 
     /// Select a pane while routing the resulting notification through the
     /// exact mux that owns the surrounding topology.
     pub(crate) fn set_active_pane_for_mux(&self, pane: &Arc<dyn Pane>, mux: &Mux) -> bool {
-        self.inner.lock().set_active_pane(pane, Some(mux))
+        {
+            let inner = self.inner.lock();
+            if !inner.is_active_mux_owner(mux) {
+                return false;
+            }
+        }
+        let pane_id = match observe_pane_id_for_mutation(pane) {
+            Ok(pane_id) => pane_id,
+            Err(error) => {
+                log::error!("refusing to focus a pane whose identity callback failed: {error:#}");
+                return false;
+            }
+        };
+        let (owner, selected, callbacks) = {
+            let mut inner = self.inner.lock();
+            if !inner.is_active_mux_owner(mux) {
+                return false;
+            }
+            let owner = inner.notification_owner();
+            let (selected, mut callbacks) = inner.prepare_set_active_pane(pane, pane_id);
+            if let Some(owner) = owner.as_deref() {
+                callbacks.reserve_topology_notifications(owner, self.tab_id);
+            }
+            (owner, selected, callbacks)
+        };
+        callbacks.execute(owner.as_deref());
+        selected
     }
 
     pub fn set_active_idx(&self, pane_index: usize) {
-        self.inner.lock().set_active_idx(pane_index)
+        let pane = self.inner.lock().raw_tree_pane_at_index(pane_index);
+        if let Some(pane) = pane {
+            self.set_active_pane(&pane);
+        }
     }
 
     /// Assigns the root pane.
@@ -5747,6 +5962,12 @@ impl Tab {
         pane_index: usize,
         request: SplitRequest,
     ) -> Option<SplitDirectionAndSize> {
+        // A non-top-level split cannot be computed against zoom geometry.
+        // Perform the unzoom transaction through the outer deferred-callback
+        // boundary before taking the topology lock for the pure computation.
+        if !request.top_level {
+            self.set_zoomed(false);
+        }
         self.inner.lock().compute_split_size(pane_index, request)
     }
 
@@ -6790,6 +7011,10 @@ impl TabInner {
     fn new(size: &TerminalSize) -> Self {
         Self {
             id: crate::next_unique_usize_id(&TAB_ID, "mux tab"),
+            mux_owner: Weak::new(),
+            mux_owner_bound: false,
+            mux_owner_active: false,
+            mux_owner_generation: 0,
             pane: Some(Tree::new()),
             floating_panes: vec![],
             floating_focus: None,
@@ -6803,6 +7028,64 @@ impl TabInner {
             layout_cycle: Some(crate::layout::default_cycle()),
             pane_stacks: HashMap::new(),
             constraint_overrides: HashMap::new(),
+        }
+    }
+
+    fn bind_mux_owner(&mut self, mux: &Arc<Mux>) -> anyhow::Result<()> {
+        if self.mux_owner_bound {
+            let Some(owner) = self.mux_owner.upgrade() else {
+                anyhow::bail!(
+                    "tab {} cannot be rebound after its exact mux owner was dropped",
+                    self.id
+                );
+            };
+            anyhow::ensure!(
+                Arc::ptr_eq(&owner, mux),
+                "tab {} is already bound to a different mux authority",
+                self.id
+            );
+            anyhow::ensure!(
+                !self.mux_owner_active,
+                "tab {} already has an active mux-owner generation",
+                self.id
+            );
+        }
+
+        let next_generation = self
+            .mux_owner_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("tab {} mux-owner generation exhausted", self.id))?;
+        if !self.mux_owner_bound {
+            self.mux_owner = Arc::downgrade(mux);
+            self.mux_owner_bound = true;
+        }
+
+        self.mux_owner_generation = next_generation;
+        self.mux_owner_active = true;
+        Ok(())
+    }
+
+    fn retire_mux_owner(&mut self, mux: &Mux) -> bool {
+        if !self.is_active_mux_owner(mux) {
+            return false;
+        }
+        self.mux_owner_active = false;
+        true
+    }
+
+    fn is_active_mux_owner(&self, mux: &Mux) -> bool {
+        self.mux_owner_active
+            && self
+                .mux_owner
+                .upgrade()
+                .is_some_and(|owner| std::ptr::eq(owner.as_ref(), mux))
+    }
+
+    fn notification_owner(&self) -> Option<Arc<Mux>> {
+        if self.mux_owner_active {
+            self.mux_owner.upgrade()
+        } else {
+            None
         }
     }
 
@@ -6936,28 +7219,6 @@ impl TabInner {
             }
         }
         callbacks
-    }
-
-    /// Legacy inner call surface retained while older compound mutations are
-    /// migrated to return deferred callbacks to their outer `Tab` boundary.
-    /// New code must use `prepare_set_zoomed`/`prepare_toggle_zoom`.
-    fn set_zoomed(&mut self, zoomed: bool) -> bool {
-        let mux = Mux::try_get();
-        let (prior, mut callbacks) = self.prepare_set_zoomed(zoomed);
-        if let Some(mux) = mux.as_deref() {
-            callbacks.reserve_topology_notifications(mux, self.id);
-        }
-        callbacks.execute(mux.as_deref());
-        prior
-    }
-
-    fn toggle_zoom(&mut self) {
-        let mux = Mux::try_get();
-        let mut callbacks = self.prepare_toggle_zoom();
-        if let Some(mux) = mux.as_deref() {
-            callbacks.reserve_topology_notifications(mux, self.id);
-        }
-        callbacks.execute(mux.as_deref());
     }
 
     fn contains_pane(&self, pane: PaneId) -> bool {
@@ -7612,35 +7873,60 @@ impl TabInner {
 
     /// Swap to the next layout in the cycle.  Returns the name of the
     /// new layout, or None if no cycle is configured or the tab has no panes.
-    fn swap_to_next_layout(&mut self) -> Option<String> {
-        let cycle = self.layout_cycle.as_mut()?;
-        let layout = cycle.advance().clone();
-        self.apply_layout(&layout)
+    fn prepare_swap_to_next_layout(&mut self) -> (Option<String>, DeferredTabCallbacks) {
+        let Some(mut next_cycle) = self.layout_cycle.clone() else {
+            return (None, DeferredTabCallbacks::default());
+        };
+        let layout = next_cycle.advance().clone();
+        let result = self.prepare_apply_layout(&layout);
+        if result.0.is_some() {
+            self.layout_cycle = Some(next_cycle);
+        }
+        result
     }
 
     /// Swap to the previous layout in the cycle.
-    fn swap_to_prev_layout(&mut self) -> Option<String> {
-        let cycle = self.layout_cycle.as_mut()?;
-        let layout = cycle.prev().clone();
-        self.apply_layout(&layout)
+    fn prepare_swap_to_prev_layout(&mut self) -> (Option<String>, DeferredTabCallbacks) {
+        let Some(mut next_cycle) = self.layout_cycle.clone() else {
+            return (None, DeferredTabCallbacks::default());
+        };
+        let layout = next_cycle.prev().clone();
+        let result = self.prepare_apply_layout(&layout);
+        if result.0.is_some() {
+            self.layout_cycle = Some(next_cycle);
+        }
+        result
     }
 
     /// Swap to a specific layout by index in the cycle.
-    fn swap_to_layout_index(&mut self, index: usize) -> Option<String> {
-        let cycle = self.layout_cycle.as_mut()?;
-        if !cycle.select(index) {
-            return None;
+    fn prepare_swap_to_layout_index(
+        &mut self,
+        index: usize,
+    ) -> (Option<String>, DeferredTabCallbacks) {
+        let Some(mut next_cycle) = self.layout_cycle.clone() else {
+            return (None, DeferredTabCallbacks::default());
+        };
+        if !next_cycle.select(index) {
+            return (None, DeferredTabCallbacks::default());
         }
-        let layout = cycle.current().clone();
-        self.apply_layout(&layout)
+        let layout = next_cycle.current().clone();
+        let result = self.prepare_apply_layout(&layout);
+        if result.0.is_some() {
+            self.layout_cycle = Some(next_cycle);
+        }
+        result
     }
 
     /// Apply a layout, redistributing panes from the current tree.
-    fn apply_layout(&mut self, layout: &SwapLayout) -> Option<String> {
+    fn prepare_apply_layout(
+        &mut self,
+        layout: &SwapLayout,
+    ) -> (Option<String>, DeferredTabCallbacks) {
+        let prior_focus = self.raw_active_pane_retained_id();
         // Collect all panes from the current tree AND from any existing stacks.
         let all_panes = self.collect_all_panes();
         if all_panes.is_empty() {
-            return None;
+            return (None, DeferredTabCallbacks::default());
         }
 
         let active_pane_id = self
@@ -7648,7 +7934,11 @@ impl TabInner {
             .map(|p| p.pane_id())
             .unwrap_or_else(|| all_panes[0].pane_id());
 
-        let result = redistribute_panes(&layout.arrangement, all_panes, active_pane_id, self.size)?;
+        let Some(result) =
+            redistribute_panes(&layout.arrangement, all_panes, active_pane_id, self.size)
+        else {
+            return (None, DeferredTabCallbacks::default());
+        };
 
         self.pane = Some(result.tree);
         self.pane_stacks = result.stacks;
@@ -7656,42 +7946,47 @@ impl TabInner {
         self.zoomed = None;
         self.collapsed_panes.clear();
 
-        // Apply sizes to the new tree.
-        let size = self.size;
-        if let Some(tree) = self.pane.as_mut() {
-            apply_sizes_from_splits(tree, &size);
-        }
-
-        // Notify about the focus change.
-        if let Some(pane) = self.get_active_pane() {
+        let current_focus = self.raw_active_pane_retained_id();
+        if current_focus.is_some() {
             self.recency.tag(self.active);
-            Mux::try_get().map(|mux| {
-                mux.notify(MuxNotification::PaneFocused(pane.pane_id()));
-            });
+        }
+        let mut callbacks = DeferredTabCallbacks {
+            changed: true,
+            prior_focus,
+            current_focus,
+            current_focus_id: self
+                .raw_active_pane_retained_id()
+                .as_ref()
+                .map(|pane| pane.pane_id()),
+            ..DeferredTabCallbacks::default()
+        };
+        if let Some(tree) = self.pane.as_ref() {
+            collect_pane_resize_work(tree, &self.size, &mut callbacks.resize_work);
         }
 
-        Some(layout.name.clone())
+        (Some(layout.name.clone()), callbacks)
     }
 
     /// Collect all panes: from the tree leaves AND from stacked (hidden) panes.
     fn collect_all_panes(&mut self) -> Vec<Arc<dyn Pane>> {
         let mut panes: Vec<Arc<dyn Pane>> = Vec::new();
+        let mut seen = HashSet::new();
 
         // Collect from tree leaves.
         let positioned = self.iter_panes_ignoring_zoom();
         for pp in &positioned {
-            panes.push(pp.pane.clone());
+            if seen.insert(pane_identity(&pp.pane)) {
+                panes.push(Arc::clone(&pp.pane));
+            }
         }
 
-        // Collect from stacks (non-visible panes that aren't already in the tree).
-        // Use std::mem::take for an atomic swap instead of drain(), which would
-        // leave pane_stacks empty if anything accesses it before reassignment.
-        let tree_ids: HashSet<PaneId> = panes.iter().map(|p| p.pane_id()).collect();
-        let old_stacks = std::mem::take(&mut self.pane_stacks);
-        for (_slot, stack) in old_stacks {
-            for p in stack.into_panes() {
-                if !tree_ids.contains(&p.pane_id()) {
-                    panes.push(p);
+        // Snapshot hidden stack members without consuming the old topology.
+        // Layout construction can fail; retaining the stacks until the new
+        // tree is ready makes that failure byte-for-byte non-mutating.
+        for stack in self.pane_stacks.values() {
+            for pane in stack.panes() {
+                if seen.insert(pane_identity(pane)) {
+                    panes.push(Arc::clone(pane));
                 }
             }
         }
@@ -8281,10 +8576,14 @@ impl TabInner {
     }
 
     fn raw_tree_active_pane(&self) -> Option<Arc<dyn Pane>> {
+        self.raw_tree_pane_at_index(self.active)
+    }
+
+    fn raw_tree_pane_at_index(&self, index: usize) -> Option<Arc<dyn Pane>> {
         let tree = self.pane.as_ref()?;
         let mut leaves = Vec::new();
         collect_raw_tree_leaves(tree, &mut leaves);
-        leaves.get(self.active).cloned()
+        leaves.get(index).cloned()
     }
 
     fn raw_active_pane_retained_id(&self) -> Option<Arc<dyn Pane>> {
@@ -8636,12 +8935,12 @@ impl TabInner {
         self.iter_panes_impl(false)
     }
 
-    fn rotate_counter_clockwise(&mut self) {
+    fn prepare_rotate_counter_clockwise(&mut self) -> DeferredTabCallbacks {
         let panes = self.iter_panes_ignoring_zoom();
         if panes.is_empty() {
             // Shouldn't happen, but we check for this here so that the
             // expect below cannot trigger a panic
-            return;
+            return DeferredTabCallbacks::default();
         }
         let mut pane_to_swap = panes
             .first()
@@ -8659,21 +8958,31 @@ impl TabInner {
                 Ok(c) => cursor = c,
                 Err(c) => {
                     self.pane.replace(c.tree());
-                    let size = self.size;
-                    apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
                     break;
                 }
             }
         }
         self.reindex_pane_stacks_from_tree();
+        let mut callbacks = DeferredTabCallbacks {
+            changed: true,
+            ..DeferredTabCallbacks::default()
+        };
+        collect_pane_resize_work(
+            self.pane
+                .as_ref()
+                .expect("rotated pane tree remains present"),
+            &self.size,
+            &mut callbacks.resize_work,
+        );
+        callbacks
     }
 
-    fn rotate_clockwise(&mut self) {
+    fn prepare_rotate_clockwise(&mut self) -> DeferredTabCallbacks {
         let panes = self.iter_panes_ignoring_zoom();
         if panes.is_empty() {
             // Shouldn't happen, but we check for this here so that the
             // expect below cannot trigger a panic
-            return;
+            return DeferredTabCallbacks::default();
         }
         let mut pane_to_swap = panes
             .last()
@@ -8691,14 +9000,23 @@ impl TabInner {
                 Ok(c) => cursor = c,
                 Err(c) => {
                     self.pane.replace(c.tree());
-                    let size = self.size;
-                    apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
                     break;
                 }
             }
         }
         self.reindex_pane_stacks_from_tree();
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        let mut callbacks = DeferredTabCallbacks {
+            changed: true,
+            ..DeferredTabCallbacks::default()
+        };
+        collect_pane_resize_work(
+            self.pane
+                .as_ref()
+                .expect("rotated pane tree remains present"),
+            &self.size,
+            &mut callbacks.resize_work,
+        );
+        callbacks
     }
 
     fn iter_panes_impl(&mut self, respect_zoom_state: bool) -> Vec<PositionedPane> {
@@ -8948,7 +9266,7 @@ impl TabInner {
     }
 
     fn resize(&mut self, size: TerminalSize) {
-        let mux = Mux::try_get();
+        let mux = self.notification_owner();
         let mut callbacks = self.prepare_resize(size);
         if let Some(mux) = mux.as_deref() {
             callbacks.reserve_topology_notifications(mux, self.id);
@@ -9037,9 +9355,9 @@ impl TabInner {
         }
     }
 
-    fn rebuild_splits_sizes_from_contained_panes(&mut self) {
+    fn rebuild_splits_sizes_from_contained_panes(&mut self) -> bool {
         if self.zoomed.is_some() {
-            return;
+            return false;
         }
 
         fn compute_size(node: &mut Tree) -> Option<TerminalSize> {
@@ -9072,12 +9390,14 @@ impl TabInner {
             }
         }
 
-        if let Some(root) = self.pane.as_mut() {
-            if let Some(size) = compute_size(root) {
-                self.size = size;
-            }
-        }
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        let Some(root) = self.pane.as_mut() else {
+            return false;
+        };
+        let Some(size) = compute_size(root) else {
+            return false;
+        };
+        self.size = size;
+        true
     }
 
     fn prepare_resize_split_by(
@@ -9306,23 +9626,6 @@ impl TabInner {
                     self.pane.replace(c.tree());
                     return callbacks;
                 }
-            }
-        }
-    }
-
-    fn activate_pane_direction(&mut self, direction: PaneDirection) {
-        if self.zoomed.is_some() {
-            if !configuration().unzoom_on_switch_pane {
-                return;
-            }
-            self.toggle_zoom();
-        }
-        if let Some(panel_idx) = self.get_pane_direction(direction, false) {
-            self.set_active_idx(panel_idx);
-        }
-        if let Some(mux) = Mux::try_get() {
-            if let Some(window_id) = mux.window_containing_tab(self.id) {
-                mux.notify(MuxNotification::WindowInvalidated(window_id));
             }
         }
     }
@@ -9587,18 +9890,23 @@ impl TabInner {
         self.active
     }
 
-    fn set_active_pane(&mut self, pane: &Arc<dyn Pane>, mux: Option<&Mux>) -> bool {
-        let prior = self.get_active_pane();
+    fn prepare_set_active_pane(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        pane_id: PaneId,
+    ) -> (bool, DeferredTabCallbacks) {
+        let prior = self.raw_active_pane_retained_id();
 
         if is_pane(pane, &prior.as_ref()) {
-            return true;
+            return (true, DeferredTabCallbacks::default());
         }
 
+        let mut callbacks = DeferredTabCallbacks::default();
         if self.zoomed.is_some() {
             if !configuration().unzoom_on_switch_pane {
-                return false;
+                return (false, callbacks);
             }
-            self.toggle_zoom();
+            callbacks = self.prepare_toggle_zoom();
         }
 
         if let Some(index) = self
@@ -9607,13 +9915,16 @@ impl TabInner {
             .position(|floating| Arc::ptr_eq(&floating.pane, pane))
         {
             if !self.floating_panes[index].visible {
-                return false;
+                return (false, callbacks);
             }
             let next_z = self.next_floating_z_order();
-            self.floating_focus = Some(pane.pane_id());
+            self.floating_focus = Some(pane_id);
             self.floating_panes[index].z_order = next_z;
-            self.advise_focus_change_with_mux(prior, mux);
-            return true;
+            callbacks.changed = true;
+            callbacks.prior_focus = prior;
+            callbacks.current_focus = Some(Arc::clone(pane));
+            callbacks.current_focus_id = Some(pane_id);
+            return (true, callbacks);
         }
 
         if let Some(item) = self
@@ -9624,14 +9935,17 @@ impl TabInner {
             self.active = item.index;
             self.recency.tag(item.index);
             self.clear_floating_focus();
-            self.advise_focus_change_with_mux(prior, mux);
-            return true;
+            callbacks.changed = true;
+            callbacks.prior_focus = prior;
+            callbacks.current_focus = Some(Arc::clone(pane));
+            callbacks.current_focus_id = Some(pane_id);
+            return (true, callbacks);
         }
-        false
+        (false, callbacks)
     }
 
     fn advise_focus_change(&mut self, prior: Option<Arc<dyn Pane>>) {
-        let mux = Mux::try_get();
+        let mux = self.notification_owner();
         self.advise_focus_change_with_mux(prior, mux.as_deref());
     }
 
@@ -9834,9 +10148,10 @@ impl TabInner {
             });
         }
 
-        // Ensure that we're not zoomed, otherwise we'll end up in
-        // a bogus split state (https://github.com/wezterm/wezterm/issues/723)
-        self.set_zoomed(false);
+        debug_assert!(
+            self.zoomed.is_none(),
+            "non-top-level split sizing must unzoom at the outer Tab boundary"
+        );
 
         self.iter_panes().iter().nth(pane_index).and_then(|pos| {
             let existing_constraints =

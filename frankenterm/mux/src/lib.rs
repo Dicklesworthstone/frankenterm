@@ -7581,6 +7581,9 @@ impl Mux {
             .get(&tab_id)
             .is_some_and(|registered| Arc::ptr_eq(registered, expected))
         {
+            if !expected.retire_mux_owner(self) {
+                return false;
+            }
             tabs.remove(&tab_id);
             true
         } else {
@@ -7724,17 +7727,25 @@ impl Mux {
         Ok(())
     }
 
-    fn insert_tab_registration_locked(&self, tab: &Arc<Tab>) -> Result<bool, Error> {
+    fn insert_tab_registration_locked(self: &Arc<Self>, tab: &Arc<Tab>) -> Result<bool, Error> {
         let tab_id = tab.tab_id();
         let mut tabs = self.tabs.write();
         if let Some(existing) = tabs.get(&tab_id) {
             if Arc::ptr_eq(existing, tab) {
+                anyhow::ensure!(
+                    tab.has_active_mux_owner(self),
+                    "tab identifier {tab_id} is registered without active mux-owner authority"
+                );
                 return Ok(false);
             }
             return Err(anyhow!(
                 "tab identifier {tab_id} is already registered to a different tab instance"
             ));
         }
+        // This is the final fallible registration step. Keep the tab map
+        // write-locked through the infallible insertion so another mux cannot
+        // win a cross-owner registration race after validation.
+        tab.bind_mux_owner(self)?;
         tabs.insert(tab_id, Arc::clone(tab));
         Ok(true)
     }
@@ -7743,6 +7754,10 @@ impl Mux {
         let tab_id = tab.tab_id();
         if let Some(existing) = self.tabs.read().get(&tab_id) {
             if Arc::ptr_eq(existing, tab) {
+                anyhow::ensure!(
+                    tab.has_active_mux_owner(self),
+                    "tab identifier {tab_id} is registered without active mux-owner authority"
+                );
                 return Ok(false);
             }
             return Err(anyhow!(
@@ -8037,7 +8052,7 @@ impl Mux {
         Ok(())
     }
 
-    pub fn add_tab_no_panes(&self, tab: &Arc<Tab>) -> Result<(), Error> {
+    pub fn add_tab_no_panes(self: &Arc<Self>, tab: &Arc<Tab>) -> Result<(), Error> {
         let inserted = {
             let _registration = self.pane_registration.lock();
             self.insert_tab_registration_locked(tab)?
@@ -8129,6 +8144,19 @@ impl Mux {
                             .take()
                             .expect("a prepared pane retains its registration reservation")
                             .commit()?;
+                        // Owner binding is the last fallible step. The pane
+                        // commit guard rolls its slot back if binding rejects;
+                        // after this branch all publication is infallible.
+                        // Bind only a newly inserted tab; an existing exact
+                        // registration must already carry active authority.
+                        if tab_needs_insert {
+                            tab.bind_mux_owner(self)?;
+                        } else {
+                            anyhow::ensure!(
+                                tab.has_active_mux_owner(self),
+                                "tab identifier {tab_id} is registered without active mux-owner authority"
+                            );
+                        }
                         panes.insert(
                             pane_id,
                             LivePaneRegistration {
@@ -8351,7 +8379,7 @@ impl Mux {
                         .then_some(*window_id)
                 }));
             }
-            let result = tab.with_pane_snapshot_callback_free(|pane_snapshot| {
+            let result = tab.with_pane_snapshot_for_retirement(self, |pane_snapshot| {
                 let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
                 if !prepared_windows.is_empty() {
                     if let Err(error) = self.commit_prepared_window_states_locked(
@@ -8624,24 +8652,30 @@ impl Mux {
                         .then_some(*window_id)
                 }));
             }
-            let result = expected.with_exact_pane_operation(operation, |pane_snapshot| {
-                let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
-                if !prepared_windows.is_empty() {
-                    if let Err(error) = self.commit_prepared_window_states_locked(
-                        &mut windows,
-                        prepared_windows,
-                        Vec::new(),
-                        Vec::new(),
-                        removed_windows,
-                    ) {
-                        log::error!("refusing witnessed tab retirement window commit: {error:#}");
-                        return None;
+            let result = expected.with_exact_pane_operation_for_retirement(
+                self,
+                operation,
+                |pane_snapshot| {
+                    let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
+                    if !prepared_windows.is_empty() {
+                        if let Err(error) = self.commit_prepared_window_states_locked(
+                            &mut windows,
+                            prepared_windows,
+                            Vec::new(),
+                            Vec::new(),
+                            removed_windows,
+                        ) {
+                            log::error!(
+                                "refusing witnessed tab retirement window commit: {error:#}"
+                            );
+                            return None;
+                        }
                     }
-                }
-                tabs.remove(&tab_id);
-                Some(self.take_tab_pane_candidates_for_removal_locked(pane_candidates))
-            })?;
-            result?
+                    tabs.remove(&tab_id);
+                    Some(self.take_tab_pane_candidates_for_removal_locked(pane_candidates))
+                },
+            )?;
+            result
         };
         self.finish_taken_tab_pane_state(&removed_panes, output_batches);
         Some((Arc::clone(expected), removed_panes))
@@ -8736,7 +8770,7 @@ impl Mux {
                         .then_some(*window_id)
                 }));
             }
-            let tab = expected.with_structurally_empty(|| {
+            let tab = expected.with_structurally_empty_for_retirement(self, || {
                 if !prepared_windows.is_empty() {
                     if let Err(error) = self.commit_prepared_window_states_locked(
                         &mut windows,
@@ -8750,7 +8784,7 @@ impl Mux {
                     }
                 }
                 tabs.remove(&tab_id)
-            })??;
+            })?;
             tab
         };
         self.flush_window_notifications();
@@ -8838,7 +8872,8 @@ impl Mux {
                 prepared_windows.push((window_id, retirement));
             }
 
-            let removed_tabs = Tab::with_pane_snapshots_callback_free(
+            let removed_tabs = Tab::with_pane_snapshots_for_retirement(
+                self,
                 &retired_tabs,
                 expected,
                 |pane_snapshots| {
@@ -8892,7 +8927,7 @@ impl Mux {
                             .collect::<Vec<_>>(),
                     )
                 },
-            )??;
+            )?;
             removed_tabs
         };
 
@@ -9419,7 +9454,7 @@ impl Mux {
         let Some(tab) = self.get_tab(tab_id) else {
             return false;
         };
-        let (changed, notification) = tab.set_title_for_mux(title, Some(self));
+        let (changed, notification) = tab.set_title_for_mux(title, self);
         if let Some(notification) = notification {
             self.dispatch_notification_envelope(notification);
         }
@@ -14780,6 +14815,193 @@ mod tests {
     }
 
     #[test]
+    fn tab_registration_rejects_cross_mux_authority_without_mutation() {
+        let origin = Arc::new(Mux::new(None));
+        let foreign = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+
+        origin
+            .add_tab_no_panes(&tab)
+            .expect("origin mux should bind the new tab allocation");
+        assert_eq!(tab.mux_owner_generation_for_test(), 1);
+        let error = foreign
+            .add_tab_no_panes(&tab)
+            .expect_err("one tab allocation must not bind to two mux authorities");
+        assert!(error
+            .to_string()
+            .contains("already bound to a different mux authority"));
+        assert!(origin
+            .get_tab(tab.tab_id())
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &tab)));
+        assert!(foreign.get_tab(tab.tab_id()).is_none());
+
+        assert!(origin.remove_tab(tab.tab_id()).is_some());
+        let error = foreign
+            .add_tab_no_panes(&tab)
+            .expect_err("retirement must not transfer a tab allocation to another mux");
+        assert!(error
+            .to_string()
+            .contains("already bound to a different mux authority"));
+        assert_eq!(tab.mux_owner_generation_for_test(), 1);
+        assert!(origin.get_tab(tab.tab_id()).is_none());
+        assert!(foreign.get_tab(tab.tab_id()).is_none());
+
+        let forged = Arc::new(Tab::new(&test_size()));
+        origin
+            .tabs
+            .write()
+            .insert(forged.tab_id(), Arc::clone(&forged));
+        let error = origin
+            .add_tab_no_panes(&forged)
+            .expect_err("an unowned raw tab-map entry must not be adopted implicitly");
+        assert!(error
+            .to_string()
+            .contains("registered without active mux-owner authority"));
+        origin.tabs.write().remove(&forged.tab_id());
+
+        let stale_active = Arc::new(Tab::new(&test_size()));
+        origin
+            .add_tab_no_panes(&stale_active)
+            .expect("stale-active fixture starts authoritatively registered");
+        origin.tabs.write().remove(&stale_active.tab_id());
+        let error = origin
+            .add_tab_no_panes(&stale_active)
+            .expect_err("an active generation without its map entry must fail closed");
+        assert!(error
+            .to_string()
+            .contains("already has an active mux-owner generation"));
+        assert_eq!(stale_active.mux_owner_generation_for_test(), 1);
+    }
+
+    #[test]
+    fn tab_notifications_follow_exact_owner_generation_across_global_mux_swap() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let origin = Arc::new(Mux::new(None));
+        let replacement = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        origin
+            .add_tab_no_panes(&tab)
+            .expect("origin mux should bind the new tab allocation");
+
+        let origin_titles = Arc::new(Mutex::new(Vec::new()));
+        let origin_titles_for_subscriber = Arc::clone(&origin_titles);
+        let tab_for_subscriber = Arc::clone(&tab);
+        origin
+            .subscribe(move |notification| {
+                if let MuxNotification::TabTitleChanged { tab_id, title } = notification {
+                    assert_eq!(tab_id, tab_for_subscriber.tab_id());
+                    assert!(
+                        tab_for_subscriber.topology_lock_is_available_for_test(),
+                        "tab callbacks must run after releasing the topology lock",
+                    );
+                    origin_titles_for_subscriber.lock().push(title);
+                }
+                true
+            })
+            .expect("origin subscription");
+
+        let replacement_titles = Arc::new(Mutex::new(Vec::new()));
+        let replacement_titles_for_subscriber = Arc::clone(&replacement_titles);
+        replacement
+            .subscribe(move |notification| {
+                if let MuxNotification::TabTitleChanged { title, .. } = notification {
+                    replacement_titles_for_subscriber.lock().push(title);
+                }
+                true
+            })
+            .expect("replacement subscription");
+
+        let _mux_override = ScopedMuxOverride::install(&replacement);
+        let (foreign_focus_candidate, _, foreign_focus_pane_id_calls) =
+            KillCountingPane::new_with_pane_id_counter(210_001, test_size());
+        assert!(!tab.set_active_pane_for_mux(&foreign_focus_candidate, &replacement));
+        assert_eq!(
+            foreign_focus_pane_id_calls.load(Ordering::SeqCst),
+            0,
+            "a non-owner mux must be rejected before invoking an arbitrary pane identity callback",
+        );
+        tab.set_title("origin generation one");
+        assert_eq!(&*origin_titles.lock(), &["origin generation one"]);
+        assert!(replacement_titles.lock().is_empty());
+
+        assert!(origin.remove_tab(tab.tab_id()).is_some());
+        let origin_count_after_retirement = origin_titles.lock().len();
+        let title_before_stale_explicit_mutation = tab.get_title();
+        let (changed, notification) = tab.set_title_for_mux("stale explicit mux", &origin);
+        assert!(!changed);
+        assert!(notification.is_none());
+        assert_eq!(tab.get_title(), title_before_stale_explicit_mutation);
+        tab.set_title("detached mutation");
+        assert_eq!(origin_titles.lock().len(), origin_count_after_retirement);
+        assert!(replacement_titles.lock().is_empty());
+
+        origin
+            .add_tab_no_panes(&tab)
+            .expect("the same mux may reactivate the exact tab as a new generation");
+        assert_eq!(tab.mux_owner_generation_for_test(), 2);
+        tab.set_title("origin generation two");
+        assert_eq!(
+            &*origin_titles.lock(),
+            &["origin generation one", "origin generation two"]
+        );
+        assert!(replacement_titles.lock().is_empty());
+    }
+
+    #[test]
+    fn tab_rotation_notifies_only_exact_owner_after_global_mux_swap() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let origin = Arc::new(Mux::new(None));
+        let replacement = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        let (first, _) = KillCountingPane::new(196, test_size());
+        let (second, _) = KillCountingPane::new(197, test_size());
+        tab.assign_pane(&first);
+        origin
+            .add_tab_and_active_pane(&tab)
+            .expect("origin tab and first pane registration");
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&second))
+            .expect("two-pane rotation fixture");
+        origin.add_pane(&second).expect("second pane registration");
+
+        let origin_resizes = Arc::new(AtomicUsize::new(0));
+        let origin_resizes_for_subscriber = Arc::clone(&origin_resizes);
+        let tab_for_subscriber = Arc::clone(&tab);
+        origin
+            .subscribe(move |notification| {
+                if matches!(notification, MuxNotification::TabResized(_)) {
+                    assert!(
+                        tab_for_subscriber.topology_lock_is_available_for_test(),
+                        "rotation subscribers must run after releasing the tab topology lock",
+                    );
+                    origin_resizes_for_subscriber.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("origin resize subscription");
+        let replacement_resizes = Arc::new(AtomicUsize::new(0));
+        let replacement_resizes_for_subscriber = Arc::clone(&replacement_resizes);
+        replacement
+            .subscribe(move |notification| {
+                if matches!(notification, MuxNotification::TabResized(_)) {
+                    replacement_resizes_for_subscriber.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("replacement resize subscription");
+
+        let _mux_override = ScopedMuxOverride::install(&replacement);
+        tab.rotate_clockwise();
+        tab.rotate_counter_clockwise();
+
+        assert_eq!(origin_resizes.load(Ordering::SeqCst), 2);
+        assert_eq!(replacement_resizes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn exact_tab_removal_uses_callback_free_structural_census() {
         let _guard = global_test_lock();
         Mux::shutdown();
@@ -16791,9 +17013,8 @@ mod tests {
         let failed_tab = Arc::new(Tab::new(&test_size()));
         let replacement_tab = Arc::new(Tab::new(&test_size()));
         let replacement_tab_id = replacement_tab.tab_id();
-        mux.tabs
-            .write()
-            .insert(replacement_tab_id, Arc::clone(&replacement_tab));
+        mux.add_tab_no_panes(&replacement_tab)
+            .expect("replacement tab must enter through authoritative registration");
 
         assert!(!mux.remove_tab_registration_if_same(replacement_tab_id, &failed_tab));
         let registered_tab = mux
@@ -17221,7 +17442,7 @@ mod tests {
         })
         .expect("test topology subscription should allocate an identifier");
 
-        let (changed, notification) = tab.set_title_for_mux("reserved", Some(&mux));
+        let (changed, notification) = tab.set_title_for_mux("reserved", &mux);
         assert!(changed);
         assert_eq!(tab.get_title(), "reserved");
         assert!(
@@ -18175,9 +18396,14 @@ mod tests {
 
         let origin_notifications = Arc::new(AtomicUsize::new(0));
         let origin_notifications_for_subscriber = Arc::clone(&origin_notifications);
+        let tab_for_subscriber = Arc::clone(&tab);
         origin
             .subscribe(move |notification| {
                 if matches!(notification, MuxNotification::PaneFocused(784)) {
+                    assert!(
+                        tab_for_subscriber.topology_lock_is_available_for_test(),
+                        "focus subscribers must run after releasing the tab topology lock",
+                    );
                     origin_notifications_for_subscriber.fetch_add(1, Ordering::SeqCst);
                 }
                 true
