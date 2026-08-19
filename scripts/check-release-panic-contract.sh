@@ -127,9 +127,6 @@ stale_shipped_profile_refs="$(
     "$REPO_ROOT/docs" \
     "$REPO_ROOT/AGENTS.md" \
     "$REPO_ROOT/README.md" \
-    "$REPO_ROOT/PLAN.md" \
-    "$REPO_ROOT/PLAN_CODEX.md" \
-    "$REPO_ROOT/frankenterm_guide.md" \
     "$REPO_ROOT/scripts/demo.tape" \
     "$REPO_ROOT/scripts/demo-full.tape"
 )"
