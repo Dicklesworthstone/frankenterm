@@ -299,3 +299,7 @@ ubs_*.txt
 # Skill-loop progress scratch
 .skill-loop-progress.md
 .skill-loop-progress-*.md
+# Accidental root ELF / session scratch (not cargo bins)
+/pat
+/output.txt
+claude-upgrade-progress.json
