@@ -15,8 +15,8 @@
 
 use codec::{
     ErrorResponse, GetCodecVersion, GetCodecVersionResponse, InputSerial, KillPane,
-    LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize,
-    SendPaste, SetActiveWorkspace, SetFocusedPane, SetPaneZoomed, SetWindowWorkspace,
+    LivenessResponse, PaneFocused, PaneRemoved, Pdu, PduWireIdent, Ping, Pong, RenameWorkspace,
+    Resize, SendPaste, SetActiveWorkspace, SetFocusedPane, SetPaneZoomed, SetWindowWorkspace,
     StreamingPduBuffer, TabAddedToWindow, TabResized, TabTitleChanged, UnitResponse,
     WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
 };
@@ -42,7 +42,7 @@ enum FuzzPdu {
         executable_path: String,
         config_file_path: Option<String>,
     },
-    ErrorResponse(String),
+    ErrorResponse,
     LivenessResponse {
         pane_id: u32,
         is_alive: bool,
@@ -164,7 +164,7 @@ impl<'a> Arbitrary<'a> for FuzzPdu {
                 executable_path: bounded_string(u)?,
                 config_file_path: Option::<String>::arbitrary(u)?.map(|s| bound_str(&s)),
             },
-            5 => Self::ErrorResponse(bounded_string(u)?),
+            5 => Self::ErrorResponse,
             6 => Self::LivenessResponse {
                 pane_id: u32::arbitrary(u)?,
                 is_alive: bool::arbitrary(u)?,
@@ -260,7 +260,7 @@ fn build_pdu(fp: &FuzzPdu) -> Pdu {
             config_file_path: config_file_path.as_ref().map(PathBuf::from),
             min_supported: *min_supported as usize,
         }),
-        FuzzPdu::ErrorResponse(_) => {
+        FuzzPdu::ErrorResponse => {
             Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT))
         }
         FuzzPdu::LivenessResponse { pane_id, is_alive } => {
