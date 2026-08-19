@@ -242,6 +242,23 @@ pub enum RpcTransportError {
 }
 
 impl RpcTransportError {
+    /// Whether the transport can prove that no request byte reached the peer.
+    ///
+    /// Reliable callers may reuse first-attempt-only metadata only for the
+    /// `DefinitelyNotSent` class. `OutcomeUnknown` deliberately carries no
+    /// such authority even when the operational request itself is retryable.
+    #[must_use]
+    pub const fn delivery_certainty(&self) -> RpcDeliveryCertainty {
+        match self {
+            Self::Retired { certainty, .. } => *certainty,
+            Self::Unavailable { .. }
+            | Self::AttemptIdentityExhausted { .. }
+            | Self::WireSerialExhausted { .. }
+            | Self::ConnectionGenerationExhausted { .. }
+            | Self::ConnectionGenerationDiverged { .. } => RpcDeliveryCertainty::DefinitelyNotSent,
+        }
+    }
+
     fn is_incarnation_terminal(&self) -> bool {
         matches!(
             self,
@@ -1184,7 +1201,7 @@ impl RpcProtocolAuthority {
         // explicitly coordinated reliable-input request/reply are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96 | 97
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=98
         )
     }
 
@@ -3954,6 +3971,11 @@ macro_rules! rpc_surface {
         rpc!(
             reliable_key_event_v1,
             ReliableKeyEventV1,
+            ReliableKeyEventV1Response
+        );
+        rpc!(
+            reliable_key_event_traced_v1,
+            ReliableKeyEventTracedV1,
             ReliableKeyEventV1Response
         );
         rpc!(mouse_event, SendMouseEvent, UnitResponse);
@@ -10275,7 +10297,7 @@ mod tests {
         expected.push(20);
         expected.extend(22..=78);
         expected.extend(81..=83);
-        expected.extend(96..=97);
+        expected.extend(96..=98);
 
         let actual = Pdu::all_wire_specs()
             .iter()

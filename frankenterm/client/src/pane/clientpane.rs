@@ -7,7 +7,7 @@ use crate::pane::renderable::{
     hydrate_lines, hydrate_render_application_lines, RenderableInner, RenderablePaneBinding,
     RenderableState,
 };
-use anyhow::bail;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use codec::*;
 use config::configuration;
@@ -78,6 +78,7 @@ enum ReliableInputCodecDisposition {
     AwaitingAuthority,
     Legacy,
     Reliable,
+    ReliableTraced,
 }
 
 fn reliable_input_codec_disposition(
@@ -88,7 +89,10 @@ fn reliable_input_codec_disposition(
         Some(version) if version < RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION => {
             ReliableInputCodecDisposition::Legacy
         }
-        Some(_) => ReliableInputCodecDisposition::Reliable,
+        Some(version) if version < RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION => {
+            ReliableInputCodecDisposition::Reliable
+        }
+        Some(_) => ReliableInputCodecDisposition::ReliableTraced,
     }
 }
 
@@ -119,6 +123,7 @@ struct QueuedReliableInput {
     registration: PaneRegistrationHandle,
     pane_authority: Arc<Mutex<Option<ReliablePaneRegistrationIdentityV1>>>,
     request: ReliableKeyEventV1,
+    trace_context: Option<SampledTraceContextV1>,
 }
 
 struct ReliableInputQueueState {
@@ -140,6 +145,11 @@ enum ReliableInputAttempt {
     PaneAuthorityRetired(&'static str),
 }
 
+enum ReliableInputWireAttempt {
+    Unsampled(ReliableKeyEventV1),
+    Traced(ReliableKeyEventTracedV1),
+}
+
 impl ReliableInputQueue {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -158,6 +168,28 @@ impl ReliableInputQueue {
         pane_authority: Arc<Mutex<Option<ReliablePaneRegistrationIdentityV1>>>,
         request: ReliableKeyEventV1,
     ) -> anyhow::Result<()> {
+        self.enqueue_with_trace_context(client, registration, pane_authority, request, None)
+    }
+
+    fn enqueue_with_trace_context(
+        self: &Arc<Self>,
+        client: &Arc<ClientInner>,
+        registration: PaneRegistrationHandle,
+        pane_authority: Arc<Mutex<Option<ReliablePaneRegistrationIdentityV1>>>,
+        request: ReliableKeyEventV1,
+        trace_context: Option<SampledTraceContextV1>,
+    ) -> anyhow::Result<()> {
+        match trace_context {
+            Some(trace_context) => ReliableKeyEventTracedV1 {
+                request: request.clone(),
+                trace_context,
+            }
+            .validate()
+            .context("validating sampled reliable key input before queue admission")?,
+            None => request
+                .validate()
+                .context("validating reliable key input before queue admission")?,
+        }
         let start_worker = {
             let mut state = self.state.lock();
             if state.domain_detached || client.is_detached() {
@@ -176,6 +208,7 @@ impl ReliableInputQueue {
                 registration,
                 pane_authority,
                 request,
+                trace_context,
             });
             if state.worker_running {
                 false
@@ -238,7 +271,7 @@ impl ReliableInputQueue {
                 yield_reliable_input_worker_once().await;
                 continue;
             }
-            let attempt = Self::attempt(&client, &entry).await;
+            let attempt = Self::attempt(&queue, &client, &entry).await;
             if client.is_detached() {
                 return;
             }
@@ -291,10 +324,12 @@ impl ReliableInputQueue {
     }
 
     async fn attempt(
+        queue: &Self,
         client: &Arc<ClientInner>,
         entry: &QueuedReliableInput,
     ) -> ReliableInputAttempt {
-        match reliable_input_codec_disposition(client.client.agreed_codec_version()) {
+        let disposition = reliable_input_codec_disposition(client.client.agreed_codec_version());
+        match disposition {
             ReliableInputCodecDisposition::AwaitingAuthority => {
                 return ReliableInputAttempt::Retry(
                     RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
@@ -308,22 +343,50 @@ impl ReliableInputQueue {
                 // prior v60 attempt whose response was lost.
                 return ReliableInputAttempt::AbortLane("codec_downgrade");
             }
-            ReliableInputCodecDisposition::Reliable => {}
+            ReliableInputCodecDisposition::Reliable
+            | ReliableInputCodecDisposition::ReliableTraced => {}
         }
 
-        let mut request = entry.request.clone();
-        request.pane_registration = *entry.pane_authority.lock();
+        let (wire_attempt, consumed_trace_context) =
+            match queue.claim_front_wire_attempt(entry, disposition) {
+                Ok(attempt) => attempt,
+                Err(()) => return ReliableInputAttempt::AbortLane("fifo_authority_changed"),
+            };
+        let request = match &wire_attempt {
+            ReliableInputWireAttempt::Unsampled(request) => request,
+            ReliableInputWireAttempt::Traced(request) => &request.request,
+        };
         let request_had_pane_authority = request.pane_registration.is_some();
-        let response = client.client.reliable_key_event_v1(request).await;
+        let response = match wire_attempt {
+            ReliableInputWireAttempt::Unsampled(request) => {
+                client.client.reliable_key_event_v1(request).await
+            }
+            ReliableInputWireAttempt::Traced(request) => {
+                client.client.reliable_key_event_traced_v1(request).await
+            }
+        };
         let response = match response {
             Ok(response) => response,
             Err(error) if error.root_cause().is::<crate::client::RpcTransportError>() => {
+                let transport = error
+                    .root_cause()
+                    .downcast_ref::<crate::client::RpcTransportError>()
+                    .expect("root-cause type was checked above");
+                if transport.delivery_certainty()
+                    == crate::client::RpcDeliveryCertainty::DefinitelyNotSent
+                    && !queue.restore_front_trace_context(entry, consumed_trace_context)
+                {
+                    return ReliableInputAttempt::AbortLane("trace_context_restore_conflict");
+                }
                 return ReliableInputAttempt::Retry(
                     RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
                     "transport_retired",
                 );
             }
             Err(error) if error.root_cause().is::<ClientOutboundAdmissionError>() => {
+                if !queue.restore_front_trace_context(entry, consumed_trace_context) {
+                    return ReliableInputAttempt::AbortLane("trace_context_restore_conflict");
+                }
                 return ReliableInputAttempt::Retry(
                     RELIABLE_INPUT_TRANSPORT_RETRY_DELAY,
                     "outbound_admission_full",
@@ -412,6 +475,64 @@ impl ReliableInputQueue {
                 }
             },
         }
+    }
+
+    fn claim_front_wire_attempt(
+        &self,
+        expected: &QueuedReliableInput,
+        disposition: ReliableInputCodecDisposition,
+    ) -> Result<(ReliableInputWireAttempt, Option<SampledTraceContextV1>), ()> {
+        let pane_registration = *expected.pane_authority.lock();
+        let mut state = self.state.lock();
+        let Some(front) = state.pending.front_mut() else {
+            return Err(());
+        };
+        if front.request != expected.request
+            || !front.registration.same_registration(&expected.registration)
+            || !Arc::ptr_eq(&front.pane_authority, &expected.pane_authority)
+        {
+            return Err(());
+        }
+        let trace_context = front.trace_context.take();
+        let mut request = front.request.clone();
+        request.pane_registration = pane_registration;
+        let attempt = if disposition == ReliableInputCodecDisposition::ReliableTraced {
+            match trace_context {
+                Some(trace_context) => {
+                    ReliableInputWireAttempt::Traced(ReliableKeyEventTracedV1 {
+                        request,
+                        trace_context,
+                    })
+                }
+                None => ReliableInputWireAttempt::Unsampled(request),
+            }
+        } else {
+            ReliableInputWireAttempt::Unsampled(request)
+        };
+        Ok((attempt, trace_context))
+    }
+
+    fn restore_front_trace_context(
+        &self,
+        expected: &QueuedReliableInput,
+        trace_context: Option<SampledTraceContextV1>,
+    ) -> bool {
+        let Some(trace_context) = trace_context else {
+            return true;
+        };
+        let mut state = self.state.lock();
+        let Some(front) = state.pending.front_mut() else {
+            return false;
+        };
+        if front.request != expected.request
+            || !front.registration.same_registration(&expected.registration)
+            || !Arc::ptr_eq(&front.pane_authority, &expected.pane_authority)
+            || front.trace_context.is_some()
+        {
+            return false;
+        }
+        front.trace_context = Some(trace_context);
+        true
     }
 
     fn complete_front(&self, expected: &QueuedReliableInput, outcome: &'static str) -> bool {
@@ -1294,6 +1415,144 @@ impl ClientPane {
             .prepare_authoritative_bootstrap(connection_identity, connection_generation))
     }
 
+    /// Enqueue one sampled key-down on the same reliable lane as ordinary
+    /// PDU96 input. The context is eligible only for the first wire attempt;
+    /// retries retain the operational request and serial but use PDU96.
+    pub fn key_down_with_trace_context(
+        &self,
+        key: KeyCode,
+        mods: KeyModifiers,
+        trace_context: SampledTraceContextV1,
+    ) -> anyhow::Result<()> {
+        self.dispatch_key_down(key, mods, Some(trace_context))
+    }
+
+    /// Sampled counterpart to [`Pane::key_up`] with the same first-attempt-only
+    /// trace-context rule as [`Self::key_down_with_trace_context`].
+    pub fn key_up_with_trace_context(
+        &self,
+        key: KeyCode,
+        mods: KeyModifiers,
+        trace_context: SampledTraceContextV1,
+    ) -> anyhow::Result<()> {
+        self.dispatch_key_up(key, mods, Some(trace_context))
+    }
+
+    fn dispatch_key_down(
+        &self,
+        key: KeyCode,
+        mods: KeyModifiers,
+        trace_context: Option<SampledTraceContextV1>,
+    ) -> anyhow::Result<()> {
+        let input_serial = InputSerial::try_now()
+            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
+        let reliable_request = ReliableKeyEventV1 {
+            pane_id: self.remote_pane_id,
+            pane_registration: None,
+            event: KeyEvent {
+                key,
+                modifiers: mods,
+            },
+            input_serial,
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        if let Some(trace_context) = trace_context {
+            ReliableKeyEventTracedV1 {
+                request: reliable_request.clone(),
+                trace_context,
+            }
+            .validate()
+            .context("validating sampled reliable key down")?;
+        }
+        if reliable_input_codec_disposition(self.client.client.agreed_codec_version())
+            == ReliableInputCodecDisposition::Legacy
+        {
+            let request = self.client.client.key_down(SendKeyDown {
+                pane_id: reliable_request.pane_id,
+                event: reliable_request.event,
+                input_serial,
+            });
+            let renderable = self.renderable.lock();
+            let mut inner = renderable.inner.borrow_mut();
+            dispatch_interactive_rpc(request, "key_down")?;
+            inner.input_serial = input_serial;
+            inner.predict_from_key_event(key, mods);
+            inner.update_last_send();
+            return Ok(());
+        }
+        let registration = self.mux_registration.load().ok_or_else(|| {
+            anyhow::anyhow!("client pane is not bound to a live mux registration")
+        })?;
+        // Keep the same pane authority across bounded admission and prediction
+        // publication. The shared reliable FIFO synchronously polls its first
+        // RPC attempt in this callback, and a response handler needs this lock
+        // before it can record the dispatch fence, so neither can overtake the
+        // new prediction.
+        let renderable = self.renderable.lock();
+        let mut inner = renderable.inner.borrow_mut();
+        self.client.reliable_input_queue.enqueue_with_trace_context(
+            &self.client,
+            registration,
+            Arc::clone(&self.reliable_input_pane_authority),
+            reliable_request,
+            trace_context,
+        )?;
+        inner.input_serial = input_serial;
+        inner.predict_from_key_event(key, mods);
+        inner.update_last_send();
+        Ok(())
+    }
+
+    fn dispatch_key_up(
+        &self,
+        key: KeyCode,
+        mods: KeyModifiers,
+        trace_context: Option<SampledTraceContextV1>,
+    ) -> anyhow::Result<()> {
+        let input_serial = InputSerial::try_now()
+            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
+        let reliable_request = ReliableKeyEventV1 {
+            pane_id: self.remote_pane_id,
+            pane_registration: None,
+            event: KeyEvent {
+                key,
+                modifiers: mods,
+            },
+            input_serial,
+            kind: ReliableKeyEventKindV1::KeyUp,
+        };
+        if let Some(trace_context) = trace_context {
+            ReliableKeyEventTracedV1 {
+                request: reliable_request.clone(),
+                trace_context,
+            }
+            .validate()
+            .context("validating sampled reliable key up")?;
+        }
+        if reliable_input_codec_disposition(self.client.client.agreed_codec_version())
+            == ReliableInputCodecDisposition::Legacy
+        {
+            return dispatch_interactive_rpc(
+                self.client.client.key_up(SendKeyUp {
+                    pane_id: reliable_request.pane_id,
+                    event: reliable_request.event,
+                }),
+                "key_up",
+            );
+        }
+        let registration = self.mux_registration.load().ok_or_else(|| {
+            anyhow::anyhow!("client pane is not bound to a live mux registration")
+        })?;
+        self.client.reliable_input_queue.enqueue_with_trace_context(
+            &self.client,
+            registration,
+            Arc::clone(&self.reliable_input_pane_authority),
+            reliable_request,
+            trace_context,
+        )?;
+        Ok(())
+    }
+
     #[allow(
         dead_code,
         reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
@@ -2013,95 +2272,11 @@ impl Pane for ClientPane {
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        let input_serial = InputSerial::try_now()
-            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
-        if reliable_input_codec_disposition(self.client.client.agreed_codec_version())
-            == ReliableInputCodecDisposition::Legacy
-        {
-            let request = self.client.client.key_down(SendKeyDown {
-                pane_id: self.remote_pane_id,
-                event: KeyEvent {
-                    key,
-                    modifiers: mods,
-                },
-                input_serial,
-            });
-            let renderable = self.renderable.lock();
-            let mut inner = renderable.inner.borrow_mut();
-            dispatch_interactive_rpc(request, "key_down")?;
-            inner.input_serial = input_serial;
-            inner.predict_from_key_event(key, mods);
-            inner.update_last_send();
-            return Ok(());
-        }
-        let registration = self.mux_registration.load().ok_or_else(|| {
-            anyhow::anyhow!("client pane is not bound to a live mux registration")
-        })?;
-        let request = ReliableKeyEventV1 {
-            pane_id: self.remote_pane_id,
-            pane_registration: None,
-            event: KeyEvent {
-                key,
-                modifiers: mods,
-            },
-            input_serial,
-            kind: ReliableKeyEventKindV1::KeyDown,
-        };
-        // Keep the same pane authority across bounded admission and prediction
-        // publication. The shared reliable FIFO synchronously polls its first
-        // RPC attempt in this callback, and a response handler needs this lock
-        // before it can record the dispatch fence, so neither can overtake the
-        // new prediction.
-        let renderable = self.renderable.lock();
-        let mut inner = renderable.inner.borrow_mut();
-        self.client.reliable_input_queue.enqueue(
-            &self.client,
-            registration,
-            Arc::clone(&self.reliable_input_pane_authority),
-            request,
-        )?;
-        inner.input_serial = input_serial;
-        inner.predict_from_key_event(key, mods);
-        inner.update_last_send();
-        Ok(())
+        self.dispatch_key_down(key, mods, None)
     }
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        if reliable_input_codec_disposition(self.client.client.agreed_codec_version())
-            == ReliableInputCodecDisposition::Legacy
-        {
-            return dispatch_interactive_rpc(
-                self.client.client.key_up(SendKeyUp {
-                    pane_id: self.remote_pane_id,
-                    event: KeyEvent {
-                        key,
-                        modifiers: mods,
-                    },
-                }),
-                "key_up",
-            );
-        }
-        let input_serial = InputSerial::try_now()
-            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
-        let registration = self.mux_registration.load().ok_or_else(|| {
-            anyhow::anyhow!("client pane is not bound to a live mux registration")
-        })?;
-        self.client.reliable_input_queue.enqueue(
-            &self.client,
-            registration,
-            Arc::clone(&self.reliable_input_pane_authority),
-            ReliableKeyEventV1 {
-                pane_id: self.remote_pane_id,
-                pane_registration: None,
-                event: KeyEvent {
-                    key,
-                    modifiers: mods,
-                },
-                input_serial,
-                kind: ReliableKeyEventKindV1::KeyUp,
-            },
-        )?;
-        Ok(())
+        self.dispatch_key_up(key, mods, None)
     }
 
     fn kill(&self) {
@@ -2323,6 +2498,25 @@ mod tests {
             MuxSessionIncarnation::from_bytes([0x9c; 16]),
         );
 
+    fn sampled_reliable_key_context() -> SampledTraceContextV1 {
+        SampledTraceContextV1 {
+            schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+            trace_id: InteractionTraceId {
+                run_id: InteractionTraceRunId {
+                    epoch_nonce_hi: 0x1112_1314_1516_1718,
+                    epoch_nonce_lo: 0x2122_2324_2526_2728,
+                },
+                sequence: 29,
+            },
+            path: InteractionTracePath::Keypress,
+            origin_recorder_epoch_id: RecorderEpochId {
+                nonce_hi: 0x3132_3334_3536_3738,
+                nonce_lo: 0x4142_4344_4546_4748,
+            },
+            sampler_algorithm: RecorderSamplerAlgorithm::SplitMix64V1,
+        }
+    }
+
     #[test]
     fn reordered_input_dispatch_ack_survives_unilateral_stale_filter() {
         let serial = InputSerial::now();
@@ -2377,6 +2571,142 @@ mod tests {
             reliable_input_codec_disposition(Some(RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION + 1)),
             ReliableInputCodecDisposition::Reliable
         );
+        assert_eq!(
+            reliable_input_codec_disposition(Some(
+                RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION
+            )),
+            ReliableInputCodecDisposition::ReliableTraced
+        );
+    }
+
+    #[test]
+    fn reliable_input_trace_context_is_first_wire_attempt_only_and_restorable_only_before_send() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane: Arc<dyn Pane> = test_client_pane(&inner, 46, 32);
+        mux.add_pane(&pane).expect("register traced input test pane");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("capture exact traced input pane registration");
+        {
+            let mut state = inner.reliable_input_queue.state.lock();
+            state.worker_running = true;
+        }
+        let pane_registration = ReliablePaneRegistrationIdentityV1::from_bytes([0x71; 16]);
+        let pane_authority = Arc::new(Mutex::new(Some(pane_registration)));
+        let request = ReliableKeyEventV1 {
+            pane_id: 32,
+            pane_registration: None,
+            event: KeyEvent {
+                key: KeyCode::Char('t'),
+                modifiers: KeyModifiers::CTRL,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(41),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        let context = sampled_reliable_key_context();
+        inner
+            .reliable_input_queue
+            .enqueue_with_trace_context(
+                &inner,
+                registration,
+                pane_authority,
+                request.clone(),
+                Some(context),
+            )
+            .expect("valid sampled reliable key must enter the existing FIFO");
+        let expected = inner
+            .reliable_input_queue
+            .state
+            .lock()
+            .pending
+            .front()
+            .expect("queued input exists")
+            .clone();
+
+        let (first, consumed) = inner
+            .reliable_input_queue
+            .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::ReliableTraced)
+            .expect("first exact attempt must claim its trace context");
+        assert_eq!(consumed, Some(context));
+        let ReliableInputWireAttempt::Traced(first) = first else {
+            panic!("v62 first attempt must use the traced wrapper");
+        };
+        assert_eq!(first.request.pane_registration, Some(pane_registration));
+        assert_eq!(first.trace_context, context);
+
+        let (retry, consumed) = inner
+            .reliable_input_queue
+            .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::ReliableTraced)
+            .expect("same operational request remains retryable");
+        assert!(consumed.is_none());
+        assert!(matches!(retry, ReliableInputWireAttempt::Unsampled(_)));
+        assert_eq!(
+            inner
+                .reliable_input_queue
+                .state
+                .lock()
+                .pending
+                .front()
+                .expect("retry remains queued")
+                .request,
+            request
+        );
+    }
+
+    #[test]
+    fn definitely_not_sent_attempt_restores_trace_context_but_v61_never_emits_pdu98() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane: Arc<dyn Pane> = test_client_pane(&inner, 47, 33);
+        mux.add_pane(&pane).expect("register trace restoration pane");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("capture trace restoration registration");
+        inner.reliable_input_queue.state.lock().worker_running = true;
+        let request = ReliableKeyEventV1 {
+            pane_id: 33,
+            pane_registration: None,
+            event: KeyEvent {
+                key: KeyCode::Char('r'),
+                modifiers: KeyModifiers::NONE,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(42),
+            kind: ReliableKeyEventKindV1::KeyUp,
+        };
+        let context = sampled_reliable_key_context();
+        inner
+            .reliable_input_queue
+            .enqueue_with_trace_context(
+                &inner,
+                registration,
+                Arc::new(Mutex::new(None)),
+                request,
+                Some(context),
+            )
+            .expect("sampled input should queue");
+        let expected = inner.reliable_input_queue.state.lock().pending[0].clone();
+
+        let (v61_attempt, consumed) = inner
+            .reliable_input_queue
+            .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::Reliable)
+            .expect("v61 attempt should retain reliable operational semantics");
+        assert!(matches!(v61_attempt, ReliableInputWireAttempt::Unsampled(_)));
+        assert_eq!(consumed, Some(context));
+        assert!(inner
+            .reliable_input_queue
+            .restore_front_trace_context(&expected, consumed));
+
+        let (v62_attempt, consumed_again) = inner
+            .reliable_input_queue
+            .claim_front_wire_attempt(&expected, ReliableInputCodecDisposition::ReliableTraced)
+            .expect("a definitely-not-sent attempt may preserve first-wire context");
+        assert!(matches!(v62_attempt, ReliableInputWireAttempt::Traced(_)));
+        assert_eq!(consumed_again, Some(context));
     }
 
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
@@ -2633,11 +2963,13 @@ mod tests {
             registration: first_registration,
             pane_authority: Arc::clone(&first_authority_cache),
             request: request(29, first_authority, 1),
+            trace_context: None,
         };
         let second = QueuedReliableInput {
             registration: second_registration,
             pane_authority: Arc::clone(&second_authority_cache),
             request: request(30, second_authority, 2),
+            trace_context: None,
         };
         {
             let mut state = inner.reliable_input_queue.state.lock();

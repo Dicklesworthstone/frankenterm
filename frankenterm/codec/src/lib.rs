@@ -18,11 +18,14 @@
 
 use anyhow::{anyhow, bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
-pub use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceContextV1;
-use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
-    RecorderContractError, RecorderSamplerAlgorithm,
+pub use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
+    RecorderEpochId, RecorderSamplerAlgorithm, SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+    SampledTraceContextV1,
 };
-use frankenterm_core_audit_types::interaction_trace_v2::InteractionTracePath;
+use frankenterm_core_audit_types::interaction_flight_recorder_v1::RecorderContractError;
+pub use frankenterm_core_audit_types::interaction_trace_v2::{
+    InteractionTraceId, InteractionTracePath, InteractionTraceRunId,
+};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, SemanticZone, StableRowIndex, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
@@ -3373,6 +3376,12 @@ macro_rules! pdu_encoded_body_limit {
             max_zstd_encoded_bytes: MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_ZSTD_ENCODED_BYTES,
         }
     };
+    (ReliableKeyEventTracedV1, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_RELIABLE_KEY_EVENT_TRACED_V1_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_RELIABLE_KEY_EVENT_TRACED_V1_ZSTD_ENCODED_BYTES,
+        }
+    };
     (SendKeyDownTracedV1, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_SEND_KEY_DOWN_TRACED_V1_DECOMPRESSED_BYTES,
@@ -4146,7 +4155,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 61;
+pub const CODEC_VERSION: usize = 62;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4450,6 +4459,9 @@ pdu! {
     ReliableKeyEventV1Response: 97, 60, server_reply, none,
         interactive_input, interactive_input, interactive
         => deserialize_reliable_key_event_v1_response;
+    ReliableKeyEventTracedV1: 98, 62, client_request, none,
+        interactive_input, interactive_input, interactive
+        => deserialize_reliable_key_event_traced_v1;
 }
 
 impl Pdu {
@@ -4469,6 +4481,7 @@ impl Pdu {
             Self::SendKeyDownTracedV1(value) => value.validate()?,
             Self::ReliableKeyEventV1(value) => value.validate()?,
             Self::ReliableKeyEventV1Response(value) => value.validate()?,
+            Self::ReliableKeyEventTracedV1(value) => value.validate()?,
             _ => {}
         }
         Ok(())
@@ -4730,6 +4743,7 @@ impl Pdu {
                 | Self::SendKeyDown(_)
                 | Self::SendKeyDownTracedV1(_)
                 | Self::ReliableKeyEventV1(_)
+                | Self::ReliableKeyEventTracedV1(_)
                 | Self::SendKeyUp(_)
                 | Self::SendMouseEvent(_)
                 | Self::SendPaste(_)
@@ -5550,6 +5564,20 @@ fn deserialize_reliable_key_event_v1_response(
     )?;
     response.validate()?;
     Ok(response)
+}
+
+fn deserialize_reliable_key_event_traced_v1(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<ReliableKeyEventTracedV1, Error> {
+    let request: ReliableKeyEventTracedV1 = deserialize_exact_payload_with_limit(
+        data,
+        is_compressed,
+        "ReliableKeyEventTracedV1",
+        MAX_RELIABLE_KEY_EVENT_TRACED_V1_DECOMPRESSED_BYTES,
+    )?;
+    request.validate()?;
+    Ok(request)
 }
 
 fn deserialize_list_panes_coherent(
@@ -11794,6 +11822,8 @@ pub const SAMPLED_INPUT_TRACE_V1_MIN_CODEC_VERSION: usize = 59;
 pub enum SampledInputTraceContextError {
     #[error(transparent)]
     Contract(#[from] RecorderContractError),
+    #[error(transparent)]
+    ReliableKeyEvent(#[from] ReliableKeyEventProtocolError),
     #[error("sampled key input requires the keypress trace path")]
     WrongPath,
 }
@@ -11836,6 +11866,18 @@ pub struct ReliableKeyEventV1 {
     pub event: termwiz::input::KeyEvent,
     pub input_serial: InputSerial,
     pub kind: ReliableKeyEventKindV1,
+}
+
+/// Additive sampled envelope for the current reliable key-input lane.
+///
+/// The inner [`ReliableKeyEventV1`] is the complete operational request and
+/// retains its v60 positional schema unchanged. A sampled first wire attempt
+/// uses this distinct PDU identity; every typed or ambiguous retry returns to
+/// PDU96 so one originating trace cannot publish K4/K5 twice.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ReliableKeyEventTracedV1 {
+    pub request: ReliableKeyEventV1,
+    pub trace_context: SampledTraceContextV1,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy)]
@@ -11924,8 +11966,12 @@ impl ReliablePaneRegistrationIdentityV1 {
 }
 
 pub const RELIABLE_KEY_EVENT_V1_MIN_CODEC_VERSION: usize = 60;
+/// First dialect that can carry sampled context on the reliable key lane.
+pub const RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION: usize = 62;
 pub const MAX_RELIABLE_KEY_EVENT_V1_DECOMPRESSED_BYTES: usize = 64 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_V1_ZSTD_ENCODED_BYTES: usize = 128 * 1024;
+pub const MAX_RELIABLE_KEY_EVENT_TRACED_V1_DECOMPRESSED_BYTES: usize = 64 * 1024;
+pub const MAX_RELIABLE_KEY_EVENT_TRACED_V1_ZSTD_ENCODED_BYTES: usize = 128 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_DECOMPRESSED_BYTES: usize = 4 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_V1_RESPONSE_ZSTD_ENCODED_BYTES: usize = 8 * 1024;
 pub const MAX_RELIABLE_KEY_EVENT_RETRY_AFTER_NS: u64 = 1_000_000_000;
@@ -11958,6 +12004,25 @@ impl ReliableKeyEventV1 {
             return Err(ReliableKeyEventProtocolError::ReservedPaneRegistration);
         }
         Ok(())
+    }
+}
+
+impl ReliableKeyEventTracedV1 {
+    pub fn validate(&self) -> Result<(), SampledInputTraceContextError> {
+        self.request.validate()?;
+        self.trace_context.validate()?;
+        if self.trace_context.path != InteractionTracePath::Keypress {
+            return Err(SampledInputTraceContextError::WrongPath);
+        }
+        match self.trace_context.sampler_algorithm {
+            RecorderSamplerAlgorithm::SplitMix64V1 => {}
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ReliableKeyEventV1, SampledTraceContextV1) {
+        (self.request, self.trace_context)
     }
 }
 
@@ -19949,8 +20014,8 @@ mod test {
     }
 
     #[test]
-    fn codec_v61_rejection_schema_requires_atomic_redeploy_after_additive_v60() {
-        assert_eq!(CODEC_VERSION, 61);
+    fn codec_v62_additive_trace_wrapper_preserves_the_v61_compatibility_floor() {
+        assert_eq!(CODEC_VERSION, 62);
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
@@ -19981,6 +20046,11 @@ mod test {
             check_compat(61, 61, 61, 61),
             Ok(CompatDecision::Compatible { agreed: 61 })
         );
+        assert_eq!(
+            check_compat(62, 61, 61, 61),
+            Ok(CompatDecision::Compatible { agreed: 61 }),
+            "a v61 peer must retain PDU96 without seeing the additive PDU98 wrapper"
+        );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
         assert_eq!(
@@ -19994,6 +20064,10 @@ mod test {
         assert_eq!(
             <SendKeyDownTracedV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
             SAMPLED_INPUT_TRACE_V1_MIN_CODEC_VERSION
+        );
+        assert_eq!(
+            <ReliableKeyEventTracedV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION
         );
         assert_eq!(
             <ListPanesOrderedV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
@@ -21044,8 +21118,164 @@ mod test {
     }
 
     #[test]
+    fn reliable_key_event_traced_wrapper_roundtrips_under_additive_v62() {
+        let request = ReliableKeyEventV1 {
+            pane_id: 7,
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x5a; 16])),
+            event: termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Char('x'),
+                modifiers: termwiz::input::Modifiers::CTRL,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(11),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        let pdu = Pdu::ReliableKeyEventTracedV1(ReliableKeyEventTracedV1 {
+            request,
+            trace_context: sampled_key_trace_context(),
+        });
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let mut encoded = Vec::new();
+            pdu.encode_with_mode(&mut encoded, 31, mode)
+                .expect("valid traced reliable request should encode");
+            let decoded = Pdu::decode(encoded.as_slice())
+                .expect("traced reliable request should decode exactly");
+            assert_eq!(decoded.serial, 31);
+            assert_eq!(decoded.pdu, pdu);
+        }
+        assert_eq!(<ReliableKeyEventTracedV1 as PduWireIdent>::IDENT, 98);
+        assert_eq!(
+            <ReliableKeyEventTracedV1 as PduWireIdent>::WIRE_SPEC.min_codec_version,
+            RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION
+        );
+        assert_eq!(
+            <ReliableKeyEventTracedV1 as PduWireIdent>::WIRE_SPEC.encoded_body_limit,
+            PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+                max_decompressed_bytes: MAX_RELIABLE_KEY_EVENT_TRACED_V1_DECOMPRESSED_BYTES,
+                max_zstd_encoded_bytes: MAX_RELIABLE_KEY_EVENT_TRACED_V1_ZSTD_ENCODED_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn unsampled_reliable_key_event_bytes_match_the_frozen_v60_schema() {
+        #[derive(Serialize)]
+        struct FrozenReliableKeyEventV1<'a> {
+            pane_id: PaneId,
+            pane_registration: Option<ReliablePaneRegistrationIdentityV1>,
+            event: &'a termwiz::input::KeyEvent,
+            input_serial: InputSerial,
+            kind: ReliableKeyEventKindV1,
+        }
+
+        let request = ReliableKeyEventV1 {
+            pane_id: 0x0102_0304,
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x5a; 16])),
+            event: termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Char('x'),
+                modifiers: termwiz::input::Modifiers::CTRL,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(0x1112_1314),
+            kind: ReliableKeyEventKindV1::KeyUp,
+        };
+        let frozen = FrozenReliableKeyEventV1 {
+            pane_id: request.pane_id,
+            pane_registration: request.pane_registration,
+            event: &request.event,
+            input_serial: request.input_serial,
+            kind: request.kind,
+        };
+        let (payload, compressed) = serialize_with_mode(&frozen, CompressionMode::Never)
+            .expect("frozen v60 reliable-key schema should serialize");
+        assert!(!compressed);
+        let mut expected = Vec::new();
+        encode_raw(
+            <ReliableKeyEventV1 as PduWireIdent>::IDENT,
+            31,
+            &payload,
+            false,
+            &mut expected,
+        )
+        .expect("frozen v60 reliable-key schema should frame");
+
+        let actual = Pdu::ReliableKeyEventV1(request)
+            .encode_frame_with_mode(31, CompressionMode::Never)
+            .expect("current unsampled reliable-key request should frame");
+        assert_eq!(
+            actual, expected,
+            "PDU96 must remain byte-identical to its frozen v60 positional schema"
+        );
+    }
+
+    #[test]
+    fn reliable_key_event_traced_wrapper_rejects_invalid_context_and_inner_request_before_framing() {
+        let request = ReliableKeyEventV1 {
+            pane_id: 7,
+            pane_registration: None,
+            event: termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Char('x'),
+                modifiers: termwiz::input::Modifiers::NONE,
+            },
+            input_serial: InputSerial::from_millis_since_epoch(11),
+            kind: ReliableKeyEventKindV1::KeyDown,
+        };
+        let mut wrong_path = sampled_key_trace_context();
+        wrong_path.path = InteractionTracePath::ResizeZoom;
+        for malformed in [
+            ReliableKeyEventTracedV1 {
+                request: request.clone(),
+                trace_context: wrong_path,
+            },
+            ReliableKeyEventTracedV1 {
+                request: ReliableKeyEventV1 {
+                    input_serial: InputSerial::empty(),
+                    ..request
+                },
+                trace_context: sampled_key_trace_context(),
+            },
+        ] {
+            let mut encoded = Vec::new();
+            Pdu::ReliableKeyEventTracedV1(malformed)
+                .encode(&mut encoded, 31)
+                .expect_err("invalid traced reliable input must fail before framing");
+            assert!(encoded.is_empty());
+        }
+    }
+
+    #[test]
+    fn reliable_key_event_traced_wrapper_rejects_oversized_body_at_header_admission() {
+        for (compressed, body_len) in [
+            (
+                false,
+                MAX_RELIABLE_KEY_EVENT_TRACED_V1_DECOMPRESSED_BYTES + 1,
+            ),
+            (
+                true,
+                MAX_RELIABLE_KEY_EVENT_TRACED_V1_ZSTD_ENCODED_BYTES + 1,
+            ),
+        ] {
+            let mut frame = Vec::new();
+            encode_raw(
+                <ReliableKeyEventTracedV1 as PduWireIdent>::IDENT,
+                31,
+                &vec![0_u8; body_len],
+                compressed,
+                &mut frame,
+            )
+            .expect("oversized traced reliable-input fixture should frame");
+            let error = Pdu::decode(frame.as_slice())
+                .expect_err("oversized traced reliable-input body must fail at admission");
+            assert!(
+                error
+                    .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                    .is_some(),
+                "unexpected oversized-body error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn reliable_key_event_is_classified_as_user_input() {
-        assert!(Pdu::ReliableKeyEventV1(ReliableKeyEventV1 {
+        let request = ReliableKeyEventV1 {
             pane_id: 7,
             pane_registration: None,
             event: termwiz::input::KeyEvent {
@@ -21054,8 +21284,15 @@ mod test {
             },
             input_serial: InputSerial::from_millis_since_epoch(1),
             kind: ReliableKeyEventKindV1::KeyDown,
-        })
-        .is_user_input());
+        };
+        assert!(Pdu::ReliableKeyEventV1(request.clone()).is_user_input());
+        assert!(
+            Pdu::ReliableKeyEventTracedV1(ReliableKeyEventTracedV1 {
+                request,
+                trace_context: sampled_key_trace_context(),
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -21333,7 +21570,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 61);
+        assert_eq!(CODEC_VERSION, 62);
     }
 
     #[test]
@@ -21622,7 +21859,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=97 {
+        for ident in 0..=98 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -21636,9 +21873,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(98).is_none());
+        assert!(Pdu::wire_spec_for_ident(99).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 98 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 99 - GAPS.len());
     }
 
     #[test]
@@ -21675,6 +21912,7 @@ mod test {
                 93..=94 => 57,
                 95 => 59,
                 96..=97 => 60,
+                98 => 62,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -21709,7 +21947,7 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93, 95, 96,
+            77, 80, 81, 85, 86, 88, 91, 93, 95, 96, 98,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
@@ -22807,12 +23045,12 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_requires_atomic_v61_error_schema() {
+    fn check_compat_current_build_keeps_v61_floor_after_additive_v62() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
-        assert_eq!(CODEC_VERSION, 61);
-        assert!(check_compat(61, 61, 60, 58).is_err());
+        assert_eq!(CODEC_VERSION, 62);
+        assert!(check_compat(62, 61, 60, 58).is_err());
         assert_eq!(
-            check_compat(61, 61, 61, 61),
+            check_compat(62, 61, 61, 61),
             Ok(CompatDecision::Compatible { agreed: 61 })
         );
     }
