@@ -99,6 +99,7 @@ fn arb_lifecycle_phase() -> impl Strategy<Value = RecorderLifecyclePhase> {
         Just(RecorderLifecyclePhase::PaneClosed),
         Just(RecorderLifecyclePhase::ReplayStarted),
         Just(RecorderLifecyclePhase::ReplayFinished),
+        Just(RecorderLifecyclePhase::MigrationReadyForActivation),
     ]
 }
 

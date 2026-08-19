@@ -942,6 +942,9 @@ pub enum RecorderLifecyclePhase {
     PaneClosed,
     ReplayStarted,
     ReplayFinished,
+    /// Imported recorder data passed readiness verification; activating the
+    /// process-wide backend selector remains a separate external operation.
+    MigrationReadyForActivation,
 }
 
 /// Causal linkage between recorder events.
@@ -2859,6 +2862,7 @@ mod tests {
             RecorderLifecyclePhase::PaneClosed,
             RecorderLifecyclePhase::ReplayStarted,
             RecorderLifecyclePhase::ReplayFinished,
+            RecorderLifecyclePhase::MigrationReadyForActivation,
         ] {
             let json = serde_json::to_string(&phase).unwrap();
             let back: RecorderLifecyclePhase = serde_json::from_str(&json).unwrap();
@@ -3412,6 +3416,7 @@ mod tests {
             RecorderLifecyclePhase::PaneClosed,
             RecorderLifecyclePhase::ReplayStarted,
             RecorderLifecyclePhase::ReplayFinished,
+            RecorderLifecyclePhase::MigrationReadyForActivation,
         ];
         for v in variants {
             let json_val = serde_json::to_value(v).unwrap();

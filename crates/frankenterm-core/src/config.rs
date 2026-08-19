@@ -1649,7 +1649,7 @@ pub struct CaptureBudgetConfig {
 
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     /// Database file path (relative to workspace .ft dir if not absolute)
     pub db_path: String,
@@ -8981,6 +8981,27 @@ recorder_backend = "franken_sqlite"
         assert!(
             legacy.contains("frankensqlite"),
             "unexpected error: {legacy}"
+        );
+    }
+
+    #[test]
+    fn storage_recorder_backend_selector_typo_fails_closed_instead_of_using_default() {
+        let error = Config::from_toml_unvalidated(
+            r#"
+[storage]
+recorder_backed = "rusqlite"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown field"), "unexpected error: {error}");
+        assert!(
+            error.contains("recorder_backed"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("recorder_backend"),
+            "unexpected error: {error}"
         );
     }
 

@@ -2172,6 +2172,26 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // destructive-cleanup authority forward-only.
         down_sql: None,
     },
+    Migration {
+        version: 45,
+        description: "Enqueue selected-recorder delivery with output segment commits",
+        up_sql: "
+        CREATE TABLE IF NOT EXISTS recorder_delivery_ledger (
+            segment_id INTEGER PRIMARY KEY
+                REFERENCES output_segments(id) ON DELETE RESTRICT,
+            event_id TEXT NOT NULL UNIQUE,
+            target_backend TEXT NOT NULL
+                CHECK(target_backend IN ('append_log', 'rusqlite')),
+            event_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_recorder_delivery_ledger_created
+            ON recorder_delivery_ledger(created_at, segment_id);
+        ",
+        // Rolling back this table would discard pending recorder deliveries.
+        // Keep the crash-consistency boundary forward-only.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -7559,6 +7579,53 @@ mod tests {
             SCHEMA_VERSION,
             "MIGRATIONS array length must equal SCHEMA_VERSION; \
              versions are 1-indexed contiguous",
+        );
+    }
+
+    #[test]
+    fn recorder_delivery_ledger_migration_is_forward_only_and_restricts_parent_deletion() {
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 45)
+            .expect("version 45 recorder delivery migration must be registered");
+        assert!(migration.description.contains("recorder"));
+        assert!(migration.up_sql.contains("recorder_delivery_ledger"));
+        assert!(migration.up_sql.contains("ON DELETE RESTRICT"));
+        assert!(
+            migration.down_sql.is_none(),
+            "rollback must not discard pending recorder deliveries"
+        );
+
+        let conn = Connection::open_in_memory().expect("open migration database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE output_segments (id INTEGER PRIMARY KEY);
+             INSERT INTO output_segments (id) VALUES (7);",
+        )
+        .expect("seed output segment parent");
+        conn.execute_batch(migration.up_sql)
+            .expect("apply recorder delivery migration");
+        conn.execute(
+            "INSERT INTO recorder_delivery_ledger (
+                 segment_id, event_id, target_backend, event_json, created_at
+             ) VALUES (7, 'event-7', 'append_log', '{}', 1)",
+            [],
+        )
+        .expect("seed pending delivery");
+        assert!(
+            conn.execute("DELETE FROM output_segments WHERE id = 7", [])
+                .is_err(),
+            "retention must not delete a segment with a pending recorder obligation"
+        );
+        conn.execute(
+            "DELETE FROM recorder_delivery_ledger WHERE segment_id = 7",
+            [],
+        )
+        .expect("ack delivery");
+        assert_eq!(
+            conn.execute("DELETE FROM output_segments WHERE id = 7", [])
+                .expect("delete parent after delivery ack"),
+            1
         );
     }
 

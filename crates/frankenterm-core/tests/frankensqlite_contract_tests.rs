@@ -1,16 +1,17 @@
 //! E4.F1.T1: Contract-level unit and integration suites for recorder and projection seams.
 //!
-//! Tests RecorderStorage trait contracts against AppendLog backend and mock backends.
-//! When FrankenSqlite is implemented, each test should be parameterized to run against both.
+//! Tests RecorderStorage trait contracts against the implemented AppendLog and Rusqlite backends.
+//! FrankenSQLite remains a reserved selector and appears only in fail-closed selection tests.
 
 use frankenterm_core::recorder_migration::{
-    CheckpointSyncResult, CutoverResult, MigrationConfig, MigrationEngine, MigrationManifest,
-    MigrationStage,
+    CheckpointSyncResult, CutoverReadinessResult, MigrationConfig, MigrationEngine,
+    MigrationManifest, MigrationStage,
 };
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointCommitOutcome,
     CheckpointConsumerId, DurabilityLevel, FlushMode, RecorderBackendKind, RecorderCheckpoint,
-    RecorderOffset, RecorderStorage, RecorderStorageError, RecorderStorageErrorClass,
+    RecorderEventReader, RecorderOffset, RecorderStorage, RecorderStorageError,
+    RecorderStorageErrorClass, RusqliteRecorderStorage, RusqliteStorageConfig,
 };
 use frankenterm_core::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
@@ -42,6 +43,16 @@ fn test_config(path: &std::path::Path) -> AppendLogStorageConfig {
     AppendLogStorageConfig {
         data_path: path.join("events.log"),
         state_path: path.join("state.json"),
+        queue_capacity: 4,
+        max_batch_events: 16,
+        max_batch_bytes: 128 * 1024,
+        max_idempotency_entries: 8,
+    }
+}
+
+fn rusqlite_test_config(path: &std::path::Path) -> RusqliteStorageConfig {
+    RusqliteStorageConfig {
+        db_path: path.join("events.sqlite3"),
         queue_capacity: 4,
         max_batch_events: 16,
         max_batch_bytes: 128 * 1024,
@@ -93,26 +104,23 @@ fn test_append_idempotency_append_log() {
     run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let event = sample_event("e1", 1, 0, "one");
 
         let first = storage
-            .append_batch(append_req(
-                "same-batch",
-                vec![sample_event("e1", 1, 0, "one")],
-            ))
+            .append_batch(append_req("same-batch", vec![event.clone()]))
             .await
             .unwrap();
         assert_eq!(first.accepted_count, 1);
+        assert!(!first.was_idempotent_replay);
 
         let second = storage
-            .append_batch(append_req(
-                "same-batch",
-                vec![sample_event("e2", 1, 1, "two")],
-            ))
+            .append_batch(append_req("same-batch", vec![event]))
             .await
             .unwrap();
         // Idempotent: same batch_id → same result, no duplicate
         assert_eq!(second.accepted_count, 1);
         assert_eq!(second.first_offset, first.first_offset);
+        assert!(second.was_idempotent_replay);
     });
 }
 
@@ -269,6 +277,164 @@ fn test_lag_metrics_append_log() {
         assert!(!lag.consumers.is_empty());
         let consumer_lag = &lag.consumers[0];
         assert!(consumer_lag.offsets_behind > 0);
+    });
+}
+
+#[test]
+fn test_rusqlite_recorder_storage_contract_parity_and_reopen() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let config = rusqlite_test_config(dir.path());
+        let storage = RusqliteRecorderStorage::open(config.clone()).unwrap();
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::Rusqlite);
+
+        let first_event = sample_event("sqlite-e1", 1, 0, "one");
+        let first = storage
+            .append_batch(append_req("sqlite-same", vec![first_event.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(first.first_offset.ordinal, 0);
+        assert_eq!(first.last_offset.ordinal, 0);
+        assert!(!first.was_idempotent_replay);
+
+        let replay = storage
+            .append_batch(AppendRequest {
+                batch_id: "sqlite-same".to_string(),
+                events: vec![first_event.clone()],
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(replay.first_offset, first.first_offset);
+        assert_eq!(replay.last_offset, first.last_offset);
+        assert_eq!(replay.committed_durability, DurabilityLevel::Fsync);
+        assert!(replay.was_idempotent_replay);
+
+        let conflict = storage
+            .append_batch(append_req(
+                "sqlite-same",
+                vec![sample_event("sqlite-conflict", 1, 9, "different")],
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            RecorderStorageError::IdempotencyConflict { ref batch_id }
+                if batch_id == "sqlite-same"
+        ));
+
+        let second = storage
+            .append_batch(append_req(
+                "sqlite-second",
+                vec![sample_event("sqlite-e2", 1, 1, "two")],
+            ))
+            .await
+            .unwrap();
+        assert!(second.first_offset.ordinal > first.last_offset.ordinal);
+
+        let consumer = CheckpointConsumerId("sqlite-contract".to_string());
+        let behind = RecorderCheckpoint {
+            consumer: consumer.clone(),
+            upto_offset: first.last_offset.clone(),
+            schema_version: "ft.recorder.event.v1".to_string(),
+            committed_at_ms: 10,
+        };
+        assert_eq!(
+            storage.commit_checkpoint(behind.clone()).await.unwrap(),
+            CheckpointCommitOutcome::Advanced
+        );
+        assert_eq!(
+            storage.read_checkpoint(&consumer).await.unwrap().unwrap(),
+            behind
+        );
+        let lag = storage.lag_metrics().await.unwrap();
+        assert_eq!(
+            lag.latest_offset.as_ref().map(|offset| offset.ordinal),
+            Some(1)
+        );
+        assert_eq!(lag.consumers.len(), 1);
+        assert_eq!(lag.consumers[0].offsets_behind, 1);
+
+        let advanced = RecorderCheckpoint {
+            upto_offset: second.last_offset.clone(),
+            committed_at_ms: 11,
+            ..behind.clone()
+        };
+        assert_eq!(
+            storage.commit_checkpoint(advanced.clone()).await.unwrap(),
+            CheckpointCommitOutcome::Advanced
+        );
+        assert_eq!(
+            storage.commit_checkpoint(advanced.clone()).await.unwrap(),
+            CheckpointCommitOutcome::NoopAlreadyAdvanced
+        );
+        let regression = storage.commit_checkpoint(behind).await.unwrap_err();
+        assert!(matches!(
+            regression,
+            RecorderStorageError::CheckpointRegression { .. }
+        ));
+
+        for mode in [FlushMode::Buffered, FlushMode::Durable] {
+            let stats = storage.flush(mode).await.unwrap();
+            assert_eq!(stats.backend, RecorderBackendKind::Rusqlite);
+            assert_eq!(
+                stats.latest_offset.as_ref().map(|offset| offset.ordinal),
+                Some(1)
+            );
+        }
+        assert!(matches!(
+            storage
+                .append_batch(append_req("sqlite-empty", Vec::new()))
+                .await,
+            Err(RecorderStorageError::InvalidRequest { .. })
+        ));
+
+        drop(storage);
+        let reopened = RusqliteRecorderStorage::open(config).unwrap();
+        assert_eq!(
+            reopened
+                .health()
+                .await
+                .latest_offset
+                .map(|offset| offset.ordinal),
+            Some(1)
+        );
+        assert_eq!(
+            reopened.read_checkpoint(&consumer).await.unwrap().unwrap(),
+            advanced
+        );
+        let reopened_replay = reopened
+            .append_batch(AppendRequest {
+                batch_id: "sqlite-same".to_string(),
+                events: vec![first_event],
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 3,
+            })
+            .await
+            .unwrap();
+        assert!(reopened_replay.was_idempotent_replay);
+        assert_eq!(reopened_replay.accepted_count, first.accepted_count);
+        assert_eq!(reopened_replay.first_offset, first.first_offset);
+        assert_eq!(reopened_replay.last_offset, first.last_offset);
+        let reopened_conflict = reopened
+            .append_batch(append_req(
+                "sqlite-same",
+                vec![sample_event("sqlite-reopen-conflict", 1, 9, "different")],
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            reopened_conflict,
+            RecorderStorageError::IdempotencyConflict { ref batch_id }
+                if batch_id == "sqlite-same"
+        ));
+        assert!(!reopened.health().await.degraded);
+        let mut cursor = reopened.event_reader().open_cursor_from_start().unwrap();
+        let records = cursor.next_batch(8).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event.event_id, "sqlite-e1");
+        assert_eq!(records[1].event.event_id, "sqlite-e2");
     });
 }
 
@@ -648,23 +814,19 @@ fn test_stage_m0_through_m5_progression() {
         MigrationStage::M2Import,
         MigrationStage::M3CheckpointSync,
         MigrationStage::M4Reserved,
-        MigrationStage::M5Cutover,
+        MigrationStage::M5Readiness,
     ];
 
-    // Only M5 is complete
-    for (i, stage) in stages.iter().enumerate() {
-        if i == 5 {
-            assert!(stage.is_complete());
-        } else {
-            assert!(!stage.is_complete());
-        }
+    // M5 proves readiness only; no stage can claim selector activation.
+    for stage in stages {
+        assert!(!stage.is_complete());
     }
 
-    // M0-M3 can rollback, M4-M5 cannot
+    // Readiness is rollback-safe because the selector remains untouched.
     assert!(MigrationStage::M0Preflight.can_rollback());
     assert!(MigrationStage::M3CheckpointSync.can_rollback());
     assert!(!MigrationStage::M4Reserved.can_rollback());
-    assert!(!MigrationStage::M5Cutover.can_rollback());
+    assert!(MigrationStage::M5Readiness.can_rollback());
 }
 
 // ---------------------------------------------------------------------------
@@ -732,15 +894,19 @@ fn test_migration_manifest_serde_roundtrip() {
 }
 
 #[test]
-fn test_cutover_result_serde_roundtrip() {
-    let result = CutoverResult {
-        activated_backend: RecorderBackendKind::FrankenSqlite,
+fn test_cutover_readiness_result_serde_roundtrip() {
+    let result = CutoverReadinessResult {
+        target_backend: RecorderBackendKind::FrankenSqlite,
         migration_epoch_ms: 1708000000,
-        target_healthy: true,
-        source_retained_path: Some("/data/events.log".to_string()),
+        marker_offset: RecorderOffset {
+            segment_id: 4,
+            byte_offset: 512,
+            ordinal: 100,
+        },
+        source_path_hint: Some("/data/events.log".to_string()),
     };
     let json = serde_json::to_string(&result).unwrap();
-    let back: CutoverResult = serde_json::from_str(&json).unwrap();
+    let back: CutoverReadinessResult = serde_json::from_str(&json).unwrap();
     assert_eq!(result, back);
 }
 
@@ -809,8 +975,5 @@ fn test_frankensqlite_bootstrap_returns_unavailable() {
         RecorderStorageError::BackendSelection(selection)
             if selection.requested() == RecorderBackendKind::FrankenSqlite
     ));
-    assert_eq!(
-        err.class(),
-        RecorderStorageErrorClass::DependencyUnavailable
-    );
+    assert_eq!(err.class(), RecorderStorageErrorClass::TerminalConfig);
 }

@@ -16,7 +16,7 @@ fn arb_stage() -> impl Strategy<Value = MigrationStage> {
         Just(MigrationStage::M2Import),
         Just(MigrationStage::M3CheckpointSync),
         Just(MigrationStage::M4Reserved),
-        Just(MigrationStage::M5Cutover),
+        Just(MigrationStage::M5Readiness),
     ]
 }
 
@@ -93,7 +93,7 @@ fn arb_checkpoint_sync_result() -> impl Strategy<Value = CheckpointSyncResult> {
         })
 }
 
-fn arb_cutover_result() -> impl Strategy<Value = CutoverResult> {
+fn arb_cutover_readiness_result() -> impl Strategy<Value = CutoverReadinessResult> {
     (
         prop_oneof![
             Just(RecorderBackendKind::AppendLog),
@@ -101,15 +101,17 @@ fn arb_cutover_result() -> impl Strategy<Value = CutoverResult> {
             Just(RecorderBackendKind::FrankenSqlite),
         ],
         any::<u64>(),
-        any::<bool>(),
+        arb_offset(),
         proptest::option::of("[a-z/]{5,20}"),
     )
-        .prop_map(|(backend, epoch, healthy, path)| CutoverResult {
-            activated_backend: backend,
-            migration_epoch_ms: epoch,
-            target_healthy: healthy,
-            source_retained_path: path,
-        })
+        .prop_map(
+            |(backend, epoch, marker_offset, path)| CutoverReadinessResult {
+                target_backend: backend,
+                migration_epoch_ms: epoch,
+                marker_offset,
+                source_path_hint: path,
+            },
+        )
 }
 
 /// Ordinal sequences for FNV-1a testing.
@@ -124,14 +126,13 @@ fn arb_ordinal_seq(max_len: usize) -> impl Strategy<Value = Vec<u64>> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    // 1. Only M5Cutover is complete
+    // 1. No stage claims complete selector activation
     #[test]
-    fn only_m5_is_complete(stage in arb_stage()) {
-        let expected = matches!(stage, MigrationStage::M5Cutover);
-        prop_assert_eq!(stage.is_complete(), expected);
+    fn no_stage_is_complete(stage in arb_stage()) {
+        prop_assert!(!stage.is_complete());
     }
 
-    // 2. can_rollback is false for M4 and M5 only
+    // 2. Readiness remains rollback-safe because no selector was switched
     #[test]
     fn rollback_excludes_m4_m5(stage in arb_stage()) {
         let expected = matches!(
@@ -140,6 +141,7 @@ proptest! {
                 | MigrationStage::M1Export
                 | MigrationStage::M2Import
                 | MigrationStage::M3CheckpointSync
+                | MigrationStage::M5Readiness
         );
         prop_assert_eq!(stage.can_rollback(), expected);
     }
@@ -284,11 +286,11 @@ proptest! {
         prop_assert_eq!(result, restored);
     }
 
-    // 15. CutoverResult serde roundtrip
+    // 15. CutoverReadinessResult serde roundtrip
     #[test]
-    fn cutover_result_serde_roundtrip(result in arb_cutover_result()) {
+    fn cutover_readiness_result_serde_roundtrip(result in arb_cutover_readiness_result()) {
         let json = serde_json::to_string(&result).unwrap();
-        let restored: CutoverResult = serde_json::from_str(&json).unwrap();
+        let restored: CutoverReadinessResult = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(result, restored);
     }
 }
@@ -335,7 +337,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    // 19. Checkpoint stage accessibility: checkpoint with M5 stage is non-rollbackable
+    // 19. M5 checkpoint records readiness, not completion, and is rollbackable
     #[test]
     fn checkpoint_m5_not_rollbackable(
         manifest in arb_manifest(),
@@ -343,13 +345,13 @@ proptest! {
         active in any::<bool>()
     ) {
         let cp = MigrationCheckpoint {
-            stage: MigrationStage::M5Cutover,
+            stage: MigrationStage::M5Readiness,
             manifest,
             last_processed_ordinal: ordinal,
             migration_active: active,
         };
-        prop_assert!(!cp.stage.can_rollback());
-        prop_assert!(cp.stage.is_complete());
+        prop_assert!(cp.stage.can_rollback());
+        prop_assert!(!cp.stage.is_complete());
     }
 
     // 20. Checkpoint stage: non-M5 stages are incomplete
@@ -423,23 +425,23 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Properties: CutoverResult
+// Properties: CutoverReadinessResult
 // ---------------------------------------------------------------------------
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    // 24. CutoverResult clone eq
+    // 24. CutoverReadinessResult clone eq
     #[test]
-    fn cutover_result_clone_eq(result in arb_cutover_result()) {
+    fn cutover_readiness_result_clone_eq(result in arb_cutover_readiness_result()) {
         prop_assert_eq!(result.clone(), result);
     }
 
-    // 25. CutoverResult backend is always one of the declared stable variants
+    // 25. Target backend is always one of the declared stable variants
     #[test]
-    fn cutover_result_backend_variant(result in arb_cutover_result()) {
+    fn cutover_readiness_result_backend_variant(result in arb_cutover_readiness_result()) {
         let is_valid = matches!(
-            result.activated_backend,
+            result.target_backend,
             RecorderBackendKind::AppendLog
                 | RecorderBackendKind::Rusqlite
                 | RecorderBackendKind::FrankenSqlite
@@ -447,12 +449,12 @@ proptest! {
         prop_assert!(is_valid);
     }
 
-    // 26. CutoverResult serde preserves source_retained_path
+    // 26. CutoverReadinessResult serde preserves source_path_hint
     #[test]
-    fn cutover_result_path_preservation(result in arb_cutover_result()) {
+    fn cutover_readiness_result_path_preservation(result in arb_cutover_readiness_result()) {
         let json = serde_json::to_string(&result).unwrap();
-        let restored: CutoverResult = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(result.source_retained_path, restored.source_retained_path);
+        let restored: CutoverReadinessResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(result.source_path_hint, restored.source_path_hint);
     }
 }
 
@@ -502,7 +504,7 @@ const ALL_STAGES: [MigrationStage; 6] = [
     MigrationStage::M2Import,
     MigrationStage::M3CheckpointSync,
     MigrationStage::M4Reserved,
-    MigrationStage::M5Cutover,
+    MigrationStage::M5Readiness,
 ];
 
 fn stage_index(s: MigrationStage) -> usize {

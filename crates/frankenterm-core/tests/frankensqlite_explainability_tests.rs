@@ -333,13 +333,14 @@ fn build_healthy_log_database() -> LogDatabase {
             ("digest", "12345678"),
         ],
     );
-    // M5 Cutover
+    // M5 readiness (selector activation is external)
     db.add(
         LogLevel::Info,
         "M5",
         vec![
-            ("migration_stage", "M5Cutover"),
-            ("backend", "franken_sqlite"),
+            ("migration_stage", "M5Readiness"),
+            ("backend", "rusqlite"),
+            ("selector_activated", "false"),
         ],
     );
     // Bootstrap

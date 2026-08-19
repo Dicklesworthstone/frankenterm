@@ -2250,6 +2250,7 @@ pub async fn persist_captured_segment_with_zone_with_cx(
         max_segment_bytes,
         zone_type,
         None,
+        None,
     )
     .await
 }
@@ -2270,6 +2271,30 @@ pub(crate) async fn persist_authorized_captured_segment_with_zone_with_cx(
         captured,
         max_segment_bytes,
         zone_type,
+        None,
+        Some(guard),
+    )
+    .await
+}
+
+/// Persist one admitted capture and atomically enqueue its selected-recorder
+/// obligation after storage's stateful redaction has finalized the text.
+pub(crate) async fn persist_authorized_captured_segment_with_zone_and_recorder_delivery_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+    zone_type: Option<&str>,
+    recorder_delivery: crate::storage::RecorderDeliverySeed,
+    guard: &crate::capture_authority::CapturePersistenceGuard,
+) -> Result<PersistedCapture> {
+    persist_captured_segment_with_zone_and_guard_with_cx(
+        cx,
+        storage,
+        captured,
+        max_segment_bytes,
+        zone_type,
+        Some(recorder_delivery),
         Some(guard),
     )
     .await
@@ -2281,6 +2306,7 @@ async fn persist_captured_segment_with_zone_and_guard_with_cx(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
     zone_type: Option<&str>,
+    recorder_delivery: Option<crate::storage::RecorderDeliverySeed>,
     guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
 ) -> Result<PersistedCapture> {
     cx.checkpoint()
@@ -2330,6 +2356,7 @@ async fn persist_captured_segment_with_zone_and_guard_with_cx(
         bounded_segment.pane_id,
         &redacted_content,
         stored_zone_type,
+        recorder_delivery,
         guard,
     )
     .await?;
@@ -2421,10 +2448,24 @@ async fn append_segment_with_optional_capture_hold(
     pane_id: u64,
     content: &str,
     zone_type: Option<&str>,
+    recorder_delivery: Option<crate::storage::RecorderDeliverySeed>,
     guard: Option<&crate::capture_authority::CapturePersistenceGuard>,
 ) -> Result<Segment> {
-    match guard {
-        Some(guard) => {
+    match (guard, recorder_delivery) {
+        (Some(guard), Some(recorder_delivery)) => {
+            storage
+                .append_captured_segment_with_recorder_delivery_with_cx(
+                    cx,
+                    pane_id,
+                    content,
+                    None,
+                    zone_type,
+                    recorder_delivery,
+                    guard.delegate_storage()?,
+                )
+                .await
+        }
+        (Some(guard), None) => {
             storage
                 .append_captured_segment_with_zone_with_cx(
                     cx,
@@ -2436,11 +2477,14 @@ async fn append_segment_with_optional_capture_hold(
                 )
                 .await
         }
-        None => {
+        (None, None) => {
             storage
                 .append_segment_with_zone_with_cx(cx, pane_id, content, None, zone_type)
                 .await
         }
+        (None, Some(_)) => Err(crate::Error::Storage(crate::error::StorageError::Database(
+            "recorder delivery seed requires capture persistence authority".to_string(),
+        ))),
     }
 }
 

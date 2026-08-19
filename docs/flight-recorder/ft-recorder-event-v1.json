@@ -214,7 +214,8 @@
         "pane_opened",
         "pane_closed",
         "replay_started",
-        "replay_finished"
+        "replay_finished",
+        "migration_ready_for_activation"
       ]
     }
   },

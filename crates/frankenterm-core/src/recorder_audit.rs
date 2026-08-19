@@ -31,7 +31,7 @@ use frankenterm_core_audit_types::recorder_audit_engine::{
 };
 
 use crate::policy::ActorKind;
-use crate::recorder_storage::RecorderBackendKind;
+use crate::recorder_storage::{RecorderBackendKind, RecorderBackendSelection};
 
 // =============================================================================
 // Constants
@@ -528,8 +528,9 @@ impl AuditLog {
     pub fn verify_chain_for_backend(
         entries: &[RecorderAuditEntry],
         expected_prev_hash: &str,
-        backend_kind: RecorderBackendKind,
+        backend: RecorderBackendSelection,
     ) -> ChainVerification {
+        let backend_kind = backend.backend_kind();
         let mut result = Self::verify_chain(entries, expected_prev_hash);
         result.backend_kind = Some(backend_kind);
 
@@ -2020,7 +2021,7 @@ mod tests {
         let result = AuditLog::verify_chain_for_backend(
             &entries,
             GENESIS_HASH,
-            RecorderBackendKind::AppendLog,
+            RecorderBackendSelection::AppendLog,
         );
         assert!(result.chain_intact);
         assert_eq!(result.backend_kind, Some(RecorderBackendKind::AppendLog));
@@ -2028,19 +2029,16 @@ mod tests {
     }
 
     #[test]
-    fn audit_chain_integrity_with_frankensqlite() {
+    fn audit_chain_integrity_with_rusqlite() {
         let log = build_audit_log_with_entries(5);
         let entries = log.entries();
         let result = AuditLog::verify_chain_for_backend(
             &entries,
             GENESIS_HASH,
-            RecorderBackendKind::FrankenSqlite,
+            RecorderBackendSelection::Rusqlite,
         );
         assert!(result.chain_intact);
-        assert_eq!(
-            result.backend_kind,
-            Some(RecorderBackendKind::FrankenSqlite)
-        );
+        assert_eq!(result.backend_kind, Some(RecorderBackendKind::Rusqlite));
         assert_eq!(result.total_entries, 5);
     }
 
@@ -2051,14 +2049,14 @@ mod tests {
         // Tamper: modify the second entry's body
         entries[1].justification = Some("tampered".to_string());
 
-        for backend in RecorderBackendKind::ALL {
+        for backend in RecorderBackendSelection::ALL {
             let result = AuditLog::verify_chain_for_backend(&entries, GENESIS_HASH, backend);
             assert!(
                 !result.chain_intact,
                 "tamper should be detected for {:?}",
                 backend
             );
-            assert_eq!(result.backend_kind, Some(backend));
+            assert_eq!(result.backend_kind, Some(backend.backend_kind()));
             // Break should be at the entry after the tampered one
             assert!(result.first_break_at.is_some());
         }
@@ -2066,19 +2064,9 @@ mod tests {
 
     #[test]
     fn audit_access_tier_enforcement_backend_agnostic() {
-        // Access tier logic is independent of storage backend
-        for backend in RecorderBackendKind::ALL {
-            assert!(
-                AccessTier::A3PrivilegedRaw.satisfies(AccessTier::A2FullQuery),
-                "A3 should satisfy A2 regardless of backend {:?}",
-                backend
-            );
-            assert!(
-                !AccessTier::A1RedactedQuery.satisfies(AccessTier::A3PrivilegedRaw),
-                "A1 should not satisfy A3 regardless of backend {:?}",
-                backend
-            );
-        }
+        // Access tier logic is independent of storage backend identity.
+        assert!(AccessTier::A3PrivilegedRaw.satisfies(AccessTier::A2FullQuery));
+        assert!(!AccessTier::A1RedactedQuery.satisfies(AccessTier::A3PrivilegedRaw));
     }
 
     #[test]
@@ -2092,11 +2080,11 @@ mod tests {
 
     #[test]
     fn audit_chain_empty_entries_all_backends() {
-        for backend in RecorderBackendKind::ALL {
+        for backend in RecorderBackendSelection::ALL {
             let result = AuditLog::verify_chain_for_backend(&[], GENESIS_HASH, backend);
             assert!(result.chain_intact);
             assert_eq!(result.total_entries, 0);
-            assert_eq!(result.backend_kind, Some(backend));
+            assert_eq!(result.backend_kind, Some(backend.backend_kind()));
         }
     }
 
@@ -2108,12 +2096,12 @@ mod tests {
         let result_al = AuditLog::verify_chain_for_backend(
             &entries,
             GENESIS_HASH,
-            RecorderBackendKind::AppendLog,
+            RecorderBackendSelection::AppendLog,
         );
         let result_fs = AuditLog::verify_chain_for_backend(
             &entries,
             GENESIS_HASH,
-            RecorderBackendKind::FrankenSqlite,
+            RecorderBackendSelection::Rusqlite,
         );
 
         // Same chain integrity result regardless of backend
@@ -2129,10 +2117,10 @@ mod tests {
         let result = AuditLog::verify_chain_for_backend(
             &entries,
             GENESIS_HASH,
-            RecorderBackendKind::FrankenSqlite,
+            RecorderBackendSelection::Rusqlite,
         );
         let dbg = format!("{:?}", result);
-        assert!(dbg.contains("FrankenSqlite"));
+        assert!(dbg.contains("Rusqlite"));
     }
 
     #[test]

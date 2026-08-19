@@ -1463,6 +1463,7 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
             pane_id: 1,
             content: "late".to_string(),
             content_hash: None,
+            recorder_delivery: None,
             respond: append_tx,
             zone_type: None,
             capture_hold: None,

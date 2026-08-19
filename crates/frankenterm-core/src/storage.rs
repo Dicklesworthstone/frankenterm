@@ -64,8 +64,10 @@ use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
 #[cfg(test)]
 use crate::recorder_invariants::InvariantReport;
+use crate::recorder_storage::RecorderBackendKind;
 #[cfg(test)]
-use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
+use crate::recorder_storage::RecorderOffset;
+use crate::recording::RecorderEvent;
 use crate::redactor::DEFAULT_STREAMING_REDACTOR_TAIL_BYTES;
 use crate::runtime_async::mpsc;
 use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
@@ -120,6 +122,35 @@ pub const EVENT_DELIVERY_LEASE_TOKEN_MAX_BYTES: usize = 256;
 pub const EVENT_DELIVERY_STATUS_MAX_BYTES: usize = 256;
 /// Maximum UTF-8 bytes persisted as one event-delivery workflow identity.
 pub const EVENT_DELIVERY_WORKFLOW_ID_MAX_BYTES: usize = 1_024;
+
+/// Maximum selected-recorder delivery obligations returned by one read.
+///
+/// The persistence task drains repeatedly, so this is an allocation and
+/// writer-fairness bound rather than a durability limit.
+const RECORDER_DELIVERY_READ_BATCH_MAX: usize = 256;
+
+/// Selected-recorder egress admitted before the primary segment write.
+///
+/// The raw egress metadata is intentionally not the durable recorder event.
+/// The storage writer first applies its stateful, cross-segment redactor, then
+/// asks this capture adapter to apply recorder policy to that exact persisted
+/// text. Only that post-redaction event is assigned the durable segment
+/// sequence and inserted into the delivery ledger in the same transaction.
+#[derive(Clone)]
+pub(crate) struct RecorderDeliverySeed {
+    pub egress: crate::recording::EgressEvent,
+    pub capture: Arc<crate::replay_capture::CaptureAdapter>,
+    pub target_backend: RecorderBackendKind,
+}
+
+/// One durable selected-recorder delivery obligation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRecorderDelivery {
+    pub segment_id: i64,
+    pub event: RecorderEvent,
+    pub target_backend: RecorderBackendKind,
+    pub created_at: i64,
+}
 
 // Keep hot-path SQL in one place so execution and EXPLAIN-plan regression
 // tests cannot silently drift apart.
@@ -850,9 +881,18 @@ enum WriteCommand {
         content: String,
         content_hash: Option<String>,
         zone_type: Option<String>,
+        /// Selected-recorder event to enqueue atomically with this segment.
+        recorder_delivery: Option<RecorderDeliverySeed>,
         /// Delegated capture hold retained through durable writer completion.
         capture_hold: Option<CapturePersistenceHold>,
         respond: oneshot::Sender<Result<Segment>>,
+    },
+    /// Remove one recorder delivery obligation after exact delivery proof.
+    AcknowledgeRecorderDelivery {
+        segment_id: i64,
+        event_id: String,
+        target_backend: RecorderBackendKind,
+        respond: oneshot::Sender<Result<bool>>,
     },
     /// Record a gap event
     RecordGap {
@@ -1357,6 +1397,7 @@ impl std::fmt::Debug for WriteCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let variant = match self {
             Self::AppendSegment { .. } => "AppendSegment",
+            Self::AcknowledgeRecorderDelivery { .. } => "AcknowledgeRecorderDelivery",
             Self::RecordGap { .. } => "RecordGap",
             Self::RecordEvent { .. } => "RecordEvent",
             Self::MarkEventHandled { .. } => "MarkEventHandled",
@@ -3687,6 +3728,7 @@ impl StorageHandle {
             content_hash,
             zone_type,
             None,
+            None,
         )
         .await
     }
@@ -3707,7 +3749,52 @@ impl StorageHandle {
             content,
             content_hash,
             zone_type,
+            None,
             Some(capture_hold),
+        )
+        .await
+    }
+
+    /// Capture-authorized writer handoff that atomically creates a selected-
+    /// recorder delivery obligation with the output segment.
+    pub(crate) async fn append_captured_segment_with_recorder_delivery_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        content: &str,
+        content_hash: Option<String>,
+        zone_type: Option<&str>,
+        recorder_delivery: RecorderDeliverySeed,
+        capture_hold: CapturePersistenceHold,
+    ) -> Result<Segment> {
+        self.append_segment_with_zone_and_capture_hold_with_cx(
+            cx,
+            pane_id,
+            content,
+            content_hash,
+            zone_type,
+            Some(recorder_delivery),
+            Some(capture_hold),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn append_segment_with_recorder_delivery_for_test(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        content: &str,
+        recorder_delivery: RecorderDeliverySeed,
+    ) -> Result<Segment> {
+        self.append_segment_with_zone_and_capture_hold_with_cx(
+            cx,
+            pane_id,
+            content,
+            None,
+            None,
+            Some(recorder_delivery),
+            None,
         )
         .await
     }
@@ -3719,6 +3806,7 @@ impl StorageHandle {
         content: &str,
         content_hash: Option<String>,
         zone_type: Option<&str>,
+        recorder_delivery: Option<RecorderDeliverySeed>,
         capture_hold: Option<CapturePersistenceHold>,
     ) -> Result<Segment> {
         Self::checkpoint_storage_operation(cx, "append_segment")?;
@@ -3732,6 +3820,7 @@ impl StorageHandle {
                     content: content.to_string(),
                     content_hash,
                     zone_type: zone_type.map(str::to_string),
+                    recorder_delivery,
                     capture_hold,
                     respond: tx,
                 },
@@ -3741,6 +3830,48 @@ impl StorageHandle {
         let result = Self::recv_writer_response(rx).await;
         timer.finish_result(&result);
         result
+    }
+
+    /// Read the oldest bounded batch of pending selected-recorder deliveries.
+    pub(crate) async fn pending_recorder_deliveries_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<PendingRecorderDelivery>> {
+        Self::checkpoint_storage_operation(cx, "pending_recorder_deliveries")?;
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_cx(cx, move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_pending_recorder_deliveries_backend(backend, RECORDER_DELIVERY_READ_BATCH_MAX)
+            })
+        })
+        .await
+    }
+
+    /// Durably acknowledge one exact selected-recorder delivery obligation.
+    ///
+    /// `false` means the ledger row was missing or no longer matched all three
+    /// identities. Callers must treat that as an ambiguous delivery state, not
+    /// success.
+    pub(crate) async fn acknowledge_recorder_delivery_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        delivery: &PendingRecorderDelivery,
+    ) -> Result<bool> {
+        Self::checkpoint_storage_operation(cx, "acknowledge_recorder_delivery")?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::AcknowledgeRecorderDelivery {
+                    segment_id: delivery.segment_id,
+                    event_id: delivery.event.event_id.clone(),
+                    target_backend: delivery.target_backend,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|error| Self::writer_send_error("acknowledge_recorder_delivery", error))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Record a gap event
@@ -12510,6 +12641,7 @@ struct PendingAppendSegmentWrite {
     content: String,
     content_hash: Option<String>,
     zone_type: Option<String>,
+    recorder_delivery: Option<RecorderDeliverySeed>,
     capture_hold: Option<CapturePersistenceHold>,
     respond: WriterResultResponder<Segment>,
 }
@@ -12521,6 +12653,7 @@ impl PendingAppendSegmentWrite {
             content: self.content,
             content_hash: self.content_hash,
             zone_type: self.zone_type,
+            recorder_delivery: self.recorder_delivery,
             capture_hold: self.capture_hold,
             respond: self.respond.into_sender(),
         }
@@ -12536,6 +12669,7 @@ fn pending_append_segment_from_command(
             content,
             content_hash,
             zone_type,
+            recorder_delivery,
             capture_hold,
             respond,
         } => Ok(PendingAppendSegmentWrite {
@@ -12543,6 +12677,7 @@ fn pending_append_segment_from_command(
             content,
             content_hash,
             zone_type,
+            recorder_delivery,
             capture_hold,
             respond: WriterResultResponder::new(respond),
         }),
@@ -12763,7 +12898,8 @@ fn fail_undispatched_write_command(cmd: WriteCommand, failure: &WriterFailure) -
         | WriteCommand::MarkSessionShutdownClean { respond, .. } => {
             respond_oneshot_best_effort(respond, failure.result());
         }
-        WriteCommand::FinalizeEventDelivery { respond, .. }
+        WriteCommand::AcknowledgeRecorderDelivery { respond, .. }
+        | WriteCommand::FinalizeEventDelivery { respond, .. }
         | WriteCommand::ReleaseEventDelivery { respond, .. }
         | WriteCommand::SetEventTriageState { respond, .. }
         | WriteCommand::AddEventLabel { respond, .. }
@@ -14852,6 +14988,7 @@ mod writer_io_scheduler_tests {
             content: content.to_string(),
             content_hash: None,
             zone_type: None,
+            recorder_delivery: None,
             capture_hold: None,
             respond: tx,
         }
@@ -15174,7 +15311,7 @@ mod writer_io_scheduler_tests {
     fn singleton_append_failure_after_retroactive_mask_restores_database_and_redactor() {
         let backend = real_writer_backend_with_panes(&[71]);
         let mut redactors = HashMap::<u64, SegmentPersistRedactor>::new();
-        append_segment_commit_backend(&backend, 71, "prefix sk-", None, None, &mut redactors)
+        append_segment_commit_backend(&backend, 71, "prefix sk-", None, None, None, &mut redactors)
             .expect("seed split-secret prefix");
         let redactors_before = redactors.clone();
 
@@ -15183,6 +15320,7 @@ mod writer_io_scheduler_tests {
             &backend,
             71,
             "abcdefghijklmnopqrstuvwxyz suffix",
+            None,
             None,
             None,
             &mut redactors,
@@ -15211,6 +15349,7 @@ mod writer_io_scheduler_tests {
             "abcdefghijklmnopqrstuvwxyz suffix",
             None,
             None,
+            None,
             &mut redactors,
         )
         .expect("one-shot fault clears and restored lookback supports retry");
@@ -15230,6 +15369,7 @@ mod writer_io_scheduler_tests {
                 "prefix sk-",
                 None,
                 None,
+                None,
                 &mut redactors,
             )
             .expect("seed grouped split-secret prefix");
@@ -15243,6 +15383,7 @@ mod writer_io_scheduler_tests {
                 content: "abcdefghijklmnopqrstuvwxyz first".to_string(),
                 content_hash: None,
                 zone_type: None,
+                recorder_delivery: None,
                 capture_hold: None,
                 respond: WriterResultResponder::new(first_tx),
             },
@@ -15251,6 +15392,7 @@ mod writer_io_scheduler_tests {
                 content: "abcdefghijklmnopqrstuvwxyz second".to_string(),
                 content_hash: None,
                 zone_type: None,
+                recorder_delivery: None,
                 capture_hold: None,
                 respond: WriterResultResponder::new(second_tx),
             },
@@ -15307,6 +15449,7 @@ mod writer_io_scheduler_tests {
                 content: "first group append".to_string(),
                 content_hash: Some("hash-first".to_string()),
                 zone_type: None,
+                recorder_delivery: None,
                 capture_hold: None,
                 respond: first_tx,
             });
@@ -15315,6 +15458,7 @@ mod writer_io_scheduler_tests {
                 content: "second group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                recorder_delivery: None,
                 capture_hold: None,
                 respond: second_tx,
             });
@@ -15389,6 +15533,7 @@ mod writer_io_scheduler_tests {
                     content: "first mismatched group append".to_string(),
                     content_hash: None,
                     zone_type: None,
+                    recorder_delivery: None,
                     capture_hold: None,
                     respond: WriterResultResponder::new(first_tx),
                 },
@@ -15397,6 +15542,7 @@ mod writer_io_scheduler_tests {
                     content: "second mismatched group append".to_string(),
                     content_hash: None,
                     zone_type: None,
+                    recorder_delivery: None,
                     capture_hold: None,
                     respond: WriterResultResponder::new(second_tx),
                 },
@@ -15672,6 +15818,7 @@ mod writer_io_scheduler_tests {
                 content: "first panic group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                recorder_delivery: None,
                 capture_hold: None,
                 respond: first_tx,
             });
@@ -15680,6 +15827,7 @@ mod writer_io_scheduler_tests {
                 content: "second panic group append".to_string(),
                 content_hash: None,
                 zone_type: None,
+                recorder_delivery: None,
                 capture_hold: None,
                 respond: second_tx,
             });
@@ -16926,6 +17074,7 @@ mod writer_io_scheduler_tests {
             content: "x".to_string(),
             content_hash: None,
             zone_type: None,
+            recorder_delivery: None,
             capture_hold: None,
             respond: tx,
         }));
@@ -17335,6 +17484,7 @@ fn dispatch_write_command_raw(
             content,
             content_hash,
             zone_type,
+            recorder_delivery,
             capture_hold,
             respond,
         } => {
@@ -17345,6 +17495,7 @@ fn dispatch_write_command_raw(
                 &content,
                 content_hash.as_deref(),
                 zone_type.as_deref(),
+                recorder_delivery.as_ref(),
                 segment_redactors,
             );
             let result = result.map(|committed| {
@@ -17356,6 +17507,21 @@ fn dispatch_write_command_raw(
             });
             respond_oneshot_best_effort(respond, result);
             drop(capture_hold);
+        }
+        WriteCommand::AcknowledgeRecorderDelivery {
+            segment_id,
+            event_id,
+            target_backend,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = acknowledge_recorder_delivery_backend(
+                backend,
+                segment_id,
+                &event_id,
+                target_backend,
+            );
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordGap {
             pane_id,
@@ -18923,6 +19089,7 @@ fn append_segment_backend(
     content: &str,
     content_hash: Option<&str>,
     zone_type: Option<&str>,
+    recorder_delivery: Option<&RecorderDeliverySeed>,
 ) -> Result<Segment> {
     let next_seq = next_output_segment_seq_backend(backend, pane_id)?;
     let now = now_ms();
@@ -18956,6 +19123,9 @@ fn append_segment_backend(
         content,
         now,
     )?;
+    if let Some(delivery) = recorder_delivery {
+        insert_recorder_delivery_backend(backend, &segment, delivery, now)?;
+    }
     Ok(segment)
 }
 
@@ -19010,6 +19180,7 @@ fn append_segment_commit_backend(
     content: &str,
     content_hash: Option<&str>,
     zone_type: Option<&str>,
+    recorder_delivery: Option<&RecorderDeliverySeed>,
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
 ) -> Result<CommittedAppendSegment> {
     let snapshot = segment_redactors.get(&pane_id).cloned();
@@ -19032,6 +19203,7 @@ fn append_segment_commit_backend(
                 &redacted_content,
                 persisted_hash,
                 zone_type,
+                recorder_delivery,
             )?;
             Ok(CommittedAppendSegment {
                 segment,
@@ -19133,6 +19305,9 @@ fn append_segment_group_commit_inner(
             &content,
             now,
         )?;
+        if let Some(delivery) = write.recorder_delivery.as_ref() {
+            insert_recorder_delivery_backend(backend, &segment, delivery, now)?;
+        }
         committed_segments.push(CommittedAppendSegment {
             segment,
             retained_tail_moved,
@@ -19140,6 +19315,188 @@ fn append_segment_group_commit_inner(
     }
 
     Ok(committed_segments)
+}
+
+fn implemented_recorder_backend_name(backend: RecorderBackendKind) -> Result<&'static str> {
+    match backend {
+        RecorderBackendKind::AppendLog => Ok("append_log"),
+        RecorderBackendKind::Rusqlite => Ok("rusqlite"),
+        RecorderBackendKind::FrankenSqlite => Err(StorageError::Database(
+            "reserved FrankenSQLite backend cannot own a recorder delivery obligation".to_string(),
+        )
+        .into()),
+    }
+}
+
+fn parse_implemented_recorder_backend(value: &str) -> Result<RecorderBackendKind> {
+    match value {
+        "append_log" => Ok(RecorderBackendKind::AppendLog),
+        "rusqlite" => Ok(RecorderBackendKind::Rusqlite),
+        other => Err(StorageError::Database(format!(
+            "recorder delivery ledger contains unsupported target backend {other:?}"
+        ))
+        .into()),
+    }
+}
+
+fn insert_recorder_delivery_backend(
+    backend: &dyn StorageBackend,
+    segment: &Segment,
+    seed: &RecorderDeliverySeed,
+    created_at: i64,
+) -> Result<()> {
+    if seed.egress.pane_id != segment.pane_id {
+        return Err(StorageError::Database(format!(
+            "recorder delivery pane mismatch: segment pane {}, seed pane {}",
+            segment.pane_id, seed.egress.pane_id
+        ))
+        .into());
+    }
+    let mut egress = seed.egress.clone();
+    let stateful_redaction_changed_text = egress.text != segment.content;
+    egress.text.clone_from(&segment.content);
+    egress.sequence = segment.seq;
+    if stateful_redaction_changed_text {
+        egress.redaction = crate::recording::RecorderRedactionLevel::Full;
+    }
+    let mut event = seed
+        .capture
+        .prepare_authoritative_egress_event(&egress)
+        .map_err(|error| {
+            StorageError::Database(format!(
+                "selected recorder rejected durable segment identity for pane {} sequence {}: {error}",
+                segment.pane_id, segment.seq
+            ))
+        })?
+        .map(|(event, _merge_key)| event)
+        .ok_or_else(|| {
+            StorageError::Database(format!(
+                "selected recorder capture policy dropped durable segment for pane {} sequence {}",
+                segment.pane_id, segment.seq
+            ))
+        })?;
+    // The event generator already uses the durable sequence, but recomputing
+    // here makes the transaction boundary authoritative even if construction
+    // internals change: no pre-redaction or provisional identity can persist.
+    event.event_id = crate::event_id::generate_event_id_v1(&event);
+    let event_json = serde_json::to_string(&event).map_err(|error| {
+        StorageError::Database(format!(
+            "failed to serialize recorder delivery event {}: {error}",
+            event.event_id
+        ))
+    })?;
+    let target_backend = implemented_recorder_backend_name(seed.target_backend)?;
+
+    execute_typed(
+        backend,
+        "INSERT INTO recorder_delivery_ledger (
+             segment_id, event_id, target_backend, event_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            ToSqlValue::Integer(segment.id),
+            ToSqlValue::Text(&event.event_id),
+            ToSqlValue::Text(target_backend),
+            ToSqlValue::Text(&event_json),
+            ToSqlValue::Integer(created_at),
+        ],
+    )
+    .map_err(|error| storage_backend_error("Insert recorder delivery ledger row", error).into())
+}
+
+fn query_pending_recorder_deliveries_backend(
+    backend: &dyn StorageBackend,
+    limit: usize,
+) -> Result<Vec<PendingRecorderDelivery>> {
+    let limit = limit.clamp(1, RECORDER_DELIVERY_READ_BATCH_MAX);
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = backend
+        .query_map_typed(
+            "SELECT ledger.segment_id, ledger.event_id, ledger.target_backend,
+                    ledger.event_json, ledger.created_at, segment.pane_id, segment.seq
+             FROM recorder_delivery_ledger AS ledger
+             INNER JOIN output_segments AS segment ON segment.id = ledger.segment_id
+             ORDER BY ledger.created_at ASC, ledger.segment_id ASC
+             LIMIT ?1",
+            &[ToSqlValue::Integer(limit)],
+        )
+        .map_err(|error| storage_backend_error("List recorder delivery ledger rows", error))?;
+
+    rows.iter()
+        .map(|row| {
+            let reader = RowReader::new(row);
+            let segment_id = reader
+                .i64(0)
+                .map_err(|error| storage_backend_error("Recorder delivery segment_id", error))?;
+            let stored_event_id = reader
+                .string(1)
+                .map_err(|error| storage_backend_error("Recorder delivery event_id", error))?;
+            let target_backend = reader
+                .string(2)
+                .map_err(|error| storage_backend_error("Recorder delivery target_backend", error))?;
+            let target_backend = parse_implemented_recorder_backend(&target_backend)?;
+            let event_json = reader
+                .string(3)
+                .map_err(|error| storage_backend_error("Recorder delivery event_json", error))?;
+            let created_at = reader
+                .i64(4)
+                .map_err(|error| storage_backend_error("Recorder delivery created_at", error))?;
+            let pane_id = reader
+                .i64(5)
+                .map_err(|error| storage_backend_error("Recorder delivery pane_id", error))?;
+            let pane_id = backend_i64_to_u64(pane_id, "recorder delivery pane_id")
+                .map_err(|error| storage_backend_error("Recorder delivery pane_id", error))?;
+            let sequence = reader
+                .i64(6)
+                .map_err(|error| storage_backend_error("Recorder delivery sequence", error))?;
+            let sequence = backend_i64_to_u64(sequence, "recorder delivery sequence")
+                .map_err(|error| storage_backend_error("Recorder delivery sequence", error))?;
+            let event = serde_json::from_str::<RecorderEvent>(&event_json).map_err(|error| {
+                StorageError::Database(format!(
+                    "recorder delivery event JSON for segment {segment_id} is corrupt: {error}"
+                ))
+            })?;
+            let canonical_event_id = crate::event_id::generate_event_id_v1(&event);
+            if event.event_id != stored_event_id
+                || event.event_id != canonical_event_id
+                || event.pane_id != pane_id
+                || event.sequence != sequence
+            {
+                return Err(StorageError::Database(format!(
+                    "recorder delivery identity mismatch for segment {segment_id}: stored_event_id={stored_event_id}, event_id={}, canonical_event_id={canonical_event_id}, event_pane={}, segment_pane={pane_id}, event_sequence={}, segment_sequence={sequence}",
+                    event.event_id, event.pane_id, event.sequence
+                ))
+                .into());
+            }
+            Ok(PendingRecorderDelivery {
+                segment_id,
+                event,
+                target_backend,
+                created_at,
+            })
+        })
+        .collect()
+}
+
+fn acknowledge_recorder_delivery_backend(
+    backend: &dyn StorageBackend,
+    segment_id: i64,
+    event_id: &str,
+    target_backend: RecorderBackendKind,
+) -> Result<bool> {
+    let target_backend = implemented_recorder_backend_name(target_backend)?;
+    backend
+        .query_row_typed(
+            "DELETE FROM recorder_delivery_ledger
+             WHERE segment_id = ?1 AND event_id = ?2 AND target_backend = ?3
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(segment_id),
+                ToSqlValue::Text(event_id),
+                ToSqlValue::Text(target_backend),
+            ],
+        )
+        .map(|row| row.is_some())
+        .map_err(|error| storage_backend_error("Acknowledge recorder delivery", error).into())
 }
 
 const SEGMENT_EMBEDDING_INSERT_SQL: &str =
@@ -33355,25 +33712,27 @@ fn append_segment_assigns_gapless_monotonic_independent_seqs() {
     // Pane 1: the first five appends must return seq 0,1,2,3,4 in order.
     for expected in 0u64..5 {
         let seg =
-            append_segment_backend(&backend, 1, &format!("p1-{expected}"), None, None).unwrap();
+            append_segment_backend(&backend, 1, &format!("p1-{expected}"), None, None, None)
+                .unwrap();
         assert_eq!(seg.seq, expected, "pane 1 seq must be gapless and start at 0");
         assert_eq!(seg.pane_id, 1);
     }
     // Pane 2 is independent — its sequence also starts at 0.
     for expected in 0u64..3 {
         let seg =
-            append_segment_backend(&backend, 2, &format!("p2-{expected}"), None, None).unwrap();
+            append_segment_backend(&backend, 2, &format!("p2-{expected}"), None, None, None)
+                .unwrap();
         assert_eq!(seg.seq, expected, "pane 2 seq is independent of pane 1");
     }
     // Interleaving resumes each pane's own counter.
     assert_eq!(
-        append_segment_backend(&backend, 1, "p1-5", None, None)
+        append_segment_backend(&backend, 1, "p1-5", None, None, None)
             .unwrap()
             .seq,
         5
     );
     assert_eq!(
-        append_segment_backend(&backend, 2, "p2-3", None, None)
+        append_segment_backend(&backend, 2, "p2-3", None, None, None)
             .unwrap()
             .seq,
         3
@@ -33421,8 +33780,15 @@ fn append_segment_backend_writes_semantic_embedding_like_group_path() {
     let backend = memory_backend();
     seed_pane_backend(&backend, 1, 1_000);
 
-    let seg = append_segment_backend(&backend, 1, "compilation failed in auth", None, None)
-        .unwrap();
+    let seg = append_segment_backend(
+        &backend,
+        1,
+        "compilation failed in auth",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     let row = backend
         .query_row_typed(
@@ -33441,7 +33807,7 @@ fn append_segment_backend_writes_semantic_embedding_like_group_path() {
 
     // Empty content is skipped by contract (nothing to embed) — and must not
     // error out the append itself.
-    let empty = append_segment_backend(&backend, 1, "", None, None).unwrap();
+    let empty = append_segment_backend(&backend, 1, "", None, None, None).unwrap();
     let empty_row = backend
         .query_row_typed(
             "SELECT COUNT(*) FROM segment_embeddings WHERE segment_id = ?1",

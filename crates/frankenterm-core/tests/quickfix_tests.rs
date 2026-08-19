@@ -11,6 +11,7 @@ use frankenterm_core::event_templates::{EVENT_TEMPLATE_REGISTRY, render_event};
 use frankenterm_core::explanations::{
     format_explanation, get_explanation, list_template_ids, render_explanation,
 };
+use frankenterm_core::recorder_storage::{RecorderBackendKind, select_recorder_backend};
 use frankenterm_core::storage::StoredEvent;
 
 #[allow(deprecated)]
@@ -208,6 +209,9 @@ fn every_error_variant_has_remediation() {
         Error::Config(ConfigError::ParseFailed("parse".to_string())),
         Error::Config(ConfigError::SerializeFailed("serialize".to_string())),
         Error::Config(ConfigError::ValidationError("invalid".to_string())),
+        Error::Config(ConfigError::RecorderBackendSelection(
+            select_recorder_backend(RecorderBackendKind::FrankenSqlite).unwrap_err(),
+        )),
         // Other variants
         Error::Policy("denied".to_string()),
         Error::Io(std::io::Error::other("io")),
@@ -621,6 +625,9 @@ fn error_renderer_maps_all_error_variants_to_catalog() {
         Error::Config(ConfigError::ParseFailed("p".to_string())),
         Error::Config(ConfigError::SerializeFailed("s".to_string())),
         Error::Config(ConfigError::ValidationError("v".to_string())),
+        Error::Config(ConfigError::RecorderBackendSelection(
+            select_recorder_backend(RecorderBackendKind::FrankenSqlite).unwrap_err(),
+        )),
         Error::Policy("denied".to_string()),
         Error::Io(std::io::Error::other("io")),
         Error::Json(json_err),

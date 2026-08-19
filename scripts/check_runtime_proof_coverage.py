@@ -531,7 +531,7 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("recorder_migration.rs", "m0_preflight"),
     ("recorder_migration.rs", "m2_import"),
     ("recorder_migration.rs", "m3_checkpoint_sync"),
-    ("recorder_migration.rs", "m5_cutover"),
+    ("recorder_migration.rs", "m5_mark_ready"),
     ("recorder_migration.rs", "run_m0_m2"),
     # snapshot_engine.rs: snapshot capture + retention/checkpoint.
     ("snapshot_engine.rs", "capture"),

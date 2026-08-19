@@ -55,6 +55,14 @@ fn write_recovering<T>(lock: &std::sync::RwLock<T>) -> RwLockWriteGuard<'_, T> {
     }
 }
 
+const fn backend_index(backend: RecorderBackendKind) -> usize {
+    match backend {
+        RecorderBackendKind::AppendLog => 0,
+        RecorderBackendKind::Rusqlite => 1,
+        RecorderBackendKind::FrankenSqlite => 2,
+    }
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -126,6 +134,21 @@ impl StorageHealthTier {
     }
 }
 
+fn tier_for_health(
+    health: Option<&RecorderStorageHealth>,
+    thresholds: &[f64; 3],
+) -> StorageHealthTier {
+    let Some(health) = health else {
+        return StorageHealthTier::Green;
+    };
+    let ratio = if health.queue_capacity > 0 {
+        health.queue_depth as f64 / health.queue_capacity as f64
+    } else {
+        0.0
+    };
+    StorageHealthTier::classify(ratio, health.degraded, thresholds)
+}
+
 // =============================================================================
 // Metric names (constants for stable keys)
 // =============================================================================
@@ -139,11 +162,11 @@ pub const METRIC_CHECKPOINT_LATENCY_US: &str = "storage.checkpoint_latency_us";
 /// Histogram: batch size (number of events per append).
 pub const METRIC_BATCH_SIZE: &str = "storage.batch_size";
 
-/// Counter: total events appended.
+/// Counter: total events newly appended (idempotent replays excluded).
 pub const COUNTER_EVENTS_APPENDED: &str = "storage.events_appended";
-/// Counter: total batches processed.
+/// Counter: total batches newly committed (idempotent replays excluded).
 pub const COUNTER_BATCHES_PROCESSED: &str = "storage.batches_processed";
-/// Counter: total bytes written (estimated from event count × avg size).
+/// Counter: total bytes newly written (estimated from event count × avg size).
 pub const COUNTER_BYTES_WRITTEN: &str = "storage.bytes_written";
 /// Counter: total flush operations.
 pub const COUNTER_FLUSHES: &str = "storage.flushes";
@@ -213,10 +236,10 @@ pub struct StoragePipelineSnapshot {
     /// Batch size distribution.
     pub batch_size: Option<HistogramSummary>,
 
-    /// Total events appended since start.
+    /// Total newly committed events since start (replays excluded).
     pub total_events_appended: u64,
 
-    /// Total batches processed since start.
+    /// Total newly committed batches since start (replays excluded).
     pub total_batches: u64,
 
     /// Total flush operations since start.
@@ -366,6 +389,14 @@ impl StorageTelemetry {
             &backend_metric_name(METRIC_APPEND_LATENCY_US, backend),
             elapsed_us,
         );
+
+        if was_idempotent_replay {
+            self.registry.increment_counter(COUNTER_IDEMPOTENT_REPLAYS);
+            self.registry
+                .increment_counter(&backend_metric_name(COUNTER_IDEMPOTENT_REPLAYS, backend));
+            return;
+        }
+
         self.registry
             .record_histogram(METRIC_BATCH_SIZE, event_count as f64);
         self.registry.record_histogram(
@@ -389,12 +420,6 @@ impl StorageTelemetry {
             &backend_metric_name(COUNTER_BYTES_WRITTEN, backend),
             estimated_bytes,
         );
-
-        if was_idempotent_replay {
-            self.registry.increment_counter(COUNTER_IDEMPOTENT_REPLAYS);
-            self.registry
-                .increment_counter(&backend_metric_name(COUNTER_IDEMPOTENT_REPLAYS, backend));
-        }
 
         // Update rate EWMA
         let now_ms = self.created_at.elapsed().as_millis() as u64;
@@ -587,15 +612,11 @@ impl StorageTelemetry {
             corruption: self.registry.counter_value(COUNTER_ERROR_CORRUPTION),
         };
 
-        let health = read_recovering(&self.last_health_by_backend[backend_index(backend)]).clone();
-        let health_tier = tier_for_health(health.as_ref(), &self.config.tier_thresholds);
-        let lag = read_recovering(&self.last_lag_by_backend[backend_index(backend)]).clone();
-
         StoragePipelineSnapshot {
             timestamp_ms: now_ms,
-            health_tier,
-            health,
-            lag,
+            health_tier: self.current_tier(),
+            health: read_recovering(&self.last_health).clone(),
+            lag: read_recovering(&self.last_lag).clone(),
             append_latency: append_summary,
             flush_latency: flush_summary,
             checkpoint_latency: find_summary(METRIC_CHECKPOINT_LATENCY_US),
@@ -604,7 +625,7 @@ impl StorageTelemetry {
             total_batches: self.registry.counter_value(COUNTER_BATCHES_PROCESSED),
             total_flushes: self.registry.counter_value(COUNTER_FLUSHES),
             total_checkpoints: self.registry.counter_value(COUNTER_CHECKPOINTS),
-            append_rate_ewma: self.append_rate_for_backend(backend),
+            append_rate_ewma: self.append_rate(),
             backend_kind: None,
             errors,
             slo_append_p95,
@@ -658,11 +679,15 @@ impl StorageTelemetry {
             corruption: backend_counter(COUNTER_ERROR_CORRUPTION),
         };
 
+        let health = read_recovering(&self.last_health_by_backend[backend_index(backend)]).clone();
+        let health_tier = tier_for_health(health.as_ref(), &self.config.tier_thresholds);
+        let lag = read_recovering(&self.last_lag_by_backend[backend_index(backend)]).clone();
+
         StoragePipelineSnapshot {
             timestamp_ms: now_ms,
-            health_tier: self.current_tier(),
-            health: read_recovering(&self.last_health).clone(),
-            lag: read_recovering(&self.last_lag).clone(),
+            health_tier,
+            health,
+            lag,
             append_latency: append_summary,
             flush_latency: flush_summary,
             checkpoint_latency: find_summary(METRIC_CHECKPOINT_LATENCY_US),
@@ -671,7 +696,7 @@ impl StorageTelemetry {
             total_batches: backend_counter(COUNTER_BATCHES_PROCESSED),
             total_flushes: backend_counter(COUNTER_FLUSHES),
             total_checkpoints: backend_counter(COUNTER_CHECKPOINTS),
-            append_rate_ewma: self.append_rate(),
+            append_rate_ewma: self.append_rate_for_backend(backend),
             backend_kind: Some(backend),
             errors,
             slo_append_p95,
@@ -707,7 +732,7 @@ pub struct InstrumentedStorage<S> {
     telemetry: Arc<StorageTelemetry>,
 }
 
-impl<S: RecorderStorage> InstrumentedStorage<S> {
+impl<S> InstrumentedStorage<S> {
     /// Wrap a storage backend with telemetry instrumentation.
     pub fn new(inner: S, telemetry: Arc<StorageTelemetry>) -> Self {
         Self { inner, telemetry }
@@ -729,7 +754,7 @@ impl<S: RecorderStorage> InstrumentedStorage<S> {
 // RecorderStorage is an async trait and the exact impl depends on the
 // calling pattern. Callers should use InstrumentedStorage's helper methods:
 
-impl<S> InstrumentedStorage<S> {
+impl<S: RecorderStorage> InstrumentedStorage<S> {
     /// Time an append_batch call and record telemetry.
     // Intentionally `async`: mirrors the instrumented storage async surface even
     // though the telemetry recording path is currently synchronous.
@@ -783,7 +808,7 @@ impl<S> InstrumentedStorage<S> {
                     elapsed_us,
                     resp.accepted_count,
                     estimated_bytes,
-                    false,
+                    resp.was_idempotent_replay,
                     resp.backend,
                 );
             }
@@ -943,7 +968,7 @@ pub fn remediation_for_error(class: RecorderStorageErrorClass) -> &'static str {
         }
         RecorderStorageErrorClass::Retryable => "Retry with exponential backoff; check disk I/O",
         RecorderStorageErrorClass::TerminalData => {
-            "Fix producer data (invalid batch_id, checkpoint regression)"
+            "Fix producer data (invalid or conflicting batch_id, checkpoint regression)"
         }
         RecorderStorageErrorClass::TerminalConfig => "Fix configuration and restart",
         RecorderStorageErrorClass::Corruption => {
@@ -963,8 +988,13 @@ pub fn remediation_for_error(class: RecorderStorageErrorClass) -> &'static str {
 mod tests {
     use super::*;
     use crate::recorder_storage::{
-        CheckpointConsumerId, FlushMode, RecorderBackendKind, RecorderCheckpoint,
-        RecorderConsumerLag, RecorderOffset,
+        AppendLogRecorderStorage, AppendLogStorageConfig, CheckpointConsumerId, DurabilityLevel,
+        FlushMode, RecorderBackendKind, RecorderCheckpoint, RecorderConsumerLag, RecorderOffset,
+        RusqliteRecorderStorage, RusqliteStorageConfig,
+    };
+    use crate::recording::{
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
+        RecorderEventPayload, RecorderEventSource, RecorderLifecyclePhase,
     };
 
     #[derive(Debug, Clone, Copy)]
@@ -1048,6 +1078,27 @@ mod tests {
         backend: RecorderBackendKind,
     ) -> InstrumentedStorage<TestRecorderStorage> {
         InstrumentedStorage::new(TestRecorderStorage::new(backend), telemetry)
+    }
+
+    fn telemetry_test_event(event_id: &str) -> RecorderEvent {
+        RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            event_id: event_id.to_string(),
+            pane_id: 1,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::RecoveryFlow,
+            occurred_at_ms: 1,
+            recorded_at_ms: 1,
+            sequence: 0,
+            causality: RecorderEventCausality::default(),
+            payload: RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase: RecorderLifecyclePhase::CaptureStarted,
+                reason: Some("telemetry-test".to_string()),
+                details: serde_json::Value::Null,
+            },
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1140,6 +1191,112 @@ mod tests {
         telem.record_append(100.0, 5, 1280, true);
 
         assert_eq!(telem.registry.counter_value(COUNTER_IDEMPOTENT_REPLAYS), 1);
+        assert_eq!(telem.registry.counter_value(COUNTER_EVENTS_APPENDED), 0);
+        assert_eq!(telem.registry.counter_value(COUNTER_BATCHES_PROCESSED), 0);
+        assert_eq!(telem.registry.counter_value(COUNTER_BYTES_WRITTEN), 0);
+        assert_eq!(telem.snapshot().append_rate_ewma, 0.0);
+    }
+
+    #[test]
+    fn real_duplicate_batches_are_attributed_as_replays_without_double_counting_writes() {
+        use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let telemetry = Arc::new(StorageTelemetry::with_defaults());
+            let cx = crate::cx::for_request();
+            let append_dir = tempfile::tempdir().unwrap();
+            let mut append_config = AppendLogStorageConfig::default();
+            append_config.data_path = append_dir.path().join("events.log");
+            append_config.state_path = append_dir.path().join("state.json");
+            let append = InstrumentedStorage::new(
+                AppendLogRecorderStorage::open(append_config).unwrap(),
+                Arc::clone(&telemetry),
+            );
+            let append_event = telemetry_test_event("append-event");
+
+            for expected_replay in [false, true] {
+                let request = || AppendRequest {
+                    batch_id: "append-duplicate".to_string(),
+                    events: vec![append_event.clone()],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                };
+                let start = Instant::now();
+                let result = append.inner.append_batch(request()).await;
+                let response = append
+                    .append_batch_instrumented_with_cx(&cx, request(), result, start)
+                    .await
+                    .unwrap();
+                assert_eq!(response.was_idempotent_replay, expected_replay);
+            }
+
+            let sqlite_dir = tempfile::tempdir().unwrap();
+            let mut sqlite_config = RusqliteStorageConfig::default();
+            sqlite_config.db_path = sqlite_dir.path().join("events.sqlite3");
+            let sqlite = InstrumentedStorage::new(
+                RusqliteRecorderStorage::open(sqlite_config).unwrap(),
+                Arc::clone(&telemetry),
+            );
+            let sqlite_event = telemetry_test_event("sqlite-event");
+
+            for expected_replay in [false, true] {
+                let request = || AppendRequest {
+                    batch_id: "sqlite-duplicate".to_string(),
+                    events: vec![sqlite_event.clone()],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                };
+                let start = Instant::now();
+                let result = sqlite.inner.append_batch(request()).await;
+                let response = sqlite
+                    .append_batch_instrumented_with_cx(&cx, request(), result, start)
+                    .await
+                    .unwrap();
+                assert_eq!(response.was_idempotent_replay, expected_replay);
+            }
+
+            assert_eq!(telemetry.registry.counter_value(COUNTER_EVENTS_APPENDED), 2);
+            assert_eq!(
+                telemetry.registry.counter_value(COUNTER_BATCHES_PROCESSED),
+                2
+            );
+            assert_eq!(telemetry.registry.counter_value(COUNTER_BYTES_WRITTEN), 512);
+            assert_eq!(
+                telemetry.registry.counter_value(COUNTER_IDEMPOTENT_REPLAYS),
+                2
+            );
+            for backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                assert_eq!(
+                    telemetry
+                        .registry
+                        .counter_value(&backend_metric_name(COUNTER_EVENTS_APPENDED, backend)),
+                    1
+                );
+                assert_eq!(
+                    telemetry
+                        .registry
+                        .counter_value(&backend_metric_name(COUNTER_BATCHES_PROCESSED, backend)),
+                    1
+                );
+                assert_eq!(
+                    telemetry
+                        .registry
+                        .counter_value(&backend_metric_name(COUNTER_IDEMPOTENT_REPLAYS, backend)),
+                    1
+                );
+            }
+        });
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
     }
 
     #[test]
@@ -1557,6 +1714,14 @@ mod tests {
                 class
             );
         }
+        assert_eq!(
+            remediation_for_error(RecorderStorageErrorClass::TerminalConfig),
+            "Fix configuration and restart"
+        );
+        assert_ne!(
+            remediation_for_error(RecorderStorageErrorClass::TerminalConfig),
+            remediation_for_error(RecorderStorageErrorClass::DependencyUnavailable)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1589,8 +1754,7 @@ mod tests {
     #[test]
     fn instrumented_health_updates_telemetry() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented =
-            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
+        let instrumented = instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let health = make_health(2, 4, false); // 50% → Yellow
         instrumented.health_instrumented(&health).unwrap();
@@ -1601,8 +1765,7 @@ mod tests {
     #[test]
     fn instrumented_lag_updates_telemetry() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented =
-            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
+        let instrumented = instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let lag = RecorderStorageLag {
             latest_offset: Some(RecorderOffset {
@@ -1621,8 +1784,7 @@ mod tests {
     #[test]
     fn instrumented_flush_records_latency() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented =
-            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
+        let instrumented = instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let start = Instant::now();
         let result: Result<FlushStats, RecorderStorageError> = Ok(FlushStats {
@@ -1640,8 +1802,7 @@ mod tests {
     #[test]
     fn instrumented_checkpoint_records_outcome() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented =
-            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
+        let instrumented = instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let start = Instant::now();
         let result: Result<CheckpointCommitOutcome, RecorderStorageError> =
@@ -1661,8 +1822,7 @@ mod tests {
     #[test]
     fn instrumented_error_records_class() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented =
-            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
+        let instrumented = instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let start = Instant::now();
         let result: Result<FlushStats, RecorderStorageError> =
@@ -1677,6 +1837,95 @@ mod tests {
         let backend_overload =
             backend_metric_name(COUNTER_ERROR_OVERLOAD, RecorderBackendKind::AppendLog);
         assert_eq!(telem.registry().counter_value(&backend_overload), 1);
+    }
+
+    #[test]
+    fn instrumented_storage_rejects_result_backend_mismatch() {
+        use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+
+        let telem = Arc::new(StorageTelemetry::with_defaults());
+        let instrumented = instrumented_test_storage(telem.clone(), RecorderBackendKind::Rusqlite);
+        let request = AppendRequest {
+            batch_id: "wrong-backend".to_string(),
+            events: Vec::new(),
+            required_durability: crate::recorder_storage::DurabilityLevel::Enqueued,
+            producer_ts_ms: 0,
+        };
+        let response = AppendResponse {
+            backend: RecorderBackendKind::AppendLog,
+            accepted_count: 1,
+            first_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            },
+            last_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            },
+            committed_durability: crate::recorder_storage::DurabilityLevel::Enqueued,
+            committed_at_ms: 0,
+            was_idempotent_replay: false,
+        };
+        let cx = crate::cx::for_request();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(instrumented.append_batch_instrumented_with_cx(
+                &cx,
+                request,
+                Ok(response),
+                Instant::now(),
+            ))
+            .unwrap_err();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        assert!(matches!(
+            error,
+            RecorderStorageError::BackendIdentityMismatch {
+                operation: "append_batch",
+                expected_backend: RecorderBackendKind::Rusqlite,
+                actual_backend: RecorderBackendKind::AppendLog,
+            }
+        ));
+        assert_eq!(
+            telem
+                .snapshot_for_backend(RecorderBackendKind::Rusqlite)
+                .errors
+                .corruption,
+            1
+        );
+        assert_eq!(
+            telem
+                .snapshot_for_backend(RecorderBackendKind::AppendLog)
+                .total_events_appended,
+            0
+        );
+    }
+
+    #[test]
+    fn instrumented_health_rejects_backend_mismatch_without_publishing_health() {
+        let telem = Arc::new(StorageTelemetry::with_defaults());
+        let instrumented = instrumented_test_storage(telem.clone(), RecorderBackendKind::Rusqlite);
+        let health = make_health(1, 4, false);
+
+        let error = instrumented.health_instrumented(&health).unwrap_err();
+        assert!(matches!(
+            error,
+            RecorderStorageError::BackendIdentityMismatch {
+                operation: "health",
+                expected_backend: RecorderBackendKind::Rusqlite,
+                actual_backend: RecorderBackendKind::AppendLog,
+            }
+        ));
+        let snapshot = telem.snapshot_for_backend(RecorderBackendKind::Rusqlite);
+        assert!(snapshot.health.is_none());
+        assert_eq!(snapshot.errors.corruption, 1);
     }
 
     #[test]
@@ -1719,6 +1968,7 @@ mod tests {
             },
             committed_durability: DurabilityLevel::Enqueued,
             committed_at_ms: 0,
+            was_idempotent_replay: false,
         };
         let cx = crate::cx::for_request();
 
@@ -1790,17 +2040,13 @@ mod tests {
                     },
                     committed_durability: DurabilityLevel::Enqueued,
                     committed_at_ms: 0,
+                    was_idempotent_replay: false,
                 };
 
                 let start = Instant::now();
                 let cx = crate::cx::for_request();
                 let out = instrumented
-                    .append_batch_instrumented_with_cx(
-                        &cx,
-                        req,
-                        Ok(resp.clone()),
-                        start,
-                    )
+                    .append_batch_instrumented_with_cx(&cx, req, Ok(resp.clone()), start)
                     .await
                     .unwrap();
 
@@ -1866,6 +2112,7 @@ mod tests {
                     },
                     committed_durability: DurabilityLevel::Enqueued,
                     committed_at_ms: 0,
+                    was_idempotent_replay: false,
                 };
                 let successful_result = instrumented
                     .append_batch_instrumented_with_cx(
@@ -2262,5 +2509,33 @@ mod tests {
         assert_eq!(snap.total_flushes, 0);
         assert_eq!(snap.total_checkpoints, 0);
         assert_eq!(snap.slo_append_p95, SloStatus::Unknown);
+    }
+
+    #[test]
+    fn backend_snapshot_never_inherits_another_backends_health_lag_or_rate() {
+        let telem = StorageTelemetry::with_defaults();
+        let append_health = RecorderStorageHealth {
+            backend: RecorderBackendKind::AppendLog,
+            degraded: true,
+            queue_depth: 4,
+            queue_capacity: 4,
+            latest_offset: None,
+            last_error: Some("append-log failure".to_string()),
+        };
+        telem.update_health(append_health.clone());
+        telem.update_lag_for_backend(make_lag(9, 3), RecorderBackendKind::AppendLog);
+        telem.record_append_for_backend(100.0, 5, 1_280, false, RecorderBackendKind::AppendLog);
+
+        let append_snapshot = telem.snapshot_for_backend(RecorderBackendKind::AppendLog);
+        assert_eq!(append_snapshot.health, Some(append_health));
+        assert!(append_snapshot.lag.is_some());
+        assert_eq!(append_snapshot.health_tier, StorageHealthTier::Black);
+        assert!(append_snapshot.append_rate_ewma > 0.0);
+
+        let sqlite_snapshot = telem.snapshot_for_backend(RecorderBackendKind::Rusqlite);
+        assert!(sqlite_snapshot.health.is_none());
+        assert!(sqlite_snapshot.lag.is_none());
+        assert_eq!(sqlite_snapshot.health_tier, StorageHealthTier::Green);
+        assert_eq!(sqlite_snapshot.append_rate_ewma, 0.0);
     }
 }

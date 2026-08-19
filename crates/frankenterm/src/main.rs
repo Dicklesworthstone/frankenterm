@@ -37060,7 +37060,6 @@ async fn bootstrap_recorder_backend_with_probe(
     rusqlite: frankenterm_core::recorder_storage::RusqliteStorageConfig,
 ) -> std::result::Result<frankenterm_core::recorder_storage::RecorderStorageInstance, anyhow::Error>
 {
-    use anyhow::Context as _;
     use frankenterm_core::recorder_storage::{
         RecorderStorage, RecorderStorageConfig, bootstrap_recorder_storage,
     };
@@ -37109,57 +37108,59 @@ fn recorder_backend_lifecycle_payload(
     serde_json::Value::Object(payload)
 }
 
-async fn emit_recorder_backend_lifecycle_event(
-    storage: &frankenterm_core::storage::StorageHandle,
+fn next_recorder_lifecycle_sequence(
+    health: &frankenterm_core::recorder_storage::RecorderStorageHealth,
+) -> anyhow::Result<u64> {
+    health.latest_offset.as_ref().map_or(Ok(0), |offset| {
+        offset.ordinal.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "non-retryable: recorder lifecycle sequence exhausted at ordinal {}",
+                offset.ordinal
+            )
+        })
+    })
+}
+
+fn recorder_backend_lifecycle_event(
     selection: &RecorderBackendStartupSelection,
-) -> anyhow::Result<i64> {
-    use anyhow::Context as _;
-
-    // Ensure the sentinel system pane (pane_id=0) exists so that the foreign
-    // key constraint on events.pane_id is satisfied for system-level events.
-    let now = now_epoch_ms();
-    let system_pane = frankenterm_core::storage::PaneRecord {
+    sequence: u64,
+    now_ms: u64,
+) -> frankenterm_core::recording::RecorderEvent {
+    let mut event = frankenterm_core::recording::RecorderEvent {
+        schema_version: frankenterm_core::recording::RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+        event_id: String::new(),
         pane_id: 0,
-        pane_uuid: None,
-        domain: "system".to_string(),
-        window_id: None,
-        tab_id: None,
-        title: Some("system".to_string()),
-        cwd: None,
-        tty_name: None,
-        first_seen_at: now,
-        last_seen_at: now,
-        observed: false,
-        ignore_reason: Some("system_sentinel".to_string()),
-        last_decision_at: None,
+        session_id: None,
+        workflow_id: None,
+        correlation_id: None,
+        source: frankenterm_core::recording::RecorderEventSource::RecoveryFlow,
+        occurred_at_ms: now_ms,
+        recorded_at_ms: now_ms,
+        sequence,
+        causality: frankenterm_core::recording::RecorderEventCausality::default(),
+        payload: frankenterm_core::recording::RecorderEventPayload::LifecycleMarker {
+            lifecycle_phase: frankenterm_core::recording::RecorderLifecyclePhase::CaptureStarted,
+            reason: Some("recorder_backend_selected".to_string()),
+            details: recorder_backend_lifecycle_payload(selection),
+        },
     };
-    storage
-        .upsert_pane(system_pane)
-        .await
-        .context("failed to upsert system sentinel pane for lifecycle marker")?;
+    event.event_id = frankenterm_core::event_id::generate_event_id_v1(&event);
+    event
+}
 
-    let event = frankenterm_core::storage::StoredEvent {
-        id: 0,
-        pane_id: 0,
-        rule_id: "system.recorder.backend".to_string(),
-        agent_type: "system".to_string(),
-        event_type: "recorder.backend_selected".to_string(),
-        severity: "info".to_string(),
-        confidence: 1.0,
-        extracted: Some(recorder_backend_lifecycle_payload(selection)),
-        matched_text: None,
-        segment_id: None,
-        detected_at: now,
-        dedupe_key: None,
-        handled_at: None,
-        handled_by_workflow_id: None,
-        handled_status: None,
-    };
-
-    storage
-        .record_event(event)
-        .await
-        .context("failed to record recorder backend lifecycle marker")
+async fn emit_recorder_backend_lifecycle_event(
+    cx: &frankenterm_core::cx::Cx,
+    storage: &frankenterm_core::recorder_storage::RecorderStorageInstance,
+    event: frankenterm_core::recording::RecorderEvent,
+) -> anyhow::Result<frankenterm_core::recorder_storage::AppendResponse> {
+    frankenterm_core::runtime::append_runtime_recorder_event_with_cx(
+        cx,
+        storage,
+        event,
+        frankenterm_core::recorder_storage::DurabilityLevel::Fsync,
+    )
+    .await
+    .map_err(anyhow::Error::new)
 }
 
 #[cfg(feature = "distributed")]
@@ -40952,12 +40953,14 @@ async fn run_watcher(
     let requested_recorder_backend = config.storage.recorder_backend;
     let recorder_append_log_config = recorder_append_log_storage_config(layout, &config);
     let recorder_rusqlite_config = recorder_rusqlite_storage_config(layout, &config);
-    let recorder_storage = bootstrap_recorder_backend_with_probe(
-        requested_recorder_backend,
-        recorder_append_log_config,
-        recorder_rusqlite_config,
-    )
-    .await?;
+    let recorder_storage = Arc::new(
+        bootstrap_recorder_backend_with_probe(
+            requested_recorder_backend,
+            recorder_append_log_config,
+            recorder_rusqlite_config,
+        )
+        .await?,
+    );
     let recorder_selected_backend = {
         use frankenterm_core::recorder_storage::RecorderStorage as _;
         recorder_storage.backend_kind()
@@ -40985,21 +40988,31 @@ async fn run_watcher(
         "Recorder backend startup health probe passed"
     );
 
+    let lifecycle_sequence = next_recorder_lifecycle_sequence(&recorder_health)?;
+    let lifecycle_event = recorder_backend_lifecycle_event(
+        &recorder_startup_selection,
+        lifecycle_sequence,
+        u64::try_from(now_epoch_ms()).unwrap_or(0),
+    );
+    let lifecycle_event_id = lifecycle_event.event_id.clone();
+    let lifecycle_response =
+        emit_recorder_backend_lifecycle_event(cx, recorder_storage.as_ref(), lifecycle_event)
+            .await?;
+    tracing::info!(
+        event_id = %lifecycle_event_id,
+        recorder_ordinal = lifecycle_response.last_offset.ordinal,
+        backend = %lifecycle_response.backend,
+        requested_backend = %recorder_startup_selection.requested_backend,
+        migration_epoch = RECORDER_BACKEND_MIGRATION_EPOCH,
+        "Recorded recorder backend lifecycle marker through selected backend"
+    );
+
     // ft-xbnl0.2.3 tick 299: cx-first watch-runtime storage open.
     let watch_storage_cx =
         frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let storage =
         StorageHandle::with_config_with_cx(&watch_storage_cx, &db_path, storage_config).await?;
-    let lifecycle_event_id =
-        emit_recorder_backend_lifecycle_event(&storage, &recorder_startup_selection).await?;
     tracing::info!(db_path = %db_path, "Storage initialized");
-    tracing::info!(
-        event_id = lifecycle_event_id,
-        backend = %recorder_startup_selection.selected_backend,
-        requested_backend = %recorder_startup_selection.requested_backend,
-        migration_epoch = RECORDER_BACKEND_MIGRATION_EPOCH,
-        "Recorded recorder backend lifecycle marker event"
-    );
     let scheduler_storage = storage.clone();
 
     maybe_trigger_e2e_watcher_panic_once(layout);
@@ -41382,6 +41395,7 @@ async fn run_watcher(
     // Create and start the observation runtime (with event bus for workflow integration)
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
         .with_tuning(config.tuning.clone())
+        .with_recorder_storage(Arc::clone(&recorder_storage))
         .with_connector_inbound_bridge_config(
             frankenterm_core::connector_inbound_bridge::ConnectorInboundBridgeConfig {
                 classifier: config.safety.data_classifier.clone(),
@@ -41980,6 +41994,39 @@ async fn run_watcher(
             shutdown_failures.push(anyhow::anyhow!(
                 "observation runtime retained {strong_count} owners and could not be joined"
             ));
+        }
+    }
+
+    {
+        use frankenterm_core::recorder_storage::RecorderStorage as _;
+        match recorder_storage
+            .flush_with_cx(
+                &background_shutdown_cx,
+                frankenterm_core::recorder_storage::FlushMode::Durable,
+            )
+            .await
+        {
+            Ok(stats) if stats.backend == recorder_startup_selection.selected_backend => {
+                tracing::info!(
+                    backend = %stats.backend,
+                    flushed_at_ms = stats.flushed_at_ms,
+                    latest_ordinal = stats.latest_offset.as_ref().map(|offset| offset.ordinal),
+                    "Selected recorder backend reached durable shutdown flush"
+                );
+            }
+            Ok(stats) => {
+                shutdown_failures.push(anyhow::anyhow!(
+                    "selected recorder backend {} returned shutdown flush identity {}",
+                    recorder_startup_selection.selected_backend,
+                    stats.backend
+                ));
+            }
+            Err(error) => {
+                shutdown_failures.push(anyhow::anyhow!(
+                    "selected recorder backend {} failed durable shutdown flush: {error}",
+                    recorder_startup_selection.selected_backend
+                ));
+            }
         }
     }
 
@@ -86878,6 +86925,107 @@ recorder_backend = "rusqlite"
         assert_eq!(payload["requested_backend_kind"], "rusqlite");
         assert_eq!(payload["migration_epoch"], RECORDER_BACKEND_MIGRATION_EPOCH);
         assert!(payload.get("fallback_reason").is_none());
+    }
+
+    #[test]
+    fn watcher_selected_recorder_backend_owns_marker_without_duplicate_or_storagehandle_echo() {
+        run_async_test(async {
+            use frankenterm_core::recorder_storage::{
+                AppendLogStorageConfig, RecorderBackendKind, RecorderEventReader,
+                RecorderStorage as _, RecorderStorageConfig, RecorderStorageInstance,
+                RusqliteStorageConfig, bootstrap_recorder_storage,
+            };
+
+            let temp_root = tempfile::tempdir().expect("create recorder routing tempdir");
+            let selected = bootstrap_recorder_storage(RecorderStorageConfig {
+                backend: RecorderBackendKind::Rusqlite,
+                append_log: AppendLogStorageConfig {
+                    data_path: temp_root.path().join("unused-selected-append/events.log"),
+                    state_path: temp_root.path().join("unused-selected-append/state.json"),
+                    ..AppendLogStorageConfig::default()
+                },
+                rusqlite: RusqliteStorageConfig {
+                    db_path: temp_root.path().join("selected/events.sqlite3"),
+                    ..RusqliteStorageConfig::default()
+                },
+            })
+            .expect("bootstrap selected recorder");
+            let unselected = bootstrap_recorder_storage(RecorderStorageConfig {
+                backend: RecorderBackendKind::AppendLog,
+                append_log: AppendLogStorageConfig {
+                    data_path: temp_root.path().join("unselected/events.log"),
+                    state_path: temp_root.path().join("unselected/state.json"),
+                    ..AppendLogStorageConfig::default()
+                },
+                rusqlite: RusqliteStorageConfig {
+                    db_path: temp_root
+                        .path()
+                        .join("unused-unselected-rusqlite/events.sqlite3"),
+                    ..RusqliteStorageConfig::default()
+                },
+            })
+            .expect("bootstrap unselected recorder");
+            let unrelated_db = temp_root.path().join("capture.sqlite3");
+            let unrelated_db_string = unrelated_db.to_string_lossy().into_owned();
+            let unrelated_storage =
+                frankenterm_core::storage::StorageHandle::new(&unrelated_db_string)
+                    .await
+                    .expect("open unrelated StorageHandle");
+
+            let selection = RecorderBackendStartupSelection {
+                requested_backend: RecorderBackendKind::Rusqlite,
+                selected_backend: RecorderBackendKind::Rusqlite,
+            };
+            let health = selected.health().await;
+            let sequence = next_recorder_lifecycle_sequence(&health)
+                .expect("derive lifecycle sequence from selected backend");
+            let marker = recorder_backend_lifecycle_event(&selection, sequence, 1_700_000_000_000);
+            let cx = frankenterm_core::cx::for_testing();
+
+            let first = emit_recorder_backend_lifecycle_event(&cx, &selected, marker.clone())
+                .await
+                .expect("append selected marker");
+            let retry = emit_recorder_backend_lifecycle_event(&cx, &selected, marker.clone())
+                .await
+                .expect("idempotently retry selected marker");
+
+            assert_eq!(first.backend, RecorderBackendKind::Rusqlite);
+            assert_eq!(retry.backend, RecorderBackendKind::Rusqlite);
+            assert_eq!(retry.first_offset, first.first_offset);
+            assert_eq!(retry.last_offset, first.last_offset);
+            assert_eq!(
+                selected.health().await.latest_offset.map(|o| o.ordinal),
+                Some(0)
+            );
+            assert!(
+                unselected.health().await.latest_offset.is_none(),
+                "the unselected recorder backend must receive no marker"
+            );
+            assert!(
+                unrelated_storage
+                    .get_events(frankenterm_core::storage::EventQuery::default())
+                    .await
+                    .expect("read unrelated event storage")
+                    .is_empty(),
+                "backend selection marker must not be echoed into StorageHandle"
+            );
+
+            let RecorderStorageInstance::Rusqlite(selected_rusqlite) = &selected else {
+                panic!("test selected rusqlite recorder");
+            };
+            let reader = selected_rusqlite.event_reader();
+            let mut cursor = reader
+                .open_cursor_from_start()
+                .expect("open selected recorder cursor");
+            let records = cursor.next_batch(2).expect("read selected marker");
+            assert_eq!(records.len(), 1, "retry must not duplicate marker");
+            assert_eq!(records[0].event, marker);
+
+            unrelated_storage
+                .shutdown()
+                .await
+                .expect("shutdown unrelated StorageHandle");
+        });
     }
 
     #[test]

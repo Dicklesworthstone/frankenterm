@@ -25,6 +25,7 @@ use frankenterm_core::error::{
     RemediationCommand, RuntimeOperationSource, StorageError, WatchdogWarningSource, WeztermError,
     WorkflowError, format_error_with_remediation,
 };
+use frankenterm_core::recorder_storage::{RecorderBackendKind, select_recorder_backend};
 use frankenterm_core::submit_idempotency_store::SubmitIdempotencyError;
 
 // =============================================================================
@@ -188,6 +189,9 @@ fn arb_config_error() -> impl Strategy<Value = ConfigError> {
         arb_nonempty_string().prop_map(ConfigError::ParseFailed),
         arb_nonempty_string().prop_map(ConfigError::SerializeFailed),
         arb_nonempty_string().prop_map(ConfigError::ValidationError),
+        (0..1u8).prop_map(|_| ConfigError::RecorderBackendSelection(
+            select_recorder_backend(RecorderBackendKind::FrankenSqlite).unwrap_err(),
+        )),
     ]
 }
 

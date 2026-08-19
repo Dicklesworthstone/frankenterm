@@ -79,6 +79,8 @@ pub trait RecorderStorage: Send + Sync {
 ```rust
 pub enum RecorderBackendKind {
     AppendLog,
+    Rusqlite,
+    // Reserved identity; no FrankenSQLite engine is wired yet.
     FrankenSqlite,
 }
 ```
@@ -105,6 +107,7 @@ pub struct AppendResponse {
     pub last_offset: RecorderOffset,
     pub committed_durability: DurabilityLevel,
     pub committed_at_ms: u64,
+    pub was_idempotent_replay: bool,
 }
 
 pub struct RecorderOffset {
@@ -115,7 +118,9 @@ pub struct RecorderOffset {
 ```
 
 Norms:
-- `batch_id` must be idempotency-safe. Duplicate `batch_id` append attempts must return the original committed result (or a deterministic idempotency error).
+- Within a backend's documented retention window, replaying a `batch_id` with the same ordered event content returns the original offsets/count and sets the transient `was_idempotent_replay` bit. The canonical persisted receipt always stores that bit as `false`.
+- Reusing a retained `batch_id` for different ordered event content is a typed, zero-mutation conflict. A replay may request stronger durability; the backend must upgrade the already-written batch without duplicating events.
+- Retention is backend-specific: Rusqlite persists receipt/content authority across reopen, while AppendLog's general-purpose receipt cache is process-local. Crash recovery that needs stronger AppendLog guarantees must use its own durable delivery authority and exact event scan.
 - `events` must preserve producer order. Storage may reject out-of-contract ordering but may not silently reorder.
 - `RecorderOffset.ordinal` is globally monotonic for the chosen backend instance and is the canonical replay/index cursor.
 
@@ -149,15 +154,16 @@ Norms:
 ### Proposed config shape
 
 Current shipped behavior note:
-- `append_log` is the only recorder backend that `bootstrap_recorder_storage(...)` can open today.
-- `frankensqlite` remains a design/rollout target under `ft-oegrb.3.3`; selecting it in live config currently returns `BackendUnavailable` instead of silently falling back.
+- `bootstrap_recorder_storage(...)` can open the implemented `append_log` and `rusqlite` backends.
+- `frankensqlite` remains a reserved design/rollout target under `ft-oegrb.3.3`; selecting it is rejected before filesystem or database I/O with the shared typed `RecorderBackendSelectionError`. It never silently falls back to either implemented backend.
+- The live high-level selector is `storage.recorder_backend`; the fuller fallback policy below remains a proposed configuration model rather than shipped behavior.
 
 ```toml
 [recorder]
 enabled = false
 
 [recorder.storage]
-backend = "append_log"           # shipped today; frankensqlite is rollout/test-only for now
+backend = "append_log"           # proposed nested form; append_log and rusqlite are implemented
 fallback_backend = "append_log"  # deterministic fallback target
 startup_policy = "fail_closed"   # fail_closed | fallback
 runtime_error_policy = "degrade" # degrade | fallback | stop_capture

@@ -11,7 +11,9 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::recorder_migration::{MigrationConfig, MigrationEngine, MigrationManifest};
+use frankenterm_core::recorder_migration::{
+    MigrationConfig, MigrationEngine, MigrationError, MigrationManifest,
+};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointConsumerId,
     CursorRecord, DurabilityLevel, EventCursorError, RecorderBackendKind, RecorderCheckpoint,
@@ -19,7 +21,7 @@ use frankenterm_core::recorder_storage::{
 };
 use frankenterm_core::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-    RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
+    RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel, RecorderTextEncoding,
 };
 use std::fs::File;
 use std::io::{ErrorKind, Read};
@@ -966,11 +968,11 @@ fn test_m3_real_lag_omits_consumers_without_checkpoints() {
 }
 
 // ===========================================================================
-// Section 5: M5 cutover tests
+// Section 5: M5 readiness tests
 // ===========================================================================
 
 #[test]
-fn test_m5_emits_lifecycle_marker() {
+fn test_m5_emits_readiness_marker_without_activation_claim() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let target = AppendLogStorageFixture::new();
@@ -980,30 +982,50 @@ fn test_m5_emits_lifecycle_marker() {
             first_ordinal: 0,
             last_ordinal: 99,
             export_digest: 0xCAFE,
+            export_count: 100,
+            import_digest: 0xCAFE,
+            import_count: 100,
             ..Default::default()
         };
 
         let result = engine
-            .m5_cutover(&target.storage, &manifest, 1708000000, None)
+            .m5_mark_ready(&target.storage, &manifest, 1708000000, None)
             .await
             .unwrap();
 
-        assert_eq!(result.activated_backend, RecorderBackendKind::AppendLog);
+        assert_eq!(result.target_backend, RecorderBackendKind::AppendLog);
         assert_eq!(result.migration_epoch_ms, 1708000000);
-        assert!(result.target_healthy);
-        assert!(result.source_retained_path.is_none());
+        assert_eq!(result.marker_offset.ordinal, 0);
+        assert!(result.source_path_hint.is_none());
 
         let records = target.records();
         assert_eq!(records.len(), 1);
 
         let marker = &records[0].event;
-        assert!(marker.event_id.contains("cutover"));
+        assert_eq!(marker.event_id.len(), 64);
+        assert!(
+            marker
+                .event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(
+            marker.event_id,
+            frankenterm_core::event_id::generate_event_id_v1(marker)
+        );
         assert_eq!(marker.sequence, 100); // last_ordinal + 1
+        assert!(matches!(
+            &marker.payload,
+            RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase: RecorderLifecyclePhase::MigrationReadyForActivation,
+                ..
+            }
+        ));
     });
 }
 
 #[test]
-fn test_m5_switches_backend_selector() {
+fn test_m5_reports_target_backend_without_selector_claim() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let target = AppendLogStorageFixture::new();
@@ -1011,17 +1033,16 @@ fn test_m5_switches_backend_selector() {
         let manifest = MigrationManifest::default();
 
         let result = engine
-            .m5_cutover(&target.storage, &manifest, 1000, None)
+            .m5_mark_ready(&target.storage, &manifest, 1000, None)
             .await
             .unwrap();
 
-        // Activation reports the exact backend implemented by the target.
-        assert_eq!(result.activated_backend, RecorderBackendKind::AppendLog);
+        assert_eq!(result.target_backend, RecorderBackendKind::AppendLog);
     });
 }
 
 #[test]
-fn test_m5_preserves_source_files() {
+fn test_m5_returns_source_path_hint_without_claiming_retention() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let target = AppendLogStorageFixture::new();
@@ -1029,7 +1050,7 @@ fn test_m5_preserves_source_files() {
         let manifest = MigrationManifest::default();
 
         let result = engine
-            .m5_cutover(
+            .m5_mark_ready(
                 &target.storage,
                 &manifest,
                 1000,
@@ -1039,14 +1060,14 @@ fn test_m5_preserves_source_files() {
             .unwrap();
 
         assert_eq!(
-            result.source_retained_path,
+            result.source_path_hint,
             Some("/data/events.log".to_string())
         );
     });
 }
 
 #[test]
-fn test_m5_verifies_target_health_post_activation() {
+fn test_m5_degraded_preflight_fails_before_marker_io() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let target = AppendLogStorageFixture::with_config(|config| {
@@ -1073,13 +1094,16 @@ fn test_m5_verifies_target_health_post_activation() {
         let engine = MigrationEngine::new(MigrationConfig::default());
         let manifest = MigrationManifest::default();
 
-        let result = engine
-            .m5_cutover(&target.storage, &manifest, 1000, None)
+        let error = engine
+            .m5_mark_ready(&target.storage, &manifest, 1000, None)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert!(result.target_healthy);
-        assert!(!target.storage.health().await.degraded);
+        assert!(matches!(
+            error,
+            MigrationError::TargetDegradedBeforeMarker { .. }
+        ));
+        assert_eq!(target.event_count(), 0);
     });
 }
 
@@ -1094,7 +1118,7 @@ fn test_m5_write_failure_propagates() {
         let manifest = MigrationManifest::default();
 
         let result = engine
-            .m5_cutover(&target.storage, &manifest, 1000, None)
+            .m5_mark_ready(&target.storage, &manifest, 1000, None)
             .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -1111,7 +1135,7 @@ fn test_m5_marker_batch_uses_fsync_durability() {
         let manifest = MigrationManifest::default();
 
         engine
-            .m5_cutover(&target.storage, &manifest, 1000, None)
+            .m5_mark_ready(&target.storage, &manifest, 1000, None)
             .await
             .unwrap();
 

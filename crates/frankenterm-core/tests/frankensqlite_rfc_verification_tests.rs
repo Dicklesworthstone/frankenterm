@@ -1,9 +1,10 @@
 #![allow(clippy::trivially_copy_pass_by_ref, clippy::unnecessary_literal_bound)]
 //! E5.F2.T1: RFC verification tests for upstream extraction patterns.
 //!
-//! Validates the three RFC patterns (EventSource/Cursor, Migration Engine,
-//! Rollout Gates) are implementable, object-safe, serializable, and
-//! satisfy their documented invariants.
+//! Exercises three isolated legacy RFC sketches (EventSource/Cursor,
+//! Migration Engine, and Rollout Gates). These local model types are not the
+//! production `MigrationEngine` contract and do not prove live resumability,
+//! source quiescence, target readback, or selector activation.
 
 use std::collections::BTreeSet;
 
@@ -114,7 +115,7 @@ fn make_test_events(count: u64, panes: u64) -> Vec<RfcEvent> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// RFC 2: Migration Engine M0-M5 stage model
+// RFC 2: legacy migration-stage sketch (not the production engine)
 // ═══════════════════════════════════════════════════════════════════════
 
 #[derive(
@@ -127,7 +128,7 @@ enum MigrationStage {
     M2BulkCopy,
     M3Verify,
     M4Catchup,
-    M5Cutover,
+    M5Readiness,
 }
 
 impl MigrationStage {
@@ -138,7 +139,7 @@ impl MigrationStage {
             Self::M2BulkCopy,
             Self::M3Verify,
             Self::M4Catchup,
-            Self::M5Cutover,
+            Self::M5Readiness,
         ]
     }
 
@@ -149,12 +150,20 @@ impl MigrationStage {
             Self::M2BulkCopy => Some(Self::M1SchemaPrep),
             Self::M3Verify => Some(Self::M2BulkCopy),
             Self::M4Catchup => Some(Self::M3Verify),
-            Self::M5Cutover => Some(Self::M4Catchup),
+            Self::M5Readiness => Some(Self::M4Catchup),
         }
     }
 
     fn is_read_only(&self) -> bool {
-        !matches!(self, Self::M5Cutover)
+        matches!(
+            self,
+            Self::M0Inventory
+                | Self::M1SchemaPrep
+                | Self::M2BulkCopy
+                | Self::M3Verify
+                | Self::M4Catchup
+                | Self::M5Readiness
+        )
     }
 
     fn label(&self) -> &'static str {
@@ -164,13 +173,13 @@ impl MigrationStage {
             Self::M2BulkCopy => "Bulk Copy",
             Self::M3Verify => "Verify",
             Self::M4Catchup => "Catchup",
-            Self::M5Cutover => "Cutover",
+            Self::M5Readiness => "Readiness",
         }
     }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct MigrationCheckpoint {
+struct RfcSketchMigrationCheckpoint {
     stage: MigrationStage,
     progress_pct: f64,
     events_processed: u64,
@@ -178,8 +187,8 @@ struct MigrationCheckpoint {
     is_complete: bool,
 }
 
-impl MigrationCheckpoint {
-    fn is_resumable(&self) -> bool {
+impl RfcSketchMigrationCheckpoint {
+    fn has_partial_progress_hint(&self) -> bool {
         !self.is_complete && self.events_processed > 0
     }
 }
@@ -366,39 +375,39 @@ fn test_empty_source_empty_cursor() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_migration_engine_is_resumable() {
-    let cp = MigrationCheckpoint {
+fn rfc_sketch_marks_incomplete_nonzero_progress_as_a_resume_hint() {
+    let cp = RfcSketchMigrationCheckpoint {
         stage: MigrationStage::M2BulkCopy,
         progress_pct: 47.0,
         events_processed: 470,
         events_total: 1000,
         is_complete: false,
     };
-    assert!(cp.is_resumable());
+    assert!(cp.has_partial_progress_hint());
 }
 
 #[test]
-fn test_migration_checkpoint_complete_not_resumable() {
-    let cp = MigrationCheckpoint {
+fn rfc_sketch_complete_checkpoint_has_no_resume_hint() {
+    let cp = RfcSketchMigrationCheckpoint {
         stage: MigrationStage::M2BulkCopy,
         progress_pct: 100.0,
         events_processed: 1000,
         events_total: 1000,
         is_complete: true,
     };
-    assert!(!cp.is_resumable());
+    assert!(!cp.has_partial_progress_hint());
 }
 
 #[test]
-fn test_migration_checkpoint_zero_progress_not_resumable() {
-    let cp = MigrationCheckpoint {
+fn rfc_sketch_zero_progress_checkpoint_has_no_resume_hint() {
+    let cp = RfcSketchMigrationCheckpoint {
         stage: MigrationStage::M0Inventory,
         progress_pct: 0.0,
         events_processed: 0,
         events_total: 100,
         is_complete: false,
     };
-    assert!(!cp.is_resumable());
+    assert!(!cp.has_partial_progress_hint());
 }
 
 #[test]
@@ -412,7 +421,7 @@ fn test_migration_stages_ordered() {
 #[test]
 fn test_migration_predecessor_chain() {
     assert_eq!(
-        MigrationStage::M5Cutover.predecessor(),
+        MigrationStage::M5Readiness.predecessor(),
         Some(MigrationStage::M4Catchup)
     );
     assert_eq!(
@@ -423,21 +432,19 @@ fn test_migration_predecessor_chain() {
 }
 
 #[test]
-fn test_migration_m0_through_m4_read_only() {
+fn test_migration_m0_through_m5_read_only() {
     for stage in MigrationStage::all() {
-        if stage != MigrationStage::M5Cutover {
-            assert!(
-                stage.is_read_only(),
-                "Stage {:?} should be read-only",
-                stage
-            );
-        }
+        assert!(
+            stage.is_read_only(),
+            "Stage {:?} should be read-only",
+            stage
+        );
     }
 }
 
 #[test]
-fn test_migration_m5_not_read_only() {
-    assert!(!MigrationStage::M5Cutover.is_read_only());
+fn test_migration_m5_readiness_is_read_only() {
+    assert!(MigrationStage::M5Readiness.is_read_only());
 }
 
 #[test]
@@ -451,7 +458,7 @@ fn test_migration_stage_serde_roundtrip() {
 
 #[test]
 fn test_migration_checkpoint_serde_roundtrip() {
-    let cp = MigrationCheckpoint {
+    let cp = RfcSketchMigrationCheckpoint {
         stage: MigrationStage::M3Verify,
         progress_pct: 75.5,
         events_processed: 755,
@@ -459,7 +466,7 @@ fn test_migration_checkpoint_serde_roundtrip() {
         is_complete: false,
     };
     let json = serde_json::to_string(&cp).unwrap();
-    let back: MigrationCheckpoint = serde_json::from_str(&json).unwrap();
+    let back: RfcSketchMigrationCheckpoint = serde_json::from_str(&json).unwrap();
     assert_eq!(cp.stage, back.stage);
     assert_eq!(cp.events_processed, back.events_processed);
 }

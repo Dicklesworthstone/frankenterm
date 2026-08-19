@@ -126,11 +126,12 @@ fn rs_duplicate_batch_id_is_idempotent() {
         let cfg = test_config(dir.path());
         let data_path = cfg.data_path.clone();
         let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+        let event = sample_event("e1", 1, 0, "one");
 
         let first = storage
             .append_batch(AppendRequest {
                 batch_id: "same-batch".to_string(),
-                events: vec![sample_event("e1", 1, 0, "one")],
+                events: vec![event.clone()],
                 required_durability: DurabilityLevel::Appended,
                 producer_ts_ms: 1,
             })
@@ -141,7 +142,7 @@ fn rs_duplicate_batch_id_is_idempotent() {
         let second = storage
             .append_batch(AppendRequest {
                 batch_id: "same-batch".to_string(),
-                events: vec![sample_event("e2", 1, 1, "two")],
+                events: vec![event],
                 required_durability: DurabilityLevel::Appended,
                 producer_ts_ms: 2,
             })
@@ -149,7 +150,14 @@ fn rs_duplicate_batch_id_is_idempotent() {
             .unwrap();
         let after_len = std::fs::metadata(&data_path).unwrap().len();
 
-        assert_eq!(first, second);
+        assert_eq!(first.backend, second.backend);
+        assert_eq!(first.accepted_count, second.accepted_count);
+        assert_eq!(first.first_offset, second.first_offset);
+        assert_eq!(first.last_offset, second.last_offset);
+        assert_eq!(first.committed_durability, second.committed_durability);
+        assert_eq!(first.committed_at_ms, second.committed_at_ms);
+        assert!(!first.was_idempotent_replay);
+        assert!(second.was_idempotent_replay);
         assert_eq!(before_len, after_len);
     });
 }

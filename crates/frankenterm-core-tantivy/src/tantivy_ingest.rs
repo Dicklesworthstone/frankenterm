@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use frankenterm_core::recorder_storage::{
-    CheckpointConsumerId, RecorderCheckpoint, RecorderOffset, RecorderStorage, RecorderStorageError,
+    CheckpointConsumerId, RecorderBackendKind, RecorderCheckpoint, RecorderOffset,
+    RecorderSourceDescriptor, RecorderStorage, RecorderStorageError,
 };
 use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventPayload, RecorderRedactionLevel,
@@ -269,7 +270,8 @@ fn format_control_marker(t: frankenterm_core::recording::RecorderControlMarkerTy
 
 fn format_lifecycle_phase(p: frankenterm_core::recording::RecorderLifecyclePhase) -> String {
     use frankenterm_core::recording::RecorderLifecyclePhase::{
-        CaptureStarted, CaptureStopped, PaneClosed, PaneOpened, ReplayFinished, ReplayStarted,
+        CaptureStarted, CaptureStopped, MigrationReadyForActivation, PaneClosed, PaneOpened,
+        ReplayFinished, ReplayStarted,
     };
     match p {
         CaptureStarted => "capture_started",
@@ -278,6 +280,7 @@ fn format_lifecycle_phase(p: frankenterm_core::recording::RecorderLifecyclePhase
         PaneClosed => "pane_closed",
         ReplayStarted => "replay_started",
         ReplayFinished => "replay_finished",
+        MigrationReadyForActivation => "migration_ready_for_activation",
     }
     .to_string()
 }
@@ -802,7 +805,8 @@ pub struct IndexerConfig {
 
 impl IndexerConfig {
     /// Convenience accessor for the data path when the source is append-log.
-    /// Returns `None` for non-file backends.
+    /// Returns `None` for every non-append-log source, including file-backed
+    /// rusqlite sources; use [`Self::source`] for backend-neutral access.
     pub fn data_path(&self) -> Option<&Path> {
         match &self.source {
             frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
@@ -897,6 +901,12 @@ pub enum IndexerError {
         expected: String,
         actual: String,
     },
+    /// The configured event source and checkpoint storage name different backends.
+    BackendIdentityMismatch {
+        operation: &'static str,
+        source_backend: RecorderBackendKind,
+        storage_backend: RecorderBackendKind,
+    },
     /// Configuration error.
     Config(String),
 }
@@ -915,6 +925,14 @@ impl std::fmt::Display for IndexerError {
             } => write!(
                 f,
                 "schema mismatch for event {event_id} at ordinal {ordinal}: expected {expected}, got {actual}"
+            ),
+            Self::BackendIdentityMismatch {
+                operation,
+                source_backend,
+                storage_backend,
+            } => write!(
+                f,
+                "{operation} backend identity mismatch: source is {source_backend}, checkpoint storage is {storage_backend}"
             ),
             Self::Config(msg) => write!(f, "config: {msg}"),
         }
@@ -939,6 +957,25 @@ impl From<IndexWriteError> for IndexerError {
     fn from(e: IndexWriteError) -> Self {
         Self::IndexWrite(e)
     }
+}
+
+/// Fail closed before reading checkpoints or mutating an index when the event
+/// stream and checkpoint store do not describe the same recorder backend.
+pub(crate) fn ensure_source_matches_storage<S: RecorderStorage>(
+    operation: &'static str,
+    source: &RecorderSourceDescriptor,
+    storage: &S,
+) -> Result<(), IndexerError> {
+    let source_backend = source.backend_kind();
+    let storage_backend = storage.backend_kind();
+    if source_backend != storage_backend {
+        return Err(IndexerError::BackendIdentityMismatch {
+            operation,
+            source_backend,
+            storage_backend,
+        });
+    }
+    Ok(())
 }
 
 /// Incremental indexer that bridges the append log to a search index.
@@ -1002,6 +1039,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         &mut self,
         storage: &S,
     ) -> Result<IndexerRunResult, IndexerError> {
+        ensure_source_matches_storage("incremental index", &self.config.source, storage)?;
         if self.config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -1112,6 +1150,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         cx.checkpoint()
             .map_err(|err| IndexerError::Config(format!("run cancelled pre-start: {err}")))?;
 
+        ensure_source_matches_storage("incremental index", &self.config.source, storage)?;
+
         if self.config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -1215,6 +1255,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         storage: &S,
         reader: &dyn frankenterm_core::recorder_storage::RecorderEventReader,
     ) -> Result<IndexerRunResult, IndexerError> {
+        ensure_source_matches_storage("incremental index", &self.config.source, storage)?;
         if self.config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -1334,6 +1375,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         cx.checkpoint().map_err(|err| {
             IndexerError::Config(format!("run_with_reader cancelled pre-start: {err}"))
         })?;
+
+        ensure_source_matches_storage("incremental index", &self.config.source, storage)?;
 
         if self.config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
@@ -1607,6 +1650,7 @@ mod tests {
     #[test]
     fn indexer_config_create_event_reader_rusqlite_opens_empty_reader() {
         let dir = tempdir().unwrap();
+        let _storage = RusqliteRecorderStorage::open(test_sqlite_config(dir.path())).unwrap();
         let cfg = IndexerConfig {
             source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::Rusqlite {
                 db_path: dir.path().join("recorder.sqlite3"),
@@ -1944,6 +1988,69 @@ mod tests {
             assert_eq!(second_result.events_indexed, 1);
             assert_eq!(second_result.final_ordinal, Some(2));
             assert!(second_result.caught_up);
+        });
+    }
+
+    #[test]
+    fn incremental_indexer_backend_mismatch_both_directions_has_zero_mutation() {
+        run_async_test(async {
+            let append_dir = tempdir().unwrap();
+            let append_storage =
+                AppendLogRecorderStorage::open(test_storage_config(append_dir.path())).unwrap();
+            let missing_db = append_dir.path().join("must-not-be-created.sqlite3");
+            let config = IndexerConfig {
+                source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::Rusqlite {
+                    db_path: missing_db.clone(),
+                },
+                consumer_id: "mismatch-rusqlite-source".to_string(),
+                ..IndexerConfig::default()
+            };
+            let reader = AppendLogEventSource::from_storage(&append_storage);
+            let mut indexer = IncrementalIndexer::new(config, MockIndexWriter::new());
+
+            let error = indexer
+                .run_with_reader(&append_storage, &reader)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                IndexerError::BackendIdentityMismatch {
+                    source_backend: RecorderBackendKind::Rusqlite,
+                    storage_backend: RecorderBackendKind::AppendLog,
+                    ..
+                }
+            ));
+            assert!(indexer.writer().docs.is_empty());
+            assert!(indexer.writer().deleted_ids.is_empty());
+            assert_eq!(indexer.writer().commits, 0);
+            assert!(!missing_db.exists());
+
+            let sqlite_dir = tempdir().unwrap();
+            let sqlite_storage =
+                RusqliteRecorderStorage::open(test_sqlite_config(sqlite_dir.path())).unwrap();
+            let missing_log = sqlite_dir.path().join("must-not-be-created.log");
+            let config = IndexerConfig {
+                source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                    data_path: missing_log.clone(),
+                },
+                consumer_id: "mismatch-append-source".to_string(),
+                ..IndexerConfig::default()
+            };
+            let mut indexer = IncrementalIndexer::new(config, MockIndexWriter::new());
+
+            let error = indexer.run(&sqlite_storage).await.unwrap_err();
+            assert!(matches!(
+                error,
+                IndexerError::BackendIdentityMismatch {
+                    source_backend: RecorderBackendKind::AppendLog,
+                    storage_backend: RecorderBackendKind::Rusqlite,
+                    ..
+                }
+            ));
+            assert!(indexer.writer().docs.is_empty());
+            assert!(indexer.writer().deleted_ids.is_empty());
+            assert_eq!(indexer.writer().commits, 0);
+            assert!(!missing_log.exists());
         });
     }
 
@@ -3288,6 +3395,10 @@ mod tests {
         assert_eq!(
             format_lifecycle_phase(RecorderLifecyclePhase::ReplayFinished),
             "replay_finished"
+        );
+        assert_eq!(
+            format_lifecycle_phase(RecorderLifecyclePhase::MigrationReadyForActivation),
+            "migration_ready_for_activation"
         );
     }
 

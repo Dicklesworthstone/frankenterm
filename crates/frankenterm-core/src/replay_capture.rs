@@ -492,24 +492,60 @@ impl CaptureAdapter {
         Ok(())
     }
 
-    /// Capture an egress event from an [`EgressEvent`] (pre-built metadata).
+    /// Prepare an egress event from an [`EgressEvent`] (pre-built metadata).
     ///
     /// This path is used when the upstream already has an EgressEvent struct
     /// (e.g., from an existing EgressTap implementation). The authoritative
     /// `EgressEvent::sequence` is preserved and advances the pane frontier.
-    pub fn capture_egress_event(
+    ///
+    /// The returned event is not sent to this adapter's sink. This split is
+    /// intentional: the observation runtime uses the same canonical identity,
+    /// sequence, and redaction logic before awaiting its selected durable
+    /// recorder backend. Callers must not call this method and then call
+    /// [`Self::capture_egress_event`] for the same event, because preparation
+    /// consumes the supplied per-pane sequence exactly once.
+    pub fn prepare_egress_event(
         &self,
         egress: &EgressEvent,
-    ) -> Result<(), ReplayCaptureSequenceError> {
+    ) -> Result<Option<(RecorderEvent, RecorderMergeKey)>, ReplayCaptureSequenceError> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(None);
         }
 
         let sequence = self.reconcile_supplied_pane_seq(egress.pane_id, egress.sequence)?;
+        Ok(self.prepare_egress_event_with_sequence(egress, sequence))
+    }
+
+    /// Prepare an egress event whose sequence was assigned by an upstream
+    /// durable authority.
+    ///
+    /// Unlike [`Self::prepare_egress_event`], this method does not advance the
+    /// adapter-local frontier. The recorder-storage path uses a deterministic
+    /// batch ID derived from the returned event, so retrying the same durable
+    /// event is idempotent instead of being misclassified as a sequence
+    /// regression. The reserved terminal sequence remains rejected.
+    pub fn prepare_authoritative_egress_event(
+        &self,
+        egress: &EgressEvent,
+    ) -> Result<Option<(RecorderEvent, RecorderMergeKey)>, ReplayCaptureSequenceError> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        if egress.sequence == u64::MAX {
+            return Err(ReplayCaptureSequenceError::ReservedSuppliedSequence {
+                pane_id: egress.pane_id,
+            });
+        }
+        Ok(self.prepare_egress_event_with_sequence(egress, egress.sequence))
+    }
+
+    fn prepare_egress_event_with_sequence(
+        &self,
+        egress: &EgressEvent,
+        sequence: u64,
+    ) -> Option<(RecorderEvent, RecorderMergeKey)> {
         let recorded_at_ms = epoch_ms_now();
-        let Some(redacted) = self.redaction.apply(&egress.text, egress.redaction) else {
-            return Ok(());
-        };
+        let redacted = self.redaction.apply(&egress.text, egress.redaction)?;
 
         let payload = RecorderEventPayload::EgressOutput {
             text: redacted.text,
@@ -546,6 +582,22 @@ impl CaptureAdapter {
             stream_kind: StreamKind::from_payload(&event.payload),
             sequence: event.sequence,
             event_id: event.event_id.clone(),
+        };
+
+        Some((event, merge_key))
+    }
+
+    /// Capture an egress event from an [`EgressEvent`] (pre-built metadata).
+    ///
+    /// This sink-facing wrapper delegates event construction to
+    /// [`Self::prepare_egress_event`] so replay sinks and selected recorder
+    /// storage consume identical redaction and identity semantics.
+    pub fn capture_egress_event(
+        &self,
+        egress: &EgressEvent,
+    ) -> Result<(), ReplayCaptureSequenceError> {
+        let Some((event, merge_key)) = self.prepare_egress_event(egress)? else {
+            return Ok(());
         };
 
         self.record_capture_success();

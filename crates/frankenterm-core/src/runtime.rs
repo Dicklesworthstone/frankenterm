@@ -72,6 +72,7 @@ use crate::ingest::{
     CapturedSegment, CapturedSegmentKind, PaneCursor, PaneLifecycleContinuity,
     PaneLifecycleIdentity, PaneLifecycleRevision, PaneMetadataChange, PaneMetadataRevision,
     PaneRegistry, PersistedCapture, bounded_segment_for_persistence,
+    persist_authorized_captured_segment_with_zone_and_recorder_delivery_with_cx,
     persist_authorized_captured_segment_with_zone_with_cx,
 };
 use crate::lru_cache::LruCache;
@@ -379,25 +380,41 @@ async fn persist_captured_segment_for_runtime(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
     zone_type: Option<&str>,
+    recorder_delivery: Option<crate::storage::RecorderDeliverySeed>,
     persistence_guard: &CapturePersistenceGuard,
 ) -> Result<PersistedCapture> {
-    persist_authorized_captured_segment_with_zone_with_cx(
-        runtime_cx,
-        storage,
-        captured,
-        max_segment_bytes,
-        zone_type,
-        persistence_guard,
-    )
-    .await
+    match recorder_delivery {
+        Some(recorder_delivery) => {
+            persist_authorized_captured_segment_with_zone_and_recorder_delivery_with_cx(
+                runtime_cx,
+                storage,
+                captured,
+                max_segment_bytes,
+                zone_type,
+                recorder_delivery,
+                persistence_guard,
+            )
+            .await
+        }
+        None => {
+            persist_authorized_captured_segment_with_zone_with_cx(
+                runtime_cx,
+                storage,
+                captured,
+                max_segment_bytes,
+                zone_type,
+                persistence_guard,
+            )
+            .await
+        }
+    }
 }
 
-fn record_authorized_replay_egress(
-    adapter: &crate::replay_capture::CaptureAdapter,
+fn authorized_recorder_egress_event(
     captured: &CapturedSegment,
     durable_sequence: u64,
     persistence_guard: &CapturePersistenceGuard,
-) -> std::result::Result<(), crate::replay_capture::ReplayCaptureSequenceError> {
+) -> crate::recording::EgressEvent {
     debug_assert_eq!(
         captured.pane_id,
         persistence_guard.stamp().global_pane_id(),
@@ -408,7 +425,7 @@ fn record_authorized_replay_egress(
         CapturedSegmentKind::Gap { reason } => Some(reason.clone()),
         CapturedSegmentKind::Delta => None,
     };
-    let event = crate::recording::EgressEvent {
+    crate::recording::EgressEvent {
         pane_id: captured.pane_id,
         text: captured.content.clone(),
         segment_kind,
@@ -418,8 +435,358 @@ fn record_authorized_replay_egress(
         redaction: crate::recording::RecorderRedactionLevel::None,
         occurred_at_ms: u64::try_from(captured.captured_at).unwrap_or(0),
         sequence: durable_sequence,
-    };
+    }
+}
+
+fn record_authorized_replay_egress(
+    adapter: &crate::replay_capture::CaptureAdapter,
+    captured: &CapturedSegment,
+    durable_sequence: u64,
+    persistence_guard: &CapturePersistenceGuard,
+) -> std::result::Result<(), crate::replay_capture::ReplayCaptureSequenceError> {
+    let event = authorized_recorder_egress_event(captured, durable_sequence, persistence_guard);
     adapter.capture_egress_event(&event)
+}
+
+const RUNTIME_RECORDER_BATCH_ID_PREFIX: &str = "runtime-recorder-v1:";
+const RECORDER_EVENT_ID_HEX_LEN: usize = 64;
+
+fn recorder_durability_satisfies(
+    actual: crate::recorder_storage::DurabilityLevel,
+    required: crate::recorder_storage::DurabilityLevel,
+) -> bool {
+    use crate::recorder_storage::DurabilityLevel::{Appended, Enqueued, Fsync};
+    matches!(
+        (actual, required),
+        (Enqueued | Appended | Fsync, Enqueued) | (Appended | Fsync, Appended) | (Fsync, Fsync)
+    )
+}
+
+fn runtime_recorder_batch_id(event: &crate::recording::RecorderEvent) -> Result<String> {
+    let valid_event_id = event.event_id.len() == RECORDER_EVENT_ID_HEX_LEN
+        && event
+            .event_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid_event_id {
+        return Err(runtime_backend_error(
+            "recorder.append",
+            "canonical recorder event_id must be exactly 64 lowercase hexadecimal bytes",
+        ));
+    }
+    Ok(format!(
+        "{RUNTIME_RECORDER_BATCH_ID_PREFIX}{}",
+        event.event_id
+    ))
+}
+
+/// Append one canonical recorder event through the exact selected backend.
+///
+/// The fixed-width event identity makes the batch ID bounded and stable across
+/// retries. Response identity, count, offset, and durability are checked before
+/// the caller may publish any backend-selected success claim.
+pub async fn append_runtime_recorder_event_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::recorder_storage::RecorderStorageInstance,
+    event: crate::recording::RecorderEvent,
+    required_durability: crate::recorder_storage::DurabilityLevel,
+) -> Result<crate::recorder_storage::AppendResponse> {
+    use crate::recorder_storage::RecorderStorage as _;
+
+    cx.checkpoint().map_err(|_| {
+        runtime_cx_error(
+            "recorder.append",
+            cx,
+            "capability checkpoint failed before recorder append",
+        )
+    })?;
+    let expected_backend = storage.backend_kind();
+    let batch_id = runtime_recorder_batch_id(&event)?;
+    let producer_ts_ms = event.recorded_at_ms;
+    let response = storage
+        .append_batch_with_cx(
+            cx,
+            crate::recorder_storage::AppendRequest {
+                batch_id,
+                events: vec![event],
+                required_durability,
+                producer_ts_ms,
+            },
+        )
+        .await
+        .map_err(|error| {
+            runtime_backend_error(
+                "recorder.append",
+                format!("selected backend {expected_backend} rejected recorder event: {error}"),
+            )
+        })?;
+
+    if response.backend != expected_backend {
+        return Err(runtime_backend_error(
+            "recorder.append",
+            format!(
+                "selected backend {expected_backend} returned response identity {}",
+                response.backend
+            ),
+        ));
+    }
+    if response.accepted_count != 1 || response.first_offset != response.last_offset {
+        return Err(runtime_backend_error(
+            "recorder.append",
+            format!(
+                "selected backend {expected_backend} returned invalid single-event receipt: accepted_count={}, first_offset={:?}, last_offset={:?}",
+                response.accepted_count, response.first_offset, response.last_offset
+            ),
+        ));
+    }
+    if !recorder_durability_satisfies(response.committed_durability, required_durability) {
+        return Err(runtime_backend_error(
+            "recorder.append",
+            format!(
+                "selected backend {expected_backend} returned durability {:?}, expected {:?}",
+                response.committed_durability, required_durability
+            ),
+        ));
+    }
+
+    Ok(response)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecorderDeliveryDrainMode {
+    /// Pending rows predate this persistence-task incarnation. AppendLog must
+    /// prove whether the event already reached its non-durable batch cache.
+    Recovery,
+    /// The caller just committed the primary segment in this process.
+    Immediate,
+    /// Test-only process-loss seam after recorder append and before ledger ack.
+    #[cfg(test)]
+    CrashAfterAppendBeforeAck,
+}
+
+fn prepare_runtime_recorder_delivery(
+    recorder: &RuntimeRecorderPersistence,
+    captured: &CapturedSegment,
+    persistence_guard: &CapturePersistenceGuard,
+) -> Result<crate::storage::RecorderDeliverySeed> {
+    use crate::recorder_storage::RecorderStorage as _;
+
+    let egress = authorized_recorder_egress_event(captured, captured.seq, persistence_guard);
+    // Preserve the configured capture-policy admission decision before the
+    // primary write. The returned provisional event is deliberately discarded:
+    // storage rebuilds it from the exact statefully redacted bytes and durable
+    // sequence inside the output-segment transaction.
+    match recorder.capture.prepare_authoritative_egress_event(&egress) {
+        Ok(Some((_event, _merge_key))) => {}
+        Ok(None) => {
+            return Err(runtime_backend_error(
+                "capture.persistence.recorder",
+                "selected recorder capture policy dropped an authority-admitted event",
+            ));
+        }
+        Err(error) => {
+            return Err(runtime_backend_error(
+                "capture.persistence.recorder",
+                format!("selected recorder rejected capture identity: {error}"),
+            ));
+        }
+    }
+    Ok(crate::storage::RecorderDeliverySeed {
+        egress,
+        capture: Arc::clone(&recorder.capture),
+        target_backend: recorder.storage.backend_kind(),
+    })
+}
+
+fn append_log_contains_exact_recorder_event(
+    path: &std::path::Path,
+    expected: &crate::recording::RecorderEvent,
+) -> std::result::Result<bool, String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    #[derive(serde::Deserialize)]
+    struct EventIdentity {
+        event_id: String,
+    }
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open append log {}: {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat append log {}: {error}", path.display()))?
+        .len();
+    let mut offset = 0u64;
+    let mut exact_matches = 0usize;
+    while offset < file_len {
+        let header_end = offset.checked_add(4).ok_or_else(|| {
+            format!(
+                "append-log offset overflow while scanning {}",
+                path.display()
+            )
+        })?;
+        if header_end > file_len {
+            return Err(format!(
+                "append log {} has a truncated length prefix at byte {offset}",
+                path.display()
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek append log {}: {error}", path.display()))?;
+        let mut length = [0u8; 4];
+        file.read_exact(&mut length)
+            .map_err(|error| format!("read append-log prefix {}: {error}", path.display()))?;
+        let payload_len = u64::from(u32::from_le_bytes(length));
+        let next_offset = header_end
+            .checked_add(payload_len)
+            .ok_or_else(|| format!("append-log record length overflow at byte {offset}"))?;
+        if next_offset > file_len {
+            return Err(format!(
+                "append log {} has a truncated record at byte {offset}: payload_bytes={payload_len}, file_bytes={file_len}",
+                path.display()
+            ));
+        }
+
+        let identity = serde_json::from_reader::<_, EventIdentity>(std::io::Read::take(
+            &mut file,
+            payload_len,
+        ))
+        .map_err(|error| {
+            format!(
+                "decode append-log event identity at byte {offset} in {}: {error}",
+                path.display()
+            )
+        })?;
+        if identity.event_id == expected.event_id {
+            file.seek(SeekFrom::Start(header_end)).map_err(|error| {
+                format!("seek matching append-log event {}: {error}", path.display())
+            })?;
+            let actual = serde_json::from_reader::<_, crate::recording::RecorderEvent>(
+                std::io::Read::take(&mut file, payload_len),
+            )
+            .map_err(|error| {
+                format!(
+                    "decode matching append-log event at byte {offset} in {}: {error}",
+                    path.display()
+                )
+            })?;
+            if actual != *expected {
+                return Err(format!(
+                    "append log {} contains event_id {} with non-canonical payload",
+                    path.display(),
+                    expected.event_id
+                ));
+            }
+            exact_matches = exact_matches.saturating_add(1);
+        }
+        offset = next_offset;
+    }
+
+    match exact_matches {
+        0 => Ok(false),
+        1 => Ok(true),
+        count => Err(format!(
+            "append log {} contains {count} exact copies of recorder event {}",
+            path.display(),
+            expected.event_id
+        )),
+    }
+}
+
+async fn append_log_contains_exact_recorder_event_with_cx(
+    cx: &crate::cx::Cx,
+    path: PathBuf,
+    expected: crate::recording::RecorderEvent,
+) -> Result<bool> {
+    crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+        append_log_contains_exact_recorder_event(&path, &expected)
+    })
+    .await
+    .map_err(|error| {
+        runtime_backend_error(
+            "recorder.delivery.recover",
+            format!("append-log recovery scan did not complete: {error}"),
+        )
+    })?
+    .map_err(|error| runtime_backend_error("recorder.delivery.recover", error))
+}
+
+async fn drain_runtime_recorder_deliveries_with_cx(
+    cx: &crate::cx::Cx,
+    primary: &StorageHandle,
+    recorder: &RuntimeRecorderPersistence,
+    mode: RecorderDeliveryDrainMode,
+) -> Result<usize> {
+    use crate::recorder_storage::{RecorderBackendKind, RecorderStorage as _};
+
+    let selected_backend = recorder.storage.backend_kind();
+    let mut acknowledged = 0usize;
+    loop {
+        let pending = primary.pending_recorder_deliveries_with_cx(cx).await?;
+        if pending.is_empty() {
+            return Ok(acknowledged);
+        }
+        for delivery in pending {
+            if delivery.target_backend != selected_backend {
+                return Err(runtime_backend_error(
+                    "recorder.delivery.recover",
+                    format!(
+                        "pending recorder event {} targets {}, but runtime selected {}",
+                        delivery.event.event_id, delivery.target_backend, selected_backend
+                    ),
+                ));
+            }
+
+            let already_present = if mode == RecorderDeliveryDrainMode::Recovery
+                && selected_backend == RecorderBackendKind::AppendLog
+            {
+                let path = recorder
+                    .storage
+                    .append_log_data_path()
+                    .ok_or_else(|| {
+                        runtime_backend_error(
+                            "recorder.delivery.recover",
+                            "selected append-log backend exposed no data path",
+                        )
+                    })?
+                    .to_path_buf();
+                append_log_contains_exact_recorder_event_with_cx(cx, path, delivery.event.clone())
+                    .await?
+            } else {
+                false
+            };
+
+            if !already_present {
+                append_runtime_recorder_event_with_cx(
+                    cx,
+                    recorder.storage.as_ref(),
+                    delivery.event.clone(),
+                    crate::recorder_storage::DurabilityLevel::Appended,
+                )
+                .await?;
+                #[cfg(test)]
+                if mode == RecorderDeliveryDrainMode::CrashAfterAppendBeforeAck {
+                    return Err(runtime_backend_error(
+                        "recorder.delivery.test_crash",
+                        "injected process loss after selected recorder append and before ledger acknowledgement",
+                    ));
+                }
+            }
+
+            if !primary
+                .acknowledge_recorder_delivery_with_cx(cx, &delivery)
+                .await?
+            {
+                return Err(runtime_backend_error(
+                    "recorder.delivery.ack",
+                    format!(
+                        "delivery ledger row changed or disappeared before exact acknowledgement: segment_id={}, event_id={}, backend={}",
+                        delivery.segment_id, delivery.event.event_id, delivery.target_backend
+                    ),
+                ));
+            }
+            acknowledged = acknowledged.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -429,6 +796,24 @@ struct CachedSemanticZoneSnapshot {
 }
 
 type CapturePaneCacheKey = (u64, PaneIncarnation);
+
+#[derive(Clone)]
+struct RuntimeRecorderPersistence {
+    storage: Arc<crate::recorder_storage::RecorderStorageInstance>,
+    capture: Arc<crate::replay_capture::CaptureAdapter>,
+}
+
+impl RuntimeRecorderPersistence {
+    fn new(storage: Arc<crate::recorder_storage::RecorderStorageInstance>) -> Self {
+        Self {
+            storage,
+            capture: Arc::new(crate::replay_capture::CaptureAdapter::new(
+                Arc::new(crate::replay_capture::NoopCaptureSink),
+                crate::replay_capture::CaptureConfig::default(),
+            )),
+        }
+    }
+}
 
 /// Capacity-one wakeup for persistence-side incarnation retirement.
 ///
@@ -4244,6 +4629,8 @@ pub struct ObservationRuntime {
     connector_outbound_bridge: Option<Arc<StdMutex<ConnectorOutboundBridge>>>,
     /// Optional recording manager for capturing session recordings
     recording: Option<Arc<RecordingManager>>,
+    /// Selected durable recorder backend for every authority-admitted capture.
+    recorder_persistence: Option<RuntimeRecorderPersistence>,
     /// Optional replay capture adapter for `.ftreplay` recorder events.
     replay_capture: Option<crate::replay_capture::SharedCaptureAdapter>,
     /// Optional snapshot engine configuration for session persistence
@@ -4299,6 +4686,7 @@ impl ObservationRuntime {
             connector_inbound_bridge_config: ConnectorInboundBridgeConfig::default(),
             connector_outbound_bridge: None,
             recording: None,
+            recorder_persistence: None,
             replay_capture: None,
             snapshot_config: None,
             heartbeats: Arc::new(HeartbeatRegistry::new()),
@@ -4430,6 +4818,17 @@ impl ObservationRuntime {
     #[must_use]
     pub fn with_recording_manager(mut self, recording: Arc<RecordingManager>) -> Self {
         self.recording = Some(recording);
+        self
+    }
+
+    /// Route every authority-admitted, durably sequenced capture through the
+    /// exact recorder backend selected during watcher startup.
+    #[must_use]
+    pub fn with_recorder_storage(
+        mut self,
+        storage: Arc<crate::recorder_storage::RecorderStorageInstance>,
+    ) -> Self {
+        self.recorder_persistence = Some(RuntimeRecorderPersistence::new(storage));
         self
     }
 
@@ -8607,6 +9006,7 @@ impl ObservationRuntime {
         let semantic_zone_cache_ttl = self.config.capture_interval.max(Duration::from_millis(1));
         let capture_authority = self.capture_authority.clone();
         let capture_metadata = Arc::clone(&self.capture_metadata);
+        let recorder_persistence = self.recorder_persistence.clone();
         let replay_capture = self.replay_capture.clone();
 
         let loop_cx = runtime_loop_cx();
@@ -8615,6 +9015,47 @@ impl ObservationRuntime {
             let mut incarnation_state = PersistenceIncarnationState::new();
             let mut capture_open = true;
             let mut retirement_open = true;
+
+            if let Some(ref recorder) = recorder_persistence {
+                if let Err(error) = drain_runtime_recorder_deliveries_with_cx(
+                    &loop_cx,
+                    &storage,
+                    recorder,
+                    RecorderDeliveryDrainMode::Recovery,
+                )
+                .await
+                {
+                    error!(
+                        backend = %crate::recorder_storage::RecorderStorage::backend_kind(
+                            recorder.storage.as_ref()
+                        ),
+                        error = %error,
+                        "Selected recorder recovery drain failed; refusing new capture"
+                    );
+                    shutdown_flag.store(true, Ordering::SeqCst);
+                    return;
+                }
+            } else {
+                match storage.pending_recorder_deliveries_with_cx(&loop_cx).await {
+                    Ok(pending) if pending.is_empty() => {}
+                    Ok(pending) => {
+                        error!(
+                            pending_deliveries = pending.len(),
+                            "Primary storage has pending recorder deliveries but no recorder backend is selected"
+                        );
+                        shutdown_flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(error) => {
+                        error!(
+                            error = %error,
+                            "Failed to inspect recorder delivery ledger before capture"
+                        );
+                        shutdown_flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
 
             // Process data and retirement wakeups until both bounded producers
             // close and their queues drain. Retirement is left-biased when
@@ -8735,6 +9176,29 @@ impl ObservationRuntime {
                     true,
                 )
                 .await;
+                let recorder_delivery = match recorder_persistence.as_ref() {
+                    Some(recorder) => match prepare_runtime_recorder_delivery(
+                        recorder,
+                        &bounded_segment,
+                        &persistence_guard,
+                    ) {
+                        Ok(delivery) => Some(delivery),
+                        Err(error) => {
+                            error!(
+                                pane_id,
+                                seq = bounded_segment.seq,
+                                error = %error,
+                                "Selected recorder failed closed before primary segment commit"
+                            );
+                            if let Some(decision) = resync_decision.as_mut() {
+                                decision.finish(Err(error.to_string()));
+                            }
+                            shutdown_flag.store(true, Ordering::SeqCst);
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
 
                 // Persist the segment
                 // ft-xbnl0.2.3 tick 254: cx-first segment persist.
@@ -8749,6 +9213,7 @@ impl ObservationRuntime {
                     &bounded_segment,
                     max_persist_segment_bytes,
                     zone_type.as_deref(),
+                    recorder_delivery,
                     &persistence_guard,
                 )
                 .await
@@ -8790,17 +9255,40 @@ impl ObservationRuntime {
                             cursor.resync_seq(persisted.segment.seq);
                         }
 
-                        // This acknowledgement is deliberately tied to the
-                        // durable segment commit and mandatory cursor sequence
-                        // reconciliation, not to the independent
-                        // recording/detection fanout below.  Acknowledging
-                        // before a storage-assigned sequence correction can
-                        // expose the successor with a stale next sequence;
-                        // delaying it through downstream fanout can instead
-                        // time out after the gap is durable and duplicate that
-                        // gap on retry.  The persistence guard remains alive
-                        // for the entire semantic chain, so revocation still
-                        // waits for every admitted predecessor side effect.
+                        if let Some(ref recorder) = recorder_persistence
+                            && let Err(error) = drain_runtime_recorder_deliveries_with_cx(
+                                &loop_cx,
+                                &storage,
+                                recorder,
+                                RecorderDeliveryDrainMode::Immediate,
+                            )
+                            .await
+                        {
+                            error!(
+                                pane_id,
+                                seq = persisted.segment.seq,
+                                backend = %crate::recorder_storage::RecorderStorage::backend_kind(
+                                    recorder.storage.as_ref()
+                                ),
+                                error = %error,
+                                "Selected recorder append failed; stopping capture fail-closed"
+                            );
+                            if let Some(decision) = resync_decision.as_mut() {
+                                decision.finish(Err(error.to_string()));
+                            }
+                            shutdown_flag.store(true, Ordering::SeqCst);
+                            continue;
+                        }
+
+                        // This acknowledgement is deliberately tied to both
+                        // durable storage authorities: the canonical segment
+                        // commit and, when configured, the selected recorder
+                        // append. Mandatory cursor sequence reconciliation is
+                        // also complete. Independent replay and WAR recording
+                        // fanout remains below the acknowledgement boundary.
+                        // A retry after either durable write reuses stable
+                        // segment/event identities, so recorder batch
+                        // idempotency prevents duplicate selected-backend rows.
                         if let Some(decision) = resync_decision.as_mut() {
                             decision.finish(Ok(persisted.segment.seq));
                         }
@@ -14890,6 +15378,801 @@ mod tests {
             assert_eq!(runtime.metrics.capture_authority_rejections(), 0);
 
             storage.shutdown().await.expect("shutdown test storage");
+        });
+    }
+
+    #[test]
+    fn authority_admitted_capture_reaches_only_selected_recorder_backend_without_duplicates() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{
+                AppendLogStorageConfig, RecorderBackendKind, RecorderStorage as _,
+                RecorderStorageConfig, RusqliteStorageConfig, bootstrap_recorder_storage,
+            };
+
+            let pane_id = 92;
+            let revision = DiscoveryRevision(31);
+            let (_storage_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.expect("test storage");
+            storage
+                .upsert_pane(test_pane_record(pane_id))
+                .await
+                .expect("persist test pane");
+
+            let recorder_dir = tempfile::tempdir().expect("recorder backend tempdir");
+            let selected_data_path = recorder_dir.path().join("selected/events.log");
+            let selected = Arc::new(
+                bootstrap_recorder_storage(RecorderStorageConfig {
+                    backend: RecorderBackendKind::AppendLog,
+                    append_log: AppendLogStorageConfig {
+                        data_path: selected_data_path.clone(),
+                        state_path: recorder_dir.path().join("selected/state.json"),
+                        ..AppendLogStorageConfig::default()
+                    },
+                    rusqlite: RusqliteStorageConfig {
+                        db_path: recorder_dir
+                            .path()
+                            .join("unused-selected-rusqlite/events.sqlite3"),
+                        ..RusqliteStorageConfig::default()
+                    },
+                })
+                .expect("bootstrap selected append-log recorder"),
+            );
+            let unselected = bootstrap_recorder_storage(RecorderStorageConfig {
+                backend: RecorderBackendKind::Rusqlite,
+                append_log: AppendLogStorageConfig {
+                    data_path: recorder_dir
+                        .path()
+                        .join("unused-unselected-append/events.log"),
+                    state_path: recorder_dir
+                        .path()
+                        .join("unused-unselected-append/state.json"),
+                    ..AppendLogStorageConfig::default()
+                },
+                rusqlite: RusqliteStorageConfig {
+                    db_path: recorder_dir.path().join("unselected/events.sqlite3"),
+                    ..RusqliteStorageConfig::default()
+                },
+            })
+            .expect("bootstrap unselected rusqlite recorder");
+
+            let wezterm: WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage.clone(),
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_recorder_storage(Arc::clone(&selected))
+            .with_wezterm_handle(wezterm);
+
+            let pane = runtime
+                .capture_authority
+                .activate_pane(pane_id)
+                .expect("capture pane");
+            let lease = runtime
+                .capture_authority
+                .issue_source(pane, CaptureSourceKind::Polling)
+                .expect("polling source");
+            runtime.capture_metadata.write().await.insert(
+                pane.pane_incarnation(),
+                CapturePaneMetadata {
+                    pane_uuid: "selected-recorder-pane".to_string(),
+                    discovery_generation: 5,
+                    discovery_revision: revision,
+                },
+            );
+            let (_publication_tx, publication_rx) = watch::channel(DiscoveryCapturePublication {
+                epoch: 1,
+                observed_panes: Arc::new(HashMap::from([(
+                    pane_id,
+                    ObservedCapturePane {
+                        info: make_pane(pane_id, "selected-recorder-pane"),
+                        lifecycle_identity: test_lifecycle_identity(pane_id),
+                        lifecycle_revision: PaneLifecycleRevision::new(5),
+                        pane_uuid: "selected-recorder-pane".to_string(),
+                        revision,
+                        requires_storage_resync: false,
+                    },
+                )])),
+                transitioning_pane_ids: Arc::new(HashSet::new()),
+                transitions: Arc::new(HashMap::new()),
+            });
+            let captured = CapturedSegment {
+                pane_id,
+                seq: 0,
+                content: "selected recorder payload".to_string(),
+                kind: CapturedSegmentKind::Delta,
+                captured_at: 1_700_000_000_100,
+            };
+            let (ingress_tx, ingress_rx) = mpsc::channel(1);
+            ingress_tx
+                .try_send(test_capture_event_from_segment_for_lease(captured, &lease))
+                .expect("queue authority-admitted capture");
+            drop(ingress_tx);
+
+            let (ring_tx, ring_rx) = spsc_channel(1);
+            let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+            let (retirement_tx, retirement_rx) = spsc_channel(1);
+            drop(retirement_tx);
+            let persistence = runtime.spawn_persistence_task(
+                ring_rx,
+                Arc::clone(&runtime.cursors),
+                publication_rx,
+                Arc::new(StdMutex::new(LruCache::new(1))),
+                retirement_rx,
+                Arc::new(StdMutex::new(())),
+            );
+            relay.await.expect("capture relay task");
+            persistence.await.expect("capture persistence task");
+
+            assert_eq!(
+                selected
+                    .health()
+                    .await
+                    .latest_offset
+                    .map(|offset| offset.ordinal),
+                Some(0),
+                "selected recorder must own the one observed event"
+            );
+            assert!(
+                unselected.health().await.latest_offset.is_none(),
+                "unselected recorder must remain empty"
+            );
+            let bytes = std::fs::read(&selected_data_path).expect("read selected append log");
+            assert!(
+                bytes.len() >= 4,
+                "selected append log must contain one frame"
+            );
+            let payload_len = usize::try_from(u32::from_le_bytes(
+                bytes[..4]
+                    .try_into()
+                    .expect("append-log length prefix width"),
+            ))
+            .expect("u32 append-log payload length must fit usize");
+            assert_eq!(
+                bytes.len(),
+                4 + payload_len,
+                "selected append log must contain exactly one event"
+            );
+            let event: crate::recording::RecorderEvent =
+                serde_json::from_slice(&bytes[4..]).expect("decode selected recorder event");
+            assert_eq!(event.pane_id, pane_id);
+            assert_eq!(event.sequence, 0);
+            let crate::recording::RecorderEventPayload::EgressOutput { text, .. } = &event.payload
+            else {
+                panic!("observed capture must persist as egress output");
+            };
+            assert_eq!(text, "selected recorder payload");
+
+            let retry_cx = crate::cx::for_testing();
+            let first_retry = append_runtime_recorder_event_with_cx(
+                &retry_cx,
+                selected.as_ref(),
+                event.clone(),
+                crate::recorder_storage::DurabilityLevel::Fsync,
+            )
+            .await
+            .expect("idempotently upgrade selected event durability");
+            let second_retry = append_runtime_recorder_event_with_cx(
+                &retry_cx,
+                selected.as_ref(),
+                event,
+                crate::recorder_storage::DurabilityLevel::Fsync,
+            )
+            .await
+            .expect("idempotently retry selected event");
+            assert_eq!(first_retry.first_offset, second_retry.first_offset);
+            assert_eq!(first_retry.last_offset, second_retry.last_offset);
+            assert_eq!(
+                selected
+                    .health()
+                    .await
+                    .latest_offset
+                    .map(|offset| offset.ordinal),
+                Some(0),
+                "idempotent retries must not append duplicates"
+            );
+            assert_eq!(
+                std::fs::read(&selected_data_path)
+                    .expect("reread selected append log")
+                    .len(),
+                bytes.len(),
+                "idempotent retries must not grow the selected append log"
+            );
+            assert_eq!(runtime.metrics.segments_persisted(), 1);
+            assert!(!runtime.shutdown_flag.load(Ordering::SeqCst));
+
+            storage.shutdown().await.expect("shutdown test storage");
+        });
+    }
+
+    fn recorder_delivery_seed_for_test(
+        target_backend: crate::recorder_storage::RecorderBackendKind,
+        pane_id: u64,
+        sequence: u64,
+        text: &str,
+    ) -> crate::storage::RecorderDeliverySeed {
+        let egress = crate::recording::EgressEvent {
+            pane_id,
+            text: text.to_string(),
+            segment_kind: crate::recording::RecorderSegmentKind::Delta,
+            is_gap: false,
+            gap_reason: None,
+            encoding: crate::recording::RecorderTextEncoding::Utf8,
+            redaction: crate::recording::RecorderRedactionLevel::None,
+            occurred_at_ms: 1_700_000_100_000 + sequence,
+            sequence,
+        };
+        crate::storage::RecorderDeliverySeed {
+            egress,
+            capture: Arc::new(crate::replay_capture::CaptureAdapter::new(
+                Arc::new(crate::replay_capture::NoopCaptureSink),
+                crate::replay_capture::CaptureConfig::default(),
+            )),
+            target_backend,
+        }
+    }
+
+    fn recorder_delivery_config_for_test(
+        target_backend: crate::recorder_storage::RecorderBackendKind,
+        dir: &std::path::Path,
+    ) -> crate::recorder_storage::RecorderStorageConfig {
+        use crate::recorder_storage::{AppendLogStorageConfig, RusqliteStorageConfig};
+
+        crate::recorder_storage::RecorderStorageConfig {
+            backend: target_backend,
+            append_log: AppendLogStorageConfig {
+                data_path: dir.join("events.log"),
+                state_path: dir.join("state.json"),
+                ..AppendLogStorageConfig::default()
+            },
+            rusqlite: RusqliteStorageConfig {
+                db_path: dir.join("events.sqlite3"),
+                ..RusqliteStorageConfig::default()
+            },
+        }
+    }
+
+    async fn recorder_delivery_latest_ordinal(
+        recorder: &RuntimeRecorderPersistence,
+    ) -> Option<u64> {
+        use crate::recorder_storage::RecorderStorage as _;
+
+        recorder
+            .storage
+            .health()
+            .await
+            .latest_offset
+            .map(|offset| offset.ordinal)
+    }
+
+    fn recorder_delivery_events_for_test(
+        target_backend: crate::recorder_storage::RecorderBackendKind,
+        config: &crate::recorder_storage::RecorderStorageConfig,
+    ) -> Vec<crate::recording::RecorderEvent> {
+        use crate::recorder_storage::{
+            RecorderBackendKind, RecorderEventReader as _, RusqliteEventReader,
+        };
+
+        match target_backend {
+            RecorderBackendKind::AppendLog => {
+                let bytes = std::fs::read(&config.append_log.data_path)
+                    .expect("read selected append-log recorder");
+                let mut offset = 0usize;
+                let mut events = Vec::new();
+                while offset < bytes.len() {
+                    let prefix_end = offset.checked_add(4).expect("append-log prefix offset");
+                    let prefix: [u8; 4] = bytes
+                        .get(offset..prefix_end)
+                        .expect("complete append-log length prefix")
+                        .try_into()
+                        .expect("append-log prefix width");
+                    let payload_len = usize::try_from(u32::from_le_bytes(prefix))
+                        .expect("u32 append-log payload length fits usize");
+                    let payload_end = prefix_end
+                        .checked_add(payload_len)
+                        .expect("append-log payload offset");
+                    let payload = bytes
+                        .get(prefix_end..payload_end)
+                        .expect("complete append-log event payload");
+                    events.push(
+                        serde_json::from_slice(payload)
+                            .expect("decode selected append-log recorder event"),
+                    );
+                    offset = payload_end;
+                }
+                events
+            }
+            RecorderBackendKind::Rusqlite => {
+                let reader = RusqliteEventReader::new(config.rusqlite.db_path.clone());
+                let mut cursor = reader
+                    .open_cursor_from_start()
+                    .expect("open selected rusqlite recorder cursor");
+                cursor
+                    .next_batch(16)
+                    .expect("read selected rusqlite recorder events")
+                    .into_iter()
+                    .map(|record| record.event)
+                    .collect()
+            }
+            RecorderBackendKind::FrankenSqlite => {
+                panic!("reserved FrankenSQLite backend has no delivery test reader")
+            }
+        }
+    }
+
+    fn recorder_delivery_egress_text_and_redaction_for_test(
+        event: &crate::recording::RecorderEvent,
+    ) -> (&str, crate::recording::RecorderRedactionLevel) {
+        let crate::recording::RecorderEventPayload::EgressOutput {
+            text, redaction, ..
+        } = &event.payload
+        else {
+            panic!("selected recorder delivery must be an egress event");
+        };
+        (text, *redaction)
+    }
+
+    #[test]
+    fn recorder_delivery_restart_drains_primary_commit_exactly_once_for_both_backends() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
+
+            for target_backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let primary_dir = tempfile::tempdir().expect("primary recorder-ledger tempdir");
+                let primary_path = primary_dir.path().join("primary.sqlite3");
+                let primary_path_text = primary_path.to_string_lossy().into_owned();
+                let primary = StorageHandle::new(&primary_path_text)
+                    .await
+                    .expect("open primary storage");
+                primary
+                    .upsert_pane(test_pane_record(401))
+                    .await
+                    .expect("seed delivery pane");
+                primary
+                    .append_segment_with_recorder_delivery_for_test(
+                        &crate::cx::for_testing(),
+                        401,
+                        "primary committed before recorder process loss",
+                        recorder_delivery_seed_for_test(
+                            target_backend,
+                            401,
+                            0,
+                            "primary committed before recorder process loss",
+                        ),
+                    )
+                    .await
+                    .expect("commit segment and delivery ledger atomically");
+                assert_eq!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&crate::cx::for_testing())
+                        .await
+                        .expect("read pending delivery")
+                        .len(),
+                    1
+                );
+                primary
+                    .shutdown()
+                    .await
+                    .expect("stop primary before restart");
+
+                let primary = StorageHandle::new(&primary_path_text)
+                    .await
+                    .expect("reopen primary storage");
+                let recorder_dir = tempfile::tempdir().expect("selected recorder tempdir");
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(recorder_delivery_config_for_test(
+                        target_backend,
+                        recorder_dir.path(),
+                    ))
+                    .expect("open selected recorder"),
+                ));
+                let cx = crate::cx::for_testing();
+                assert_eq!(
+                    drain_runtime_recorder_deliveries_with_cx(
+                        &cx,
+                        &primary,
+                        &recorder,
+                        RecorderDeliveryDrainMode::Recovery,
+                    )
+                    .await
+                    .expect("restart drains primary-only commit"),
+                    1
+                );
+                assert!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .expect("ledger empty after ack")
+                        .is_empty()
+                );
+                assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, Some(0));
+                assert_eq!(
+                    drain_runtime_recorder_deliveries_with_cx(
+                        &cx,
+                        &primary,
+                        &recorder,
+                        RecorderDeliveryDrainMode::Recovery,
+                    )
+                    .await
+                    .expect("empty recovery drain is idempotent"),
+                    0
+                );
+                assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, Some(0));
+                primary.shutdown().await.expect("stop reopened primary");
+            }
+        });
+    }
+
+    #[test]
+    fn recorder_delivery_restart_after_append_before_ack_never_duplicates() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
+
+            for target_backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let primary_dir = tempfile::tempdir().expect("primary recorder-ledger tempdir");
+                let primary_path = primary_dir.path().join("primary.sqlite3");
+                let primary_path_text = primary_path.to_string_lossy().into_owned();
+                let primary = StorageHandle::new(&primary_path_text)
+                    .await
+                    .expect("open primary storage");
+                primary
+                    .upsert_pane(test_pane_record(402))
+                    .await
+                    .expect("seed delivery pane");
+                primary
+                    .append_segment_with_recorder_delivery_for_test(
+                        &crate::cx::for_testing(),
+                        402,
+                        "recorder append committed before ack crash",
+                        recorder_delivery_seed_for_test(
+                            target_backend,
+                            402,
+                            0,
+                            "recorder append committed before ack crash",
+                        ),
+                    )
+                    .await
+                    .expect("commit segment and delivery ledger atomically");
+
+                let recorder_dir = tempfile::tempdir().expect("selected recorder tempdir");
+                let recorder_config =
+                    recorder_delivery_config_for_test(target_backend, recorder_dir.path());
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(recorder_config.clone())
+                        .expect("open selected recorder"),
+                ));
+                let cx = crate::cx::for_testing();
+                let error = drain_runtime_recorder_deliveries_with_cx(
+                    &cx,
+                    &primary,
+                    &recorder,
+                    RecorderDeliveryDrainMode::CrashAfterAppendBeforeAck,
+                )
+                .await
+                .expect_err("plant crash after recorder append before ledger ack");
+                assert!(error.to_string().contains("injected process loss"));
+                assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, Some(0));
+                assert_eq!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .expect("crash must leave ledger row pending")
+                        .len(),
+                    1,
+                    "recorder append alone must never acknowledge primary ledger"
+                );
+
+                primary
+                    .shutdown()
+                    .await
+                    .expect("stop primary after planted crash");
+                drop(recorder);
+                let primary = StorageHandle::new(&primary_path_text)
+                    .await
+                    .expect("reopen primary after planted crash");
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(recorder_config)
+                        .expect("reopen selected recorder after planted crash"),
+                ));
+                let cx = crate::cx::for_testing();
+                assert_eq!(
+                    drain_runtime_recorder_deliveries_with_cx(
+                        &cx,
+                        &primary,
+                        &recorder,
+                        RecorderDeliveryDrainMode::Recovery,
+                    )
+                    .await
+                    .expect("restart resolves ambiguous append and acks ledger"),
+                    1
+                );
+                assert!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .expect("ledger empty after restart ack")
+                        .is_empty()
+                );
+                assert_eq!(
+                    recorder_delivery_latest_ordinal(&recorder).await,
+                    Some(0),
+                    "recovery must retain exactly one selected-recorder event"
+                );
+                primary.shutdown().await.expect("stop reopened primary");
+            }
+        });
+    }
+
+    #[test]
+    fn recorder_delivery_stateful_split_secret_redaction_reaches_ledger_and_both_backends() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
+
+            const SECRET: &str = "sk-abcdefghijklmnopqrstuvwxyz";
+            const SECRET_PREFIX: &str = "sk-";
+            const SECRET_SUFFIX: &str = "abcdefghijklmnopqrstuvwxyz";
+
+            for target_backend in [
+                RecorderBackendKind::AppendLog,
+                RecorderBackendKind::Rusqlite,
+            ] {
+                let primary_dir = tempfile::tempdir().expect("primary recorder-ledger tempdir");
+                let primary_path = primary_dir.path().join("primary.sqlite3");
+                let primary_path_text = primary_path.to_string_lossy().into_owned();
+                let primary = StorageHandle::new(&primary_path_text)
+                    .await
+                    .expect("open primary storage");
+                primary
+                    .upsert_pane(test_pane_record(404))
+                    .await
+                    .expect("seed split-secret delivery pane");
+
+                let first = format!("benign prefix {SECRET_PREFIX}");
+                primary
+                    .append_segment_with_recorder_delivery_for_test(
+                        &crate::cx::for_testing(),
+                        404,
+                        &first,
+                        recorder_delivery_seed_for_test(target_backend, 404, 0, &first),
+                    )
+                    .await
+                    .expect("commit split-secret prefix and ledger row");
+                let second = format!("{SECRET_SUFFIX} benign suffix");
+                primary
+                    .append_segment_with_recorder_delivery_for_test(
+                        &crate::cx::for_testing(),
+                        404,
+                        &second,
+                        recorder_delivery_seed_for_test(target_backend, 404, 1, &second),
+                    )
+                    .await
+                    .expect("commit split-secret completion and ledger row");
+
+                let cx = crate::cx::for_testing();
+                let pending = primary
+                    .pending_recorder_deliveries_with_cx(&cx)
+                    .await
+                    .expect("read split-secret delivery ledger");
+                assert_eq!(pending.len(), 2, "both primary commits remain pending");
+                let ledger_texts = pending
+                    .iter()
+                    .map(|delivery| {
+                        recorder_delivery_egress_text_and_redaction_for_test(&delivery.event)
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !ledger_texts
+                        .iter()
+                        .any(|(text, _)| text.contains(SECRET_SUFFIX)),
+                    "ledger must not retain the completing raw half: {ledger_texts:?}"
+                );
+                assert!(
+                    !ledger_texts
+                        .iter()
+                        .map(|(text, _)| *text)
+                        .collect::<String>()
+                        .contains(SECRET),
+                    "ledger event stream must not reconstruct the split secret: {ledger_texts:?}"
+                );
+                assert!(
+                    ledger_texts[1].0.contains(crate::redactor::REDACTED_MARKER),
+                    "stateful cross-segment marker must reach the durable ledger"
+                );
+                assert_eq!(
+                    ledger_texts[1].1,
+                    crate::recording::RecorderRedactionLevel::Full,
+                    "recorder identity must record the storage redaction"
+                );
+
+                let recorder_dir = tempfile::tempdir().expect("selected recorder tempdir");
+                let recorder_config =
+                    recorder_delivery_config_for_test(target_backend, recorder_dir.path());
+                let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                    bootstrap_recorder_storage(recorder_config.clone())
+                        .expect("open selected recorder"),
+                ));
+                assert_eq!(
+                    drain_runtime_recorder_deliveries_with_cx(
+                        &cx,
+                        &primary,
+                        &recorder,
+                        RecorderDeliveryDrainMode::Immediate,
+                    )
+                    .await
+                    .expect("drain split-secret deliveries"),
+                    2
+                );
+                assert!(
+                    primary
+                        .pending_recorder_deliveries_with_cx(&cx)
+                        .await
+                        .expect("ledger empty after split-secret delivery")
+                        .is_empty()
+                );
+
+                let recorder_events =
+                    recorder_delivery_events_for_test(target_backend, &recorder_config);
+                assert_eq!(recorder_events.len(), 2);
+                let recorder_texts = recorder_events
+                    .iter()
+                    .map(recorder_delivery_egress_text_and_redaction_for_test)
+                    .collect::<Vec<_>>();
+                assert!(
+                    !recorder_texts
+                        .iter()
+                        .any(|(text, _)| text.contains(SECRET_SUFFIX)),
+                    "selected backend must not retain the completing raw half: {recorder_texts:?}"
+                );
+                assert!(
+                    !recorder_texts
+                        .iter()
+                        .map(|(text, _)| *text)
+                        .collect::<String>()
+                        .contains(SECRET),
+                    "selected backend event stream must not reconstruct the split secret: {recorder_texts:?}"
+                );
+                assert!(
+                    recorder_texts[1]
+                        .0
+                        .contains(crate::redactor::REDACTED_MARKER)
+                );
+                assert_eq!(
+                    recorder_texts[1].1,
+                    crate::recording::RecorderRedactionLevel::Full
+                );
+                primary.shutdown().await.expect("stop primary storage");
+            }
+        });
+    }
+
+    #[test]
+    fn recorder_delivery_append_failure_never_acknowledges_primary_ledger() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{RecorderBackendKind, bootstrap_recorder_storage};
+
+            let primary_dir = tempfile::tempdir().expect("primary recorder-ledger tempdir");
+            let primary_path = primary_dir.path().join("primary.sqlite3");
+            let primary = StorageHandle::new(&primary_path.to_string_lossy())
+                .await
+                .expect("open primary storage");
+            primary
+                .upsert_pane(test_pane_record(403))
+                .await
+                .expect("seed delivery pane");
+            primary
+                .append_segment_with_recorder_delivery_for_test(
+                    &crate::cx::for_testing(),
+                    403,
+                    "cancel before selected recorder append",
+                    recorder_delivery_seed_for_test(
+                        RecorderBackendKind::AppendLog,
+                        403,
+                        0,
+                        "cancel before selected recorder append",
+                    ),
+                )
+                .await
+                .expect("commit segment and delivery ledger atomically");
+            let recorder_dir = tempfile::tempdir().expect("selected recorder tempdir");
+            let recorder = RuntimeRecorderPersistence::new(Arc::new(
+                bootstrap_recorder_storage(recorder_delivery_config_for_test(
+                    RecorderBackendKind::AppendLog,
+                    recorder_dir.path(),
+                ))
+                .expect("open selected recorder"),
+            ));
+            let cancelled = crate::cx::for_testing();
+            cancelled.cancel_with(crate::outcome::CancelKind::User, Some("planted failure"));
+            drain_runtime_recorder_deliveries_with_cx(
+                &cancelled,
+                &primary,
+                &recorder,
+                RecorderDeliveryDrainMode::Immediate,
+            )
+            .await
+            .expect_err("cancelled drain must fail before selected recorder mutation");
+
+            let fresh = crate::cx::for_testing();
+            assert_eq!(
+                primary
+                    .pending_recorder_deliveries_with_cx(&fresh)
+                    .await
+                    .expect("failed append leaves ledger readable")
+                    .len(),
+                1
+            );
+            assert_eq!(recorder_delivery_latest_ordinal(&recorder).await, None);
+            primary.shutdown().await.expect("stop primary storage");
+        });
+    }
+
+    #[test]
+    fn selected_recorder_append_honors_prestart_cancellation_without_writing() {
+        run_async_test_isolated(|| async {
+            use crate::recorder_storage::{
+                AppendLogStorageConfig, RecorderBackendKind, RecorderStorage as _,
+                RecorderStorageConfig, RusqliteStorageConfig, bootstrap_recorder_storage,
+            };
+
+            let recorder_dir = tempfile::tempdir().expect("recorder cancellation tempdir");
+            let storage = bootstrap_recorder_storage(RecorderStorageConfig {
+                backend: RecorderBackendKind::AppendLog,
+                append_log: AppendLogStorageConfig {
+                    data_path: recorder_dir.path().join("events.log"),
+                    state_path: recorder_dir.path().join("state.json"),
+                    ..AppendLogStorageConfig::default()
+                },
+                rusqlite: RusqliteStorageConfig {
+                    db_path: recorder_dir.path().join("unused.sqlite3"),
+                    ..RusqliteStorageConfig::default()
+                },
+            })
+            .expect("bootstrap cancellation recorder");
+            let mut event = crate::recording::RecorderEvent {
+                schema_version: crate::recording::RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                event_id: String::new(),
+                pane_id: 7,
+                session_id: None,
+                workflow_id: None,
+                correlation_id: None,
+                source: crate::recording::RecorderEventSource::WeztermMux,
+                occurred_at_ms: 1_700_000_000_200,
+                recorded_at_ms: 1_700_000_000_200,
+                sequence: 0,
+                causality: crate::recording::RecorderEventCausality::default(),
+                payload: crate::recording::RecorderEventPayload::EgressOutput {
+                    text: "must not persist".to_string(),
+                    encoding: crate::recording::RecorderTextEncoding::Utf8,
+                    redaction: crate::recording::RecorderRedactionLevel::None,
+                    segment_kind: crate::recording::RecorderSegmentKind::Delta,
+                    is_gap: false,
+                },
+            };
+            event.event_id = crate::event_id::generate_event_id_v1(&event);
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("SECRET recorder cancellation detail"),
+            );
+
+            let error = append_runtime_recorder_event_with_cx(
+                &cx,
+                &storage,
+                event,
+                crate::recorder_storage::DurabilityLevel::Fsync,
+            )
+            .await
+            .expect_err("pre-cancelled recorder append must fail before mutation");
+
+            assert!(is_runtime_cancellation(&error));
+            assert!(!format!("{error:?}").contains("SECRET"));
+            assert!(storage.health().await.latest_offset.is_none());
         });
     }
 

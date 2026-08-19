@@ -1,14 +1,23 @@
 //! Deterministic migration engine for recorder backends.
 //!
 //! Orchestrates the M0→M5 migration pipeline:
-//! - **M0 Preflight**: health check, manifest capture, quiesce source
+//! - **M0 Preflight**: health check and manifest observation; source
+//!   quiescence remains an external prerequisite
 //! - **M1 Export**: stream all events from source, compute digest
 //! - **M2 Import**: write events to target, verify digest match
 //! - **M3 Checkpoint sync**: migrate consumer checkpoints with monotonicity
 //! - **M4 Reserved**: projection reconciliation (handled by E2.F2 reindex hooks)
-//! - **M5 Cutover**: emit lifecycle marker, switch backend selector
+//! - **M5 Readiness**: verify the imported manifest and target, then emit a
+//!   durable marker stating that an external selector authority may activate
+//!   the target
+//!
+//! This module does not own the process-wide recorder backend selector. M5
+//! therefore never claims to activate a backend or complete a migration. A
+//! caller with real selector authority must atomically persist/switch that
+//! selector after [`MigrationEngine::m5_mark_ready`] succeeds.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tracing::{error, info};
 
@@ -16,8 +25,8 @@ use tracing::{debug, warn};
 
 use crate::recorder_storage::{
     AppendRequest, CheckpointConsumerId, CursorRecord, DurabilityLevel, EventCursorError,
-    RecorderBackendKind, RecorderCheckpoint, RecorderEventReader, RecorderOffset, RecorderStorage,
-    RecorderStorageHealth,
+    RecorderBackendKind, RecorderBackendSelectionError, RecorderCheckpoint, RecorderEventReader,
+    RecorderOffset, RecorderStorage, RecorderStorageHealth, select_recorder_backend,
 };
 use crate::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
@@ -32,7 +41,7 @@ use crate::recording::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrationStage {
-    /// Preflight: health check, manifest capture, quiesce.
+    /// Preflight: health check and manifest observation (no quiescence fence).
     M0Preflight,
     /// Export: stream events from source, compute digest.
     M1Export,
@@ -42,21 +51,37 @@ pub enum MigrationStage {
     M3CheckpointSync,
     /// Reserved for future use.
     M4Reserved,
-    /// Cutover: activate target backend.
-    M5Cutover,
+    /// Target readiness marker persisted; selector activation remains external.
+    M5Readiness,
 }
 
 impl MigrationStage {
-    /// Returns `true` when this stage marks a completed migration.
+    /// Returns `true` when this stage proves a completed migration.
+    ///
+    /// No current stage returns `true`: M5 only establishes target readiness,
+    /// and this module has no authority to persist or switch the live backend
+    /// selector.
     pub fn is_complete(&self) -> bool {
-        matches!(self, Self::M5Cutover)
+        !matches!(
+            self,
+            Self::M0Preflight
+                | Self::M1Export
+                | Self::M2Import
+                | Self::M3CheckpointSync
+                | Self::M4Reserved
+                | Self::M5Readiness
+        )
     }
 
     /// Returns `true` if the migration can be rolled back from this stage.
     pub fn can_rollback(&self) -> bool {
         matches!(
             self,
-            Self::M0Preflight | Self::M1Export | Self::M2Import | Self::M3CheckpointSync
+            Self::M0Preflight
+                | Self::M1Export
+                | Self::M2Import
+                | Self::M3CheckpointSync
+                | Self::M5Readiness
         )
     }
 }
@@ -105,19 +130,22 @@ impl Default for MigrationManifest {
 }
 
 // ---------------------------------------------------------------------------
-// Migration checkpoint (resumable)
+// Migration checkpoint DTO (external orchestration)
 // ---------------------------------------------------------------------------
 
-/// Persisted state for resumable migration.
+/// Serializable state an external migration orchestrator may persist.
+///
+/// `MigrationEngine` itself neither stores nor consumes this DTO, so its
+/// presence is not evidence of durable stage resumption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationCheckpoint {
     /// Current stage of the migration.
     pub stage: MigrationStage,
     /// Manifest captured so far.
     pub manifest: MigrationManifest,
-    /// Last successfully processed ordinal (for resume).
+    /// Last successfully processed ordinal reported by the external owner.
     pub last_processed_ordinal: u64,
-    /// Whether the migration is currently active (quiesced).
+    /// Caller-reported active state; this is not a source-quiescence witness.
     pub migration_active: bool,
 }
 
@@ -139,20 +167,25 @@ pub struct CheckpointSyncResult {
 }
 
 // ---------------------------------------------------------------------------
-// M5 cutover result
+// M5 readiness result
 // ---------------------------------------------------------------------------
 
-/// Result of M5 cutover activation.
+/// Proof that an M5 readiness marker was durably appended to a healthy target.
+///
+/// This result deliberately has no `activated` field: selector persistence and
+/// activation are outside this module's authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CutoverResult {
-    /// The backend kind that was activated.
-    pub activated_backend: RecorderBackendKind,
+pub struct CutoverReadinessResult {
+    /// Backend whose readiness marker was durably appended.
+    pub target_backend: RecorderBackendKind,
     /// Migration epoch timestamp (ms).
     pub migration_epoch_ms: u64,
-    /// Whether the target health check passed post-activation.
-    pub target_healthy: bool,
-    /// Source path retained for rollback (if file-backed).
-    pub source_retained_path: Option<String>,
+    /// Durable storage offset returned for the readiness marker.
+    pub marker_offset: RecorderOffset,
+    /// Caller-reported source path hint for external rollback coordination.
+    ///
+    /// The migration engine does not verify filesystem retention or ownership.
+    pub source_path_hint: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +204,56 @@ fn fnv1a_feed(hash: u64, ordinal: u64) -> u64 {
         h = h.wrapping_mul(FNV1A_PRIME);
     }
     h
+}
+
+/// Compute a content-bound M2 idempotency digest.
+///
+/// Ordinals alone are insufficient: a retry with different event bytes but
+/// the same ordinal range must not collide with the first append request.
+fn m2_batch_content_digest(records: &[CursorRecord]) -> Result<String, MigrationError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ft.recorder.migration.m2.batch.v1\0");
+    for record in records {
+        hasher.update(record.offset.ordinal.to_le_bytes());
+        let event_json = serde_json::to_vec(&record.event).map_err(|error| {
+            MigrationError::StorageError(format!(
+                "failed to serialize M2 event {} for batch identity: {error}",
+                record.event.event_id
+            ))
+        })?;
+        let event_len = u64::try_from(event_json.len()).map_err(|_| {
+            MigrationError::StorageError(format!(
+                "M2 event {} serialized length cannot fit in u64",
+                record.event.event_id
+            ))
+        })?;
+        hasher.update(event_len.to_le_bytes());
+        hasher.update(event_json);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Derive the full-content idempotency digest for an M5 readiness marker.
+///
+/// `event_id.v1` remains the canonical recorder-event identity. This separate
+/// domain-separated digest binds the storage retry key to every serialized
+/// marker field, including fields intentionally outside the event-ID preimage.
+fn readiness_marker_batch_digest(marker: &RecorderEvent) -> Result<String, MigrationError> {
+    let encoded = serde_json::to_vec(marker).map_err(|error| {
+        MigrationError::StorageError(format!(
+            "failed to serialize readiness marker for batch identity: {error}"
+        ))
+    })?;
+    let encoded_len = u64::try_from(encoded.len()).map_err(|_| {
+        MigrationError::StorageError(
+            "readiness marker serialized length cannot fit in u64".to_string(),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"ft.recorder.migration.readiness.batch.v1\0");
+    hasher.update(encoded_len.to_le_bytes());
+    hasher.update(encoded);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +277,52 @@ pub enum MigrationError {
     StorageError(String),
     /// Target checkpoint commit was rejected.
     CheckpointCommitRejected { consumer: String, reason: String },
+    /// A migration endpoint advertised a reserved or unavailable backend.
+    BackendSelection(RecorderBackendSelectionError),
+    /// A configured migration batch size was zero.
+    InvalidBatchSize {
+        stage: &'static str,
+        field: &'static str,
+    },
+    /// A successful M2 append response violated the target contract.
+    TargetAppendContractViolation { batch_id: String, reason: String },
+    /// M0, M1, and M2 counts do not describe the same event set.
+    ManifestCountMismatch {
+        preflight_count: u64,
+        export_count: u64,
+        import_count: u64,
+    },
+    /// M1 and M2 digests do not describe the same ordinal sequence.
+    ManifestDigestMismatch {
+        export_digest: u64,
+        import_digest: u64,
+    },
+    /// The readiness-marker ordinal cannot be represented.
+    MarkerOrdinalOverflow { last_ordinal: u64 },
+    /// Target was unhealthy before marker I/O; no marker was attempted.
+    TargetDegradedBeforeMarker {
+        backend: RecorderBackendKind,
+        last_error: Option<String>,
+    },
+    /// A target health snapshot identified a different backend than the target.
+    TargetIdentityMismatch {
+        phase: &'static str,
+        expected: RecorderBackendKind,
+        actual: RecorderBackendKind,
+        marker_offset: Option<RecorderOffset>,
+    },
+    /// A successful append response violated the one-event fsync contract.
+    ReadinessMarkerContractViolation {
+        marker_offset: RecorderOffset,
+        reason: String,
+    },
+    /// Marker append succeeded, but the target degraded before readiness could
+    /// be confirmed. The marker offset is retained for operator diagnosis.
+    TargetDegradedAfterMarker {
+        backend: RecorderBackendKind,
+        marker_offset: RecorderOffset,
+        last_error: Option<String>,
+    },
 }
 
 impl std::fmt::Display for MigrationError {
@@ -220,6 +349,68 @@ impl std::fmt::Display for MigrationError {
                     "checkpoint commit rejected for consumer {consumer}: {reason}"
                 )
             }
+            Self::BackendSelection(error) => write!(f, "backend selection error: {error}"),
+            Self::InvalidBatchSize { stage, field } => {
+                write!(f, "{stage} requires {field} >= 1")
+            }
+            Self::TargetAppendContractViolation { batch_id, reason } => write!(
+                f,
+                "M2 append contract violation for batch {batch_id}: {reason}"
+            ),
+            Self::ManifestCountMismatch {
+                preflight_count,
+                export_count,
+                import_count,
+            } => write!(
+                f,
+                "migration manifest count mismatch: preflight={preflight_count}, export={export_count}, import={import_count}"
+            ),
+            Self::ManifestDigestMismatch {
+                export_digest,
+                import_digest,
+            } => write!(
+                f,
+                "migration manifest digest mismatch: export={export_digest:#x}, import={import_digest:#x}"
+            ),
+            Self::MarkerOrdinalOverflow { last_ordinal } => write!(
+                f,
+                "readiness marker ordinal overflow: last_ordinal={last_ordinal}"
+            ),
+            Self::TargetDegradedBeforeMarker {
+                backend,
+                last_error,
+            } => write!(
+                f,
+                "target {backend} degraded before readiness marker: {last_error:?}"
+            ),
+            Self::TargetIdentityMismatch {
+                phase,
+                expected,
+                actual,
+                marker_offset,
+            } => write!(
+                f,
+                "target backend identity mismatch during {phase}: expected={expected}, actual={actual}, marker_offset={marker_offset:?}"
+            ),
+            Self::ReadinessMarkerContractViolation {
+                marker_offset,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "readiness marker append contract violation at ordinal {}: {reason}",
+                    marker_offset.ordinal
+                )
+            }
+            Self::TargetDegradedAfterMarker {
+                backend,
+                marker_offset,
+                last_error,
+            } => write!(
+                f,
+                "target {backend} degraded after readiness marker at ordinal {}: {last_error:?}",
+                marker_offset.ordinal
+            ),
         }
     }
 }
@@ -229,6 +420,12 @@ impl std::error::Error for MigrationError {}
 impl From<EventCursorError> for MigrationError {
     fn from(e: EventCursorError) -> Self {
         Self::CursorError(e)
+    }
+}
+
+impl From<RecorderBackendSelectionError> for MigrationError {
+    fn from(error: RecorderBackendSelectionError) -> Self {
+        Self::BackendSelection(error)
     }
 }
 
@@ -257,7 +454,7 @@ impl Default for MigrationConfig {
     }
 }
 
-/// Orchestrates the M0→M2 migration pipeline.
+/// Provides the implemented M0/M1/M2/M3/M5 migration stage helpers.
 ///
 /// The engine reads from a `RecorderEventReader` source and writes to a
 /// `RecorderStorage` target, verifying deterministic digests at each stage.
@@ -275,10 +472,12 @@ impl MigrationEngine {
     // M0 — Preflight
     // -----------------------------------------------------------------------
 
-    /// Execute M0 preflight: health check, capture manifest, quiesce.
+    /// Execute M0 preflight: health check and capture a manifest observation.
     ///
     /// Returns a manifest with event_count, first/last ordinal, and per-pane counts.
-    /// Rejects if the source storage reports as degraded.
+    /// Rejects if the source storage reports as degraded. This method does not
+    /// own a source quiescence or snapshot fence; concurrent-source exclusion
+    /// remains an external prerequisite.
     pub async fn m0_preflight<S: RecorderStorage>(
         &self,
         source_storage: &S,
@@ -307,6 +506,14 @@ impl MigrationEngine {
         source_storage: &S,
         source_reader: &dyn RecorderEventReader,
     ) -> Result<MigrationManifest, MigrationError> {
+        if self.config.export_batch_size == 0 {
+            return Err(MigrationError::InvalidBatchSize {
+                stage: "M0",
+                field: "export_batch_size",
+            });
+        }
+        select_recorder_backend(source_storage.backend_kind())?;
+
         cx.checkpoint()
             .map_err(|err| MigrationError::SourceDegraded {
                 last_error: Some(format!("m0_preflight cancelled pre-start: {err}")),
@@ -389,6 +596,12 @@ impl MigrationEngine {
         source_reader: &dyn RecorderEventReader,
         manifest: &mut MigrationManifest,
     ) -> Result<Vec<CursorRecord>, MigrationError> {
+        if self.config.export_batch_size == 0 {
+            return Err(MigrationError::InvalidBatchSize {
+                stage: "M1",
+                field: "export_batch_size",
+            });
+        }
         let mut cursor = source_reader.open_cursor_from_start()?;
         let mut all_records: Vec<CursorRecord> = Vec::new();
         let mut digest = FNV1A_OFFSET_BASIS;
@@ -442,8 +655,9 @@ impl MigrationEngine {
     /// `cx.checkpoint()?` before each `target.append_batch` call.
     /// A pre-cancelled cx returns before any writes; a mid-import
     /// cancel leaves the target with all successfully-committed
-    /// chunks intact (batch_id idempotency means a resume after
-    /// cancellation will skip already-written chunks cleanly).
+    /// chunks intact. Re-running against a backend that still retains the
+    /// content-bound batch receipts skips those chunks cleanly; this method
+    /// does not persist a resume cursor itself.
     ///
     /// Digest + count verification runs AFTER the loop completes
     /// (no checkpoint there — the verification is pure CPU, and
@@ -460,6 +674,15 @@ impl MigrationEngine {
         records: &[CursorRecord],
         manifest: &mut MigrationManifest,
     ) -> Result<(), MigrationError> {
+        if self.config.import_batch_size == 0 {
+            return Err(MigrationError::InvalidBatchSize {
+                stage: "M2",
+                field: "import_batch_size",
+            });
+        }
+        let target_backend = target.backend_kind();
+        select_recorder_backend(target_backend)?;
+
         cx.checkpoint().map_err(|err| {
             MigrationError::TargetWriteError(format!("m2_import cancelled pre-start: {err}"))
         })?;
@@ -476,12 +699,16 @@ impl MigrationEngine {
 
             let first_ord = chunk.first().map(|r| r.offset.ordinal).unwrap_or(0);
             let last_ord = chunk.last().map(|r| r.offset.ordinal).unwrap_or(0);
-            let batch_id = format!("{}-{first_ord}-{last_ord}", self.config.consumer_id);
+            let content_digest = m2_batch_content_digest(chunk)?;
+            let batch_id = format!(
+                "{}-{first_ord}-{last_ord}-{content_digest}",
+                self.config.consumer_id
+            );
 
             let events: Vec<_> = chunk.iter().map(|r| r.event.clone()).collect();
 
             let req = AppendRequest {
-                batch_id,
+                batch_id: batch_id.clone(),
                 events,
                 required_durability: DurabilityLevel::Appended,
                 producer_ts_ms: 0,
@@ -495,10 +722,65 @@ impl MigrationEngine {
             // code will benefit; the default impl is
             // observationally equivalent to the prior
             // `append_batch` call.
-            target
+            let append_response = target
                 .append_batch_with_cx(cx, req)
                 .await
                 .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
+
+            if append_response.backend != target_backend {
+                return Err(MigrationError::TargetAppendContractViolation {
+                    batch_id,
+                    reason: format!(
+                        "response backend {} did not match target backend {target_backend}",
+                        append_response.backend
+                    ),
+                });
+            }
+            if append_response.accepted_count != chunk.len() {
+                return Err(MigrationError::TargetAppendContractViolation {
+                    batch_id,
+                    reason: format!(
+                        "response accepted {} events, expected {}",
+                        append_response.accepted_count,
+                        chunk.len()
+                    ),
+                });
+            }
+            if !matches!(
+                append_response.committed_durability,
+                DurabilityLevel::Appended | DurabilityLevel::Fsync
+            ) {
+                return Err(MigrationError::TargetAppendContractViolation {
+                    batch_id,
+                    reason: format!(
+                        "response durability {:?} did not satisfy appended",
+                        append_response.committed_durability
+                    ),
+                });
+            }
+            let ordinal_span = u64::try_from(chunk.len().saturating_sub(1)).map_err(|_| {
+                MigrationError::TargetAppendContractViolation {
+                    batch_id: batch_id.clone(),
+                    reason: "chunk ordinal span cannot fit in u64".to_string(),
+                }
+            })?;
+            let expected_last_ordinal = append_response
+                .first_offset
+                .ordinal
+                .checked_add(ordinal_span)
+                .ok_or_else(|| MigrationError::TargetAppendContractViolation {
+                    batch_id: batch_id.clone(),
+                    reason: "response ordinal span overflowed u64".to_string(),
+                })?;
+            if append_response.last_offset.ordinal != expected_last_ordinal {
+                return Err(MigrationError::TargetAppendContractViolation {
+                    batch_id,
+                    reason: format!(
+                        "response offsets were not contiguous: first={}, last={}, expected_last={expected_last_ordinal}",
+                        append_response.first_offset.ordinal, append_response.last_offset.ordinal
+                    ),
+                });
+            }
 
             for record in chunk {
                 import_digest = fnv1a_feed(import_digest, record.offset.ordinal);
@@ -581,8 +863,8 @@ impl MigrationEngine {
     /// consistent set of fully-migrated consumers up to the abort
     /// point. Already-migrated consumers are NOT rolled back —
     /// the `commit_checkpoint` idempotency (Advanced /
-    /// NoopAlreadyAdvanced outcomes) means a subsequent resume
-    /// replays safely.
+    /// NoopAlreadyAdvanced outcomes) means re-running the consumer loop
+    /// replays safely; this method does not persist a resume cursor itself.
     pub async fn m3_checkpoint_sync_with_cx<S: RecorderStorage, T: RecorderStorage>(
         &self,
         cx: &crate::cx::Cx,
@@ -590,6 +872,11 @@ impl MigrationEngine {
         target: &T,
         manifest: &MigrationManifest,
     ) -> Result<CheckpointSyncResult, MigrationError> {
+        // Resolve both endpoints before touching either one. In particular, a
+        // reserved target must fail before source lag/checkpoint reads begin.
+        select_recorder_backend(source.backend_kind())?;
+        select_recorder_backend(target.backend_kind())?;
+
         // Tick 75 refactor: use the Cx-first trait sibling (tick
         // 74) — absorbs the pre-flight checkpoint into the trait
         // default's cancellation seam.
@@ -709,59 +996,93 @@ impl MigrationEngine {
     }
 
     // -----------------------------------------------------------------------
-    // M5 — Cutover
+    // M5 — Readiness marker
     // -----------------------------------------------------------------------
 
-    /// Execute M5 cutover: emit lifecycle marker, verify target health.
+    /// Execute M5 readiness verification and persist a durable marker.
     ///
-    /// Emits a `LifecycleMarker` event to the target with migration metadata,
-    /// then verifies the target is healthy post-activation. Returns the
-    /// source path for retention (rollback window).
-    pub async fn m5_cutover<T: RecorderStorage>(
+    /// This method does **not** activate a backend selector. Before any marker
+    /// I/O it verifies M0/M1/M2 count parity, M1/M2 digest parity, a checked
+    /// marker ordinal, and target health/identity. After the fsync append it
+    /// rechecks target health. A successful result means the target is ready
+    /// for a separate selector authority to activate; it does not mean that
+    /// activation occurred.
+    pub async fn m5_mark_ready<T: RecorderStorage>(
         &self,
         target: &T,
         manifest: &MigrationManifest,
         epoch_ms: u64,
         source_path: Option<String>,
-    ) -> Result<CutoverResult, MigrationError> {
+    ) -> Result<CutoverReadinessResult, MigrationError> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.m5_cutover_with_cx(&cx, target, manifest, epoch_ms, source_path)
+        self.m5_mark_ready_with_cx(&cx, target, manifest, epoch_ms, source_path)
             .await
     }
 
-    /// Cx-first [`Self::m5_cutover`] (ft-xbnl0.2.3). Threads
-    /// caller `&Cx` through the cutover sequence via checkpoint
-    /// seams: pre-flight (short-circuits before building the
-    /// lifecycle marker), between the marker append and the
-    /// post-activation health check.
+    /// Cx-first [`Self::m5_mark_ready`] (ft-xbnl0.2.3).
     ///
-    /// Cancellation-safety contract: the pre-flight checkpoint
-    /// fires BEFORE constructing the marker event, so a
-    /// pre-cancelled cx leaves the target completely untouched
-    /// (no marker written). A cancel between the marker append
-    /// and the health check leaves the marker on the target (it
-    /// was fsync'd) but the caller doesn't see the `target_healthy`
-    /// field — a subsequent re-attempt of m5 would write a second
-    /// marker with a different epoch_ms (the `batch_id` includes
-    /// it, so idempotency is epoch-scoped). Operators should
-    /// treat a mid-cutover cancellation as "cutover started, re-run
-    /// to confirm".
-    pub async fn m5_cutover_with_cx<T: RecorderStorage>(
+    /// A pre-cancelled context leaves the target untouched. Cancellation after
+    /// append is surfaced by `health_with_cx` as
+    /// [`MigrationError::TargetDegradedAfterMarker`], which records the durable
+    /// marker offset and never claims readiness or activation.
+    pub async fn m5_mark_ready_with_cx<T: RecorderStorage>(
         &self,
         cx: &crate::cx::Cx,
         target: &T,
         manifest: &MigrationManifest,
         epoch_ms: u64,
         source_path: Option<String>,
-    ) -> Result<CutoverResult, MigrationError> {
-        cx.checkpoint().map_err(|err| {
-            MigrationError::TargetWriteError(format!("m5_cutover cancelled pre-start: {err}"))
-        })?;
+    ) -> Result<CutoverReadinessResult, MigrationError> {
         let target_backend = target.backend_kind();
+        select_recorder_backend(target_backend)?;
 
-        let marker_event = RecorderEvent {
+        cx.checkpoint().map_err(|err| {
+            MigrationError::TargetWriteError(format!("m5_mark_ready cancelled pre-start: {err}"))
+        })?;
+
+        if manifest.event_count != manifest.export_count
+            || manifest.export_count != manifest.import_count
+        {
+            return Err(MigrationError::ManifestCountMismatch {
+                preflight_count: manifest.event_count,
+                export_count: manifest.export_count,
+                import_count: manifest.import_count,
+            });
+        }
+        if manifest.export_digest != manifest.import_digest {
+            return Err(MigrationError::ManifestDigestMismatch {
+                export_digest: manifest.export_digest,
+                import_digest: manifest.import_digest,
+            });
+        }
+
+        let marker_sequence =
+            manifest
+                .last_ordinal
+                .checked_add(1)
+                .ok_or(MigrationError::MarkerOrdinalOverflow {
+                    last_ordinal: manifest.last_ordinal,
+                })?;
+
+        let preflight_health = target.health_with_cx(cx).await;
+        if preflight_health.backend != target_backend {
+            return Err(MigrationError::TargetIdentityMismatch {
+                phase: "pre-marker health check",
+                expected: target_backend,
+                actual: preflight_health.backend,
+                marker_offset: None,
+            });
+        }
+        if preflight_health.degraded {
+            return Err(MigrationError::TargetDegradedBeforeMarker {
+                backend: target_backend,
+                last_error: preflight_health.last_error,
+            });
+        }
+
+        let mut marker_event = RecorderEvent {
             schema_version: "ft.recorder.event.v1".to_string(),
-            event_id: format!("migration-cutover-{epoch_ms}"),
+            event_id: String::new(),
             pane_id: 0,
             session_id: None,
             workflow_id: None,
@@ -769,27 +1090,31 @@ impl MigrationEngine {
             source: RecorderEventSource::RecoveryFlow,
             occurred_at_ms: epoch_ms,
             recorded_at_ms: epoch_ms,
-            sequence: manifest.last_ordinal + 1,
+            sequence: marker_sequence,
             causality: RecorderEventCausality {
                 parent_event_id: None,
                 trigger_event_id: None,
                 root_event_id: None,
             },
             payload: RecorderEventPayload::LifecycleMarker {
-                lifecycle_phase: RecorderLifecyclePhase::CaptureStarted,
-                reason: Some("migration_complete".to_string()),
+                lifecycle_phase: RecorderLifecyclePhase::MigrationReadyForActivation,
+                reason: Some("migration_target_ready_for_external_activation".to_string()),
                 details: serde_json::json!({
-                    "migration_type": format!("append_log_to_{target_backend}"),
+                    "migration_type": "recorder_target_readiness",
                     "target_backend": target_backend,
                     "event_count": manifest.event_count,
                     "export_digest": format!("{:#x}", manifest.export_digest),
                     "epoch_ms": epoch_ms,
+                    "selector_activated": false,
+                    "selector_authority": "external_to_recorder_migration",
                 }),
             },
         };
+        marker_event.event_id = crate::event_id::generate_event_id_v1(&marker_event);
+        let marker_batch_digest = readiness_marker_batch_digest(&marker_event)?;
 
         let req = AppendRequest {
-            batch_id: format!("{}-cutover-{epoch_ms}", self.config.consumer_id),
+            batch_id: format!("ft-recorder-migration-readiness-{marker_batch_digest}"),
             events: vec![marker_event],
             required_durability: DurabilityLevel::Fsync,
             producer_ts_ms: epoch_ms,
@@ -799,42 +1124,82 @@ impl MigrationEngine {
         // sibling. A backend with internal cancellation support
         // (via `timeout_with_cx`) can short-circuit the fsync'd
         // write rather than waiting for a timeout.
-        target
+        let append_response = target
             .append_batch_with_cx(cx, req)
             .await
             .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
 
-        cx.checkpoint().map_err(|err| {
-            MigrationError::TargetWriteError(format!(
-                "m5_cutover cancelled after marker append (epoch_ms={epoch_ms}): {err}"
-            ))
-        })?;
+        if append_response.backend != target_backend {
+            return Err(MigrationError::ReadinessMarkerContractViolation {
+                marker_offset: append_response.last_offset.clone(),
+                reason: format!(
+                    "append response backend {} did not match target backend {target_backend}",
+                    append_response.backend
+                ),
+            });
+        }
+        if append_response.accepted_count != 1 {
+            return Err(MigrationError::ReadinessMarkerContractViolation {
+                marker_offset: append_response.last_offset.clone(),
+                reason: format!(
+                    "append response accepted {} events instead of exactly 1",
+                    append_response.accepted_count
+                ),
+            });
+        }
+        if append_response.committed_durability != DurabilityLevel::Fsync {
+            return Err(MigrationError::ReadinessMarkerContractViolation {
+                marker_offset: append_response.last_offset.clone(),
+                reason: format!(
+                    "append response durability {:?} did not satisfy fsync",
+                    append_response.committed_durability
+                ),
+            });
+        }
 
-        // ft-xbnl0.2.3 tick 128: cx-first health probe.
-        let health = target.health_with_cx(cx).await;
+        // Do not insert a separate checkpoint here: health_with_cx converts a
+        // cancellation into a degraded snapshot, allowing the error to retain
+        // the durable marker offset instead of reporting a generic write error.
+        let postflight_health = target.health_with_cx(cx).await;
+        if postflight_health.backend != target_backend {
+            return Err(MigrationError::TargetIdentityMismatch {
+                phase: "post-marker health check",
+                expected: target_backend,
+                actual: postflight_health.backend,
+                marker_offset: Some(append_response.last_offset.clone()),
+            });
+        }
+        if postflight_health.degraded {
+            return Err(MigrationError::TargetDegradedAfterMarker {
+                backend: target_backend,
+                marker_offset: append_response.last_offset,
+                last_error: postflight_health.last_error,
+            });
+        }
 
-        if source_path.is_some() {
+        if let Some(source_path_hint) = source_path.as_deref() {
             info!(
-                source_retention = true,
-                path = %source_path.as_deref().unwrap_or(""),
-                "source files retained for rollback window (cx)"
+                source_path_hint_reported = true,
+                path = %source_path_hint,
+                "caller reported a source path hint; filesystem retention is not verified"
             );
         }
 
-        let result = CutoverResult {
-            activated_backend: target_backend,
+        let result = CutoverReadinessResult {
+            target_backend,
             migration_epoch_ms: epoch_ms,
-            target_healthy: !health.degraded,
-            source_retained_path: source_path,
+            marker_offset: append_response.last_offset,
+            source_path_hint: source_path,
         };
 
         info!(
             migration_stage = "M5",
-            activated = true,
+            readiness_marker_durable = true,
+            selector_activated = false,
             backend = %target_backend,
             epoch = %epoch_ms,
-            healthy = result.target_healthy,
-            "cutover complete (cx)"
+            marker_ordinal = result.marker_offset.ordinal,
+            "target ready for external selector activation (cx)"
         );
 
         Ok(result)
@@ -881,8 +1246,8 @@ impl MigrationEngine {
     ///   - m0 cancel: manifest never returned, no target writes.
     ///   - m1 cancel: m1 is sync, so cancellation only fires at
     ///     the boundary checkpoint (before or after m1).
-    ///   - m2 cancel: already-committed chunks on target remain
-    ///     (batch_id idempotency on resume).
+    ///   - m2 cancel: already-committed chunks on target remain; a full rerun
+    ///     can reuse them while the target retains their batch receipts.
     pub async fn run_m0_m2_with_cx<S: RecorderStorage, T: RecorderStorage>(
         &self,
         cx: &crate::cx::Cx,
@@ -934,7 +1299,7 @@ mod tests {
     };
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // -----------------------------------------------------------------------
     // Async test helper
@@ -1092,6 +1457,9 @@ mod tests {
         health: RecorderStorageHealth,
         appended: Mutex<Vec<AppendRequest>>,
         fail_append: AtomicBool,
+        degrade_after_append: AtomicBool,
+        health_calls: AtomicUsize,
+        response_accepted_count: Mutex<Option<usize>>,
     }
 
     impl MockMigrationStorage {
@@ -1107,6 +1475,9 @@ mod tests {
                 },
                 appended: Mutex::new(Vec::new()),
                 fail_append: AtomicBool::new(false),
+                degrade_after_append: AtomicBool::new(false),
+                health_calls: AtomicUsize::new(0),
+                response_accepted_count: Mutex::new(None),
             }
         }
 
@@ -1122,7 +1493,40 @@ mod tests {
                 },
                 appended: Mutex::new(Vec::new()),
                 fail_append: AtomicBool::new(false),
+                degrade_after_append: AtomicBool::new(false),
+                health_calls: AtomicUsize::new(0),
+                response_accepted_count: Mutex::new(None),
             }
+        }
+
+        fn reserved() -> Self {
+            Self {
+                health: RecorderStorageHealth {
+                    backend: RecorderBackendKind::FrankenSqlite,
+                    degraded: false,
+                    queue_depth: 0,
+                    queue_capacity: 100,
+                    latest_offset: None,
+                    last_error: None,
+                },
+                appended: Mutex::new(Vec::new()),
+                fail_append: AtomicBool::new(false),
+                degrade_after_append: AtomicBool::new(false),
+                health_calls: AtomicUsize::new(0),
+                response_accepted_count: Mutex::new(None),
+            }
+        }
+
+        fn degrades_after_append() -> Self {
+            let storage = Self::healthy();
+            storage.degrade_after_append.store(true, Ordering::Relaxed);
+            storage
+        }
+
+        fn with_response_accepted_count(accepted_count: usize) -> Self {
+            let storage = Self::healthy();
+            *storage.response_accepted_count.lock().unwrap() = Some(accepted_count);
+            storage
         }
 
         fn total_events_appended(&self) -> usize {
@@ -1149,12 +1553,18 @@ mod tests {
                 return std::future::ready(Err(RecorderStorageError::QueueFull { capacity: 0 }));
             }
             let count = req.events.len();
+            let accepted_count = self
+                .response_accepted_count
+                .lock()
+                .unwrap()
+                .unwrap_or(count);
+            let committed_durability = req.required_durability;
             let first_ord = 0_u64;
             let last_ord = count.saturating_sub(1) as u64;
             self.appended.lock().unwrap().push(req);
             std::future::ready(Ok(AppendResponse {
                 backend: self.health.backend,
-                accepted_count: count,
+                accepted_count,
                 first_offset: RecorderOffset {
                     segment_id: 0,
                     byte_offset: 0,
@@ -1165,8 +1575,9 @@ mod tests {
                     byte_offset: 0,
                     ordinal: last_ord,
                 },
-                committed_durability: DurabilityLevel::Appended,
+                committed_durability,
                 committed_at_ms: 0,
+                was_idempotent_replay: false,
             }))
         }
 
@@ -1201,7 +1612,18 @@ mod tests {
         }
 
         fn health(&self) -> impl std::future::Future<Output = RecorderStorageHealth> {
-            std::future::ready(self.health.clone())
+            self.health_calls.fetch_add(1, Ordering::Relaxed);
+            let degraded_after_append = self.degrade_after_append.load(Ordering::Relaxed)
+                && !self.appended.lock().unwrap().is_empty();
+            std::future::ready(if degraded_after_append {
+                RecorderStorageHealth {
+                    degraded: true,
+                    last_error: Some("degraded after readiness marker".to_string()),
+                    ..self.health.clone()
+                }
+            } else {
+                self.health.clone()
+            })
         }
 
         fn lag_metrics(
@@ -1718,7 +2140,7 @@ mod tests {
         assert!(!MigrationStage::M2Import.is_complete());
         assert!(!MigrationStage::M3CheckpointSync.is_complete());
         assert!(!MigrationStage::M4Reserved.is_complete());
-        assert!(MigrationStage::M5Cutover.is_complete());
+        assert!(!MigrationStage::M5Readiness.is_complete());
     }
 
     #[test]
@@ -1728,7 +2150,7 @@ mod tests {
         assert!(MigrationStage::M2Import.can_rollback());
         assert!(MigrationStage::M3CheckpointSync.can_rollback());
         assert!(!MigrationStage::M4Reserved.can_rollback());
-        assert!(!MigrationStage::M5Cutover.can_rollback());
+        assert!(MigrationStage::M5Readiness.can_rollback());
     }
 
     #[test]
@@ -1970,6 +2392,152 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_m0_rejects_reserved_source_before_health_io() {
+        run_async_test(async {
+            let source = MockMigrationStorage::reserved();
+            let reader = TestEventReader::new(vec![make_cursor_record(1, 0)]);
+            let engine = MigrationEngine::new(MigrationConfig::default());
+
+            let error = engine.m0_preflight(&source, &reader).await.unwrap_err();
+
+            assert!(matches!(error, MigrationError::BackendSelection(_)));
+            assert_eq!(source.health_calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn test_m2_rejects_reserved_target_before_append_io() {
+        run_async_test(async {
+            let target = MockMigrationStorage::reserved();
+            let records = vec![make_cursor_record(1, 0)];
+            let reader = TestEventReader::new(records);
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut manifest = MigrationManifest::default();
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+
+            let error = engine
+                .m2_import(&target, &exported, &mut manifest)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, MigrationError::BackendSelection(_)));
+            assert!(target.appended.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_zero_batch_sizes_fail_typed_before_storage_io() {
+        run_async_test(async {
+            let source = MockMigrationStorage::healthy();
+            let reader = TestEventReader::new(vec![make_cursor_record(1, 0)]);
+            let export_zero = MigrationEngine::new(MigrationConfig {
+                export_batch_size: 0,
+                ..MigrationConfig::default()
+            });
+
+            let m0_error = export_zero
+                .m0_preflight(&source, &reader)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                m0_error,
+                MigrationError::InvalidBatchSize {
+                    stage: "M0",
+                    field: "export_batch_size"
+                }
+            ));
+            assert_eq!(source.health_calls.load(Ordering::Relaxed), 0);
+
+            let mut manifest = MigrationManifest::default();
+            let m1_error = export_zero.m1_export(&reader, &mut manifest).unwrap_err();
+            assert!(matches!(
+                m1_error,
+                MigrationError::InvalidBatchSize {
+                    stage: "M1",
+                    field: "export_batch_size"
+                }
+            ));
+
+            let target = MockMigrationStorage::healthy();
+            let import_zero = MigrationEngine::new(MigrationConfig {
+                import_batch_size: 0,
+                ..MigrationConfig::default()
+            });
+            let m2_error = import_zero
+                .m2_import(&target, &[make_cursor_record(1, 0)], &mut manifest)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                m2_error,
+                MigrationError::InvalidBatchSize {
+                    stage: "M2",
+                    field: "import_batch_size"
+                }
+            ));
+            assert!(target.appended.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_m2_batch_identity_is_bound_to_event_content() {
+        run_async_test(async {
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut first_record = make_cursor_record(1, 7);
+            let mut second_record = first_record.clone();
+            first_record.event.event_id = "content-a".to_string();
+            second_record.event.event_id = "content-b".to_string();
+
+            let first_target = MockMigrationStorage::healthy();
+            let second_target = MockMigrationStorage::healthy();
+            let mut first_manifest = MigrationManifest {
+                export_count: 1,
+                export_digest: fnv1a_feed(FNV1A_OFFSET_BASIS, 7),
+                ..Default::default()
+            };
+            let mut second_manifest = first_manifest.clone();
+
+            engine
+                .m2_import(&first_target, &[first_record], &mut first_manifest)
+                .await
+                .unwrap();
+            engine
+                .m2_import(&second_target, &[second_record], &mut second_manifest)
+                .await
+                .unwrap();
+
+            let first_batches = first_target.appended.lock().unwrap();
+            let second_batches = second_target.appended.lock().unwrap();
+            assert_ne!(first_batches[0].batch_id, second_batches[0].batch_id);
+        });
+    }
+
+    #[test]
+    fn test_m2_rejects_success_response_with_wrong_accepted_count() {
+        run_async_test(async {
+            let target = MockMigrationStorage::with_response_accepted_count(0);
+            let record = make_cursor_record(1, 0);
+            let mut manifest = MigrationManifest {
+                export_count: 1,
+                export_digest: fnv1a_feed(FNV1A_OFFSET_BASIS, 0),
+                ..Default::default()
+            };
+            let engine = MigrationEngine::new(MigrationConfig::default());
+
+            let error = engine
+                .m2_import(&target, &[record], &mut manifest)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                MigrationError::TargetAppendContractViolation { .. }
+            ));
+            assert_eq!(manifest.import_count, 0);
+            assert_eq!(target.appended.lock().unwrap().len(), 1);
+        });
+    }
+
     // -----------------------------------------------------------------------
     // M3 mock storage with checkpoint support
     // -----------------------------------------------------------------------
@@ -1983,6 +2551,7 @@ mod tests {
         consumers: Vec<RecorderConsumerLag>,
         committed: Mutex<Vec<RecorderCheckpoint>>,
         reject_commit: AtomicBool,
+        lag_calls: AtomicUsize,
     }
 
     impl MockCheckpointStorage {
@@ -2003,11 +2572,18 @@ mod tests {
                 consumers,
                 committed: Mutex::new(Vec::new()),
                 reject_commit: AtomicBool::new(false),
+                lag_calls: AtomicUsize::new(0),
             }
         }
 
         fn empty_target() -> Self {
             Self::new(vec![], HashMap::new())
+        }
+
+        fn reserved_target() -> Self {
+            let mut target = Self::empty_target();
+            target.health.backend = RecorderBackendKind::FrankenSqlite;
+            target
         }
     }
 
@@ -2036,6 +2612,7 @@ mod tests {
                 },
                 committed_durability: DurabilityLevel::Appended,
                 committed_at_ms: 0,
+                was_idempotent_replay: false,
             }))
         }
 
@@ -2087,6 +2664,7 @@ mod tests {
         ) -> impl std::future::Future<
             Output = std::result::Result<RecorderStorageLag, RecorderStorageError>,
         > {
+            self.lag_calls.fetch_add(1, Ordering::Relaxed);
             std::future::ready(Ok(RecorderStorageLag {
                 latest_offset: None,
                 consumers: self.consumers.clone(),
@@ -2117,6 +2695,24 @@ mod tests {
     // -----------------------------------------------------------------------
     // M3 tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_m3_rejects_reserved_target_before_source_io() {
+        run_async_test(async {
+            let source = MockCheckpointStorage::new(vec![], HashMap::new());
+            let target = MockCheckpointStorage::reserved_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+
+            let error = engine
+                .m3_checkpoint_sync(&source, &target, &MigrationManifest::default())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, MigrationError::BackendSelection(_)));
+            assert_eq!(source.lag_calls.load(Ordering::Relaxed), 0);
+            assert!(target.committed.lock().unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn test_m3_migrates_all_consumer_checkpoints() {
@@ -2450,127 +3046,175 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M5 tests
+    // M5 readiness tests
     // -----------------------------------------------------------------------
 
+    fn verified_manifest(event_count: u64, last_ordinal: u64, digest: u64) -> MigrationManifest {
+        MigrationManifest {
+            event_count,
+            first_ordinal: 0,
+            last_ordinal,
+            export_digest: digest,
+            export_count: event_count,
+            import_digest: digest,
+            import_count: event_count,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn test_m5_emits_lifecycle_marker() {
+    fn test_m5_emits_readiness_marker_without_activation_claim() {
         run_async_test(async {
             let target = MockMigrationStorage::healthy();
             let engine = MigrationEngine::new(MigrationConfig::default());
-            let manifest = MigrationManifest {
-                event_count: 100,
-                first_ordinal: 0,
-                last_ordinal: 99,
-                export_digest: 0xCAFE,
-                ..Default::default()
-            };
+            let manifest = verified_manifest(100, 99, 0xCAFE);
 
             let result = engine
-                .m5_cutover(&target, &manifest, 1708000000, None)
+                .m5_mark_ready(&target, &manifest, 1708000000, None)
                 .await
                 .unwrap();
 
-            assert_eq!(result.activated_backend, RecorderBackendKind::Rusqlite);
+            assert_eq!(result.target_backend, RecorderBackendKind::Rusqlite);
             assert_eq!(result.migration_epoch_ms, 1708000000);
-            assert!(result.target_healthy);
-            assert!(result.source_retained_path.is_none());
+            assert_eq!(result.marker_offset.ordinal, 0);
+            assert!(result.source_path_hint.is_none());
 
-            // Verify one batch was appended (the marker event)
             let appended = target.appended.lock().unwrap();
             assert_eq!(appended.len(), 1);
             assert_eq!(appended[0].events.len(), 1);
 
             let marker = &appended[0].events[0];
-            assert!(marker.event_id.contains("cutover"));
-            assert_eq!(marker.sequence, 100); // last_ordinal + 1
+            assert_eq!(marker.event_id.len(), 64);
+            assert!(
+                marker
+                    .event_id
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+            );
+            assert_eq!(
+                marker.event_id,
+                crate::event_id::generate_event_id_v1(marker)
+            );
+            assert_eq!(
+                appended[0].batch_id,
+                format!(
+                    "ft-recorder-migration-readiness-{}",
+                    readiness_marker_batch_digest(marker).unwrap()
+                )
+            );
+            assert_eq!(marker.sequence, 100);
+            let RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase,
+                reason,
+                details,
+            } = &marker.payload
+            else {
+                panic!("M5 must append a lifecycle readiness marker");
+            };
+            assert_eq!(
+                *lifecycle_phase,
+                RecorderLifecyclePhase::MigrationReadyForActivation
+            );
+            assert_eq!(
+                reason.as_deref(),
+                Some("migration_target_ready_for_external_activation")
+            );
+            assert_eq!(details["selector_activated"], false);
         });
     }
 
-    /// ft-xbnl0.2.3 Cx-first: `m5_cutover_with_cx` must emit an
-    /// identical lifecycle marker and produce an identical
-    /// CutoverResult for the same inputs as the legacy
-    /// `m5_cutover`. Parallel of `test_m5_emits_lifecycle_marker`
-    /// under the Cx-first path, plus cross-path parity
-    /// assertions.
+    /// The Cx-first readiness path must produce the same proof and marker as
+    /// the ambient-Cx wrapper for identical inputs.
     #[test]
-    fn m5_cutover_with_cx_matches_legacy() {
+    fn m5_mark_ready_with_cx_matches_wrapper() {
         run_async_test(async {
-            let target_legacy = MockMigrationStorage::healthy();
+            let target_wrapper = MockMigrationStorage::healthy();
             let target_cx = MockMigrationStorage::healthy();
             let engine = MigrationEngine::new(MigrationConfig::default());
-            let manifest = MigrationManifest {
-                event_count: 100,
-                first_ordinal: 0,
-                last_ordinal: 99,
-                export_digest: 0xCAFE,
-                ..Default::default()
-            };
+            let manifest = verified_manifest(100, 99, 0xCAFE);
             let epoch_ms = 1_708_000_000_u64;
 
-            let legacy = engine
-                .m5_cutover(&target_legacy, &manifest, epoch_ms, None)
+            let wrapper = engine
+                .m5_mark_ready(&target_wrapper, &manifest, epoch_ms, None)
                 .await
                 .unwrap();
 
             let cx = crate::cx::for_request();
             let cx_first = engine
-                .m5_cutover_with_cx(&cx, &target_cx, &manifest, epoch_ms, None)
+                .m5_mark_ready_with_cx(&cx, &target_cx, &manifest, epoch_ms, None)
                 .await
                 .unwrap();
 
-            // Result parity.
-            assert_eq!(legacy.activated_backend, cx_first.activated_backend);
-            assert_eq!(legacy.migration_epoch_ms, cx_first.migration_epoch_ms);
-            assert_eq!(legacy.target_healthy, cx_first.target_healthy);
-            assert_eq!(legacy.source_retained_path, cx_first.source_retained_path);
+            assert_eq!(wrapper, cx_first);
 
-            // Both targets must have received exactly one batch with
-            // exactly one event (the cutover marker).
-            let legacy_appended = target_legacy.appended.lock().unwrap();
+            let wrapper_appended = target_wrapper.appended.lock().unwrap();
             let cx_appended = target_cx.appended.lock().unwrap();
-            assert_eq!(legacy_appended.len(), cx_appended.len());
-            assert_eq!(legacy_appended.len(), 1);
-            assert_eq!(legacy_appended[0].events.len(), cx_appended[0].events.len());
+            assert_eq!(wrapper_appended.len(), cx_appended.len());
+            assert_eq!(wrapper_appended.len(), 1);
+            assert_eq!(
+                wrapper_appended[0].events.len(),
+                cx_appended[0].events.len()
+            );
 
-            // The marker event_id must be identical (epoch_ms-based).
-            let legacy_marker = &legacy_appended[0].events[0];
+            let wrapper_marker = &wrapper_appended[0].events[0];
             let cx_marker = &cx_appended[0].events[0];
-            assert_eq!(legacy_marker.event_id, cx_marker.event_id);
-            assert_eq!(legacy_marker.sequence, cx_marker.sequence);
-            assert_eq!(legacy_marker.sequence, 100);
-
-            // batch_id must match too (contains consumer_id + epoch).
-            assert_eq!(legacy_appended[0].batch_id, cx_appended[0].batch_id);
+            assert_eq!(wrapper_marker.event_id, cx_marker.event_id);
+            assert_eq!(wrapper_marker.sequence, cx_marker.sequence);
+            assert_eq!(wrapper_appended[0].batch_id, cx_appended[0].batch_id);
         });
     }
 
     #[test]
-    fn test_m5_switches_backend_selector() {
+    fn m5_readiness_identity_is_bound_to_verified_manifest_content() {
         run_async_test(async {
-            let target = MockMigrationStorage::healthy();
+            let first_target = MockMigrationStorage::healthy();
+            let second_target = MockMigrationStorage::healthy();
             let engine = MigrationEngine::new(MigrationConfig::default());
-            let manifest = MigrationManifest::default();
+            let first_manifest = verified_manifest(100, 99, 0xCAFE);
+            let second_manifest = verified_manifest(101, 100, 0xBEEF);
+            let epoch_ms = 1_708_000_000_u64;
 
-            let result = engine
-                .m5_cutover(&target, &manifest, 1000, None)
+            engine
+                .m5_mark_ready(&first_target, &first_manifest, epoch_ms, None)
+                .await
+                .unwrap();
+            engine
+                .m5_mark_ready(&second_target, &second_manifest, epoch_ms, None)
                 .await
                 .unwrap();
 
-            // Activation result reports the actual target backend.
-            assert_eq!(result.activated_backend, RecorderBackendKind::Rusqlite);
+            let first = first_target.appended.lock().unwrap();
+            let second = second_target.appended.lock().unwrap();
+            assert_ne!(first[0].events[0].event_id, second[0].events[0].event_id);
+            assert_ne!(first[0].batch_id, second[0].batch_id);
         });
     }
 
     #[test]
-    fn test_m5_preserves_source_files() {
+    fn test_m5_result_names_target_without_claiming_selector_activation() {
         run_async_test(async {
             let target = MockMigrationStorage::healthy();
             let engine = MigrationEngine::new(MigrationConfig::default());
             let manifest = MigrationManifest::default();
 
             let result = engine
-                .m5_cutover(
+                .m5_mark_ready(&target, &manifest, 1000, None)
+                .await
+                .unwrap();
+
+            assert_eq!(result.target_backend, RecorderBackendKind::Rusqlite);
+        });
+    }
+
+    #[test]
+    fn test_m5_returns_source_path_hint_without_claiming_retention() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest::default();
+
+            let result = engine
+                .m5_mark_ready(
                     &target,
                     &manifest,
                     1000,
@@ -2580,27 +3224,49 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                result.source_retained_path,
+                result.source_path_hint,
                 Some("/data/events.log".to_string())
             );
         });
     }
 
     #[test]
-    fn test_m5_verifies_target_health_post_activation() {
+    fn test_m5_rejects_degraded_target_before_marker_io() {
         run_async_test(async {
-            // Use a degraded target
             let target = MockMigrationStorage::degraded();
             let engine = MigrationEngine::new(MigrationConfig::default());
             let manifest = MigrationManifest::default();
 
-            let result = engine
-                .m5_cutover(&target, &manifest, 1000, None)
+            let error = engine
+                .m5_mark_ready(&target, &manifest, 1000, None)
                 .await
-                .unwrap();
+                .unwrap_err();
 
-            // Degraded target reports unhealthy
-            assert!(!result.target_healthy);
+            assert!(matches!(
+                error,
+                MigrationError::TargetDegradedBeforeMarker { .. }
+            ));
+            assert!(target.appended.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_m5_reports_post_marker_degradation_without_readiness_result() {
+        run_async_test(async {
+            let target = MockMigrationStorage::degrades_after_append();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest::default();
+
+            let error = engine
+                .m5_mark_ready(&target, &manifest, 1000, None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                MigrationError::TargetDegradedAfterMarker { .. }
+            ));
+            assert_eq!(target.appended.lock().unwrap().len(), 1);
         });
     }
 
@@ -2612,7 +3278,7 @@ mod tests {
             let engine = MigrationEngine::new(MigrationConfig::default());
             let manifest = MigrationManifest::default();
 
-            let result = engine.m5_cutover(&target, &manifest, 1000, None).await;
+            let result = engine.m5_mark_ready(&target, &manifest, 1000, None).await;
             assert!(result.is_err());
             let msg = format!("{}", result.unwrap_err());
             assert!(msg.contains("target write error"), "msg: {msg}");
@@ -2620,15 +3286,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cutover_result_serialize_roundtrip() {
-        let result = CutoverResult {
-            activated_backend: RecorderBackendKind::Rusqlite,
+    fn test_cutover_readiness_result_serialize_roundtrip() {
+        let result = CutoverReadinessResult {
+            target_backend: RecorderBackendKind::Rusqlite,
             migration_epoch_ms: 1708000000,
-            target_healthy: true,
-            source_retained_path: Some("/data/events.log".to_string()),
+            marker_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 10,
+                ordinal: 4,
+            },
+            source_path_hint: Some("/data/events.log".to_string()),
         };
         let json = serde_json::to_string(&result).unwrap();
-        let restored: CutoverResult = serde_json::from_str(&json).unwrap();
+        let restored: CutoverReadinessResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, restored);
     }
 
@@ -2640,12 +3310,95 @@ mod tests {
             let manifest = MigrationManifest::default();
 
             engine
-                .m5_cutover(&target, &manifest, 1000, None)
+                .m5_mark_ready(&target, &manifest, 1000, None)
                 .await
                 .unwrap();
 
             let appended = target.appended.lock().unwrap();
             assert_eq!(appended[0].required_durability, DurabilityLevel::Fsync,);
+        });
+    }
+
+    #[test]
+    fn test_m5_rejects_count_mismatch_before_marker_io() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut manifest = verified_manifest(3, 2, 0xCAFE);
+            manifest.import_count = 2;
+
+            let error = engine
+                .m5_mark_ready(&target, &manifest, 1000, None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                MigrationError::ManifestCountMismatch { .. }
+            ));
+            assert_eq!(target.health_calls.load(Ordering::Relaxed), 0);
+            assert!(target.appended.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_m5_rejects_digest_mismatch_before_marker_io() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut manifest = verified_manifest(3, 2, 0xCAFE);
+            manifest.import_digest = 0xDEAD;
+
+            let error = engine
+                .m5_mark_ready(&target, &manifest, 1000, None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                MigrationError::ManifestDigestMismatch { .. }
+            ));
+            assert_eq!(target.health_calls.load(Ordering::Relaxed), 0);
+            assert!(target.appended.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_m5_rejects_max_ordinal_before_marker_io() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = verified_manifest(1, u64::MAX, 0xCAFE);
+
+            let error = engine
+                .m5_mark_ready(&target, &manifest, 1000, None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                MigrationError::MarkerOrdinalOverflow { .. }
+            ));
+            assert_eq!(target.health_calls.load(Ordering::Relaxed), 0);
+            assert!(target.appended.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_m5_rejects_reserved_backend_before_health_or_marker_io() {
+        run_async_test(async {
+            let target = MockMigrationStorage::reserved();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest::default();
+
+            let error = engine
+                .m5_mark_ready(&target, &manifest, 1000, None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, MigrationError::BackendSelection(_)));
+            assert_eq!(target.health_calls.load(Ordering::Relaxed), 0);
+            assert!(target.appended.lock().unwrap().is_empty());
         });
     }
 }

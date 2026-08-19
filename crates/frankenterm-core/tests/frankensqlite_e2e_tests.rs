@@ -1,9 +1,11 @@
-//! E4.F1.T2: End-to-end migration cutover and rollback scenario harness.
+//! E4.F1.T2: End-to-end migration readiness and rollback scenario harness.
 //!
 //! Tests the full M0→M5 pipeline and rollback tiers using AppendLog source
 //! and mock target storage.
 
-use frankenterm_core::recorder_migration::{MigrationConfig, MigrationEngine, MigrationManifest};
+use frankenterm_core::recorder_migration::{
+    MigrationConfig, MigrationEngine, MigrationError, MigrationManifest,
+};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, AppendResponse,
     CheckpointCommitOutcome, CheckpointConsumerId, CursorRecord, DurabilityLevel, EventCursorError,
@@ -24,7 +26,7 @@ use frankenterm_core::storage::{
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tempfile::tempdir;
 
 fn run_async_test<F>(future: F)
@@ -205,14 +207,15 @@ struct MockTargetStorage {
     appended: Mutex<Vec<AppendRequest>>,
     checkpoints: Mutex<std::collections::HashMap<String, RecorderCheckpoint>>,
     fail_append: AtomicBool,
-    degraded_post_cutover: AtomicBool,
+    degraded_post_marker: AtomicBool,
+    health_checks: AtomicUsize,
 }
 
 impl MockTargetStorage {
     fn healthy() -> Self {
         Self {
             health: RecorderStorageHealth {
-                backend: RecorderBackendKind::FrankenSqlite,
+                backend: RecorderBackendKind::Rusqlite,
                 degraded: false,
                 queue_depth: 0,
                 queue_capacity: 100,
@@ -222,7 +225,8 @@ impl MockTargetStorage {
             appended: Mutex::new(Vec::new()),
             checkpoints: Mutex::new(std::collections::HashMap::new()),
             fail_append: AtomicBool::new(false),
-            degraded_post_cutover: AtomicBool::new(false),
+            degraded_post_marker: AtomicBool::new(false),
+            health_checks: AtomicUsize::new(0),
         }
     }
 
@@ -250,22 +254,30 @@ impl RecorderStorage for MockTargetStorage {
             return std::future::ready(Err(RecorderStorageError::QueueFull { capacity: 0 }));
         }
         let count = req.events.len();
-        self.appended.lock().unwrap().push(req);
+        let committed_durability = req.required_durability;
+        let mut appended = self.appended.lock().unwrap();
+        let first_ordinal = appended
+            .iter()
+            .map(|batch| batch.events.len() as u64)
+            .sum::<u64>();
+        appended.push(req);
+        drop(appended);
         std::future::ready(Ok(AppendResponse {
             backend: self.health.backend,
             accepted_count: count,
             first_offset: RecorderOffset {
                 segment_id: 0,
                 byte_offset: 0,
-                ordinal: 0,
+                ordinal: first_ordinal,
             },
             last_offset: RecorderOffset {
                 segment_id: 0,
                 byte_offset: 0,
-                ordinal: count.saturating_sub(1) as u64,
+                ordinal: first_ordinal + count.saturating_sub(1) as u64,
             },
-            committed_durability: DurabilityLevel::Appended,
+            committed_durability,
             committed_at_ms: 0,
+            was_idempotent_replay: false,
         }))
     }
 
@@ -309,15 +321,18 @@ impl RecorderStorage for MockTargetStorage {
     }
 
     fn health(&self) -> impl std::future::Future<Output = RecorderStorageHealth> {
-        std::future::ready(if self.degraded_post_cutover.load(Ordering::Relaxed) {
-            RecorderStorageHealth {
-                degraded: true,
-                last_error: Some("post-cutover degradation".to_string()),
-                ..self.health.clone()
-            }
-        } else {
-            self.health.clone()
-        })
+        let health_check = self.health_checks.fetch_add(1, Ordering::Relaxed);
+        std::future::ready(
+            if self.degraded_post_marker.load(Ordering::Relaxed) && health_check > 0 {
+                RecorderStorageHealth {
+                    degraded: true,
+                    last_error: Some("post-marker degradation".to_string()),
+                    ..self.health.clone()
+                }
+            } else {
+                self.health.clone()
+            },
+        )
     }
 
     fn lag_metrics(
@@ -360,7 +375,7 @@ fn test_e2e_full_migration_happy_path() {
 }
 
 #[test]
-fn test_e2e_m5_cutover_completes() {
+fn test_e2e_m5_readiness_does_not_claim_selector_activation() {
     run_async_test(async {
         let dir = tempdir().unwrap();
         let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
@@ -371,8 +386,8 @@ fn test_e2e_m5_cutover_completes() {
 
         let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
-        let cutover = engine
-            .m5_cutover(
+        let readiness = engine
+            .m5_mark_ready(
                 &target,
                 &manifest,
                 1708000000,
@@ -381,12 +396,9 @@ fn test_e2e_m5_cutover_completes() {
             .await
             .unwrap();
 
-        assert_eq!(
-            cutover.activated_backend,
-            RecorderBackendKind::FrankenSqlite
-        );
-        assert!(cutover.target_healthy);
-        assert!(cutover.source_retained_path.is_some());
+        assert_eq!(readiness.target_backend, RecorderBackendKind::Rusqlite);
+        assert_eq!(readiness.marker_offset.ordinal, 10);
+        assert!(readiness.source_path_hint.is_some());
     });
 }
 
@@ -448,7 +460,7 @@ fn test_e2e_corruption_triggers_immediate_rollback() {
 }
 
 #[test]
-fn test_e2e_rollback_preserves_source_data() {
+fn source_fixture_remains_readable_without_migration_mutation() {
     run_async_test(async {
         let dir = tempdir().unwrap();
         let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
@@ -526,7 +538,7 @@ fn test_e2e_target_write_failure_at_m2() {
 }
 
 #[test]
-fn test_e2e_m5_degraded_target_reports_unhealthy() {
+fn test_e2e_m5_post_marker_degradation_returns_typed_error() {
     run_async_test(async {
         let dir = tempdir().unwrap();
         let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
@@ -537,14 +549,18 @@ fn test_e2e_m5_degraded_target_reports_unhealthy() {
 
         let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
-        target.degraded_post_cutover.store(true, Ordering::Relaxed);
+        target.degraded_post_marker.store(true, Ordering::Relaxed);
 
-        let cutover = engine
-            .m5_cutover(&target, &manifest, 1000, None)
+        let error = engine
+            .m5_mark_ready(&target, &manifest, 1000, None)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert!(!cutover.target_healthy);
+        assert!(matches!(
+            error,
+            MigrationError::TargetDegradedAfterMarker { .. }
+        ));
+        assert_eq!(target.total_events(), 6);
     });
 }
 
@@ -754,8 +770,8 @@ fn test_e2e_full_pipeline_with_m3_and_m5() {
             .unwrap();
         assert_eq!(sync.checkpoints_migrated, 1);
 
-        let cutover = engine
-            .m5_cutover(
+        let readiness = engine
+            .m5_mark_ready(
                 &target,
                 &manifest,
                 1708000000,
@@ -765,11 +781,7 @@ fn test_e2e_full_pipeline_with_m3_and_m5() {
             )
             .await
             .unwrap();
-        assert!(cutover.target_healthy);
-        assert_eq!(
-            cutover.activated_backend,
-            RecorderBackendKind::FrankenSqlite
-        );
+        assert_eq!(readiness.target_backend, RecorderBackendKind::Rusqlite);
     });
 }
 

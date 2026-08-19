@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::tantivy_ingest::{
-    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, map_event_to_document,
+    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError,
+    ensure_source_matches_storage, map_event_to_document,
 };
 use frankenterm_core::recorder_storage::{
     CheckpointConsumerId, EventCursorError, RecorderCheckpoint, RecorderEventCursor,
@@ -363,6 +364,7 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         storage: &S,
         config: &ReindexConfig,
     ) -> Result<ReindexProgress, IndexerError> {
+        ensure_source_matches_storage("full reindex", &config.source, storage)?;
         if config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -372,8 +374,6 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
         let checkpoint = if config.clear_before_start {
-            let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
-            progress.docs_cleared = cleared;
             None
         } else {
             let checkpoint = storage.read_checkpoint(&consumer_id).await?;
@@ -397,6 +397,11 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
             None => event_reader.open_cursor_from_start().map_err(cursor_err)?,
         };
 
+        if config.clear_before_start {
+            let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
+            progress.docs_cleared = cleared;
+        }
+
         self.index_loop(
             storage,
             &mut *cursor,
@@ -418,11 +423,10 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
     /// `cx.checkpoint()` seams) and through the index loop via
     /// [`Self::index_loop_with_cx`] (per-iteration cancellation).
     ///
-    /// Cancellation-safety contract: the `writer.clear_all()` call
-    /// fires BEFORE the first cx.checkpoint inside the index loop,
-    /// so a cx cancelled after clear-before-start still lets the
-    /// caller observe what was cleared in `progress.docs_cleared`
-    /// — no silent data loss.
+    /// Cancellation-safety contract: source identity and cursor readability are
+    /// proven before `writer.clear_all()`. A cancellation checkpoint immediately
+    /// before the clear prevents destructive mutation if cancellation arrived
+    /// during source discovery; a post-clear checkpoint reports the cleared count.
     pub async fn full_reindex_with_cx<S: RecorderStorage>(
         &mut self,
         cx: &frankenterm_core::cx::Cx,
@@ -433,6 +437,8 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
             IndexerError::Config(format!("full_reindex cancelled pre-start: {err}"))
         })?;
 
+        ensure_source_matches_storage("full reindex", &config.source, storage)?;
+
         if config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -442,16 +448,6 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
         let checkpoint = if config.clear_before_start {
-            let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
-            progress.docs_cleared = cleared;
-
-            cx.checkpoint().map_err(|err| {
-                IndexerError::Config(format!(
-                    "full_reindex cancelled after clear_all (docs_cleared={}): {err}",
-                    progress.docs_cleared
-                ))
-            })?;
-
             None
         } else {
             cx.checkpoint().map_err(|err| {
@@ -481,6 +477,24 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
             }
             None => event_reader.open_cursor_from_start().map_err(cursor_err)?,
         };
+
+        if config.clear_before_start {
+            cx.checkpoint().map_err(|err| {
+                IndexerError::Config(format!(
+                    "full_reindex cancelled after source proof and before clear_all: {err}"
+                ))
+            })?;
+
+            let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
+            progress.docs_cleared = cleared;
+
+            cx.checkpoint().map_err(|err| {
+                IndexerError::Config(format!(
+                    "full_reindex cancelled after clear_all (docs_cleared={}): {err}",
+                    progress.docs_cleared
+                ))
+            })?;
+        }
 
         self.index_loop_with_cx(
             cx,
@@ -537,6 +551,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         dedup_on_replay: bool,
         expected_schema: &str,
     ) -> Result<ReindexProgress, IndexerError> {
+        ensure_source_matches_storage("range reindex", source, storage)?;
         if batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -628,6 +643,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
             IndexerError::Config(format!("reindex_range cancelled pre-start: {err}"))
         })?;
 
+        ensure_source_matches_storage("range reindex", source, storage)?;
+
         if batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -712,6 +729,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         observer: &O,
     ) -> Result<(ReindexProgress, ReindexStats), IndexerError> {
         let start_ms = epoch_ms_now();
+
+        ensure_source_matches_storage("observed range reindex", source, storage)?;
 
         if batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
@@ -931,6 +950,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
 
         let start_ms = epoch_ms_now();
 
+        ensure_source_matches_storage("observed range reindex", source, storage)?;
+
         if batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -1115,6 +1136,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         storage: &S,
         config: &BackfillConfig,
     ) -> Result<ReindexProgress, IndexerError> {
+        ensure_source_matches_storage("backfill", &config.source, storage)?;
         if config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
         }
@@ -1187,6 +1209,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     ) -> Result<ReindexProgress, IndexerError> {
         cx.checkpoint()
             .map_err(|err| IndexerError::Config(format!("backfill cancelled pre-start: {err}")))?;
+
+        ensure_source_matches_storage("backfill", &config.source, storage)?;
 
         if config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
@@ -1786,6 +1810,11 @@ impl Default for IntegrityCheckConfig {
 }
 
 /// Verifies index integrity against the source-of-truth append log.
+///
+/// This boundary is intentionally source-only: it neither reads nor commits a
+/// recorder checkpoint, so [`IntegrityCheckConfig::source`] is the sole recorder
+/// backend identity involved. Reindex and backfill pair that source identity
+/// with checkpoint storage and reject mismatches before mutation.
 pub struct IntegrityChecker;
 
 impl IntegrityChecker {
@@ -1938,6 +1967,7 @@ mod tests {
     use crate::tantivy_ingest::{IndexCommitStats, IndexDocumentFields};
     use frankenterm_core::recorder_storage::{
         AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
+        RusqliteRecorderStorage, RusqliteStorageConfig,
     };
     use frankenterm_core::recording::{
         RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
@@ -2025,11 +2055,35 @@ mod tests {
         }
     }
 
+    fn test_rusqlite_storage_config(path: &Path) -> RusqliteStorageConfig {
+        RusqliteStorageConfig {
+            db_path: path.join("recorder.sqlite3"),
+            queue_capacity: 4,
+            max_batch_events: 256,
+            max_batch_bytes: 1024 * 1024,
+            max_idempotency_entries: 64,
+        }
+    }
+
     async fn populate_log(storage: &AppendLogRecorderStorage, events: Vec<RecorderEvent>) {
         for (i, chunk) in events.chunks(4).enumerate() {
             storage
                 .append_batch(AppendRequest {
                     batch_id: format!("b-{i}"),
+                    events: chunk.to_vec(),
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1_700_000_000_000 + i as u64,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn populate_rusqlite(storage: &RusqliteRecorderStorage, events: Vec<RecorderEvent>) {
+        for (i, chunk) in events.chunks(4).enumerate() {
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: format!("sqlite-b-{i}"),
                     events: chunk.to_vec(),
                     required_durability: DurabilityLevel::Appended,
                     producer_ts_ms: 1_700_000_000_000 + i as u64,
@@ -2319,6 +2373,173 @@ mod tests {
 
             // Verify docs start from ordinal 3
             assert_eq!(pipeline2.writer().docs[0].event_id, "e3");
+        });
+    }
+
+    #[test]
+    fn full_reindex_missing_source_fails_before_clear_all() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage = AppendLogRecorderStorage::open(test_storage_config(dir.path())).unwrap();
+            let missing_source = dir.path().join("missing-events.log");
+            assert!(!missing_source.exists());
+
+            let config = ReindexConfig {
+                source: RecorderSourceDescriptor::AppendLog {
+                    data_path: missing_source.clone(),
+                },
+                consumer_id: "missing-source-no-clear".to_string(),
+                clear_before_start: true,
+                ..ReindexConfig::default()
+            };
+            let mut writer = MockReindexWriter::new();
+            writer.docs.push(map_event_to_document(
+                &sample_event("must-survive", 1, 99, "stale but recoverable"),
+                99,
+            ));
+            let mut pipeline = ReindexPipeline::new(writer);
+
+            let error = pipeline.full_reindex(&storage, &config).await.unwrap_err();
+
+            assert!(matches!(error, IndexerError::LogRead(_)));
+            assert!(!pipeline.writer().cleared);
+            assert_eq!(pipeline.writer().docs.len(), 1);
+            assert_eq!(pipeline.writer().docs[0].event_id, "must-survive");
+            assert!(!missing_source.exists());
+        });
+    }
+
+    #[test]
+    fn full_reindex_backend_mismatch_both_directions_has_zero_index_mutation() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let append_storage =
+                AppendLogRecorderStorage::open(test_storage_config(dir.path())).unwrap();
+            let nonexistent_db = dir.path().join("must-not-be-created.sqlite3");
+            let rusqlite_source = ReindexConfig {
+                source: RecorderSourceDescriptor::Rusqlite {
+                    db_path: nonexistent_db.clone(),
+                },
+                consumer_id: "mismatch-rusqlite-source".to_string(),
+                clear_before_start: true,
+                ..ReindexConfig::default()
+            };
+            let mut writer = MockReindexWriter::new();
+            writer.docs.push(map_event_to_document(
+                &sample_event("keep-a", 1, 0, "keep"),
+                0,
+            ));
+            let mut pipeline = ReindexPipeline::new(writer);
+
+            let error = pipeline
+                .full_reindex(&append_storage, &rusqlite_source)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                IndexerError::BackendIdentityMismatch {
+                    source_backend:
+                        frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite,
+                    storage_backend:
+                        frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog,
+                    ..
+                }
+            ));
+            assert!(!pipeline.writer().cleared);
+            assert_eq!(pipeline.writer().docs.len(), 1);
+            assert!(!nonexistent_db.exists());
+
+            let sqlite_dir = tempdir().unwrap();
+            let rusqlite_storage =
+                RusqliteRecorderStorage::open(test_rusqlite_storage_config(sqlite_dir.path()))
+                    .unwrap();
+            let nonexistent_log = sqlite_dir.path().join("must-not-be-created.log");
+            let append_source = ReindexConfig {
+                source: RecorderSourceDescriptor::AppendLog {
+                    data_path: nonexistent_log.clone(),
+                },
+                consumer_id: "mismatch-append-source".to_string(),
+                clear_before_start: true,
+                ..ReindexConfig::default()
+            };
+            let mut writer = MockReindexWriter::new();
+            writer.docs.push(map_event_to_document(
+                &sample_event("keep-b", 1, 0, "keep"),
+                0,
+            ));
+            let mut pipeline = ReindexPipeline::new(writer);
+
+            let error = pipeline
+                .full_reindex(&rusqlite_storage, &append_source)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                IndexerError::BackendIdentityMismatch {
+                    source_backend:
+                        frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog,
+                    storage_backend:
+                        frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite,
+                    ..
+                }
+            ));
+            assert!(!pipeline.writer().cleared);
+            assert_eq!(pipeline.writer().docs.len(), 1);
+            assert!(!nonexistent_log.exists());
+        });
+    }
+
+    #[test]
+    fn rusqlite_full_reindex_resumes_from_persisted_checkpoint() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage =
+                RusqliteRecorderStorage::open(test_rusqlite_storage_config(dir.path())).unwrap();
+            populate_rusqlite(
+                &storage,
+                (0..5)
+                    .map(|i| sample_event(&format!("sql-e{i}"), 1, i, &format!("text-{i}")))
+                    .collect(),
+            )
+            .await;
+
+            let first_config = ReindexConfig {
+                source: RecorderSourceDescriptor::Rusqlite {
+                    db_path: dir.path().join("recorder.sqlite3"),
+                },
+                consumer_id: "rusqlite-full-resume".to_string(),
+                batch_size: 2,
+                dedup_on_replay: true,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                clear_before_start: true,
+                max_batches: 1,
+            };
+            let mut first = ReindexPipeline::new(MockReindexWriter::new());
+            let first_progress = first.full_reindex(&storage, &first_config).await.unwrap();
+            assert_eq!(first_progress.events_indexed, 2);
+            assert_eq!(first_progress.current_ordinal, Some(1));
+
+            let resume_config = ReindexConfig {
+                clear_before_start: false,
+                max_batches: 0,
+                ..first_config
+            };
+            let mut resumed = ReindexPipeline::new(MockReindexWriter::new());
+            let resumed_progress = resumed
+                .full_reindex(&storage, &resume_config)
+                .await
+                .unwrap();
+            assert_eq!(resumed_progress.events_indexed, 3);
+            assert_eq!(resumed_progress.current_ordinal, Some(4));
+            assert_eq!(
+                resumed
+                    .writer()
+                    .docs
+                    .iter()
+                    .map(|doc| doc.event_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["sql-e2", "sql-e3", "sql-e4"]
+            );
         });
     }
 
@@ -2803,6 +3024,102 @@ mod tests {
     }
 
     #[test]
+    fn rusqlite_backfill_and_integrity_read_real_recorder_database() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage =
+                RusqliteRecorderStorage::open(test_rusqlite_storage_config(dir.path())).unwrap();
+            populate_rusqlite(
+                &storage,
+                (0..5)
+                    .map(|i| sample_event(&format!("sql-range-{i}"), 7, i, &format!("text-{i}")))
+                    .collect(),
+            )
+            .await;
+
+            let source = RecorderSourceDescriptor::Rusqlite {
+                db_path: dir.path().join("recorder.sqlite3"),
+            };
+            let config = BackfillConfig {
+                source: source.clone(),
+                consumer_id: "rusqlite-backfill".to_string(),
+                batch_size: 2,
+                range: BackfillRange::OrdinalRange { start: 1, end: 3 },
+                dedup_on_replay: false,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                max_batches: 0,
+            };
+            let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+            let progress = pipeline.backfill(&storage, &config).await.unwrap();
+
+            assert_eq!(progress.events_indexed, 3);
+            assert_eq!(
+                pipeline
+                    .backfill_writer()
+                    .docs
+                    .iter()
+                    .map(|doc| doc.event_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["sql-range-1", "sql-range-2", "sql-range-3"]
+            );
+
+            let lookup = MockIndexLookup::from_docs(&pipeline.backfill_writer().docs);
+            let report = IntegrityChecker::check(
+                &lookup,
+                &IntegrityCheckConfig {
+                    source,
+                    ordinal_range: Some((1, 3)),
+                    batch_size: 2,
+                    max_events: 0,
+                    expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                },
+            )
+            .unwrap();
+
+            assert!(report.is_consistent);
+            assert_eq!(report.log_events_scanned, 3);
+            assert_eq!(report.index_matches, 3);
+            assert_eq!(report.checked_range.start_ordinal, 1);
+            assert_eq!(report.checked_range.end_ordinal, 3);
+        });
+    }
+
+    #[test]
+    fn backfill_backend_mismatch_fails_before_writer_or_checkpoint_mutation() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage = AppendLogRecorderStorage::open(test_storage_config(dir.path())).unwrap();
+            let db_path = dir.path().join("must-not-exist.sqlite3");
+            let config = BackfillConfig {
+                source: RecorderSourceDescriptor::Rusqlite {
+                    db_path: db_path.clone(),
+                },
+                consumer_id: "backfill-mismatch".to_string(),
+                ..BackfillConfig::default()
+            };
+            let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+
+            let error = pipeline.backfill(&storage, &config).await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                IndexerError::BackendIdentityMismatch { .. }
+            ));
+            assert!(pipeline.backfill_writer().docs.is_empty());
+            assert!(pipeline.backfill_writer().deleted_ids.is_empty());
+            assert_eq!(pipeline.backfill_writer().commits, 0);
+            assert!(!db_path.exists());
+            assert!(
+                storage
+                    .read_checkpoint(&CheckpointConsumerId(config.consumer_id))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
     fn backfill_schema_mismatch_skipped() {
         run_async_test(async {
             let dir = tempdir().unwrap();
@@ -2940,6 +3257,25 @@ mod tests {
     // =========================================================================
     // Integrity checker tests
     // =========================================================================
+
+    #[test]
+    fn integrity_check_missing_rusqlite_source_creates_no_file_or_index_queries() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("missing-integrity-source.sqlite3");
+        let lookup = MockIndexLookup::new();
+        let config = IntegrityCheckConfig {
+            source: RecorderSourceDescriptor::Rusqlite {
+                db_path: db_path.clone(),
+            },
+            ..IntegrityCheckConfig::default()
+        };
+
+        let error = IntegrityChecker::check(&lookup, &config).unwrap_err();
+
+        assert!(matches!(error, IndexerError::LogRead(_)));
+        assert_eq!(lookup.lookup_calls(), 0);
+        assert!(!db_path.exists());
+    }
 
     #[test]
     fn integrity_check_consistent() {

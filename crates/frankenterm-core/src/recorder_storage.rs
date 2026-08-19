@@ -11,11 +11,13 @@
 //!   monotonically and never rewrite prior bytes.
 //! - `batch_id` is idempotent within retention bounds: replaying an existing `batch_id`
 //!   returns the same offsets without duplicating writes. A replay that requests stronger
-//!   durability upgrades the cached response after flushing the already-written batch.
+//!   durability upgrades the cached response after flushing the already-written batch. Reusing
+//!   the ID for different ordered event content is a typed, zero-mutation conflict.
 //! - `commit_checkpoint` is monotonic per consumer: lower ordinals are rejected with
 //!   `CheckpointRegression`, identical ordinals are `NoopAlreadyAdvanced`, and higher ordinals
 //!   are accepted as `Advanced`.
-//! - checkpoint state is durable in `state.json` and survives reopen.
+//! - checkpoint state is durable in AppendLog's `state.json` or Rusqlite's
+//!   `recorder_checkpoints` table and survives reopen.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -24,8 +26,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::runtime_async::Mutex;
@@ -70,6 +73,9 @@ pub enum RecorderBackendSelection {
 }
 
 impl RecorderBackendSelection {
+    /// Every backend that is implemented and safe to construct.
+    pub const ALL: [Self; 2] = [Self::AppendLog, Self::Rusqlite];
+
     /// Return the public backend identity represented by this selection.
     #[must_use]
     pub const fn backend_kind(self) -> RecorderBackendKind {
@@ -227,6 +233,40 @@ pub struct AppendResponse {
     pub committed_durability: DurabilityLevel,
     /// Commit timestamp.
     pub committed_at_ms: u64,
+    /// True only when this response came from an existing idempotency entry.
+    ///
+    /// Canonical receipts persisted by a backend always store `false`; a cache
+    /// hit returns a transient clone with this bit set. The serde default keeps
+    /// pre-field receipts readable without misclassifying them as replays.
+    #[serde(default)]
+    pub was_idempotent_replay: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedAppendReceipt {
+    request_digest_sha256: String,
+    response: AppendResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CachedAppendReceiptWire {
+    Current(CachedAppendReceipt),
+    Legacy(AppendResponse),
+}
+
+fn digest_serialized_event_payloads<'a>(payloads: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ft.recorder.append-request.v1\0");
+    for payload in payloads {
+        hasher.update(
+            u64::try_from(payload.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(payload);
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// Checkpoint consumer identity.
@@ -327,6 +367,17 @@ pub enum RecorderStorageError {
     },
 
     #[error(
+        "corrupt cached response for batch {batch_id}: persisted receipts cannot be marked as idempotent replays"
+    )]
+    CorruptCachedReplayReceipt { batch_id: String },
+
+    #[error("corrupt cached response for batch {batch_id}: {reason}")]
+    CorruptCachedReceiptEncoding { batch_id: String, reason: String },
+
+    #[error("batch_id {batch_id} was reused for different ordered event content")]
+    IdempotencyConflict { batch_id: String },
+
+    #[error(
         "storage operation {operation} returned backend {actual_backend}, but the storage instance is {expected_backend}"
     )]
     BackendIdentityMismatch {
@@ -360,14 +411,14 @@ impl RecorderStorageError {
     pub fn class(&self) -> RecorderStorageErrorClass {
         match self {
             Self::QueueFull { .. } => RecorderStorageErrorClass::Overload,
-            Self::InvalidRequest { .. } | Self::CheckpointRegression { .. } => {
-                RecorderStorageErrorClass::TerminalData
-            }
+            Self::InvalidRequest { .. }
+            | Self::CheckpointRegression { .. }
+            | Self::IdempotencyConflict { .. } => RecorderStorageErrorClass::TerminalData,
             Self::CorruptRecord { .. }
             | Self::CorruptCachedResponse { .. }
-            | Self::BackendIdentityMismatch { .. } => {
-                RecorderStorageErrorClass::Corruption
-            }
+            | Self::CorruptCachedReplayReceipt { .. }
+            | Self::CorruptCachedReceiptEncoding { .. }
+            | Self::BackendIdentityMismatch { .. } => RecorderStorageErrorClass::Corruption,
             Self::Io(_) => RecorderStorageErrorClass::Retryable,
             Self::Json(_) => RecorderStorageErrorClass::TerminalData,
             Self::Sqlite(_) => RecorderStorageErrorClass::Retryable,
@@ -783,7 +834,7 @@ struct AppendLogInner {
     next_offset: u64,
     next_ordinal: u64,
     checkpoints: HashMap<String, RecorderCheckpoint>,
-    idempotency_cache: HashMap<String, AppendResponse>,
+    idempotency_cache: HashMap<String, CachedAppendReceipt>,
     idempotency_order: VecDeque<String>,
     last_error: Option<String>,
 }
@@ -933,6 +984,12 @@ impl AppendLogRecorderStorage {
         operation: &'static str,
         err: &RecorderStorageError,
     ) {
+        if matches!(
+            err.class(),
+            RecorderStorageErrorClass::TerminalData | RecorderStorageErrorClass::TerminalConfig
+        ) {
+            return;
+        }
         inner.last_error = Some(format!(
             "{operation} failed (class={:?}): {err}",
             err.class()
@@ -1035,7 +1092,6 @@ impl RecorderStorage for AppendLogRecorderStorage {
             });
         }
 
-        let mut inner = self.inner.lock().await;
         let AppendRequest {
             batch_id,
             events,
@@ -1043,16 +1099,59 @@ impl RecorderStorage for AppendLogRecorderStorage {
             producer_ts_ms: _producer_ts_ms,
         } = req;
 
+        let mut encoded = Vec::with_capacity(events.len());
+        let mut total_bytes = 0usize;
+        for event in events {
+            let payload = serde_json::to_vec(&event)?;
+            if payload.len() > u32::MAX as usize {
+                return Err(RecorderStorageError::InvalidRequest {
+                    message: format!("record payload too large: {} bytes", payload.len()),
+                });
+            }
+            total_bytes = total_bytes
+                .checked_add(payload.len().saturating_add(4))
+                .ok_or_else(|| RecorderStorageError::InvalidRequest {
+                    message: "batch byte size overflow".to_string(),
+                })?;
+            encoded.push(payload);
+        }
+        if total_bytes > self.config.max_batch_bytes {
+            return Err(RecorderStorageError::InvalidRequest {
+                message: format!(
+                    "batch bytes {} exceeds max {}",
+                    total_bytes, self.config.max_batch_bytes
+                ),
+            });
+        }
+        let request_digest_sha256 =
+            digest_serialized_event_payloads(encoded.iter().map(Vec::as_slice));
+
+        let mut inner = self.inner.lock().await;
         if let Some(mut existing) = inner.idempotency_cache.get(&batch_id).cloned() {
+            if existing.request_digest_sha256 != request_digest_sha256 {
+                let err = RecorderStorageError::IdempotencyConflict {
+                    batch_id: batch_id.clone(),
+                };
+                Self::record_last_error(&mut inner, "append_batch_idempotency_conflict", &err);
+                return Err(err);
+            }
+            if existing.response.was_idempotent_replay {
+                let err = RecorderStorageError::CorruptCachedReplayReceipt {
+                    batch_id: batch_id.clone(),
+                };
+                Self::record_last_error(&mut inner, "append_batch_idempotent_receipt", &err);
+                return Err(err);
+            }
             match self.ensure_cached_response_durability(
                 &mut inner,
-                &mut existing,
+                &mut existing.response,
                 required_durability,
             ) {
                 Ok(()) => {
                     inner.idempotency_cache.insert(batch_id, existing.clone());
                     Self::clear_last_error(&mut inner);
-                    return Ok(existing);
+                    existing.response.was_idempotent_replay = true;
+                    return Ok(existing.response);
                 }
                 Err(err) => {
                     Self::record_last_error(&mut inner, "append_batch_idempotent_durability", &err);
@@ -1062,23 +1161,6 @@ impl RecorderStorage for AppendLogRecorderStorage {
         }
 
         let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
-            let mut encoded = Vec::with_capacity(events.len());
-            let mut total_bytes = 0usize;
-            for event in events {
-                let payload = serde_json::to_vec(&event)?;
-                total_bytes += payload.len() + 4;
-                encoded.push(payload);
-            }
-
-            if total_bytes > self.config.max_batch_bytes {
-                return Err(RecorderStorageError::InvalidRequest {
-                    message: format!(
-                        "batch bytes {} exceeds max {}",
-                        total_bytes, self.config.max_batch_bytes
-                    ),
-                });
-            }
-
             let first_offset = RecorderOffset {
                 segment_id: inner.segment_id,
                 byte_offset: inner.next_offset,
@@ -1089,12 +1171,6 @@ impl RecorderStorage for AppendLogRecorderStorage {
 
             for payload in encoded {
                 let payload_len = payload.len();
-                if payload_len > u32::MAX as usize {
-                    return Err(RecorderStorageError::InvalidRequest {
-                        message: format!("record payload too large: {payload_len} bytes"),
-                    });
-                }
-
                 let record_start = inner.next_offset;
                 let ordinal = inner.next_ordinal;
                 inner
@@ -1133,11 +1209,16 @@ impl RecorderStorage for AppendLogRecorderStorage {
                 last_offset,
                 committed_durability: required_durability,
                 committed_at_ms: crate::recording::epoch_ms_now(),
+                was_idempotent_replay: false,
             };
 
-            inner
-                .idempotency_cache
-                .insert(batch_id.clone(), response.clone());
+            inner.idempotency_cache.insert(
+                batch_id.clone(),
+                CachedAppendReceipt {
+                    request_digest_sha256,
+                    response: response.clone(),
+                },
+            );
             inner.idempotency_order.push_back(batch_id);
             while inner.idempotency_cache.len() > self.config.max_idempotency_entries {
                 if let Some(evict) = inner.idempotency_order.pop_front() {
@@ -1330,6 +1411,12 @@ impl RusqliteRecorderStorage {
         operation: &'static str,
         err: &RecorderStorageError,
     ) {
+        if matches!(
+            err.class(),
+            RecorderStorageErrorClass::TerminalData | RecorderStorageErrorClass::TerminalConfig
+        ) {
+            return;
+        }
         inner.last_error = Some(format!(
             "{operation} failed (class={:?}): {err}",
             err.class()
@@ -1339,7 +1426,7 @@ impl RusqliteRecorderStorage {
     fn cached_response(
         conn: &Connection,
         batch_id: &str,
-    ) -> std::result::Result<Option<AppendResponse>, RecorderStorageError> {
+    ) -> std::result::Result<Option<CachedAppendReceipt>, RecorderStorageError> {
         let response_json = conn
             .query_row(
                 "SELECT response_json FROM recorder_batches WHERE batch_id = ?1",
@@ -1348,27 +1435,162 @@ impl RusqliteRecorderStorage {
             )
             .optional()
             .map_err(sqlite_error)?;
-        let response = response_json
-            .map(|json| serde_json::from_str::<AppendResponse>(&json).map_err(Into::into))
+        let receipt = response_json
+            .map(|json| {
+                let wire = serde_json::from_str::<CachedAppendReceiptWire>(&json).map_err(
+                    |error| RecorderStorageError::CorruptCachedReceiptEncoding {
+                        batch_id: batch_id.to_string(),
+                        reason: format!(
+                            "receipt JSON matched neither the current nor legacy schema: {error}"
+                        ),
+                    },
+                )?;
+                let (request_digest_sha256, response) = match wire {
+                    CachedAppendReceiptWire::Current(receipt) => {
+                        (Some(receipt.request_digest_sha256), receipt.response)
+                    }
+                    CachedAppendReceiptWire::Legacy(response) => (None, response),
+                };
+                if response.backend != RecorderBackendKind::Rusqlite {
+                    return Err(RecorderStorageError::CorruptCachedResponse {
+                        batch_id: batch_id.to_string(),
+                        expected_backend: RecorderBackendKind::Rusqlite,
+                        actual_backend: response.backend,
+                    });
+                }
+                if response.was_idempotent_replay {
+                    return Err(RecorderStorageError::CorruptCachedReplayReceipt {
+                        batch_id: batch_id.to_string(),
+                    });
+                }
+                let receipt_i64 = |value: u64, field: &str| {
+                    i64::try_from(value).map_err(|_| {
+                        RecorderStorageError::CorruptCachedReceiptEncoding {
+                            batch_id: batch_id.to_string(),
+                            reason: format!("{field} value {value} exceeds SQLite INTEGER range"),
+                        }
+                    })
+                };
+                let first_ordinal = receipt_i64(response.first_offset.ordinal, "first ordinal")?;
+                let last_ordinal = receipt_i64(response.last_offset.ordinal, "last ordinal")?;
+                let mut statement = conn
+                    .prepare(
+                        "SELECT ordinal, segment_id, byte_offset, payload_json
+                         FROM recorder_events
+                         WHERE batch_id = ?1 AND ordinal BETWEEN ?2 AND ?3
+                         ORDER BY ordinal ASC",
+                    )
+                    .map_err(sqlite_error)?;
+                let rows = statement
+                    .query_map(params![batch_id, first_ordinal, last_ordinal], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .map_err(sqlite_error)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sqlite_error)?;
+                let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+                    return Err(RecorderStorageError::CorruptCachedReceiptEncoding {
+                        batch_id: batch_id.to_string(),
+                        reason: "receipt has no committed event rows".to_string(),
+                    });
+                };
+                if response.accepted_count != rows.len() {
+                    return Err(RecorderStorageError::CorruptCachedReceiptEncoding {
+                        batch_id: batch_id.to_string(),
+                        reason: format!(
+                            "receipt accepted_count {} does not match {} committed events",
+                            response.accepted_count,
+                            rows.len()
+                        ),
+                    });
+                }
+                let expected_first = (
+                    first_ordinal,
+                    receipt_i64(response.first_offset.segment_id, "first segment_id")?,
+                    receipt_i64(response.first_offset.byte_offset, "first byte_offset")?,
+                );
+                let expected_last = (
+                    last_ordinal,
+                    receipt_i64(response.last_offset.segment_id, "last segment_id")?,
+                    receipt_i64(response.last_offset.byte_offset, "last byte_offset")?,
+                );
+                let actual_first = (first.0, first.1, first.2);
+                let actual_last = (last.0, last.1, last.2);
+                if actual_first != expected_first || actual_last != expected_last {
+                    return Err(RecorderStorageError::CorruptCachedReceiptEncoding {
+                        batch_id: batch_id.to_string(),
+                        reason: "receipt offsets do not match the committed event range"
+                            .to_string(),
+                    });
+                }
+                for (index, row) in rows.iter().enumerate() {
+                    let index = i64::try_from(index).map_err(|_| {
+                        RecorderStorageError::CorruptCachedReceiptEncoding {
+                            batch_id: batch_id.to_string(),
+                            reason: "committed event count cannot fit in i64".to_string(),
+                        }
+                    })?;
+                    if row.0
+                        != first_ordinal.checked_add(index).ok_or_else(|| {
+                            RecorderStorageError::CorruptCachedReceiptEncoding {
+                                batch_id: batch_id.to_string(),
+                                reason: "committed event ordinal range overflowed".to_string(),
+                            }
+                        })?
+                    {
+                        return Err(RecorderStorageError::CorruptCachedReceiptEncoding {
+                            batch_id: batch_id.to_string(),
+                            reason: "committed event ordinals are not contiguous".to_string(),
+                        });
+                    }
+                }
+                let stored_digest = digest_serialized_event_payloads(
+                    rows.iter().map(|(_, _, _, payload)| payload.as_bytes()),
+                );
+                let request_digest_sha256 =
+                    request_digest_sha256.unwrap_or_else(|| stored_digest.clone());
+                let canonical_digest = request_digest_sha256.len() == 64
+                    && request_digest_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+                if !canonical_digest {
+                    return Err(RecorderStorageError::CorruptCachedReceiptEncoding {
+                        batch_id: batch_id.to_string(),
+                        reason: "request digest is not 64 lowercase hexadecimal bytes".to_string(),
+                    });
+                }
+                if request_digest_sha256 != stored_digest {
+                    return Err(RecorderStorageError::CorruptCachedReceiptEncoding {
+                        batch_id: batch_id.to_string(),
+                        reason: "request digest does not match the committed event payloads"
+                            .to_string(),
+                    });
+                }
+                Ok(CachedAppendReceipt {
+                    request_digest_sha256,
+                    response,
+                })
+            })
             .transpose()?;
-        if let Some(response) = response.as_ref()
-            && response.backend != RecorderBackendKind::Rusqlite
-        {
-            return Err(RecorderStorageError::CorruptCachedResponse {
-                batch_id: batch_id.to_string(),
-                expected_backend: RecorderBackendKind::Rusqlite,
-                actual_backend: response.backend,
-            });
-        }
-        Ok(response)
+        Ok(receipt)
     }
 
     fn update_cached_response(
         conn: &Connection,
         batch_id: &str,
-        response: &AppendResponse,
+        receipt: &CachedAppendReceipt,
     ) -> std::result::Result<(), RecorderStorageError> {
-        let response_json = serde_json::to_string(response)?;
+        if receipt.response.was_idempotent_replay {
+            return Err(RecorderStorageError::CorruptCachedReplayReceipt {
+                batch_id: batch_id.to_string(),
+            });
+        }
+        let response_json = serde_json::to_string(receipt)?;
         conn.execute(
             "UPDATE recorder_batches
              SET response_json = ?2, committed_at_ms = ?3
@@ -1376,7 +1598,7 @@ impl RusqliteRecorderStorage {
             params![
                 batch_id,
                 response_json,
-                u64_to_sql_i64(response.committed_at_ms, "committed_at_ms")?,
+                u64_to_sql_i64(receipt.response.committed_at_ms, "committed_at_ms")?,
             ],
         )
         .map_err(sqlite_error)?;
@@ -1441,16 +1663,28 @@ impl RecorderStorage for RusqliteRecorderStorage {
                 ),
             });
         }
+        let request_digest_sha256 =
+            digest_serialized_event_payloads(encoded.iter().map(|(_, payload)| payload.as_bytes()));
 
         let mut inner = self.inner.lock().await;
         let result = (|| -> std::result::Result<AppendResponse, RecorderStorageError> {
             if let Some(mut existing) = Self::cached_response(&inner.conn, &batch_id)? {
-                if !existing.committed_durability.satisfies(required_durability) {
-                    existing.committed_durability = required_durability;
-                    existing.committed_at_ms = crate::recording::epoch_ms_now();
+                if existing.request_digest_sha256 != request_digest_sha256 {
+                    return Err(RecorderStorageError::IdempotencyConflict {
+                        batch_id: batch_id.clone(),
+                    });
+                }
+                if !existing
+                    .response
+                    .committed_durability
+                    .satisfies(required_durability)
+                {
+                    existing.response.committed_durability = required_durability;
+                    existing.response.committed_at_ms = crate::recording::epoch_ms_now();
                     Self::update_cached_response(&inner.conn, &batch_id, &existing)?;
                 }
-                return Ok(existing);
+                existing.response.was_idempotent_replay = true;
+                return Ok(existing.response);
             }
 
             let head = sqlite_head_offset(&inner.conn)?;
@@ -1504,8 +1738,13 @@ impl RecorderStorage for RusqliteRecorderStorage {
                 last_offset,
                 committed_durability: required_durability,
                 committed_at_ms,
+                was_idempotent_replay: false,
             };
-            let response_json = serde_json::to_string(&response)?;
+            let receipt = CachedAppendReceipt {
+                request_digest_sha256,
+                response: response.clone(),
+            };
+            let response_json = serde_json::to_string(&receipt)?;
             tx.execute(
                 "INSERT INTO recorder_batches (batch_id, response_json, committed_at_ms)
                  VALUES (?1, ?2, ?3)",
@@ -1516,25 +1755,7 @@ impl RecorderStorage for RusqliteRecorderStorage {
                 ],
             )
             .map_err(sqlite_error)?;
-            tx.execute(
-                "DELETE FROM recorder_batches
-                 WHERE batch_id IN (
-                     SELECT batch_id FROM recorder_batches
-                     ORDER BY committed_at_ms ASC, batch_id ASC
-                     LIMIT (
-                         SELECT CASE
-                             WHEN COUNT(*) > ?1 THEN COUNT(*) - ?1
-                             ELSE 0
-                         END
-                         FROM recorder_batches
-                     )
-                 )",
-                params![usize_to_sql_i64(
-                    self.config.max_idempotency_entries,
-                    "max_idempotency_entries"
-                )?],
-            )
-            .map_err(sqlite_error)?;
+            evict_rusqlite_receipts(&tx, self.config.max_idempotency_entries)?;
             tx.commit().map_err(sqlite_error)?;
             Ok(response)
         })();
@@ -1717,14 +1938,24 @@ impl RusqliteEventReader {
     }
 
     fn open_connection(&self) -> std::result::Result<Connection, EventCursorError> {
-        let conn = Connection::open(&self.db_path).map_err(|err| {
+        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|err| {
+                EventCursorError::Unavailable(format!(
+                    "failed to open existing rusqlite recorder DB {} read-only: {err}",
+                    self.db_path.display()
+                ))
+            })?;
+        conn.prepare(
+            "SELECT ordinal, segment_id, byte_offset, payload_json, payload_bytes
+             FROM recorder_events
+             LIMIT 0",
+        )
+        .map_err(|err| {
             EventCursorError::Unavailable(format!(
-                "failed to open rusqlite recorder DB {}: {err}",
+                "rusqlite recorder DB {} is missing the required recorder_events schema: {err}",
                 self.db_path.display()
             ))
         })?;
-        initialize_rusqlite_schema(&conn)
-            .map_err(|err| EventCursorError::Unavailable(err.to_string()))?;
         Ok(conn)
     }
 }
@@ -1871,6 +2102,29 @@ fn sql_i64_to_u64(value: i64, field: &str) -> std::result::Result<u64, EventCurs
         },
         reason: format!("{field} is negative: {value}"),
     })
+}
+
+fn evict_rusqlite_receipts(
+    conn: &Connection,
+    max_entries: usize,
+) -> std::result::Result<(), RecorderStorageError> {
+    conn.execute(
+        "DELETE FROM recorder_batches
+         WHERE rowid IN (
+             SELECT rowid FROM recorder_batches
+             ORDER BY rowid ASC
+             LIMIT (
+                 SELECT CASE
+                     WHEN COUNT(*) > ?1 THEN COUNT(*) - ?1
+                     ELSE 0
+                 END
+                 FROM recorder_batches
+             )
+         )",
+        params![usize_to_sql_i64(max_entries, "max_idempotency_entries")?],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 fn initialize_rusqlite_schema(conn: &Connection) -> std::result::Result<(), RecorderStorageError> {
@@ -2720,6 +2974,7 @@ recorder_backend = "frankensqlite"
             assert_eq!(response.accepted_count, 3);
             assert_eq!(response.first_offset.ordinal, 0);
             assert_eq!(response.last_offset.ordinal, 2);
+            assert!(!response.was_idempotent_replay);
 
             let idempotent = storage
                 .append_batch(AppendRequest {
@@ -2733,6 +2988,7 @@ recorder_backend = "frankensqlite"
             assert_eq!(idempotent.accepted_count, 3);
             assert_eq!(idempotent.last_offset.ordinal, 2);
             assert_eq!(idempotent.committed_durability, DurabilityLevel::Fsync);
+            assert!(idempotent.was_idempotent_replay);
 
             let reader = storage.event_reader();
             let head = reader.head_offset().unwrap();
@@ -2801,6 +3057,11 @@ recorder_backend = "frankensqlite"
                 },
                 committed_durability: DurabilityLevel::Appended,
                 committed_at_ms: 1,
+                was_idempotent_replay: false,
+            };
+            let poisoned = CachedAppendReceipt {
+                request_digest_sha256: "0".repeat(64),
+                response: poisoned,
             };
             {
                 let inner = storage.inner.lock().await;
@@ -2844,6 +3105,326 @@ recorder_backend = "frankensqlite"
                 .unwrap();
             assert_eq!(event_count, 0);
         });
+    }
+
+    #[test]
+    fn rusqlite_rejects_persisted_replay_receipt_without_inserting_events() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage =
+                RusqliteRecorderStorage::open(recorder_test_config(dir.path()).rusqlite).unwrap();
+            let event = sample_event("must-not-insert", 7, 0, "payload");
+            let payload = serde_json::to_string(&event).unwrap();
+            let poisoned = CachedAppendReceipt {
+                request_digest_sha256: digest_serialized_event_payloads([payload.as_bytes()]),
+                response: AppendResponse {
+                    backend: RecorderBackendKind::Rusqlite,
+                    accepted_count: 1,
+                    first_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: 0,
+                    },
+                    last_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: 0,
+                    },
+                    committed_durability: DurabilityLevel::Appended,
+                    committed_at_ms: 1,
+                    was_idempotent_replay: true,
+                },
+            };
+            {
+                let inner = storage.inner.lock().await;
+                inner
+                    .conn
+                    .execute(
+                        "INSERT INTO recorder_batches (batch_id, response_json, committed_at_ms)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            "poisoned-replay",
+                            serde_json::to_string(&poisoned).unwrap(),
+                            1_i64,
+                        ],
+                    )
+                    .unwrap();
+            }
+
+            let error = storage
+                .append_batch(AppendRequest {
+                    batch_id: "poisoned-replay".to_string(),
+                    events: vec![event],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RecorderStorageError::CorruptCachedReplayReceipt { ref batch_id }
+                    if batch_id == "poisoned-replay"
+            ));
+            let inner = storage.inner.lock().await;
+            let event_count: i64 = inner
+                .conn
+                .query_row("SELECT COUNT(*) FROM recorder_events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(event_count, 0);
+        });
+    }
+
+    #[test]
+    fn rusqlite_reads_legacy_bare_receipt_and_verifies_committed_content() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage =
+                RusqliteRecorderStorage::open(recorder_test_config(dir.path()).rusqlite).unwrap();
+            let event = sample_event("legacy-receipt-event", 7, 0, "payload");
+            let first = storage
+                .append_batch(AppendRequest {
+                    batch_id: "legacy-receipt".to_string(),
+                    events: vec![event.clone()],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            {
+                let inner = storage.inner.lock().await;
+                let mut legacy = serde_json::to_value(&first).unwrap();
+                legacy
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("was_idempotent_replay");
+                inner
+                    .conn
+                    .execute(
+                        "UPDATE recorder_batches SET response_json = ?2 WHERE batch_id = ?1",
+                        params!["legacy-receipt", serde_json::to_string(&legacy).unwrap()],
+                    )
+                    .unwrap();
+            }
+
+            let replay = storage
+                .append_batch(AppendRequest {
+                    batch_id: "legacy-receipt".to_string(),
+                    events: vec![event],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap();
+            assert!(replay.was_idempotent_replay);
+            assert_eq!(replay.first_offset, first.first_offset);
+            assert_eq!(replay.last_offset, first.last_offset);
+            let mut cursor = storage.event_reader().open_cursor_from_start().unwrap();
+            assert_eq!(cursor.next_batch(8).unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn rusqlite_classifies_malformed_persisted_receipt_as_corruption() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage =
+                RusqliteRecorderStorage::open(recorder_test_config(dir.path()).rusqlite).unwrap();
+            let event = sample_event("malformed-receipt-event", 7, 0, "payload");
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "malformed-receipt".to_string(),
+                    events: vec![event.clone()],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            {
+                let inner = storage.inner.lock().await;
+                inner
+                    .conn
+                    .execute(
+                        "UPDATE recorder_batches SET response_json = '{' WHERE batch_id = ?1",
+                        params!["malformed-receipt"],
+                    )
+                    .unwrap();
+            }
+
+            let error = storage
+                .append_batch(AppendRequest {
+                    batch_id: "malformed-receipt".to_string(),
+                    events: vec![event],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RecorderStorageError::CorruptCachedReceiptEncoding { ref batch_id, .. }
+                    if batch_id == "malformed-receipt"
+            ));
+            assert_eq!(error.class(), RecorderStorageErrorClass::Corruption);
+            assert!(storage.health().await.degraded);
+            let mut cursor = storage.event_reader().open_cursor_from_start().unwrap();
+            assert_eq!(cursor.next_batch(8).unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn rusqlite_receipt_eviction_uses_insertion_order_when_timestamps_tie() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_rusqlite_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO recorder_batches (batch_id, response_json, committed_at_ms)
+             VALUES ('z-old', '{}', 7), ('a-new', '{}', 7)",
+            [],
+        )
+        .unwrap();
+
+        evict_rusqlite_receipts(&conn, 1).unwrap();
+
+        let remaining = conn
+            .query_row("SELECT batch_id FROM recorder_batches", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, "a-new");
+    }
+
+    #[test]
+    fn rusqlite_evicted_batch_id_can_be_reused_and_replayed_without_old_rows_leaking() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let mut config = recorder_test_config(dir.path()).rusqlite;
+            config.max_idempotency_entries = 1;
+            let storage = RusqliteRecorderStorage::open(config).unwrap();
+
+            let same = sample_event("same-old", 1, 0, "same-content");
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "reuse-same".to_string(),
+                    events: vec![same.clone()],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "evict-same".to_string(),
+                    events: vec![sample_event("evict-same", 1, 1, "evict")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap();
+            let same_reused = storage
+                .append_batch(AppendRequest {
+                    batch_id: "reuse-same".to_string(),
+                    events: vec![same.clone()],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 3,
+                })
+                .await
+                .unwrap();
+            assert!(!same_reused.was_idempotent_replay);
+            let same_replay = storage
+                .append_batch(AppendRequest {
+                    batch_id: "reuse-same".to_string(),
+                    events: vec![same],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 4,
+                })
+                .await
+                .unwrap();
+            assert!(same_replay.was_idempotent_replay);
+            assert_eq!(same_replay.first_offset, same_reused.first_offset);
+
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "reuse-changed".to_string(),
+                    events: vec![sample_event("changed-old", 1, 3, "old-content")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 5,
+                })
+                .await
+                .unwrap();
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "evict-changed".to_string(),
+                    events: vec![sample_event("evict-changed", 1, 4, "evict")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 6,
+                })
+                .await
+                .unwrap();
+            let changed = sample_event("changed-new", 1, 5, "new-content");
+            let changed_reused = storage
+                .append_batch(AppendRequest {
+                    batch_id: "reuse-changed".to_string(),
+                    events: vec![changed.clone()],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 7,
+                })
+                .await
+                .unwrap();
+            assert!(!changed_reused.was_idempotent_replay);
+            let changed_replay = storage
+                .append_batch(AppendRequest {
+                    batch_id: "reuse-changed".to_string(),
+                    events: vec![changed],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 8,
+                })
+                .await
+                .unwrap();
+            assert!(changed_replay.was_idempotent_replay);
+            assert_eq!(changed_replay.first_offset, changed_reused.first_offset);
+
+            let mut cursor = storage.event_reader().open_cursor_from_start().unwrap();
+            assert_eq!(cursor.next_batch(16).unwrap().len(), 6);
+        });
+    }
+
+    #[test]
+    fn rusqlite_reader_missing_path_fails_without_creating_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("missing-recorder.sqlite3");
+        assert!(!db_path.exists());
+
+        let reader = RusqliteEventReader::new(db_path.clone());
+        let error = reader
+            .open_cursor_from_start()
+            .err()
+            .expect("missing source path must be rejected");
+
+        assert!(matches!(error, EventCursorError::Unavailable(_)));
+        assert!(
+            !db_path.exists(),
+            "read-only recorder source discovery must never create a missing database"
+        );
+    }
+
+    #[test]
+    fn rusqlite_reader_rejects_database_without_required_schema() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("invalid-recorder.sqlite3");
+        Connection::open(&db_path).unwrap();
+
+        let reader = RusqliteEventReader::new(db_path.clone());
+        let error = reader.head_offset().unwrap_err();
+
+        assert!(matches!(error, EventCursorError::Unavailable(_)));
+        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0, "reader must not initialize missing schema");
     }
 
     #[test]
@@ -3047,7 +3628,7 @@ recorder_backend = "frankensqlite"
     fn trait_health_with_cx_cancelled_preserves_backend_kind() {
         run_async_test(async {
             let storage = StubRecorderStorage {
-                backend: RecorderBackendKind::FrankenSqlite,
+                backend: RecorderBackendKind::Rusqlite,
             };
             let cx = crate::cx::Cx::for_testing();
             cx.cancel_with(
@@ -3057,7 +3638,7 @@ recorder_backend = "frankensqlite"
 
             let health = storage.health_with_cx(&cx).await;
             assert!(health.degraded);
-            assert_eq!(health.backend, RecorderBackendKind::FrankenSqlite);
+            assert_eq!(health.backend, RecorderBackendKind::Rusqlite);
             assert_eq!(
                 health.last_error.as_deref(),
                 Some("health cancelled pre-start via Cx")
@@ -3066,7 +3647,7 @@ recorder_backend = "frankensqlite"
             let health_json = serde_json::to_value(&health).expect("serialize recorder health");
             assert_eq!(
                 health_json["backend"],
-                serde_json::Value::String("frankensqlite".to_string())
+                serde_json::Value::String("rusqlite".to_string())
             );
             assert_eq!(health_json["degraded"], serde_json::Value::Bool(true));
             assert_eq!(
@@ -3083,11 +3664,12 @@ recorder_backend = "frankensqlite"
             let cfg = test_config(dir.path());
             let data_path = cfg.data_path.clone();
             let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+            let event = sample_event("e1", 1, 0, "one");
 
             let first = storage
                 .append_batch(AppendRequest {
                     batch_id: "same-batch".to_string(),
-                    events: vec![sample_event("e1", 1, 0, "one")],
+                    events: vec![event.clone()],
                     required_durability: DurabilityLevel::Appended,
                     producer_ts_ms: 1,
                 })
@@ -3098,7 +3680,7 @@ recorder_backend = "frankensqlite"
             let second = storage
                 .append_batch(AppendRequest {
                     batch_id: "same-batch".to_string(),
-                    events: vec![sample_event("e2", 1, 1, "two")],
+                    events: vec![event],
                     required_durability: DurabilityLevel::Appended,
                     producer_ts_ms: 2,
                 })
@@ -3106,8 +3688,97 @@ recorder_backend = "frankensqlite"
                 .unwrap();
             let after_len = std::fs::metadata(&data_path).unwrap().len();
 
-            assert_eq!(first, second);
+            assert_eq!(first.first_offset, second.first_offset);
+            assert_eq!(first.last_offset, second.last_offset);
+            assert_eq!(first.accepted_count, second.accepted_count);
+            assert!(!first.was_idempotent_replay);
+            assert!(second.was_idempotent_replay);
             assert_eq!(before_len, after_len);
+        });
+    }
+
+    #[test]
+    fn conflicting_batch_id_content_is_rejected_without_mutation_by_both_backends() {
+        run_async_test(async {
+            let append_dir = tempdir().unwrap();
+            let append_config = test_config(append_dir.path());
+            let append_path = append_config.data_path.clone();
+            let append = AppendLogRecorderStorage::open(append_config).unwrap();
+            append
+                .append_batch(AppendRequest {
+                    batch_id: "content-bound".to_string(),
+                    events: vec![sample_event("first", 1, 0, "one")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            let append_len = std::fs::metadata(&append_path).unwrap().len();
+            let append_error = append
+                .append_batch(AppendRequest {
+                    batch_id: "content-bound".to_string(),
+                    events: vec![sample_event("second", 1, 1, "different")],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                append_error,
+                RecorderStorageError::IdempotencyConflict { ref batch_id }
+                    if batch_id == "content-bound"
+            ));
+            assert_eq!(std::fs::metadata(&append_path).unwrap().len(), append_len);
+            assert_eq!(
+                append
+                    .health()
+                    .await
+                    .latest_offset
+                    .map(|offset| offset.ordinal),
+                Some(0)
+            );
+            assert!(!append.health().await.degraded);
+
+            let sqlite_dir = tempdir().unwrap();
+            let sqlite =
+                RusqliteRecorderStorage::open(recorder_test_config(sqlite_dir.path()).rusqlite)
+                    .unwrap();
+            sqlite
+                .append_batch(AppendRequest {
+                    batch_id: "content-bound".to_string(),
+                    events: vec![sample_event("first", 1, 0, "one")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            let sqlite_error = sqlite
+                .append_batch(AppendRequest {
+                    batch_id: "content-bound".to_string(),
+                    events: vec![sample_event("second", 1, 1, "different")],
+                    required_durability: DurabilityLevel::Fsync,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                sqlite_error,
+                RecorderStorageError::IdempotencyConflict { ref batch_id }
+                    if batch_id == "content-bound"
+            ));
+            assert_eq!(
+                sqlite
+                    .health()
+                    .await
+                    .latest_offset
+                    .map(|offset| offset.ordinal),
+                Some(0)
+            );
+            let mut cursor = sqlite.event_reader().open_cursor_from_start().unwrap();
+            let records = cursor.next_batch(8).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].event.event_id, "first");
+            assert!(!sqlite.health().await.degraded);
         });
     }
 
@@ -3119,11 +3790,12 @@ recorder_backend = "frankensqlite"
             let data_path = cfg.data_path.clone();
             let state_path = cfg.state_path.clone();
             let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+            let event = sample_event("e1", 1, 0, "one");
 
             let first = storage
                 .append_batch(AppendRequest {
                     batch_id: "same-batch".to_string(),
-                    events: vec![sample_event("e1", 1, 0, "one")],
+                    events: vec![event.clone()],
                     required_durability: DurabilityLevel::Enqueued,
                     producer_ts_ms: 1,
                 })
@@ -3138,7 +3810,7 @@ recorder_backend = "frankensqlite"
             let upgraded = storage
                 .append_batch(AppendRequest {
                     batch_id: "same-batch".to_string(),
-                    events: vec![sample_event("e2", 1, 1, "two")],
+                    events: vec![event.clone()],
                     required_durability: DurabilityLevel::Fsync,
                     producer_ts_ms: 2,
                 })
@@ -3149,6 +3821,7 @@ recorder_backend = "frankensqlite"
             assert_eq!(upgraded.last_offset, first.last_offset);
             assert_eq!(upgraded.accepted_count, first.accepted_count);
             assert_eq!(upgraded.committed_durability, DurabilityLevel::Fsync);
+            assert!(upgraded.was_idempotent_replay);
             assert!(
                 state_path.exists(),
                 "durability upgrade should persist recorder state"
@@ -3158,7 +3831,7 @@ recorder_backend = "frankensqlite"
             let cached = storage
                 .append_batch(AppendRequest {
                     batch_id: "same-batch".to_string(),
-                    events: vec![sample_event("e3", 1, 2, "three")],
+                    events: vec![event],
                     required_durability: DurabilityLevel::Appended,
                     producer_ts_ms: 3,
                 })
@@ -3169,6 +3842,7 @@ recorder_backend = "frankensqlite"
             assert_eq!(cached.first_offset, first.first_offset);
             assert_eq!(cached.last_offset, first.last_offset);
             assert_eq!(cached.committed_durability, DurabilityLevel::Fsync);
+            assert!(cached.was_idempotent_replay);
             assert_eq!(
                 upgraded_len, cached_len,
                 "cached duplicate must not append another copy of the batch"
@@ -3478,10 +4152,10 @@ recorder_backend = "frankensqlite"
                 .unwrap()
                 .len();
 
-            let _ = storage
+            let cached = storage
                 .append_batch(AppendRequest {
                     batch_id: "b3".to_string(),
-                    events: vec![sample_event("e3-replay", 1, 200, "replay")],
+                    events: vec![sample_event("e3", 1, 3, "x")],
                     required_durability: DurabilityLevel::Appended,
                     producer_ts_ms: 200,
                 })
@@ -3493,6 +4167,7 @@ recorder_backend = "frankensqlite"
                 .len();
 
             assert_eq!(data_len_before2, data_len_after2, "b3 should be cached");
+            assert!(cached.was_idempotent_replay);
         });
     }
 
@@ -4023,9 +4698,41 @@ recorder_backend = "frankensqlite"
         };
         assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
 
+        let err = RecorderStorageError::IdempotencyConflict {
+            batch_id: "reused".to_string(),
+        };
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
+
         let err = RecorderStorageError::CorruptRecord {
             offset: 100,
             reason: "bad crc".to_string(),
+        };
+        assert_eq!(err.class(), RecorderStorageErrorClass::Corruption);
+
+        let err = RecorderStorageError::CorruptCachedReceiptEncoding {
+            batch_id: "corrupt".to_string(),
+            reason: "invalid receipt JSON".to_string(),
+        };
+        assert_eq!(err.class(), RecorderStorageErrorClass::Corruption);
+
+        let err = RecorderStorageError::BackendSelection(
+            select_recorder_backend(RecorderBackendKind::FrankenSqlite).unwrap_err(),
+        );
+        assert_eq!(err.class(), RecorderStorageErrorClass::TerminalConfig);
+
+        let err = RecorderStorageError::BackendUnavailable {
+            backend: RecorderBackendKind::Rusqlite,
+            message: "dependency is temporarily unavailable".to_string(),
+        };
+        assert_eq!(
+            err.class(),
+            RecorderStorageErrorClass::DependencyUnavailable
+        );
+
+        let err = RecorderStorageError::BackendIdentityMismatch {
+            operation: "append_batch",
+            expected_backend: RecorderBackendKind::Rusqlite,
+            actual_backend: RecorderBackendKind::AppendLog,
         };
         assert_eq!(err.class(), RecorderStorageErrorClass::Corruption);
     }
@@ -4095,7 +4802,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn flush_stats_serde_roundtrip() {
         let stats = FlushStats {
-            backend: RecorderBackendKind::FrankenSqlite,
+            backend: RecorderBackendKind::Rusqlite,
             flushed_at_ms: 123456,
             latest_offset: None,
         };
@@ -4319,10 +5026,19 @@ recorder_backend = "frankensqlite"
             },
             committed_durability: DurabilityLevel::Appended,
             committed_at_ms: 1_700_000_000_000,
+            was_idempotent_replay: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: AppendResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
+
+        let mut legacy = serde_json::to_value(&resp).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("was_idempotent_replay");
+        let legacy_back: AppendResponse = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy_back.was_idempotent_replay);
     }
 
     #[test]

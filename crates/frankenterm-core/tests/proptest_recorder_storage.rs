@@ -28,6 +28,13 @@ fn arb_backend_kind() -> impl Strategy<Value = RecorderBackendKind> {
     ]
 }
 
+fn arb_implemented_backend_kind() -> impl Strategy<Value = RecorderBackendKind> {
+    prop_oneof![
+        Just(RecorderBackendKind::AppendLog),
+        Just(RecorderBackendKind::Rusqlite),
+    ]
+}
+
 fn arb_durability_level() -> impl Strategy<Value = DurabilityLevel> {
     prop_oneof![
         Just(DurabilityLevel::Enqueued),
@@ -183,12 +190,13 @@ proptest! {
 
     #[test]
     fn prop_append_response_serde(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         accepted_count in 0_usize..1000,
         first in arb_offset(),
         last in arb_offset(),
         durability in arb_durability_level(),
         committed_at_ms in 1_000_000_000_000_u64..2_000_000_000_000,
+        was_idempotent_replay in any::<bool>(),
     ) {
         let response = AppendResponse {
             backend,
@@ -197,6 +205,7 @@ proptest! {
             last_offset: last,
             committed_durability: durability,
             committed_at_ms,
+            was_idempotent_replay,
         };
         let json = serde_json::to_string(&response).unwrap();
         let back: AppendResponse = serde_json::from_str(&json).unwrap();
@@ -254,7 +263,7 @@ proptest! {
 
     #[test]
     fn prop_health_serde(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         degraded in any::<bool>(),
         queue_depth in 0_usize..1000,
         queue_capacity in 0_usize..10_000,
@@ -338,7 +347,7 @@ proptest! {
 
     #[test]
     fn prop_flush_stats_serde(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         flushed_at_ms in 1_000_000_000_000_u64..2_000_000_000_000,
         has_offset in any::<bool>(),
     ) {
@@ -520,10 +529,11 @@ proptest! {
 
     #[test]
     fn prop_append_response_field_preservation(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         count in 0_usize..500,
         durability in arb_durability_level(),
         ts in 1_000_000_000_000_u64..2_000_000_000_000,
+        was_idempotent_replay in any::<bool>(),
     ) {
         let response = AppendResponse {
             backend,
@@ -532,6 +542,7 @@ proptest! {
             last_offset: RecorderOffset { segment_id: 0, byte_offset: 100, ordinal: count as u64 },
             committed_durability: durability,
             committed_at_ms: ts,
+            was_idempotent_replay,
         };
         let json = serde_json::to_string(&response).unwrap();
         let back: AppendResponse = serde_json::from_str(&json).unwrap();
@@ -539,6 +550,7 @@ proptest! {
         prop_assert_eq!(back.accepted_count, count);
         prop_assert_eq!(back.committed_durability, durability);
         prop_assert_eq!(back.committed_at_ms, ts);
+        prop_assert_eq!(back.was_idempotent_replay, was_idempotent_replay);
     }
 
     #[test]
@@ -564,7 +576,7 @@ proptest! {
 
     #[test]
     fn prop_health_field_preservation(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         degraded in any::<bool>(),
         depth in 0_usize..1000,
         capacity in 1_usize..10_000,
@@ -608,7 +620,7 @@ proptest! {
 
     #[test]
     fn prop_append_response_json_has_expected_keys(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         durability in arb_durability_level(),
     ) {
         let response = AppendResponse {
@@ -618,6 +630,7 @@ proptest! {
             last_offset: RecorderOffset { segment_id: 0, byte_offset: 10, ordinal: 0 },
             committed_durability: durability,
             committed_at_ms: 1_700_000_000_000,
+            was_idempotent_replay: false,
         };
         let json = serde_json::to_string(&response).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -628,11 +641,12 @@ proptest! {
         prop_assert!(obj.contains_key("last_offset"));
         prop_assert!(obj.contains_key("committed_durability"));
         prop_assert!(obj.contains_key("committed_at_ms"));
-        prop_assert_eq!(obj.len(), 6);
+        prop_assert!(obj.contains_key("was_idempotent_replay"));
+        prop_assert_eq!(obj.len(), 7);
     }
 
     #[test]
-    fn prop_health_json_has_expected_keys(backend in arb_backend_kind()) {
+    fn prop_health_json_has_expected_keys(backend in arb_implemented_backend_kind()) {
         let health = RecorderStorageHealth {
             backend,
             degraded: false,
@@ -654,7 +668,7 @@ proptest! {
     }
 
     #[test]
-    fn prop_flush_stats_json_has_expected_keys(backend in arb_backend_kind()) {
+    fn prop_flush_stats_json_has_expected_keys(backend in arb_implemented_backend_kind()) {
         let stats = FlushStats {
             backend,
             flushed_at_ms: 1_700_000_000_000,
@@ -704,7 +718,7 @@ proptest! {
 
     #[test]
     fn prop_health_pretty_serde(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         degraded in any::<bool>(),
         depth in 0_usize..500,
         cap in 1_usize..5000,
@@ -860,7 +874,7 @@ proptest! {
 
     #[test]
     fn prop_flush_stats_clone_eq(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         ts in 1_000_000_000_000_u64..2_000_000_000_000,
     ) {
         let stats = FlushStats {
@@ -873,7 +887,7 @@ proptest! {
     }
 
     #[test]
-    fn prop_flush_stats_debug_nonempty(backend in arb_backend_kind()) {
+    fn prop_flush_stats_debug_nonempty(backend in arb_implemented_backend_kind()) {
         let stats = FlushStats {
             backend,
             flushed_at_ms: 0,
@@ -894,10 +908,11 @@ proptest! {
 
     #[test]
     fn prop_append_response_clone_eq(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         count in 0_usize..100,
         durability in arb_durability_level(),
         ts in 1_000_000_000_000_u64..2_000_000_000_000,
+        was_idempotent_replay in any::<bool>(),
     ) {
         let response = AppendResponse {
             backend,
@@ -906,6 +921,7 @@ proptest! {
             last_offset: RecorderOffset { segment_id: 0, byte_offset: 50, ordinal: count as u64 },
             committed_durability: durability,
             committed_at_ms: ts,
+            was_idempotent_replay,
         };
         let cloned = response.clone();
         prop_assert_eq!(cloned, response);
@@ -913,9 +929,10 @@ proptest! {
 
     #[test]
     fn prop_append_response_serde_deterministic(
-        backend in arb_backend_kind(),
+        backend in arb_implemented_backend_kind(),
         count in 0_usize..100,
         durability in arb_durability_level(),
+        was_idempotent_replay in any::<bool>(),
     ) {
         let response = AppendResponse {
             backend,
@@ -924,6 +941,7 @@ proptest! {
             last_offset: RecorderOffset { segment_id: 0, byte_offset: 50, ordinal: count as u64 },
             committed_durability: durability,
             committed_at_ms: 1_700_000_000_000,
+            was_idempotent_replay,
         };
         let j1 = serde_json::to_string(&response).unwrap();
         let j2 = serde_json::to_string(&response).unwrap();

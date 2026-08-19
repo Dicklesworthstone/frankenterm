@@ -97,7 +97,11 @@
 /// Bumped 43 -> 44 to replace unbounded recovery-candidate validation during
 /// retention with trigger-invalidated, incrementally reconciled usability and
 /// durable bounded-selection authority.
-pub const SCHEMA_VERSION: i32 = 44;
+/// Bumped 44 -> 45 to add the recorder delivery ledger. Runtime-selected
+/// recorder events are now enqueued in the same transaction as their owning
+/// output segment, so a process loss between the primary commit and recorder
+/// append cannot permanently omit the event.
+pub const SCHEMA_VERSION: i32 = 45;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -194,6 +198,24 @@ CREATE INDEX IF NOT EXISTS idx_segments_captured ON output_segments(captured_at)
 CREATE INDEX IF NOT EXISTS idx_segments_pane_captured
     ON output_segments(pane_id, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_segments_zone_type ON output_segments(zone_type);
+
+-- Crash-consistent selected-recorder delivery ledger.
+--
+-- Each row is inserted by the same writer transaction that creates its
+-- output_segments parent. RESTRICT is intentional: retention must not erase
+-- the only durable delivery obligation while the selected recorder is down.
+CREATE TABLE IF NOT EXISTS recorder_delivery_ledger (
+    segment_id INTEGER PRIMARY KEY
+        REFERENCES output_segments(id) ON DELETE RESTRICT,
+    event_id TEXT NOT NULL UNIQUE,
+    target_backend TEXT NOT NULL
+        CHECK(target_backend IN ('append_log', 'rusqlite')),
+    event_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recorder_delivery_ledger_created
+    ON recorder_delivery_ledger(created_at, segment_id);
 
 -- Exact retained-segment metadata for bounded snapshot projection (ft-0yuxe.4).
 --

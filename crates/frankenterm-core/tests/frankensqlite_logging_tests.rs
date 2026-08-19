@@ -304,7 +304,7 @@ impl MockTargetStorage {
     fn healthy() -> Self {
         Self {
             health: RecorderStorageHealth {
-                backend: RecorderBackendKind::FrankenSqlite,
+                backend: RecorderBackendKind::Rusqlite,
                 degraded: false,
                 queue_depth: 0,
                 queue_capacity: 100,
@@ -334,6 +334,7 @@ impl RecorderStorage for MockTargetStorage {
             return std::future::ready(Err(RecorderStorageError::QueueFull { capacity: 0 }));
         }
         let count = req.events.len();
+        let committed_durability = req.required_durability;
         self.appended.lock().unwrap().push(req);
         std::future::ready(Ok(AppendResponse {
             backend: self.health.backend,
@@ -348,8 +349,9 @@ impl RecorderStorage for MockTargetStorage {
                 byte_offset: 0,
                 ordinal: count.saturating_sub(1) as u64,
             },
-            committed_durability: DurabilityLevel::Appended,
+            committed_durability,
             committed_at_ms: 0,
+            was_idempotent_replay: false,
         }))
     }
 
@@ -630,7 +632,7 @@ fn test_m3_checkpoint_sync_logs_stage() {
 }
 
 #[test]
-fn test_m5_cutover_logs_stage() {
+fn test_m5_readiness_logs_stage_without_activation_claim() {
     run_async_test(async {
         let (_guard, captured) = install_capture();
         let dir = tempdir().unwrap();
@@ -642,7 +644,7 @@ fn test_m5_cutover_logs_stage() {
 
         let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
         engine
-            .m5_cutover(&target, &manifest, 1708000000, None)
+            .m5_mark_ready(&target, &manifest, 1708000000, None)
             .await
             .unwrap();
 
@@ -650,7 +652,13 @@ fn test_m5_cutover_logs_stage() {
         let m5_events = events_with_field_value(&events, "migration_stage", "M5");
         assert!(
             !m5_events.is_empty(),
-            "M5 cutover should log migration_stage=M5"
+            "M5 readiness should log migration_stage=M5"
+        );
+        assert!(
+            m5_events.iter().any(|event| {
+                event.fields.get("selector_activated").map(String::as_str) == Some("false")
+            }),
+            "M5 readiness must explicitly log selector_activated=false"
         );
     });
 }
@@ -924,7 +932,7 @@ fn test_full_pipeline_emits_all_stage_logs() {
             .await
             .unwrap();
         engine
-            .m5_cutover(&target, &manifest, 1708000000, None)
+            .m5_mark_ready(&target, &manifest, 1708000000, None)
             .await
             .unwrap();
 
