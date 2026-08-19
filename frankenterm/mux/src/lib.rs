@@ -78,9 +78,10 @@ use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
-    Condvar, MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard,
-    RwLockWriteGuard,
+    Condvar, MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
+#[cfg(test)]
+use parking_lot::MappedRwLockWriteGuard;
 use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use serde::{Deserialize, Serialize};
@@ -973,6 +974,60 @@ static SUB_ID: AtomicUsize = AtomicUsize::new(0);
 pub struct IdAllocationError {
     namespace: &'static str,
     requested: usize,
+}
+
+/// Stable classification for one exact-window metadata transaction failure.
+///
+/// Callers must classify this single transaction result rather than re-reading
+/// the window registry before or after the mutation, where concurrent removal
+/// or same-id replacement could change the apparent cause.
+#[derive(Debug, Error)]
+pub enum WindowMutationError {
+    #[error("window {window_id} is not registered")]
+    NotFound { window_id: WindowId },
+    #[error("window registry key {window_id} names another exact window allocation")]
+    ExactIdentity { window_id: WindowId },
+    #[error("window {window_id} mutation could not allocate {operation}: {source:#}")]
+    Allocation {
+        window_id: WindowId,
+        operation: &'static str,
+        source: anyhow::Error,
+    },
+    #[error("window {window_id} mutation topology revision space is exhausted: {source}")]
+    RevisionExhausted {
+        window_id: WindowId,
+        source: TopologyRevisionExhausted,
+    },
+    #[error("window {window_id} mutation invariant rejected: {source:#}")]
+    Invariant {
+        window_id: WindowId,
+        source: anyhow::Error,
+    },
+}
+
+impl WindowMutationError {
+    pub const fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound { .. })
+    }
+
+    fn allocation(
+        window_id: WindowId,
+        operation: &'static str,
+        source: impl Into<anyhow::Error>,
+    ) -> Self {
+        Self::Allocation {
+            window_id,
+            operation,
+            source: source.into(),
+        }
+    }
+
+    fn invariant(window_id: WindowId, source: impl Into<anyhow::Error>) -> Self {
+        Self::Invariant {
+            window_id,
+            source: source.into(),
+        }
+    }
 }
 
 impl IdAllocationError {
@@ -1985,7 +2040,12 @@ mod pane_registration_handle {
                     if let Some((_domain_id, window_id, _tab_id)) =
                         self.owner.resolve_pane_id(self.pane_id)
                     {
-                        self.owner.set_window_title(window_id, title);
+                        if let Err(error) = self.owner.set_window_title(window_id, title) {
+                            log::error!(
+                                "refusing window-title alert for exact pane {}: {error:#}",
+                                self.pane_id
+                            );
+                        }
                     }
                 }
                 Alert::TabTitleChanged(title) => {
@@ -4212,6 +4272,23 @@ struct PaneAuthorityIndex {
     registrations_by_domain: HashMap<DomainId, DomainPaneRegistrations>,
     next_structural_generation: u64,
 }
+
+/// Reused exhaustive tab-identity scratch space for corruption tests.
+///
+/// Production writers already enforce unique tab membership. Keeping this
+/// oracle test-only preserves those planted-corruption checks without adding
+/// a per-window allocation to pane-count recounts or workspace moves.
+#[cfg(test)]
+#[derive(Default)]
+struct ExactWindowTabCensus {
+    tab_ids: HashMap<TabId, usize>,
+    exact_identities: HashSet<usize>,
+}
+
+/// Zero-cost production counterpart to the test-only exhaustive census.
+#[cfg(not(test))]
+#[derive(Default)]
+struct ExactWindowTabCensus;
 
 /// Exact domain allocation plus the live pane generations attributed to it.
 ///
@@ -7245,11 +7322,13 @@ impl std::ops::Deref for MuxWindowBuilder {
     }
 }
 
-pub struct MuxWindowWriteGuard<'a> {
+#[cfg(test)]
+pub(crate) struct MuxWindowWriteGuard<'a> {
     guard: Option<MappedRwLockWriteGuard<'a, Window>>,
     mux: &'a Mux,
 }
 
+#[cfg(test)]
 impl std::ops::Deref for MuxWindowWriteGuard<'_> {
     type Target = Window;
 
@@ -7260,6 +7339,7 @@ impl std::ops::Deref for MuxWindowWriteGuard<'_> {
     }
 }
 
+#[cfg(test)]
 impl std::ops::DerefMut for MuxWindowWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut Window {
         self.guard
@@ -7268,6 +7348,7 @@ impl std::ops::DerefMut for MuxWindowWriteGuard<'_> {
     }
 }
 
+#[cfg(test)]
 impl Drop for MuxWindowWriteGuard<'_> {
     fn drop(&mut self) {
         drop(self.guard.take());
@@ -7351,27 +7432,210 @@ impl Mux {
             .to_string()
     }
 
+    /// Fallibly materialize owned notification/state text before a topology mutation.
+    /// `String::to_owned` would make allocation failure process-fatal at an
+    /// arbitrary point in a multi-index commit; reserving first keeps every
+    /// metadata transaction fail-before-mutation.
+    fn prepare_owned_text(value: &str, role: &str) -> anyhow::Result<String> {
+        let mut prepared = String::new();
+        prepared
+            .try_reserve_exact(value.len())
+            .map_err(|error| anyhow!("reserve {role} text: {error}"))?;
+        prepared.push_str(value);
+        Ok(prepared)
+    }
+
+    /// Count one exact window's structurally owned panes without acquiring
+    /// any pane callback or `Tab::inner` lock.
+    ///
+    /// The pane-authority reverse bucket is maintained by every structural
+    /// writer. Walking only the window's tab vector makes workspace changes
+    /// proportional to that window, rather than to the whole session, while
+    /// the caller's authority guard keeps the count stable through commit.
+    fn exact_window_structural_pane_count(
+        &self,
+        authority: &PaneAuthorityIndex,
+        registered_tabs: &HashMap<TabId, Arc<Tab>>,
+        tab_parents: &HashMap<TabId, TabParentRegistration>,
+        census: &mut ExactWindowTabCensus,
+        window_id: WindowId,
+        window: &Window,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            window.has_exact_mux_identity(self, window_id),
+            "window registry key {window_id} names another exact window allocation"
+        );
+        #[cfg(not(test))]
+        let _ = census;
+        #[cfg(test)]
+        {
+            census.tab_ids.clear();
+            census.exact_identities.clear();
+            census.tab_ids.try_reserve(window.len()).map_err(|error| {
+                anyhow!("reserve window {window_id} tab identity census: {error}")
+            })?;
+            census
+                .exact_identities
+                .try_reserve(window.len())
+                .map_err(|error| {
+                    anyhow!("reserve window {window_id} exact tab census: {error}")
+                })?;
+        }
+        let mut pane_count = 0usize;
+        for tab in window.iter() {
+            #[cfg(test)]
+            {
+                let identity = Arc::as_ptr(tab) as usize;
+                anyhow::ensure!(
+                    census.tab_ids.insert(tab.tab_id(), identity).is_none(),
+                    "window {window_id} contains duplicate tab id {}",
+                    tab.tab_id()
+                );
+                anyhow::ensure!(
+                    census.exact_identities.insert(identity),
+                    "window {window_id} contains exact tab {} more than once",
+                    tab.tab_id()
+                );
+            }
+            anyhow::ensure!(
+                registered_tabs
+                    .get(&tab.tab_id())
+                    .is_some_and(|registered| Arc::ptr_eq(registered, tab)),
+                "window {window_id} tab {} is not the exact live mux tab generation",
+                tab.tab_id()
+            );
+            anyhow::ensure!(
+                tab_parents
+                    .get(&tab.tab_id())
+                    .is_some_and(|parent| parent.matches(tab, window_id)),
+                "window {window_id} tab {} lacks its exact indexed parent",
+                tab.tab_id()
+            );
+            let tab_count = match authority.pane_ids_by_tab.get(&tab.tab_id()) {
+                Some(members) => {
+                    anyhow::ensure!(
+                        members.matches_tab(tab),
+                        "window {window_id} tab {} structural directory names another exact allocation",
+                        tab.tab_id()
+                    );
+                    #[cfg(test)]
+                    for pane_id in &members.pane_ids {
+                        anyhow::ensure!(
+                            authority
+                                .structural_by_pane_id
+                                .get(pane_id)
+                                .is_some_and(|owner| owner.matches_tab(tab)),
+                            "window {window_id} tab {} reverse directory has no exact forward pane {pane_id}",
+                            tab.tab_id()
+                        );
+                    }
+                    members.pane_ids.len()
+                }
+                None => {
+                    #[cfg(test)]
+                    anyhow::ensure!(
+                        authority
+                            .structural_by_pane_id
+                            .values()
+                            .all(|owner| !owner.matches_tab(tab)),
+                        "window {window_id} tab {} omits its structural reverse directory",
+                        tab.tab_id()
+                    );
+                    0
+                }
+            };
+            pane_count = pane_count
+                .checked_add(tab_count)
+                .ok_or_else(|| anyhow!("window {window_id} structural pane count overflow"))?;
+        }
+        Ok(pane_count)
+    }
+
     pub fn is_main_thread(&self) -> bool {
         std::thread::current().id() == self.main_thread_id
     }
 
     fn recompute_pane_count(&self) {
+        self.recompute_pane_count_with_before_publish(|| ());
+    }
+
+    /// Test-observable implementation of the exact recount cut. The observer
+    /// runs after every allocation and census check but before cache
+    /// publication, while the authority/window guards are still retained.
+    /// Production supplies a no-op observer.
+    fn recompute_pane_count_with_before_publish(&self, before_publish: impl FnOnce()) {
         #[cfg(test)]
         self.pane_count_recomputes.fetch_add(1, Ordering::Relaxed);
-        let mut count = HashMap::new();
-        for window in self.windows.read().values() {
-            let workspace = window.get_workspace();
-            for tab in window.iter() {
-                *count.entry(workspace.to_string()).or_insert(0) += match tab.count_panes() {
-                    Some(n) => n,
-                    None => {
-                        // Busy: abort this and we'll retry later
+        // Retain one exact structural/window cut through cache publication.
+        // Releasing the window census before the count write allowed a
+        // concurrent workspace transaction to commit and then be overwritten
+        // by this stale snapshot.
+        let authority = self.pane_authority.lock();
+        let registered_tabs = self.tabs.read();
+        let windows = self.windows.read();
+        let tab_parents = self.tab_parents.read();
+        let mut count: HashMap<String, usize> = HashMap::new();
+        let mut census = ExactWindowTabCensus::default();
+        if let Err(error) = count.try_reserve(windows.len()) {
+            log::error!("refusing pane-count recompute before cache mutation: {error}");
+            return;
+        }
+        for (window_id, window) in windows.iter() {
+            let pane_count = match self.exact_window_structural_pane_count(
+                &authority,
+                &registered_tabs,
+                &tab_parents,
+                &mut census,
+                *window_id,
+                window,
+            ) {
+                Ok(pane_count) => pane_count,
+                Err(error) => {
+                    log::error!(
+                        "refusing pane-count recompute before cache mutation: {error:#}"
+                    );
+                    return;
+                }
+            };
+            if pane_count == 0 {
+                continue;
+            }
+            if let Some(existing) = count.get_mut(window.get_workspace()) {
+                let Some(next) = existing.checked_add(pane_count) else {
+                    log::error!(
+                        "refusing pane-count recompute: workspace {} count overflow",
+                        window.get_workspace()
+                    );
+                    return;
+                };
+                *existing = next;
+            } else {
+                let workspace = match Self::prepare_owned_text(
+                    window.get_workspace(),
+                    "recomputed pane-count key",
+                ) {
+                    Ok(workspace) => workspace,
+                    Err(error) => {
+                        log::error!(
+                            "refusing pane-count recompute before cache mutation: {error:#}"
+                        );
                         return;
                     }
                 };
+                count.insert(workspace, pane_count);
             }
         }
-        *self.num_panes_by_workspace.write() = count;
+        before_publish();
+        let mut workspace_counts = self.num_panes_by_workspace.write();
+        let old_count = std::mem::replace(&mut *workspace_counts, count);
+        drop(workspace_counts);
+        drop(tab_parents);
+        drop(windows);
+        drop(registered_tabs);
+        drop(authority);
+        // String/map deallocation is deliberately outside every mux authority
+        // lock so a large retired workspace set cannot extend writer latency.
+        drop(old_count);
     }
 
     /// Record input only when `client_id` is the exact live registration.
@@ -7821,6 +8085,42 @@ impl Mux {
         changed
     }
 
+    /// Replace an exact live client's active workspace only if its current
+    /// value still matches `expected_workspace`.
+    ///
+    /// This is the rollback/convergence seam for a rejected remote grouped
+    /// rename. The comparison and replacement share one client-registry write
+    /// cut, so an intervening local workspace selection is never overwritten.
+    pub fn compare_set_active_workspace_for_client_if_same(
+        &self,
+        ident: &Arc<ClientId>,
+        expected_workspace: &str,
+        workspace: &str,
+    ) -> anyhow::Result<bool> {
+        let workspace_state = Self::prepare_owned_text(workspace, "active client workspace state")?;
+        let replaced = {
+            let mut clients = self.clients.write();
+            if let Some(info) = clients
+                .get_mut(ident.as_ref())
+                .filter(|info| Arc::ptr_eq(&info.client_id, ident))
+                .filter(|info| info.active_workspace.as_deref() == Some(expected_workspace))
+            {
+                Some(std::mem::replace(
+                    &mut info.active_workspace,
+                    Some(workspace_state),
+                ))
+            } else {
+                None
+            }
+        };
+        let changed = replaced.is_some();
+        drop(replaced);
+        if changed {
+            self.notify(MuxNotification::ActiveWorkspaceChanged(Arc::clone(ident)));
+        }
+        Ok(changed)
+    }
+
     /// Assigns the active workspace name for the current identity
     pub fn set_active_workspace(&self, workspace: &str) {
         if let Some(ident) = self.identity.read().clone() {
@@ -7828,43 +8128,185 @@ impl Mux {
         }
     }
 
-    pub fn rename_workspace(&self, old_workspace: &str, new_workspace: &str) {
+    /// Atomically rename every matching window and active client workspace.
+    ///
+    /// A rename publishes one grouped [`MuxNotification::WorkspaceRenamed`]
+    /// after the complete state/count commit. It intentionally does not emit
+    /// derivative per-window or per-client notifications: local consumers use
+    /// the grouped event as their invalidation boundary, while protocol bridges
+    /// must forward exactly one remote rename rather than an unordered O(N)
+    /// mixture of equivalent metadata RPCs.
+    pub fn rename_workspace(
+        self: &Arc<Self>,
+        old_workspace: &str,
+        new_workspace: &str,
+    ) -> anyhow::Result<()> {
         if old_workspace == new_workspace {
-            return;
+            return Ok(());
         }
 
-        let rename_notification = {
+        self.bind_window_notification_owner();
+        {
+            let authority = self.pane_authority.lock();
+            let registered_tabs = self.tabs.read();
             let mut windows = self.windows.write();
-            for window in windows.values_mut() {
+            let tab_parents = self.tab_parents.read();
+            let mut census = ExactWindowTabCensus::default();
+            let mut affected_window_ids = Vec::new();
+            affected_window_ids
+                .try_reserve(windows.len())
+                .map_err(|error| anyhow!("reserve renamed workspace window census: {error}"))?;
+            let mut exact_old_count = 0usize;
+            let mut exact_new_count = 0usize;
+            for (window_id, window) in windows.iter() {
+                if window.get_workspace() != old_workspace
+                    && window.get_workspace() != new_workspace
+                {
+                    continue;
+                }
+                let pane_count = self.exact_window_structural_pane_count(
+                    &authority,
+                    &registered_tabs,
+                    &tab_parents,
+                    &mut census,
+                    *window_id,
+                    window,
+                )?;
                 if window.get_workspace() == old_workspace {
-                    window.set_workspace(new_workspace);
+                    affected_window_ids.push(*window_id);
+                    exact_old_count = exact_old_count.checked_add(pane_count).ok_or_else(|| {
+                        anyhow!("workspace {old_workspace} structural pane count overflow")
+                    })?;
+                } else {
+                    exact_new_count = exact_new_count.checked_add(pane_count).ok_or_else(|| {
+                        anyhow!("workspace {new_workspace} structural pane count overflow")
+                    })?;
                 }
             }
-            self.envelope_notification(MuxNotification::WorkspaceRenamed {
-                old_workspace: old_workspace.to_string(),
-                new_workspace: new_workspace.to_string(),
+            affected_window_ids.sort_unstable();
+
+            let mut workspace_counts = self.num_panes_by_workspace.write();
+            let cached_old_count = workspace_counts
+                .get(old_workspace)
+                .copied()
+                .unwrap_or(0);
+            anyhow::ensure!(
+                cached_old_count == exact_old_count,
+                "workspace {old_workspace} pane-count cache {cached_old_count} differs from exact structural count {exact_old_count}"
+            );
+            let cached_new_count = workspace_counts
+                .get(new_workspace)
+                .copied()
+                .unwrap_or(0);
+            anyhow::ensure!(
+                cached_new_count == exact_new_count,
+                "workspace {new_workspace} pane-count cache {cached_new_count} differs from exact structural count {exact_new_count}"
+            );
+            let final_new_count = exact_new_count.checked_add(exact_old_count).ok_or_else(|| {
+                anyhow!(
+                    "workspace {new_workspace} pane count overflows while renaming {old_workspace}"
+                )
+            })?;
+            if final_new_count != 0 && !workspace_counts.contains_key(new_workspace) {
+                workspace_counts.try_reserve(1).map_err(|error| {
+                    anyhow!("reserve renamed workspace pane-count entry: {error}")
+                })?;
+            }
+            let prepared_count_key = (final_new_count != 0
+                && !workspace_counts.contains_key(new_workspace))
+            .then(|| {
+                Self::prepare_owned_text(new_workspace, "renamed pane-count key")
             })
-        };
-        self.flush_window_notifications();
-        self.dispatch_notification_envelope(rename_notification);
-        self.recompute_pane_count();
-        let changed_clients = {
+            .transpose()?;
+
+            let mut prepared_windows = Vec::new();
+            prepared_windows
+                .try_reserve_exact(affected_window_ids.len())
+                .map_err(|error| anyhow!("reserve renamed workspace window states: {error}"))?;
+            for window_id in affected_window_ids {
+                prepared_windows.push((
+                    window_id,
+                    Self::prepare_owned_text(new_workspace, "renamed window state")?,
+                ));
+            }
+            let renamed_old_event =
+                Self::prepare_owned_text(old_workspace, "workspace-renamed old event")?;
+            let renamed_new_event =
+                Self::prepare_owned_text(new_workspace, "workspace-renamed new event")?;
+
             let mut clients = self.clients.write();
-            clients
-                .values_mut()
-                .filter_map(|client| {
-                    if client.active_workspace.as_deref() == Some(old_workspace) {
-                        client.active_workspace.replace(new_workspace.to_string());
-                        Some(Arc::clone(&client.client_id))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-        for client_id in changed_clients {
-            self.notify(MuxNotification::ActiveWorkspaceChanged(client_id));
+            let matching_clients = clients
+                .values()
+                .filter(|client| client.active_workspace.as_deref() == Some(old_workspace))
+                .count();
+            let mut prepared_clients = Vec::new();
+            prepared_clients
+                .try_reserve_exact(matching_clients)
+                .map_err(|error| anyhow!("reserve renamed workspace client states: {error}"))?;
+            for client in clients.values() {
+                if client.active_workspace.as_deref() == Some(old_workspace) {
+                    prepared_clients.push((
+                        Arc::clone(&client.client_id),
+                        Self::prepare_owned_text(new_workspace, "renamed client state")?,
+                    ));
+                }
+            }
+            let mut topology = self.topology.lock();
+            let mut pending = self.pending_window_notifications.lock();
+            anyhow::ensure!(
+                std::ptr::eq(pending.owner.as_ptr(), self.as_ref() as *const Self),
+                "workspace rename requires the exact window-notification owner"
+            );
+            pending
+                .queue
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve workspace rename delivery: {error}"))?;
+            let revision = topology.reserve_revision().map_err(anyhow::Error::new)?;
+
+            workspace_counts.remove(old_workspace);
+            if final_new_count == 0 {
+                workspace_counts.remove(new_workspace);
+            } else if let Some(count) = workspace_counts.get_mut(new_workspace) {
+                *count = final_new_count;
+            } else {
+                let prior = workspace_counts.insert(
+                    prepared_count_key
+                        .expect("absent nonzero destination count key was prepared"),
+                    final_new_count,
+                );
+                debug_assert!(prior.is_none());
+            }
+
+            for (window_id, workspace_state) in prepared_windows {
+                let window = windows
+                    .get_mut(&window_id)
+                    .expect("prepared renamed window remains present under write guard");
+                debug_assert_eq!(window.get_workspace(), old_workspace);
+                let prior_workspace = window.replace_workspace_without_notify(workspace_state);
+                debug_assert_eq!(prior_workspace, old_workspace);
+            }
+
+            for (client_id, workspace_state) in prepared_clients {
+                let client = clients
+                    .get_mut(client_id.as_ref())
+                    .expect("prepared exact client remains present under write guard");
+                debug_assert!(Arc::ptr_eq(&client.client_id, &client_id));
+                debug_assert_eq!(client.active_workspace.as_deref(), Some(old_workspace));
+                client.active_workspace = Some(workspace_state);
+            }
+            pending.queue.push_back(PendingWindowAction::Notification {
+                envelope: MuxNotificationEnvelope {
+                    notification: MuxNotification::WorkspaceRenamed {
+                        old_workspace: renamed_old_event,
+                        new_workspace: renamed_new_event,
+                    },
+                    topology: MuxTopologyStamp::Revision(revision),
+                },
+                activity: None,
+            });
         }
+        self.flush_window_notifications();
+        Ok(())
     }
 
     /// Overrides the current client identity.
@@ -8160,18 +8602,6 @@ impl Mux {
     ) {
         self.bind_window_notification_owner();
         self.queue_window_notification_entry(notification, activity);
-    }
-
-    /// Queue a window event after the owning [`Arc<Mux>`] has been bound.
-    ///
-    /// A number of mux APIs intentionally accept `&Mux` because exact pane
-    /// generation handles borrow the mux without retaining it.  Every window
-    /// is nevertheless created by `new_empty_window`, which binds this queue
-    /// before publishing the window.  Keeping the non-retaining enqueue path
-    /// lets those APIs participate in the same FIFO without consulting the
-    /// mutable process-global mux singleton.
-    fn queue_window_notification(&self, notification: MuxNotification) {
-        self.queue_window_notification_entry(notification, None);
     }
 
     fn queue_window_notification_entry(
@@ -12525,7 +12955,8 @@ impl Mux {
         RwLockReadGuard::try_map(self.windows.read(), |windows| windows.get(&window_id)).ok()
     }
 
-    pub fn get_window_mut(&self, window_id: WindowId) -> Option<MuxWindowWriteGuard<'_>> {
+    #[cfg(test)]
+    pub(crate) fn get_window_mut(&self, window_id: WindowId) -> Option<MuxWindowWriteGuard<'_>> {
         let guard =
             RwLockWriteGuard::try_map(self.windows.write(), |windows| windows.get_mut(&window_id))
                 .ok()?;
@@ -12535,38 +12966,293 @@ impl Mux {
         })
     }
 
-    /// Non-blocking variant of [`Self::get_window_mut`].
+    /// Probe whether the window registry can be acquired exclusively without
+    /// exposing mutable `Window` access outside this crate.
     ///
-    /// Returns `None` when the window registry is contended or the window is
-    /// absent.
-    pub fn try_get_window_mut(&self, window_id: WindowId) -> Option<MuxWindowWriteGuard<'_>> {
-        let guard = RwLockWriteGuard::try_map(self.windows.try_write()?, |windows| {
-            windows.get_mut(&window_id)
-        })
-        .ok()?;
-        Some(MuxWindowWriteGuard {
-            guard: Some(guard),
-            mux: self,
+    /// Snapshot adapters use this to prove that pane callbacks run after their
+    /// enclosing window read cut has been released. The guard is dropped
+    /// before returning and no window field is changed.
+    pub fn try_window_exclusive_access(&self, window_id: WindowId) -> bool {
+        self.windows.try_write().is_some_and(|windows| {
+            windows
+                .get(&window_id)
+                .is_some_and(|window| window.has_exact_mux_identity(self, window_id))
         })
     }
 
-    pub fn set_window_title(&self, window_id: WindowId, title: &str) -> bool {
+    /// Move one exact mux window to another workspace and transfer its
+    /// structurally owned pane count in the same transaction.
+    ///
+    /// All identity, parent-index, count, allocation, delivery-capacity, and
+    /// topology-revision checks complete before the first field changes. The
+    /// count transfer touches only the two workspace entries; it never scans
+    /// or recomputes the session-wide pane cache. Subscribers run only after
+    /// every authority lock has been released.
+    pub fn set_window_workspace(
+        self: &Arc<Self>,
+        window_id: WindowId,
+        workspace: &str,
+    ) -> Result<bool, WindowMutationError> {
+        self.bind_window_notification_owner();
         let changed = {
+            let authority = self.pane_authority.lock();
+            let registered_tabs = self.tabs.read();
             let mut windows = self.windows.write();
-            let Some(window) = windows.get_mut(&window_id) else {
-                return false;
-            };
-            let changed = window.set_title_without_notify(title);
-            if changed {
-                self.queue_window_notification(MuxNotification::WindowTitleChanged {
-                    window_id,
-                    title: title.to_string(),
-                });
+            let tab_parents = self.tab_parents.read();
+            let mut census = ExactWindowTabCensus::default();
+            let window = windows
+                .get(&window_id)
+                .ok_or(WindowMutationError::NotFound { window_id })?;
+            if !window.has_exact_mux_identity(self, window_id) {
+                return Err(WindowMutationError::ExactIdentity { window_id });
             }
-            changed
+            if window.get_workspace() == workspace {
+                return Ok(false);
+            }
+
+            let window_pane_count = self.exact_window_structural_pane_count(
+                &authority,
+                &registered_tabs,
+                &tab_parents,
+                &mut census,
+                window_id,
+                window,
+            )
+            .map_err(|source| WindowMutationError::invariant(window_id, source))?;
+            let old_workspace = Self::prepare_owned_text(
+                window.get_workspace(),
+                "prior window state",
+            )
+            .map_err(|source| {
+                WindowMutationError::allocation(window_id, "prior workspace state", source)
+            })?;
+            let workspace_state = Self::prepare_owned_text(workspace, "window state")
+                .map_err(|source| {
+                    WindowMutationError::allocation(window_id, "workspace state", source)
+                })?;
+            let workspace_event = Self::prepare_owned_text(workspace, "window event")
+                .map_err(|source| {
+                    WindowMutationError::allocation(window_id, "workspace event", source)
+                })?;
+
+            let mut workspace_counts = self.num_panes_by_workspace.write();
+            let mut workspace_count_key = None;
+            let count_transfer = if window_pane_count == 0 {
+                None
+            } else {
+                let old_count = workspace_counts
+                    .get(&old_workspace)
+                    .copied()
+                    .ok_or_else(|| {
+                        WindowMutationError::invariant(
+                            window_id,
+                            anyhow!(
+                                "workspace {old_workspace} lacks its nonzero pane-count entry"
+                            ),
+                        )
+                    })?;
+                if old_count < window_pane_count {
+                    return Err(WindowMutationError::invariant(
+                        window_id,
+                        anyhow!(
+                            "workspace {old_workspace} pane-count cache {old_count} is smaller than window {window_id} structural count {window_pane_count}"
+                        ),
+                    ));
+                }
+                let next_old_count = old_count.checked_sub(window_pane_count).ok_or_else(|| {
+                    WindowMutationError::invariant(
+                        window_id,
+                        anyhow!("workspace {old_workspace} pane count underflow"),
+                    )
+                })?;
+                let new_count = workspace_counts.get(workspace).copied().unwrap_or(0);
+                let next_new_count = new_count.checked_add(window_pane_count).ok_or_else(|| {
+                    WindowMutationError::invariant(
+                        window_id,
+                        anyhow!("workspace {workspace} pane count overflow"),
+                    )
+                })?;
+                if !workspace_counts.contains_key(workspace) {
+                    workspace_counts.try_reserve(1).map_err(|error| {
+                        WindowMutationError::allocation(
+                            window_id,
+                            "destination workspace pane-count entry",
+                            error,
+                        )
+                    })?;
+                    workspace_count_key = Some(Self::prepare_owned_text(
+                        workspace,
+                        "window pane-count key",
+                    )
+                    .map_err(|source| {
+                        WindowMutationError::allocation(
+                            window_id,
+                            "destination workspace pane-count key",
+                            source,
+                        )
+                    })?);
+                }
+                Some((old_count, next_old_count, new_count, next_new_count))
+            };
+
+            let mut topology = self.topology.lock();
+            let mut pending = self.pending_window_notifications.lock();
+            if !std::ptr::eq(pending.owner.as_ptr(), self.as_ref() as *const Self) {
+                return Err(WindowMutationError::invariant(
+                    window_id,
+                    anyhow!("window workspace transaction requires the exact notification owner"),
+                ));
+            }
+            pending
+                .queue
+                .try_reserve(1)
+                .map_err(|source| {
+                    WindowMutationError::allocation(window_id, "workspace delivery", source)
+                })?;
+            let revision = topology
+                .reserve_revision()
+                .map_err(|source| WindowMutationError::RevisionExhausted {
+                    window_id,
+                    source,
+                })?;
+
+            let window = windows
+                .get_mut(&window_id)
+                .expect("workspace transaction retained the window-map write guard");
+            let replaced_workspace = window.replace_workspace_without_notify(workspace_state);
+            debug_assert_eq!(replaced_workspace, old_workspace);
+            if let Some((old_count, next_old_count, new_count, next_new_count)) = count_transfer {
+                if next_old_count == 0 {
+                    let removed = workspace_counts.remove(&old_workspace);
+                    debug_assert_eq!(removed, Some(old_count));
+                } else {
+                    let count = workspace_counts
+                        .get_mut(&old_workspace)
+                        .expect("validated source pane-count entry remains present");
+                    debug_assert_eq!(*count, old_count);
+                    *count = next_old_count;
+                }
+                if let Some(count) = workspace_counts.get_mut(workspace) {
+                    debug_assert_eq!(*count, new_count);
+                    *count = next_new_count;
+                } else {
+                    let replaced = workspace_counts.insert(
+                        workspace_count_key
+                            .expect("absent destination pane-count key was prepared"),
+                        next_new_count,
+                    );
+                    debug_assert!(replaced.is_none());
+                }
+            }
+            pending.queue.push_back(PendingWindowAction::Notification {
+                envelope: MuxNotificationEnvelope {
+                    notification: MuxNotification::WindowWorkspaceChanged {
+                        window_id,
+                        workspace: workspace_event,
+                    },
+                    topology: MuxTopologyStamp::Revision(revision),
+                },
+                activity: None,
+            });
+            true
         };
         self.flush_window_notifications();
-        changed
+        Ok(changed)
+    }
+
+    /// Set one exact mux window title with allocation and topology delivery
+    /// prepared before mutation. Exact windows bind their notification owner
+    /// before publication, allowing borrowed pane-generation handles to use
+    /// this path without manufacturing or consulting a global `Arc<Mux>`.
+    pub fn set_window_title(
+        &self,
+        window_id: WindowId,
+        title: &str,
+    ) -> Result<bool, WindowMutationError> {
+        let changed = {
+            let mut windows = self.windows.write();
+            let window = windows
+                .get(&window_id)
+                .ok_or(WindowMutationError::NotFound { window_id })?;
+            if !window.has_exact_mux_identity(self, window_id) {
+                return Err(WindowMutationError::ExactIdentity { window_id });
+            }
+            if window.get_title() == title {
+                return Ok(false);
+            }
+
+            let title_state = Self::prepare_owned_text(title, "window title state")
+                .map_err(|source| {
+                    WindowMutationError::allocation(window_id, "title state", source)
+                })?;
+            let title_event = Self::prepare_owned_text(title, "window title event")
+                .map_err(|source| {
+                    WindowMutationError::allocation(window_id, "title event", source)
+                })?;
+            let mut topology = self.topology.lock();
+            let mut pending = self.pending_window_notifications.lock();
+            if !std::ptr::eq(pending.owner.as_ptr(), self as *const Self) {
+                return Err(WindowMutationError::invariant(
+                    window_id,
+                    anyhow!("window title transaction requires the exact notification owner"),
+                ));
+            }
+            pending
+                .queue
+                .try_reserve(1)
+                .map_err(|source| {
+                    WindowMutationError::allocation(window_id, "title delivery", source)
+                })?;
+            let revision = topology
+                .reserve_revision()
+                .map_err(|source| WindowMutationError::RevisionExhausted {
+                    window_id,
+                    source,
+                })?;
+
+            let window = windows
+                .get_mut(&window_id)
+                .expect("title transaction retained the window-map write guard");
+            let replaced_title = window.replace_title_without_notify(title_state);
+            debug_assert_ne!(replaced_title, title);
+            pending.queue.push_back(PendingWindowAction::Notification {
+                envelope: MuxNotificationEnvelope {
+                    notification: MuxNotification::WindowTitleChanged {
+                        window_id,
+                        title: title_event,
+                    },
+                    topology: MuxTopologyStamp::Revision(revision),
+                },
+                activity: None,
+            });
+            true
+        };
+        self.flush_window_notifications();
+        Ok(changed)
+    }
+
+    /// Mutate tab-stack metadata without exporting a raw mutable window guard.
+    pub fn create_window_tab_stack(
+        &self,
+        window_id: WindowId,
+        stack_id: crate::tab::TabStackId,
+        tab_ids: Vec<TabId>,
+    ) -> anyhow::Result<()> {
+        let result = {
+            let mut windows = self.windows.write();
+            let window = windows
+                .get_mut(&window_id)
+                .ok_or_else(|| anyhow!("window {window_id} is not registered"))?;
+            anyhow::ensure!(
+                window.has_exact_mux_identity(self, window_id),
+                "window registry key {window_id} names another exact window allocation"
+            );
+            window
+                .create_tab_stack(stack_id, tab_ids)
+                .map_err(|error| anyhow!("create tab stack in window {window_id}: {error:?}"))
+        };
+        self.flush_window_notifications();
+        result
     }
 
     pub fn set_tab_title(&self, tab_id: TabId, title: &str) -> bool {
@@ -14460,7 +15146,7 @@ impl Mux {
 
         let (window_id, size) = if let Some(window_id) = window_id {
             let window = self
-                .get_window_mut(window_id)
+                .get_window(window_id)
                 .ok_or_else(|| anyhow!("window_id {} not found on this server", window_id))?;
             let tab = window
                 .get_active()
@@ -19454,7 +20140,11 @@ mod tests {
             .expect("replacement subscription");
 
         Mux::set_mux(&replacement);
-        assert!(origin.set_window_title(window_id, "origin window"));
+        assert!(
+            origin
+                .set_window_title(window_id, "origin window")
+                .expect("set origin window title")
+        );
         assert!(origin.set_tab_title(tab_id, "origin tab"));
         assert_eq!(origin_notifications.load(Ordering::SeqCst), 2);
         assert_eq!(replacement_notifications.load(Ordering::SeqCst), 0);
@@ -21220,10 +21910,13 @@ mod tests {
         })
         .expect("test topology subscription should allocate an identifier");
 
-        mux.queue_window_notification(MuxNotification::WindowTitleChanged {
-            window_id: 31,
-            title: "queued".to_string(),
-        });
+        mux.queue_window_notification_entry(
+            MuxNotification::WindowTitleChanged {
+                window_id: 31,
+                title: "queued".to_string(),
+            },
+            None,
+        );
         assert_eq!(
             mux.topology_snapshot_authority()
                 .expect("queued topology publication should retain authority")
@@ -21293,11 +21986,478 @@ mod tests {
     }
 
     #[test]
-    fn workspace_rename_dispatches_only_after_new_window_state_is_visible() {
+    fn window_workspace_transaction_moves_populated_count_without_recompute() {
+        let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
-        let window_builder = mux.new_empty_window(Some("old-workspace".to_string()), None);
-        let window_id = *window_builder;
-        drop(window_builder);
+        let (pane, _kills) = KillCountingPane::new(61_001, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        assert_eq!(
+            mux.num_panes_by_workspace
+                .read()
+                .get(DEFAULT_WORKSPACE)
+                .copied(),
+            Some(1)
+        );
+        mux.pane_count_recomputes.store(0, Ordering::Relaxed);
+
+        assert!(
+            mux.set_window_workspace(window_id, "workspace-b")
+                .expect("move populated window to workspace B")
+        );
+
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("moved window remains registered")
+                .get_workspace(),
+            "workspace-b"
+        );
+        let counts = mux.num_panes_by_workspace.read();
+        assert_eq!(counts.get(DEFAULT_WORKSPACE), None);
+        assert_eq!(counts.get("workspace-b").copied(), Some(1));
+        assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn window_workspace_transaction_stale_recount_cannot_overwrite_transfer() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(61_007, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let (census_ready_tx, census_ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel(1);
+        let mux_for_recount = Arc::clone(&mux);
+        let recount = std::thread::spawn(move || {
+            mux_for_recount.recompute_pane_count_with_before_publish(|| {
+                census_ready_tx
+                    .send(())
+                    .expect("announce completed recount census");
+                publish_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("release exact recount publication cut");
+            });
+        });
+        census_ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("recount must reach its pre-publication barrier");
+        assert!(
+            !mux.try_window_exclusive_access(window_id),
+            "the completed census must retain its window cut through cache publication"
+        );
+
+        let (setter_started_tx, setter_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (setter_result_tx, setter_result_rx) = std::sync::mpsc::sync_channel(1);
+        let mux_for_setter = Arc::clone(&mux);
+        let setter = std::thread::spawn(move || {
+            setter_started_tx
+                .send(())
+                .expect("announce workspace setter attempt");
+            let result = mux_for_setter.set_window_workspace(window_id, "workspace-b");
+            setter_result_tx
+                .send(result)
+                .expect("return workspace setter result");
+        });
+        setter_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("workspace setter must start");
+        assert!(
+            matches!(
+                setter_result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "workspace transfer must wait behind the retained recount cut"
+        );
+
+        publish_tx
+            .send(())
+            .expect("release recount publication before workspace transfer");
+        recount.join().expect("exact recount must finish");
+        assert!(
+            setter_result_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("workspace transfer must return")
+                .expect("workspace transfer after recount must commit")
+        );
+        setter.join().expect("workspace setter thread must finish");
+
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("workspace-transferred window remains registered")
+                .get_workspace(),
+            "workspace-b"
+        );
+        let counts = mux.num_panes_by_workspace.read();
+        assert_eq!(counts.get(DEFAULT_WORKSPACE), None);
+        assert_eq!(counts.get("workspace-b").copied(), Some(1));
+    }
+
+    #[test]
+    fn window_workspace_transaction_same_workspace_is_exact_noop() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(61_002, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let counts_before = mux.num_panes_by_workspace.read().clone();
+        let revision_before = mux
+            .topology_snapshot_authority()
+            .expect("topology before workspace no-op")
+            .1;
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(
+                notification,
+                MuxNotification::WindowWorkspaceChanged { window_id: id, .. }
+                    if id == window_id
+            ) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe to workspace no-op events");
+
+        assert!(
+            !mux.set_window_workspace(window_id, DEFAULT_WORKSPACE)
+                .expect("same workspace is a successful no-op")
+        );
+
+        assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("topology after workspace no-op")
+                .1,
+            revision_before
+        );
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn window_workspace_transaction_missing_window_failure_is_typed() {
+        let mux = Arc::new(Mux::new(None));
+        let window_id = usize::MAX;
+
+        assert!(matches!(
+            mux.set_window_workspace(window_id, "workspace-b"),
+            Err(WindowMutationError::NotFound {
+                window_id: missing
+            }) if missing == window_id
+        ));
+        assert!(matches!(
+            mux.set_window_title(window_id, "title"),
+            Err(WindowMutationError::NotFound {
+                window_id: missing
+            }) if missing == window_id
+        ));
+    }
+
+    #[test]
+    fn window_workspace_transaction_corrupt_count_rejects_without_mutation() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(61_003, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        mux.num_panes_by_workspace
+            .write()
+            .insert(DEFAULT_WORKSPACE.to_string(), 0);
+        let counts_before = mux.num_panes_by_workspace.read().clone();
+        let revision_before = mux
+            .topology_snapshot_authority()
+            .expect("topology before corrupt-count rejection")
+            .1;
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowWorkspaceChanged { .. }) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe to rejected workspace events");
+
+        let error = mux
+            .set_window_workspace(window_id, "workspace-b")
+            .expect_err("a smaller-than-window count cache must fail closed");
+
+        assert!(format!("{error:#}").contains("smaller than window"));
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("rejected window remains registered")
+                .get_workspace(),
+            DEFAULT_WORKSPACE
+        );
+        assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("topology after corrupt-count rejection")
+                .1,
+            revision_before
+        );
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn window_workspace_transaction_destination_overflow_rejects_without_mutation() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(61_010, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        mux.num_panes_by_workspace
+            .write()
+            .insert("workspace-b".to_string(), usize::MAX);
+        let counts_before = mux.num_panes_by_workspace.read().clone();
+        let revision_before = mux
+            .topology_snapshot_authority()
+            .expect("topology before destination-overflow rejection")
+            .1;
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowWorkspaceChanged { .. }) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe to destination-overflow events");
+
+        let error = mux
+            .set_window_workspace(window_id, "workspace-b")
+            .expect_err("a destination count at usize::MAX must fail closed");
+
+        assert!(format!("{error:#}").contains("pane count overflow"));
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("overflow-rejected window remains registered")
+                .get_workspace(),
+            DEFAULT_WORKSPACE
+        );
+        assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("topology after destination-overflow rejection")
+                .1,
+            revision_before
+        );
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn window_workspace_transaction_replaced_window_rejects_without_mutation() {
+        let mux = Arc::new(Mux::new(None));
+        let original_builder = mux.new_empty_window(Some("original".to_string()), None);
+        let window_id = *original_builder;
+        let replacement = Window::new_for_owner(
+            Some("replacement".to_string()),
+            None,
+            Arc::downgrade(&mux),
+        );
+        let replacement_id = replacement.window_id();
+        assert_ne!(replacement_id, window_id);
+        let original = mux
+            .windows
+            .write()
+            .insert(window_id, replacement)
+            .expect("replace the planted window-map value");
+        let counts_before = mux.num_panes_by_workspace.read().clone();
+        let revision_before = mux
+            .topology_snapshot_authority()
+            .expect("topology before exact-window rejection")
+            .1;
+
+        let error = mux
+            .set_window_workspace(window_id, "workspace-b")
+            .expect_err("a same-key different window allocation must fail closed");
+
+        assert!(matches!(
+            &error,
+            WindowMutationError::ExactIdentity {
+                window_id: rejected
+            } if *rejected == window_id
+        ));
+        assert!(format!("{error:#}").contains("another exact window allocation"));
+        let planted = mux
+            .windows
+            .write()
+            .insert(window_id, original)
+            .expect("restore the original exact window value");
+        assert_eq!(planted.window_id(), replacement_id);
+        assert_eq!(planted.get_workspace(), "replacement");
+        assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("topology after exact-window rejection")
+                .1,
+            revision_before
+        );
+        drop(original_builder);
+    }
+
+    #[test]
+    fn window_workspace_transaction_missing_parent_rejects_without_mutation() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(61_004, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let parent = mux
+            .tab_parents
+            .write()
+            .remove(&tab.tab_id())
+            .expect("plant a missing exact parent");
+        let counts_before = mux.num_panes_by_workspace.read().clone();
+        let revision_before = mux
+            .topology_snapshot_authority()
+            .expect("topology before missing-parent rejection")
+            .1;
+
+        let error = mux
+            .set_window_workspace(window_id, "workspace-b")
+            .expect_err("forward membership without a parent must fail closed");
+
+        assert!(format!("{error:#}").contains("lacks its exact indexed parent"));
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("rejected window remains registered")
+                .get_workspace(),
+            DEFAULT_WORKSPACE
+        );
+        assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("topology after missing-parent rejection")
+                .1,
+            revision_before
+        );
+        assert!(
+            mux.tab_parents
+                .write()
+                .insert(tab.tab_id(), parent)
+                .is_none(),
+            "restore the exact parent after the planted-corruption assertion"
+        );
+    }
+
+    #[test]
+    fn window_workspace_transaction_callbacks_run_after_all_authority_locks() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(61_005, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_subscriber = Arc::clone(&events);
+        let mux_for_subscriber = Arc::clone(&mux);
+        mux.subscribe_with_topology(move |envelope| {
+            match envelope.notification {
+                MuxNotification::WindowWorkspaceChanged {
+                    window_id: id,
+                    workspace,
+                } if id == window_id => {
+                    assert_eq!(workspace, "workspace-b");
+                    assert!(mux_for_subscriber.pane_authority.try_lock().is_some());
+                    assert!(mux_for_subscriber.tabs.try_write().is_some());
+                    assert!(mux_for_subscriber.try_window_exclusive_access(window_id));
+                    assert!(mux_for_subscriber.tab_parents.try_write().is_some());
+                    assert!(
+                        mux_for_subscriber
+                            .num_panes_by_workspace
+                            .try_write()
+                            .is_some()
+                    );
+                    assert!(mux_for_subscriber.topology.try_lock().is_some());
+                    assert!(
+                        mux_for_subscriber
+                            .pending_window_notifications
+                            .try_lock()
+                            .is_some()
+                    );
+                    assert_eq!(
+                        mux_for_subscriber
+                            .num_panes_by_workspace
+                            .read()
+                            .get("workspace-b")
+                            .copied(),
+                        Some(1)
+                    );
+                    events_for_subscriber.lock().push("workspace");
+                    assert!(
+                        mux_for_subscriber
+                            .set_window_title(window_id, "reentrant-title")
+                            .expect("reentrant title transaction after workspace locks")
+                    );
+                }
+                MuxNotification::WindowTitleChanged {
+                    window_id: id,
+                    title,
+                } if id == window_id && title == "reentrant-title" => {
+                    events_for_subscriber.lock().push("title");
+                }
+                _ => {}
+            }
+            true
+        })
+        .expect("subscribe to exact workspace transaction");
+
+        assert!(
+            mux.set_window_workspace(window_id, "workspace-b")
+                .expect("workspace callback transaction")
+        );
+
+        assert_eq!(events.lock().as_slice(), &["workspace", "title"]);
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("callback-mutated window remains registered")
+                .get_title(),
+            "reentrant-title"
+        );
+    }
+
+    #[test]
+    fn window_workspace_transaction_title_exhaustion_preserves_state_and_event() {
+        let mux = Arc::new(Mux::new(None));
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowTitleChanged { .. }) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe to rejected title events");
+        mux.topology.lock().revision = TopologyRevision::new(u64::MAX - 1);
+
+        let error = mux
+            .set_window_title(window_id, "must-not-commit")
+            .expect_err("terminal topology revision must reject title mutation");
+
+        assert!(matches!(
+            &error,
+            WindowMutationError::RevisionExhausted {
+                window_id: rejected,
+                ..
+            } if *rejected == window_id
+        ));
+        assert!(format!("{error:#}").contains("revision space is exhausted"));
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("title-rejected window remains registered")
+                .get_title(),
+            ""
+        );
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+        drop(window);
+    }
+
+    #[test]
+    fn window_workspace_transaction_rename_dispatches_after_state_and_count_commit() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _kills) = KillCountingPane::new(61_006, test_size());
+        let (_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        mux.set_window_workspace(window_id, "old-workspace")
+            .expect("prepare populated old workspace");
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        assert!(mux.set_active_workspace_for_client_if_same(&client, "old-workspace"));
+        mux.pane_count_recomputes.store(0, Ordering::Relaxed);
         let before = mux
             .topology_snapshot_authority()
             .expect("topology authority should be live")
@@ -21307,11 +22467,9 @@ mod tests {
         let mux_for_subscriber = Arc::clone(&mux);
         mux.subscribe_with_topology(move |envelope| {
             let kind = match envelope.notification {
-                MuxNotification::WindowWorkspaceChanged {
-                    window_id: id,
-                    workspace,
-                } if id == window_id && workspace == "new-workspace" => Some("window"),
                 MuxNotification::WorkspaceRenamed { .. } => Some("rename"),
+                MuxNotification::WindowWorkspaceChanged { .. }
+                | MuxNotification::ActiveWorkspaceChanged(_) => Some("derivative"),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -21320,6 +22478,15 @@ mod tests {
                     .expect("renamed window must remain registered")
                     .get_workspace()
                     .to_string();
+                assert_eq!(
+                    mux_for_subscriber
+                        .num_panes_by_workspace
+                        .read()
+                        .get("new-workspace")
+                        .copied(),
+                    Some(1),
+                    "rename callbacks must observe the committed count transfer"
+                );
                 observed_for_subscriber
                     .lock()
                     .push((kind, envelope.topology, workspace));
@@ -21328,23 +22495,95 @@ mod tests {
         })
         .expect("test topology subscription should allocate an identifier");
 
-        mux.rename_workspace("old-workspace", "new-workspace");
+        mux.rename_workspace("old-workspace", "new-workspace")
+            .expect("rename workspace transaction");
 
         assert_eq!(
             observed.lock().as_slice(),
-            &[
-                (
-                    "window",
-                    MuxTopologyStamp::Revision(TopologyRevision::new(before.get() + 1)),
-                    "new-workspace".to_string(),
-                ),
-                (
-                    "rename",
-                    MuxTopologyStamp::Revision(TopologyRevision::new(before.get() + 2)),
-                    "new-workspace".to_string(),
-                ),
-            ],
-            "both reserved events must observe the fully committed workspace mutation",
+            &[((
+                "rename",
+                MuxTopologyStamp::Revision(TopologyRevision::new(before.get() + 1)),
+                "new-workspace".to_string(),
+            ))],
+            "one grouped event must replace unordered per-window and per-client derivatives",
+        );
+        assert_eq!(mux.active_workspace_for_client(&client), "new-workspace");
+        let counts = mux.num_panes_by_workspace.read();
+        assert_eq!(counts.get("old-workspace"), None);
+        assert_eq!(counts.get("new-workspace").copied(), Some(1));
+        assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn window_workspace_transaction_multi_window_rename_exhaustion_is_atomic() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (first_pane, _first_kills) = KillCountingPane::new(61_008, test_size());
+        let (second_pane, _second_kills) = KillCountingPane::new(61_009, test_size());
+        let (_first_tab, first_window_id) =
+            register_attached_test_pane(&global_guard, &mux, &first_pane);
+        let (_second_tab, second_window_id) =
+            register_attached_test_pane(&global_guard, &mux, &second_pane);
+        mux.set_window_workspace(first_window_id, "old-workspace")
+            .expect("prepare first old-workspace window");
+        mux.set_window_workspace(second_window_id, "old-workspace")
+            .expect("prepare second old-workspace window");
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+        assert!(mux.set_active_workspace_for_client_if_same(
+            &client,
+            "old-workspace"
+        ));
+
+        let counts_before = mux.num_panes_by_workspace.read().clone();
+        let client_workspace_before = mux.active_workspace_for_client(&client);
+        let events = Arc::new(AtomicUsize::new(0));
+        let events_for_subscriber = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            if matches!(
+                notification,
+                MuxNotification::WindowWorkspaceChanged { .. }
+                    | MuxNotification::WorkspaceRenamed { .. }
+                    | MuxNotification::ActiveWorkspaceChanged(_)
+            ) {
+                events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe to rejected multi-window rename events");
+        {
+            let mut topology = mux.topology.lock();
+            topology.revision = TopologyRevision::new(u64::MAX - 1);
+            topology.exhausted = false;
+        }
+
+        let error = mux
+            .rename_workspace("old-workspace", "new-workspace")
+            .expect_err("grouped rename must reject exhausted revision space");
+
+        assert!(format!("{error:#}").contains("revision space is exhausted"));
+        assert_eq!(
+            mux.get_window(first_window_id)
+                .expect("first rejected rename window remains registered")
+                .get_workspace(),
+            "old-workspace"
+        );
+        assert_eq!(
+            mux.get_window(second_window_id)
+                .expect("second rejected rename window remains registered")
+                .get_workspace(),
+            "old-workspace"
+        );
+        assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
+        assert_eq!(
+            mux.active_workspace_for_client(&client),
+            client_workspace_before
+        );
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            mux.topology.lock().current_revision(),
+            TopologyRevision::new(u64::MAX - 1),
+            "failed batch reservation must not publish a partial revision"
         );
     }
 
@@ -22991,14 +24230,22 @@ mod tests {
         let window_builder = mux.new_empty_window(None, None);
         let window_id = *window_builder;
 
-        {
-            let mut window = mux
-                .get_window_mut(window_id)
-                .expect("new_empty_window should register the window");
-            assert_eq!(window.get_workspace(), DEFAULT_WORKSPACE);
-            window.set_workspace("workspace-without-global-mux");
-            assert_eq!(window.get_workspace(), "workspace-without-global-mux");
-        }
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("new_empty_window should register the window")
+                .get_workspace(),
+            DEFAULT_WORKSPACE
+        );
+        assert!(
+            mux.set_window_workspace(window_id, "workspace-without-global-mux")
+                .expect("set exact mux window workspace")
+        );
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("workspace-mutated window remains registered")
+                .get_workspace(),
+            "workspace-without-global-mux"
+        );
 
         drop(window_builder);
         Mux::shutdown();
@@ -23080,10 +24327,9 @@ mod tests {
                 {
                     events_for_subscriber.lock().push("topology");
                     if !did_reenter_for_subscriber.swap(true, Ordering::SeqCst) {
-                        let mut window = mux_for_subscriber
-                            .get_window_mut(window_id)
+                        mux_for_subscriber
+                            .set_window_workspace(window_id, "reentrant-workspace")
                             .expect("subscriber must re-enter after the map lock is released");
-                        window.set_workspace("reentrant-workspace");
                     }
                 }
                 MuxNotification::WindowWorkspaceChanged {
@@ -23150,13 +24396,11 @@ mod tests {
         let mux_for_thread = Arc::clone(&mux);
         std::thread::spawn(move || {
             mux_for_thread
-                .get_window_mut(window_id)
-                .expect("test window should remain registered")
-                .set_workspace("first-workspace");
+                .set_window_workspace(window_id, "first-workspace")
+                .expect("first workspace transaction");
             mux_for_thread
-                .get_window_mut(window_id)
-                .expect("test window should remain registered")
-                .set_workspace("second-workspace");
+                .set_window_workspace(window_id, "second-workspace")
+                .expect("second workspace transaction");
         })
         .join()
         .expect("off-main workspace mutations should not panic");

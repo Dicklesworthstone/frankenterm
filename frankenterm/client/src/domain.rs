@@ -23,14 +23,25 @@ use mux::{
 };
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::hash::Hash;
+use std::marker::PhantomData;
+use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use wezterm_term::TerminalSize;
+
+thread_local! {
+    /// Remote metadata application is synchronous with mux notification
+    /// delivery. Keep suppression thread-local so an unrelated local mutation
+    /// on another thread is never mistaken for an echo from this attachment.
+    static REMOTE_METADATA_APPLICATION_DEPTHS: RefCell<HashMap<usize, usize>> =
+        RefCell::new(HashMap::new());
+}
 
 /// One attachment-generation-scoped bijection between remote and local ids.
 ///
@@ -181,6 +192,42 @@ pub struct ClientInner {
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
     pub(crate) reliable_input_queue: Arc<ReliableInputQueue>,
     detached: AtomicBool,
+}
+
+/// Suppresses only this exact client attachment's outbound metadata echo while
+/// an authoritative remote mutation is synchronously applied to the local mux.
+pub(crate) struct RemoteMetadataApplicationGuard<'a> {
+    inner_key: usize,
+    _attachment: PhantomData<&'a ClientInner>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for RemoteMetadataApplicationGuard<'_> {
+    fn drop(&mut self) {
+        let released = REMOTE_METADATA_APPLICATION_DEPTHS
+            .try_with(|depths| {
+                let Ok(mut depths) = depths.try_borrow_mut() else {
+                    return false;
+                };
+                let Some(depth) = depths.get_mut(&self.inner_key) else {
+                    return false;
+                };
+                if *depth == 1 {
+                    depths.remove(&self.inner_key);
+                } else if let Some(next) = depth.checked_sub(1) {
+                    *depth = next;
+                } else {
+                    return false;
+                }
+                true
+            })
+            .unwrap_or(false);
+        if !released {
+            log::error!(
+                "remote metadata suppression guard lost its thread-local attachment depth"
+            );
+        }
+    }
 }
 
 pub(crate) fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
@@ -1206,6 +1253,47 @@ impl ClientInner {
         }
     }
 
+    pub(crate) fn begin_remote_metadata_application(
+        &self,
+    ) -> anyhow::Result<RemoteMetadataApplicationGuard<'_>> {
+        let inner_key = self as *const Self as usize;
+        REMOTE_METADATA_APPLICATION_DEPTHS
+            .try_with(|depths| -> anyhow::Result<()> {
+                let mut depths = depths
+                    .try_borrow_mut()
+                    .map_err(|_| anyhow!("remote metadata suppression state is re-entered"))?;
+                if let Some(depth) = depths.get_mut(&inner_key) {
+                    *depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("remote metadata suppression depth exhausted"))?;
+                } else {
+                    depths.try_reserve(1).map_err(|error| {
+                        anyhow!("reserve remote metadata suppression attachment: {error}")
+                    })?;
+                    depths.insert(inner_key, 1);
+                }
+                Ok(())
+            })
+            .map_err(|_| anyhow!("remote metadata suppression thread-local is unavailable"))??;
+        Ok(RemoteMetadataApplicationGuard {
+            inner_key,
+            _attachment: PhantomData,
+            _not_send: PhantomData,
+        })
+    }
+
+    fn should_forward_local_metadata(&self) -> bool {
+        let inner_key = self as *const Self as usize;
+        REMOTE_METADATA_APPLICATION_DEPTHS
+            .try_with(|depths| {
+                depths
+                    .try_borrow()
+                    .map(|depths| depths.get(&inner_key).copied().unwrap_or(0) == 0)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+    }
+
     pub(crate) fn is_detached(&self) -> bool {
         self.detached.load(Ordering::Acquire)
     }
@@ -1302,15 +1390,202 @@ impl Drop for ClientDomain {
     }
 }
 
+async fn settle_remote_metadata_update<Update, UpdateOutput, Resync, ResyncFuture, Abort>(
+    operation: &'static str,
+    subject: &str,
+    update: Update,
+    resync: Resync,
+    abort: Abort,
+) -> anyhow::Result<()>
+where
+    Update: std::future::Future<Output = anyhow::Result<UpdateOutput>>,
+    Resync: FnOnce() -> ResyncFuture,
+    ResyncFuture: std::future::Future<Output = anyhow::Result<bool>>,
+    Abort: FnOnce() -> anyhow::Result<()>,
+{
+    match update.await {
+        Ok(_) => {
+            metrics::counter!(
+                "mux.client.remote_metadata_update",
+                "operation" => operation,
+                "outcome" => "success"
+            )
+            .increment(1);
+            Ok(())
+        }
+        Err(remote_error) => {
+            metrics::counter!(
+                "mux.client.remote_metadata_update",
+                "operation" => operation,
+                "outcome" => "remote_rejected"
+            )
+            .increment(1);
+            log::warn!(
+                "remote {operation} for {subject} failed: \
+                 {remote_error:#}; requesting an authoritative topology resync"
+            );
+            match resync().await {
+                Ok(true) => {
+                    metrics::counter!(
+                        "mux.client.remote_metadata_update",
+                        "operation" => operation,
+                        "outcome" => "resynced"
+                    )
+                    .increment(1);
+                    Ok(())
+                }
+                Ok(false) => {
+                    metrics::counter!(
+                        "mux.client.remote_metadata_update",
+                        "operation" => operation,
+                        "outcome" => "resync_retired"
+                    )
+                    .increment(1);
+                    Ok(())
+                }
+                Err(resync_error) => {
+                    metrics::counter!(
+                        "mux.client.remote_metadata_update",
+                        "operation" => operation,
+                        "outcome" => "resync_failed"
+                    )
+                    .increment(1);
+                    let abort_error = abort().err();
+                    if let Some(abort_error) = abort_error.as_ref() {
+                        log::error!(
+                            "remote {operation} for {subject} was rejected and authoritative \
+                             resync failed; exact-generation abort also failed: \
+                             original={remote_error:#}; resync={resync_error:#}; \
+                             abort={abort_error:#}"
+                        );
+                    } else {
+                        log::error!(
+                            "remote {operation} for {subject} was rejected and authoritative \
+                             resync failed; aborted the exact RPC generation: \
+                             original={remote_error:#}; resync={resync_error:#}"
+                        );
+                    }
+                    let convergence_error = resync_error.context(format!(
+                        "authoritative resync after rejected remote {operation} for {subject}; \
+                         original error: {remote_error:#}"
+                    ));
+                    if let Some(abort_error) = abort_error {
+                        Err(convergence_error.context(format!(
+                            "aborting the divergent exact RPC generation also failed: \
+                             {abort_error:#}"
+                        )))
+                    } else {
+                        Err(convergence_error)
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn update_remote_workspace(
+    mux: Arc<Mux>,
+    domain: Arc<dyn Domain>,
     inner: Arc<ClientInner>,
     pdu: codec::SetWindowWorkspace,
 ) -> anyhow::Result<()> {
     if inner.is_detached() {
         return Ok(());
     }
-    inner.client.set_window_workspace(pdu).await?;
+    let remote_window_id = pdu.window_id;
+    let subject = format!("window {remote_window_id}");
+    let rpc = inner.client.rpc_scope();
+    settle_remote_metadata_update(
+        "workspace update",
+        &subject,
+        rpc.set_window_workspace(pdu),
+        || async {
+            if !client_inner_is_current(&mux, &domain, &inner) {
+                return Ok(false);
+            }
+            let client_domain = domain
+                .downcast_ref::<ClientDomain>()
+                .ok_or_else(|| anyhow!("current remote workspace owner is not a ClientDomain"))?;
+            client_domain
+                .resync_if_current(Arc::clone(&mux), Arc::clone(&inner), &rpc)
+                .await
+        },
+        || {
+            inner.client.abort_rpc_transport_generation(
+                &rpc,
+                "rejected workspace update could not be authoritatively resynchronized",
+            )
+        },
+    )
+    .await
+}
+
+fn reconcile_rejected_workspace_rename(
+    mux: &Mux,
+    inner: &ClientInner,
+    old_workspace: &str,
+    new_workspace: &str,
+) -> anyhow::Result<()> {
+    let Some(owner_client_id) = inner.owner_client_id.as_ref() else {
+        return Ok(());
+    };
+    let _remote_application = inner.begin_remote_metadata_application()?;
+    let _ = mux.compare_set_active_workspace_for_client_if_same(
+        owner_client_id,
+        new_workspace,
+        old_workspace,
+    )?;
     Ok(())
+}
+
+async fn update_remote_workspace_rename(
+    mux: Arc<Mux>,
+    domain: Arc<dyn Domain>,
+    inner: Arc<ClientInner>,
+    old_workspace: String,
+    new_workspace: String,
+) -> anyhow::Result<()> {
+    if inner.is_detached() {
+        return Ok(());
+    }
+    let rpc = inner.client.rpc_scope();
+    let request = codec::RenameWorkspace {
+        old_workspace: old_workspace.clone(),
+        new_workspace: new_workspace.clone(),
+    };
+    let subject = format!("workspace {old_workspace:?} -> {new_workspace:?}");
+    settle_remote_metadata_update(
+        "workspace rename",
+        &subject,
+        rpc.rename_workspace(request),
+        || async {
+            if !client_inner_is_current(&mux, &domain, &inner) {
+                return Ok(false);
+            }
+            let client_domain = domain
+                .downcast_ref::<ClientDomain>()
+                .ok_or_else(|| anyhow!("current remote workspace owner is not a ClientDomain"))?;
+            let topology_current = client_domain
+                .resync_if_current(Arc::clone(&mux), Arc::clone(&inner), &rpc)
+                .await?;
+            if topology_current {
+                reconcile_rejected_workspace_rename(
+                    &mux,
+                    &inner,
+                    &old_workspace,
+                    &new_workspace,
+                )?;
+            }
+            Ok(topology_current)
+        },
+        || {
+            inner.client.abort_rpc_transport_generation(
+                &rpc,
+                "rejected workspace rename could not be authoritatively resynchronized",
+            )
+        },
+    )
+    .await
 }
 
 fn active_workspace_sync_request(
@@ -1405,20 +1680,21 @@ fn mux_notify_client_domain(
             new_workspace,
         } => {
             if let Some(inner) = client_domain.inner() {
-                let workspaces = mux.iter_workspaces();
-                if workspaces.contains(&old_workspace) {
-                    let rpc = inner.client.rename_workspace(codec::RenameWorkspace {
-                        old_workspace,
-                        new_workspace,
-                    });
+                if inner.should_forward_local_metadata() {
                     let mux = Arc::clone(&mux);
                     let domain = Arc::clone(&domain);
                     promise::spawn::spawn(async move {
                         if !client_inner_is_current(&mux, &domain, &inner) {
                             return Ok(());
                         }
-                        rpc.await?;
-                        anyhow::Result::<()>::Ok(())
+                        update_remote_workspace_rename(
+                            mux,
+                            domain,
+                            inner,
+                            old_workspace,
+                            new_workspace,
+                        )
+                        .await
                     })
                     .detach();
                 }
@@ -1428,6 +1704,12 @@ fn mux_notify_client_domain(
             window_id,
             workspace,
         } => {
+            let Some(observed_inner) = client_domain.inner() else {
+                return true;
+            };
+            if !observed_inner.should_forward_local_metadata() {
+                return true;
+            }
             // Defer the RPC so the notification callback never performs
             // domain lookup or transport work while the originating mux
             // mutation is still unwinding.
@@ -1455,7 +1737,19 @@ fn mux_notify_client_domain(
                         window_id: remote_window_id,
                         workspace,
                     };
-                    let _ = update_remote_workspace(inner, request).await;
+                    if let Err(error) = update_remote_workspace(
+                        Arc::clone(&mux),
+                        Arc::clone(&domain),
+                        inner,
+                        request,
+                    )
+                    .await
+                    {
+                        log::error!(
+                            "failed to converge rejected remote workspace update for window \
+                             {remote_window_id}: {error:#}"
+                        );
+                    }
                 } else {
                     log::debug!(
                         "local window id {window_id} has no known remote window \
@@ -1468,6 +1762,9 @@ fn mux_notify_client_domain(
         MuxNotification::TabTitleChanged { tab_id, title } => {
             if let Some(remote_tab_id) = client_domain.local_to_remote_tab_id(tab_id) {
                 if let Some(inner) = client_domain.inner() {
+                    if !inner.should_forward_local_metadata() {
+                        return true;
+                    }
                     let rpc = inner.client.set_tab_title(codec::TabTitleChanged {
                         tab_id: remote_tab_id,
                         title,
@@ -1490,6 +1787,9 @@ fn mux_notify_client_domain(
             title: _,
         } => {
             if let Some(inner) = client_domain.inner() {
+                if !inner.should_forward_local_metadata() {
+                    return true;
+                }
                 let mux = Arc::clone(&mux);
                 let domain = Arc::clone(&domain);
                 promise::spawn::spawn_into_main_thread(async move {
@@ -1834,6 +2134,7 @@ impl ClientDomain {
                 if !incarnation_is_current() {
                     bail!("client attachment retired before coherent topology application");
                 }
+                let _remote_application = inner.begin_remote_metadata_application()?;
                 Self::process_pane_list(&mux, Arc::clone(&inner), panes, primary_window_id)?;
                 if !incarnation_is_current() {
                     bail!("client attachment retired during coherent topology application");
@@ -2354,11 +2655,13 @@ impl ClientDomain {
         {
             remote_windows_to_forget.remove(&remote_window_id);
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                if let Some(mut window) = mux.get_window_mut(local_window_id) {
-                    window.set_title(&window_title.title);
-                } else {
-                    lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
-                        .remove(&remote_window_id);
+                match mux.set_window_title(local_window_id, &window_title.title) {
+                    Ok(_) => {}
+                    Err(error) if error.is_not_found() => {
+                        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                            .remove(&remote_window_id);
+                    }
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -2751,9 +3054,9 @@ impl ClientDomain {
                     // `windows` RwLock, while `add_tab_to_window` acquires the *write*
                     // lock on that same RwLock. Holding the read guard across that call
                     // self-deadlocks parking_lot's (non-reentrant) RwLock — observed as a
-                    // hang on remote-domain attach (main thread parked in
-                    // `get_window_mut` -> `lock_exclusive_slow`). Decide what to do while
-                    // the read guard is alive, then drop it *before* mutating the mux.
+                    // hang on remote-domain attach (main thread parked acquiring the
+                    // exclusive window-registry lock). Decide what to do while the read
+                    // guard is alive, then drop it *before* mutating the mux.
                     enum PrimaryWindow {
                         Reuse,
                         WorkspaceMismatch,
@@ -2977,16 +3280,18 @@ impl ClientDomain {
 
         for (remote_window_id, window_title) in panes.window_titles {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                if let Some(mut window) = mux.get_window_mut(local_window_id) {
-                    window.set_title(&window_title);
-                } else {
-                    log::debug!(
-                        "dropping stale title mapping for remote window {} -> local {}",
-                        remote_window_id,
-                        local_window_id
-                    );
-                    lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
-                        .remove(&remote_window_id);
+                match mux.set_window_title(local_window_id, &window_title) {
+                    Ok(_) => {}
+                    Err(error) if error.is_not_found() => {
+                        log::debug!(
+                            "dropping stale title mapping for remote window {} -> local {}",
+                            remote_window_id,
+                            local_window_id
+                        );
+                        lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                            .remove(&remote_window_id);
+                    }
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -3482,7 +3787,94 @@ impl Domain for ClientDomain {
 mod tests {
     use super::*;
     use crate::MuxTestScope;
+    use asupersync::runtime::RuntimeBuilder;
     use mux::tab::{PaneEntry, PaneNode};
+
+    fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build client-domain test runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn rejected_remote_workspace_update_deterministically_resyncs() {
+        let resyncs = Arc::new(AtomicUsize::new(0));
+        let resyncs_for_call = Arc::clone(&resyncs);
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let aborts_for_call = Arc::clone(&aborts);
+        asupersync_block_on(settle_remote_metadata_update(
+            "workspace update",
+            "window 77",
+            async { Err::<(), _>(anyhow!("planted remote rejection")) },
+            move || async move {
+                resyncs_for_call.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+            move || {
+                aborts_for_call.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ))
+        .expect("a successful authoritative resync must converge the rejection");
+        assert_eq!(resyncs.load(Ordering::SeqCst), 1);
+        assert_eq!(aborts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejected_remote_workspace_update_aborts_once_when_resync_fails() {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let aborts_for_call = Arc::clone(&aborts);
+        let error = asupersync_block_on(settle_remote_metadata_update(
+            "workspace update",
+            "window 78",
+            async { Err::<(), _>(anyhow!("planted remote rejection")) },
+            || async { Err(anyhow!("planted resync failure")) },
+            move || {
+                aborts_for_call.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ))
+        .expect_err("failed authoritative convergence must abort its exact generation");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("planted remote rejection"));
+        assert!(rendered.contains("planted resync failure"));
+        assert_eq!(aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn remote_metadata_suppression_is_exact_and_nested() {
+        let inner = test_client_inner(91_001);
+        assert!(inner.should_forward_local_metadata());
+        let outer = inner
+            .begin_remote_metadata_application()
+            .expect("enter outer remote metadata application");
+        assert!(!inner.should_forward_local_metadata());
+        let nested = inner
+            .begin_remote_metadata_application()
+            .expect("enter nested remote metadata application");
+        assert!(!inner.should_forward_local_metadata());
+        drop(nested);
+        assert!(!inner.should_forward_local_metadata());
+        drop(outer);
+        assert!(inner.should_forward_local_metadata());
+    }
+
+    #[test]
+    fn remote_metadata_suppression_does_not_hide_another_threads_local_change() {
+        let inner = test_client_inner(91_002);
+        let guard = inner
+            .begin_remote_metadata_application()
+            .expect("enter remote metadata application");
+        let inner_for_thread = Arc::clone(&inner);
+        let visible_elsewhere = std::thread::spawn(move || {
+            inner_for_thread.should_forward_local_metadata()
+        })
+        .join()
+        .expect("metadata visibility probe thread");
+        assert!(visible_elsewhere);
+        drop(guard);
+    }
 
     fn test_client_id(name: &str, pid: u32) -> Arc<ClientId> {
         Arc::new(ClientId {
@@ -3536,7 +3928,8 @@ mod tests {
         let owner = test_client_id("owner", 41_003);
         mux.register_client(Arc::clone(&owner));
         mux.set_active_workspace_for_client(&owner, "old-workspace");
-        mux.rename_workspace("old-workspace", "renamed-workspace");
+        mux.rename_workspace("old-workspace", "renamed-workspace")
+            .expect("rename active workspace");
 
         assert_eq!(
             active_workspace_sync_request(Some(&owner), &owner, &mux),
@@ -3581,6 +3974,79 @@ mod tests {
             None,
             false,
         ))
+    }
+
+    #[test]
+    fn rejected_workspace_rename_restores_only_unchanged_owner_workspace() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let owner = test_client_id("rename-owner", 41_005);
+        mux.register_client(Arc::clone(&owner));
+        mux.set_active_workspace_for_client(&owner, "renamed-workspace");
+
+        let unix = UnixDomain {
+            name: "rename-client-domain".to_string(),
+            ..UnixDomain::default()
+        };
+        let inner = Arc::new(ClientInner::new(
+            91_003,
+            Client::new_test_client(Some(91_003), ClientDomainConfig::Unix(unix)),
+            Some(Arc::clone(&owner)),
+            None,
+            false,
+        ));
+        let forwarding_states = Arc::new(Mutex::new(Vec::new()));
+        let forwarding_states_for_subscriber = Arc::clone(&forwarding_states);
+        let inner_for_subscriber = Arc::clone(&inner);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::ActiveWorkspaceChanged(_)) {
+                forwarding_states_for_subscriber
+                    .lock()
+                    .expect("forwarding-state observation lock")
+                    .push(inner_for_subscriber.should_forward_local_metadata());
+            }
+            true
+        })
+        .expect("subscribe to rejected rename reconciliation");
+
+        reconcile_rejected_workspace_rename(
+            &mux,
+            &inner,
+            "old-workspace",
+            "renamed-workspace",
+        )
+        .expect("restore rejected owner workspace");
+        assert_eq!(mux.active_workspace_for_client(&owner), "old-workspace");
+        assert_eq!(
+            forwarding_states
+                .lock()
+                .expect("forwarding states after rollback")
+                .as_slice(),
+            &[false],
+            "authoritative rollback notification must not echo to the rejecting server"
+        );
+
+        mux.set_active_workspace_for_client(&owner, "intervening-local-workspace");
+        reconcile_rejected_workspace_rename(
+            &mux,
+            &inner,
+            "old-workspace",
+            "renamed-workspace",
+        )
+        .expect("intervening selection is a successful no-op");
+        assert_eq!(
+            mux.active_workspace_for_client(&owner),
+            "intervening-local-workspace"
+        );
+        assert_eq!(
+            forwarding_states
+                .lock()
+                .expect("forwarding states after intervening selection")
+                .as_slice(),
+            &[false, true],
+            "compare-and-set reconciliation must not overwrite or re-notify an intervening choice"
+        );
     }
 
     #[test]

@@ -268,8 +268,11 @@ pub struct StorageTelemetry {
     config: StorageTelemetryConfig,
     registry: Arc<MetricRegistry>,
     rate_ewma: std::sync::Mutex<Ewma>,
+    rate_ewma_by_backend: [std::sync::Mutex<Ewma>; 3],
     last_health: std::sync::RwLock<Option<RecorderStorageHealth>>,
+    last_health_by_backend: [std::sync::RwLock<Option<RecorderStorageHealth>>; 3],
     last_lag: std::sync::RwLock<Option<RecorderStorageLag>>,
+    last_lag_by_backend: [std::sync::RwLock<Option<RecorderStorageLag>>; 3],
     created_at: Instant,
     /// Monotonic counter for estimating bytes written (from accepted_count × estimate).
     estimated_bytes: AtomicU64,
@@ -287,10 +290,7 @@ impl StorageTelemetry {
         registry.register_histogram(METRIC_FLUSH_LATENCY_US, max);
         registry.register_histogram(METRIC_CHECKPOINT_LATENCY_US, max);
         registry.register_histogram(METRIC_BATCH_SIZE, max);
-        for backend in [
-            RecorderBackendKind::AppendLog,
-            RecorderBackendKind::FrankenSqlite,
-        ] {
+        for backend in RecorderBackendKind::ALL {
             registry
                 .register_histogram(backend_metric_name(METRIC_APPEND_LATENCY_US, backend), max);
             registry.register_histogram(backend_metric_name(METRIC_FLUSH_LATENCY_US, backend), max);
@@ -303,13 +303,19 @@ impl StorageTelemetry {
 
         let rate_ewma =
             std::sync::Mutex::new(Ewma::with_half_life_ms(config.rate_ewma_half_life_ms));
+        let rate_ewma_by_backend = std::array::from_fn(|_| {
+            std::sync::Mutex::new(Ewma::with_half_life_ms(config.rate_ewma_half_life_ms))
+        });
 
         Self {
             config,
             registry,
             rate_ewma,
+            rate_ewma_by_backend,
             last_health: std::sync::RwLock::new(None),
+            last_health_by_backend: std::array::from_fn(|_| std::sync::RwLock::new(None)),
             last_lag: std::sync::RwLock::new(None),
+            last_lag_by_backend: std::array::from_fn(|_| std::sync::RwLock::new(None)),
             created_at: Instant::now(),
             estimated_bytes: AtomicU64::new(0),
         }
@@ -392,6 +398,8 @@ impl StorageTelemetry {
         // Update rate EWMA
         let now_ms = self.created_at.elapsed().as_millis() as u64;
         lock_recovering(&self.rate_ewma).observe(event_count as f64, now_ms);
+        lock_recovering(&self.rate_ewma_by_backend[backend_index(backend)])
+            .observe(event_count as f64, now_ms);
     }
 
     /// Record a flush operation.
@@ -490,11 +498,22 @@ impl StorageTelemetry {
 
     /// Update the last-observed health snapshot.
     pub fn update_health(&self, health: RecorderStorageHealth) {
+        *write_recovering(&self.last_health_by_backend[backend_index(health.backend)]) =
+            Some(health.clone());
         *write_recovering(&self.last_health) = Some(health);
     }
 
-    /// Update the last-observed lag snapshot.
+    /// Update the last-observed lag snapshot for the append-log backend.
+    ///
+    /// New callers should use [`Self::update_lag_for_backend`] so a per-backend
+    /// snapshot cannot inherit another backend's lag state.
     pub fn update_lag(&self, lag: RecorderStorageLag) {
+        self.update_lag_for_backend(lag, RecorderBackendKind::AppendLog);
+    }
+
+    /// Update the last-observed lag snapshot for an exact backend.
+    pub fn update_lag_for_backend(&self, lag: RecorderStorageLag, backend: RecorderBackendKind) {
+        *write_recovering(&self.last_lag_by_backend[backend_index(backend)]) = Some(lag.clone());
         *write_recovering(&self.last_lag) = Some(lag);
     }
 
@@ -519,6 +538,12 @@ impl StorageTelemetry {
     #[must_use]
     pub fn append_rate(&self) -> f64 {
         lock_recovering(&self.rate_ewma).value()
+    }
+
+    /// Current EWMA-smoothed append rate for an exact backend.
+    #[must_use]
+    pub fn append_rate_for_backend(&self, backend: RecorderBackendKind) -> f64 {
+        lock_recovering(&self.rate_ewma_by_backend[backend_index(backend)]).value()
     }
 
     /// Produce a full diagnostic snapshot.
@@ -561,11 +586,15 @@ impl StorageTelemetry {
             corruption: self.registry.counter_value(COUNTER_ERROR_CORRUPTION),
         };
 
+        let health = read_recovering(&self.last_health_by_backend[backend_index(backend)]).clone();
+        let health_tier = tier_for_health(health.as_ref(), &self.config.tier_thresholds);
+        let lag = read_recovering(&self.last_lag_by_backend[backend_index(backend)]).clone();
+
         StoragePipelineSnapshot {
             timestamp_ms: now_ms,
-            health_tier: self.current_tier(),
-            health: read_recovering(&self.last_health).clone(),
-            lag: read_recovering(&self.last_lag).clone(),
+            health_tier,
+            health,
+            lag,
             append_latency: append_summary,
             flush_latency: flush_summary,
             checkpoint_latency: find_summary(METRIC_CHECKPOINT_LATENCY_US),
@@ -574,7 +603,7 @@ impl StorageTelemetry {
             total_batches: self.registry.counter_value(COUNTER_BATCHES_PROCESSED),
             total_flushes: self.registry.counter_value(COUNTER_FLUSHES),
             total_checkpoints: self.registry.counter_value(COUNTER_CHECKPOINTS),
-            append_rate_ewma: self.append_rate(),
+            append_rate_ewma: self.append_rate_for_backend(backend),
             backend_kind: None,
             errors,
             slo_append_p95,
@@ -1034,18 +1063,16 @@ mod tests {
     #[test]
     fn record_append_for_backend_updates_backend_dimension_counters() {
         let telem = StorageTelemetry::with_defaults();
-        telem.record_append_for_backend(220.0, 3, 768, false, RecorderBackendKind::FrankenSqlite);
+        telem.record_append_for_backend(220.0, 3, 768, false, RecorderBackendKind::Rusqlite);
 
         let events_counter =
-            backend_metric_name(COUNTER_EVENTS_APPENDED, RecorderBackendKind::FrankenSqlite);
-        let batches_counter = backend_metric_name(
-            COUNTER_BATCHES_PROCESSED,
-            RecorderBackendKind::FrankenSqlite,
-        );
+            backend_metric_name(COUNTER_EVENTS_APPENDED, RecorderBackendKind::Rusqlite);
+        let batches_counter =
+            backend_metric_name(COUNTER_BATCHES_PROCESSED, RecorderBackendKind::Rusqlite);
         let bytes_counter =
-            backend_metric_name(COUNTER_BYTES_WRITTEN, RecorderBackendKind::FrankenSqlite);
+            backend_metric_name(COUNTER_BYTES_WRITTEN, RecorderBackendKind::Rusqlite);
         let append_histogram =
-            backend_metric_name(METRIC_APPEND_LATENCY_US, RecorderBackendKind::FrankenSqlite);
+            backend_metric_name(METRIC_APPEND_LATENCY_US, RecorderBackendKind::Rusqlite);
 
         assert_eq!(telem.registry.counter_value(&events_counter), 3);
         assert_eq!(telem.registry.counter_value(&batches_counter), 1);
@@ -1065,11 +1092,11 @@ mod tests {
         let telem = StorageTelemetry::with_defaults();
         telem.record_error_for_backend(
             RecorderStorageErrorClass::Overload,
-            Some(RecorderBackendKind::FrankenSqlite),
+            Some(RecorderBackendKind::Rusqlite),
         );
 
         let overload_counter =
-            backend_metric_name(COUNTER_ERROR_OVERLOAD, RecorderBackendKind::FrankenSqlite);
+            backend_metric_name(COUNTER_ERROR_OVERLOAD, RecorderBackendKind::Rusqlite);
         assert_eq!(telem.registry.counter_value(COUNTER_ERROR_OVERLOAD), 1);
         assert_eq!(telem.registry.counter_value(&overload_counter), 1);
     }
@@ -1971,18 +1998,18 @@ mod tests {
     fn instrumented_storage_emits_backend_kind_tag() {
         let telem = StorageTelemetry::with_defaults();
         telem.record_append_for_backend(500.0, 10, 2560, false, RecorderBackendKind::AppendLog);
-        telem.record_append_for_backend(800.0, 5, 1280, false, RecorderBackendKind::FrankenSqlite);
+        telem.record_append_for_backend(800.0, 5, 1280, false, RecorderBackendKind::Rusqlite);
 
         let snap_al = telem.snapshot_for_backend(RecorderBackendKind::AppendLog);
-        let snap_fs = telem.snapshot_for_backend(RecorderBackendKind::FrankenSqlite);
+        let snap_sqlite = telem.snapshot_for_backend(RecorderBackendKind::Rusqlite);
 
         assert_eq!(snap_al.backend_kind, Some(RecorderBackendKind::AppendLog));
         assert_eq!(
-            snap_fs.backend_kind,
-            Some(RecorderBackendKind::FrankenSqlite)
+            snap_sqlite.backend_kind,
+            Some(RecorderBackendKind::Rusqlite)
         );
         assert_eq!(snap_al.total_events_appended, 10);
-        assert_eq!(snap_fs.total_events_appended, 5);
+        assert_eq!(snap_sqlite.total_events_appended, 5);
     }
 
     #[test]
@@ -1998,22 +2025,16 @@ mod tests {
             telem.record_append_for_backend(500.0, 1, 256, false, RecorderBackendKind::AppendLog);
         }
 
-        // FrankenSqlite: over SLO
+        // Rusqlite: over SLO
         for _ in 0..20 {
-            telem.record_append_for_backend(
-                2000.0,
-                1,
-                256,
-                false,
-                RecorderBackendKind::FrankenSqlite,
-            );
+            telem.record_append_for_backend(2000.0, 1, 256, false, RecorderBackendKind::Rusqlite);
         }
 
         let snap_al = telem.snapshot_for_backend(RecorderBackendKind::AppendLog);
-        let snap_fs = telem.snapshot_for_backend(RecorderBackendKind::FrankenSqlite);
+        let snap_sqlite = telem.snapshot_for_backend(RecorderBackendKind::Rusqlite);
 
         assert_eq!(snap_al.slo_append_p95, SloStatus::Met);
-        assert_eq!(snap_fs.slo_append_p95, SloStatus::Breached);
+        assert_eq!(snap_sqlite.slo_append_p95, SloStatus::Breached);
     }
 
     #[test]
@@ -2027,10 +2048,10 @@ mod tests {
     #[test]
     fn metric_labels_contain_backend_dimension() {
         let telem = StorageTelemetry::with_defaults();
-        telem.record_flush_for_backend(200.0, RecorderBackendKind::FrankenSqlite);
+        telem.record_flush_for_backend(200.0, RecorderBackendKind::Rusqlite);
 
-        let snap_fs = telem.snapshot_for_backend(RecorderBackendKind::FrankenSqlite);
-        assert_eq!(snap_fs.total_flushes, 1);
+        let snap_sqlite = telem.snapshot_for_backend(RecorderBackendKind::Rusqlite);
+        assert_eq!(snap_sqlite.total_flushes, 1);
 
         // AppendLog didn't get the flush
         let snap_al = telem.snapshot_for_backend(RecorderBackendKind::AppendLog);
@@ -2041,8 +2062,8 @@ mod tests {
     fn backend_metric_name_format() {
         let name = backend_metric_name("storage.test", RecorderBackendKind::AppendLog);
         assert!(name.contains("append_log"));
-        let name = backend_metric_name("storage.test", RecorderBackendKind::FrankenSqlite);
-        assert!(name.contains("frankensqlite"));
+        let name = backend_metric_name("storage.test", RecorderBackendKind::Rusqlite);
+        assert!(name.contains("rusqlite"));
     }
 
     #[test]
@@ -2054,16 +2075,16 @@ mod tests {
         );
         telem.record_error_for_backend(
             RecorderStorageErrorClass::Corruption,
-            Some(RecorderBackendKind::FrankenSqlite),
+            Some(RecorderBackendKind::Rusqlite),
         );
 
         let snap_al = telem.snapshot_for_backend(RecorderBackendKind::AppendLog);
         assert_eq!(snap_al.errors.overload, 1);
         assert_eq!(snap_al.errors.corruption, 0);
 
-        let snap_fs = telem.snapshot_for_backend(RecorderBackendKind::FrankenSqlite);
-        assert_eq!(snap_fs.errors.overload, 0);
-        assert_eq!(snap_fs.errors.corruption, 1);
+        let snap_sqlite = telem.snapshot_for_backend(RecorderBackendKind::Rusqlite);
+        assert_eq!(snap_sqlite.errors.overload, 0);
+        assert_eq!(snap_sqlite.errors.corruption, 1);
     }
 
     #[test]
@@ -2077,14 +2098,14 @@ mod tests {
         telem.record_checkpoint_for_backend(
             200.0,
             CheckpointCommitOutcome::NoopAlreadyAdvanced,
-            RecorderBackendKind::FrankenSqlite,
+            RecorderBackendKind::Rusqlite,
         );
 
         let snap_al = telem.snapshot_for_backend(RecorderBackendKind::AppendLog);
         assert_eq!(snap_al.total_checkpoints, 1);
 
-        let snap_fs = telem.snapshot_for_backend(RecorderBackendKind::FrankenSqlite);
-        assert_eq!(snap_fs.total_checkpoints, 1);
+        let snap_sqlite = telem.snapshot_for_backend(RecorderBackendKind::Rusqlite);
+        assert_eq!(snap_sqlite.total_checkpoints, 1);
     }
 
     #[test]
@@ -2102,9 +2123,9 @@ mod tests {
     #[test]
     fn empty_backend_snapshot_is_clean() {
         let telem = StorageTelemetry::with_defaults();
-        // No operations recorded for FrankenSqlite
-        let snap = telem.snapshot_for_backend(RecorderBackendKind::FrankenSqlite);
-        assert_eq!(snap.backend_kind, Some(RecorderBackendKind::FrankenSqlite));
+        // No operations recorded for rusqlite.
+        let snap = telem.snapshot_for_backend(RecorderBackendKind::Rusqlite);
+        assert_eq!(snap.backend_kind, Some(RecorderBackendKind::Rusqlite));
         assert_eq!(snap.total_events_appended, 0);
         assert_eq!(snap.total_batches, 0);
         assert_eq!(snap.total_flushes, 0);

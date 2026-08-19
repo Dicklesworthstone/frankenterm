@@ -1824,37 +1824,32 @@ mod tests {
         ];
         let checker = InvariantChecker::new();
 
-        let report_al = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
-        let report_fs = checker.check_for_backend(&events, RecorderBackendKind::FrankenSqlite);
-
-        // Same number of violations
-        assert_eq!(report_al.violations.len(), report_fs.violations.len());
-        // Same pass/fail
-        assert_eq!(report_al.passed, report_fs.passed);
-        // Backend tag differs
-        assert_eq!(report_al.backend_kind, Some(RecorderBackendKind::AppendLog));
-        assert_eq!(
-            report_fs.backend_kind,
-            Some(RecorderBackendKind::FrankenSqlite)
-        );
+        let baseline = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
+        for backend in RecorderBackendKind::ALL {
+            let report = checker.check_for_backend(&events, backend);
+            assert_eq!(report.violations.len(), baseline.violations.len());
+            assert_eq!(report.passed, baseline.passed);
+            assert_eq!(report.backend_kind, Some(backend));
+        }
     }
 
     #[test]
     fn clock_invariant_backend_agnostic() {
-        // Clock regression detected the same way for both backends
+        // Clock regression is detected the same way for every backend identity.
         let events = vec![
             make_event("e1", 1, 0, 500, "a"),
             make_event("e2", 1, 1, 100, "b"), // clock regression
         ];
         let checker = InvariantChecker::new();
 
-        let report_al = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
-        let report_fs = checker.check_for_backend(&events, RecorderBackendKind::FrankenSqlite);
-
-        assert_eq!(
-            report_al.count_by_kind(ViolationKind::ClockRegression),
-            report_fs.count_by_kind(ViolationKind::ClockRegression),
-        );
+        let baseline = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
+        for backend in RecorderBackendKind::ALL {
+            let report = checker.check_for_backend(&events, backend);
+            assert_eq!(
+                report.count_by_kind(ViolationKind::ClockRegression),
+                baseline.count_by_kind(ViolationKind::ClockRegression),
+            );
+        }
     }
 
     #[test]
@@ -1876,17 +1871,14 @@ mod tests {
     }
 
     #[test]
-    fn sequence_regression_detected_both_backends() {
+    fn sequence_regression_detected_all_backends() {
         let events = vec![
             make_event("e1", 1, 5, 100, "a"),
             make_event("e2", 1, 3, 200, "b"), // regression: 5 → 3
         ];
         let checker = InvariantChecker::new();
 
-        for backend in [
-            RecorderBackendKind::AppendLog,
-            RecorderBackendKind::FrankenSqlite,
-        ] {
+        for backend in RecorderBackendKind::ALL {
             let report = checker.check_for_backend(&events, backend);
             assert!(!report.passed);
             assert!(
@@ -1898,17 +1890,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_event_id_detected_both_backends() {
+    fn duplicate_event_id_detected_all_backends() {
         let events = vec![
             make_event("dup", 1, 0, 100, "a"),
             make_event("dup", 2, 0, 200, "b"), // same event_id
         ];
         let checker = InvariantChecker::new();
 
-        for backend in [
-            RecorderBackendKind::AppendLog,
-            RecorderBackendKind::FrankenSqlite,
-        ] {
+        for backend in RecorderBackendKind::ALL {
             let report = checker.check_for_backend(&events, backend);
             assert!(report.count_by_kind(ViolationKind::DuplicateEventId) > 0);
             assert_eq!(report.backend_kind, Some(backend));
@@ -1925,23 +1914,21 @@ mod tests {
 
         let checker = InvariantChecker::new();
 
-        let report_al = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
-        let report_fs = checker.check_for_backend(&events, RecorderBackendKind::FrankenSqlite);
-
-        assert_eq!(
-            report_al.count_by_kind(ViolationKind::DanglingParentRef),
-            report_fs.count_by_kind(ViolationKind::DanglingParentRef),
-        );
+        let baseline = checker.check_for_backend(&events, RecorderBackendKind::AppendLog);
+        for backend in RecorderBackendKind::ALL {
+            let report = checker.check_for_backend(&events, backend);
+            assert_eq!(
+                report.count_by_kind(ViolationKind::DanglingParentRef),
+                baseline.count_by_kind(ViolationKind::DanglingParentRef),
+            );
+        }
     }
 
     #[test]
-    fn empty_events_passes_both_backends() {
+    fn empty_events_passes_all_backends() {
         let checker = InvariantChecker::new();
 
-        for backend in [
-            RecorderBackendKind::AppendLog,
-            RecorderBackendKind::FrankenSqlite,
-        ] {
+        for backend in RecorderBackendKind::ALL {
             let report = checker.check_for_backend(&[], backend);
             assert!(report.passed);
             assert_eq!(report.events_checked, 0);

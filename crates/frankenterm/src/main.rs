@@ -37014,7 +37014,6 @@ fn watcher_error_is_non_retryable(err: &anyhow::Error) -> bool {
 struct RecorderBackendStartupSelection {
     requested_backend: frankenterm_core::recorder_storage::RecorderBackendKind,
     selected_backend: frankenterm_core::recorder_storage::RecorderBackendKind,
-    fallback_reason: Option<String>,
 }
 
 fn recorder_append_log_storage_config(
@@ -37024,6 +37023,17 @@ fn recorder_append_log_storage_config(
     frankenterm_core::recorder_storage::AppendLogStorageConfig {
         data_path: layout.ft_dir.join("recorder-log").join("events.log"),
         state_path: layout.ft_dir.join("recorder-log").join("state.json"),
+        queue_capacity: (config.storage.writer_queue_size as usize).max(1),
+        ..Default::default()
+    }
+}
+
+fn recorder_rusqlite_storage_config(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
+) -> frankenterm_core::recorder_storage::RusqliteStorageConfig {
+    frankenterm_core::recorder_storage::RusqliteStorageConfig {
+        db_path: layout.ft_dir.join("recorder-log").join("events.sqlite3"),
         queue_capacity: (config.storage.writer_queue_size as usize).max(1),
         ..Default::default()
     }
@@ -37047,74 +37057,29 @@ fn recorder_startup_health_failure_reason(
 async fn bootstrap_recorder_backend_with_probe(
     requested_backend: frankenterm_core::recorder_storage::RecorderBackendKind,
     append_log: frankenterm_core::recorder_storage::AppendLogStorageConfig,
-) -> std::result::Result<
-    (
-        frankenterm_core::recorder_storage::RecorderStorageInstance,
-        Option<String>,
-    ),
-    anyhow::Error,
-> {
+    rusqlite: frankenterm_core::recorder_storage::RusqliteStorageConfig,
+) -> std::result::Result<frankenterm_core::recorder_storage::RecorderStorageInstance, anyhow::Error>
+{
     use anyhow::Context as _;
     use frankenterm_core::recorder_storage::{
-        RecorderBackendKind, RecorderStorage, RecorderStorageConfig, bootstrap_recorder_storage,
+        RecorderStorage, RecorderStorageConfig, bootstrap_recorder_storage,
     };
 
-    let make_config = |backend| RecorderStorageConfig {
-        backend,
-        append_log: append_log.clone(),
-        frankensqlite: Default::default(),
+    let recorder_config = RecorderStorageConfig {
+        backend: requested_backend,
+        append_log,
+        rusqlite,
     };
-    let attempt_bootstrap = |backend| bootstrap_recorder_storage(make_config(backend));
-
-    let mut fallback_reason: Option<String> = None;
-    let storage = match attempt_bootstrap(requested_backend) {
-        Ok(storage) => storage,
-        Err(err) if requested_backend == RecorderBackendKind::FrankenSqlite => {
-            let reason = format!("bootstrap_failed:{err}");
-            tracing::warn!(
-                backend = %requested_backend,
-                fallback = %RecorderBackendKind::AppendLog,
-                reason = %reason,
-                "Recorder backend unavailable at startup; falling back to append-log"
-            );
-            fallback_reason = Some(reason);
-            attempt_bootstrap(RecorderBackendKind::AppendLog)
-                .context("fallback append-log bootstrap failed")?
-        }
-        Err(err) => {
-            anyhow::bail!(
-                "non-retryable: failed to bootstrap recorder backend {}: {err}",
-                requested_backend
-            );
-        }
-    };
+    let storage = bootstrap_recorder_storage(recorder_config).map_err(|error| {
+        let detail = error.to_string();
+        anyhow::Error::new(error).context(format!(
+            "non-retryable: failed to bootstrap recorder backend {}: {detail}",
+            requested_backend
+        ))
+    })?;
 
     let health = storage.health().await;
     if let Some(reason) = recorder_startup_health_failure_reason(&health) {
-        if requested_backend == RecorderBackendKind::FrankenSqlite {
-            tracing::warn!(
-                backend = %requested_backend,
-                fallback = %RecorderBackendKind::AppendLog,
-                reason = %reason,
-                "Recorder backend startup health probe failed; falling back to append-log"
-            );
-            let fallback_storage = attempt_bootstrap(RecorderBackendKind::AppendLog)
-                .context("append-log fallback bootstrap failed after health-probe failure")?;
-            let fallback_health = fallback_storage.health().await;
-            if let Some(fallback_health_reason) =
-                recorder_startup_health_failure_reason(&fallback_health)
-            {
-                anyhow::bail!(
-                    "non-retryable: append-log fallback startup health probe failed: {fallback_health_reason}"
-                );
-            }
-            let existing = fallback_reason.take();
-            fallback_reason = Some(match existing {
-                Some(previous) => format!("{previous};health_probe_failed:{reason}"),
-                None => format!("health_probe_failed:{reason}"),
-            });
-            return Ok((fallback_storage, fallback_reason));
-        }
         anyhow::bail!(
             "non-retryable: recorder backend {} startup health probe failed: {}",
             requested_backend,
@@ -37122,7 +37087,7 @@ async fn bootstrap_recorder_backend_with_probe(
         );
     }
 
-    Ok((storage, fallback_reason))
+    Ok(storage)
 }
 
 fn recorder_backend_lifecycle_payload(
@@ -37141,12 +37106,6 @@ fn recorder_backend_lifecycle_payload(
         "migration_epoch".to_string(),
         serde_json::Value::String(RECORDER_BACKEND_MIGRATION_EPOCH.to_string()),
     );
-    if let Some(reason) = selection.fallback_reason.clone() {
-        payload.insert(
-            "fallback_reason".to_string(),
-            serde_json::Value::String(reason),
-        );
-    }
     serde_json::Value::Object(payload)
 }
 
@@ -40992,9 +40951,11 @@ async fn run_watcher(
     let storage_config = frankenterm_core::storage::StorageConfig::from(&config.storage);
     let requested_recorder_backend = config.storage.recorder_backend;
     let recorder_append_log_config = recorder_append_log_storage_config(layout, &config);
-    let (recorder_storage, recorder_fallback_reason) = bootstrap_recorder_backend_with_probe(
+    let recorder_rusqlite_config = recorder_rusqlite_storage_config(layout, &config);
+    let recorder_storage = bootstrap_recorder_backend_with_probe(
         requested_recorder_backend,
         recorder_append_log_config,
+        recorder_rusqlite_config,
     )
     .await?;
     let recorder_selected_backend = {
@@ -41004,15 +40965,10 @@ async fn run_watcher(
     let recorder_startup_selection = RecorderBackendStartupSelection {
         requested_backend: requested_recorder_backend,
         selected_backend: recorder_selected_backend,
-        fallback_reason: recorder_fallback_reason,
     };
     tracing::info!(
         requested_backend = %recorder_startup_selection.requested_backend,
         selected_backend = %recorder_startup_selection.selected_backend,
-        fallback_reason = %recorder_startup_selection
-            .fallback_reason
-            .as_deref()
-            .unwrap_or("none"),
         migration_epoch = RECORDER_BACKEND_MIGRATION_EPOCH,
         "Recorder backend startup selection resolved"
     );
@@ -86790,60 +86746,102 @@ reason = "overly conservative pending threshold"
     }
 
     #[test]
-    fn watcher_startup_frankensqlite_selected_via_config() {
-        let config = frankenterm_core::config::Config::from_toml_unvalidated(
+    fn watcher_startup_rusqlite_selected_via_config() {
+        let config = frankenterm_core::config::Config::from_toml(
             r#"
 [storage]
-recorder_backend = "frankensqlite"
+recorder_backend = "rusqlite"
 "#,
         )
         .expect("parse config");
 
         assert_eq!(
             config.storage.recorder_backend,
-            frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite
+            frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite
         );
     }
 
     #[test]
-    fn watcher_startup_frankensqlite_fallback_on_connection_failure() {
+    fn watcher_startup_frankensqlite_selection_fails_closed_without_side_effects() {
         run_async_test(async {
-            let temp_root = std::env::temp_dir().join(format!(
-                "ft_recorder_fallback_{}_{}",
-                std::process::id(),
-                now_ms()
-            ));
-            std::fs::create_dir_all(&temp_root).expect("create temp root");
+            let temp_root = tempfile::tempdir().expect("create recorder tempdir");
 
             let append_log = frankenterm_core::recorder_storage::AppendLogStorageConfig {
-                data_path: temp_root.join("recorder-log/events.log"),
-                state_path: temp_root.join("recorder-log/state.json"),
+                data_path: temp_root.path().join("append/events.log"),
+                state_path: temp_root.path().join("append/state.json"),
                 ..frankenterm_core::recorder_storage::AppendLogStorageConfig::default()
             };
+            let rusqlite = frankenterm_core::recorder_storage::RusqliteStorageConfig {
+                db_path: temp_root.path().join("rusqlite/recorder.sqlite3"),
+                ..frankenterm_core::recorder_storage::RusqliteStorageConfig::default()
+            };
+            let append_data_path = append_log.data_path.clone();
+            let rusqlite_db_path = rusqlite.db_path.clone();
 
-            let (storage, fallback_reason) = bootstrap_recorder_backend_with_probe(
+            let error = bootstrap_recorder_backend_with_probe(
                 frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
                 append_log,
+                rusqlite,
             )
             .await
-            .expect("fallback to append-log should succeed");
+            .unwrap_err();
+
+            assert!(error.to_string().contains("non-retryable"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("FrankenSQLite recorder integration is not wired")
+            );
+            assert!(matches!(
+                error.downcast_ref::<
+                    frankenterm_core::recorder_storage::RecorderStorageError,
+                >(),
+                Some(
+                    frankenterm_core::recorder_storage::RecorderStorageError::BackendSelection(
+                        selection
+                    )
+                ) if selection.requested()
+                    == frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite
+            ));
+            assert!(!append_data_path.exists());
+            assert!(!rusqlite_db_path.exists());
+        });
+    }
+
+    #[test]
+    fn watcher_startup_rusqlite_bootstrap_succeeds_without_fallback() {
+        run_async_test(async {
+            let temp_root = tempfile::tempdir().expect("create recorder tempdir");
+            let append_log = frankenterm_core::recorder_storage::AppendLogStorageConfig {
+                data_path: temp_root.path().join("append/events.log"),
+                state_path: temp_root.path().join("append/state.json"),
+                ..frankenterm_core::recorder_storage::AppendLogStorageConfig::default()
+            };
+            let rusqlite = frankenterm_core::recorder_storage::RusqliteStorageConfig {
+                db_path: temp_root.path().join("rusqlite/recorder.sqlite3"),
+                ..frankenterm_core::recorder_storage::RusqliteStorageConfig::default()
+            };
+
+            let storage = bootstrap_recorder_backend_with_probe(
+                frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite,
+                append_log,
+                rusqlite,
+            )
+            .await
+            .expect("rusqlite bootstrap should succeed");
 
             use frankenterm_core::recorder_storage::RecorderStorage as _;
             assert_eq!(
                 storage.backend_kind(),
-                frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog
+                frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite
             );
-            let reason = fallback_reason.expect("fallback reason should be present");
-            assert!(reason.contains("bootstrap_failed"));
-
-            let _ = std::fs::remove_dir_all(&temp_root);
         });
     }
 
     #[test]
     fn health_probe_passes_for_non_degraded_backend() {
         let health = frankenterm_core::recorder_storage::RecorderStorageHealth {
-            backend: frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
+            backend: frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite,
             degraded: false,
             queue_depth: 0,
             queue_capacity: 1,
@@ -86856,7 +86854,7 @@ recorder_backend = "frankensqlite"
     #[test]
     fn health_probe_fails_for_missing_tables_style_error() {
         let health = frankenterm_core::recorder_storage::RecorderStorageHealth {
-            backend: frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
+            backend: frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite,
             degraded: true,
             queue_depth: 0,
             queue_capacity: 1,
@@ -86872,19 +86870,14 @@ recorder_backend = "frankensqlite"
     #[test]
     fn lifecycle_marker_includes_backend_kind() {
         let selection = RecorderBackendStartupSelection {
-            requested_backend:
-                frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
-            selected_backend: frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog,
-            fallback_reason: Some("bootstrap_failed:dependency unavailable".to_string()),
+            requested_backend: frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite,
+            selected_backend: frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite,
         };
         let payload = recorder_backend_lifecycle_payload(&selection);
-        assert_eq!(payload["backend_kind"], "append_log");
-        assert_eq!(payload["requested_backend_kind"], "frankensqlite");
+        assert_eq!(payload["backend_kind"], "rusqlite");
+        assert_eq!(payload["requested_backend_kind"], "rusqlite");
         assert_eq!(payload["migration_epoch"], RECORDER_BACKEND_MIGRATION_EPOCH);
-        assert_eq!(
-            payload["fallback_reason"],
-            "bootstrap_failed:dependency unavailable"
-        );
+        assert!(payload.get("fallback_reason").is_none());
     }
 
     #[test]

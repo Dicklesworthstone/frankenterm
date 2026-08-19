@@ -25,9 +25,9 @@ use crate::tantivy_ingest::{
     AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, map_event_to_document,
 };
 use frankenterm_core::recorder_storage::{
-    CheckpointConsumerId, EventCursorError, FrankenSqliteEventReader, RecorderCheckpoint,
-    RecorderEventCursor, RecorderEventReader, RecorderOffset, RecorderSourceDescriptor,
-    RecorderStorage,
+    CheckpointConsumerId, EventCursorError, RecorderCheckpoint, RecorderEventCursor,
+    RecorderEventReader, RecorderOffset, RecorderSourceDescriptor, RecorderStorage,
+    RusqliteEventReader,
 };
 use frankenterm_core::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
 
@@ -53,13 +53,13 @@ fn create_event_reader(
             );
             Ok(Box::new(AppendLogEventSource::from_path(data_path.clone())))
         }
-        RecorderSourceDescriptor::FrankenSqlite { db_path } => {
+        RecorderSourceDescriptor::Rusqlite { db_path } => {
             tracing::debug!(
                 reindex_source = %source,
                 db_path = %db_path.display(),
-                "creating frankensqlite event reader for reindex"
+                "creating rusqlite event reader for reindex"
             );
-            Ok(Box::new(FrankenSqliteEventReader::new(db_path.clone())))
+            Ok(Box::new(RusqliteEventReader::new(db_path.clone())))
         }
     }
 }
@@ -4600,7 +4600,7 @@ mod tests {
     fn reindex_range_parity_across_backends() {
         run_async_test(async {
             // Tests that the same range produces identical documents from
-            // an AppendLog backend and an in-memory "FrankenSqlite-like" backend.
+            // an AppendLog backend and an in-memory alternate backend.
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
             let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -4640,7 +4640,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            // --- In-memory backend (simulating FrankenSqlite) ---
+            // --- In-memory alternate backend ---
             let mem_reader = InMemoryEventReader::from_events(&events);
             let mut cursor = mem_reader.open_cursor_at_ordinal(from.ordinal).unwrap();
 

@@ -7,8 +7,7 @@
 //! `RecorderStorageErrorClass`.
 //!
 //! Also covers Clone/Debug invariants, field preservation, JSON structure
-//! properties, binary (bincode) roundtrips, and cross-type serialization
-//! non-confusion.
+//! properties, and cross-type serialization non-confusion.
 
 use frankenterm_core::recorder_storage::{
     AppendResponse, CheckpointCommitOutcome, CheckpointConsumerId, DurabilityLevel, FlushMode,
@@ -24,6 +23,7 @@ use proptest::prelude::*;
 fn arb_backend_kind() -> impl Strategy<Value = RecorderBackendKind> {
     prop_oneof![
         Just(RecorderBackendKind::AppendLog),
+        Just(RecorderBackendKind::Rusqlite),
         Just(RecorderBackendKind::FrankenSqlite),
     ]
 }
@@ -92,6 +92,7 @@ proptest! {
         let json = serde_json::to_string(&kind).unwrap();
         let expected = match kind {
             RecorderBackendKind::AppendLog => "\"append_log\"",
+            RecorderBackendKind::Rusqlite => "\"rusqlite\"",
             RecorderBackendKind::FrankenSqlite => "\"frankensqlite\"",
         };
         prop_assert_eq!(&json, expected);
@@ -362,9 +363,13 @@ proptest! {
 
 #[test]
 fn all_backend_kinds_distinct_json() {
-    let a = serde_json::to_string(&RecorderBackendKind::AppendLog).unwrap();
-    let b = serde_json::to_string(&RecorderBackendKind::FrankenSqlite).unwrap();
-    assert_ne!(a, b);
+    let mut encoded = RecorderBackendKind::ALL
+        .into_iter()
+        .map(|backend| serde_json::to_string(&backend).unwrap())
+        .collect::<Vec<_>>();
+    encoded.sort();
+    encoded.dedup();
+    assert_eq!(encoded.len(), RecorderBackendKind::ALL.len());
 }
 
 #[test]

@@ -1449,6 +1449,9 @@ pub enum ConfigError {
     #[error("Failed to serialize config: {0}")]
     SerializeFailed(String),
 
+    #[error(transparent)]
+    RecorderBackendSelection(#[from] crate::recorder_storage::RecorderBackendSelectionError),
+
     #[error("Validation error: {0}")]
     ValidationError(String),
 }
@@ -1477,6 +1480,12 @@ impl ConfigError {
                     .command("Diagnostics", "ft doctor")
                     .alternative("Recreate the config from known-good defaults.")
             }
+            Self::RecorderBackendSelection(error) => Remediation::new(format!(
+                "Recorder backend {} is unavailable. Select an implemented recorder backend.",
+                error.requested()
+            ))
+            .command("Validate config", "ft config validate")
+            .alternative("Set storage.recorder_backend to \"append_log\" or \"rusqlite\"."),
             Self::ValidationError(_) => {
                 Remediation::new("Config validation failed. Fix the invalid fields and retry.")
                     .command("Diagnostics", "ft doctor")
@@ -1576,6 +1585,12 @@ mod tests {
             Error::Config(ConfigError::ParseError("parse".to_string())),
             Error::Config(ConfigError::ParseFailed("parse".to_string())),
             Error::Config(ConfigError::SerializeFailed("serialize".to_string())),
+            Error::Config(ConfigError::RecorderBackendSelection(
+                crate::recorder_storage::select_recorder_backend(
+                    crate::recorder_storage::RecorderBackendKind::FrankenSqlite,
+                )
+                .unwrap_err(),
+            )),
             Error::Config(ConfigError::ValidationError("invalid".to_string())),
             Error::Policy("denied".to_string()),
             Error::Io(std::io::Error::other("io")),
@@ -2134,6 +2149,16 @@ mod tests {
                 .contains("err")
         );
         assert!(
+            ConfigError::RecorderBackendSelection(
+                crate::recorder_storage::select_recorder_backend(
+                    crate::recorder_storage::RecorderBackendKind::FrankenSqlite,
+                )
+                .unwrap_err(),
+            )
+            .to_string()
+            .contains("frankensqlite")
+        );
+        assert!(
             ConfigError::ValidationError("invalid".to_string())
                 .to_string()
                 .contains("invalid")
@@ -2228,6 +2253,19 @@ mod tests {
         let r = ConfigError::ValidationError("bad field".to_string()).remediation();
         assert!(!r.summary.is_empty());
         assert!(!r.commands.is_empty());
+
+        let r = ConfigError::RecorderBackendSelection(
+            crate::recorder_storage::select_recorder_backend(
+                crate::recorder_storage::RecorderBackendKind::FrankenSqlite,
+            )
+            .unwrap_err(),
+        )
+        .remediation();
+        assert!(!r.summary.is_empty());
+        assert!(!r.commands.is_empty());
+        let rendered = r.render_plain();
+        assert!(rendered.contains("frankensqlite"));
+        assert!(rendered.contains("rusqlite"));
     }
 
     #[test]

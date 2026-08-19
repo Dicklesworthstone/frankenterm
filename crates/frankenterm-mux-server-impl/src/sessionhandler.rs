@@ -3925,6 +3925,21 @@ fn session_mux(authority: &SessionAuthority) -> anyhow::Result<CurrentSession> {
     authority.acquire().map_err(Into::into)
 }
 
+/// Map one exact mutation result without a racy window-registry re-read.
+fn map_window_mutation_error(
+    window_id: mux::window::WindowId,
+    operation: &'static str,
+    error: mux::WindowMutationError,
+) -> anyhow::Error {
+    if error.is_not_found() {
+        return u64::try_from(window_id).map_or_else(
+            |_| MuxServerRejection::invalid_request().into(),
+            |id| MuxServerRejection::window_not_found(id).into(),
+        );
+    }
+    anyhow::Error::new(error).context(format!("{operation} for window {window_id} failed"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ListPanesSnapshotStage {
     BeforeOrderedAuthorityRead,
@@ -6210,10 +6225,15 @@ impl SessionHandler {
                     catch(
                         move || {
                             let mux = session_mux(&authority)?;
-                            let mut window = mux
-                                .get_window_mut(window_id)
-                                .ok_or_else(|| anyhow!("window {} is invalid", window_id))?;
-                            window.set_workspace(&workspace);
+                            mux.mux()
+                                .set_window_workspace(window_id, &workspace)
+                                .map_err(|error| {
+                                    map_window_mutation_error(
+                                        window_id,
+                                        "set workspace",
+                                        error,
+                                    )
+                                })?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -6469,7 +6489,8 @@ impl SessionHandler {
                     catch(
                         move || {
                             let mux = session_mux(&authority)?;
-                            mux.rename_workspace(&old_workspace, &new_workspace);
+                            mux.mux()
+                                .rename_workspace(&old_workspace, &new_workspace)?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -7300,12 +7321,9 @@ impl SessionHandler {
                     catch(
                         move || {
                             let mux = session_mux(&authority)?;
-                            if mux.get_window(window_id).is_none() {
-                                let id = u64::try_from(window_id)
-                                    .map_err(|_| MuxServerRejection::invalid_request())?;
-                                return Err(MuxServerRejection::window_not_found(id).into());
-                            }
-                            mux.set_window_title(window_id, &title);
+                            mux.set_window_title(window_id, &title).map_err(|error| {
+                                map_window_mutation_error(window_id, "set title", error)
+                            })?;
 
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
@@ -9026,6 +9044,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn window_mutation_error_mapping_uses_single_typed_result() {
+        let missing = map_window_mutation_error(
+            73,
+            "set title",
+            mux::WindowMutationError::NotFound { window_id: 73 },
+        );
+        let rejection = missing
+            .downcast_ref::<MuxServerRejection>()
+            .expect("typed missing-window result maps directly to finite rejection");
+        assert_eq!(rejection.code, MuxErrorCode::WINDOW_NOT_FOUND);
+        assert_eq!(
+            rejection.object,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::WINDOW,
+                id: 73,
+            })
+        );
+
+        let invariant = map_window_mutation_error(
+            74,
+            "set workspace",
+            mux::WindowMutationError::Invariant {
+                window_id: 74,
+                source: anyhow!("planted pane-count mismatch"),
+            },
+        );
+        let rendered = format!("{invariant:#}");
+        assert!(rendered.contains("set workspace for window 74 failed"));
+        assert!(rendered.contains("planted pane-count mismatch"));
+        assert!(!rendered.contains("window 74 is invalid"));
+        assert!(invariant.downcast_ref::<MuxServerRejection>().is_none());
+    }
+
     struct NoSleepSnapshotBarrier {
         collector_arrived: Barrier,
         mutation_finished: Barrier,
@@ -9890,6 +9942,7 @@ mod tests {
             drop(window);
             assert!(
                 mux.set_window_title(window_id, &format!("empty-window-fairness-{window_index}"))
+                    .expect("set empty-window snapshot title")
             );
         }
 
@@ -11503,7 +11556,7 @@ mod tests {
 
             let mux = weak_mux.upgrade().expect("test mux remains live");
             assert!(
-                mux.try_get_window_mut(window_id).is_some(),
+                mux.try_window_exclusive_access(window_id),
                 "ListPanes must release the enclosing mux window read guard \
                  before invoking Pane callbacks",
             );
@@ -11656,8 +11709,14 @@ mod tests {
         let second_tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_502, None)));
         let first_window_id = attach_snapshot_tab_to_new_window(&mux, &first_tab);
         let second_window_id = attach_snapshot_tab_to_new_window(&mux, &second_tab);
-        assert!(mux.set_window_title(first_window_id, "first-ordered-window"));
-        assert!(mux.set_window_title(second_window_id, "second-ordered-window"));
+        assert!(
+            mux.set_window_title(first_window_id, "first-ordered-window")
+                .expect("set first ordered-window title")
+        );
+        assert!(
+            mux.set_window_title(second_window_id, "second-ordered-window")
+                .expect("set second ordered-window title")
+        );
 
         let snapshot = expect_current_ordered_snapshot(
             &mux,
@@ -12628,7 +12687,10 @@ mod tests {
             Arc::new(FakePane::new_with_callback_probe(7_301, probe)),
         );
         let window_id = attach_snapshot_tab_to_new_window(&mux, &tab);
-        assert!(mux.set_window_title(window_id, "before-pane-callback-cut"));
+        assert!(
+            mux.set_window_title(window_id, "before-pane-callback-cut")
+                .expect("set title before pane-callback cut")
+        );
         let barrier_for_mutator = Arc::clone(&barrier);
         let mux_for_mutator = Arc::clone(&mux);
         let mutator = thread::spawn(move || {
@@ -12649,7 +12711,8 @@ mod tests {
         armed.store(0, Ordering::Release);
         let title_changed = mutator
             .join()
-            .expect("pane-callback mutator must finish without panic");
+            .expect("pane-callback mutator must finish without panic")
+            .expect("pane-callback title mutation must commit");
         assert!(title_changed, "the pane callback cut must mutate topology");
         let snapshot = expect_current_coherent_snapshot(
             &mux,
@@ -12677,7 +12740,10 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let tab = register_snapshot_tab(&mux, Arc::new(FakePane::new_with_id(7_401, None)));
         let window_id = attach_snapshot_tab_to_new_window(&mux, &tab);
-        assert!(mux.set_window_title(window_id, "before-title-capture-cut"));
+        assert!(
+            mux.set_window_title(window_id, "before-title-capture-cut")
+                .expect("set title before title-capture cut")
+        );
         let barrier = NoSleepSnapshotBarrier::shared();
         let barrier_for_mutator = Arc::clone(&barrier);
         let mux_for_mutator = Arc::clone(&mux);
@@ -12699,7 +12765,8 @@ mod tests {
         ));
         let title_changed = mutator
             .join()
-            .expect("title-capture mutator must finish without panic");
+            .expect("title-capture mutator must finish without panic")
+            .expect("title-capture mutation must commit");
         assert!(title_changed, "the title capture cut must mutate topology");
         let snapshot = expect_current_coherent_snapshot(
             &mux,
@@ -12831,9 +12898,11 @@ mod tests {
         let window_id = mux.iter_windows()[0];
         mux.add_tab_and_active_pane(&second).unwrap();
         mux.add_tab_to_window(&second, window_id).unwrap();
-        mux.get_window_mut(window_id)
-            .unwrap()
-            .create_tab_stack(mux::tab::TabStackId(7), vec![first_id, second_id])
+        mux.create_window_tab_stack(
+            window_id,
+            mux::tab::TabStackId(7),
+            vec![first_id, second_id],
+        )
             .unwrap();
 
         let (sender, captured) = capturing_sender();

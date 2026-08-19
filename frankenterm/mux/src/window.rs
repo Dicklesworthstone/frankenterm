@@ -273,6 +273,17 @@ impl Window {
         &self.workspace
     }
 
+    /// Whether this value is the exact window allocation published under
+    /// `expected_id` by `mux`.
+    ///
+    /// The window registry is keyed separately from the value, so mutation
+    /// transactions validate both halves before committing. This catches a
+    /// corrupted or test-planted same-key replacement instead of allowing it
+    /// to borrow the displaced window's workspace authority.
+    pub(crate) fn has_exact_mux_identity(&self, mux: &Mux, expected_id: WindowId) -> bool {
+        self.id == expected_id && std::ptr::eq(self.owner.as_ptr(), mux as *const Mux)
+    }
+
     pub fn set_title(&mut self, title: &str) {
         if self.set_title_without_notify(title) {
             self.notify(MuxNotification::WindowTitleChanged {
@@ -290,19 +301,23 @@ impl Window {
         true
     }
 
+    /// Install an allocation-prepared title without publishing a second
+    /// notification. Mux-owned title changes reserve their exact topology
+    /// event before calling this commit primitive.
+    pub(crate) fn replace_title_without_notify(&mut self, title: String) -> String {
+        std::mem::replace(&mut self.title, title)
+    }
+
     pub fn get_title(&self) -> &str {
         &self.title
     }
 
-    pub fn set_workspace(&mut self, workspace: &str) {
-        if workspace == self.workspace {
-            return;
-        }
-        self.workspace = workspace.to_string();
-        self.notify(MuxNotification::WindowWorkspaceChanged {
-            window_id: self.id,
-            workspace: self.workspace.clone(),
-        });
+    /// Install an allocation-prepared workspace without publishing a second
+    /// notification. Only the mux workspace transaction may call this in
+    /// production; it updates the derived pane-count cache and queues the
+    /// exact revision-stamped event in the same lock cut.
+    pub(crate) fn replace_workspace_without_notify(&mut self, workspace: String) -> String {
+        std::mem::replace(&mut self.workspace, workspace)
     }
 
     pub fn window_id(&self) -> WindowId {

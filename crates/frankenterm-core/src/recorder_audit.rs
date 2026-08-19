@@ -2051,10 +2051,7 @@ mod tests {
         // Tamper: modify the second entry's body
         entries[1].justification = Some("tampered".to_string());
 
-        for backend in [
-            RecorderBackendKind::AppendLog,
-            RecorderBackendKind::FrankenSqlite,
-        ] {
+        for backend in RecorderBackendKind::ALL {
             let result = AuditLog::verify_chain_for_backend(&entries, GENESIS_HASH, backend);
             assert!(
                 !result.chain_intact,
@@ -2070,10 +2067,7 @@ mod tests {
     #[test]
     fn audit_access_tier_enforcement_backend_agnostic() {
         // Access tier logic is independent of storage backend
-        for backend in [
-            RecorderBackendKind::AppendLog,
-            RecorderBackendKind::FrankenSqlite,
-        ] {
+        for backend in RecorderBackendKind::ALL {
             assert!(
                 AccessTier::A3PrivilegedRaw.satisfies(AccessTier::A2FullQuery),
                 "A3 should satisfy A2 regardless of backend {:?}",
@@ -2097,11 +2091,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_chain_empty_entries_both_backends() {
-        for backend in [
-            RecorderBackendKind::AppendLog,
-            RecorderBackendKind::FrankenSqlite,
-        ] {
+    fn audit_chain_empty_entries_all_backends() {
+        for backend in RecorderBackendKind::ALL {
             let result = AuditLog::verify_chain_for_backend(&[], GENESIS_HASH, backend);
             assert!(result.chain_intact);
             assert_eq!(result.total_entries, 0);
@@ -2150,7 +2141,8 @@ mod tests {
         // and does NOT depend on RecorderStorage for its integrity.
         // This test documents the ownership boundary:
         // - AuditLog: owns chain integrity (hash chain, ordinal continuity)
-        // - RecorderStorage: owns event persistence (append_log or frankensqlite)
+        // - RecorderStorage: owns event persistence (append_log or rusqlite;
+        //   frankensqlite remains a reserved, unavailable selector)
         let log = AuditLog::new(AuditLogConfig::default());
         let actor = ActorIdentity::new(ActorKind::Human, "operator");
         log.append(AuditEventBuilder::new(

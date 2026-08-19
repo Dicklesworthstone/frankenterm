@@ -2227,6 +2227,16 @@ pub(crate) fn compile_retention_policy_tiers(
 }
 
 impl StorageConfig {
+    /// Resolve the configured recorder backend without performing any I/O.
+    pub fn recorder_backend_selection(
+        &self,
+    ) -> Result<
+        crate::recorder_storage::RecorderBackendSelection,
+        crate::recorder_storage::RecorderBackendSelectionError,
+    > {
+        crate::recorder_storage::select_recorder_backend(self.recorder_backend)
+    }
+
     /// Resolve the retention period (in days) for an event based on tier rules.
     ///
     /// Tiers are evaluated in order; the first match wins. If no tier matches,
@@ -2245,12 +2255,8 @@ impl StorageConfig {
             return Err("storage.writer_queue_size must be >= 1".to_string());
         }
 
-        if self.recorder_backend == crate::recorder_storage::RecorderBackendKind::FrankenSqlite {
-            return Err(
-                "storage.recorder_backend=frankensqlite is not yet implemented; use append_log"
-                    .to_string(),
-            );
-        }
+        self.recorder_backend_selection()
+            .map_err(|error| error.to_string())?;
 
         // br-ft-at5kq: reject db_path that can redirect runtime state
         // outside the workspace .ft directory. The env var override is
@@ -5712,8 +5718,21 @@ impl Config {
         }
     }
 
+    /// Resolve the configured recorder backend without performing any I/O.
+    pub fn recorder_backend_selection(
+        &self,
+    ) -> Result<
+        crate::recorder_storage::RecorderBackendSelection,
+        crate::recorder_storage::RecorderBackendSelectionError,
+    > {
+        self.storage.recorder_backend_selection()
+    }
+
     /// Validate semantic constraints
     pub fn validate(&self) -> crate::Result<()> {
+        self.recorder_backend_selection()
+            .map_err(crate::error::ConfigError::RecorderBackendSelection)?;
+
         if self.ingest.min_poll_interval_ms == 0 {
             return Err(crate::error::ConfigError::ValidationError(
                 "ingest.min_poll_interval_ms must be >= 1".to_string(),
@@ -8885,41 +8904,84 @@ log_level = "debug"
     }
 
     #[test]
-    fn storage_recorder_backend_toml_rejects_frankensqlite_and_legacy_alias() {
+    fn storage_recorder_backend_toml_accepts_rusqlite() {
+        let config = Config::from_toml(
+            r#"
+[storage]
+recorder_backend = "rusqlite"
+"#,
+        )
+        .expect("rusqlite backend should parse and validate");
+        assert_eq!(
+            config.storage.recorder_backend,
+            crate::recorder_storage::RecorderBackendKind::Rusqlite
+        );
+        assert_eq!(
+            config.recorder_backend_selection().unwrap(),
+            crate::recorder_storage::RecorderBackendSelection::Rusqlite
+        );
+    }
+
+    #[test]
+    fn storage_recorder_backend_toml_rejects_frankensqlite_through_shared_selector() {
         // The not-yet-implemented backend is still deserializable so config
         // inspection can report it precisely, but the validated production
         // path must reject it.
-        let err = Config::from_toml_unvalidated(
+        let mut config = Config::from_toml_unvalidated(
             r#"
 [storage]
 recorder_backend = "frankensqlite"
 "#,
         )
-        .expect("frankensqlite backend parses")
-        .validate()
-        .unwrap_err()
-        .to_string();
+        .expect("frankensqlite backend parses");
+        let temp = tempfile::tempdir().expect("create config validation tempdir");
+        let sentinel_path = temp.path().join("must-not-be-mutated.sqlite3");
+        let sentinel = b"config-validation-sentinel";
+        std::fs::write(&sentinel_path, sentinel).expect("write sentinel");
+        config.storage.db_path = sentinel_path.to_string_lossy().into_owned();
+        let config_selection_error = config.recorder_backend_selection().unwrap_err();
+        let direct_selection_error = crate::recorder_storage::select_recorder_backend(
+            crate::recorder_storage::RecorderBackendKind::FrankenSqlite,
+        )
+        .unwrap_err();
+        assert_eq!(config_selection_error, direct_selection_error);
+
+        let validation_error = config.validate().unwrap_err();
+        let crate::Error::Config(crate::error::ConfigError::RecorderBackendSelection(
+            typed_validation_error,
+        )) = &validation_error
+        else {
+            panic!("unexpected validation error: {validation_error}");
+        };
+        assert_eq!(*typed_validation_error, config_selection_error);
+        let err = validation_error.to_string();
         assert!(
-            err.contains("frankensqlite is not yet implemented"),
+            err.contains(&config_selection_error.to_string()),
             "unexpected error: {err}"
         );
-        assert!(err.contains("append_log"), "unexpected error: {err}");
+        assert!(err.contains("rusqlite"), "unexpected error: {err}");
+        let after = std::fs::read(&sentinel_path).expect("read sentinel after validation");
+        assert_eq!(after.as_slice(), sentinel);
+    }
 
+    #[test]
+    fn storage_recorder_backend_toml_rejects_legacy_alias_at_parse_time() {
         let legacy = Config::from_toml_unvalidated(
             r#"
 [storage]
 recorder_backend = "franken_sqlite"
 "#,
         )
-        .expect("legacy franken_sqlite alias parses")
-        .validate()
         .unwrap_err()
         .to_string();
         assert!(
-            legacy.contains("frankensqlite is not yet implemented"),
+            legacy.contains("unknown variant"),
             "unexpected error: {legacy}"
         );
-        assert!(legacy.contains("append_log"), "unexpected error: {legacy}");
+        assert!(
+            legacy.contains("frankensqlite"),
+            "unexpected error: {legacy}"
+        );
     }
 
     #[test]

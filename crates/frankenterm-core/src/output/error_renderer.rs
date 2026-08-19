@@ -102,7 +102,9 @@ impl ErrorRenderer {
                 ConfigError::ReadFailed(_, _) => "FT-7002",
                 ConfigError::ParseError(_) | ConfigError::ParseFailed(_) => "FT-7003",
                 ConfigError::SerializeFailed(_) => "FT-7004",
-                ConfigError::ValidationError(_) => "FT-7010",
+                ConfigError::RecorderBackendSelection(_) | ConfigError::ValidationError(_) => {
+                    "FT-7010"
+                }
             },
             Error::Policy(_) => "FT-4001",
             Error::Io(_) => "FT-9002",
@@ -830,6 +832,15 @@ mod tests {
         );
         assert_eq!(
             ErrorRenderer::error_code(&Error::Config(ConfigError::ValidationError("v".into()))),
+            "FT-7010"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Config(ConfigError::RecorderBackendSelection(
+                crate::recorder_storage::select_recorder_backend(
+                    crate::recorder_storage::RecorderBackendKind::FrankenSqlite,
+                )
+                .unwrap_err(),
+            ),)),
             "FT-7010"
         );
     }

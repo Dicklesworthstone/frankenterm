@@ -757,6 +757,7 @@ impl MigrationEngine {
         cx.checkpoint().map_err(|err| {
             MigrationError::TargetWriteError(format!("m5_cutover cancelled pre-start: {err}"))
         })?;
+        let target_backend = target.backend_kind();
 
         let marker_event = RecorderEvent {
             schema_version: "ft.recorder.event.v1".to_string(),
@@ -778,7 +779,8 @@ impl MigrationEngine {
                 lifecycle_phase: RecorderLifecyclePhase::CaptureStarted,
                 reason: Some("migration_complete".to_string()),
                 details: serde_json::json!({
-                    "migration_type": "append_log_to_frankensqlite",
+                    "migration_type": format!("append_log_to_{target_backend}"),
+                    "target_backend": target_backend,
                     "event_count": manifest.event_count,
                     "export_digest": format!("{:#x}", manifest.export_digest),
                     "epoch_ms": epoch_ms,
@@ -820,7 +822,7 @@ impl MigrationEngine {
         }
 
         let result = CutoverResult {
-            activated_backend: RecorderBackendKind::FrankenSqlite,
+            activated_backend: target_backend,
             migration_epoch_ms: epoch_ms,
             target_healthy: !health.degraded,
             source_retained_path: source_path,
@@ -829,7 +831,7 @@ impl MigrationEngine {
         info!(
             migration_stage = "M5",
             activated = true,
-            backend = "frankensqlite",
+            backend = %target_backend,
             epoch = %epoch_ms,
             healthy = result.target_healthy,
             "cutover complete (cx)"
@@ -1096,7 +1098,7 @@ mod tests {
         fn healthy() -> Self {
             Self {
                 health: RecorderStorageHealth {
-                    backend: RecorderBackendKind::FrankenSqlite,
+                    backend: RecorderBackendKind::Rusqlite,
                     degraded: false,
                     queue_depth: 0,
                     queue_capacity: 100,
@@ -2469,7 +2471,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(result.activated_backend, RecorderBackendKind::FrankenSqlite);
+            assert_eq!(result.activated_backend, RecorderBackendKind::Rusqlite);
             assert_eq!(result.migration_epoch_ms, 1708000000);
             assert!(result.target_healthy);
             assert!(result.source_retained_path.is_none());
@@ -2555,8 +2557,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Activation result always indicates FrankenSqlite
-            assert_eq!(result.activated_backend, RecorderBackendKind::FrankenSqlite);
+            // Activation result reports the actual target backend.
+            assert_eq!(result.activated_backend, RecorderBackendKind::Rusqlite);
         });
     }
 
@@ -2620,7 +2622,7 @@ mod tests {
     #[test]
     fn test_cutover_result_serialize_roundtrip() {
         let result = CutoverResult {
-            activated_backend: RecorderBackendKind::FrankenSqlite,
+            activated_backend: RecorderBackendKind::Rusqlite,
             migration_epoch_ms: 1708000000,
             target_healthy: true,
             source_retained_path: Some("/data/events.log".to_string()),

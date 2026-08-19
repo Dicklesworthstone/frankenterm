@@ -1,4 +1,4 @@
-//! Recorder storage abstraction and append-log backend.
+//! Recorder storage abstraction with append-log and rusqlite backends.
 //!
 //! This module implements the `wa-oegrb.3.2` hot-path baseline:
 //! - append-only batched writes with deterministic offsets
@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize, de::Error as _};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::runtime_async::Mutex;
@@ -33,38 +33,80 @@ use crate::runtime_async::Mutex;
 use crate::recording::RecorderEvent;
 
 /// Stable backend identity for recorder storage implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecorderBackendKind {
     /// Local append-only log backend.
     AppendLog,
-    /// FrankenSQLite-backed backend (implemented in a follow-on bead).
-    #[serde(rename = "frankensqlite", alias = "franken_sqlite")]
+    /// Recorder database implemented with the `rusqlite` crate.
+    Rusqlite,
+    /// Reserved for a future recorder backend implemented with FrankenSQLite.
+    #[serde(rename = "frankensqlite")]
     FrankenSqlite,
 }
 
-impl<'de> Deserialize<'de> for RecorderBackendKind {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        match String::deserialize(deserializer)?.as_str() {
-            "append_log" => Ok(Self::AppendLog),
-            "frankensqlite" | "franken_sqlite" => Ok(Self::FrankenSqlite),
-            other => Err(D::Error::unknown_variant(
-                other,
-                &["append_log", "frankensqlite"],
-            )),
-        }
-    }
+impl RecorderBackendKind {
+    /// Every stable recorder backend identity, including reserved selectors.
+    pub const ALL: [Self; 3] = [Self::AppendLog, Self::Rusqlite, Self::FrankenSqlite];
 }
 
 impl std::fmt::Display for RecorderBackendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AppendLog => write!(f, "append_log"),
+            Self::Rusqlite => write!(f, "rusqlite"),
             Self::FrankenSqlite => write!(f, "frankensqlite"),
         }
+    }
+}
+
+/// A recorder backend that is implemented and safe to construct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderBackendSelection {
+    /// Local append-only log backend.
+    AppendLog,
+    /// Recorder database implemented with the `rusqlite` crate.
+    Rusqlite,
+}
+
+impl RecorderBackendSelection {
+    /// Return the public backend identity represented by this selection.
+    #[must_use]
+    pub const fn backend_kind(self) -> RecorderBackendKind {
+        match self {
+            Self::AppendLog => RecorderBackendKind::AppendLog,
+            Self::Rusqlite => RecorderBackendKind::Rusqlite,
+        }
+    }
+}
+
+/// Typed rejection returned when a requested recorder backend is not wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "recorder backend {requested} is unavailable: FrankenSQLite recorder integration is not wired; use append_log or rusqlite"
+)]
+pub struct RecorderBackendSelectionError {
+    requested: RecorderBackendKind,
+}
+
+impl RecorderBackendSelectionError {
+    /// Return the backend identity that was rejected.
+    #[must_use]
+    pub const fn requested(self) -> RecorderBackendKind {
+        self.requested
+    }
+}
+
+/// Resolve a public recorder selector to an implemented backend.
+///
+/// Callers must invoke this before performing filesystem or database work.
+pub fn select_recorder_backend(
+    requested: RecorderBackendKind,
+) -> std::result::Result<RecorderBackendSelection, RecorderBackendSelectionError> {
+    match requested {
+        RecorderBackendKind::AppendLog => Ok(RecorderBackendSelection::AppendLog),
+        RecorderBackendKind::Rusqlite => Ok(RecorderBackendSelection::Rusqlite),
+        RecorderBackendKind::FrankenSqlite => Err(RecorderBackendSelectionError { requested }),
     }
 }
 
@@ -80,8 +122,8 @@ pub enum RecorderSourceDescriptor {
         /// Path to the append-log data file.
         data_path: PathBuf,
     },
-    /// FrankenSqlite database backend.
-    FrankenSqlite {
+    /// Rusqlite database backend.
+    Rusqlite {
         /// Path to the SQLite database file.
         db_path: PathBuf,
     },
@@ -93,8 +135,8 @@ impl std::fmt::Display for RecorderSourceDescriptor {
             Self::AppendLog { data_path } => {
                 write!(f, "append_log({})", data_path.display())
             }
-            Self::FrankenSqlite { db_path } => {
-                write!(f, "frankensqlite({})", db_path.display())
+            Self::Rusqlite { db_path } => {
+                write!(f, "rusqlite({})", db_path.display())
             }
         }
     }
@@ -105,7 +147,7 @@ impl RecorderSourceDescriptor {
     pub fn backend_kind(&self) -> RecorderBackendKind {
         match self {
             Self::AppendLog { .. } => RecorderBackendKind::AppendLog,
-            Self::FrankenSqlite { .. } => RecorderBackendKind::FrankenSqlite,
+            Self::Rusqlite { .. } => RecorderBackendKind::Rusqlite,
         }
     }
 }
@@ -275,6 +317,15 @@ pub enum RecorderStorageError {
     #[error("corrupt append-log record at offset={offset}: {reason}")]
     CorruptRecord { offset: u64, reason: String },
 
+    #[error(
+        "corrupt cached response for batch {batch_id}: expected backend {expected_backend}, found {actual_backend}"
+    )]
+    CorruptCachedResponse {
+        batch_id: String,
+        expected_backend: RecorderBackendKind,
+        actual_backend: RecorderBackendKind,
+    },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -283,6 +334,9 @@ pub enum RecorderStorageError {
 
     #[error("SQLite error: {0}")]
     Sqlite(String),
+
+    #[error(transparent)]
+    BackendSelection(#[from] RecorderBackendSelectionError),
 
     #[error("backend {backend} unavailable: {message}")]
     BackendUnavailable {
@@ -300,11 +354,15 @@ impl RecorderStorageError {
             Self::InvalidRequest { .. } | Self::CheckpointRegression { .. } => {
                 RecorderStorageErrorClass::TerminalData
             }
-            Self::CorruptRecord { .. } => RecorderStorageErrorClass::Corruption,
+            Self::CorruptRecord { .. } | Self::CorruptCachedResponse { .. } => {
+                RecorderStorageErrorClass::Corruption
+            }
             Self::Io(_) => RecorderStorageErrorClass::Retryable,
             Self::Json(_) => RecorderStorageErrorClass::TerminalData,
             Self::Sqlite(_) => RecorderStorageErrorClass::Retryable,
-            Self::BackendUnavailable { .. } => RecorderStorageErrorClass::DependencyUnavailable,
+            Self::BackendSelection(_) | Self::BackendUnavailable { .. } => {
+                RecorderStorageErrorClass::DependencyUnavailable
+            }
         }
     }
 }
@@ -416,7 +474,7 @@ pub trait RecorderStorage: Send + Sync {
         if cx.checkpoint().is_err() {
             return RecorderStorageHealth {
                 // Preserve the probed backend in degraded snapshots so
-                // operators can distinguish a cancelled Frankensqlite
+                // operators can distinguish a cancelled database-backend
                 // probe from a healthy append-log selection.
                 backend: self.backend_kind(),
                 degraded: true,
@@ -507,10 +565,10 @@ impl Default for AppendLogStorageConfig {
     }
 }
 
-/// FrankenSqlite recorder backend configuration.
+/// Rusqlite recorder backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct FrankenSqliteStorageConfig {
+pub struct RusqliteStorageConfig {
     /// Path to the recorder SQLite database.
     pub db_path: PathBuf,
     /// Maximum concurrent append calls admitted.
@@ -523,7 +581,7 @@ pub struct FrankenSqliteStorageConfig {
     pub max_idempotency_entries: usize,
 }
 
-impl FrankenSqliteStorageConfig {
+impl RusqliteStorageConfig {
     /// Validate config for runtime safety.
     pub fn validate(&self) -> std::result::Result<(), RecorderStorageError> {
         if self.queue_capacity == 0 {
@@ -550,7 +608,7 @@ impl FrankenSqliteStorageConfig {
     }
 }
 
-impl Default for FrankenSqliteStorageConfig {
+impl Default for RusqliteStorageConfig {
     fn default() -> Self {
         Self {
             db_path: PathBuf::from(".ft/recorder-log/events.sqlite3"),
@@ -564,14 +622,23 @@ impl Default for FrankenSqliteStorageConfig {
 
 /// Startup-time recorder storage selector/config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RecorderStorageConfig {
     /// Requested backend kind for recorder writes.
     pub backend: RecorderBackendKind,
     /// Append-log backend settings.
     pub append_log: AppendLogStorageConfig,
-    /// FrankenSqlite backend settings.
-    pub frankensqlite: FrankenSqliteStorageConfig,
+    /// Rusqlite backend settings.
+    pub rusqlite: RusqliteStorageConfig,
+}
+
+impl RecorderStorageConfig {
+    /// Resolve the requested backend without performing any I/O.
+    pub fn select_backend(
+        &self,
+    ) -> std::result::Result<RecorderBackendSelection, RecorderBackendSelectionError> {
+        select_recorder_backend(self.backend)
+    }
 }
 
 impl Default for RecorderStorageConfig {
@@ -579,7 +646,7 @@ impl Default for RecorderStorageConfig {
         Self {
             backend: RecorderBackendKind::AppendLog,
             append_log: AppendLogStorageConfig::default(),
-            frankensqlite: FrankenSqliteStorageConfig::default(),
+            rusqlite: RusqliteStorageConfig::default(),
         }
     }
 }
@@ -588,21 +655,21 @@ impl Default for RecorderStorageConfig {
 #[derive(Debug)]
 pub enum RecorderStorageInstance {
     AppendLog(AppendLogRecorderStorage),
-    FrankenSqlite(FrankenSqliteRecorderStorage),
+    Rusqlite(RusqliteRecorderStorage),
 }
 
 impl RecorderStorage for RecorderStorageInstance {
     fn backend_kind(&self) -> RecorderBackendKind {
         match self {
             Self::AppendLog(inner) => inner.backend_kind(),
-            Self::FrankenSqlite(inner) => inner.backend_kind(),
+            Self::Rusqlite(inner) => inner.backend_kind(),
         }
     }
 
     fn append_log_data_path(&self) -> Option<&Path> {
         match self {
             Self::AppendLog(inner) => inner.append_log_data_path(),
-            Self::FrankenSqlite(inner) => inner.append_log_data_path(),
+            Self::Rusqlite(inner) => inner.append_log_data_path(),
         }
     }
 
@@ -612,7 +679,7 @@ impl RecorderStorage for RecorderStorageInstance {
     ) -> std::result::Result<AppendResponse, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.append_batch(req).await,
-            Self::FrankenSqlite(inner) => inner.append_batch(req).await,
+            Self::Rusqlite(inner) => inner.append_batch(req).await,
         }
     }
 
@@ -622,7 +689,7 @@ impl RecorderStorage for RecorderStorageInstance {
     ) -> std::result::Result<FlushStats, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.flush(mode).await,
-            Self::FrankenSqlite(inner) => inner.flush(mode).await,
+            Self::Rusqlite(inner) => inner.flush(mode).await,
         }
     }
 
@@ -632,7 +699,7 @@ impl RecorderStorage for RecorderStorageInstance {
     ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.read_checkpoint(consumer).await,
-            Self::FrankenSqlite(inner) => inner.read_checkpoint(consumer).await,
+            Self::Rusqlite(inner) => inner.read_checkpoint(consumer).await,
         }
     }
 
@@ -642,21 +709,21 @@ impl RecorderStorage for RecorderStorageInstance {
     ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.commit_checkpoint(checkpoint).await,
-            Self::FrankenSqlite(inner) => inner.commit_checkpoint(checkpoint).await,
+            Self::Rusqlite(inner) => inner.commit_checkpoint(checkpoint).await,
         }
     }
 
     async fn health(&self) -> RecorderStorageHealth {
         match self {
             Self::AppendLog(inner) => inner.health().await,
-            Self::FrankenSqlite(inner) => inner.health().await,
+            Self::Rusqlite(inner) => inner.health().await,
         }
     }
 
     async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
         match self {
             Self::AppendLog(inner) => inner.lag_metrics().await,
-            Self::FrankenSqlite(inner) => inner.lag_metrics().await,
+            Self::Rusqlite(inner) => inner.lag_metrics().await,
         }
     }
 }
@@ -665,8 +732,9 @@ impl RecorderStorage for RecorderStorageInstance {
 pub fn bootstrap_recorder_storage(
     config: RecorderStorageConfig,
 ) -> std::result::Result<RecorderStorageInstance, RecorderStorageError> {
-    match config.backend {
-        RecorderBackendKind::AppendLog => {
+    let selection = config.select_backend()?;
+    match selection {
+        RecorderBackendSelection::AppendLog => {
             tracing::info!(
                 target: "recorder::bootstrap",
                 backend = %RecorderBackendKind::AppendLog,
@@ -677,15 +745,15 @@ pub fn bootstrap_recorder_storage(
             let storage = AppendLogRecorderStorage::open(config.append_log)?;
             Ok(RecorderStorageInstance::AppendLog(storage))
         }
-        RecorderBackendKind::FrankenSqlite => {
+        RecorderBackendSelection::Rusqlite => {
             tracing::info!(
                 target: "recorder::bootstrap",
-                backend = %RecorderBackendKind::FrankenSqlite,
-                db_path = %config.frankensqlite.db_path.display(),
-                "Bootstrapping recorder FrankenSqlite backend"
+                backend = %RecorderBackendKind::Rusqlite,
+                db_path = %config.rusqlite.db_path.display(),
+                "Bootstrapping recorder rusqlite backend"
             );
-            let storage = FrankenSqliteRecorderStorage::open(config.frankensqlite)?;
-            Ok(RecorderStorageInstance::FrankenSqlite(storage))
+            let storage = RusqliteRecorderStorage::open(config.rusqlite)?;
+            Ok(RecorderStorageInstance::Rusqlite(storage))
         }
     }
 }
@@ -1195,21 +1263,21 @@ impl RecorderStorage for AppendLogRecorderStorage {
     }
 }
 
-/// SQLite-backed recorder storage and event reader.
-pub struct FrankenSqliteRecorderStorage {
-    config: FrankenSqliteStorageConfig,
+/// Rusqlite-backed recorder storage and event reader.
+pub struct RusqliteRecorderStorage {
+    config: RusqliteStorageConfig,
     in_flight: AtomicUsize,
-    inner: Arc<Mutex<FrankenSqliteInner>>,
+    inner: Arc<Mutex<RusqliteInner>>,
 }
 
-struct FrankenSqliteInner {
+struct RusqliteInner {
     conn: Connection,
     last_error: Option<String>,
 }
 
-impl std::fmt::Debug for FrankenSqliteRecorderStorage {
+impl std::fmt::Debug for RusqliteRecorderStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FrankenSqliteRecorderStorage")
+        f.debug_struct("RusqliteRecorderStorage")
             .field("db_path", &self.config.db_path)
             .field("queue_capacity", &self.config.queue_capacity)
             .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
@@ -1217,19 +1285,17 @@ impl std::fmt::Debug for FrankenSqliteRecorderStorage {
     }
 }
 
-impl FrankenSqliteRecorderStorage {
-    /// Open or create a FrankenSqlite recorder backend.
-    pub fn open(
-        config: FrankenSqliteStorageConfig,
-    ) -> std::result::Result<Self, RecorderStorageError> {
+impl RusqliteRecorderStorage {
+    /// Open or create a rusqlite recorder backend.
+    pub fn open(config: RusqliteStorageConfig) -> std::result::Result<Self, RecorderStorageError> {
         config.validate()?;
         ensure_parent_dir(&config.db_path)?;
         let conn = Connection::open(&config.db_path).map_err(sqlite_error)?;
-        initialize_frankensqlite_schema(&conn)?;
+        initialize_rusqlite_schema(&conn)?;
         Ok(Self {
             config,
             in_flight: AtomicUsize::new(0),
-            inner: Arc::new(Mutex::new(FrankenSqliteInner {
+            inner: Arc::new(Mutex::new(RusqliteInner {
                 conn,
                 last_error: None,
             })),
@@ -1237,20 +1303,20 @@ impl FrankenSqliteRecorderStorage {
     }
 
     /// Return a reader over this storage's event stream.
-    pub fn event_reader(&self) -> FrankenSqliteEventReader {
-        FrankenSqliteEventReader::new(self.config.db_path.clone())
+    pub fn event_reader(&self) -> RusqliteEventReader {
+        RusqliteEventReader::new(self.config.db_path.clone())
     }
 
     fn try_acquire_slot(&self) -> std::result::Result<InFlightGuard<'_>, RecorderStorageError> {
         try_acquire_bounded_slot(&self.in_flight, self.config.queue_capacity)
     }
 
-    fn clear_last_error(inner: &mut FrankenSqliteInner) {
+    fn clear_last_error(inner: &mut RusqliteInner) {
         inner.last_error = None;
     }
 
     fn record_last_error(
-        inner: &mut FrankenSqliteInner,
+        inner: &mut RusqliteInner,
         operation: &'static str,
         err: &RecorderStorageError,
     ) {
@@ -1272,9 +1338,19 @@ impl FrankenSqliteRecorderStorage {
             )
             .optional()
             .map_err(sqlite_error)?;
-        response_json
+        let response = response_json
             .map(|json| serde_json::from_str::<AppendResponse>(&json).map_err(Into::into))
-            .transpose()
+            .transpose()?;
+        if let Some(response) = response.as_ref()
+            && response.backend != RecorderBackendKind::Rusqlite
+        {
+            return Err(RecorderStorageError::CorruptCachedResponse {
+                batch_id: batch_id.to_string(),
+                expected_backend: RecorderBackendKind::Rusqlite,
+                actual_backend: response.backend,
+            });
+        }
+        Ok(response)
     }
 
     fn update_cached_response(
@@ -1298,9 +1374,9 @@ impl FrankenSqliteRecorderStorage {
     }
 }
 
-impl RecorderStorage for FrankenSqliteRecorderStorage {
+impl RecorderStorage for RusqliteRecorderStorage {
     fn backend_kind(&self) -> RecorderBackendKind {
-        RecorderBackendKind::FrankenSqlite
+        RecorderBackendKind::Rusqlite
     }
 
     async fn append_batch(
@@ -1409,7 +1485,7 @@ impl RecorderStorage for FrankenSqliteRecorderStorage {
             }
 
             let response = AppendResponse {
-                backend: RecorderBackendKind::FrankenSqlite,
+                backend: RecorderBackendKind::Rusqlite,
                 accepted_count: last_offset
                     .ordinal
                     .saturating_sub(first_offset.ordinal)
@@ -1478,7 +1554,7 @@ impl RecorderStorage for FrankenSqliteRecorderStorage {
                     .map_err(sqlite_error)?;
             }
             Ok(FlushStats {
-                backend: RecorderBackendKind::FrankenSqlite,
+                backend: RecorderBackendKind::Rusqlite,
                 flushed_at_ms: crate::recording::epoch_ms_now(),
                 latest_offset: sqlite_latest_storage_offset(&inner.conn)?,
             })
@@ -1572,7 +1648,7 @@ impl RecorderStorage for FrankenSqliteRecorderStorage {
             Ok(offset) => offset,
             Err(err) => {
                 return RecorderStorageHealth {
-                    backend: RecorderBackendKind::FrankenSqlite,
+                    backend: RecorderBackendKind::Rusqlite,
                     degraded: true,
                     queue_depth: self.in_flight.load(Ordering::Acquire),
                     queue_capacity: self.config.queue_capacity,
@@ -1582,7 +1658,7 @@ impl RecorderStorage for FrankenSqliteRecorderStorage {
             }
         };
         RecorderStorageHealth {
-            backend: RecorderBackendKind::FrankenSqlite,
+            backend: RecorderBackendKind::Rusqlite,
             degraded: inner.last_error.is_some(),
             queue_depth: self.in_flight.load(Ordering::Acquire),
             queue_capacity: self.config.queue_capacity,
@@ -1619,13 +1695,13 @@ impl RecorderStorage for FrankenSqliteRecorderStorage {
     }
 }
 
-/// Reader over a FrankenSqlite recorder event stream.
+/// Reader over a rusqlite recorder event stream.
 #[derive(Debug, Clone)]
-pub struct FrankenSqliteEventReader {
+pub struct RusqliteEventReader {
     db_path: PathBuf,
 }
 
-impl FrankenSqliteEventReader {
+impl RusqliteEventReader {
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
     }
@@ -1633,17 +1709,17 @@ impl FrankenSqliteEventReader {
     fn open_connection(&self) -> std::result::Result<Connection, EventCursorError> {
         let conn = Connection::open(&self.db_path).map_err(|err| {
             EventCursorError::Unavailable(format!(
-                "failed to open FrankenSqlite recorder DB {}: {err}",
+                "failed to open rusqlite recorder DB {}: {err}",
                 self.db_path.display()
             ))
         })?;
-        initialize_frankensqlite_schema(&conn)
+        initialize_rusqlite_schema(&conn)
             .map_err(|err| EventCursorError::Unavailable(err.to_string()))?;
         Ok(conn)
     }
 }
 
-impl RecorderEventReader for FrankenSqliteEventReader {
+impl RecorderEventReader for RusqliteEventReader {
     fn open_cursor(
         &self,
         from: RecorderOffset,
@@ -1657,7 +1733,7 @@ impl RecorderEventReader for FrankenSqliteEventReader {
     ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
         let conn = self.open_connection()?;
         let start = sqlite_cursor_start(&conn, target_ordinal)?;
-        Ok(Box::new(FrankenSqliteCursor {
+        Ok(Box::new(RusqliteCursor {
             conn,
             next_offset: start,
         }))
@@ -1669,12 +1745,12 @@ impl RecorderEventReader for FrankenSqliteEventReader {
     }
 }
 
-struct FrankenSqliteCursor {
+struct RusqliteCursor {
     conn: Connection,
     next_offset: RecorderOffset,
 }
 
-impl RecorderEventCursor for FrankenSqliteCursor {
+impl RecorderEventCursor for RusqliteCursor {
     fn next_batch(
         &mut self,
         max: usize,
@@ -1787,9 +1863,7 @@ fn sql_i64_to_u64(value: i64, field: &str) -> std::result::Result<u64, EventCurs
     })
 }
 
-fn initialize_frankensqlite_schema(
-    conn: &Connection,
-) -> std::result::Result<(), RecorderStorageError> {
+fn initialize_rusqlite_schema(conn: &Connection) -> std::result::Result<(), RecorderStorageError> {
     conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
@@ -2102,7 +2176,7 @@ pub struct CursorRecord {
 /// Backend-neutral sequential reader of recorder events.
 ///
 /// Implementations wrap a concrete storage backend (append-log file,
-/// FrankenSqlite, etc.) and expose a cursor-based iteration interface
+/// rusqlite, etc.) and expose a cursor-based iteration interface
 /// that the indexing pipeline consumes without knowing the backend.
 pub trait RecorderEventReader: Send + Sync {
     /// Open a cursor positioned at `from`. Events with ordinal >= `from.ordinal`
@@ -2312,7 +2386,7 @@ mod tests {
         RecorderStorageConfig {
             backend: RecorderBackendKind::AppendLog,
             append_log: test_config(path),
-            frankensqlite: FrankenSqliteStorageConfig {
+            rusqlite: RusqliteStorageConfig {
                 db_path: path.join("recorder.sqlite3"),
                 queue_capacity: 4,
                 max_batch_events: 256,
@@ -2331,24 +2405,82 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_selects_frankensqlite_backend() {
+    fn bootstrap_selects_rusqlite_backend_with_default_settings() {
         let dir = tempdir().unwrap();
         let mut config = recorder_test_config(dir.path());
-        config.backend = RecorderBackendKind::FrankenSqlite;
+        config.backend = RecorderBackendKind::Rusqlite;
+        config.rusqlite = RusqliteStorageConfig {
+            db_path: dir.path().join("recorder-defaults.sqlite3"),
+            ..RusqliteStorageConfig::default()
+        };
 
         let storage = bootstrap_recorder_storage(config).unwrap();
-        assert_eq!(storage.backend_kind(), RecorderBackendKind::FrankenSqlite);
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::Rusqlite);
     }
 
     #[test]
-    fn bootstrap_frankensqlite_ignores_append_log_validation() {
+    fn bootstrap_rusqlite_ignores_append_log_validation() {
         let dir = tempdir().unwrap();
         let mut config = recorder_test_config(dir.path());
-        config.backend = RecorderBackendKind::FrankenSqlite;
+        config.backend = RecorderBackendKind::Rusqlite;
         config.append_log.queue_capacity = 0; // invalid for append-log
 
         let storage = bootstrap_recorder_storage(config).unwrap();
-        assert_eq!(storage.backend_kind(), RecorderBackendKind::FrankenSqlite);
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::Rusqlite);
+    }
+
+    #[test]
+    fn bootstrap_rejects_frankensqlite_before_creating_a_database() {
+        let dir = tempdir().unwrap();
+        let untouched_parent = dir.path().join("must-not-exist");
+        let db_path = untouched_parent.join("recorder.sqlite3");
+        let mut config = recorder_test_config(dir.path());
+        config.backend = RecorderBackendKind::FrankenSqlite;
+        config.rusqlite.db_path = db_path.clone();
+
+        let expected = config.select_backend().unwrap_err();
+        let high_level_config = crate::config::Config::from_toml_unvalidated(
+            r#"
+[storage]
+recorder_backend = "frankensqlite"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            high_level_config.recorder_backend_selection().unwrap_err(),
+            expected
+        );
+        assert_eq!(expected.requested(), RecorderBackendKind::FrankenSqlite);
+        let error = bootstrap_recorder_storage(config).unwrap_err();
+        assert!(matches!(
+            error,
+            RecorderStorageError::BackendSelection(actual) if actual == expected
+        ));
+        assert!(!untouched_parent.exists());
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn bootstrap_rejection_does_not_mutate_an_existing_database_path() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("existing.sqlite3");
+        let sentinel = b"not-a-database-and-must-remain-byte-identical";
+        std::fs::write(&db_path, sentinel).unwrap();
+
+        let mut config = recorder_test_config(dir.path());
+        config.backend = RecorderBackendKind::FrankenSqlite;
+        config.rusqlite.db_path = db_path.clone();
+
+        let error = bootstrap_recorder_storage(config).unwrap_err();
+        assert!(matches!(
+            error,
+            RecorderStorageError::BackendSelection(selection)
+                if selection.requested() == RecorderBackendKind::FrankenSqlite
+        ));
+        let after = std::fs::read(&db_path).unwrap();
+        assert_eq!(after.as_slice(), sentinel);
+        assert!(!db_path.with_extension("sqlite3-wal").exists());
+        assert!(!db_path.with_extension("sqlite3-shm").exists());
     }
 
     #[test]
@@ -2389,16 +2521,16 @@ mod tests {
     }
 
     #[test]
-    fn frankensqlite_slot_admission_is_atomic_at_capacity_one() {
+    fn rusqlite_slot_admission_is_atomic_at_capacity_one() {
         let dir = tempdir().unwrap();
-        let cfg = FrankenSqliteStorageConfig {
+        let cfg = RusqliteStorageConfig {
             db_path: dir.path().join("recorder.sqlite3"),
             queue_capacity: 1,
             max_batch_events: 16,
             max_batch_bytes: 128 * 1024,
             max_idempotency_entries: 8,
         };
-        let storage = Arc::new(FrankenSqliteRecorderStorage::open(cfg).unwrap());
+        let storage = Arc::new(RusqliteRecorderStorage::open(cfg).unwrap());
         let attempts = 32usize;
         let start = Arc::new(Barrier::new(attempts));
         let release = Arc::new(Barrier::new(attempts));
@@ -2435,6 +2567,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = recorder_test_config(dir.path());
         let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"rusqlite\""));
+        assert!(!json.contains("\"frankensqlite\""));
         let back: RecorderStorageConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.backend, RecorderBackendKind::AppendLog);
         assert_eq!(
@@ -2445,17 +2579,24 @@ mod tests {
             back.append_log.max_batch_events,
             config.append_log.max_batch_events
         );
+        assert_eq!(back.rusqlite.db_path, config.rusqlite.db_path);
     }
 
     #[test]
-    fn recorder_storage_config_accepts_legacy_franken_sqlite_alias() {
+    fn recorder_storage_config_rejects_legacy_franken_sqlite_names() {
         let value = serde_json::json!({
             "backend": "franken_sqlite",
             "append_log": AppendLogStorageConfig::default(),
-            "frankensqlite": FrankenSqliteStorageConfig::default()
+            "rusqlite": RusqliteStorageConfig::default()
         });
-        let config = serde_json::from_value::<RecorderStorageConfig>(value).unwrap();
-        assert_eq!(config.backend, RecorderBackendKind::FrankenSqlite);
+        assert!(serde_json::from_value::<RecorderStorageConfig>(value).is_err());
+
+        let value = serde_json::json!({
+            "backend": "rusqlite",
+            "append_log": AppendLogStorageConfig::default(),
+            "frankensqlite": RusqliteStorageConfig::default()
+        });
+        assert!(serde_json::from_value::<RecorderStorageConfig>(value).is_err());
     }
 
     #[test]
@@ -2533,9 +2674,9 @@ mod tests {
         drop(append_first);
 
         let sqlite_dir = tempdir().unwrap();
-        let mut sqlite_config = recorder_test_config(sqlite_dir.path()).frankensqlite;
+        let mut sqlite_config = recorder_test_config(sqlite_dir.path()).rusqlite;
         sqlite_config.queue_capacity = 1;
-        let sqlite_storage = FrankenSqliteRecorderStorage::open(sqlite_config).unwrap();
+        let sqlite_storage = RusqliteRecorderStorage::open(sqlite_config).unwrap();
         let sqlite_first = sqlite_storage.try_acquire_slot().unwrap();
         assert!(matches!(
             sqlite_storage.try_acquire_slot(),
@@ -2545,11 +2686,11 @@ mod tests {
     }
 
     #[test]
-    fn frankensqlite_append_reader_seek_head_and_checkpoints() {
+    fn rusqlite_append_reader_seek_head_and_checkpoints() {
         run_async_test(async {
             let dir = tempdir().unwrap();
-            let config = recorder_test_config(dir.path()).frankensqlite;
-            let storage = FrankenSqliteRecorderStorage::open(config).unwrap();
+            let config = recorder_test_config(dir.path()).rusqlite;
+            let storage = RusqliteRecorderStorage::open(config).unwrap();
             let events = vec![
                 sample_event("sql-0", 7, 0, "zero"),
                 sample_event("sql-1", 7, 1, "one"),
@@ -2565,7 +2706,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(response.backend, RecorderBackendKind::FrankenSqlite);
+            assert_eq!(response.backend, RecorderBackendKind::Rusqlite);
             assert_eq!(response.accepted_count, 3);
             assert_eq!(response.first_offset.ordinal, 0);
             assert_eq!(response.last_offset.ordinal, 2);
@@ -2630,11 +2771,77 @@ mod tests {
     }
 
     #[test]
-    fn frankensqlite_reader_reports_corrupt_payload_row() {
+    fn rusqlite_rejects_cached_response_from_a_different_backend_without_inserting_events() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let config = recorder_test_config(dir.path()).rusqlite;
+            let storage = RusqliteRecorderStorage::open(config).unwrap();
+            let poisoned = AppendResponse {
+                backend: RecorderBackendKind::FrankenSqlite,
+                accepted_count: 1,
+                first_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                },
+                last_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                },
+                committed_durability: DurabilityLevel::Appended,
+                committed_at_ms: 1,
+            };
+            {
+                let inner = storage.inner.lock().await;
+                inner
+                    .conn
+                    .execute(
+                        "INSERT INTO recorder_batches (batch_id, response_json, committed_at_ms)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            "poisoned-backend",
+                            serde_json::to_string(&poisoned).unwrap(),
+                            1_i64,
+                        ],
+                    )
+                    .unwrap();
+            }
+
+            let error = storage
+                .append_batch(AppendRequest {
+                    batch_id: "poisoned-backend".to_string(),
+                    events: vec![sample_event("must-not-insert", 7, 0, "payload")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &error,
+                RecorderStorageError::CorruptCachedResponse {
+                    batch_id,
+                    expected_backend: RecorderBackendKind::Rusqlite,
+                    actual_backend: RecorderBackendKind::FrankenSqlite,
+                } if batch_id == "poisoned-backend"
+            ));
+            assert_eq!(error.class(), RecorderStorageErrorClass::Corruption);
+
+            let inner = storage.inner.lock().await;
+            let event_count: i64 = inner
+                .conn
+                .query_row("SELECT COUNT(*) FROM recorder_events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(event_count, 0);
+        });
+    }
+
+    #[test]
+    fn rusqlite_reader_reports_corrupt_payload_row() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("recorder.sqlite3");
         let conn = Connection::open(&db_path).unwrap();
-        initialize_frankensqlite_schema(&conn).unwrap();
+        initialize_rusqlite_schema(&conn).unwrap();
         conn.execute(
             "INSERT INTO recorder_events (
                  ordinal, segment_id, byte_offset, payload_json, payload_bytes,
@@ -2658,7 +2865,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let reader = FrankenSqliteEventReader::new(db_path);
+        let reader = RusqliteEventReader::new(db_path);
         let mut cursor = reader.open_cursor_from_start().unwrap();
         let err = cursor.next_batch(1).unwrap_err();
         assert!(matches!(
@@ -2675,6 +2882,10 @@ mod tests {
         assert_eq!(
             RecorderBackendKind::AppendLog.to_string(),
             "append_log".to_string()
+        );
+        assert_eq!(
+            RecorderBackendKind::Rusqlite.to_string(),
+            "rusqlite".to_string()
         );
         assert_eq!(
             RecorderBackendKind::FrankenSqlite.to_string(),
@@ -3959,16 +4170,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn backend_kind_serde_roundtrip_both_variants() {
-        let json = serde_json::to_string(&RecorderBackendKind::AppendLog).unwrap();
-        let back: RecorderBackendKind = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, RecorderBackendKind::AppendLog);
-        let back: RecorderBackendKind = serde_json::from_str("\"frankensqlite\"").unwrap();
-        assert_eq!(back, RecorderBackendKind::FrankenSqlite);
-        // Verify snake_case rename
-        assert!(json.contains("append_log"));
-        let json = serde_json::to_string(&RecorderBackendKind::FrankenSqlite).unwrap();
-        assert!(json.contains("frankensqlite"));
+    fn backend_kind_serde_roundtrip_all_variants() {
+        for backend in RecorderBackendKind::ALL {
+            let json = serde_json::to_string(&backend).unwrap();
+            let back: RecorderBackendKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, backend);
+        }
+        assert_eq!(
+            serde_json::to_string(&RecorderBackendKind::AppendLog).unwrap(),
+            "\"append_log\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecorderBackendKind::Rusqlite).unwrap(),
+            "\"rusqlite\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecorderBackendKind::FrankenSqlite).unwrap(),
+            "\"frankensqlite\""
+        );
     }
 
     #[test]
@@ -5121,12 +5340,12 @@ mod tests {
     }
 
     #[test]
-    fn source_descriptor_frankensqlite_display() {
-        let desc = RecorderSourceDescriptor::FrankenSqlite {
+    fn source_descriptor_rusqlite_display() {
+        let desc = RecorderSourceDescriptor::Rusqlite {
             db_path: PathBuf::from("/tmp/recorder.db"),
         };
         let display = desc.to_string();
-        assert!(display.contains("frankensqlite"));
+        assert!(display.contains("rusqlite"));
         assert!(display.contains("/tmp/recorder.db"));
     }
 
@@ -5137,10 +5356,10 @@ mod tests {
         };
         assert_eq!(al.backend_kind(), RecorderBackendKind::AppendLog);
 
-        let fs = RecorderSourceDescriptor::FrankenSqlite {
+        let sqlite = RecorderSourceDescriptor::Rusqlite {
             db_path: PathBuf::from("y"),
         };
-        assert_eq!(fs.backend_kind(), RecorderBackendKind::FrankenSqlite);
+        assert_eq!(sqlite.backend_kind(), RecorderBackendKind::Rusqlite);
     }
 
     #[test]
@@ -5155,12 +5374,12 @@ mod tests {
     }
 
     #[test]
-    fn source_descriptor_serde_roundtrip_frankensqlite() {
-        let desc = RecorderSourceDescriptor::FrankenSqlite {
+    fn source_descriptor_serde_roundtrip_rusqlite() {
+        let desc = RecorderSourceDescriptor::Rusqlite {
             db_path: PathBuf::from("/data/recorder.db"),
         };
         let json = serde_json::to_string(&desc).unwrap();
-        assert!(json.contains("franken_sqlite"));
+        assert!(json.contains("rusqlite"));
         let back: RecorderSourceDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(back, desc);
     }
@@ -5173,7 +5392,7 @@ mod tests {
         let cloned = desc.clone();
         assert_eq!(desc, cloned);
 
-        let other = RecorderSourceDescriptor::FrankenSqlite {
+        let other = RecorderSourceDescriptor::Rusqlite {
             db_path: PathBuf::from("db.sqlite"),
         };
         assert_ne!(desc, other);

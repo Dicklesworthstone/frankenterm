@@ -4245,9 +4245,11 @@ async fn apply_unilateral_on_main_thread(
                     .client_domain()
                     .remote_to_local_window_id(window_id)
                     .ok_or_else(|| anyhow!("no local window for remote window id {}", window_id))?;
-                if let Some(mut window) = dispatch.mux.get_window_mut(local_window_id) {
-                    window.set_workspace(&workspace);
-                }
+                let _remote_application =
+                    dispatch.inner.begin_remote_metadata_application()?;
+                dispatch
+                    .mux
+                    .set_window_workspace(local_window_id, &workspace)?;
                 Ok(())
             });
         }
@@ -4262,7 +4264,9 @@ async fn apply_unilateral_on_main_thread(
                     .client_domain()
                     .remote_to_local_window_id(window_id)
                     .ok_or_else(|| anyhow!("no local window for remote window id {}", window_id))?;
-                dispatch.mux.set_window_title(local_window_id, &title);
+                let _remote_application =
+                    dispatch.inner.begin_remote_metadata_application()?;
+                dispatch.mux.set_window_title(local_window_id, &title)?;
                 Ok(())
             });
         }
@@ -4277,9 +4281,11 @@ async fn apply_unilateral_on_main_thread(
                     return Ok(());
                 }
                 log::debug!("got a rename {old_workspace} -> {new_workspace}");
+                let _remote_application =
+                    dispatch.inner.begin_remote_metadata_application()?;
                 dispatch
                     .mux
-                    .rename_workspace(&old_workspace, &new_workspace);
+                    .rename_workspace(&old_workspace, &new_workspace)?;
                 Ok(())
             });
         }
@@ -4294,6 +4300,8 @@ async fn apply_unilateral_on_main_thread(
                     .inner
                     .remote_to_local_tab_id(tab_id)
                     .ok_or_else(|| anyhow!("no local tab for remote tab id {}", tab_id))?;
+                let _remote_application =
+                    dispatch.inner.begin_remote_metadata_application()?;
                 dispatch.mux.set_tab_title(local_tab_id, &title);
                 Ok(())
             });

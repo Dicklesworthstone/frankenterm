@@ -707,10 +707,7 @@ fn test_recorder_offset_inequality() {
 
 #[test]
 fn test_backend_kind_serde_roundtrip() {
-    for kind in [
-        RecorderBackendKind::AppendLog,
-        RecorderBackendKind::FrankenSqlite,
-    ] {
+    for kind in RecorderBackendKind::ALL {
         let json = serde_json::to_string(&kind).unwrap();
         let back: RecorderBackendKind = serde_json::from_str(&json).unwrap();
         assert_eq!(kind, back);
@@ -808,8 +805,9 @@ fn test_frankensqlite_bootstrap_returns_unavailable() {
     };
     let err = bootstrap_recorder_storage(config).unwrap_err();
     assert!(matches!(
-        err,
-        RecorderStorageError::BackendUnavailable { .. }
+        &err,
+        RecorderStorageError::BackendSelection(selection)
+            if selection.requested() == RecorderBackendKind::FrankenSqlite
     ));
     assert_eq!(
         err.class(),

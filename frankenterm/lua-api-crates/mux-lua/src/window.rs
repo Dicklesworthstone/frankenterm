@@ -13,10 +13,6 @@ impl MuxWindow {
             .ok_or_else(|| mlua::Error::external(format!("window id {} not found in mux", self.0)))
     }
 
-    pub fn resolve_mut<'a>(&self, mux: &'a Arc<Mux>) -> mlua::Result<mux::MuxWindowWriteGuard<'a>> {
-        mux.get_window_mut(self.0)
-            .ok_or_else(|| mlua::Error::external(format!("window id {} not found in mux", self.0)))
-    }
 }
 
 impl UserData for MuxWindow {
@@ -45,8 +41,8 @@ impl UserData for MuxWindow {
         });
         methods.add_method("set_workspace", |_, this, new_name: String| {
             let mux = get_mux()?;
-            let mut window = this.resolve_mut(&mux)?;
-            let _: () = window.set_workspace(&new_name);
+            mux.set_window_workspace(this.0, &new_name)
+                .map_err(mlua::Error::external)?;
             Ok(())
         });
         // Must be an async Lua method: `spawn.spawn()` awaits
@@ -79,8 +75,16 @@ impl UserData for MuxWindow {
         });
         methods.add_method("set_title", |_, this, title: String| {
             let mux = get_mux()?;
-            let mut window = this.resolve_mut(&mux)?;
-            let _: () = window.set_title(&title);
+            match mux.set_window_title(this.0, &title) {
+                Ok(_) => {}
+                Err(error) if error.is_not_found() => {
+                    return Err(mlua::Error::external(format!(
+                        "window id {} not found in mux",
+                        this.0
+                    )));
+                }
+                Err(error) => return Err(mlua::Error::external(error)),
+            }
             Ok(())
         });
         methods.add_method("tabs", |_, this, _: ()| {

@@ -808,9 +808,7 @@ impl IndexerConfig {
             frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
                 data_path,
             } => Some(data_path),
-            frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
-                ..
-            } => None,
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::Rusqlite { .. } => None,
         }
     }
 
@@ -830,18 +828,14 @@ impl IndexerConfig {
                 );
                 Ok(Box::new(AppendLogEventSource::from_path(data_path.clone())))
             }
-            frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
-                db_path,
-            } => {
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::Rusqlite { db_path } => {
                 tracing::info!(
                     indexer_source = %self.source,
                     db_path = %db_path.display(),
-                    "creating frankensqlite event reader"
+                    "creating rusqlite event reader"
                 );
                 Ok(Box::new(
-                    frankenterm_core::recorder_storage::FrankenSqliteEventReader::new(
-                        db_path.clone(),
-                    ),
+                    frankenterm_core::recorder_storage::RusqliteEventReader::new(db_path.clone()),
                 ))
             }
         }
@@ -1215,7 +1209,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
     ///
     /// This is the preferred entry point for backend-agnostic indexing.
     /// The reader provides a cursor over recorder events regardless of whether
-    /// the underlying storage is an append-log file or FrankenSqlite.
+    /// the underlying storage is an append-log file or rusqlite database.
     pub async fn run_with_reader<S: RecorderStorage>(
         &mut self,
         storage: &S,
@@ -1576,7 +1570,7 @@ mod tests {
     use super::*;
     use frankenterm_core::recorder_storage::{
         AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
-        FrankenSqliteRecorderStorage, FrankenSqliteStorageConfig, RecorderEventReader,
+        RecorderEventReader, RusqliteRecorderStorage, RusqliteStorageConfig,
     };
     use frankenterm_core::recording::{
         RecorderControlMarkerType, RecorderEventCausality, RecorderEventPayload,
@@ -1611,10 +1605,10 @@ mod tests {
     }
 
     #[test]
-    fn indexer_config_create_event_reader_frankensqlite_opens_empty_reader() {
+    fn indexer_config_create_event_reader_rusqlite_opens_empty_reader() {
         let dir = tempdir().unwrap();
         let cfg = IndexerConfig {
-            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::Rusqlite {
                 db_path: dir.path().join("recorder.sqlite3"),
             },
             ..IndexerConfig::default()
@@ -1874,8 +1868,8 @@ mod tests {
         writer
     }
 
-    fn test_sqlite_config(path: &Path) -> FrankenSqliteStorageConfig {
-        FrankenSqliteStorageConfig {
+    fn test_sqlite_config(path: &Path) -> RusqliteStorageConfig {
+        RusqliteStorageConfig {
             db_path: path.join("recorder.sqlite3"),
             queue_capacity: 4,
             max_batch_events: 256,
@@ -1884,7 +1878,7 @@ mod tests {
         }
     }
 
-    async fn populate_sqlite(storage: &FrankenSqliteRecorderStorage, events: Vec<RecorderEvent>) {
+    async fn populate_sqlite(storage: &RusqliteRecorderStorage, events: Vec<RecorderEvent>) {
         for (i, chunk) in events.chunks(4).enumerate() {
             storage
                 .append_batch(AppendRequest {
@@ -1899,10 +1893,10 @@ mod tests {
     }
 
     #[test]
-    fn frankensqlite_reader_incremental_indexer_resumes_from_checkpoint() {
+    fn rusqlite_reader_incremental_indexer_resumes_from_checkpoint() {
         run_async_test(async {
             let dir = tempdir().unwrap();
-            let storage = FrankenSqliteRecorderStorage::open(test_sqlite_config(dir.path()))
+            let storage = RusqliteRecorderStorage::open(test_sqlite_config(dir.path()))
                 .expect("open sqlite recorder storage");
             populate_sqlite(
                 &storage,
@@ -1915,10 +1909,9 @@ mod tests {
             .await;
 
             let cfg = IndexerConfig {
-                source:
-                    frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
-                        db_path: dir.path().join("recorder.sqlite3"),
-                    },
+                source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::Rusqlite {
+                    db_path: dir.path().join("recorder.sqlite3"),
+                },
                 consumer_id: "sqlite-indexer-resume".to_string(),
                 batch_size: 2,
                 dedup_on_replay: true,
@@ -4817,11 +4810,11 @@ mod tests {
     }
 
     // =========================================================================
-    // Mock FrankenSqlite cursor for testing abstraction
+    // Mock alternate-backend cursor for testing the abstraction.
     // =========================================================================
 
     #[test]
-    fn mock_frankensqlite_cursor_produces_identical_results() {
+    fn mock_alternate_backend_cursor_produces_identical_results() {
         run_async_test(async {
             use frankenterm_core::recorder_storage::{
                 CursorRecord, EventCursorError, RecorderEventCursor, RecorderEventReader,
@@ -4949,9 +4942,9 @@ mod tests {
     }
 
     #[test]
-    fn indexer_config_frankensqlite_descriptor() {
+    fn indexer_config_rusqlite_descriptor() {
         let cfg = IndexerConfig {
-            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::Rusqlite {
                 db_path: PathBuf::from("/data/recorder.db"),
             },
             ..IndexerConfig::default()
@@ -4959,7 +4952,7 @@ mod tests {
         assert!(cfg.data_path().is_none());
         assert_eq!(
             cfg.source.backend_kind(),
-            frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite
+            frankenterm_core::recorder_storage::RecorderBackendKind::Rusqlite
         );
     }
 
@@ -4976,10 +4969,10 @@ mod tests {
     }
 
     #[test]
-    fn indexer_config_create_event_reader_frankensqlite_returns_reader() {
+    fn indexer_config_create_event_reader_rusqlite_returns_reader() {
         let dir = tempdir().unwrap();
         let cfg = IndexerConfig {
-            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::Rusqlite {
                 db_path: dir.path().join("recorder.db"),
             },
             ..IndexerConfig::default()

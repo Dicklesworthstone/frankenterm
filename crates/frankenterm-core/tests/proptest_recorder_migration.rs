@@ -97,6 +97,7 @@ fn arb_cutover_result() -> impl Strategy<Value = CutoverResult> {
     (
         prop_oneof![
             Just(RecorderBackendKind::AppendLog),
+            Just(RecorderBackendKind::Rusqlite),
             Just(RecorderBackendKind::FrankenSqlite),
         ],
         any::<u64>(),
@@ -434,12 +435,14 @@ proptest! {
         prop_assert_eq!(result.clone(), result);
     }
 
-    // 25. CutoverResult backend is always one of two variants
+    // 25. CutoverResult backend is always one of the declared stable variants
     #[test]
     fn cutover_result_backend_variant(result in arb_cutover_result()) {
         let is_valid = matches!(
             result.activated_backend,
-            RecorderBackendKind::AppendLog | RecorderBackendKind::FrankenSqlite
+            RecorderBackendKind::AppendLog
+                | RecorderBackendKind::Rusqlite
+                | RecorderBackendKind::FrankenSqlite
         );
         prop_assert!(is_valid);
     }

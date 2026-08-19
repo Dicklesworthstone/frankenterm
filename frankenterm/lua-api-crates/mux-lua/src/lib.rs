@@ -72,7 +72,8 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         "rename_workspace",
         lua.create_function(|_, (old_workspace, new_workspace): (String, String)| {
             let mux = get_mux()?;
-            mux.rename_workspace(&old_workspace, &new_workspace);
+            mux.rename_workspace(&old_workspace, &new_workspace)
+                .map_err(mlua::Error::external)?;
             Ok(())
         })?,
     )?;

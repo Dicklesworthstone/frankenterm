@@ -1297,6 +1297,7 @@ fn arb_recorder_offset() -> impl Strategy<Value = RecorderOffset> {
 fn arb_recorder_backend_kind() -> impl Strategy<Value = RecorderBackendKind> {
     prop_oneof![
         Just(RecorderBackendKind::AppendLog),
+        Just(RecorderBackendKind::Rusqlite),
         Just(RecorderBackendKind::FrankenSqlite),
     ]
 }

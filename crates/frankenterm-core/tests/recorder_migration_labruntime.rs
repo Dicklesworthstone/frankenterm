@@ -988,7 +988,7 @@ fn test_m5_emits_lifecycle_marker() {
             .await
             .unwrap();
 
-        assert_eq!(result.activated_backend, RecorderBackendKind::FrankenSqlite);
+        assert_eq!(result.activated_backend, RecorderBackendKind::AppendLog);
         assert_eq!(result.migration_epoch_ms, 1708000000);
         assert!(result.target_healthy);
         assert!(result.source_retained_path.is_none());
@@ -1015,8 +1015,8 @@ fn test_m5_switches_backend_selector() {
             .await
             .unwrap();
 
-        // Activation result always indicates FrankenSqlite
-        assert_eq!(result.activated_backend, RecorderBackendKind::FrankenSqlite);
+        // Activation reports the exact backend implemented by the target.
+        assert_eq!(result.activated_backend, RecorderBackendKind::AppendLog);
     });
 }
 
