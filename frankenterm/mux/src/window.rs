@@ -468,6 +468,11 @@ impl Window {
     ) -> anyhow::Result<Option<PreparedWindowState>> {
         let old_id = old.tab_id();
         let new_id = new.tab_id();
+        anyhow::ensure!(
+            self.last_active != Some(new_id),
+            "window {} replacement would launder dangling last-active tab {new_id}",
+            self.id,
+        );
         let mut old_index = None;
         for (index, candidate) in self.tabs.iter().enumerate() {
             anyhow::ensure!(

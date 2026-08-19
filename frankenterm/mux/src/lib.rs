@@ -14378,8 +14378,12 @@ impl Mux {
                     removed_windows,
                     trailing_revision_count,
                     |first_revision| {
-                        let committed = tab_locks.commit(self, prepared, first_revision);
+                        // Remove the source's exact authority while its tab
+                        // generation is still active. The tab commit may
+                        // terminally retire an emptied source, and doing that
+                        // first would make exact-owner removal look stale.
                         prepared_authority.commit();
+                        let committed = tab_locks.commit(self, prepared, first_revision);
                         if source_tab_retires {
                             let removed = tabs.remove(&source_tab.tab_id());
                             debug_assert!(removed
@@ -17816,6 +17820,19 @@ mod tests {
         assert_eq!(receipt.window_id(), window_id);
         assert_ne!(receipt.tab_id(), source_tab.tab_id());
         assert!(mux.get_tab(source_tab.tab_id()).is_none());
+        assert!(source_tab.active_mux_owner_generation().is_none());
+        let destination_tab = mux
+            .get_tab(receipt.tab_id())
+            .expect("replacement tab remains exact-current");
+        assert!(destination_tab.active_mux_owner_generation().is_some());
+        assert!(mux
+            .pane_authority
+            .lock()
+            .structural_by_pane_id
+            .get(&pane.pane_id())
+            .is_some_and(|owner| {
+                owner.matches_pane(&pane) && owner.matches_tab(&destination_tab)
+            }));
         let after = mux
             .window_order_snapshot(window_id)
             .expect("snapshot replacement window")
