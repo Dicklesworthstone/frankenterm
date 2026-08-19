@@ -7941,7 +7941,7 @@ impl Tab {
         expected_window_id: WindowId,
         split: Option<(&PaneRegistrationHandle, SplitRequest)>,
         pane: &Arc<dyn Pane>,
-    ) -> anyhow::Result<PaneRegistrationHandle> {
+    ) -> anyhow::Result<(PaneRegistrationHandle, usize)> {
         anyhow::ensure!(
             split.is_some() || expected_window_id.is_none(),
             "root pane publication must target an unattached tab"
@@ -7986,7 +7986,7 @@ impl Tab {
                 .ok_or_else(|| anyhow::anyhow!("tiled publication pane count overflow"))?
         };
         let mut replacement = baseline.clone();
-        let (mut callbacks, target_registration) = match split {
+        let (mut callbacks, target_registration, inserted_index) = match split {
             Some((target_registration, request)) => {
                 anyhow::ensure!(
                     target_registration
@@ -8014,13 +8014,13 @@ impl Tab {
                 observed_panes.push(Arc::clone(pane));
                 let observed = Self::observe_panes(observed_panes);
                 let pane_ids = build_callback_pane_id_snapshot(self.tab_id, &observed)?;
-                let (_inserted, callbacks) = replacement.prepare_split_and_insert(
+                let (inserted, callbacks) = replacement.prepare_split_and_insert(
                     pane_index,
                     request,
                     Arc::clone(pane),
                     &pane_ids,
                 )?;
-                (callbacks, Some(target_registration))
+                (callbacks, Some(target_registration), inserted)
             }
             None => {
                 anyhow::ensure!(
@@ -8029,7 +8029,7 @@ impl Tab {
                     self.tab_id
                 );
                 replacement.assign_pane(pane);
-                (DeferredTabCallbacks::default(), None)
+                (DeferredTabCallbacks::default(), None, 0)
             }
         };
         let next_structural_count = {
@@ -8257,7 +8257,7 @@ impl Tab {
         callbacks.execute(Some(mux));
         mux.complete_pane_lifecycle_notification(lifecycle_ticket);
         mux.notify_pane_registration_did_bind(pane, &registration);
-        Ok(registration)
+        Ok((registration, inserted_index))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8276,6 +8276,7 @@ impl Tab {
             None,
             pane,
         )
+        .map(|(registration, _)| registration)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8297,6 +8298,7 @@ impl Tab {
             Some((target, request)),
             pane,
         )
+        .map(|(registration, _)| registration)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8308,7 +8310,7 @@ impl Tab {
         target: &PaneRegistrationHandle,
         request: SplitRequest,
         pane: &Arc<dyn Pane>,
-    ) -> anyhow::Result<PaneRegistrationHandle> {
+    ) -> anyhow::Result<(PaneRegistrationHandle, usize)> {
         self.commit_unregistered_tiled_pane(
             mux,
             expected_domain,

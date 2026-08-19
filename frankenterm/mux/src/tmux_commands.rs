@@ -1268,6 +1268,26 @@ impl TmuxDomainState {
                         err.context("failed to attach tmux window to local tab state"),
                     )
                 })?;
+            let expected_domain = mux.get_domain(self.domain_id).ok_or_else(|| {
+                self.fail_local_mirror_publication(anyhow!(
+                    "tmux domain {} retired before initial pane publication",
+                    self.domain_id
+                ))
+            })?;
+            let expected_tmux_domain = expected_domain
+                .downcast_ref::<TmuxDomain>()
+                .ok_or_else(|| {
+                    self.fail_local_mirror_publication(anyhow!(
+                        "tmux domain {} changed concrete type before initial pane publication",
+                        self.domain_id
+                    ))
+                })?;
+            if !std::ptr::eq(expected_tmux_domain.inner.as_ref(), self) {
+                return Err(self.fail_local_mirror_publication(anyhow!(
+                    "tmux domain {} changed exact identity before initial pane publication",
+                    self.domain_id
+                )));
+            }
 
             let mut split_stack;
             let mut split_direction;
@@ -1289,23 +1309,24 @@ impl TmuxDomainState {
                             pane_left: x.pane_left,
                             pane_top: x.pane_top,
                         };
-                        let local_pane = self.create_pane(&p).map_err(|err| {
+                        let publication =
+                            self.prepare_initial_pane_publication(&p).map_err(|err| {
                             self.fail_local_mirror_publication(
-                                err.context("failed to create tmux pane"),
+                                err.context("failed to prepare initial tmux pane mirror"),
                             )
                         })?;
-                        tab.assign_pane(&local_pane);
-                        self.add_attached_pane(p.window_id, p.pane_id)
-                            .map_err(|err| {
+                        tab.commit_unregistered_root_pane(
+                            &mux,
+                            &expected_domain,
+                            self.domain_id,
+                            publication.pane(),
+                        )
+                        .map_err(|err| {
                                 self.fail_local_mirror_publication(
-                                    err.context("failed to attach tmux pane to local window state"),
+                                    err.context("failed to publish initial tmux root pane"),
                                 )
-                            })?;
-                        mux.add_pane(&local_pane).map_err(|err| {
-                            self.fail_local_mirror_publication(
-                                err.context("failed to publish tmux pane in local mux"),
-                            )
                         })?;
+                        publication.commit();
                         break;
                     }
 
@@ -1334,53 +1355,91 @@ impl TmuxDomainState {
                         pane_left: x.pane_left,
                         pane_top: x.pane_top,
                     };
-                    let local_pane;
                     if !self.check_pane_attached(p.window_id, p.pane_id) {
-                        local_pane = self.create_pane(&p).map_err(|err| {
-                            self.fail_local_mirror_publication(
-                                err.context("failed to create tmux pane"),
-                            )
-                        })?;
-                        self.add_attached_pane(p.window_id, p.pane_id)
-                            .map_err(|err| {
+                        let publication =
+                            self.prepare_initial_pane_publication(&p).map_err(|err| {
                                 self.fail_local_mirror_publication(
-                                    err.context("failed to attach tmux pane to local window state"),
+                                    err.context("failed to prepare initial tmux pane mirror"),
                                 )
                             })?;
-                        mux.add_pane(&local_pane).map_err(|err| {
-                            self.fail_local_mirror_publication(
-                                err.context("failed to publish tmux pane in local mux"),
-                            )
-                        })?;
                         if let None = tab.get_active_pane() {
-                            tab.assign_pane(&local_pane);
+                            tab.commit_unregistered_root_pane(
+                                &mux,
+                                &expected_domain,
+                                self.domain_id,
+                                publication.pane(),
+                            )
+                            .map_err(|err| {
+                                self.fail_local_mirror_publication(
+                                    err.context("failed to publish initial tmux root pane"),
+                                )
+                            })?;
                             split_pane_index = tab.get_active_idx();
+                            publication.commit();
                             continue;
                         }
 
-                        split_pane_index = next_split_pane_index(
-                            tab.split_and_insert(
-                                split_pane_index,
-                                SplitRequest {
-                                    direction: split_direction,
-                                    target_is_second: false,
-                                    top_level: false,
-                                    size: SplitSize::Cells(
-                                        if split_direction == SplitDirection::Horizontal {
-                                            u64_to_usize_saturating(p.pane_width)
-                                        } else {
-                                            u64_to_usize_saturating(p.pane_height)
-                                        },
-                                    ),
-                                },
-                                local_pane.clone(),
-                            )
-                            .map_err(|err| {
+                        let target_pane = tab
+                            .iter_panes_ignoring_zoom()
+                            .into_iter()
+                            .find(|positioned| positioned.index == split_pane_index)
+                            .map(|positioned| positioned.pane)
+                            .ok_or_else(|| {
                                 self.fail_local_mirror_publication(
-                                    err.context("failed to insert tmux pane into local tab"),
+                                    anyhow!(
+                                        "initial tmux split target index {split_pane_index} disappeared"
+                                    ),
                                 )
-                            })?,
-                        );
+                            })?;
+                        let target_registration = mux
+                            .capture_pane_registration(&target_pane)
+                            .ok_or_else(|| {
+                                self.fail_local_mirror_publication(anyhow!(
+                                    "initial tmux split target {} lost its exact registration",
+                                    target_pane.pane_id()
+                                ))
+                            })?;
+                        let split_request = SplitRequest {
+                            direction: split_direction,
+                            target_is_second: false,
+                            top_level: false,
+                            size: SplitSize::Cells(
+                                if split_direction == SplitDirection::Horizontal {
+                                    u64_to_usize_saturating(p.pane_width)
+                                } else {
+                                    u64_to_usize_saturating(p.pane_height)
+                                },
+                            ),
+                        };
+                        tab.commit_unregistered_unattached_split_pane(
+                            &mux,
+                            &expected_domain,
+                            self.domain_id,
+                            &target_registration,
+                            split_request,
+                            publication.pane(),
+                        )
+                        .map_err(|err| {
+                            self.fail_local_mirror_publication(
+                                err.context("failed to publish initial tmux split pane"),
+                            )
+                        })?;
+                        let inserted_index = tab
+                            .iter_panes_ignoring_zoom()
+                            .into_iter()
+                            .find(|positioned| {
+                                Arc::ptr_eq(&positioned.pane, publication.pane())
+                            })
+                            .map(|positioned| positioned.index)
+                            .ok_or_else(|| {
+                                self.fail_local_mirror_publication(anyhow!(
+                                    "committed initial tmux pane {} disappeared from tab {}",
+                                    p.pane_id,
+                                    tab.tab_id()
+                                ))
+                            })?;
+                        split_pane_index = next_split_pane_index(inserted_index);
+                        publication.commit();
                     } else {
                         let remote_pane = {
                             let pane_map = self.remote_panes.lock();
