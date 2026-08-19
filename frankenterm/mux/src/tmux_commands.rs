@@ -313,6 +313,38 @@ struct TmuxNotificationIntentRunnableLease {
     completed: bool,
 }
 
+/// Rollback authority for an existing remote pane whose local mirror is not
+/// yet structurally published. Initial window synchronization discovers these
+/// panes rather than spawning them, so rollback fences the local child without
+/// sending a destructive `kill-pane` to the authoritative tmux session.
+struct TmuxInitialPanePublication<'owner> {
+    owner: &'owner TmuxDomainState,
+    pane: Arc<dyn Pane>,
+    remote_gate: crate::tmux::RefTmuxRemotePane,
+    remote_pane_id: TmuxPaneId,
+    remote_window_id: TmuxWindowId,
+    local_pane_id: PaneId,
+    armed: bool,
+}
+
+impl TmuxInitialPanePublication<'_> {
+    fn pane(&self) -> &Arc<dyn Pane> {
+        &self.pane
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmuxInitialPanePublication<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.owner.rollback_initial_pane_publication(self);
+        }
+    }
+}
+
 impl Drop for TmuxNotificationIntentRunnableLease {
     fn drop(&mut self) {
         if self.completed {
@@ -368,31 +400,6 @@ impl TmuxDomainState {
     pub fn check_window_attached(&self, window_id: TmuxWindowId) -> bool {
         let gui_tabs = self.gui_tabs.lock();
         return gui_tabs.get(&window_id).is_some();
-    }
-
-    /// after we create a tab for a remote pane, save its ID into the
-    /// TmuxPane-TmuxPane tree, so we can ref it later.
-    fn add_attached_pane(
-        &self,
-        window_id: TmuxWindowId,
-        pane_id: TmuxPaneId,
-    ) -> anyhow::Result<()> {
-        let mut gui_tabs = self.gui_tabs.lock();
-
-        let panes = match gui_tabs.get_mut(&window_id) {
-            Some(tab) => &mut tab.panes,
-            None => anyhow::bail!("The window {window_id} is not attached"),
-        };
-
-        match panes.get(&pane_id) {
-            Some(_) => {
-                anyhow::bail!("Tmux pane already attached");
-            }
-            None => {
-                panes.insert(pane_id);
-                return Ok(());
-            }
-        }
     }
 
     fn add_attached_window(&self, target: &WindowItem, tab_id: &TabId) -> anyhow::Result<()> {
@@ -748,50 +755,127 @@ impl TmuxDomainState {
         Ok((local_pane, ref_pane))
     }
 
-    fn create_pane(&self, pane: &PaneItem) -> anyhow::Result<Arc<dyn Pane>> {
+    fn prepare_initial_pane_publication(
+        &self,
+        pane: &PaneItem,
+    ) -> anyhow::Result<TmuxInitialPanePublication<'_>> {
         let child_state = Arc::new(TmuxChildState::new());
         let (local_pane, ref_pane) = self.construct_pane(pane, Arc::clone(&child_state))?;
         let local_pane_id = local_pane.pane_id();
-
-        let _registry = self.pane_registry.lock();
-        if self.retired_panes.lock().contains(&pane.pane_id)
-            || self
-                .remote_split_reservations
-                .lock()
-                .contains_key(&pane.pane_id)
-        {
-            child_state.mark_exited(ExitStatus::with_signal(
-                "retired tmux remote pane identity reuse",
-            ));
-            anyhow::bail!(
+        let result = (|| {
+            let _registry = self.pane_registry.lock();
+            let retired_panes = self.retired_panes.lock();
+            anyhow::ensure!(
+                !retired_panes.contains(&pane.pane_id),
                 "tmux attempted to reuse retired remote pane id {}",
                 pane.pane_id
             );
-        }
-        let mut pane_map = self.remote_panes.lock();
-        if pane_map.contains_key(&pane.pane_id) {
-            child_state.mark_exited(ExitStatus::with_signal(
-                "duplicate tmux remote pane identity",
-            ));
-            anyhow::bail!(
+            let reservations = self.remote_split_reservations.lock();
+            anyhow::ensure!(
+                !reservations.contains_key(&pane.pane_id),
+                "tmux attempted to reuse reserved remote split pane id {}",
+                pane.pane_id
+            );
+            let mut pane_map = self.remote_panes.lock();
+            anyhow::ensure!(
+                !pane_map.contains_key(&pane.pane_id),
                 "tmux remote pane {} is already mapped to a local pane",
                 pane.pane_id
             );
-        }
-        if let Err(err) = self
-            .mirror_index
-            .lock()
-            .register_pane(local_pane_id, pane.pane_id)
-        {
-            child_state.mark_exited(ExitStatus::with_signal(
-                "conflicting tmux pane reverse-index identity",
-            ));
-            return Err(err.context("failed to register tmux pane reverse index"));
-        }
-        pane_map.insert(pane.pane_id, ref_pane);
-        drop(pane_map);
+            pane_map
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve initial tmux pane mirror: {error}"))?;
+            let mut mirror_index = self.mirror_index.lock();
+            mirror_index
+                .prepare_pane_registration(local_pane_id, pane.pane_id)
+                .context("prepare initial tmux pane reverse index")?;
+            let mut gui_tabs = self.gui_tabs.lock();
+            let gui_tab = gui_tabs.get_mut(&pane.window_id).ok_or_else(|| {
+                anyhow!(
+                    "tmux window {} disappeared before initial pane publication",
+                    pane.window_id
+                )
+            })?;
+            anyhow::ensure!(
+                !gui_tab.panes.contains(&pane.pane_id),
+                "tmux pane {} is already attached to window {}",
+                pane.pane_id,
+                pane.window_id
+            );
+            gui_tab
+                .panes
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve initial tmux pane membership: {error}"))?;
 
-        Ok(local_pane)
+            let prior = pane_map.insert(pane.pane_id, Arc::clone(&ref_pane));
+            debug_assert!(prior.is_none());
+            mirror_index.commit_pane_registration(local_pane_id, pane.pane_id);
+            let inserted = gui_tab.panes.insert(pane.pane_id);
+            debug_assert!(inserted);
+
+            Ok(TmuxInitialPanePublication {
+                owner: self,
+                pane: local_pane,
+                remote_gate: ref_pane,
+                remote_pane_id: pane.pane_id,
+                remote_window_id: pane.window_id,
+                local_pane_id,
+                armed: true,
+            })
+        })();
+
+        if result.is_err() {
+            child_state.mark_exited(ExitStatus::with_signal(
+                "initial tmux pane mirror preparation failed",
+            ));
+        }
+        result
+    }
+
+    fn rollback_initial_pane_publication(&self, publication: &TmuxInitialPanePublication<'_>) {
+        let mut inconsistent = false;
+        {
+            let _registry = self.pane_registry.lock();
+            let mut pane_map = self.remote_panes.lock();
+            let removed = pane_map.remove(&publication.remote_pane_id);
+            if !matches!(
+                removed.as_ref(),
+                Some(removed) if Arc::ptr_eq(removed, &publication.remote_gate)
+            ) {
+                inconsistent = true;
+            }
+            let mut mirror_index = self.mirror_index.lock();
+            match mirror_index.unregister_pane(publication.remote_pane_id) {
+                Ok(Some(local_pane_id)) if local_pane_id == publication.local_pane_id => {}
+                _ => inconsistent = true,
+            }
+            let mut gui_tabs = self.gui_tabs.lock();
+            let removed_membership = gui_tabs
+                .get_mut(&publication.remote_window_id)
+                .is_some_and(|tab| tab.panes.remove(&publication.remote_pane_id));
+            if !removed_membership {
+                inconsistent = true;
+            }
+            self.backlog
+                .lock()
+                .remove_many(&[publication.remote_pane_id]);
+        }
+
+        let mut remote = publication.remote_gate.lock();
+        remote.child_state.mark_exited(ExitStatus::with_signal(
+            "initial tmux pane publication rolled back",
+        ));
+        remote.output_state = TmuxPaneOutputState::Retired;
+        remote.output_ingress.clear();
+        drop(remote);
+
+        if inconsistent {
+            log::error!(
+                "initial tmux pane {} rollback lost exact mirror ownership",
+                publication.remote_pane_id
+            );
+        }
+        self.transition_to_exit_and_schedule_detach();
     }
 
     fn finish_fresh_split(&self, pane_id: TmuxPaneId) -> anyhow::Result<()> {

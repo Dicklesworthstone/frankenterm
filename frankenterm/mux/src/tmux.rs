@@ -1167,7 +1167,7 @@ pub(crate) struct TmuxMirrorIndex {
 }
 
 impl TmuxMirrorIndex {
-    fn prepare_pane_registration(
+    pub(crate) fn prepare_pane_registration(
         &mut self,
         local_pane_id: PaneId,
         remote_pane_id: TmuxPaneId,
@@ -1189,7 +1189,7 @@ impl TmuxMirrorIndex {
         Ok(())
     }
 
-    fn commit_pane_registration(
+    pub(crate) fn commit_pane_registration(
         &mut self,
         local_pane_id: PaneId,
         remote_pane_id: TmuxPaneId,
@@ -4908,10 +4908,16 @@ impl TmuxDomainState {
                             _ => inconsistent = true,
                         }
                         match reservation.published_window_id {
-                            Some(window_id) => match gui_tabs.get_mut(&window_id) {
-                                Some(tab) if tab.panes.remove(&reservation.remote_pane_id) => {}
-                                _ => inconsistent = true,
-                            },
+                            Some(window_id) => {
+                                let removed_membership = gui_tabs
+                                    .get_mut(&window_id)
+                                    .is_some_and(|tab| {
+                                        tab.panes.remove(&reservation.remote_pane_id)
+                                    });
+                                if !removed_membership {
+                                    inconsistent = true;
+                                }
+                            }
                             None => inconsistent = true,
                         }
                         if reservation
@@ -5077,10 +5083,15 @@ impl TmuxDomainState {
         mirror_index.commit_pane_registration(local_pane_id, reservation.remote_pane_id);
         let inserted = gui_tab.panes.insert(reservation.remote_pane_id);
         debug_assert!(inserted);
-        reservation.state.transition(
-            TmuxRemoteSplitState::Reserved,
-            TmuxRemoteSplitState::Published,
-        )?;
+        reservation
+            .state
+            .transition(
+                TmuxRemoteSplitState::Reserved,
+                TmuxRemoteSplitState::Published,
+            )
+            .expect(
+                "exact reserved split state remains stable under the pane-registry transaction",
+            );
         remote.output_state = TmuxPaneOutputState::Ready;
         drop(remote);
         drop(gui_tabs);

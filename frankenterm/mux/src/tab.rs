@@ -5757,7 +5757,7 @@ impl Tab {
         mux: &Arc<Mux>,
         expected_domain: &Arc<dyn Domain>,
         expected_domain_id: DomainId,
-        expected_window_id: WindowId,
+        expected_window_id: Option<WindowId>,
         target_registration: &PaneRegistrationHandle,
         unpublished: UnpublishedPane,
         geometry: PreparedFloatingPaneGeometry,
@@ -7942,6 +7942,10 @@ impl Tab {
         split: Option<(&PaneRegistrationHandle, SplitRequest)>,
         pane: &Arc<dyn Pane>,
     ) -> anyhow::Result<PaneRegistrationHandle> {
+        anyhow::ensure!(
+            split.is_some() || expected_window_id.is_none(),
+            "root pane publication must target an unattached tab"
+        );
         let pane_id = observe_pane_id_for_mutation(pane)?;
         let mut preparation_claim = mux
             .claim_pane_preparation(pane)?
@@ -8079,16 +8083,26 @@ impl Tab {
             })?;
             let mut windows = mux.windows.write();
             let tab_parents = mux.tab_parents.read();
-            anyhow::ensure!(
-                tab_parents
-                    .get(&self.tab_id)
-                    .is_some_and(|parent| parent.matches(self, expected_window_id))
-                    && windows
-                        .get(&expected_window_id)
-                        .is_some_and(|window| window.iter().any(|tab| Arc::ptr_eq(tab, self))),
-                "destination tab {} changed exact window parent before tiled commit",
-                self.tab_id
-            );
+            match expected_window_id {
+                Some(expected_window_id) => anyhow::ensure!(
+                    tab_parents
+                        .get(&self.tab_id)
+                        .is_some_and(|parent| parent.matches(self, expected_window_id))
+                        && windows
+                            .get(&expected_window_id)
+                            .is_some_and(|window| window.iter().any(|tab| Arc::ptr_eq(tab, self))),
+                    "destination tab {} changed exact window parent before tiled commit",
+                    self.tab_id
+                ),
+                None => anyhow::ensure!(
+                    !tab_parents.contains_key(&self.tab_id)
+                        && windows
+                            .values()
+                            .all(|window| window.iter().all(|tab| !Arc::ptr_eq(tab, self))),
+                    "unattached destination tab {} acquired a window parent before root-pane commit",
+                    self.tab_id
+                ),
+            }
             let mut workspace_counts = mux.num_panes_by_workspace.write();
 
             if let Some(target_registration) = target_registration {
@@ -8252,14 +8266,13 @@ impl Tab {
         mux: &Arc<Mux>,
         expected_domain: &Arc<dyn Domain>,
         expected_domain_id: DomainId,
-        expected_window_id: WindowId,
         pane: &Arc<dyn Pane>,
     ) -> anyhow::Result<PaneRegistrationHandle> {
         self.commit_unregistered_tiled_pane(
             mux,
             expected_domain,
             expected_domain_id,
-            expected_window_id,
+            None,
             None,
             pane,
         )
@@ -8280,7 +8293,27 @@ impl Tab {
             mux,
             expected_domain,
             expected_domain_id,
-            expected_window_id,
+            Some(expected_window_id),
+            Some((target, request)),
+            pane,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_unregistered_unattached_split_pane(
+        self: &Arc<Self>,
+        mux: &Arc<Mux>,
+        expected_domain: &Arc<dyn Domain>,
+        expected_domain_id: DomainId,
+        target: &PaneRegistrationHandle,
+        request: SplitRequest,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<PaneRegistrationHandle> {
+        self.commit_unregistered_tiled_pane(
+            mux,
+            expected_domain,
+            expected_domain_id,
+            None,
             Some((target, request)),
             pane,
         )
