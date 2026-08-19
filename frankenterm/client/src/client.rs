@@ -8982,12 +8982,17 @@ mod tests {
         assert!(error.contains("code=backend_failure"));
         assert!(error.starts_with("FRANKENTERM_MUX_ERROR_V1 "));
         assert!(error.contains(&format!("request_ident={}", Ping::IDENT)));
+        assert!(error.contains(&format!("response_request_ident={}", Ping::IDENT)));
+        assert!(error.contains("operation=ping"));
+        assert!(error.contains("object=none"));
         assert!(error.contains("effect=not_applied"));
         assert!(error.contains("retry=safe_after_backoff"));
         assert!(!error.contains("SECRET_REMOTE_STDERR_CANARY"));
 
         let mismatch = remote_rejection_error("ping", ListPanes::IDENT, &response).to_string();
         assert!(mismatch.contains("code=unknown_future"));
+        assert!(mismatch.contains(&format!("request_ident={}", ListPanes::IDENT)));
+        assert!(mismatch.contains(&format!("response_request_ident={}", Ping::IDENT)));
         assert!(mismatch.contains("effect=unknown_future"));
         assert!(mismatch.contains("retry=unknown_future"));
     }
