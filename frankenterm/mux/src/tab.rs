@@ -5,7 +5,7 @@ use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{
     FrozenFloatingPaneSpawn, Mux, MuxNotification, MuxNotificationEnvelope, PaneOperationGuard,
-    PaneRegistrationHandle, WindowId,
+    PaneRegistrationHandle, PaneStructuralLane, WindowId,
 };
 use anyhow::Context;
 use bintree::PathBranch;
@@ -3993,6 +3993,14 @@ impl Tab {
         self.inner.lock().is_active_mux_owner(mux)
     }
 
+    fn exact_registered_arc(&self, mux: &Mux) -> Option<Arc<Self>> {
+        mux.tabs
+            .read()
+            .get(&self.tab_id)
+            .filter(|tab| std::ptr::eq(Arc::as_ptr(tab), self))
+            .cloned()
+    }
+
     #[cfg(test)]
     pub(crate) fn mux_owner_generation_for_test(&self) -> u64 {
         self.inner.lock().mux_owner_generation
@@ -5942,7 +5950,76 @@ impl Tab {
     /// This is suitable when creating a new tab and then assigning
     /// the initial pane
     pub fn assign_pane(&self, pane: &Arc<dyn Pane>) {
-        self.inner.lock().assign_pane(pane)
+        let pane_id = match observe_pane_id_for_mutation(pane) {
+            Ok(pane_id) => pane_id,
+            Err(error) => {
+                log::error!("refusing root-pane assignment: {error:#}");
+                return;
+            }
+        };
+        let owner = self.inner.lock().notification_owner();
+        let Some(mux) = owner else {
+            self.inner.lock().assign_pane(pane);
+            return;
+        };
+
+        let _registration = mux.pane_registration.lock();
+        let mut authority = mux.pane_authority.lock();
+        let Some(registered_tab) = self.exact_registered_arc(&mux) else {
+            log::error!(
+                "refusing pane {pane_id} assignment: tab {} lost exact mux registration",
+                self.tab_id
+            );
+            return;
+        };
+        let mut inner = self.inner.lock();
+        if !inner.is_active_mux_owner(&mux) {
+            return;
+        }
+        if !inner.snapshot_panes_callback_free().is_empty() {
+            inner.assign_pane(pane);
+            return;
+        }
+        let (pane_registration, domain_id) = {
+            let panes = mux.panes.read();
+            let Some(registered) = panes.get(&pane_id) else {
+                log::error!(
+                    "refusing pane {pane_id} assignment: pane is not registered in the owning mux"
+                );
+                return;
+            };
+            if !Arc::ptr_eq(&registered.pane, pane) {
+                log::error!(
+                    "refusing pane {pane_id} assignment: numeric slot names another exact allocation"
+                );
+                return;
+            }
+            (
+                PaneRegistrationHandle::new(&registered.pane, &registered.generation),
+                registered.domain_id,
+            )
+        };
+        if !authority.contains_live_registration(pane_id, domain_id, &pane_registration) {
+            log::error!(
+                "refusing pane {pane_id} assignment: exact domain-registration authority is absent"
+            );
+            return;
+        }
+        let structural = match authority.prepare_structural_bind(
+            pane_id,
+            Arc::clone(pane),
+            registered_tab,
+            PaneStructuralLane::Tiled,
+            Some((pane_registration, domain_id)),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                log::error!("refusing pane {pane_id} assignment: {error:#}");
+                return;
+            }
+        };
+        inner.assign_pane(pane);
+        authority.commit_structural_bind(structural);
     }
 
     /// Swap the active pane with the specified pane_index
@@ -5981,9 +6058,58 @@ impl Tab {
         request: SplitRequest,
         pane: Arc<dyn Pane>,
     ) -> anyhow::Result<usize> {
-        self.inner
-            .lock()
-            .split_and_insert(pane_index, request, pane)
+        let pane_id = observe_pane_id_for_mutation(&pane)?;
+        let owner = self.inner.lock().notification_owner();
+        let Some(mux) = owner else {
+            return self
+                .inner
+                .lock()
+                .split_and_insert(pane_index, request, pane);
+        };
+
+        let _registration = mux.pane_registration.lock();
+        let mut authority = mux.pane_authority.lock();
+        let registered_tab = self
+            .exact_registered_arc(&mux)
+            .ok_or_else(|| anyhow::anyhow!("tab {} lost exact mux registration", self.tab_id))?;
+        let mut inner = self.inner.lock();
+        anyhow::ensure!(
+            inner.is_active_mux_owner(&mux),
+            "tab {} lost active mux-owner authority",
+            self.tab_id
+        );
+        let (pane_registration, domain_id) = {
+            let panes = mux.panes.read();
+            let registered = panes.get(&pane_id).ok_or_else(|| {
+                anyhow::anyhow!("split pane {pane_id} is not registered in the owning mux")
+            })?;
+            anyhow::ensure!(
+                Arc::ptr_eq(&registered.pane, &pane),
+                "split pane {pane_id} was replaced by another exact allocation"
+            );
+            (
+                PaneRegistrationHandle::new(&registered.pane, &registered.generation),
+                registered.domain_id,
+            )
+        };
+        anyhow::ensure!(
+            authority.contains_live_registration(
+                pane_id,
+                domain_id,
+                &pane_registration,
+            ),
+            "split pane {pane_id} lacks exact domain-registration authority"
+        );
+        let structural = authority.prepare_structural_bind(
+            pane_id,
+            Arc::clone(&pane),
+            registered_tab,
+            PaneStructuralLane::Tiled,
+            Some((pane_registration, domain_id)),
+        )?;
+        let inserted = inner.split_and_insert(pane_index, request, pane)?;
+        authority.commit_structural_bind(structural);
+        Ok(inserted)
     }
 
     pub fn get_zoomed_pane(&self) -> Option<Arc<dyn Pane>> {
