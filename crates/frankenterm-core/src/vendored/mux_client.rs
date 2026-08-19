@@ -14108,9 +14108,10 @@ mod tests {
     fn tiered_scrollback_bulk_rejects_invalid_batches_before_wire() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = temp_dir
-                .path()
-                .join("mux-tiered-scrollback-prewrite-rejections.sock");
+            // Keep the leaf deliberately short: RCH and macOS both place
+            // temporary directories under prefixes that can approach the
+            // platform's small sockaddr_un path limit.
+            let socket_path = temp_dir.path().join("tiered-invalid.sock");
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
             let server = task::spawn(async move {
                 let mut stream = accept_direct_mux_handshake(
