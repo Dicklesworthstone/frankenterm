@@ -4423,7 +4423,7 @@ mod hardened_tests {
             palette: if kind == RenderApplicationKind::Snapshot {
                 codec::RenderComponentUpdate::Replace(codec::SetPalette {
                     pane_id,
-                    palette: wezterm_term::color::ColorPalette::default(),
+                    palette: Arc::new(wezterm_term::color::ColorPalette::default()),
                 })
             } else {
                 codec::RenderComponentUpdate::Unchanged
@@ -4829,7 +4829,7 @@ mod hardened_tests {
             });
         snapshot.palette = codec::RenderComponentUpdate::Replace(codec::SetPalette {
             pane_id: snapshot.identity.pane_id,
-            palette: wezterm_term::color::ColorPalette::default(),
+            palette: Arc::new(wezterm_term::color::ColorPalette::default()),
         });
         tracker
             .begin(&snapshot_claim, &snapshot, 1_011)

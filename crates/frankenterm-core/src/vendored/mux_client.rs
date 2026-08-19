@@ -10188,95 +10188,101 @@ mod tests {
         });
     }
 
-    #[test]
-    fn concurrent_connect_attempts_assign_unique_connection_ids() {
-        run_async_test(async {
-            let temp_dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = temp_dir.path().join("concurrent-connect.sock");
-            let listener = compat_unix::bind(&socket_path)
-                .await
-                .expect("bind listener");
-            let expected_clients = 4usize;
+    async fn assert_concurrent_connect_attempts_assign_unique_connection_ids(
+        expected_clients: usize,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp_dir.path().join("concurrent-connect.sock");
+        let listener = compat_unix::bind(&socket_path)
+            .await
+            .expect("bind listener");
 
-            let server = task::spawn(async move {
-                let mut handlers = Vec::with_capacity(expected_clients);
-                for _ in 0..expected_clients {
-                    let (mut stream, _) = listener.accept().await.expect("accept");
-                    handlers.push(task::spawn(async move {
-                        let mut read_buf = StreamingPduBuffer::new();
-                        loop {
-                            let mut temp = vec![0u8; 4096];
-                            let read = unix_stream_read(&mut stream, &mut temp)
-                                .await
-                                .expect("read");
-                            if read == 0 {
-                                break;
-                            }
-                            read_buf.extend_from_slice(&temp[..read]);
-
-                            while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
-                                let response = match decoded.pdu {
-                                    Pdu::GetCodecVersion(_) => {
-                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
-                                            codec_vers: CODEC_VERSION,
-                                            version_string: "concurrent-connect-test".to_string(),
-                                            executable_path: PathBuf::from("/bin/wezterm"),
-                                            config_file_path: None,
-                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
-                                        })
-                                    }
-                                    Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                                    Pdu::ListPanes(_) => {
-                                        Pdu::ListPanesResponse(ListPanesResponse {
-                                            tabs: Vec::new(),
-                                            tab_titles: Vec::new(),
-                                            window_titles: HashMap::new(),
-                                            floating_panes: Vec::new(),
-                                        })
-                                    }
-                                    _ => continue,
-                                };
-
-                                let mut out = Vec::new();
-                                response
-                                    .encode(&mut out, decoded.serial)
-                                    .expect("encode response");
-                                stream.write_all(&out).await.expect("write response");
-                            }
-                        }
-                    }));
-                }
-
-                for handler in handlers {
-                    handler.await.expect("connection handler");
-                }
-            });
-
-            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-            let mut joins = Vec::with_capacity(expected_clients);
+        let server = task::spawn(async move {
+            let mut handlers = Vec::with_capacity(expected_clients);
             for _ in 0..expected_clients {
-                let config = config.clone();
-                joins.push(task::spawn(async move {
-                    let mut client = DirectMuxClient::connect(config).await.expect("connect");
-                    let _ = client.list_panes().await.expect("list panes");
-                    client.connection_id
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                handlers.push(task::spawn(async move {
+                    let mut read_buf = StreamingPduBuffer::new();
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "concurrent-connect-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::ListPanes(_) => Pdu::ListPanesResponse(ListPanesResponse {
+                                    tabs: Vec::new(),
+                                    tab_titles: Vec::new(),
+                                    window_titles: HashMap::new(),
+                                    floating_panes: Vec::new(),
+                                }),
+                                _ => continue,
+                            };
+
+                            let mut out = Vec::new();
+                            response
+                                .encode(&mut out, decoded.serial)
+                                .expect("encode response");
+                            stream.write_all(&out).await.expect("write response");
+                        }
+                    }
                 }));
             }
 
-            let mut ids = HashSet::new();
-            for join in joins {
-                let id = join.await.expect("join connect task");
-                assert!(id > 0, "connection id should be positive");
-                ids.insert(id);
+            for handler in handlers {
+                handler.await.expect("connection handler");
             }
-            assert_eq!(
-                ids.len(),
-                expected_clients,
-                "each concurrent connect should get a unique connection id"
-            );
-
-            server.await.expect("server task");
         });
+
+        let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+        let mut joins = Vec::with_capacity(expected_clients);
+        for _ in 0..expected_clients {
+            let config = config.clone();
+            joins.push(task::spawn(async move {
+                let mut client = DirectMuxClient::connect(config).await.expect("connect");
+                let _ = client.list_panes().await.expect("list panes");
+                client.connection_id
+            }));
+        }
+
+        let mut ids = HashSet::new();
+        for join in joins {
+            let id = join.await.expect("join connect task");
+            assert!(id > 0, "connection id should be positive");
+            ids.insert(id);
+        }
+        assert_eq!(
+            ids.len(),
+            expected_clients,
+            "each concurrent connect should get a unique connection id"
+        );
+
+        server.await.expect("server task");
+    }
+
+    #[test]
+    fn concurrent_connect_attempts_assign_unique_connection_ids() {
+        run_async_test(assert_concurrent_connect_attempts_assign_unique_connection_ids(4));
+    }
+
+    #[test]
+    fn thirty_two_concurrent_connect_attempts_keep_unique_connection_ids() {
+        run_async_test(assert_concurrent_connect_attempts_assign_unique_connection_ids(32));
     }
 
     #[test]

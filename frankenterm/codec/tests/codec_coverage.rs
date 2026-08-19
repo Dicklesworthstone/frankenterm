@@ -139,7 +139,7 @@ fn pane_id_for_set_clipboard_variant() {
 fn pane_id_for_set_palette_variant() {
     let pdu = Pdu::SetPalette(SetPalette {
         pane_id: 55,
-        palette: ColorPalette::default(),
+        palette: std::sync::Arc::new(ColorPalette::default()),
     });
     assert_eq!(pdu.pane_id(), Some(55));
 }

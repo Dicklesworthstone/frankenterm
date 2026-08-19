@@ -3173,7 +3173,7 @@ impl PaneRenderPreparation {
         };
         let palette = needs_palette.then(|| SetPalette {
             pane_id,
-            palette: pane.palette(),
+            palette: Arc::new(pane.palette()),
         });
         let source_after_effects = pane.get_current_seqno();
         if source_after_effects != source_start {
@@ -3739,7 +3739,7 @@ fn maybe_push_pane_changes(
                 Alert::PaletteChanged => sender.send_bulk(DecodedPdu {
                     pdu: Pdu::SetPalette(SetPalette {
                         pane_id: pane.pane_id(),
-                        palette: pane.palette(),
+                        palette: Arc::new(pane.palette()),
                     }),
                     serial: 0,
                 }),
@@ -7343,7 +7343,7 @@ impl SessionHandler {
                     catch(
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
-                                pane.set_client_palette(palette);
+                                pane.set_client_palette(Arc::unwrap_or_clone(palette));
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             })
                         },

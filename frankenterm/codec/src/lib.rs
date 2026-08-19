@@ -3467,6 +3467,13 @@ macro_rules! pdu {
             )*
         ];
 
+        #[cfg(test)]
+        const PDU_VARIANT_PAYLOAD_LAYOUT_BYTES: &[(&str, usize)] = &[
+            $(
+                (stringify!($name), std::mem::size_of::<$name>()),
+            )*
+        ];
+
         impl Pdu {
             pub fn encode<W: std::io::Write>(&self, w: W, serial: u64) -> Result<(), Error> {
                 self.encode_with_mode(w, serial, CompressionMode::Auto)
@@ -12173,7 +12180,10 @@ pub struct SetActiveWorkspace {
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetPalette {
     pub pane_id: PaneId,
-    pub palette: ColorPalette,
+    /// Cold, comparatively large palette state is shared so that this rare
+    /// variant does not inflate every [`Pdu`] on the interactive hot path.
+    /// `Arc<T>` is serde-transparent, so the wire schema remains unchanged.
+    pub palette: Arc<ColorPalette>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -14239,6 +14249,69 @@ mod test {
             },
             Pdu::decode(encoded.as_slice()).unwrap()
         );
+    }
+
+    #[test]
+    fn pdu_layout_diagnostic_reports_largest_inline_payload() {
+        let &(largest_name, largest_bytes) = PDU_VARIANT_PAYLOAD_LAYOUT_BYTES
+            .iter()
+            .max_by_key(|(_, bytes)| *bytes)
+            .expect("PDU registry must not be empty");
+        eprintln!(
+            "PDU_LAYOUT enum_bytes={} largest_payload={} largest_payload_bytes={}",
+            std::mem::size_of::<Pdu>(),
+            largest_name,
+            largest_bytes,
+        );
+        assert!(
+            std::mem::size_of::<Pdu>() >= largest_bytes,
+            "the enum must accommodate its largest inline payload"
+        );
+        assert!(
+            std::mem::size_of::<Pdu>() <= 1024,
+            "cold payload ownership inflated every PDU: enum={} largest={} payload={}",
+            std::mem::size_of::<Pdu>(),
+            largest_name,
+            largest_bytes,
+        );
+    }
+
+    #[test]
+    fn shared_palette_preserves_legacy_inline_wire_bytes_and_clone_shares_storage() {
+        #[derive(Serialize)]
+        struct LegacyInlineSetPalette<'a> {
+            pane_id: PaneId,
+            palette: &'a ColorPalette,
+        }
+
+        let palette = ColorPalette::default();
+        let shared = SetPalette {
+            pane_id: 73,
+            palette: Arc::new(palette.clone()),
+        };
+        let cloned = shared.clone();
+        assert!(Arc::ptr_eq(&shared.palette, &cloned.palette));
+
+        let shared_payload = serialize_pdu_payload(
+            &shared,
+            &SetPalette::WIRE_SPEC,
+            41,
+            CompressionMode::Never,
+        )
+        .expect("serialize shared palette payload");
+        let legacy_payload = serialize_pdu_payload(
+            &LegacyInlineSetPalette {
+                pane_id: shared.pane_id,
+                palette: &palette,
+            },
+            &SetPalette::WIRE_SPEC,
+            41,
+            CompressionMode::Never,
+        )
+        .expect("serialize legacy inline palette payload");
+        assert!(!shared_payload.is_compressed);
+        assert!(!legacy_payload.is_compressed);
+        assert_eq!(shared_payload.data, legacy_payload.data);
     }
 
     #[test]
@@ -21569,7 +21642,7 @@ mod test {
     fn pdu_wire_registry_covers_every_assigned_id_and_only_the_historical_gaps() {
         const GAPS: &[u64] = &[5, 6, 7, 15, 16, 17, 18, 19, 21];
 
-        for ident in 0..=95 {
+        for ident in 0..=97 {
             let spec = Pdu::wire_spec_for_ident(ident);
             assert_eq!(
                 spec.is_none(),
@@ -21583,9 +21656,9 @@ mod test {
             }
         }
 
-        assert!(Pdu::wire_spec_for_ident(96).is_none());
+        assert!(Pdu::wire_spec_for_ident(98).is_none());
         assert!(Pdu::wire_spec_for_ident(u64::MAX).is_none());
-        assert_eq!(Pdu::all_wire_specs().len(), 96 - GAPS.len());
+        assert_eq!(Pdu::all_wire_specs().len(), 98 - GAPS.len());
     }
 
     #[test]
@@ -21608,10 +21681,11 @@ mod test {
     fn pdu_wire_registry_minimum_dialects_are_exhaustive() {
         for spec in Pdu::all_wire_specs() {
             let expected = match spec.ident {
+                0 => 61,
                 4 => 58,
                 13 => 56,
                 23 | 47 => 55,
-                0..=74 => 46,
+                1..=3 | 8..=12 | 14 | 20 | 22 | 24..=46 | 48..=74 => 46,
                 75..=78 => 47,
                 79..=80 => 48,
                 81..=83 => 49,
@@ -21620,6 +21694,7 @@ mod test {
                 91..=92 => 52,
                 93..=94 => 57,
                 95 => 59,
+                96..=97 => 60,
                 ident => panic!("unexpected assigned PDU ID {}", ident),
             };
             assert_eq!(
@@ -21654,10 +21729,11 @@ mod test {
         const CLIENT_REQUESTS: &[u64] = &[
             1, 3, 9, 11, 12, 13, 14, 22, 24, 26, 28, 31, 33, 34, 35, 36, 38, 40, 41, 43, 45, 46,
             48, 50, 51, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-            77, 80, 81, 85, 86, 88, 91, 93, 95,
+            77, 80, 81, 85, 86, 88, 91, 93, 95, 96,
         ];
         const SERVER_REPLIES: &[u64] = &[
             0, 2, 4, 8, 10, 23, 25, 27, 29, 30, 32, 42, 47, 49, 52, 61, 76, 78, 82, 87, 89, 92, 94,
+            97,
         ];
         const SERVER_UNILATERALS: &[u64] = &[
             20, 25, 37, 38, 39, 44, 53, 54, 55, 56, 57, 58, 79, 83, 84, 90,
@@ -21738,7 +21814,7 @@ mod test {
 
             let expected_class = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Class::ConnectionControl,
-                9 | 11..=13 | 73 | 95 => Class::InteractiveInput,
+                9 | 11..=13 | 73 | 95..=97 => Class::InteractiveInput,
                 8
                 | 14
                 | 20
@@ -21762,7 +21838,7 @@ mod test {
             };
             let expected_cap = match spec.ident {
                 1 | 2 | 26..=30 | 40 => Cap::Control,
-                9 | 11 | 12 | 73 | 95 => Cap::InteractiveInput,
+                9 | 11 | 12 | 73 | 95..=97 => Cap::InteractiveInput,
                 8 | 14 | 33..=36 | 38 | 43 | 45 | 48..=50 | 56..=59 | 62..=72 | 74 | 88 | 89 => {
                     Cap::InteractiveState
                 }
@@ -21787,7 +21863,7 @@ mod test {
                 | 62..=74
                 | 88
                 | 89
-                | 95 => Qos::Interactive,
+                | 95..=97 => Qos::Interactive,
                 3
                 | 22
                 | 24
@@ -24548,7 +24624,7 @@ mod test {
 
         snapshot.palette = RenderComponentUpdate::Replace(SetPalette {
             pane_id: snapshot.identity.pane_id,
-            palette: ColorPalette::default(),
+            palette: Arc::new(ColorPalette::default()),
         });
         assert_eq!(
             snapshot.validate(),

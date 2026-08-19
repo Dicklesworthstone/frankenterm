@@ -398,7 +398,7 @@ fn arb_spawn_v2() -> impl Strategy<Value = SpawnV2> {
 fn arb_set_palette() -> impl Strategy<Value = SetPalette> {
     arb_id().prop_map(|pane_id| SetPalette {
         pane_id,
-        palette: ColorPalette::default(),
+        palette: std::sync::Arc::new(ColorPalette::default()),
     })
 }
 

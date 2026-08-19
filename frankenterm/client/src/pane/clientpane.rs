@@ -1466,9 +1466,10 @@ impl ClientPane {
                     };
                 }
                 if let RenderComponentUpdate::Replace(palette) = palette {
+                    let palette = Arc::unwrap_or_clone(palette.palette);
                     *self.application_palette.lock() =
-                        palette.palette != *self.configured_palette.lock();
-                    *self.palette.lock() = palette.palette;
+                        palette != *self.configured_palette.lock();
+                    *self.palette.lock() = palette;
                     current.dispatch_alert(Alert::PaletteChanged);
                 }
                 for NotifyAlert { alert, .. } in alerts {
@@ -1649,6 +1650,7 @@ impl ClientPane {
             Pdu::SetPalette(SetPalette { palette, .. }) => {
                 rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
                     let _ = registration.try_with_current(|current| {
+                        let palette = Arc::unwrap_or_clone(palette);
                         *self.application_palette.lock() =
                             palette != *self.configured_palette.lock();
                         *self.palette.lock() = palette;
@@ -1779,7 +1781,7 @@ impl Pane for ClientPane {
         let palette = self.configured_palette.lock().clone();
         let request = client.client.set_configured_palette_for_pane(SetPalette {
             pane_id: remote_pane_id,
-            palette,
+            palette: Arc::new(palette),
         });
         promise::spawn::spawn(async move {
             let registration_is_current = mux_registration
@@ -2243,7 +2245,7 @@ impl Pane for ClientPane {
         let remote_pane_id = self.remote_pane_id;
         let request = client.client.set_configured_palette_for_pane(SetPalette {
             pane_id: remote_pane_id,
-            palette,
+            palette: Arc::new(palette),
         });
         promise::spawn::spawn(request).detach();
         self.config.lock().replace(config);
@@ -2753,7 +2755,7 @@ mod tests {
             palette: if kind == RenderApplicationKind::Snapshot {
                 RenderComponentUpdate::Replace(SetPalette {
                     pane_id,
-                    palette: ColorPalette::default(),
+                    palette: Arc::new(ColorPalette::default()),
                 })
             } else {
                 RenderComponentUpdate::Unchanged
@@ -2871,7 +2873,7 @@ mod tests {
         let application_palette = ColorPalette::default();
         update.palette = RenderComponentUpdate::Replace(SetPalette {
             pane_id: pane.remote_pane_id,
-            palette: application_palette.clone(),
+            palette: Arc::new(application_palette.clone()),
         });
         update.alerts = vec![
             NotifyAlert {
