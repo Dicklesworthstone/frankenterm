@@ -7089,6 +7089,14 @@ const ROBOT_ERR_CONFIG: &str = "robot.config_error";
 const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
 const ROBOT_ERR_APPROVAL: &str = "robot.approval_error";
 const ROBOT_ERR_PANE_NOT_FOUND: &str = "robot.pane_not_found";
+const ROBOT_ERR_TAB_NOT_FOUND: &str = "robot.tab_not_found";
+const ROBOT_ERR_WINDOW_NOT_FOUND: &str = "robot.window_not_found";
+const ROBOT_ERR_DOMAIN_NOT_FOUND: &str = "robot.domain_not_found";
+const ROBOT_ERR_MUX_CANCELLED: &str = "robot.mux_cancelled";
+const ROBOT_ERR_MUX_QUOTA_EXCEEDED: &str = "robot.mux_quota_exceeded";
+const ROBOT_ERR_MUX_BACKEND_FAILURE: &str = "robot.mux_backend_failure";
+const ROBOT_ERR_MUX_UNKNOWN_FUTURE: &str = "robot.mux_unknown_future";
+const ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE: &str = "robot.wezterm_mutation_indeterminate";
 const ROBOT_ERR_RESERVATION_CONFLICT: &str = "robot.reservation_conflict";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
 const ROBOT_ERR_STORAGE_EFFECT_INDETERMINATE: &str = "robot.storage_effect_indeterminate";
@@ -35553,7 +35561,71 @@ async fn batch_get_pane_text(
     results
 }
 
-/// Map frankenterm_core errors to stable robot error codes
+/// Map every finite mux rejection class to a stable Robot error code.
+fn map_mux_rejection_code_to_robot(
+    code: frankenterm_core::error::MuxRejectionCode,
+) -> (&'static str, Option<String>) {
+    use frankenterm_core::error::MuxRejectionCode;
+
+    match code {
+        MuxRejectionCode::PaneNotFound => (
+            ROBOT_ERR_PANE_NOT_FOUND,
+            Some("The requested mux pane no longer exists. Reconcile live mux state.".to_string()),
+        ),
+        MuxRejectionCode::TabNotFound => (
+            ROBOT_ERR_TAB_NOT_FOUND,
+            Some("The requested mux tab no longer exists. Reconcile live mux state.".to_string()),
+        ),
+        MuxRejectionCode::WindowNotFound => (
+            ROBOT_ERR_WINDOW_NOT_FOUND,
+            Some("The requested mux window no longer exists. Reconcile live mux state.".to_string()),
+        ),
+        MuxRejectionCode::DomainNotFound => (
+            ROBOT_ERR_DOMAIN_NOT_FOUND,
+            Some("The requested mux domain no longer exists. Reconcile live mux state.".to_string()),
+        ),
+        MuxRejectionCode::InvalidRequest => (
+            ROBOT_ERR_INVALID_ARGS,
+            Some("The mux rejected the request as invalid; correct it before retrying.".to_string()),
+        ),
+        MuxRejectionCode::PolicyRejected => (
+            ROBOT_ERR_POLICY_DENIED,
+            Some("Mux policy rejected the operation; review policy and approval state.".to_string()),
+        ),
+        MuxRejectionCode::Cancelled => (
+            ROBOT_ERR_MUX_CANCELLED,
+            Some("The mux operation was cancelled before it took effect.".to_string()),
+        ),
+        MuxRejectionCode::DeadlineExceeded => (
+            ROBOT_ERR_TIMEOUT,
+            Some("The mux operation exceeded its deadline before it took effect.".to_string()),
+        ),
+        MuxRejectionCode::QuotaExceeded => (
+            ROBOT_ERR_MUX_QUOTA_EXCEEDED,
+            Some("The mux operation exceeded a bounded quota; retry only after backoff.".to_string()),
+        ),
+        MuxRejectionCode::BackendFailure => (
+            ROBOT_ERR_MUX_BACKEND_FAILURE,
+            Some("The mux backend failed before applying the operation; retry after backoff.".to_string()),
+        ),
+        MuxRejectionCode::IndeterminateMutation => (
+            ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE,
+            Some(
+                "The mutation may already have taken effect. Reconcile live mux state and verify the intended postcondition; do not blindly retry."
+                    .to_string(),
+            ),
+        ),
+        MuxRejectionCode::UnknownFuture => (
+            ROBOT_ERR_MUX_UNKNOWN_FUTURE,
+            Some(
+                "The mux returned an unknown future rejection. Upgrade FrankenTerm and reconcile live mux state before retrying."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+/// Map frankenterm_core errors to stable Robot error codes.
 fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str, Option<String>) {
     use frankenterm_core::error::WeztermError;
 
@@ -35594,7 +35666,7 @@ fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str,
                 ),
             ),
             WeztermError::IndeterminateMutation { .. } => (
-                "robot.wezterm_mutation_indeterminate",
+                ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE,
                 Some(
                     "The mutation may already have taken effect. Reconcile live mux state and verify the intended postcondition; do not blindly retry."
                         .to_string(),
@@ -35624,6 +35696,9 @@ fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str,
                     "WezTerm circuit breaker is open. Retry after {retry_after_ms} ms."
                 )),
             ),
+            WeztermError::MuxRejection(rejection) => {
+                map_mux_rejection_code_to_robot(rejection.code)
+            }
         },
         _ => (
             "robot.internal_error",
@@ -96992,6 +97067,97 @@ log_level = "debug"
     }
 
     #[test]
+    fn finite_mux_rejections_have_exhaustive_stable_robot_codes() {
+        use frankenterm_core::error::{
+            MuxEffectCertainty, MuxObjectIdentity, MuxObjectKind, MuxOperation, MuxRejection,
+            MuxRejectionCode, MuxRetryAuthority, WeztermError,
+        };
+
+        let cases = [
+            (MuxRejectionCode::PaneNotFound, ROBOT_ERR_PANE_NOT_FOUND),
+            (MuxRejectionCode::TabNotFound, ROBOT_ERR_TAB_NOT_FOUND),
+            (MuxRejectionCode::WindowNotFound, ROBOT_ERR_WINDOW_NOT_FOUND),
+            (MuxRejectionCode::DomainNotFound, ROBOT_ERR_DOMAIN_NOT_FOUND),
+            (MuxRejectionCode::InvalidRequest, ROBOT_ERR_INVALID_ARGS),
+            (MuxRejectionCode::PolicyRejected, ROBOT_ERR_POLICY_DENIED),
+            (MuxRejectionCode::Cancelled, ROBOT_ERR_MUX_CANCELLED),
+            (MuxRejectionCode::DeadlineExceeded, ROBOT_ERR_TIMEOUT),
+            (
+                MuxRejectionCode::QuotaExceeded,
+                ROBOT_ERR_MUX_QUOTA_EXCEEDED,
+            ),
+            (
+                MuxRejectionCode::BackendFailure,
+                ROBOT_ERR_MUX_BACKEND_FAILURE,
+            ),
+            (
+                MuxRejectionCode::IndeterminateMutation,
+                ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE,
+            ),
+            (
+                MuxRejectionCode::UnknownFuture,
+                ROBOT_ERR_MUX_UNKNOWN_FUTURE,
+            ),
+        ];
+
+        for (code, expected) in cases {
+            let object = match code {
+                MuxRejectionCode::PaneNotFound => Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Pane,
+                    id: 7,
+                }),
+                MuxRejectionCode::TabNotFound => Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Tab,
+                    id: 8,
+                }),
+                MuxRejectionCode::WindowNotFound => Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Window,
+                    id: 9,
+                }),
+                MuxRejectionCode::DomainNotFound => Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Domain,
+                    id: 10,
+                }),
+                _ => None,
+            };
+            let (effect, retry) = match code {
+                MuxRejectionCode::DeadlineExceeded
+                | MuxRejectionCode::QuotaExceeded
+                | MuxRejectionCode::BackendFailure => (
+                    MuxEffectCertainty::NotApplied,
+                    MuxRetryAuthority::SafeAfterBackoff,
+                ),
+                MuxRejectionCode::IndeterminateMutation => (
+                    MuxEffectCertainty::Indeterminate,
+                    MuxRetryAuthority::ReconcileBeforeRetry,
+                ),
+                MuxRejectionCode::UnknownFuture => (
+                    MuxEffectCertainty::UnknownFuture,
+                    MuxRetryAuthority::UnknownFuture,
+                ),
+                _ => (MuxEffectCertainty::NotApplied, MuxRetryAuthority::Never),
+            };
+            let rejection = MuxRejection {
+                code,
+                operation: if matches!(code, MuxRejectionCode::UnknownFuture) {
+                    MuxOperation::UnknownRequest
+                } else {
+                    MuxOperation::ListPanes
+                },
+                object,
+                effect,
+                retry,
+            };
+            assert!(rejection.has_consistent_authority());
+
+            let error = frankenterm_core::Error::Wezterm(WeztermError::MuxRejection(rejection));
+            let (actual, hint) = map_wezterm_error_to_robot(&error);
+            assert_eq!(actual, expected);
+            assert!(hint.is_some_and(|value| !value.is_empty()));
+        }
+    }
+
+    #[test]
     fn indeterminate_mux_mutation_maps_to_reconciliation_without_retry() {
         let error = frankenterm_core::Error::Wezterm(
             frankenterm_core::error::WeztermError::IndeterminateMutation {
@@ -96999,7 +97165,7 @@ log_level = "debug"
             },
         );
         let (code, hint) = map_wezterm_error_to_robot(&error);
-        assert_eq!(code, "robot.wezterm_mutation_indeterminate");
+        assert_eq!(code, ROBOT_ERR_WEZTERM_MUTATION_INDETERMINATE);
         let hint = hint.expect("indeterminate mutation must carry reconciliation guidance");
         assert!(hint.contains("Reconcile live mux state"));
         assert!(hint.contains("do not blindly retry"));
