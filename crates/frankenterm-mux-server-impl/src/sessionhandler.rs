@@ -21,7 +21,8 @@ use codec::{
     PaneTieredScrollbackStatusOutcomeV1, Pdu, PduProducer, PduWireRole, Ping, Pong,
     ReliableInputSchedulerPressureV1, ReliableKeyEventKindV1, ReliableKeyEventOutcomeV1,
     ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventV1,
-    ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1, RemoveFloatingPane,
+    ReliableKeyEventTracedV1, ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1,
+    RemoveFloatingPane,
     RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
     SendKeyDown, SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace,
     SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
@@ -29,18 +30,21 @@ use codec::{
     ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
-use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceContextV1;
+use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
+    RecorderEpochId, RecorderMode, RecorderSamplerAlgorithm, RecorderSamplerConfigV1,
+    SampledTraceContextV1,
+};
 use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceClockDomain, InteractionTraceCorrelation,
     InteractionTraceCounterUnavailability, InteractionTraceCounters, InteractionTraceGenerations,
     InteractionTraceObservationBoundary, InteractionTraceProducer,
     InteractionTraceSchedulerQueueEvidence, InteractionTraceStage, InteractionTraceStageOutcome,
-    InteractionTraceTimestamp, InteractionTraceTopology,
+    InteractionTraceRunId, InteractionTraceTimestamp, InteractionTraceTopology,
 };
 use frankenterm_core_audit_types::renderer_scenario_catalog::RendererKeypressTraceStage;
 use frankenterm_flight_recorder::{
-    ClockStamp, EventFields, FlightRecorder, ProducerHandle, RecordOutcome, RecorderError,
-    TraceAdmission, TraceToken,
+    ClockStamp, EventFields, FlightRecorder, ProducerHandle, RecordOutcome, RecorderConfig,
+    RecorderError, TraceAdmission, TraceToken,
 };
 use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use mux::client::ClientId;
@@ -72,6 +76,10 @@ use wezterm_term::terminal::Alert;
 
 const SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
 const RELIABLE_INPUT_RETRY_AFTER_NS: u64 = 1_000_000;
+const PRODUCTION_TRACE_SHARDS: u16 = 64;
+const PRODUCTION_TRACE_TOTAL_SLOTS: u32 = 16_384;
+const PRODUCTION_TRACE_BYTE_CEILING: u64 = 32 * 1024 * 1024;
+const PRODUCTION_TRACE_SAMPLE_DENOMINATOR: u64 = 1_024;
 
 fn record_send_key_down_scheduler_receipt(receipt: MainThreadEnqueueReceipt, sampled: bool) {
     let snapshot = receipt.snapshot_after_enqueue;
@@ -337,6 +345,53 @@ impl DispatchTraceAuthority {
             },
             clock_origin: Instant::now(),
         })
+    }
+
+    /// Construct the bounded release-default receiver for sampled remote
+    /// traces. Low mode cannot accidentally become full-trace certification;
+    /// remote contexts are already sampled by their originating authority and
+    /// are admitted without a second sampling decision.
+    pub fn production_low() -> anyhow::Result<Arc<Self>> {
+        fn uuid_halves() -> (u64, u64) {
+            let bytes = *uuid::Uuid::new_v4().as_bytes();
+            (
+                u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                    bytes[7],
+                ]),
+                u64::from_le_bytes([
+                    bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                    bytes[15],
+                ]),
+            )
+        }
+
+        let (epoch_hi, epoch_lo) = uuid_halves();
+        let epoch_id = RecorderEpochId::new(epoch_hi, epoch_lo)
+            .context("random production trace recorder epoch was reserved")?;
+        let (run_hi, run_lo) = uuid_halves();
+        let run_id = InteractionTraceRunId::new(run_hi, run_lo)
+            .context("random production trace run identity was reserved")?;
+        let (seed_hi, seed_lo) = uuid_halves();
+        let recorder_config = RecorderConfig::new(
+            epoch_id,
+            run_id,
+            RecorderMode::Low,
+            RecorderSamplerConfigV1 {
+                algorithm: RecorderSamplerAlgorithm::SplitMix64V1,
+                numerator: 1,
+                denominator: PRODUCTION_TRACE_SAMPLE_DENOMINATOR,
+                seed_hi,
+                seed_lo,
+            },
+            PRODUCTION_TRACE_SHARDS,
+            PRODUCTION_TRACE_TOTAL_SLOTS,
+            PRODUCTION_TRACE_BYTE_CEILING,
+        )
+        .context("configuring bounded production mux trace recorder")?;
+        let recorder = FlightRecorder::new(recorder_config)
+            .context("allocating bounded production mux trace recorder")?;
+        Ok(Self::new(recorder))
     }
 
     pub(crate) fn claim_session(
@@ -1353,7 +1408,9 @@ pub(crate) struct AdmittedInputTraceV1 {
     context: SampledTraceContextV1,
     stream_id: TopologyStreamId,
     pane_id: PaneId,
+    pane_registration: Option<ReliablePaneRegistrationIdentityV1>,
     input_serial: InputSerial,
+    kind: ReliableKeyEventKindV1,
     recorder_token: Option<TraceToken>,
     topology: Option<InteractionTraceTopology>,
     dispatch_queued_at: Option<Instant>,
@@ -1363,13 +1420,13 @@ pub(crate) struct AdmittedInputTraceV1 {
 
 impl AdmittedInputTraceV1 {
     pub(crate) fn admit(
-        request: &SendKeyDownTracedV1,
+        request: &ReliableKeyEventTracedV1,
         stream_id: TopologyStreamId,
         local_codec_version: usize,
     ) -> anyhow::Result<Self> {
-        if local_codec_version < codec::SAMPLED_INPUT_TRACE_V1_MIN_CODEC_VERSION {
+        if local_codec_version < codec::RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION {
             return Err(anyhow!(
-                "sampled key input is unavailable in this codec dialect"
+                "sampled reliable key input is unavailable in this codec dialect"
             ));
         }
         if stream_id.as_bytes() == [0; 16] {
@@ -1384,7 +1441,9 @@ impl AdmittedInputTraceV1 {
             context: request.trace_context,
             stream_id,
             pane_id: request.request.pane_id,
+            pane_registration: request.request.pane_registration,
             input_serial: request.request.input_serial,
+            kind: request.request.kind,
             recorder_token: None,
             topology: None,
             dispatch_queued_at: None,
@@ -1395,7 +1454,7 @@ impl AdmittedInputTraceV1 {
 
     fn validate_for_request(
         &self,
-        request: &SendKeyDownTracedV1,
+        request: &ReliableKeyEventTracedV1,
         current_stream_id: TopologyStreamId,
     ) -> anyhow::Result<()> {
         request
@@ -1412,7 +1471,9 @@ impl AdmittedInputTraceV1 {
             ));
         }
         if self.pane_id != request.request.pane_id
+            || self.pane_registration != request.request.pane_registration
             || self.input_serial != request.request.input_serial
+            || self.kind != request.request.kind
         {
             return Err(anyhow!(
                 "sampled key input request identity differs from its admission authority"
