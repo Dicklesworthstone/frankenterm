@@ -5,11 +5,94 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags**: listed under [Tags & Releases](#tags--releases)
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.13.0` tag has a published GitHub Release; `backup-before-rewrite` is a tag only.
+
+Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through HEAD on 2026-08-19 ([`bb6809b3d7ab4cda8d4f264a01718003618d8ec9`](https://github.com/Dicklesworthstone/frankenterm/commit/bb6809b3d7ab4cda8d4f264a01718003618d8ec9)). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) is now a first-class version row.
+
+## Version Timeline
+
+`Kind` distinguishes a published GitHub Release from a plain git tag. Full spine is under [Tags & Releases](#tags--releases).
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.13.0...main) | HEAD | 2026-08-19 | Mux exact-owner/census + janitor docs-reorg |
+| [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) | Release | 2026-07-28 | Test-suite honesty + tx/capture/redaction; full platform matrix |
+| [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) | Release | 2026-06-29 | asupersync 0.3.5 churn fix + window-maximize persistence |
 
 ---
 
-## [0.12.0] -- 2026-06-29
+## [Unreleased] -- development on `main` since [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) (as of 2026-08-19)
+
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.13.0...main>
+
+1,271 non-merge commits after the v0.13.0 tag. This is a navigation aid, not an exhaustive dump: the dominant landed work is mux exact-owner/census/codec authority, plus the 2026-08-19 janitor docs-reorg.
+
+### Janitor docs-reorg (2026-08-19)
+
+Root ELF/scratch and the planning/wizard cluster left the repository root and now live under `docs/`.
+
+- Removed root `pat` ELF, `output.txt`, `HELLO_AGENTS.txt`, and `claude-upgrade-progress.json`; archived one-shot bead scripts under `scripts/archive/`.
+- Relocated `PLAN.md`, `PLAN_CODEX.md`, `UPGRADE_LOG.md`, `UPGRADE_TODO.md`, `AGENT_TODO.md`, the `PLAN_TO_DEEPLY_INTEGRATE_*` series, and the full wizard-report cluster into [`docs/planning/`](https://github.com/Dicklesworthstone/frankenterm/tree/main/docs/planning) and [`docs/planning/wizards/`](https://github.com/Dicklesworthstone/frankenterm/tree/main/docs/planning/wizards).
+
+### Representative commits
+
+- [`bb6809b3d7ab4cda8d4f264a01718003618d8ec9`](https://github.com/Dicklesworthstone/frankenterm/commit/bb6809b3d7ab4cda8d4f264a01718003618d8ec9) — `chore(janitor): remove root ELF/scratch; move plans and wizard cluster into docs/`.
+
+### Mux exact-owner authority, census, and codec
+
+The post-0.13 mux campaign binds tabs and pane trees to exact owner generations, charges snapshot work against a request-scoped census ledger, and shrinks hot PDU frames.
+
+- Transport-independent `MuxOperation` identity on every mux call ([`60062f0fb0ce5717c97f7a798cb920573ed801b8`](https://github.com/Dicklesworthstone/frankenterm/commit/60062f0fb0ce5717c97f7a798cb920573ed801b8)).
+- Request-scoped pane-census ledger with exact-boundary proofs ([`33288f766d17a0c655aa59b7e0eb3d4766a3e7e3`](https://github.com/Dicklesworthstone/frankenterm/commit/33288f766d17a0c655aa59b7e0eb3d4766a3e7e3)); complete census work telemetry ([`cad84ed15f411a56364ee28af7701fcb99af56ec`](https://github.com/Dicklesworthstone/frankenterm/commit/cad84ed15f411a56364ee28af7701fcb99af56ec)); yield during large pane snapshots ([`fe0c098337d5c6c1cea093d54e2546de0181a1e0`](https://github.com/Dicklesworthstone/frankenterm/commit/fe0c098337d5c6c1cea093d54e2546de0181a1e0)).
+- Structural-owner index (tiled vs floating) and prepared pane-tree binding ([`5655efa090c35131dac0ab54d2391886b0dd23b0`](https://github.com/Dicklesworthstone/frankenterm/commit/5655efa090c35131dac0ab54d2391886b0dd23b0), [`d33b0800d2a21cd6c3f8cb151948a07051e0c9c6`](https://github.com/Dicklesworthstone/frankenterm/commit/d33b0800d2a21cd6c3f8cb151948a07051e0c9c6)); exact in-place tab-generation replace and move-by-registration ([`f28a8cc64ea9fd3f93f03f1d0e0ef971ae2a3a24`](https://github.com/Dicklesworthstone/frankenterm/commit/f28a8cc64ea9fd3f93f03f1d0e0ef971ae2a3a24)).
+- Hot mux PDU frame shrink ([`b7d0821c5b58c657e6cf63756a9a9c8048a8919d`](https://github.com/Dicklesworthstone/frankenterm/commit/b7d0821c5b58c657e6cf63756a9a9c8048a8919d)); bounded GUI scheduler lanes ([`09b3c4b1a4f60a19ead56f7f1c1d0fff03305587`](https://github.com/Dicklesworthstone/frankenterm/commit/09b3c4b1a4f60a19ead56f7f1c1d0fff03305587)).
+
+### Runtime / asupersync upgrade path
+
+- Asupersync pair advanced to 0.3.10 ([`1b5f2519457ef0a94d5a55a1903cb6cfe7f0581d`](https://github.com/Dicklesworthstone/frankenterm/commit/1b5f2519457ef0a94d5a55a1903cb6cfe7f0581d)); mixed-runtime codec prefers asupersync ([`5e04c80eac2217b7bf8ec31bcad8621a78559777`](https://github.com/Dicklesworthstone/frankenterm/commit/5e04c80eac2217b7bf8ec31bcad8621a78559777)).
+- Upgrade re-audit of the Asupersync 0.4.x gate against 0.4.8 and FastMCP 0.6.0 ([`c87a6962316aaa213a2b9c5ea6f209b8ea15b5e2`](https://github.com/Dicklesworthstone/frankenterm/commit/c87a6962316aaa213a2b9c5ea6f209b8ea15b5e2)); asupersync/fsqlite target refresh ([`c70011ae95def8131fdd02929a63fc8fedeb16a0`](https://github.com/Dicklesworthstone/frankenterm/commit/c70011ae95def8131fdd02929a63fc8fedeb16a0)).
+
+---
+
+## [0.13.0] -- 2026-07-28 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0>
+Published 2026-07-28 (`v0.13.0 — test-suite honesty campaign + tx/capture/redaction hardening; full platform matrix returns`).
+Tag `v0.13.0` created 2026-07-27 at [`c366f3ac95a2a53d6d86e438f1432bdcf4981f26`](https://github.com/Dicklesworthstone/frankenterm/commit/c366f3ac95a2a53d6d86e438f1432bdcf4981f26).
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.12.0...v0.13.0>
+
+128 commits since v0.12.0. Two campaigns: make the unfiltered `frankenterm-core --lib` suite honest (ft-nam3s — 29,600+ tests, 85 known failures → zero deterministic failures), and harden the tx/capture/redaction production paths those recovered tests exposed. Restores the full binary matrix: Linux (x86_64 + arm64), macOS (Apple Silicon CLI + FrankenTerm.app), and Windows (x86_64).
+
+### Test-suite honesty (ft-nam3s)
+
+The unfiltered `frankenterm-core --lib` suite went from never-terminating, to 85 known failures, to zero. Process-global counters/config/fault-injection became test-scoped; never-executed tests that had rotted into contradiction with production were rebuilt on their preserved intent; nine of the failures were real production bugs (fixed below).
+
+- Residual `--lib` failures cleared across 21 modules ([`cb70b68750885757ddfabf623f68c60dd2b69e9e`](https://github.com/Dicklesworthstone/frankenterm/commit/cb70b68750885757ddfabf623f68c60dd2b69e9e)).
+- Zero-failure ratchet: tx lease grace, MCP counter locks, FTS error mapping ([`a0e13e828fe5c3b69c4497c598ac72b838462a8d`](https://github.com/Dicklesworthstone/frankenterm/commit/a0e13e828fe5c3b69c4497c598ac72b838462a8d)).
+- Version bump + bounded `ETXTBSY` spawn retry in `SubprocessBridge` ([`7362cbb5ce34a6f46c30600d0456e1f764e2ea91`](https://github.com/Dicklesworthstone/frankenterm/commit/7362cbb5ce34a6f46c30600d0456e1f764e2ea91)).
+
+### Production bugs the recovered suite found
+
+- **Capture integrity** — overlap windows size from the snapshot, not a fixed budget ([`de562f2b8e5ef007c7689c172214cd3a7e6d064f`](https://github.com/Dicklesworthstone/frankenterm/commit/de562f2b8e5ef007c7689c172214cd3a7e6d064f)); coincidental/boundary-noise overlaps refused and resumed capture anchored ([`549754cd4de39916f370bc41970a073c6a29763b`](https://github.com/Dicklesworthstone/frankenterm/commit/549754cd4de39916f370bc41970a073c6a29763b)).
+- **Async runtime** — wrapper-built runtimes get a real blocking pool so `spawn_blocking` no longer runs inline and freezes timers/cancel watchers ([`f223887addbc90c47cd979e8535e827be4feb808`](https://github.com/Dicklesworthstone/frankenterm/commit/f223887addbc90c47cd979e8535e827be4feb808)).
+- **Tx engine** — contract store durable, TOCTOU-safe, and wired into production ([`37fb43d0ec74486a364af08f34cff3948926affd`](https://github.com/Dicklesworthstone/frankenterm/commit/37fb43d0ec74486a364af08f34cff3948926affd)); rollback compensation requires authoritative durable proof taken atomically before mutation ([`a5ad34ab55c8d46143b9c5c70dd3fefdcbe0d2f9`](https://github.com/Dicklesworthstone/frankenterm/commit/a5ad34ab55c8d46143b9c5c70dd3fefdcbe0d2f9)); storeless execution entrypoints sealed against effectful executors ([`e1508558cb8fc6248e458ac688f529de30439778`](https://github.com/Dicklesworthstone/frankenterm/commit/e1508558cb8fc6248e458ac688f529de30439778)).
+- **Redaction** — four bypasses closed ([`6f27516bc407635ced44cfcc52200525bce2ad12`](https://github.com/Dicklesworthstone/frankenterm/commit/6f27516bc407635ced44cfcc52200525bce2ad12)); streaming retention bounded so ordinary output drains ([`08e98414d218e4531248f54fa73c942147673ad3`](https://github.com/Dicklesworthstone/frankenterm/commit/08e98414d218e4531248f54fa73c942147673ad3)); streaming emit boundary made linear ([`44bfeba105fc3b09545175a9ee084fde1d1763d5`](https://github.com/Dicklesworthstone/frankenterm/commit/44bfeba105fc3b09545175a9ee084fde1d1763d5)).
+- **Policy & command guard** — `[safety].block_alt_screen` approval gate reachable ([`e46f9d1c62b9cc5447be333b82754e3a20ec22c0`](https://github.com/Dicklesworthstone/frankenterm/commit/e46f9d1c62b9cc5447be333b82754e3a20ec22c0)); rm/git/chmod rules attribute by command position so `aws s3 rm` / `docker rm` do not inherit `core.filesystem:rm-rf` ([`ecb6a820ded73da3e24ffc18c78f6812f44011eb`](https://github.com/Dicklesworthstone/frankenterm/commit/ecb6a820ded73da3e24ffc18c78f6812f44011eb)).
+- **Storage** — size-cap eviction deletes proportionally instead of wiping every segment ([`88e68c88a6c92fff31a78f72f70a73bc7cd52ed8`](https://github.com/Dicklesworthstone/frankenterm/commit/88e68c88a6c92fff31a78f72f70a73bc7cd52ed8)); single-append path writes semantic embeddings ([`8056b1f4e8627fa2da3c5d65650270cc6b00cbfe`](https://github.com/Dicklesworthstone/frankenterm/commit/8056b1f4e8627fa2da3c5d65650270cc6b00cbfe)); orphan pane-state cleanup counts correctly under either FK setting ([`daec3eca46cbbeafa43580088a17fc354fb2183d`](https://github.com/Dicklesworthstone/frankenterm/commit/daec3eca46cbbeafa43580088a17fc354fb2183d)).
+- **Mux / MCP** — Progress alerts no longer deduped-then-forwarded twice ([`524d1e76e44167bd39440ab56e8d0d3556f451e3`](https://github.com/Dicklesworthstone/frankenterm/commit/524d1e76e44167bd39440ab56e8d0d3556f451e3)); tx contract errors moved onto the FT-MCP taxonomy ([`9f6c5e1ce3a225a4d5e8f5c308eaa7d7c5eaa794`](https://github.com/Dicklesworthstone/frankenterm/commit/9f6c5e1ce3a225a4d5e8f5c308eaa7d7c5eaa794)).
+
+### Features
+
+- Robot connector lifecycle family: handler, persistence, and contract ([`4a6b9b22037c76e60e250ef6e7af55633ca2760e`](https://github.com/Dicklesworthstone/frankenterm/commit/4a6b9b22037c76e60e250ef6e7af55633ca2760e)).
+- `robot.tx_rollback_proof_missing` / `_conflict` published on the robot error surface ([`1282b15011fcf5d21a6a70ddfc1faf5744139184`](https://github.com/Dicklesworthstone/frankenterm/commit/1282b15011fcf5d21a6a70ddfc1faf5744139184)).
+- Product journey catalog v1 — fail-closed product truth contract ([`32d72991856a9b00d55086ca07384dc082b8a3fc`](https://github.com/Dicklesworthstone/frankenterm/commit/32d72991856a9b00d55086ca07384dc082b8a3fc)).
+- Mux-server render-delivery ledger and scheduler contracts frozen ([`5c12432bb10eb989e223122365344609d1d457bf`](https://github.com/Dicklesworthstone/frankenterm/commit/5c12432bb10eb989e223122365344609d1d457bf)).
+
+---
+
+## [0.12.0] -- 2026-06-29 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0>
 
 Runtime churn fix (asupersync 0.3.5) + window-state persistence.
 
@@ -101,9 +184,9 @@ CC=$(xcrun --find clang) CXX=$(xcrun --find clang++) cargo install ...
 
 ---
 
-## [Unreleased] -- development on `main` since the 0.1.0 baseline
+## [0.1.0+] -- development on `main` after the 0.1.0 baseline (through 2026-05-18)
 
-> Continued development after the 0.1.0 baseline. Roughly 3,550 commits land on `origin/main` between 2026-05-01 and 2026-05-18 across the concurrent agent swarm, with 3,558 commits in the same window on local `main`. Current local `main` is eight commits ahead of `origin/main`; entries marked local-only are not yet GitHub-live.
+> Historical notes written while this window was still unreleased. The work below landed on `main` between the 0.1.0 changelog baseline and the later tagged 0.2.0–0.12.0 releases; it is **not** the current Unreleased window (that is v0.13.0..HEAD at the top of this file). Roughly 3,550 commits land on `origin/main` between 2026-05-01 and 2026-05-18 across the concurrent agent swarm, with 3,558 commits in the same window on local `main` as of that snapshot.
 
 ### RCH pressure, Agent Mail failover, and static proof hardening (2026-05-18)
 
@@ -705,11 +788,28 @@ Migration: re-run `ft setup --wezterm` to update your `wezterm.lua`. The ft-mana
 
 Current refs do not include a `v0.1.0` tag; the `0.1.0` sections above are changelog milestones reconstructed from history, not published GitHub Releases.
 
-| Tag / Ref | Type | Date | Points to | Description |
-|-----------|------|------|-----------|-------------|
-| `backup-before-rewrite` | Git tag (no GitHub Release) | 2026-02-17 | [`888c17d0`](https://github.com/Dicklesworthstone/frankenterm/commit/888c17d0da2564269df114e4c5d9ecfd8edf85c5) | Snapshot before the major WezTerm source import and codebase rewrite |
+`Kind` distinguishes a published GitHub Release from a plain git tag. Every `v0.2.0`–`v0.13.0` tag below has a GitHub Release; `backup-before-rewrite` does not.
 
-There are no GitHub Releases published for this repository.
+| Tag / Ref | Kind | Date | Points to | Description |
+|-----------|------|------|-----------|-------------|
+| [`v0.13.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) | Release | 2026-07-28 | [`c366f3ac9`](https://github.com/Dicklesworthstone/frankenterm/commit/c366f3ac95a2a53d6d86e438f1432bdcf4981f26) | Test-suite honesty (ft-nam3s) + tx/capture/redaction hardening; full platform matrix returns |
+| [`v0.12.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) | Release | 2026-06-29 | tag `v0.12.0` | asupersync 0.3.5 churn fix + window-maximize persistence |
+| [`v0.11.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.11.0) | Release | 2026-06-27 | tag `v0.11.0` | Mux latency-hiding + mosh-grade predictive echo |
+| [`v0.10.4`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.10.4) | Release | 2026-06-27 | tag `v0.10.4` | macOS GUI progressive-slowdown fix (shape-cache/atlas decoupling) |
+| [`v0.10.3`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.10.3) | Release | 2026-06-25 | tag `v0.10.3` | macOS GUI GPU-atlas memory leak fix |
+| [`v0.10.2`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.10.2) | Release | 2026-06-24 | tag `v0.10.2` | Round-9 convergence (quick_reject removal + WAL + scan_pipeline deletion) |
+| [`v0.10.1`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.10.1) | Release | 2026-06-22 | tag `v0.10.1` | 0.10.1 point release |
+| [`v0.10.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.10.0) | Release | 2026-06-21 | tag `v0.10.0` | Round-7 Alien Optimization Gauntlet |
+| [`v0.9.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.9.0) | Release | 2026-06-20 | tag `v0.9.0` | Round-6 Alien Optimization Gauntlet |
+| [`v0.8.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.8.0) | Release | 2026-06-20 | tag `v0.8.0` | Round-5 Alien Optimization Gauntlet |
+| [`v0.7.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.7.0) | Release | 2026-06-19 | tag `v0.7.0` | 0.7.0 |
+| [`v0.6.1`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.6.1) | Release | 2026-06-18 | tag `v0.6.1` | 0.6.1 |
+| [`v0.6.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.6.0) | Release | 2026-06-15 | tag `v0.6.0` | 0.6.0 |
+| [`v0.5.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.5.0) | Release | 2026-06-09 | tag `v0.5.0` | 0.5.0 |
+| [`v0.4.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.4.0) | Release | 2026-06-08 | tag `v0.4.0` | 0.4.0 |
+| [`v0.3.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.3.0) | Release | 2026-05-26 | tag `v0.3.0` | 0.3.0 |
+| [`v0.2.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.2.0) | Release | 2026-05-21 | tag `v0.2.0` | First tagged release |
+| `backup-before-rewrite` | Git tag (no GitHub Release) | 2026-02-17 | [`888c17d0`](https://github.com/Dicklesworthstone/frankenterm/commit/888c17d0da2564269df114e4c5d9ecfd8edf85c5) | Snapshot before the major WezTerm source import and codebase rewrite |
 
 ---
 
@@ -754,9 +854,14 @@ There are no GitHub Releases published for this repository.
 | 2026-06-23 | **v0.10.2 — Alien Optimization Gauntlet round 9 (FULL convergence).** Removed the net-negative `quick_reject` Bloom prefilter (default-off, +35–43% per-delta detection / −22.76% of fleet detection self-time, byte-equivalent — ft-ui1xn); promoted the WAL skip-startup-checkpoint lever to default-on (+74% dirty-WAL startup, no regression — ft-yjihu.1); deleted the dead `scan_pipeline` module (4260 lines); caught one false-open (ft-uyt88 reader test hangs on macOS host — not the BufReader change). The 5-round optimization campaign (v0.7→v0.10.2) is declared **fully converged**. Ledgers: `docs/perf-ledger/round9-*`. |
 | 2026-06-25 | **v0.10.3 — macOS GUI GPU-memory leak fix.** Fixed a progressive GPU-atlas leak that made the GUI lag worse over hours until restart: the thread-local glyph-run shaping cache held `Rc<CachedGlyph>` (which owns the ~49 MB atlas texture), so each atlas recreation leaked the old generation (~691 MB IOSurface / ~14 generations observed in the field). Fix = lifetime decoupling — the cache now stores only the atlas-invariant shaping (positions) and re-attaches live glyphs on hit: leak-free by construction, more correct (always renders the live atlas), and faster than clearing. Hardened with a `cache_gpu_handle` CI lint that makes "a global cache owns a GPU handle" a build failure, a 64-generation churn behavior-proof test, and `docs/render/gpu-cache-lifetime-invariant.md`. Stopgap on older builds: `FT_DISABLE_GLYPH_RUN_INTERNING=1`. |
 | 2026-06-25 | **v0.10.4 — macOS GUI progressive-slowdown fix (the real one).** Fixed the render-loop CPU climb (~30%→70% over ~40 min of a long swarm session) that made the GUI laggier until restart. Root cause: the glyph atlas is a bump-allocator that reclaims space only by a full rebuild, and every overflow **wiped the shape cache**, forcing a full-screen **HarfBuzz re-shape**; as cumulative glyph diversity grew, these re-shapes became frequent → render CPU climbed. (The ~1 GB of GPU surfaces was a stable red herring — the atlas pinned at its 256 MiB cap — which is why v0.10.3's GPU-memory changes didn't help.) Fix: **decouple the shape cache from the atlas** — cache the atlas-invariant HarfBuzz output + a generation tag and re-resolve glyph sprites cheaply on rebuild instead of re-shaping (the same lifetime-decoupling as the v0.10.3 interner fix, applied to the cache that dominates). Verified: ~56% fewer HarfBuzz calls per atlas rebuild, ~31% lower render CPU on a throttled repro, shape tests green; re-resolve is byte-identical to a fresh shape. |
+| 2026-06-29 | **v0.12.0 GitHub Release.** asupersync 0.3.5 churn fix + window-maximize persistence. |
+| 2026-07-28 | **v0.13.0 GitHub Release.** Test-suite honesty campaign (ft-nam3s) + tx/capture/redaction hardening; full platform matrix returns. |
+| 2026-08-19 | HEAD `bb6809b3d`. Janitor docs-reorg: root ELF/scratch removed; plans and wizard cluster moved into `docs/planning/`. Mux exact-owner/census campaign continues on `main` (1,271 non-merge commits since v0.13.0). |
 
 ---
 
 <!-- Links -->
-[Unreleased]: https://github.com/Dicklesworthstone/frankenterm/compare/backup-before-rewrite...main
+[Unreleased]: https://github.com/Dicklesworthstone/frankenterm/compare/v0.13.0...main
+[0.13.0]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0
+[0.12.0]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0
 [0.1.0]: https://github.com/Dicklesworthstone/frankenterm/commits/main/?after=backup-before-rewrite
