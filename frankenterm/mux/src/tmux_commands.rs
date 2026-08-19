@@ -440,12 +440,20 @@ impl TmuxDomainState {
         let removed_panes = {
             let mut remote_panes = self.remote_panes.lock();
             let mut retired_panes = self.retired_panes.lock();
+            let remote_split_reservations = self.remote_split_reservations.lock();
             let mut mirror_index = self.mirror_index.lock();
             let new_tombstones = pane_ids
                 .iter()
-                .filter(|pane_id| !retired_panes.contains(pane_id))
+                .filter(|pane_id| {
+                    !retired_panes.contains(pane_id)
+                        && !remote_split_reservations.contains_key(pane_id)
+                })
                 .count();
-            let Some(next_tombstone_count) = retired_panes.len().checked_add(new_tombstones) else {
+            let Some(next_tombstone_count) = retired_panes
+                .len()
+                .checked_add(remote_split_reservations.len())
+                .and_then(|count| count.checked_add(new_tombstones))
+            else {
                 anyhow::bail!("tmux retired-pane tombstone accounting overflow");
             };
             anyhow::ensure!(
@@ -463,12 +471,36 @@ impl TmuxDomainState {
                     remote_present == indexed_present,
                     "tmux pane {pane_id} map and reverse index disagree before retirement"
                 );
+                if let Some(reservation) = remote_split_reservations.get(pane_id) {
+                    let state = reservation.load()?;
+                    anyhow::ensure!(
+                        matches!(
+                            (remote_present, state),
+                            (true, super::tmux::TmuxRemoteSplitState::Published)
+                                | (false, super::tmux::TmuxRemoteSplitState::Retired)
+                        ),
+                        "tmux split pane {pane_id} has {state:?} reservation with remote_present={remote_present}"
+                    );
+                }
             }
 
             let mut removed = Vec::with_capacity(pane_ids.len());
             for pane_id in &pane_ids {
                 let indexed_local = mirror_index.unregister_pane(*pane_id)?;
-                retired_panes.insert(*pane_id);
+                if let Some(reservation) = remote_split_reservations.get(pane_id) {
+                    match reservation.load()? {
+                        super::tmux::TmuxRemoteSplitState::Published => reservation.transition(
+                            super::tmux::TmuxRemoteSplitState::Published,
+                            super::tmux::TmuxRemoteSplitState::Retired,
+                        )?,
+                        super::tmux::TmuxRemoteSplitState::Retired => {}
+                        super::tmux::TmuxRemoteSplitState::Reserved => anyhow::bail!(
+                            "tmux split pane {pane_id} retired before mirror publication"
+                        ),
+                    }
+                } else {
+                    retired_panes.insert(*pane_id);
+                }
                 let remote = remote_panes.remove(pane_id);
                 match (remote, indexed_local) {
                     (Some(remote), Some(local_pane_id)) => {
@@ -635,9 +667,12 @@ impl TmuxDomainState {
         }
     }
 
-    fn create_pane(&self, pane: &PaneItem) -> anyhow::Result<Arc<dyn Pane>> {
+    fn construct_pane(
+        &self,
+        pane: &PaneItem,
+        child_state: Arc<TmuxChildState>,
+    ) -> anyhow::Result<(Arc<dyn Pane>, crate::tmux::RefTmuxRemotePane)> {
         let local_pane_id = alloc_pane_id()?;
-        let child_state = Arc::new(TmuxChildState::new());
         let (output_read, mut output_write) = filedescriptor::socketpair()?;
         output_write
             .set_non_blocking(true)
@@ -710,8 +745,21 @@ impl TmuxDomainState {
             command_description,
         ));
 
+        Ok((local_pane, ref_pane))
+    }
+
+    fn create_pane(&self, pane: &PaneItem) -> anyhow::Result<Arc<dyn Pane>> {
+        let child_state = Arc::new(TmuxChildState::new());
+        let (local_pane, ref_pane) = self.construct_pane(pane, Arc::clone(&child_state))?;
+        let local_pane_id = local_pane.pane_id();
+
         let _registry = self.pane_registry.lock();
-        if self.retired_panes.lock().contains(&pane.pane_id) {
+        if self.retired_panes.lock().contains(&pane.pane_id)
+            || self
+                .remote_split_reservations
+                .lock()
+                .contains_key(&pane.pane_id)
+        {
             child_state.mark_exited(ExitStatus::with_signal(
                 "retired tmux remote pane identity reuse",
             ));
@@ -797,7 +845,7 @@ impl TmuxDomainState {
         &self,
         mux: &Arc<Mux>,
         target: &PaneOperationGuard,
-        remote_id: TmuxPaneId,
+        mut remote: super::tmux::TmuxRemoteSplitReservation,
         split_request: SplitRequest,
     ) -> anyhow::Result<SplitCommitReceipt> {
         anyhow::ensure!(
@@ -828,11 +876,48 @@ impl TmuxDomainState {
             .lock()
             .remote_window_for_local_tab(tab.tab_id())
             .with_context(|| format!("No tmux mirror for exact tab {}", tab.tab_id()))?;
+        anyhow::ensure!(
+            self.mirror_index
+                .lock()
+                .remote_pane_for_local(target.pane_id())
+                == Some(remote.target_remote_pane_id()),
+            "tmux split target registration {} no longer maps to remote pane {}",
+            target.pane_id(),
+            remote.target_remote_pane_id()
+        );
+        let target_remote = self
+            .remote_panes
+            .lock()
+            .get(&remote.target_remote_pane_id())
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "tmux split target remote pane {} disappeared before materialization",
+                    remote.target_remote_pane_id()
+                )
+            })?;
+        anyhow::ensure!(
+            target_remote.lock().window_id == remote_window_id,
+            "tmux split target remote pane {} changed windows before materialization",
+            remote.target_remote_pane_id()
+        );
+
+        let expected_domain = mux
+            .get_domain(self.domain_id)
+            .with_context(|| format!("tmux domain {} retired before split commit", self.domain_id))?;
+        let expected_tmux_domain = expected_domain
+            .downcast_ref::<TmuxDomain>()
+            .context("tmux domain registration changed concrete type before split commit")?;
+        anyhow::ensure!(
+            std::ptr::eq(expected_tmux_domain.inner.as_ref(), self),
+            "tmux domain {} changed exact identity before split commit",
+            self.domain_id
+        );
 
         let p = PaneItem {
             session_id: 0,
             window_id: remote_window_id,
-            pane_id: remote_id,
+            pane_id: remote.remote_pane_id(),
             _pane_index: 0,
             cursor_x: 0,
             cursor_y: 0,
@@ -843,42 +928,28 @@ impl TmuxDomainState {
             pane_active: false,
         };
 
-        let pane = self.create_pane(&p).map_err(|err| {
-            self.fail_local_mirror_publication(err.context("failed to create pane"))
-        })?;
+        let (pane, remote_gate) = self
+            .construct_pane(&p, remote.child_state())
+            .context("failed to construct local tmux split pane")?;
+        remote.transfer_kill_to_local_pane();
         if let Some(config) = target.with_pane(|pane| pane.get_config()) {
             pane.set_config(config);
         }
-        tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))
-            .map_err(|err| {
-                self.fail_local_mirror_publication(
-                    err.context("failed to insert tmux pane into local tab"),
-                )
-            })?;
-
-        self.add_attached_pane(remote_window_id, remote_id)
-            .map_err(|err| {
-                self.fail_local_mirror_publication(
-                    err.context("failed to attach tmux pane to local window state"),
-                )
-            })?;
-
-        mux.add_pane(&pane).map_err(|err| {
-            self.fail_local_mirror_publication(
-                err.context("failed to publish tmux pane in local mux"),
+        remote
+            .publish_local_mirror(Arc::clone(&remote_gate), pane.pane_id(), remote_window_id)
+            .context("publish prepared tmux split mirror")?;
+        let registration = tab
+            .commit_unregistered_split_pane(
+                mux,
+                &expected_domain,
+                self.domain_id,
+                local_window_id,
+                &target.registration(),
+                split_request,
+                &pane,
             )
-        })?;
-        let registration = mux.capture_pane_registration(&pane).ok_or_else(|| {
-            self.fail_local_mirror_publication(anyhow!(
-                "published tmux pane {} has no exact mux registration",
-                pane.pane_id()
-            ))
-        })?;
-        self.finish_fresh_split(remote_id).map_err(|err| {
-            self.fail_local_mirror_publication(
-                err.context("failed to commit split tmux pane initial output"),
-            )
-        })?;
+            .context("commit atomic tmux split publication")?;
+        remote.commit()?;
 
         Ok(SplitCommitReceipt::from_exact_parts(
             pane,
@@ -2575,7 +2646,7 @@ impl TmuxCommand for SplitPane {
                 anyhow::ensure!(
                     tmux_domain
                         .inner
-                        .resolve_pending_split(self.request_id, pane_id),
+                        .resolve_pending_split(self.request_id, pane_id)?,
                     "missing pending tmux split request {}",
                     self.request_id
                 );

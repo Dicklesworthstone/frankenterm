@@ -7932,6 +7932,360 @@ impl Tab {
         self.inner.lock().compute_split_size(pane_index, request)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn commit_unregistered_tiled_pane(
+        self: &Arc<Self>,
+        mux: &Arc<Mux>,
+        expected_domain: &Arc<dyn Domain>,
+        expected_domain_id: DomainId,
+        expected_window_id: WindowId,
+        split: Option<(&PaneRegistrationHandle, SplitRequest)>,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<PaneRegistrationHandle> {
+        let pane_id = observe_pane_id_for_mutation(pane)?;
+        let mut preparation_claim = mux
+            .claim_pane_preparation(pane)?
+            .ok_or_else(|| anyhow::anyhow!("unregistered tiled pane is already registered"))?;
+        anyhow::ensure!(
+            preparation_claim.domain_id == expected_domain_id,
+            "prepared tiled pane {pane_id} belongs to domain {} rather than {expected_domain_id}",
+            preparation_claim.domain_id
+        );
+        let prepared = mux.prepare_claimed_pane_registration(
+            pane,
+            preparation_claim.pane_id,
+            &preparation_claim.generation,
+        )?;
+        let (mut reader_start_gate, registration_reservation) =
+            mux.spawn_prepared_pane_reader(pane, prepared, &preparation_claim.generation)?;
+
+        // All pane callbacks, geometry work, successor allocation, and
+        // notification allocation complete before the combined registry and
+        // topology cut. The exact baseline is revalidated under Tab::inner.
+        let mut baseline = {
+            let inner = self.inner.lock();
+            anyhow::ensure!(
+                inner.is_active_mux_owner(mux),
+                "tab {} lost active mux-owner authority",
+                self.tab_id
+            );
+            if split.is_some() {
+                admit_moved_split_tree_clone(&inner)?;
+            }
+            inner.clone()
+        };
+        let prior_structural_count = {
+            let (tiled, floating) = baseline.snapshot_structural_panes_callback_free_checked()?;
+            tiled
+                .len()
+                .checked_add(floating.len())
+                .ok_or_else(|| anyhow::anyhow!("tiled publication pane count overflow"))?
+        };
+        let mut replacement = baseline.clone();
+        let (mut callbacks, target_registration) = match split {
+            Some((target_registration, request)) => {
+                anyhow::ensure!(
+                    target_registration
+                        .owner()
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, mux)),
+                    "tiled split target belongs to another mux registration"
+                );
+                anyhow::ensure!(
+                    target_registration.pane_id() != pane_id,
+                    "cannot split pane {pane_id} beside itself"
+                );
+                let pane_index = baseline
+                    .iter_panes_ignoring_zoom()
+                    .into_iter()
+                    .find(|positioned| target_registration.is_same_pane(&positioned.pane))
+                    .map(|positioned| positioned.index)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "exact split target registration {} is not tiled in tab {}",
+                            target_registration.pane_id(),
+                            self.tab_id
+                        )
+                    })?;
+                let mut observed_panes = baseline.snapshot_panes_callback_free();
+                observed_panes.push(Arc::clone(pane));
+                let observed = Self::observe_panes(observed_panes);
+                let pane_ids = build_callback_pane_id_snapshot(self.tab_id, &observed)?;
+                let (_inserted, callbacks) = replacement.prepare_split_and_insert(
+                    pane_index,
+                    request,
+                    Arc::clone(pane),
+                    &pane_ids,
+                )?;
+                (callbacks, Some(target_registration))
+            }
+            None => {
+                anyhow::ensure!(
+                    prior_structural_count == 0,
+                    "root-pane publication requires structurally empty tab {}",
+                    self.tab_id
+                );
+                replacement.assign_pane(pane);
+                (DeferredTabCallbacks::default(), None)
+            }
+        };
+        let next_structural_count = {
+            let (tiled, floating) = replacement.snapshot_structural_panes_callback_free_checked()?;
+            tiled
+                .len()
+                .checked_add(floating.len())
+                .ok_or_else(|| anyhow::anyhow!("tiled successor pane count overflow"))?
+        };
+        anyhow::ensure!(
+            next_structural_count == prior_structural_count.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("tiled publication structural count overflow")
+            })?,
+            "tiled publication successor did not add exactly one structural pane"
+        );
+        let topology_notification_count =
+            callbacks.reserve_relocation_topology_notifications()?;
+        let revision_count = topology_notification_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("tiled publication revision count overflow"))?;
+
+        let (registration, lifecycle_ticket, retired_inner) = {
+            let _domain_registration = mux.domain_registration.lock();
+            anyhow::ensure!(
+                !mux.retired_domain_ids.lock().contains(&expected_domain_id)
+                    && mux
+                        .domains
+                        .read()
+                        .get(&expected_domain_id)
+                        .is_some_and(|domain| Arc::ptr_eq(domain, expected_domain)),
+                "tiled-pane domain retired or changed identity before commit"
+            );
+            let _pane_registration = mux.pane_registration.lock();
+            let mut authority = mux.pane_authority.lock();
+            let registered_tabs = mux.tabs.read();
+            let registered_tab = registered_tabs
+                .get(&self.tab_id)
+                .filter(|registered| Arc::ptr_eq(registered, self))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "destination tab {} retired or changed identity before tiled commit",
+                        self.tab_id
+                    )
+                })?;
+            let tab_mux_owner_generation = self.active_mux_owner_generation().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "destination tab {} lacks active mux-owner generation before tiled commit",
+                    self.tab_id
+                )
+            })?;
+            let mut windows = mux.windows.write();
+            let tab_parents = mux.tab_parents.read();
+            anyhow::ensure!(
+                tab_parents
+                    .get(&self.tab_id)
+                    .is_some_and(|parent| parent.matches(self, expected_window_id))
+                    && windows
+                        .get(&expected_window_id)
+                        .is_some_and(|window| window.iter().any(|tab| Arc::ptr_eq(tab, self))),
+                "destination tab {} changed exact window parent before tiled commit",
+                self.tab_id
+            );
+            let mut workspace_counts = mux.num_panes_by_workspace.write();
+
+            if let Some(target_registration) = target_registration {
+                let target_pane = {
+                    let panes = mux.panes.read();
+                    let registered = panes
+                        .get(&target_registration.pane_id())
+                        .filter(|registered| {
+                            target_registration.matches_live_registration(registered)
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("tiled split target registration retired before commit")
+                        })?;
+                    Arc::clone(&registered.pane)
+                };
+                authority.validate_structural_owner_exact(
+                    target_registration.pane_id(),
+                    &target_pane,
+                    &registered_tab,
+                    Some(PaneStructuralLane::Tiled),
+                    Some(target_registration),
+                )?;
+            }
+
+            let registration =
+                PaneRegistrationHandle::new(pane, &preparation_claim.generation);
+            let prepared_authority = authority.prepare_live_registration_insert(
+                pane_id,
+                pane,
+                expected_domain_id,
+                Some(expected_domain),
+            )?;
+            let structural = authority.prepare_new_structural_bind(
+                pane_id,
+                Arc::clone(pane),
+                Arc::clone(&registered_tab),
+                PaneStructuralLane::Tiled,
+                Some((registration.clone(), expected_domain_id)),
+            )?;
+            anyhow::ensure!(
+                Mux::exact_tab_structural_pane_count(&authority, &registered_tab)?
+                    == prior_structural_count,
+                "tab {} structural authority changed before tiled commit",
+                self.tab_id
+            );
+            let prepared_counts = mux.prepare_tab_pane_count_mutation_locked(
+                &windows,
+                &tab_parents,
+                &mut workspace_counts,
+                &[(
+                    Arc::clone(&registered_tab),
+                    prior_structural_count,
+                    next_structural_count,
+                )],
+                "atomic unregistered tiled pane publication",
+            )?;
+
+            let mut inner = self.inner.lock();
+            anyhow::ensure!(
+                inner.is_active_mux_owner(mux)
+                    && relocation_inner_matches_baseline(&inner, &baseline)?,
+                "tab {} changed after tiled successor preparation",
+                self.tab_id
+            );
+            if let Some(target_registration) = target_registration {
+                anyhow::ensure!(
+                    inner
+                        .snapshot_panes_callback_free()
+                        .iter()
+                        .filter(|candidate| target_registration.is_same_pane(candidate))
+                        .count()
+                        == 1,
+                    "tiled split target left or duplicated inside destination tab"
+                );
+            }
+            anyhow::ensure!(
+                inner
+                    .snapshot_panes_callback_free()
+                    .iter()
+                    .all(|candidate| !Arc::ptr_eq(candidate, pane)),
+                "unregistered tiled pane acquired a structural owner before commit"
+            );
+            anyhow::ensure!(
+                preparation_claim.is_authoritative_locked(),
+                "unregistered tiled-pane preparation was cancelled"
+            );
+            let mut panes = mux.panes.write();
+            anyhow::ensure!(
+                !panes.contains_key(&pane_id),
+                "tiled pane id {pane_id} became registered before commit"
+            );
+            panes
+                .try_reserve(1)
+                .map_err(|error| anyhow::anyhow!("reserve tiled pane registry slot: {error}"))?;
+            let lifecycle_enqueue = mux.prepare_pane_lifecycle_enqueue(pane_id)?;
+            let mut topology = mux.topology.lock();
+            let first_revision = topology
+                .reserve_revisions(revision_count)
+                .map_err(anyhow::Error::new)?;
+            let topology_stamp = crate::MuxTopologyStamp::Revision(first_revision);
+            let callback_first_revision = (topology_notification_count != 0).then(|| {
+                crate::TopologyRevision::new(
+                    first_revision
+                        .get()
+                        .checked_add(1)
+                        .expect("reserved tiled topology range cannot overflow"),
+                )
+            });
+
+            let commit_guard = registration_reservation
+                .commit()
+                .expect("validated exclusive tiled registration reservation must commit");
+            let prior = panes.insert(
+                pane_id,
+                crate::LivePaneRegistration {
+                    pane: Arc::clone(pane),
+                    generation: Arc::clone(&preparation_claim.generation),
+                    domain_id: expected_domain_id,
+                },
+            );
+            debug_assert!(prior.is_none());
+            let retired_inner = std::mem::replace(&mut *inner, replacement);
+            authority.insert_live_registration(
+                pane_id,
+                pane,
+                expected_domain_id,
+                registration.clone(),
+                prepared_authority,
+            );
+            authority.commit_structural_bind(structural, tab_mux_owner_generation);
+            prepared_counts.commit(&mut windows, &mut workspace_counts);
+            let consumed = callbacks.stamp_relocation_topology_notifications(
+                self.tab_id,
+                callback_first_revision,
+                0,
+            );
+            debug_assert_eq!(consumed, topology_notification_count);
+            let lifecycle_ticket = lifecycle_enqueue.enqueue(
+                crate::PaneLifecycleNotification::Added(pane_id),
+                topology_stamp,
+                reader_start_gate.take(),
+                None,
+                crate::PaneRemovalFollowUp::None,
+            );
+            let finalized = commit_guard.finalize();
+            debug_assert!(registration.same_registration(&finalized));
+            preparation_claim.retire_locked();
+            (registration, lifecycle_ticket, retired_inner)
+        };
+
+        drop(retired_inner);
+        callbacks.execute(Some(mux));
+        mux.complete_pane_lifecycle_notification(lifecycle_ticket);
+        mux.notify_pane_registration_did_bind(pane, &registration);
+        Ok(registration)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_unregistered_root_pane(
+        self: &Arc<Self>,
+        mux: &Arc<Mux>,
+        expected_domain: &Arc<dyn Domain>,
+        expected_domain_id: DomainId,
+        expected_window_id: WindowId,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<PaneRegistrationHandle> {
+        self.commit_unregistered_tiled_pane(
+            mux,
+            expected_domain,
+            expected_domain_id,
+            expected_window_id,
+            None,
+            pane,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_unregistered_split_pane(
+        self: &Arc<Self>,
+        mux: &Arc<Mux>,
+        expected_domain: &Arc<dyn Domain>,
+        expected_domain_id: DomainId,
+        expected_window_id: WindowId,
+        target: &PaneRegistrationHandle,
+        request: SplitRequest,
+        pane: &Arc<dyn Pane>,
+    ) -> anyhow::Result<PaneRegistrationHandle> {
+        self.commit_unregistered_tiled_pane(
+            mux,
+            expected_domain,
+            expected_domain_id,
+            expected_window_id,
+            Some((target, request)),
+            pane,
+        )
+    }
+
     /// Split the pane that has pane_index in the given direction and assign
     /// the right/bottom pane of the newly created split to the provided Pane
     /// instance.  Returns the resultant index of the newly inserted pane.
