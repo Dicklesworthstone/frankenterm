@@ -326,6 +326,15 @@ pub enum RecorderStorageError {
         actual_backend: RecorderBackendKind,
     },
 
+    #[error(
+        "storage operation {operation} returned backend {actual_backend}, but the storage instance is {expected_backend}"
+    )]
+    BackendIdentityMismatch {
+        operation: &'static str,
+        expected_backend: RecorderBackendKind,
+        actual_backend: RecorderBackendKind,
+    },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -354,15 +363,16 @@ impl RecorderStorageError {
             Self::InvalidRequest { .. } | Self::CheckpointRegression { .. } => {
                 RecorderStorageErrorClass::TerminalData
             }
-            Self::CorruptRecord { .. } | Self::CorruptCachedResponse { .. } => {
+            Self::CorruptRecord { .. }
+            | Self::CorruptCachedResponse { .. }
+            | Self::BackendIdentityMismatch { .. } => {
                 RecorderStorageErrorClass::Corruption
             }
             Self::Io(_) => RecorderStorageErrorClass::Retryable,
             Self::Json(_) => RecorderStorageErrorClass::TerminalData,
             Self::Sqlite(_) => RecorderStorageErrorClass::Retryable,
-            Self::BackendSelection(_) | Self::BackendUnavailable { .. } => {
-                RecorderStorageErrorClass::DependencyUnavailable
-            }
+            Self::BackendSelection(_) => RecorderStorageErrorClass::TerminalConfig,
+            Self::BackendUnavailable { .. } => RecorderStorageErrorClass::DependencyUnavailable,
         }
     }
 }

@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::ewma::Ewma;
 use crate::recorder_storage::{
     AppendRequest, AppendResponse, CheckpointCommitOutcome, FlushStats, RecorderBackendKind,
-    RecorderStorageError, RecorderStorageErrorClass, RecorderStorageHealth, RecorderStorageLag,
+    RecorderStorage, RecorderStorageError, RecorderStorageErrorClass, RecorderStorageHealth,
+    RecorderStorageLag,
 };
 use crate::telemetry::{HistogramSummary, MetricRegistry};
 
@@ -706,7 +707,7 @@ pub struct InstrumentedStorage<S> {
     telemetry: Arc<StorageTelemetry>,
 }
 
-impl<S> InstrumentedStorage<S> {
+impl<S: RecorderStorage> InstrumentedStorage<S> {
     /// Wrap a storage backend with telemetry instrumentation.
     pub fn new(inner: S, telemetry: Arc<StorageTelemetry>) -> Self {
         Self { inner, telemetry }
@@ -740,10 +741,9 @@ impl<S> InstrumentedStorage<S> {
         req: AppendRequest,
         result: Result<AppendResponse, RecorderStorageError>,
         start: Instant,
-        backend: RecorderBackendKind,
     ) -> Result<AppendResponse, RecorderStorageError> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.append_batch_instrumented_with_cx(&cx, req, result, start, backend)
+        self.append_batch_instrumented_with_cx(&cx, req, result, start)
             .await
     }
 
@@ -763,8 +763,18 @@ impl<S> InstrumentedStorage<S> {
         _req: AppendRequest,
         result: Result<AppendResponse, RecorderStorageError>,
         start: Instant,
-        backend: RecorderBackendKind,
     ) -> impl std::future::Future<Output = Result<AppendResponse, RecorderStorageError>> {
+        let backend = self.inner.backend_kind();
+        let result = match result {
+            Ok(response) if response.backend != backend => {
+                Err(RecorderStorageError::BackendIdentityMismatch {
+                    operation: "append_batch",
+                    expected_backend: backend,
+                    actual_backend: response.backend,
+                })
+            }
+            other => other,
+        };
         let elapsed_us = start.elapsed().as_nanos() as f64 / 1000.0;
         match &result {
             Ok(resp) => {
@@ -774,7 +784,7 @@ impl<S> InstrumentedStorage<S> {
                     resp.accepted_count,
                     estimated_bytes,
                     false,
-                    backend,
+                    resp.backend,
                 );
             }
             Err(e) => {
@@ -788,17 +798,30 @@ impl<S> InstrumentedStorage<S> {
     /// Time a flush call and record telemetry.
     pub fn flush_instrumented(
         &self,
-        result: &Result<FlushStats, RecorderStorageError>,
+        result: Result<FlushStats, RecorderStorageError>,
         start: Instant,
-        backend: RecorderBackendKind,
-    ) {
+    ) -> Result<FlushStats, RecorderStorageError> {
+        let backend = self.inner.backend_kind();
+        let result = match result {
+            Ok(stats) if stats.backend != backend => {
+                Err(RecorderStorageError::BackendIdentityMismatch {
+                    operation: "flush",
+                    expected_backend: backend,
+                    actual_backend: stats.backend,
+                })
+            }
+            other => other,
+        };
         let elapsed_us = start.elapsed().as_nanos() as f64 / 1000.0;
-        match result {
-            Ok(_) => self.telemetry.record_flush_for_backend(elapsed_us, backend),
+        match &result {
+            Ok(stats) => self
+                .telemetry
+                .record_flush_for_backend(elapsed_us, stats.backend),
             Err(e) => self
                 .telemetry
                 .record_error_for_backend(e.class(), Some(backend)),
         }
+        result
     }
 
     /// Time a checkpoint commit and record telemetry.
@@ -806,8 +829,8 @@ impl<S> InstrumentedStorage<S> {
         &self,
         result: &Result<CheckpointCommitOutcome, RecorderStorageError>,
         start: Instant,
-        backend: RecorderBackendKind,
     ) {
+        let backend = self.inner.backend_kind();
         let elapsed_us = start.elapsed().as_nanos() as f64 / 1000.0;
         match result {
             Ok(outcome) => self
@@ -820,13 +843,29 @@ impl<S> InstrumentedStorage<S> {
     }
 
     /// Update health from a health() call result.
-    pub fn health_instrumented(&self, health: &RecorderStorageHealth) {
+    pub fn health_instrumented(
+        &self,
+        health: &RecorderStorageHealth,
+    ) -> Result<(), RecorderStorageError> {
+        let backend = self.inner.backend_kind();
+        if health.backend != backend {
+            let error = RecorderStorageError::BackendIdentityMismatch {
+                operation: "health",
+                expected_backend: backend,
+                actual_backend: health.backend,
+            };
+            self.telemetry
+                .record_error_for_backend(error.class(), Some(backend));
+            return Err(error);
+        }
         self.telemetry.update_health(health.clone());
+        Ok(())
     }
 
     /// Update lag from a lag_metrics() call result.
     pub fn lag_instrumented(&self, lag: &RecorderStorageLag) {
-        self.telemetry.update_lag(lag.clone());
+        self.telemetry
+            .update_lag_for_backend(lag.clone(), self.inner.backend_kind());
     }
 }
 
@@ -924,8 +963,92 @@ pub fn remediation_for_error(class: RecorderStorageErrorClass) -> &'static str {
 mod tests {
     use super::*;
     use crate::recorder_storage::{
-        CheckpointConsumerId, RecorderBackendKind, RecorderConsumerLag, RecorderOffset,
+        CheckpointConsumerId, FlushMode, RecorderBackendKind, RecorderCheckpoint,
+        RecorderConsumerLag, RecorderOffset,
     };
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestRecorderStorage {
+        backend: RecorderBackendKind,
+    }
+
+    impl TestRecorderStorage {
+        fn new(backend: RecorderBackendKind) -> Self {
+            Self { backend }
+        }
+    }
+
+    impl RecorderStorage for TestRecorderStorage {
+        fn backend_kind(&self) -> RecorderBackendKind {
+            self.backend
+        }
+
+        fn append_batch(
+            &self,
+            _req: AppendRequest,
+        ) -> impl std::future::Future<Output = Result<AppendResponse, RecorderStorageError>>
+        {
+            std::future::ready(Err(RecorderStorageError::BackendUnavailable {
+                backend: self.backend,
+                message: "test storage does not execute appends".to_string(),
+            }))
+        }
+
+        fn flush(
+            &self,
+            _mode: FlushMode,
+        ) -> impl std::future::Future<Output = Result<FlushStats, RecorderStorageError>> {
+            std::future::ready(Ok(FlushStats {
+                backend: self.backend,
+                flushed_at_ms: 0,
+                latest_offset: None,
+            }))
+        }
+
+        fn read_checkpoint(
+            &self,
+            _consumer: &CheckpointConsumerId,
+        ) -> impl std::future::Future<Output = Result<Option<RecorderCheckpoint>, RecorderStorageError>>
+        {
+            std::future::ready(Ok(None))
+        }
+
+        fn commit_checkpoint(
+            &self,
+            _checkpoint: RecorderCheckpoint,
+        ) -> impl std::future::Future<Output = Result<CheckpointCommitOutcome, RecorderStorageError>>
+        {
+            std::future::ready(Ok(CheckpointCommitOutcome::NoopAlreadyAdvanced))
+        }
+
+        fn health(&self) -> impl std::future::Future<Output = RecorderStorageHealth> {
+            std::future::ready(RecorderStorageHealth {
+                backend: self.backend,
+                degraded: false,
+                queue_depth: 0,
+                queue_capacity: 1,
+                latest_offset: None,
+                last_error: None,
+            })
+        }
+
+        fn lag_metrics(
+            &self,
+        ) -> impl std::future::Future<Output = Result<RecorderStorageLag, RecorderStorageError>>
+        {
+            std::future::ready(Ok(RecorderStorageLag {
+                latest_offset: None,
+                consumers: Vec::new(),
+            }))
+        }
+    }
+
+    fn instrumented_test_storage(
+        telemetry: Arc<StorageTelemetry>,
+        backend: RecorderBackendKind,
+    ) -> InstrumentedStorage<TestRecorderStorage> {
+        InstrumentedStorage::new(TestRecorderStorage::new(backend), telemetry)
+    }
 
     // -----------------------------------------------------------------------
     // StorageHealthTier
@@ -1466,10 +1589,11 @@ mod tests {
     #[test]
     fn instrumented_health_updates_telemetry() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented = InstrumentedStorage::new((), telem.clone());
+        let instrumented =
+            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let health = make_health(2, 4, false); // 50% → Yellow
-        instrumented.health_instrumented(&health);
+        instrumented.health_instrumented(&health).unwrap();
 
         assert_eq!(telem.current_tier(), StorageHealthTier::Yellow);
     }
@@ -1477,7 +1601,8 @@ mod tests {
     #[test]
     fn instrumented_lag_updates_telemetry() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented = InstrumentedStorage::new((), telem.clone());
+        let instrumented =
+            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let lag = RecorderStorageLag {
             latest_offset: Some(RecorderOffset {
@@ -1496,7 +1621,8 @@ mod tests {
     #[test]
     fn instrumented_flush_records_latency() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented = InstrumentedStorage::new((), telem.clone());
+        let instrumented =
+            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let start = Instant::now();
         let result: Result<FlushStats, RecorderStorageError> = Ok(FlushStats {
@@ -1504,7 +1630,7 @@ mod tests {
             flushed_at_ms: 1000,
             latest_offset: None,
         });
-        instrumented.flush_instrumented(&result, start, RecorderBackendKind::AppendLog);
+        instrumented.flush_instrumented(result, start).unwrap();
 
         assert_eq!(telem.registry().counter_value(COUNTER_FLUSHES), 1);
         let backend_flushes = backend_metric_name(COUNTER_FLUSHES, RecorderBackendKind::AppendLog);
@@ -1514,12 +1640,13 @@ mod tests {
     #[test]
     fn instrumented_checkpoint_records_outcome() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented = InstrumentedStorage::new((), telem.clone());
+        let instrumented =
+            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let start = Instant::now();
         let result: Result<CheckpointCommitOutcome, RecorderStorageError> =
             Ok(CheckpointCommitOutcome::Advanced);
-        instrumented.checkpoint_instrumented(&result, start, RecorderBackendKind::AppendLog);
+        instrumented.checkpoint_instrumented(&result, start);
 
         assert_eq!(telem.registry().counter_value(COUNTER_CHECKPOINTS), 1);
         assert_eq!(
@@ -1534,12 +1661,17 @@ mod tests {
     #[test]
     fn instrumented_error_records_class() {
         let telem = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented = InstrumentedStorage::new((), telem.clone());
+        let instrumented =
+            instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
         let start = Instant::now();
         let result: Result<FlushStats, RecorderStorageError> =
             Err(RecorderStorageError::QueueFull { capacity: 4 });
-        instrumented.flush_instrumented(&result, start, RecorderBackendKind::AppendLog);
+        let error = instrumented.flush_instrumented(result, start).unwrap_err();
+        assert!(matches!(
+            error,
+            RecorderStorageError::QueueFull { capacity: 4 }
+        ));
 
         assert_eq!(telem.registry().counter_value(COUNTER_ERROR_OVERLOAD), 1);
         let backend_overload =
@@ -1564,7 +1696,8 @@ mod tests {
         };
 
         let telemetry = Arc::new(StorageTelemetry::with_defaults());
-        let instrumented = InstrumentedStorage::new((), telemetry.clone());
+        let instrumented =
+            instrumented_test_storage(telemetry.clone(), RecorderBackendKind::AppendLog);
         let request = AppendRequest {
             batch_id: "eager-telemetry".to_string(),
             events: vec![],
@@ -1594,7 +1727,6 @@ mod tests {
             request,
             Ok(response),
             Instant::now(),
-            RecorderBackendKind::AppendLog,
         );
         assert_eq!(
             telemetry
@@ -1634,7 +1766,8 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
                 let telem = Arc::new(StorageTelemetry::with_defaults());
-                let instrumented = InstrumentedStorage::new((), telem.clone());
+                let instrumented =
+                    instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
 
                 let req = AppendRequest {
                     batch_id: "cx-test".to_string(),
@@ -1667,7 +1800,6 @@ mod tests {
                         req,
                         Ok(resp.clone()),
                         start,
-                        RecorderBackendKind::AppendLog,
                     )
                     .await
                     .unwrap();
@@ -1705,7 +1837,8 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(async {
                 let telem = Arc::new(StorageTelemetry::with_defaults());
-                let instrumented = InstrumentedStorage::new((), telem.clone());
+                let instrumented =
+                    instrumented_test_storage(telem.clone(), RecorderBackendKind::AppendLog);
                 let cx = crate::cx::for_request();
                 cx.cancel_with(
                     crate::outcome::CancelKind::User,
@@ -1740,7 +1873,6 @@ mod tests {
                         successful_request,
                         Ok(successful_response),
                         Instant::now(),
-                        RecorderBackendKind::AppendLog,
                     )
                     .await
                     .expect("completed success must remain successful");
@@ -1758,7 +1890,6 @@ mod tests {
                         failed_request,
                         Err(RecorderStorageError::QueueFull { capacity: 4 }),
                         Instant::now(),
-                        RecorderBackendKind::AppendLog,
                     )
                     .await;
                 assert!(matches!(
