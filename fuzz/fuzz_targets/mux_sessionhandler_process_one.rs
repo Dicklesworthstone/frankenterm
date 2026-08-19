@@ -2,8 +2,9 @@
 
 use codec::{
     DecodedPdu, ErrorResponse, GetClientList, GetCodecVersion, GetPaneRenderChanges, InputSerial,
-    KillPane, ListPanes, ListPanesTabStacks, Pdu, Ping, Pong, RenameWorkspace, SendPaste,
-    SetActiveWorkspace, SetClientId, SetFocusedPane, SetWindowWorkspace, UnitResponse, WriteToPane,
+    KillPane, ListPanes, ListPanesTabStacks, Pdu, PduWireIdent, Ping, Pong, RenameWorkspace,
+    SendPaste, SetActiveWorkspace, SetClientId, SetFocusedPane, SetWindowWorkspace, UnitResponse,
+    WriteToPane,
 };
 use frankenterm_mux_server_impl::sessionhandler::{PduSender, SessionHandler};
 use libfuzzer_sys::arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
@@ -61,7 +62,7 @@ enum FuzzPdu {
     Ping,
     PongAsRequest,
     UnitResponseAsRequest,
-    ErrorResponseAsRequest(String),
+    ErrorResponseAsRequest,
     Invalid {
         ident: u64,
     },
@@ -107,7 +108,7 @@ impl<'a> Arbitrary<'a> for FuzzPdu {
             0 => Self::Ping,
             1 => Self::PongAsRequest,
             2 => Self::UnitResponseAsRequest,
-            3 => Self::ErrorResponseAsRequest(bounded_string(u)?),
+            3 => Self::ErrorResponseAsRequest,
             4 => Self::Invalid {
                 ident: u64::arbitrary(u)?,
             },
@@ -158,7 +159,7 @@ impl FuzzPdu {
             Self::Ping => Pdu::Ping(Ping {}),
             Self::PongAsRequest => Pdu::Pong(Pong {}),
             Self::UnitResponseAsRequest => Pdu::UnitResponse(UnitResponse {}),
-            Self::ErrorResponseAsRequest(_) => {
+            Self::ErrorResponseAsRequest => {
                 Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT))
             }
             Self::Invalid { ident } => Pdu::Invalid { ident },
