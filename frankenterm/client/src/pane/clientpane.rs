@@ -1467,8 +1467,7 @@ impl ClientPane {
                 }
                 if let RenderComponentUpdate::Replace(palette) = palette {
                     let palette = Arc::unwrap_or_clone(palette.palette);
-                    *self.application_palette.lock() =
-                        palette != *self.configured_palette.lock();
+                    *self.application_palette.lock() = palette != *self.configured_palette.lock();
                     *self.palette.lock() = palette;
                     current.dispatch_alert(Alert::PaletteChanged);
                 }

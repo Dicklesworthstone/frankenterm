@@ -382,8 +382,8 @@ fn conformance_fixed_error_response_without_object_round_trips() {
     let mut wire = Vec::new();
     let expected = ErrorResponse::invalid_request(Ping::IDENT);
     Pdu::ErrorResponse(expected.clone())
-    .encode(&mut wire, 1)
-    .expect("encode object-free ErrorResponse");
+        .encode(&mut wire, 1)
+        .expect("encode object-free ErrorResponse");
     assert!(wire.len() <= MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES);
 
     let decoded = Pdu::decode(wire.as_slice()).expect("decode object-free ErrorResponse");
@@ -403,8 +403,8 @@ fn conformance_fixed_error_response_with_object_round_trips() {
     let mut wire = Vec::new();
     let expected = ErrorResponse::pane_not_found(Ping::IDENT, u64::MAX);
     Pdu::ErrorResponse(expected.clone())
-    .encode(&mut wire, 2)
-    .expect("encode object-bearing ErrorResponse");
+        .encode(&mut wire, 2)
+        .expect("encode object-bearing ErrorResponse");
     assert!(wire.len() <= MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES);
 
     let decoded = Pdu::decode(wire.as_slice()).expect("decode object-bearing ErrorResponse");

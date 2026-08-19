@@ -9335,7 +9335,9 @@ mod tests {
                     error.request_ident,
                     <codec::SendKeyDownTracedV1 as codec::PduWireIdent>::IDENT
                 );
-                error.validate().expect("missing pane error must be canonical");
+                error
+                    .validate()
+                    .expect("missing pane error must be canonical");
             }
             other => panic!("expected missing-pane response after trace admission, got {other:?}"),
         }

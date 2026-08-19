@@ -260,9 +260,7 @@ fn build_pdu(fp: &FuzzPdu) -> Pdu {
             config_file_path: config_file_path.as_ref().map(PathBuf::from),
             min_supported: *min_supported as usize,
         }),
-        FuzzPdu::ErrorResponse => {
-            Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT))
-        }
+        FuzzPdu::ErrorResponse => Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT)),
         FuzzPdu::LivenessResponse { pane_id, is_alive } => {
             Pdu::LivenessResponse(LivenessResponse {
                 pane_id: *pane_id as usize,

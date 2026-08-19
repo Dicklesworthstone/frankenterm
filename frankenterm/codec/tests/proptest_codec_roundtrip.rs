@@ -9,15 +9,14 @@ use codec::{
     ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse,
     MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu,
     PduWireIdent, Ping, Pong, RemoteTabId, RemoteWindowId, RemoveFloatingPane, RenameWorkspace,
-    ReorderWindowTabsV1,
-    Resize, SampledTraceContextV1, SearchScrollbackRequest, SearchScrollbackResponse,
-    SelectStackPane, SendKeyDown, SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste,
-    SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
-    SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed, SetWindowWorkspace, SpawnResponse,
-    SpawnV2, SplitPane, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
-    ToggleFloatingPane, TopologyStreamId, UnitResponse, UpdatePaneConstraints,
-    WindowOrderMutationId, WindowOrderRevision, WindowReorderDigest, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane, ORDERED_WINDOW_PROTOCOL_VERSION,
+    ReorderWindowTabsV1, Resize, SampledTraceContextV1, SearchScrollbackRequest,
+    SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyDownTracedV1, SendKeyUp,
+    SendMouseEvent, SendPaste, SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard,
+    SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
+    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabAddedToWindow,
+    TabResized, TabTitleChanged, ToggleFloatingPane, TopologyStreamId, UnitResponse,
+    UpdatePaneConstraints, WindowOrderMutationId, WindowOrderRevision, WindowReorderDigest,
+    WindowTitleChanged, WindowWorkspaceChanged, WriteToPane, ORDERED_WINDOW_PROTOCOL_VERSION,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{

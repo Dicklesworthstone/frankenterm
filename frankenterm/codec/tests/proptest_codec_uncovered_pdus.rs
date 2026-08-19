@@ -133,9 +133,7 @@ impl WireFramingPdu {
             Self::Ping => Pdu::Ping(Ping {}),
             Self::Pong => Pdu::Pong(Pong {}),
             Self::UnitResponse => Pdu::UnitResponse(UnitResponse {}),
-            Self::ErrorResponse => {
-                Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT))
-            }
+            Self::ErrorResponse => Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT)),
             Self::WriteToPane { pane_id, data } => Pdu::WriteToPane(WriteToPane {
                 pane_id: *pane_id,
                 data: data.clone(),

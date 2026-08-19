@@ -1817,15 +1817,16 @@ impl<'a> RenderBatchGuard<'a> {
         }
         let local_sideband = self.local_sidebands.take(pane_id)?;
         let (reserved_count, reserved_bytes) = self.local_sidebands.totals()?;
-        let resolved = DirectMuxClient::response_from_pdu(decoded.pdu, request_ident).and_then(|pdu| {
-            self.client.resolve_render_change_response_with_sideband(
-                pane_id,
-                pdu,
-                local_sideband,
-                reserved_count,
-                reserved_bytes,
-            )
-        });
+        let resolved =
+            DirectMuxClient::response_from_pdu(decoded.pdu, request_ident).and_then(|pdu| {
+                self.client.resolve_render_change_response_with_sideband(
+                    pane_id,
+                    pdu,
+                    local_sideband,
+                    reserved_count,
+                    reserved_bytes,
+                )
+            });
         match resolved {
             Ok(payload) => {
                 let output = self.outputs.get_mut(response_idx).ok_or(
@@ -3585,10 +3586,7 @@ impl DirectMuxClient {
         })
     }
 
-    fn take_pending_response(
-        &mut self,
-        serial: u64,
-    ) -> Result<Option<(Pdu, u64)>, DirectMuxError> {
+    fn take_pending_response(&mut self, serial: u64) -> Result<Option<(Pdu, u64)>, DirectMuxError> {
         let Some(retained) = self.pending_responses.remove(&serial) else {
             return Ok(None);
         };
@@ -7692,43 +7690,40 @@ mod tests {
                                         .expect("write pane removal before liveness");
                                     }
 
-                                    let response = match case {
-                                        LocalSemanticCase::WrongLegacyPane => {
-                                            Pdu::GetPaneRenderChangesResponse(test_render_change(
-                                                700,
-                                                2,
-                                                "wrong-legacy-pane",
-                                            ))
-                                        }
-                                        LocalSemanticCase::WrongLivenessPane => {
-                                            Pdu::LivenessResponse(codec::LivenessResponse {
-                                                pane_id: 700,
-                                                is_alive: true,
-                                            })
-                                        }
-                                        LocalSemanticCase::DeadPane => {
-                                            Pdu::LivenessResponse(codec::LivenessResponse {
-                                                pane_id: request.pane_id,
-                                                is_alive: false,
-                                            })
-                                        }
-                                        LocalSemanticCase::RemovedBeforeLiveness => {
-                                            Pdu::LivenessResponse(codec::LivenessResponse {
-                                                pane_id: request.pane_id,
-                                                is_alive: true,
-                                            })
-                                        }
-                                        LocalSemanticCase::UnexpectedPdu => {
-                                            Pdu::UnitResponse(UnitResponse {})
-                                        }
-                                        LocalSemanticCase::ErrorResponse => {
-                                            Pdu::ErrorResponse(
+                                    let response =
+                                        match case {
+                                            LocalSemanticCase::WrongLegacyPane => {
+                                                Pdu::GetPaneRenderChangesResponse(
+                                                    test_render_change(700, 2, "wrong-legacy-pane"),
+                                                )
+                                            }
+                                            LocalSemanticCase::WrongLivenessPane => {
+                                                Pdu::LivenessResponse(codec::LivenessResponse {
+                                                    pane_id: 700,
+                                                    is_alive: true,
+                                                })
+                                            }
+                                            LocalSemanticCase::DeadPane => {
+                                                Pdu::LivenessResponse(codec::LivenessResponse {
+                                                    pane_id: request.pane_id,
+                                                    is_alive: false,
+                                                })
+                                            }
+                                            LocalSemanticCase::RemovedBeforeLiveness => {
+                                                Pdu::LivenessResponse(codec::LivenessResponse {
+                                                    pane_id: request.pane_id,
+                                                    is_alive: true,
+                                                })
+                                            }
+                                            LocalSemanticCase::UnexpectedPdu => {
+                                                Pdu::UnitResponse(UnitResponse {})
+                                            }
+                                            LocalSemanticCase::ErrorResponse => Pdu::ErrorResponse(
                                                 codec::ErrorResponse::backend_failure(
                                                     <GetPaneRenderChanges as PduWireIdent>::IDENT,
                                                 ),
-                                            )
-                                        }
-                                    };
+                                            ),
+                                        };
                                     write_response_pdu(&mut stream, &response, decoded.serial)
                                         .await
                                         .expect("write semantic response");
@@ -7764,7 +7759,10 @@ mod tests {
                     case,
                     LocalSemanticCase::DeadPane | LocalSemanticCase::ErrorResponse
                 ) {
-                    assert!(matches!(error, DirectMuxError::RemoteRejection(_)), "{case:?}");
+                    assert!(
+                        matches!(error, DirectMuxError::RemoteRejection(_)),
+                        "{case:?}"
+                    );
                 } else {
                     assert!(
                         matches!(error, DirectMuxError::AlignedUnexpectedResponse { .. }),
@@ -8626,13 +8624,11 @@ mod tests {
                                         SemanticCase::UnexpectedPdu => {
                                             Pdu::UnitResponse(UnitResponse {})
                                         }
-                                        SemanticCase::ErrorResponse => {
-                                            Pdu::ErrorResponse(
-                                                codec::ErrorResponse::backend_failure(
-                                                    <GetPaneRenderChanges as PduWireIdent>::IDENT,
-                                                ),
-                                            )
-                                        }
+                                        SemanticCase::ErrorResponse => Pdu::ErrorResponse(
+                                            codec::ErrorResponse::backend_failure(
+                                                <GetPaneRenderChanges as PduWireIdent>::IDENT,
+                                            ),
+                                        ),
                                     };
                                     write_response_pdu(&mut stream, &bad_response, bad_serial)
                                         .await
@@ -8714,7 +8710,10 @@ mod tests {
                     .expect_err("semantic response shape must fail after draining");
                 match case {
                     SemanticCase::DeadPane | SemanticCase::ErrorResponse => {
-                        assert!(matches!(error, DirectMuxError::RemoteRejection(_)), "{case:?}");
+                        assert!(
+                            matches!(error, DirectMuxError::RemoteRejection(_)),
+                            "{case:?}"
+                        );
                     }
                     _ => {
                         assert!(
