@@ -4397,6 +4397,36 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > If admission expands beyond one `MuxPool`, preserve this pool-owned root as a child of the later process-wide authority; never recreate byte authority at a connection or recovery boundary.
 
+### IS-N144 — Serial execution is not a repair for deterministic mux contract failures
+
+- **Classification:** wrong performance diagnosis; deterministic fixture and
+  transport contracts repaired
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.14.7`
+- **Rejected inference:** the 11 failing mux-filtered tests require a global
+  concurrency limiter because a high-core remote worker exposes fixture or
+  resource pressure.
+- **Counterexample:** strict-remote parallel runs
+  `j-29982548671070417` and `j-29982548671070418` each produced the same 11
+  failures as serial run `j-29982548671070420` (`458 passed; 11 failed` in
+  every run). Serial execution changed neither the failure set nor the failure
+  modes. The defects were deterministic: oversized-frame writers treated an
+  expected peer close as a panic, explicit-Cx fixtures ran outside the
+  canonical installed-runtime-handle contract, a fully correlated render
+  response was mislabeled abandoned after a semantic retention failure, and
+  codec-v56 fallback tests exercised a dialect older than the workspace's
+  supported floor.
+- **Decision:** do not add a process-wide test or runtime concurrency limiter.
+  Normalize expected disconnect kinds, run explicit-Cx fixtures under the
+  canonical test runtime, preserve precise post-correlation error identity,
+  and delete only the unreachable old-dialect branch. Subsequent diagnostic
+  run `j-29982548671070428` reduced the set to five failures after the first
+  repairs; exact committed run `j-29982548671070430` passed 469 of 470 and
+  exposed one independent Unix-socket fixture-name overflow under the remote
+  path prefix. None of these results is native latency or high-core scaling
+  evidence.
+- **Primary retry condition:**
+  > Introduce a concurrency limiter only after a same-source parallel-versus-serial experiment changes the failure or latency distribution and attributes that change to a measured bounded resource, never from high core count alone.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
