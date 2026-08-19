@@ -2661,7 +2661,7 @@ impl ClientDomain {
                         lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
                             .remove(&remote_window_id);
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.into()),
                 }
             }
         }
@@ -3291,7 +3291,7 @@ impl ClientDomain {
                         lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
                             .remove(&remote_window_id);
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.into()),
                 }
             }
         }

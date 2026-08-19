@@ -175,6 +175,34 @@ pub(crate) struct PreparedWindowState {
     frozen: FrozenWindowOrder,
 }
 
+/// Allocation-free, move-only authority for one window's structural pane
+/// count transition.
+///
+/// The mux prepares this token while retaining the exact window-map and
+/// workspace-count cut.  Consuming it is the only production path that may
+/// change [`Window::structural_pane_count`], so a structural writer cannot
+/// publish a topology successor and then repair its count after callbacks.
+pub(crate) struct PreparedWindowPaneCount {
+    window_id: WindowId,
+    prior: usize,
+    next: usize,
+}
+
+impl PreparedWindowPaneCount {
+    pub(crate) const fn window_id(&self) -> WindowId {
+        self.window_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn prior(&self) -> usize {
+        self.prior
+    }
+
+    pub(crate) const fn next(&self) -> usize {
+        self.next
+    }
+}
+
 impl PreparedWindowState {
     pub(crate) fn frozen(&self) -> &FrozenWindowOrder {
         &self.frozen
@@ -214,6 +242,7 @@ pub struct Window {
     order_revision: WindowOrderRevision,
     last_active: Option<TabId>,
     tab_stacks: TabStackState,
+    structural_pane_count: usize,
     workspace: String,
     title: String,
     initial_position: Option<GuiPosition>,
@@ -249,6 +278,7 @@ impl Window {
             order_revision: WindowOrderRevision::INITIAL,
             last_active: None,
             tab_stacks: TabStackState::default(),
+            structural_pane_count: 0,
             title: String::new(),
             workspace,
             initial_position,
@@ -282,6 +312,58 @@ impl Window {
     /// to borrow the displaced window's workspace authority.
     pub(crate) fn has_exact_mux_identity(&self, mux: &Mux, expected_id: WindowId) -> bool {
         self.id == expected_id && std::ptr::eq(self.owner.as_ptr(), mux as *const Mux)
+    }
+
+    /// Exact number of tiled plus floating pane owners in this window.
+    ///
+    /// This scalar is mux transaction authority.  It is never recomputed on a
+    /// production callback path and it changes only through a consumed
+    /// [`PreparedWindowPaneCount`].
+    pub(crate) const fn structural_pane_count(&self) -> usize {
+        self.structural_pane_count
+    }
+
+    pub(crate) fn prepare_structural_pane_count(
+        &self,
+        removals: usize,
+        additions: usize,
+    ) -> anyhow::Result<PreparedWindowPaneCount> {
+        let retained = self
+            .structural_pane_count
+            .checked_sub(removals)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "window {} structural pane count {} underflows by {removals}",
+                    self.id,
+                    self.structural_pane_count,
+                )
+            })?;
+        let next = retained.checked_add(additions).ok_or_else(|| {
+            anyhow::anyhow!(
+                "window {} structural pane count overflows while adding {additions}",
+                self.id,
+            )
+        })?;
+        Ok(PreparedWindowPaneCount {
+            window_id: self.id,
+            prior: self.structural_pane_count,
+            next,
+        })
+    }
+
+    pub(crate) fn commit_structural_pane_count(
+        &mut self,
+        prepared: PreparedWindowPaneCount,
+    ) {
+        assert_eq!(
+            prepared.window_id, self.id,
+            "prepared pane count changed windows"
+        );
+        assert_eq!(
+            prepared.prior, self.structural_pane_count,
+            "window pane count changed after preparation"
+        );
+        self.structural_pane_count = prepared.next;
     }
 
     pub fn set_title(&mut self, title: &str) {
@@ -1400,6 +1482,34 @@ mod tests {
     const CONTRACT_MAX_TABS_PER_WINDOW: usize = 4_096;
     const CONTRACT_MAX_TOTAL_TABS: usize = 16_384;
     const CONTRACT_MAX_SERVER_RECEIPTS: usize = 4_096;
+
+    #[test]
+    fn structural_pane_count_token_rejects_underflow_and_overflow_before_mutation() {
+        let mut window = Window::new(Some("count-token".to_string()), None);
+
+        let underflow = window
+            .prepare_structural_pane_count(1, 0)
+            .err()
+            .expect("zero structural panes cannot remove one");
+        assert!(underflow.to_string().contains("underflows"));
+        assert_eq!(window.structural_pane_count(), 0);
+
+        window.structural_pane_count = usize::MAX;
+        let overflow = window
+            .prepare_structural_pane_count(0, 1)
+            .err()
+            .expect("the maximum structural count cannot add one");
+        assert!(overflow.to_string().contains("overflows"));
+        assert_eq!(window.structural_pane_count(), usize::MAX);
+
+        let prepared = window
+            .prepare_structural_pane_count(usize::MAX, 7)
+            .expect("checked removal before addition permits a representable successor");
+        assert_eq!(prepared.prior(), usize::MAX);
+        assert_eq!(prepared.next(), 7);
+        window.commit_structural_pane_count(prepared);
+        assert_eq!(window.structural_pane_count(), 7);
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct ContractWindow {

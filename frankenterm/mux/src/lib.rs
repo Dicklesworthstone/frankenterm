@@ -63,8 +63,9 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{
-    FrozenWindowOrder, PrepareWindowOrderError, PreparedWindowState, Window, WindowId,
-    WindowOrderRevision, WindowOrderSnapshotError, MAX_TABS_PER_ORDERED_WINDOW,
+    FrozenWindowOrder, PrepareWindowOrderError, PreparedWindowPaneCount, PreparedWindowState,
+    Window, WindowId, WindowOrderRevision, WindowOrderSnapshotError,
+    MAX_TABS_PER_ORDERED_WINDOW,
 };
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
@@ -3010,12 +3011,11 @@ mod pane_registration_handle {
         /// Callers must not hold mux topology or tab locks; pane cleanup and
         /// lifecycle subscribers may re-enter those surfaces synchronously.
         pub fn retire_if_current(&self) -> bool {
-            let Some(owner) =
+            let Some(_owner) =
                 self.remove_if_current_without_recompute(true, PaneRemovalFollowUp::None)
             else {
                 return false;
             };
-            owner.recompute_pane_count();
             true
         }
 
@@ -3026,13 +3026,12 @@ mod pane_registration_handle {
         /// intentionally suppressed while they are active. The follow-up runs
         /// before the generation's replacement fence is released.
         pub fn retire_and_prune_if_current(&self) -> bool {
-            let Some(owner) = self.remove_if_current_without_recompute(
+            let Some(_owner) = self.remove_if_current_without_recompute(
                 true,
                 PaneRemovalFollowUp::PruneDeadWindowsIgnoringActivity,
             ) else {
                 return false;
             };
-            owner.recompute_pane_count();
             true
         }
 
@@ -3040,12 +3039,11 @@ mod pane_registration_handle {
         ///
         /// Callers must not hold mux topology or tab locks.
         pub fn detach_local_if_current(&self) -> bool {
-            let Some(owner) =
+            let Some(_owner) =
                 self.remove_if_current_without_recompute(false, PaneRemovalFollowUp::None)
             else {
                 return false;
             };
-            owner.recompute_pane_count();
             true
         }
 
@@ -4285,10 +4283,97 @@ struct ExactWindowTabCensus {
     exact_identities: HashSet<usize>,
 }
 
-/// Zero-cost production counterpart to the test-only exhaustive census.
-#[cfg(not(test))]
-#[derive(Default)]
-struct ExactWindowTabCensus;
+/// One exact per-window structural pane-count delta.
+///
+/// Callers state removals and additions separately so underflow and overflow
+/// are both checked before any authority field changes. An identity delta is
+/// meaningful: membership-changing window transactions use it to prove that
+/// an empty-tab move did not omit count authority.
+#[derive(Clone, Copy, Debug)]
+struct WindowPaneCountDelta {
+    window_id: WindowId,
+    removals: usize,
+    additions: usize,
+}
+
+impl WindowPaneCountDelta {
+    const fn new(window_id: WindowId, removals: usize, additions: usize) -> Self {
+        Self {
+            window_id,
+            removals,
+            additions,
+        }
+    }
+
+    const fn identity(window_id: WindowId) -> Self {
+        Self::new(window_id, 0, 0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error(
+    "{operation} workspace {workspace} pane-count delta -{removals} +{additions} is not representable from {prior}"
+)]
+pub(crate) struct WorkspacePaneCountDeltaRejection {
+    operation: &'static str,
+    workspace: String,
+    removals: usize,
+    additions: usize,
+    prior: usize,
+}
+
+struct PreparedWorkspacePaneCount {
+    workspace: String,
+    prior: usize,
+    next: usize,
+}
+
+/// Complete allocation-prepared pane-count publication for one structural
+/// transaction.
+///
+/// The token is move-only and its fields are private. Every structural writer
+/// must consume exactly one token while retaining the same window-map and
+/// workspace-count guards as its topology/owner commit. That makes a missing
+/// or duplicate count publication a type/ownership error rather than a later
+/// recount concern.
+struct PreparedPaneCountMutation {
+    windows: Vec<PreparedWindowPaneCount>,
+    workspaces: Vec<PreparedWorkspacePaneCount>,
+}
+
+impl PreparedPaneCountMutation {
+    fn window_ids(&self) -> impl Iterator<Item = WindowId> + '_ {
+        self.windows.iter().map(PreparedWindowPaneCount::window_id)
+    }
+
+    fn commit(
+        self,
+        windows: &mut HashMap<WindowId, Window>,
+        workspace_counts: &mut HashMap<String, usize>,
+    ) {
+        for prepared in self.windows {
+            windows
+                .get_mut(&prepared.window_id())
+                .expect("prepared pane-count window remains present")
+                .commit_structural_pane_count(prepared);
+        }
+        for prepared in self.workspaces {
+            debug_assert_eq!(
+                workspace_counts
+                    .get(&prepared.workspace)
+                    .copied()
+                    .unwrap_or(0),
+                prepared.prior,
+                "workspace pane count changed after preparation"
+            );
+            if prepared.next == 0 {
+                workspace_counts.remove(&prepared.workspace);
+            } else {
+                workspace_counts.insert(prepared.workspace, prepared.next);
+            }
+        }
+    }
+}
 
 /// Exact domain allocation plus the live pane generations attributed to it.
 ///
@@ -6498,6 +6583,10 @@ pub struct Mux {
     pane_reader_preparation_fault: Mutex<Option<PaneReaderPreparationFault>>,
     #[cfg(test)]
     pane_count_recomputes: AtomicUsize,
+    #[cfg(test)]
+    pane_count_window_probes: AtomicUsize,
+    #[cfg(test)]
+    fail_next_pane_count_preparation: AtomicBool,
     banner: RwLock<Option<String>>,
     clients: RwLock<HashMap<ClientId, ClientInfo>>,
     reliable_input: Mutex<ReliableInputLedger>,
@@ -7412,6 +7501,10 @@ impl Mux {
             pane_reader_preparation_fault: Mutex::new(None),
             #[cfg(test)]
             pane_count_recomputes: AtomicUsize::new(0),
+            #[cfg(test)]
+            pane_count_window_probes: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_pane_count_preparation: AtomicBool::new(false),
             banner: RwLock::new(None),
             clients: RwLock::new(HashMap::new()),
             reliable_input: Mutex::new(ReliableInputLedger::new()),
@@ -7445,6 +7538,231 @@ impl Mux {
         Ok(prepared)
     }
 
+    /// Prepare exact per-window and per-workspace structural count authority.
+    ///
+    /// Callers retain `windows` and `workspace_counts` through the eventual
+    /// token commit. Every allocation and checked arithmetic operation happens
+    /// here, before any topology, owner, scalar, or aggregate field changes.
+    fn prepare_pane_count_mutation_locked(
+        &self,
+        windows: &HashMap<WindowId, Window>,
+        workspace_counts: &mut HashMap<String, usize>,
+        deltas: &[WindowPaneCountDelta],
+        operation: &'static str,
+    ) -> anyhow::Result<PreparedPaneCountMutation> {
+        #[cfg(test)]
+        if self
+            .fail_next_pane_count_preparation
+            .swap(false, Ordering::AcqRel)
+        {
+            anyhow::bail!("injected {operation} pane-count allocation failure");
+        }
+        let mut seen_windows = HashSet::new();
+        seen_windows
+            .try_reserve(deltas.len())
+            .map_err(|error| anyhow!("reserve {operation} pane-count window identities: {error}"))?;
+        let mut prepared_windows = Vec::new();
+        prepared_windows
+            .try_reserve_exact(deltas.len())
+            .map_err(|error| anyhow!("reserve {operation} pane-count window tokens: {error}"))?;
+        let mut workspace_deltas: Vec<(String, usize, usize)> = Vec::new();
+        workspace_deltas
+            .try_reserve_exact(deltas.len())
+            .map_err(|error| anyhow!("reserve {operation} workspace pane-count deltas: {error}"))?;
+
+        for delta in deltas {
+            #[cfg(test)]
+            self.pane_count_window_probes
+                .fetch_add(1, Ordering::Relaxed);
+            anyhow::ensure!(
+                seen_windows.insert(delta.window_id),
+                "{operation} pane-count plan names window {} more than once",
+                delta.window_id
+            );
+            let window = windows.get(&delta.window_id).ok_or_else(|| {
+                anyhow!(
+                    "{operation} pane-count window {} is absent",
+                    delta.window_id
+                )
+            })?;
+            anyhow::ensure!(
+                window.has_exact_mux_identity(self, delta.window_id),
+                "{operation} pane-count window {} names another exact allocation",
+                delta.window_id
+            );
+            prepared_windows.push(
+                window
+                    .prepare_structural_pane_count(delta.removals, delta.additions)
+                    .with_context(|| {
+                        format!(
+                            "prepare {operation} structural pane count for window {}",
+                            delta.window_id
+                        )
+                    })?,
+            );
+
+            if let Some((_, removals, additions)) = workspace_deltas
+                .iter_mut()
+                .find(|(workspace, _, _)| workspace == window.get_workspace())
+            {
+                *removals = removals.checked_add(delta.removals).ok_or_else(|| {
+                    anyhow!(
+                        "{operation} workspace {} pane removals overflow",
+                        window.get_workspace()
+                    )
+                })?;
+                *additions = additions.checked_add(delta.additions).ok_or_else(|| {
+                    anyhow!(
+                        "{operation} workspace {} pane additions overflow",
+                        window.get_workspace()
+                    )
+                })?;
+            } else {
+                workspace_deltas.push((
+                    Self::prepare_owned_text(
+                        window.get_workspace(),
+                        "prepared pane-count workspace key",
+                    )?,
+                    delta.removals,
+                    delta.additions,
+                ));
+            }
+        }
+
+        let missing_entries = workspace_deltas
+            .iter()
+            .filter(|(workspace, _, additions)| {
+                *additions != 0 && !workspace_counts.contains_key(workspace)
+            })
+            .count();
+        workspace_counts.try_reserve(missing_entries).map_err(|error| {
+            anyhow!("reserve {operation} workspace pane-count entries: {error}")
+        })?;
+        let mut prepared_workspaces = Vec::new();
+        prepared_workspaces
+            .try_reserve_exact(workspace_deltas.len())
+            .map_err(|error| anyhow!("reserve {operation} workspace pane-count tokens: {error}"))?;
+        for (workspace, removals, additions) in workspace_deltas {
+            let prior = workspace_counts.get(&workspace).copied().unwrap_or(0);
+            let next = prior
+                .checked_sub(removals)
+                .and_then(|retained| retained.checked_add(additions))
+                .ok_or_else(|| WorkspacePaneCountDeltaRejection {
+                    operation,
+                    workspace: workspace.clone(),
+                    removals,
+                    additions,
+                    prior,
+                })?;
+            prepared_workspaces.push(PreparedWorkspacePaneCount {
+                workspace,
+                prior,
+                next,
+            });
+        }
+        prepared_windows.sort_unstable_by_key(PreparedWindowPaneCount::window_id);
+        prepared_workspaces.sort_unstable_by(|left, right| left.workspace.cmp(&right.workspace));
+        Ok(PreparedPaneCountMutation {
+            windows: prepared_windows,
+            workspaces: prepared_workspaces,
+        })
+    }
+
+    /// Prepare one count token from exact before/after cardinalities for
+    /// structural changes inside already-registered tabs.
+    fn prepare_tab_pane_count_mutation_locked(
+        &self,
+        windows: &HashMap<WindowId, Window>,
+        tab_parents: &HashMap<TabId, TabParentRegistration>,
+        workspace_counts: &mut HashMap<String, usize>,
+        transitions: &[(Arc<Tab>, usize, usize)],
+        operation: &'static str,
+    ) -> anyhow::Result<PreparedPaneCountMutation> {
+        let mut deltas = Vec::<WindowPaneCountDelta>::new();
+        deltas
+            .try_reserve_exact(transitions.len())
+            .map_err(|error| anyhow!("reserve {operation} tab pane-count deltas: {error}"))?;
+        let mut seen_tabs = HashSet::new();
+        seen_tabs
+            .try_reserve(transitions.len())
+            .map_err(|error| anyhow!("reserve {operation} exact tab identities: {error}"))?;
+
+        for (tab, prior, next) in transitions {
+            anyhow::ensure!(
+                seen_tabs.insert((tab.tab_id(), Arc::as_ptr(tab) as usize)),
+                "{operation} pane-count plan names exact tab {} more than once",
+                tab.tab_id()
+            );
+            let Some(parent) = tab_parents.get(&tab.tab_id()) else {
+                continue;
+            };
+            anyhow::ensure!(
+                parent.is_same_tab(tab),
+                "{operation} tab {} parent authority names another exact generation",
+                tab.tab_id()
+            );
+            let window = windows.get(&parent.window_id).ok_or_else(|| {
+                anyhow!(
+                    "{operation} tab {} parent window {} is absent",
+                    tab.tab_id(),
+                    parent.window_id
+                )
+            })?;
+            anyhow::ensure!(
+                parent.matches(tab, parent.window_id)
+                    && window.iter().any(|candidate| Arc::ptr_eq(candidate, tab)),
+                "{operation} tab {} lacks exact forward/reverse window parentage",
+                tab.tab_id()
+            );
+            let (removals, additions) = if next >= prior {
+                (0, next - prior)
+            } else {
+                (prior - next, 0)
+            };
+            if let Some(delta) = deltas
+                .iter_mut()
+                .find(|delta| delta.window_id == parent.window_id)
+            {
+                delta.removals = delta.removals.checked_add(removals).ok_or_else(|| {
+                    anyhow!("{operation} window {} pane removals overflow", parent.window_id)
+                })?;
+                delta.additions = delta.additions.checked_add(additions).ok_or_else(|| {
+                    anyhow!("{operation} window {} pane additions overflow", parent.window_id)
+                })?;
+            } else {
+                deltas.push(WindowPaneCountDelta::new(
+                    parent.window_id,
+                    removals,
+                    additions,
+                ));
+            }
+        }
+        self.prepare_pane_count_mutation_locked(
+            windows,
+            workspace_counts,
+            &deltas,
+            operation,
+        )
+    }
+
+    /// Exact O(1) tab structural cardinality from the private reverse index.
+    pub(crate) fn exact_tab_structural_pane_count(
+        authority: &PaneAuthorityIndex,
+        tab: &Arc<Tab>,
+    ) -> anyhow::Result<usize> {
+        match authority.pane_ids_by_tab.get(&tab.tab_id()) {
+            Some(members) => {
+                anyhow::ensure!(
+                    members.matches_tab(tab),
+                    "tab {} structural pane-count bucket names another exact allocation",
+                    tab.tab_id()
+                );
+                Ok(members.pane_ids.len())
+            }
+            None => Ok(0),
+        }
+    }
+
     /// Count one exact window's structurally owned panes without acquiring
     /// any pane callback or `Tab::inner` lock.
     ///
@@ -7452,6 +7770,7 @@ impl Mux {
     /// writer. Walking only the window's tab vector makes workspace changes
     /// proportional to that window, rather than to the whole session, while
     /// the caller's authority guard keeps the count stable through commit.
+    #[cfg(test)]
     fn exact_window_structural_pane_count(
         &self,
         authority: &PaneAuthorityIndex,
@@ -7465,38 +7784,30 @@ impl Mux {
             window.has_exact_mux_identity(self, window_id),
             "window registry key {window_id} names another exact window allocation"
         );
-        #[cfg(not(test))]
-        let _ = census;
-        #[cfg(test)]
-        {
-            census.tab_ids.clear();
-            census.exact_identities.clear();
-            census.tab_ids.try_reserve(window.len()).map_err(|error| {
-                anyhow!("reserve window {window_id} tab identity census: {error}")
+        census.tab_ids.clear();
+        census.exact_identities.clear();
+        census.tab_ids.try_reserve(window.len()).map_err(|error| {
+            anyhow!("reserve window {window_id} tab identity census: {error}")
+        })?;
+        census
+            .exact_identities
+            .try_reserve(window.len())
+            .map_err(|error| {
+                anyhow!("reserve window {window_id} exact tab census: {error}")
             })?;
-            census
-                .exact_identities
-                .try_reserve(window.len())
-                .map_err(|error| {
-                    anyhow!("reserve window {window_id} exact tab census: {error}")
-                })?;
-        }
         let mut pane_count = 0usize;
         for tab in window.iter() {
-            #[cfg(test)]
-            {
-                let identity = Arc::as_ptr(tab) as usize;
-                anyhow::ensure!(
-                    census.tab_ids.insert(tab.tab_id(), identity).is_none(),
-                    "window {window_id} contains duplicate tab id {}",
-                    tab.tab_id()
-                );
-                anyhow::ensure!(
-                    census.exact_identities.insert(identity),
-                    "window {window_id} contains exact tab {} more than once",
-                    tab.tab_id()
-                );
-            }
+            let identity = Arc::as_ptr(tab) as usize;
+            anyhow::ensure!(
+                census.tab_ids.insert(tab.tab_id(), identity).is_none(),
+                "window {window_id} contains duplicate tab id {}",
+                tab.tab_id()
+            );
+            anyhow::ensure!(
+                census.exact_identities.insert(identity),
+                "window {window_id} contains exact tab {} more than once",
+                tab.tab_id()
+            );
             anyhow::ensure!(
                 registered_tabs
                     .get(&tab.tab_id())
@@ -7518,7 +7829,6 @@ impl Mux {
                         "window {window_id} tab {} structural directory names another exact allocation",
                         tab.tab_id()
                     );
-                    #[cfg(test)]
                     for pane_id in &members.pane_ids {
                         anyhow::ensure!(
                             authority
@@ -7532,7 +7842,6 @@ impl Mux {
                     members.pane_ids.len()
                 }
                 None => {
-                    #[cfg(test)]
                     anyhow::ensure!(
                         authority
                             .structural_by_pane_id
@@ -7555,16 +7864,11 @@ impl Mux {
         std::thread::current().id() == self.main_thread_id
     }
 
-    fn recompute_pane_count(&self) {
-        self.recompute_pane_count_with_before_publish(|| ());
-    }
-
-    /// Test-observable implementation of the exact recount cut. The observer
+    /// Test-only implementation of the exact recount cut. The observer
     /// runs after every allocation and census check but before cache
     /// publication, while the authority/window guards are still retained.
-    /// Production supplies a no-op observer.
+    #[cfg(test)]
     fn recompute_pane_count_with_before_publish(&self, before_publish: impl FnOnce()) {
-        #[cfg(test)]
         self.pane_count_recomputes.fetch_add(1, Ordering::Relaxed);
         // Retain one exact structural/window cut through cache publication.
         // Releasing the window census before the count write allowed a
@@ -7597,6 +7901,13 @@ impl Mux {
                     return;
                 }
             };
+            if window.structural_pane_count() != pane_count {
+                log::error!(
+                    "refusing pane-count oracle publication: window {window_id} scalar {} disagrees with exact structural count {pane_count}",
+                    window.structural_pane_count()
+                );
+                return;
+            }
             if pane_count == 0 {
                 continue;
             }
@@ -8105,10 +8416,7 @@ impl Mux {
                 .filter(|info| Arc::ptr_eq(&info.client_id, ident))
                 .filter(|info| info.active_workspace.as_deref() == Some(expected_workspace))
             {
-                Some(std::mem::replace(
-                    &mut info.active_workspace,
-                    Some(workspace_state),
-                ))
+                Some(info.active_workspace.replace(workspace_state))
             } else {
                 None
             }
@@ -8147,11 +8455,7 @@ impl Mux {
 
         self.bind_window_notification_owner();
         {
-            let authority = self.pane_authority.lock();
-            let registered_tabs = self.tabs.read();
             let mut windows = self.windows.write();
-            let tab_parents = self.tab_parents.read();
-            let mut census = ExactWindowTabCensus::default();
             let mut affected_window_ids = Vec::new();
             affected_window_ids
                 .try_reserve(windows.len())
@@ -8164,14 +8468,7 @@ impl Mux {
                 {
                     continue;
                 }
-                let pane_count = self.exact_window_structural_pane_count(
-                    &authority,
-                    &registered_tabs,
-                    &tab_parents,
-                    &mut census,
-                    *window_id,
-                    window,
-                )?;
+                let pane_count = window.structural_pane_count();
                 if window.get_workspace() == old_workspace {
                     affected_window_ids.push(*window_id);
                     exact_old_count = exact_old_count.checked_add(pane_count).ok_or_else(|| {
@@ -8638,6 +8935,7 @@ impl Mux {
         attached_tabs: Vec<(TabId, WindowId)>,
         created_windows: Vec<WindowId>,
         removed_windows: Vec<WindowId>,
+        pane_count_deltas: Vec<WindowPaneCountDelta>,
     ) -> anyhow::Result<()> {
         self.commit_prepared_window_states_with_trailing_revisions_locked(
             windows,
@@ -8645,6 +8943,7 @@ impl Mux {
             attached_tabs,
             created_windows,
             removed_windows,
+            pane_count_deltas,
             0,
             |_| (),
         )
@@ -8653,8 +8952,8 @@ impl Mux {
     /// Commit a window transaction and an allocation-complete trailing
     /// topology transaction under one contiguous revision reservation.
     ///
-    /// Lock order is `windows -> tab_parents -> topology ->
-    /// pending_window_notifications -> provisional_windows` when
+    /// Lock order is `windows -> tab_parents -> num_panes_by_workspace ->
+    /// topology -> pending_window_notifications -> provisional_windows` when
     /// created/removed window receipts require the final lock. Callers already
     /// hold the window-map write guard. A caller retaining
     /// `provisional_windows` may commit a state-only transaction only when both
@@ -8665,6 +8964,55 @@ impl Mux {
     fn commit_prepared_window_states_with_trailing_revisions_locked<R>(
         &self,
         windows: &mut HashMap<WindowId, Window>,
+        prepared: Vec<(WindowId, PreparedWindowState)>,
+        attached_tabs: Vec<(TabId, WindowId)>,
+        created_windows: Vec<WindowId>,
+        removed_windows: Vec<WindowId>,
+        pane_count_deltas: Vec<WindowPaneCountDelta>,
+        trailing_revision_count: usize,
+        commit_trailing: impl FnOnce(Option<TopologyRevision>) -> R,
+    ) -> anyhow::Result<R> {
+        // Window membership authority is already held by the caller. Acquire
+        // the remaining aggregate authorities in their canonical order before
+        // preparing the mandatory count token. Callers that must retain stable
+        // `TabInner` guards use the prepared-authorities entry point below so
+        // these two locks are acquired before those guards.
+        let mut tab_parents = self.tab_parents.write();
+        let mut workspace_counts = self.num_panes_by_workspace.write();
+        let prepared_pane_counts = self.prepare_pane_count_mutation_locked(
+            windows,
+            &mut workspace_counts,
+            &pane_count_deltas,
+            "window topology transaction",
+        )?;
+        self.commit_prepared_window_states_with_prepared_authorities_locked(
+            windows,
+            &mut tab_parents,
+            &mut workspace_counts,
+            prepared_pane_counts,
+            prepared,
+            attached_tabs,
+            created_windows,
+            removed_windows,
+            trailing_revision_count,
+            commit_trailing,
+        )
+    }
+
+    /// Commit a prepared window/count transaction while the caller retains
+    /// exact parent and workspace-count authority.
+    ///
+    /// This entry point is mandatory for structural operations that also hold
+    /// stable `TabInner` guards: callers acquire `windows -> tab_parents ->
+    /// num_panes_by_workspace`, prepare the move-only count token, and only
+    /// then acquire `TabInner`. No fallible count work or aggregate lock
+    /// acquisition can therefore occur after a stable tab snapshot is held.
+    fn commit_prepared_window_states_with_prepared_authorities_locked<R>(
+        &self,
+        windows: &mut HashMap<WindowId, Window>,
+        tab_parents: &mut HashMap<TabId, TabParentRegistration>,
+        workspace_counts: &mut HashMap<String, usize>,
+        prepared_pane_counts: PreparedPaneCountMutation,
         mut prepared: Vec<(WindowId, PreparedWindowState)>,
         attached_tabs: Vec<(TabId, WindowId)>,
         mut created_windows: Vec<WindowId>,
@@ -8724,6 +9072,20 @@ impl Mux {
             parentage_changed || attached_tabs.is_empty(),
             "membership-preserving window transaction cannot publish tab attachments"
         );
+        if parentage_changed {
+            for (window_id, state) in &prepared {
+                if state.membership_changed()
+                    || removed_windows.binary_search(window_id).is_ok()
+                {
+                    anyhow::ensure!(
+                        prepared_pane_counts
+                            .window_ids()
+                            .any(|prepared_window_id| prepared_window_id == *window_id),
+                        "membership-changing window {window_id} lacks a prepared pane-count delta"
+                    );
+                }
+            }
+        }
         let mut prepared_window_ids = HashSet::new();
         if parentage_changed {
             prepared_window_ids
@@ -8835,12 +9197,11 @@ impl Mux {
         if parentage_changed {
             self.tab_parent_write_cuts.fetch_add(1, Ordering::Relaxed);
         }
-        let mut tab_parents = parentage_changed.then(|| self.tab_parents.write());
         let mut new_parent_entries = Vec::new();
         new_parent_entries
             .try_reserve_exact(final_tab_count)
             .map_err(|error| anyhow!("reserve prepared tab-parent entries: {error}"))?;
-        if let Some(tab_parents) = tab_parents.as_mut() {
+        if parentage_changed {
             let parent_index_growth = final_tab_count.saturating_sub(prior_tab_count);
             tab_parents
                 .try_reserve(parent_index_growth)
@@ -8880,6 +9241,17 @@ impl Mux {
                 }
             }
         }
+        anyhow::ensure!(
+            removed_windows.iter().all(|window_id| {
+                prepared_pane_counts
+                    .windows
+                    .iter()
+                    .find(|prepared| prepared.window_id() == *window_id)
+                    .is_some_and(|prepared| prepared.next() == 0)
+            }),
+            "removed windows must publish a terminal zero structural pane count"
+        );
+
         let mut topology = self.topology.lock();
         let mut pending = self.pending_window_notifications.lock();
         anyhow::ensure!(
@@ -8914,7 +9286,7 @@ impl Mux {
                 focus_lost.push(pane);
             }
         }
-        if let Some(tab_parents) = tab_parents.as_mut() {
+        if parentage_changed {
             for (window_id, tab) in &prior_tabs {
                 if !final_tab_memberships.contains(&(*window_id, Arc::as_ptr(tab) as usize)) {
                     let removed = tab_parents.remove(&tab.tab_id());
@@ -8926,6 +9298,7 @@ impl Mux {
                 debug_assert!(replaced.is_none());
             }
         }
+        prepared_pane_counts.commit(windows, workspace_counts);
         if !removed_windows.is_empty() || !created_windows.is_empty() {
             let mut provisional = self.provisional_windows.lock();
             for window_id in removed_windows {
@@ -10700,12 +11073,11 @@ impl Mux {
 
         self.complete_pane_lifecycle_notification(lifecycle_notification);
         self.notify_pane_registration_did_bind(pane, &registration);
-        self.recompute_pane_count();
         Ok(())
     }
 
     pub fn add_tab_no_panes(self: &Arc<Self>, tab: &Arc<Tab>) -> Result<(), Error> {
-        let inserted = {
+        {
             let _registration = self.pane_registration.lock();
             let authority = self.pane_authority.lock();
             anyhow::ensure!(
@@ -10721,7 +11093,6 @@ impl Mux {
                         "tab {} is registered as pane-free but has structural topology",
                         tab.tab_id()
                     );
-                    false
                 }
                 Some(_) => {
                     return Err(anyhow!(
@@ -10733,16 +11104,23 @@ impl Mux {
                     tabs.try_reserve(1).map_err(|error| {
                         anyhow!("reserve empty tab registration {}: {error}", tab.tab_id())
                     })?;
+                    let mut windows = self.windows.write();
+                    let tab_parents = self.tab_parents.read();
+                    let mut workspace_counts = self.num_panes_by_workspace.write();
+                    let prepared_counts = self.prepare_tab_pane_count_mutation_locked(
+                        &windows,
+                        &tab_parents,
+                        &mut workspace_counts,
+                        &[(Arc::clone(tab), 0, 0)],
+                        "empty tab registration",
+                    )?;
                     let binding = tab.prepare_mux_owner_binding_if_structurally_empty(self)?;
                     binding.commit();
                     tabs.insert(tab.tab_id(), Arc::clone(tab));
-                    true
+                    prepared_counts.commit(&mut windows, &mut workspace_counts);
                 }
             }
         };
-        if inserted {
-            self.recompute_pane_count();
-        }
         Ok(())
     }
 
@@ -10860,6 +11238,20 @@ impl Mux {
                             PaneStructuralLane::Tiled,
                             Some((registration, registered_domain_id)),
                         )?;
+                        anyhow::ensure!(
+                            Self::exact_tab_structural_pane_count(&authority, tab)? == 0,
+                            "new active-pane tab {tab_id} already has structural pane-count authority"
+                        );
+                        let mut windows = self.windows.write();
+                        let tab_parents = self.tab_parents.read();
+                        let mut workspace_counts = self.num_panes_by_workspace.write();
+                        let prepared_counts = self.prepare_tab_pane_count_mutation_locked(
+                            &windows,
+                            &tab_parents,
+                            &mut workspace_counts,
+                            &[(Arc::clone(tab), 0, 1)],
+                            "active-pane tab registration",
+                        )?;
                         let tab_binding = tab
                             .prepare_mux_owner_binding_with_exact_single_tiled_pane(self, &pane)?;
                         let tab_mux_owner_generation = tab_binding.commit();
@@ -10868,6 +11260,7 @@ impl Mux {
                             structural,
                             tab_mux_owner_generation,
                         );
+                        prepared_counts.commit(&mut windows, &mut workspace_counts);
                         Ok(None)
                     }
                     Some(claim) => {
@@ -10912,6 +11305,10 @@ impl Mux {
                             PaneStructuralLane::Tiled,
                             Some((registration.clone(), claim.domain_id)),
                         )?;
+                        anyhow::ensure!(
+                            Self::exact_tab_structural_pane_count(&authority, tab)? == 0,
+                            "active-pane tab {tab_id} already has structural pane-count authority"
+                        );
                         let mut tabs = self.tabs.write();
                         let tab_needs_insert = match tabs.get(&tab_id) {
                             Some(existing) if Arc::ptr_eq(existing, tab) => false,
@@ -10944,7 +11341,16 @@ impl Mux {
                         panes.try_reserve(1).map_err(|error| {
                             anyhow!("reserve pane registration {pane_id}: {error}")
                         })?;
-                        drop(panes);
+                        let mut windows = self.windows.write();
+                        let tab_parents = self.tab_parents.read();
+                        let mut workspace_counts = self.num_panes_by_workspace.write();
+                        let prepared_counts = self.prepare_tab_pane_count_mutation_locked(
+                            &windows,
+                            &tab_parents,
+                            &mut workspace_counts,
+                            &[(Arc::clone(tab), 0, 1)],
+                            "active-pane tab and pane registration",
+                        )?;
                         let tab_binding = if tab_needs_insert {
                             Some(
                                 tab.prepare_mux_owner_binding_with_exact_single_tiled_pane(
@@ -10961,7 +11367,6 @@ impl Mux {
                                 anyhow!("tab {tab_id} lost mux-owner authority")
                             })?
                         };
-                        let mut panes = self.panes.write();
                         anyhow::ensure!(
                             !panes.contains_key(&pane_id),
                             "pane identifier {pane_id} became registered before final publication"
@@ -10996,6 +11401,7 @@ impl Mux {
                         );
                         authority
                             .commit_structural_bind(structural, tab_mux_owner_generation);
+                        prepared_counts.commit(&mut windows, &mut workspace_counts);
                         let lifecycle_notification = lifecycle_enqueue.enqueue(
                             PaneLifecycleNotification::Added(pane_id),
                             topology_stamp,
@@ -11022,7 +11428,6 @@ impl Mux {
         } else {
             self.capture_pane_registration(&pane)
         };
-        self.recompute_pane_count();
         Ok(registration)
     }
 
@@ -11488,9 +11893,6 @@ impl Mux {
             self.finish_pane_removal(removed, true);
             drop(operation);
         }
-        if retired != 0 {
-            self.recompute_pane_count();
-        }
         retired
     }
 
@@ -11516,7 +11918,6 @@ impl Mux {
             self.take_pane_for_removal(pane_id, None, None, PaneRemovalFollowUp::None)
         {
             self.finish_pane_removal(removed, true);
-            self.recompute_pane_count();
         }
     }
 
@@ -11527,7 +11928,6 @@ impl Mux {
             self.take_pane_for_removal(pane_id, Some(expected), None, PaneRemovalFollowUp::None)
         {
             self.finish_pane_removal(removed, true);
-            self.recompute_pane_count();
         }
     }
 
@@ -11545,7 +11945,6 @@ impl Mux {
             PaneRemovalFollowUp::None,
         ) {
             self.finish_pane_removal(removed, true);
-            self.recompute_pane_count();
         }
     }
 
@@ -11571,7 +11970,8 @@ impl Mux {
                 return None;
             }
             let mut windows = self.windows.write();
-            let prepared_windows = match self.prepare_exact_tab_detach_locked(
+            let (prepared_windows, pane_count_deltas) = match self.prepare_exact_tab_detach_locked(
+                &authority,
                 &windows,
                 std::slice::from_ref(&tab),
                 None,
@@ -11598,6 +11998,20 @@ impl Mux {
                         .then_some(*window_id)
                 }));
             }
+            let mut tab_parents = self.tab_parents.write();
+            let mut workspace_counts = self.num_panes_by_workspace.write();
+            let prepared_counts = match self.prepare_pane_count_mutation_locked(
+                &windows,
+                &mut workspace_counts,
+                &pane_count_deltas,
+                "tab retirement",
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!("refusing tab retirement count preparation: {error:#}");
+                    return None;
+                }
+            };
             let result = tab.with_pane_snapshot_for_retirement(self, |pane_snapshot| {
                 let pane_candidates = match authority
                     .prepare_tab_structural_removal(&tab, &pane_snapshot)
@@ -11631,10 +12045,20 @@ impl Mux {
                     prepared_retirement.commit(&mut authority, first_revision)
                 };
                 let committed = if prepared_windows.is_empty() {
-                    self.commit_with_reserved_pane_retirement_revisions(revision_count, commit)
+                    self.commit_with_reserved_pane_retirement_revisions(
+                        revision_count,
+                        |first_revision| {
+                            let committed = commit(first_revision);
+                            prepared_counts.commit(&mut windows, &mut workspace_counts);
+                            committed
+                        },
+                    )
                 } else {
-                    self.commit_prepared_window_states_with_trailing_revisions_locked(
+                    self.commit_prepared_window_states_with_prepared_authorities_locked(
                         &mut windows,
+                        &mut tab_parents,
+                        &mut workspace_counts,
+                        prepared_counts,
                         prepared_windows,
                         Vec::new(),
                         Vec::new(),
@@ -11930,18 +12354,22 @@ impl Mux {
     /// forward census so corruption can never masquerade as an unattached tab.
     fn prepare_exact_tab_detach_locked(
         &self,
+        authority: &PaneAuthorityIndex,
         windows: &HashMap<WindowId, Window>,
         removals: &[Arc<Tab>],
         excluded_window: Option<WindowId>,
         allow_same_id_successor: bool,
         operation: &'static str,
-    ) -> anyhow::Result<Vec<(WindowId, PreparedWindowState)>> {
+    ) -> anyhow::Result<(
+        Vec<(WindowId, PreparedWindowState)>,
+        Vec<WindowPaneCountDelta>,
+    )> {
         #[cfg(test)]
         self.validate_tab_parent_index_matches_windows_locked(windows)
             .with_context(|| format!("validate tab-parent index before {operation}"))?;
 
         let parents = self.tab_parents.read();
-        let mut removals_by_window: HashMap<WindowId, HashSet<usize>> = HashMap::new();
+        let mut removals_by_window: HashMap<WindowId, (HashSet<usize>, usize)> = HashMap::new();
         removals_by_window
             .try_reserve(removals.len())
             .map_err(|error| anyhow!("reserve {operation} indexed parents: {error}"))?;
@@ -11978,11 +12406,21 @@ impl Mux {
                 );
                 continue;
             }
-            let identities = removals_by_window.entry(parent.window_id).or_default();
+            let tab_pane_count = Self::exact_tab_structural_pane_count(authority, tab)
+                .with_context(|| format!("count tab {} before {operation}", tab.tab_id()))?;
+            let (identities, pane_count) = removals_by_window
+                .entry(parent.window_id)
+                .or_insert_with(|| (HashSet::new(), 0));
             identities
                 .try_reserve(1)
                 .map_err(|error| anyhow!("reserve {operation} tab identity: {error}"))?;
             identities.insert(Arc::as_ptr(tab) as usize);
+            *pane_count = pane_count.checked_add(tab_pane_count).ok_or_else(|| {
+                anyhow!(
+                    "{operation} window {} removed pane count overflow",
+                    parent.window_id
+                )
+            })?;
         }
         drop(parents);
 
@@ -11990,7 +12428,11 @@ impl Mux {
         prepared
             .try_reserve_exact(removals_by_window.len())
             .map_err(|error| anyhow!("reserve {operation} window transaction: {error}"))?;
-        for (window_id, removals) in removals_by_window {
+        let mut pane_count_deltas = Vec::new();
+        pane_count_deltas
+            .try_reserve_exact(removals_by_window.len())
+            .map_err(|error| anyhow!("reserve {operation} pane-count transaction: {error}"))?;
+        for (window_id, (removals, pane_count)) in removals_by_window {
             let window = windows.get(&window_id).ok_or_else(|| {
                 anyhow!("{operation}: indexed parent window {window_id} is absent")
             })?;
@@ -11999,6 +12441,11 @@ impl Mux {
                 .with_context(|| format!("prepare {operation} in window {window_id}"))?
             {
                 prepared.push((window_id, state));
+                pane_count_deltas.push(WindowPaneCountDelta::new(
+                    window_id,
+                    pane_count,
+                    0,
+                ));
             } else {
                 anyhow::bail!(
                     "{operation}: indexed exact tab membership is absent from window {window_id}"
@@ -12006,7 +12453,8 @@ impl Mux {
             }
         }
         prepared.sort_unstable_by_key(|(window_id, _)| *window_id);
-        Ok(prepared)
+        pane_count_deltas.sort_unstable_by_key(|delta| delta.window_id);
+        Ok((prepared, pane_count_deltas))
     }
 
     /// Atomically validate a delayed pane witness against an exact tab and
@@ -12031,7 +12479,8 @@ impl Mux {
                 return None;
             }
             let mut windows = self.windows.write();
-            let prepared_windows = match self.prepare_exact_tab_detach_locked(
+            let (prepared_windows, pane_count_deltas) = match self.prepare_exact_tab_detach_locked(
+                &authority,
                 &windows,
                 std::slice::from_ref(expected),
                 None,
@@ -12060,6 +12509,22 @@ impl Mux {
                         .then_some(*window_id)
                 }));
             }
+            let mut tab_parents = self.tab_parents.write();
+            let mut workspace_counts = self.num_panes_by_workspace.write();
+            let prepared_counts = match self.prepare_pane_count_mutation_locked(
+                &windows,
+                &mut workspace_counts,
+                &pane_count_deltas,
+                "witnessed tab retirement",
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!(
+                        "refusing witnessed tab retirement count preparation: {error:#}"
+                    );
+                    return None;
+                }
+            };
             let result = expected.with_exact_pane_operation_for_retirement(
                 self,
                 operation,
@@ -12100,11 +12565,18 @@ impl Mux {
                     let committed = if prepared_windows.is_empty() {
                         self.commit_with_reserved_pane_retirement_revisions(
                             revision_count,
-                            commit,
+                            |first_revision| {
+                                let committed = commit(first_revision);
+                                prepared_counts.commit(&mut windows, &mut workspace_counts);
+                                committed
+                            },
                         )
                     } else {
-                        self.commit_prepared_window_states_with_trailing_revisions_locked(
+                        self.commit_prepared_window_states_with_prepared_authorities_locked(
                             &mut windows,
+                            &mut tab_parents,
+                            &mut workspace_counts,
+                            prepared_counts,
                             prepared_windows,
                             Vec::new(),
                             Vec::new(),
@@ -12158,7 +12630,6 @@ impl Mux {
         for removed in removed_panes {
             self.finish_pane_removal(removed, true);
         }
-        self.recompute_pane_count();
 
         Some(tab)
     }
@@ -12182,7 +12653,6 @@ impl Mux {
         for removed in removed_panes {
             self.finish_pane_removal(removed, kill_remote_panes);
         }
-        self.recompute_pane_count();
 
         Some(tab)
     }
@@ -12204,7 +12674,8 @@ impl Mux {
                 return None;
             }
             let mut windows = self.windows.write();
-            let prepared_windows = match self.prepare_exact_tab_detach_locked(
+            let (prepared_windows, pane_count_deltas) = match self.prepare_exact_tab_detach_locked(
+                &authority,
                 &windows,
                 std::slice::from_ref(expected),
                 None,
@@ -12233,6 +12704,20 @@ impl Mux {
                         .then_some(*window_id)
                 }));
             }
+            let mut tab_parents = self.tab_parents.write();
+            let mut workspace_counts = self.num_panes_by_workspace.write();
+            let prepared_counts = match self.prepare_pane_count_mutation_locked(
+                &windows,
+                &mut workspace_counts,
+                &pane_count_deltas,
+                "empty-tab retirement",
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!("refusing empty-tab retirement count preparation: {error:#}");
+                    return None;
+                }
+            };
             let tab = expected.with_structurally_empty_for_retirement(self, || {
                 let structural_ids = match authority
                     .prepare_tab_structural_removal(expected, &[])
@@ -12246,16 +12731,25 @@ impl Mux {
                     }
                 };
                 if !prepared_windows.is_empty() {
-                    if let Err(error) = self.commit_prepared_window_states_locked(
+                    if let Err(error) = self
+                        .commit_prepared_window_states_with_prepared_authorities_locked(
                         &mut windows,
+                        &mut tab_parents,
+                        &mut workspace_counts,
+                        prepared_counts,
                         prepared_windows,
                         Vec::new(),
                         Vec::new(),
                         removed_windows,
-                    ) {
+                        0,
+                        |_| (),
+                    )
+                    {
                         log::error!("refusing empty-tab retirement window commit: {error:#}");
                         return None;
                     }
+                } else {
+                    prepared_counts.commit(&mut windows, &mut workspace_counts);
                 }
                 let removed = tabs.remove(&tab_id);
                 if removed.is_some() {
@@ -12266,7 +12760,6 @@ impl Mux {
             tab
         };
         self.flush_window_notifications();
-        self.recompute_pane_count();
         Some(tab)
     }
 
@@ -12317,7 +12810,8 @@ impl Mux {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut prepared_windows = match self.prepare_exact_tab_detach_locked(
+            let (mut prepared_windows, mut pane_count_deltas) = match self.prepare_exact_tab_detach_locked(
+                &authority,
                 &windows,
                 &retired_tabs,
                 None,
@@ -12351,6 +12845,28 @@ impl Mux {
                     .ok()?;
                 prepared_windows.push((window_id, retirement));
             }
+            if !pane_count_deltas
+                .iter()
+                .any(|delta| delta.window_id == window_id)
+            {
+                pane_count_deltas.push(WindowPaneCountDelta::identity(window_id));
+            }
+            let mut tab_parents = self.tab_parents.write();
+            let mut workspace_counts = self.num_panes_by_workspace.write();
+            let prepared_counts = match self.prepare_pane_count_mutation_locked(
+                &windows,
+                &mut workspace_counts,
+                &pane_count_deltas,
+                "window retirement",
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!(
+                        "refusing window {window_id} retirement count preparation: {error:#}"
+                    );
+                    return None;
+                }
+            };
 
             let removed_tabs = Tab::with_pane_snapshots_for_retirement(
                 self,
@@ -12427,6 +12943,7 @@ impl Mux {
                         self.commit_with_reserved_pane_retirement_revisions(
                             revision_count,
                             |first_revision| {
+                                prepared_counts.commit(&mut windows, &mut workspace_counts);
                                 if was_provisional {
                                     windows
                                         .remove(&window_id)
@@ -12437,8 +12954,11 @@ impl Mux {
                             },
                         )
                     } else {
-                        self.commit_prepared_window_states_with_trailing_revisions_locked(
+                        self.commit_prepared_window_states_with_prepared_authorities_locked(
                             &mut windows,
+                            &mut tab_parents,
+                            &mut workspace_counts,
+                            prepared_counts,
                             prepared_windows,
                             Vec::new(),
                             Vec::new(),
@@ -12552,13 +13072,29 @@ impl Mux {
     }
 
     fn cancel_provisional_window(&self, window_id: WindowId, mut activity: Option<Activity>) {
-        let (removed, preserved) = {
+        let (_removed, preserved) = {
             let mut windows = self.windows.write();
             if !self.provisional_windows.lock().remove(&window_id) {
                 return;
             }
             match windows.get(&window_id) {
                 Some(window) if window.is_empty() => {
+                    let mut workspace_counts = self.num_panes_by_workspace.write();
+                    let prepared_counts = match self.prepare_pane_count_mutation_locked(
+                        &windows,
+                        &mut workspace_counts,
+                        &[WindowPaneCountDelta::identity(window_id)],
+                        "provisional window cancellation",
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            log::error!(
+                                "refusing provisional window {window_id} cancellation: {error:#}"
+                            );
+                            return;
+                        }
+                    };
+                    prepared_counts.commit(&mut windows, &mut workspace_counts);
                     windows.remove(&window_id);
                     (true, false)
                 }
@@ -12575,9 +13111,6 @@ impl Mux {
                 None => (false, false),
             }
         };
-        if removed {
-            self.recompute_pane_count();
-        }
         if preserved {
             self.flush_window_notifications();
         }
@@ -12620,6 +13153,7 @@ impl Mux {
                     Vec::new(),
                     Vec::new(),
                     removed_windows,
+                    vec![WindowPaneCountDelta::identity(window_id)],
                 ) {
                     Ok(()) => true,
                     Err(error) => {
@@ -12632,7 +13166,6 @@ impl Mux {
             }
         };
         if removed {
-            self.recompute_pane_count();
             self.flush_window_notifications();
         }
         removed
@@ -12653,6 +13186,22 @@ impl Mux {
                     .get(&window_id)
                     .is_some_and(|window| window.is_empty())
                 {
+                    let mut workspace_counts = self.num_panes_by_workspace.write();
+                    let prepared_counts = match self.prepare_pane_count_mutation_locked(
+                        &windows,
+                        &mut workspace_counts,
+                        &[WindowPaneCountDelta::identity(window_id)],
+                        "unpublished window removal",
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            log::error!(
+                                "refusing unpublished window {window_id} removal: {error:#}"
+                            );
+                            return;
+                        }
+                    };
+                    prepared_counts.commit(&mut windows, &mut workspace_counts);
                     let removed = windows.remove(&window_id).is_some();
                     self.provisional_windows.lock().remove(&window_id);
                     removed
@@ -12660,9 +13209,7 @@ impl Mux {
                     false
                 }
             };
-            if removed {
-                self.recompute_pane_count();
-            } else {
+            if !removed {
                 log::debug!(
                     "preserving provisional window {window_id}: it is absent or acquired live topology"
                 );
@@ -12673,7 +13220,6 @@ impl Mux {
         if let Some(removed_window) = self.take_window_and_tabs_for_removal(window_id, None) {
             self.finish_removed_window(removed_window);
         }
-        self.recompute_pane_count();
         self.flush_window_notifications();
     }
 
@@ -12724,7 +13270,6 @@ impl Mux {
         for removed in removed_panes {
             self.finish_pane_removal(removed, true);
         }
-        self.recompute_pane_count();
         true
     }
 
@@ -12751,7 +13296,6 @@ impl Mux {
         for removed in removed_panes {
             self.finish_pane_removal(removed, false);
         }
-        self.recompute_pane_count();
         self.prune_dead_windows();
 
         Some(tab)
@@ -12857,6 +13401,7 @@ impl Mux {
         // holding its read lock through the window mutation. This prevents a
         // same-ID exact re-registration from being stripped after callbacks.
         let dead_windows = {
+            let authority = self.pane_authority.lock();
             let tabs = self.tabs.read();
             let stale_tabs = stale_window_tabs
                 .iter()
@@ -12867,8 +13412,8 @@ impl Mux {
                 .cloned()
                 .collect::<Vec<_>>();
             let mut windows = self.windows.write();
-            let provisional_windows = self.provisional_windows.lock();
-            let prepared = match self.prepare_exact_tab_detach_locked(
+            let (prepared, pane_count_deltas) = match self.prepare_exact_tab_detach_locked(
+                &authority,
                 &windows,
                 &stale_tabs,
                 None,
@@ -12878,7 +13423,7 @@ impl Mux {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     log::error!("refusing stale-parent prune before commit: {error:#}");
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 }
             };
             if !prepared.is_empty() {
@@ -12888,10 +13433,12 @@ impl Mux {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    pane_count_deltas,
                 ) {
                     log::error!("refusing stale-parent prune window commit: {error:#}");
                 }
             }
+            let provisional_windows = self.provisional_windows.lock();
             let dead_windows = windows
                 .iter()
                 .filter_map(|(window_id, window)| {
@@ -12945,7 +13492,6 @@ impl Mux {
         // separate same-ID reuse fence until cleanup fanout is complete.
         drop(operation);
         self.finish_removed_window(removed_window);
-        self.recompute_pane_count();
         self.flush_window_notifications();
         self.prune_dead_windows();
         true
@@ -12995,11 +13541,7 @@ impl Mux {
     ) -> Result<bool, WindowMutationError> {
         self.bind_window_notification_owner();
         let changed = {
-            let authority = self.pane_authority.lock();
-            let registered_tabs = self.tabs.read();
             let mut windows = self.windows.write();
-            let tab_parents = self.tab_parents.read();
-            let mut census = ExactWindowTabCensus::default();
             let window = windows
                 .get(&window_id)
                 .ok_or(WindowMutationError::NotFound { window_id })?;
@@ -13010,15 +13552,7 @@ impl Mux {
                 return Ok(false);
             }
 
-            let window_pane_count = self.exact_window_structural_pane_count(
-                &authority,
-                &registered_tabs,
-                &tab_parents,
-                &mut census,
-                window_id,
-                window,
-            )
-            .map_err(|source| WindowMutationError::invariant(window_id, source))?;
+            let window_pane_count = window.structural_pane_count();
             let old_workspace = Self::prepare_owned_text(
                 window.get_workspace(),
                 "prior window state",
@@ -13442,6 +13976,7 @@ impl Mux {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )?;
             true
         };
@@ -13493,6 +14028,7 @@ impl Mux {
             self.commit_prepared_window_states_locked(
                 &mut windows,
                 prepared,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -13561,12 +14097,14 @@ impl Mux {
     pub fn add_tab_to_window(&self, tab: &Arc<Tab>, window_id: WindowId) -> anyhow::Result<()> {
         let tab_id = tab.tab_id();
         {
+            let authority = self.pane_authority.lock();
             let tabs = self.tabs.read();
             anyhow::ensure!(
                 tabs.get(&tab_id)
                     .is_some_and(|registered| Arc::ptr_eq(registered, tab)),
                 "add_tab_to_window: tab {tab_id} is not the exact registered tab instance"
             );
+            let tab_pane_count = Self::exact_tab_structural_pane_count(&authority, tab)?;
             let mut windows = self.windows.write();
             let existing_parent = self.tab_parents.read().get(&tab_id).cloned();
             if let Some(existing_parent) = existing_parent {
@@ -13612,9 +14150,13 @@ impl Mux {
                 attached_tabs,
                 created_windows,
                 Vec::new(),
+                vec![WindowPaneCountDelta::new(
+                    window_id,
+                    0,
+                    tab_pane_count,
+                )],
             )?;
         }
-        self.recompute_pane_count();
         self.flush_window_notifications();
         Ok(())
     }
@@ -13701,12 +14243,14 @@ impl Mux {
         dst_window: WindowId,
         idx: Option<usize>,
     ) -> anyhow::Result<()> {
+        let authority = self.pane_authority.lock();
         let tabs = self.tabs.read();
         let tab = tabs
             .get(&tab_id)
             .map(Arc::clone)
             .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} not found in mux"))?;
-        let (changed, src_window) = {
+        let tab_pane_count = Self::exact_tab_structural_pane_count(&authority, &tab)?;
+        {
             let mut windows = self.windows.write();
             let src_window = self
                 .tab_parents
@@ -13843,19 +14387,21 @@ impl Mux {
                     attached_tabs,
                     created_windows,
                     Vec::new(),
+                    if src_window == dst_window {
+                        Vec::new()
+                    } else {
+                        vec![
+                            WindowPaneCountDelta::new(src_window, tab_pane_count, 0),
+                            WindowPaneCountDelta::new(dst_window, 0, tab_pane_count),
+                        ]
+                    },
                 )?;
                 true
             };
-            (changed, src_window)
-        };
-        drop(tabs);
-
-        // Pane count is unchanged for a within-workspace move; recompute keeps
-        // the per-workspace tallies correct if a caller ever moves across
-        // workspaces.
-        if changed && src_window != dst_window {
-            self.recompute_pane_count();
+            let _ = changed;
         }
+        drop(tabs);
+        drop(authority);
         self.flush_window_notifications();
         Ok(())
     }
@@ -14790,6 +15336,16 @@ impl Mux {
         let source_tab_retires = prepared.source_tab_retires();
         let trailing_revision_count = prepared.reserve_topology_notifications()?;
         let mut authority_replacements = prepared.take_authority_replacements()?;
+        let mut pane_count_deltas = Vec::new();
+        pane_count_deltas
+            .try_reserve_exact(if source_window_id == destination_window_id { 1 } else { 2 })
+            .map_err(|error| anyhow!("reserve move-to-new-tab pane-count deltas: {error}"))?;
+        if source_window_id == destination_window_id {
+            pane_count_deltas.push(WindowPaneCountDelta::identity(source_window_id));
+        } else {
+            pane_count_deltas.push(WindowPaneCountDelta::new(source_window_id, 1, 0));
+            pane_count_deltas.push(WindowPaneCountDelta::new(destination_window_id, 0, 1));
+        }
         let mut unpublished_window_state = unpublished_window
             .as_ref()
             .map(|window| window.prepare_insert(0, &destination_tab))
@@ -14852,22 +15408,6 @@ impl Mux {
                 })?;
             }
 
-            let source_workspace = windows
-                .get(&source_window_id)
-                .expect("validated move source window remains present")
-                .get_workspace()
-                .to_string();
-            let destination_workspace = unpublished_window
-                .as_ref()
-                .map(|window| window.get_workspace().to_string())
-                .unwrap_or_else(|| {
-                    windows
-                        .get(&destination_window_id)
-                        .expect("validated move destination window remains present")
-                        .get_workspace()
-                        .to_string()
-                });
-
             let mut prepared_windows = Vec::new();
             prepared_windows
                 .try_reserve_exact(2)
@@ -14885,13 +15425,20 @@ impl Mux {
                         .expect("unpublished destination retained its prepared state"),
                 ));
                 if source_tab_retires {
-                    let source_states = self.prepare_exact_tab_detach_locked(
+                    let (source_states, detach_count_deltas) = self.prepare_exact_tab_detach_locked(
+                        &authority,
                         &windows,
                         std::slice::from_ref(&source_tab),
                         None,
                         false,
                         "guarded move-to-new-tab source retirement",
                     )?;
+                    anyhow::ensure!(
+                        detach_count_deltas.iter().any(|delta| {
+                            delta.window_id == source_window_id && delta.removals == 1
+                        }),
+                        "retiring move source tab did not carry its exact one-pane count"
+                    );
                     {
                         let provisional = self.provisional_windows.lock();
                         removed_windows.extend(source_states.iter().filter_map(
@@ -14940,13 +15487,20 @@ impl Mux {
                     destination.prepare_insert(destination.len(), &destination_tab)?,
                 ));
                 if source_tab_retires {
-                    let source_states = self.prepare_exact_tab_detach_locked(
+                    let (source_states, detach_count_deltas) = self.prepare_exact_tab_detach_locked(
+                        &authority,
                         &windows,
                         std::slice::from_ref(&source_tab),
                         None,
                         false,
                         "guarded cross-window move source retirement",
                     )?;
+                    anyhow::ensure!(
+                        detach_count_deltas.iter().any(|delta| {
+                            delta.window_id == source_window_id && delta.removals == 1
+                        }),
+                        "retiring cross-window move source tab did not carry its exact one-pane count"
+                    );
                     {
                         let provisional = self.provisional_windows.lock();
                         removed_windows.extend(source_states.iter().filter_map(
@@ -14974,80 +15528,6 @@ impl Mux {
                 created_windows.push(destination_window_id);
             }
 
-            let mut workspace_counts = (source_workspace != destination_workspace)
-                .then(|| self.num_panes_by_workspace.write());
-            let workspace_transfer = if let Some(counts) = workspace_counts.as_mut() {
-                if !counts.contains_key(&destination_workspace) {
-                    counts.try_reserve(1).map_err(|error| {
-                        anyhow!(
-                            "reserve move destination workspace {destination_workspace}: {error}"
-                        )
-                    })?;
-                }
-                let source_count = counts.get(&source_workspace).copied().ok_or_else(|| {
-                    anyhow!(
-                        "move source workspace {source_workspace} lacks its pane count"
-                    )
-                })?;
-                let next_source_count = source_count.checked_sub(1).ok_or_else(|| {
-                    anyhow!("move source workspace {source_workspace} pane count underflow")
-                })?;
-                let next_destination_count = counts
-                    .get(&destination_workspace)
-                    .copied()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "move destination workspace {destination_workspace} pane count overflow"
-                        )
-                    })?;
-                Some((
-                    source_workspace,
-                    destination_workspace,
-                    next_source_count,
-                    next_destination_count,
-                ))
-            } else {
-                None
-            };
-
-            let tab_locks = prepared.lock_for_commit(
-                self,
-                &source_tab,
-                &destination_tab,
-            )?;
-            {
-                let panes = self.panes.read();
-                for replacement in &mut authority_replacements {
-                    for state in &mut replacement.desired {
-                        match panes.get(&state.pane_id) {
-                            Some(registered) => {
-                                anyhow::ensure!(
-                                    Arc::ptr_eq(&registered.pane, &state.pane),
-                                    "pane {} move registry slot names another exact allocation",
-                                    state.pane_id
-                                );
-                                state.registration = Some(PaneRegistrationHandle::new(
-                                    &registered.pane,
-                                    &registered.generation,
-                                ));
-                                state.domain_id = Some(registered.domain_id);
-                            }
-                            None => {
-                                state.registration = None;
-                                state.domain_id = None;
-                            }
-                        }
-                    }
-                }
-            }
-            let prepared_authority = authority.prepare_structural_relocation(
-                self,
-                &[&target],
-                authority_replacements,
-            )?;
-
             let inserted_unpublished_window = if let Some(window) = unpublished_window.take() {
                 let prior = windows.insert(destination_window_id, window);
                 debug_assert!(prior.is_none());
@@ -15055,9 +15535,69 @@ impl Mux {
             } else {
                 false
             };
-            let commit_result = self
-                .commit_prepared_window_states_with_trailing_revisions_locked(
+            let commit_result = (|| -> anyhow::Result<_> {
+                let mut tab_parents = self.tab_parents.write();
+                let source_parent = tab_parents.get(&source_tab.tab_id()).ok_or_else(|| {
+                    anyhow!("move source tab lost its indexed window parent")
+                })?;
+                anyhow::ensure!(
+                    source_parent.matches(&source_tab, source_window_id)
+                        && windows.get(&source_window_id).is_some_and(|window| {
+                            window
+                                .iter()
+                                .any(|tab| Arc::ptr_eq(tab, &source_tab))
+                        }),
+                    "move source tab changed exact window parent before final commit"
+                );
+                let mut workspace_counts = self.num_panes_by_workspace.write();
+                let prepared_counts = self.prepare_pane_count_mutation_locked(
+                    &windows,
+                    &mut workspace_counts,
+                    &pane_count_deltas,
+                    "guarded move to new tab",
+                )?;
+
+                let tab_locks = prepared.lock_for_commit(
+                    self,
+                    &source_tab,
+                    &destination_tab,
+                )?;
+                {
+                    let panes = self.panes.read();
+                    for replacement in &mut authority_replacements {
+                        for state in &mut replacement.desired {
+                            match panes.get(&state.pane_id) {
+                                Some(registered) => {
+                                    anyhow::ensure!(
+                                        Arc::ptr_eq(&registered.pane, &state.pane),
+                                        "pane {} move registry slot names another exact allocation",
+                                        state.pane_id
+                                    );
+                                    state.registration = Some(PaneRegistrationHandle::new(
+                                        &registered.pane,
+                                        &registered.generation,
+                                    ));
+                                    state.domain_id = Some(registered.domain_id);
+                                }
+                                None => {
+                                    state.registration = None;
+                                    state.domain_id = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                let prepared_authority = authority.prepare_structural_relocation(
+                    self,
+                    &[&target],
+                    authority_replacements,
+                )?;
+
+                self.commit_prepared_window_states_with_prepared_authorities_locked(
                     &mut windows,
+                    &mut tab_parents,
+                    &mut workspace_counts,
+                    prepared_counts,
                     prepared_windows,
                     attached_tabs,
                     created_windows,
@@ -15080,26 +15620,10 @@ impl Mux {
                             Arc::clone(&destination_tab),
                         );
                         debug_assert!(prior.is_none());
-                        if let (
-                            Some(counts),
-                            Some((
-                                source_workspace,
-                                destination_workspace,
-                                next_source_count,
-                                next_destination_count,
-                            )),
-                        ) = (workspace_counts.as_mut(), workspace_transfer)
-                        {
-                            if next_source_count == 0 {
-                                counts.remove(&source_workspace);
-                            } else {
-                                counts.insert(source_workspace, next_source_count);
-                            }
-                            counts.insert(destination_workspace, next_destination_count);
-                        }
                         committed
                     },
-                );
+                )
+            })();
             if commit_result.is_err() && inserted_unpublished_window {
                 let removed = windows.remove(&destination_window_id);
                 debug_assert!(removed.is_some());
@@ -16198,6 +16722,236 @@ mod tests {
         mux.add_tab_to_window(&tab, window_id)
             .expect("test tab should attach to its exact window");
         (tab, window_id)
+    }
+
+    fn assert_structural_pane_count_authority(mux: &Mux) {
+        let authority = mux.pane_authority.lock();
+        let registered_tabs = mux.tabs.read();
+        let windows = mux.windows.read();
+        let tab_parents = mux.tab_parents.read();
+        let workspace_counts = mux.num_panes_by_workspace.read();
+        let mut expected_workspace_counts = HashMap::<String, usize>::new();
+        let mut census = ExactWindowTabCensus::default();
+
+        for (window_id, window) in windows.iter() {
+            let exact = mux
+                .exact_window_structural_pane_count(
+                    &authority,
+                    &registered_tabs,
+                    &tab_parents,
+                    &mut census,
+                    *window_id,
+                    window,
+                )
+                .expect("exact structural pane-count oracle must remain valid");
+            assert_eq!(
+                window.structural_pane_count(),
+                exact,
+                "window {window_id} scalar must match exact structural authority"
+            );
+            if exact != 0 {
+                let count = expected_workspace_counts
+                    .entry(window.get_workspace().to_string())
+                    .or_default();
+                *count = count
+                    .checked_add(exact)
+                    .expect("test workspace structural count must be representable");
+            }
+        }
+        assert_eq!(
+            *workspace_counts, expected_workspace_counts,
+            "workspace totals must equal the sum of exact per-window scalars"
+        );
+    }
+
+    #[test]
+    fn pane_count_preparation_allocation_failure_is_zero_mutation() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (root, _root_kills) = KillCountingPane::new(62_101, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &root);
+        let (inserted, _inserted_kills) = KillCountingPane::new(62_102, test_size());
+        mux.add_pane(&inserted)
+            .expect("register split pane before injected count failure");
+        let before_topology = mux.topology_snapshot_authority().unwrap().1;
+        let before_workspace_counts = mux.num_panes_by_workspace.read().clone();
+        let before_window_count = mux
+            .get_window(window_id)
+            .expect("count-failure window remains registered")
+            .structural_pane_count();
+        let before_generation = mux.pane_authority.lock().next_structural_generation;
+        mux.fail_next_pane_count_preparation
+            .store(true, Ordering::Release);
+
+        let error = tab
+            .split_and_insert(0, SplitRequest::default(), Arc::clone(&inserted))
+            .expect_err("injected count allocation failure must reject the split");
+
+        assert!(format!("{error:#}").contains("injected bound split insertion pane-count allocation failure"));
+        assert_eq!(tab.iter_all_panes().len(), 1);
+        assert!(Arc::ptr_eq(&tab.iter_all_panes()[0], &root));
+        assert_eq!(mux.topology_snapshot_authority().unwrap().1, before_topology);
+        assert_eq!(*mux.num_panes_by_workspace.read(), before_workspace_counts);
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("count-failure window survives")
+                .structural_pane_count(),
+            before_window_count
+        );
+        let authority = mux.pane_authority.lock();
+        assert_eq!(authority.next_structural_generation, before_generation);
+        assert!(authority.structural_by_pane_id.get(&62_102).is_none());
+        drop(authority);
+        assert_structural_pane_count_authority(&mux);
+    }
+
+    #[test]
+    fn structural_pane_count_authority_tracks_every_writer_family_without_recount() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        mux.pane_count_recomputes.store(0, Ordering::Relaxed);
+        let (root, _root_kills) = KillCountingPane::new(62_201, test_size());
+        let (tab, first_window_id) = register_attached_test_pane(&global_guard, &mux, &root);
+        assert_structural_pane_count_authority(&mux);
+
+        let encoded_root = tab
+            .codec_pane_tree_in_window(first_window_id, DEFAULT_WORKSPACE)
+            .expect("encode the exact root before prepared-tree replacement");
+        tab.sync_with_pane_tree(
+            test_size(),
+            crate::tab::PaneNode::Empty,
+            |_| -> anyhow::Result<Arc<dyn Pane>> {
+                unreachable!("an empty prepared tree has no pane entries")
+            },
+        )
+        .expect("prepared-tree removal publishes count authority");
+        assert_structural_pane_count_authority(&mux);
+        tab.sync_with_pane_tree(test_size(), encoded_root, |entry| {
+            mux.get_pane(entry.pane_id)
+                .ok_or_else(|| anyhow!("prepared-tree pane {} remains registered", entry.pane_id))
+        })
+        .expect("prepared-tree restoration publishes count authority");
+        assert_structural_pane_count_authority(&mux);
+
+        let assigned_tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&assigned_tab)
+            .expect("register exact structurally empty tab");
+        let assigned_window = mux.new_empty_window(Some("count-writer-assigned".to_string()), None);
+        let assigned_window_id = *assigned_window;
+        mux.add_tab_to_window(&assigned_tab, assigned_window_id)
+            .expect("attach exact structurally empty tab");
+        let (assigned, _assigned_kills) = KillCountingPane::new(62_204, test_size());
+        mux.add_pane(&assigned)
+            .expect("register pane before bound root assignment");
+        assigned_tab.assign_pane(&assigned);
+        assert!(assigned_tab.contains_pane(62_204));
+        assert_structural_pane_count_authority(&mux);
+        mux.remove_tab(assigned_tab.tab_id())
+            .expect("bound root-assignment tab retirement publishes count authority");
+        assert_structural_pane_count_authority(&mux);
+        drop(assigned_window);
+
+        let (moved, _moved_kills) = KillCountingPane::new(62_202, test_size());
+        mux.add_pane(&moved).expect("register exact split pane");
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&moved))
+            .expect("bound split publishes count authority");
+        assert_structural_pane_count_authority(&mux);
+
+        let removed = tab
+            .remove_pane(62_202)
+            .expect("exact move removal publishes count authority");
+        assert!(Arc::ptr_eq(&removed, &moved));
+        assert_structural_pane_count_authority(&mux);
+
+        let second_tab = Arc::new(Tab::new(&test_size()));
+        second_tab.assign_pane(&moved);
+        mux.add_tab_and_active_pane(&second_tab)
+            .expect("publish the moved pane in a new exact tab");
+        let second_window = mux.new_empty_window(Some("count-writer-second".to_string()), None);
+        let second_window_id = *second_window;
+        mux.add_tab_to_window(&second_tab, second_window_id)
+            .expect("attach populated tab with its exact count");
+        assert_structural_pane_count_authority(&mux);
+
+        mux.move_tab_between_windows(second_tab.tab_id(), first_window_id, None)
+            .expect("cross-window populated-tab move publishes both count scalars");
+        assert_structural_pane_count_authority(&mux);
+        mux.remove_tab(second_tab.tab_id())
+            .expect("retire the moved populated tab");
+        assert_structural_pane_count_authority(&mux);
+
+        let (floating, _floating_kills) = KillCountingPane::new(62_203, test_size());
+        mux.add_pane(&floating)
+            .expect("register pane before floating admission");
+        tab.add_floating_pane(
+            Arc::clone(&floating),
+            FloatingPaneRect {
+                left: 2,
+                top: 2,
+                width: 20,
+                height: 8,
+            },
+        )
+        .expect("floating admission publishes count authority");
+        assert_structural_pane_count_authority(&mux);
+        tab.remove_floating_pane(62_203)
+            .expect("terminal floating removal publishes count authority");
+        assert_structural_pane_count_authority(&mux);
+
+        let (stale_pane, _stale_kills) = KillCountingPane::new(62_205, test_size());
+        let (stale_tab, stale_window_id) =
+            register_attached_test_pane(&global_guard, &mux, &stale_pane);
+        let displaced = mux
+            .tabs
+            .write()
+            .remove(&stale_tab.tab_id())
+            .expect("plant one stale exact window parent");
+        assert!(Arc::ptr_eq(&displaced, &stale_tab));
+        mux.prune_dead_windows_ignoring_activity();
+        assert!(mux.get_window(stale_window_id).is_none());
+        assert_structural_pane_count_authority(&mux);
+        assert!(mux
+            .tabs
+            .write()
+            .insert(stale_tab.tab_id(), Arc::clone(&stale_tab))
+            .is_none());
+        mux.remove_tab(stale_tab.tab_id())
+            .expect("retire the detached stale-parent tab");
+        assert_structural_pane_count_authority(&mux);
+
+        mux.remove_tab(tab.tab_id())
+            .expect("retire the final populated tab");
+        assert_structural_pane_count_authority(&mux);
+        assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
+        drop(second_window);
+    }
+
+    #[test]
+    fn pane_count_mutation_probes_only_affected_windows() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (root, _root_kills) = KillCountingPane::new(62_301, test_size());
+        let (tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &root);
+        let unrelated_windows = (0..128)
+            .map(|index| {
+                mux.new_empty_window(Some(format!("unrelated-{index}")), None)
+            })
+            .collect::<Vec<_>>();
+        let (inserted, _inserted_kills) = KillCountingPane::new(62_302, test_size());
+        mux.add_pane(&inserted)
+            .expect("register pane for constant-scope count probe");
+        mux.pane_count_window_probes.store(0, Ordering::Relaxed);
+
+        tab.split_and_insert(0, SplitRequest::default(), inserted)
+            .expect("one-window split must commit");
+
+        assert_eq!(
+            mux.pane_count_window_probes.load(Ordering::Relaxed),
+            1,
+            "count publication work must be independent of unrelated windows"
+        );
+        assert_structural_pane_count_authority(&mux);
+        drop(unrelated_windows);
     }
 
     fn reliable_input_test_event(character: char) -> KeyEvent {
@@ -18551,7 +19305,6 @@ mod tests {
         source_tab
             .split_and_insert(0, SplitRequest::default(), Arc::clone(&companion))
             .expect("attach exact companion pane to source tab");
-        mux.recompute_pane_count();
         let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
         mux.add_domain(&domain).expect("register test domain");
         let guard = mux
@@ -18676,6 +19429,7 @@ mod tests {
         );
         assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
         mux.assert_tab_parent_index_matches_windows();
+        assert_structural_pane_count_authority(&mux);
         assert_eq!(kills.load(Ordering::SeqCst), 0);
     }
 
@@ -19800,6 +20554,7 @@ mod tests {
             window.order_revision().get() == u64::MAX - 1
                 && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
         }));
+        assert_structural_pane_count_authority(&mux);
         assert_eq!(kills.load(Ordering::SeqCst), 0);
 
         Mux::shutdown();
@@ -19833,6 +20588,7 @@ mod tests {
             window.order_revision().get() == u64::MAX - 1
                 && window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))
         }));
+        assert_structural_pane_count_authority(&mux);
 
         Mux::shutdown();
     }
@@ -20162,7 +20918,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_registration_retirement_recomputes_pane_count_once() {
+    fn batch_registration_retirement_does_not_recount_unattached_panes() {
         let mux = Arc::new(Mux::new(None));
         let mut handles = Vec::new();
         let mut kill_counters = Vec::new();
@@ -20180,8 +20936,8 @@ mod tests {
         assert_eq!(PaneRegistrationHandle::retire_batch_if_current(handles), 8,);
         assert_eq!(
             mux.pane_count_recomputes.load(Ordering::Relaxed),
-            1,
-            "one owner batch must scan topology only once",
+            0,
+            "registration-only retirement must not invoke the structural repair oracle",
         );
         for (offset, kills) in kill_counters.into_iter().enumerate() {
             let pane_id = 142 + offset;
@@ -20698,9 +21454,9 @@ mod tests {
         })
         .expect("test mux subscription should allocate an identifier");
 
-        // Both mutators block in count recomputation after publishing their
-        // lifecycle event. Count aggregation must not stall reader start or
-        // later ordered lifecycle delivery.
+        // Detached registration-only mutations do not participate in window
+        // structural counts. Holding count authority must therefore neither
+        // stall reader start nor delay ordered lifecycle delivery.
         let pane_count_guard = mux.num_panes_by_workspace.read();
         let (pane, kills) = KillCountingPane::new(89, test_size());
         let mux_for_add = Arc::clone(&mux);
@@ -20717,7 +21473,7 @@ mod tests {
         while mux.get_pane(89).is_none() {
             assert!(
                 Instant::now() < publication_deadline,
-                "add should publish before blocking in pane-count recomputation"
+                "add should publish independently of window pane-count authority"
             );
             std::thread::yield_now();
         }
@@ -20727,7 +21483,7 @@ mod tests {
         while observed.lock().as_slice() != ["added"] {
             assert!(
                 Instant::now() < publication_deadline,
-                "PaneAdded should publish before blocking in pane-count recomputation"
+                "PaneAdded should publish independently of window pane-count authority"
             );
             std::thread::yield_now();
         }
@@ -20749,7 +21505,7 @@ mod tests {
         while mux.get_pane(89).is_some() {
             assert!(
                 Instant::now() < removal_deadline,
-                "remove should mutate topology before blocking in pane-count recomputation"
+                "remove should mutate registration topology independently of window counts"
             );
             std::thread::yield_now();
         }
@@ -20760,7 +21516,7 @@ mod tests {
         while observed.lock().as_slice() != ["added", "removed"] {
             assert!(
                 Instant::now() < removal_deadline,
-                "PaneRemoved should publish before blocking in pane-count recomputation"
+                "PaneRemoved should publish independently of window pane-count authority"
             );
             std::thread::yield_now();
         }
@@ -25978,6 +26734,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 vec![window_id],
+                vec![WindowPaneCountDelta::identity(window_id)],
             )
             .expect_err("nonempty window retirement must fail closed")
         };
@@ -26647,6 +27404,10 @@ mod tests {
                 vec![(tab.tab_id(), destination_id)],
                 Vec::new(),
                 Vec::new(),
+                vec![
+                    WindowPaneCountDelta::identity(source_id),
+                    WindowPaneCountDelta::identity(destination_id),
+                ],
             )
             .expect_err("stale indexed membership must fail before commit")
         };

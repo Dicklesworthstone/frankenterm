@@ -4791,14 +4791,6 @@ impl Tab {
             })
     }
 
-    fn exact_registered_arc(&self, mux: &Mux) -> Option<Arc<Self>> {
-        mux.tabs
-            .read()
-            .get(&self.tab_id)
-            .filter(|tab| std::ptr::eq(Arc::as_ptr(tab), self))
-            .cloned()
-    }
-
     #[cfg(test)]
     pub(crate) fn mux_owner_generation_for_test(&self) -> u64 {
         self.inner.lock().mux_owner_generation
@@ -4929,14 +4921,20 @@ impl Tab {
         let (mux, callbacks) = match expected_mux {
             Some(mux) => {
                 let current = current.expect("bound tabs retain a structural snapshot");
+                let prior_structural_count = current.len();
                 let _registration = mux.pane_registration.lock();
                 let mut authority = mux.pane_authority.lock();
-                let registered_tab = self.exact_registered_arc(&mux).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "tab {} lost exact mux registration before prepared-tree installation",
-                        self.tab_id
-                    )
-                })?;
+                let registered_tabs = mux.tabs.read();
+                let registered_tab = registered_tabs
+                    .get(&self.tab_id)
+                    .filter(|registered| std::ptr::eq(Arc::as_ptr(registered), self))
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "tab {} lost exact mux registration before prepared-tree installation",
+                            self.tab_id
+                        )
+                    })?;
                 let mut desired = Vec::new();
                 desired
                     .try_reserve_exact(desired_observed.len())
@@ -4976,10 +4974,25 @@ impl Tab {
                         });
                     }
                 }
+                let next_structural_count = desired.len();
                 let structural = authority.prepare_tab_structural_replacement(
                     Arc::clone(&registered_tab),
                     &current,
                     desired,
+                )?;
+                let mut windows = mux.windows.write();
+                let tab_parents = mux.tab_parents.read();
+                let mut workspace_counts = mux.num_panes_by_workspace.write();
+                let prepared_counts = mux.prepare_tab_pane_count_mutation_locked(
+                    &windows,
+                    &tab_parents,
+                    &mut workspace_counts,
+                    &[(
+                        Arc::clone(&registered_tab),
+                        prior_structural_count,
+                        next_structural_count,
+                    )],
+                    "prepared pane-tree replacement",
                 )?;
                 let mut inner = self.inner.lock();
                 anyhow::ensure!(
@@ -5027,6 +5040,7 @@ impl Tab {
                 });
                 let mut callbacks = inner.commit_prepared_pane_tree_install(install);
                 authority.commit_tab_structural_replacement(structural);
+                prepared_counts.commit(&mut windows, &mut workspace_counts);
                 callbacks.topology_notifications = topology_notifications;
                 (Some(Arc::clone(&mux)), callbacks)
             }
@@ -5573,7 +5587,7 @@ impl Tab {
                         PaneStructuralLane::Floating,
                         Some((pane_registration, domain_id)),
                     )?;
-                    let windows = mux.windows.read();
+                    let mut windows = mux.windows.write();
                     let parents = mux.tab_parents.read();
                     let parent = parents.get(&self.tab_id).ok_or_else(|| {
                         anyhow::anyhow!(
@@ -5603,15 +5617,31 @@ impl Tab {
                         "tab {} exact window-parent authority disagrees with window membership",
                         self.tab_id
                     );
-                    let workspace = window.get_workspace().to_string();
                     let mut workspace_counts = mux.num_panes_by_workspace.write();
-                    if !workspace_counts.contains_key(&workspace) {
-                        workspace_counts.try_reserve(1).map_err(|error| {
-                            anyhow::anyhow!(
-                                "reserve workspace {workspace} pane-count entry: {error}"
-                            )
-                        })?;
-                    }
+                    let prior_structural_count = expected_tiled
+                        .len()
+                        .checked_add(expected_floating.len())
+                        .ok_or_else(|| anyhow::anyhow!("floating-pane tab count overflow"))?;
+                    let next_structural_count = prior_structural_count
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("floating-pane tab count overflow"))?;
+                    anyhow::ensure!(
+                        Mux::exact_tab_structural_pane_count(&authority, &registered_tab)?
+                            == prior_structural_count,
+                        "tab {} structural authority changed during floating-pane admission",
+                        self.tab_id
+                    );
+                    let prepared_counts = mux.prepare_tab_pane_count_mutation_locked(
+                        &windows,
+                        &parents,
+                        &mut workspace_counts,
+                        &[(
+                            Arc::clone(&registered_tab),
+                            prior_structural_count,
+                            next_structural_count,
+                        )],
+                        "floating-pane admission",
+                    )?;
                     let mut inner = self.inner.lock();
                     anyhow::ensure!(
                         inner.is_active_mux_owner(&mux),
@@ -5638,18 +5668,11 @@ impl Tab {
                         .len()
                         .checked_add(current_floating.len())
                         .ok_or_else(|| anyhow::anyhow!("floating-pane tab count overflow"))?;
-                    let current_workspace_count = workspace_counts
-                        .get(&workspace)
-                        .copied()
-                        .unwrap_or(0);
                     anyhow::ensure!(
-                        current_workspace_count >= current_tab_count,
-                        "workspace {workspace} pane-count cache {current_workspace_count} is smaller than tab {} structural count {current_tab_count}",
+                        current_tab_count == prior_structural_count,
+                        "tab {} structural count changed during floating-pane admission",
                         self.tab_id
                     );
-                    let next_workspace_count = current_workspace_count.checked_add(1).ok_or_else(
-                        || anyhow::anyhow!("workspace {workspace} pane count overflow"),
-                    )?;
                     let mut prepared =
                         inner.prepare_add_floating_pane(Arc::clone(&pane), pane_id, rect)?;
                     prepared.callbacks.topology_notifications = prepared
@@ -5659,7 +5682,7 @@ impl Tab {
                         inner.commit_prepared_floating_pane_addition(prepared);
                     authority
                         .commit_structural_bind(structural, tab_mux_owner_generation);
-                    workspace_counts.insert(workspace, next_workspace_count);
+                    prepared_counts.commit(&mut windows, &mut workspace_counts);
                     (
                         Some(Arc::clone(&mux)),
                         positioned,
@@ -5918,7 +5941,7 @@ impl Tab {
                 "registered tab set changed during floating-pane spawn"
             );
 
-            let windows = mux.windows.read();
+            let mut windows = mux.windows.write();
             anyhow::ensure!(
                 windows
                     .values()
@@ -5926,31 +5949,18 @@ impl Tab {
                     .all(|tab| observed_tab_identities.contains(&(Arc::as_ptr(tab) as usize))),
                 "window tab set changed during floating-pane spawn"
             );
-            let exact_parent_count = windows
-                .values()
-                .filter(|window| window.iter().any(|tab| Arc::ptr_eq(tab, self)))
-                .count();
+            let tab_parents = mux.tab_parents.read();
             anyhow::ensure!(
-                exact_parent_count == 1
+                tab_parents
+                    .get(&self.tab_id)
+                    .is_some_and(|parent| parent.matches(self, expected_window_id))
                     && windows
                         .get(&expected_window_id)
                         .is_some_and(|window| window.iter().any(|tab| Arc::ptr_eq(tab, self))),
                 "destination tab {} no longer has exactly one admitted window parent",
                 self.tab_id
             );
-            let destination_workspace = windows
-                .get(&expected_window_id)
-                .expect("validated floating-pane destination window remains present")
-                .get_workspace()
-                .to_string();
             let mut workspace_counts = mux.num_panes_by_workspace.write();
-            if !workspace_counts.contains_key(&destination_workspace) {
-                workspace_counts.try_reserve(1).map_err(|error| {
-                    anyhow::anyhow!(
-                        "reserve workspace {destination_workspace} pane-count entry: {error}"
-                    )
-                })?;
-            }
             let destination_is_active = windows
                 .get(&expected_window_id)
                 .and_then(|window| window.get_active())
@@ -5991,6 +6001,27 @@ impl Tab {
                 Some((registration.clone(), expected_domain_id)),
             )?;
 
+            let destination_index = observed_tabs
+                .iter()
+                .position(|tab| Arc::ptr_eq(tab, self))
+                .ok_or_else(|| anyhow::anyhow!("destination tab left the observed topology"))?;
+            let current_structural_count = observed_snapshots[destination_index].len();
+            let final_structural_count = current_structural_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("floating destination pane count overflow"))?;
+            anyhow::ensure!(
+                Mux::exact_tab_structural_pane_count(&authority, self)?
+                    == current_structural_count,
+                "floating destination structural authority changed before commit"
+            );
+            let prepared_counts = mux.prepare_tab_pane_count_mutation_locked(
+                &windows,
+                &tab_parents,
+                &mut workspace_counts,
+                &[(Arc::clone(self), current_structural_count, final_structural_count)],
+                "floating pane publication",
+            )?;
+
             let mut tab_guards = observed_tabs
                 .iter()
                 .map(|tab| tab.inner.lock())
@@ -6006,41 +6037,6 @@ impl Tab {
                     "tab topology changed during floating-pane spawn"
                 );
             }
-            let destination_workspace_baseline = windows
-                .values()
-                .filter(|window| window.get_workspace() == destination_workspace)
-                .try_fold(0usize, |count, window| {
-                    window.iter().try_fold(count, |count, tab| {
-                        let identity = Arc::as_ptr(tab) as usize;
-                        let index = observed_tabs
-                            .binary_search_by_key(&identity, |tab| Arc::as_ptr(tab) as usize)
-                            .map_err(|_| {
-                                anyhow::anyhow!(
-                                    "workspace {destination_workspace} contains an unobserved exact tab"
-                                )
-                            })?;
-                        count
-                            .checked_add(
-                                tab_guards[index].snapshot_panes_callback_free().len(),
-                            )
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "workspace {destination_workspace} pane count overflow"
-                                )
-                            })
-                    })
-                })?;
-            let destination_workspace_final = destination_workspace_baseline
-                .checked_add(1)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "workspace {destination_workspace} pane count overflow"
-                    )
-                })?;
-            let destination_index = observed_tabs
-                .iter()
-                .position(|tab| Arc::ptr_eq(tab, self))
-                .ok_or_else(|| anyhow::anyhow!("destination tab left the observed topology"))?;
             anyhow::ensure!(
                 tab_guards[destination_index]
                     .snapshot_panes_callback_free()
@@ -6159,10 +6155,7 @@ impl Tab {
                 prepared_authority,
             );
             authority.commit_structural_bind(structural, tab_mux_owner_generation);
-            workspace_counts.insert(
-                destination_workspace,
-                destination_workspace_final,
-            );
+            prepared_counts.commit(&mut windows, &mut workspace_counts);
             if focus {
                 if let Some(info) = client_info {
                     info.replace_focused_pane(spawned_id, Some(registration.clone()));
@@ -6312,7 +6305,7 @@ impl Tab {
             else {
                 return Ok(None);
             };
-            let windows = mux.windows.read();
+            let mut windows = mux.windows.write();
             let parents = mux.tab_parents.read();
             let parent = parents.get(&self.tab_id).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -6342,8 +6335,23 @@ impl Tab {
                 "tab {} exact window-parent authority disagrees with window membership",
                 self.tab_id
             );
-            let workspace = window.get_workspace().to_string();
             let mut workspace_counts = mux.num_panes_by_workspace.write();
+            let prior_structural_count =
+                Mux::exact_tab_structural_pane_count(&authority, &registered_tab)?;
+            let next_structural_count = prior_structural_count.checked_sub(1).ok_or_else(|| {
+                anyhow::anyhow!("floating-pane structural authority count underflow")
+            })?;
+            let prepared_counts = mux.prepare_tab_pane_count_mutation_locked(
+                &windows,
+                &parents,
+                &mut workspace_counts,
+                &[(
+                    Arc::clone(&registered_tab),
+                    prior_structural_count,
+                    next_structural_count,
+                )],
+                "terminal floating-pane removal",
+            )?;
             let mut inner = self.inner.lock();
             anyhow::ensure!(
                 inner.is_active_mux_owner(mux),
@@ -6356,6 +6364,10 @@ impl Tab {
                 .len()
                 .checked_add(current_floating.len())
                 .ok_or_else(|| anyhow::anyhow!("floating-pane tab count overflow"))?;
+            anyhow::ensure!(
+                current_count == prior_structural_count,
+                "floating-pane tab changed after count preparation"
+            );
             let mut current_identities = HashSet::new();
             current_identities
                 .try_reserve(current_count)
@@ -6410,23 +6422,6 @@ impl Tab {
                 Some(PaneStructuralLane::Floating),
                 Some(&registration),
             )?;
-
-            let current_workspace_count = workspace_counts
-                .get(&workspace)
-                .copied()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "workspace {workspace} lacks its nonzero pane-count entry"
-                    )
-                })?;
-            anyhow::ensure!(
-                current_workspace_count >= current_count && current_workspace_count != 0,
-                "workspace {workspace} pane-count cache {current_workspace_count} is smaller than tab {} structural count {current_count}",
-                self.tab_id
-            );
-            let next_workspace_count = current_workspace_count
-                .checked_sub(1)
-                .ok_or_else(|| anyhow::anyhow!("workspace {workspace} pane count underflow"))?;
 
             let candidate = ExactPaneRemovalCandidate {
                 pane: Arc::clone(expected),
@@ -6512,13 +6507,7 @@ impl Tab {
             debug_assert!(removed_owner);
             let (callbacks, retired_inner) =
                 inner.commit_prepared_exact_pane_removal(prepared_inner);
-            if next_workspace_count == 0 {
-                let removed_count = workspace_counts.remove(&workspace);
-                debug_assert_eq!(removed_count, Some(current_workspace_count));
-            } else {
-                let replaced = workspace_counts.insert(workspace, next_workspace_count);
-                debug_assert_eq!(replaced, Some(current_workspace_count));
-            }
+            prepared_counts.commit(&mut windows, &mut workspace_counts);
             (committed, callbacks, retired_inner)
         };
 
@@ -7107,9 +7096,17 @@ impl Tab {
             // mutation. No pane trait method is invoked in this scope.
             let _registration = mux.pane_registration.lock();
             let mut authority = mux.pane_authority.lock();
-            let Some(registered_tab) = self.exact_registered_arc(mux) else {
+            let registered_tabs = mux.tabs.read();
+            let Some(registered_tab) = registered_tabs
+                .get(&self.tab_id)
+                .filter(|registered| std::ptr::eq(Arc::as_ptr(registered), self))
+                .cloned()
+            else {
                 return (false, Vec::new());
             };
+            let mut windows = mux.windows.write();
+            let tab_parents = mux.tab_parents.read();
+            let mut workspace_counts = mux.num_panes_by_workspace.write();
             let mut registration_authorized = Vec::new();
             if registration_authorized
                 .try_reserve_exact(candidates.len())
@@ -7270,6 +7267,27 @@ impl Tab {
                     }
                 };
 
+            let next_count = match current_count.checked_sub(authorized.len()) {
+                Some(count) => count,
+                None => return (false, Vec::new()),
+            };
+            let prepared_counts = match mux.prepare_tab_pane_count_mutation_locked(
+                &windows,
+                &tab_parents,
+                &mut workspace_counts,
+                &[(Arc::clone(&registered_tab), current_count, next_count)],
+                "exact pane removal",
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log::error!(
+                        "refusing exact removal count commit for tab {}: {error:#}",
+                        self.tab_id
+                    );
+                    return (false, Vec::new());
+                }
+            };
+
             let (callbacks, retired_inner) =
                 inner.commit_prepared_exact_pane_removal(prepared);
             for candidate in &authorized {
@@ -7279,6 +7297,7 @@ impl Tab {
                     &registered_tab,
                 );
             }
+            prepared_counts.commit(&mut windows, &mut workspace_counts);
             (callbacks, registrations, retired_inner)
         };
 
@@ -7784,7 +7803,12 @@ impl Tab {
 
         let _registration = mux.pane_registration.lock();
         let mut authority = mux.pane_authority.lock();
-        let Some(registered_tab) = self.exact_registered_arc(&mux) else {
+        let registered_tabs = mux.tabs.read();
+        let Some(registered_tab) = registered_tabs
+            .get(&self.tab_id)
+            .filter(|registered| std::ptr::eq(Arc::as_ptr(registered), self))
+            .cloned()
+        else {
             log::error!(
                 "refusing pane {pane_id} assignment: tab {} lost exact mux registration",
                 self.tab_id
@@ -7798,14 +7822,9 @@ impl Tab {
             );
             return;
         };
-        let mut inner = self.inner.lock();
-        if !inner.is_active_mux_owner(&mux) {
-            return;
-        }
-        if !inner.snapshot_panes_callback_free().is_empty() {
-            inner.assign_pane(pane);
-            return;
-        }
+        let mut windows = mux.windows.write();
+        let tab_parents = mux.tab_parents.read();
+        let mut workspace_counts = mux.num_panes_by_workspace.write();
         let (pane_registration, domain_id) = {
             let panes = mux.panes.read();
             let Some(registered) = panes.get(&pane_id) else {
@@ -7831,10 +7850,24 @@ impl Tab {
             );
             return;
         }
+        match Mux::exact_tab_structural_pane_count(&authority, &registered_tab) {
+            Ok(0) => {}
+            Ok(count) => {
+                log::error!(
+                    "refusing pane {pane_id} assignment: empty tab {} retains {count} structural owners",
+                    self.tab_id
+                );
+                return;
+            }
+            Err(error) => {
+                log::error!("refusing pane {pane_id} assignment count validation: {error:#}");
+                return;
+            }
+        }
         let structural = match authority.prepare_new_structural_bind(
             pane_id,
             Arc::clone(pane),
-            registered_tab,
+            Arc::clone(&registered_tab),
             PaneStructuralLane::Tiled,
             Some((pane_registration, domain_id)),
         ) {
@@ -7844,8 +7877,33 @@ impl Tab {
                 return;
             }
         };
+        let prepared_counts = match mux.prepare_tab_pane_count_mutation_locked(
+            &windows,
+            &tab_parents,
+            &mut workspace_counts,
+            &[(Arc::clone(&registered_tab), 0, 1)],
+            "bound root-pane assignment",
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                log::error!("refusing pane {pane_id} assignment count commit: {error:#}");
+                return;
+            }
+        };
+        let mut inner = self.inner.lock();
+        if !inner.is_active_mux_owner(&mux) {
+            return;
+        }
+        if !inner.snapshot_panes_callback_free().is_empty() {
+            log::error!(
+                "refusing pane {pane_id} root assignment: bound tab {} is not structurally empty",
+                self.tab_id
+            );
+            return;
+        }
         inner.assign_pane(pane);
         authority.commit_structural_bind(structural, tab_mux_owner_generation);
+        prepared_counts.commit(&mut windows, &mut workspace_counts);
     }
 
     /// Swap the active pane with the specified pane_index
@@ -7893,22 +7951,56 @@ impl Tab {
                 .split_and_insert(pane_index, request, pane);
         };
 
+        // Perform every callback-bearing geometry/constraint observation and
+        // every fallible successor allocation before taking mux authority.
+        // The final cut only revalidates and swaps this complete successor.
+        let baseline = {
+            let inner = self.inner.lock();
+            anyhow::ensure!(
+                inner.is_active_mux_owner(&mux),
+                "tab {} lost active mux-owner authority",
+                self.tab_id
+            );
+            admit_moved_split_tree_clone(&inner)?;
+            inner.clone()
+        };
+        let mut observed_panes = baseline.snapshot_panes_callback_free();
+        observed_panes.push(Arc::clone(&pane));
+        let observed = Self::observe_panes(observed_panes);
+        let pane_ids = build_callback_pane_id_snapshot(self.tab_id, &observed)?;
+        let mut replacement = baseline.clone();
+        let (inserted, mut callbacks) = replacement.prepare_split_and_insert(
+            pane_index,
+            request,
+            Arc::clone(&pane),
+            &pane_ids,
+        )?;
+        let structural_count = |inner: &TabInner| -> anyhow::Result<usize> {
+            let (tiled, floating) = inner.snapshot_structural_panes_callback_free_checked()?;
+            tiled
+                .len()
+                .checked_add(floating.len())
+                .ok_or_else(|| anyhow::anyhow!("tab structural pane count overflow"))
+        };
+        let prior_count = structural_count(&baseline)?;
+        let next_count = structural_count(&replacement)?;
+
         let _registration = mux.pane_registration.lock();
         let mut authority = mux.pane_authority.lock();
-        let registered_tab = self
-            .exact_registered_arc(&mux)
+        let registered_tabs = mux.tabs.read();
+        let registered_tab = registered_tabs
+            .get(&self.tab_id)
+            .filter(|registered| std::ptr::eq(Arc::as_ptr(registered), self))
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("tab {} lost exact mux registration", self.tab_id))?;
         let tab_mux_owner_generation = registered_tab
             .active_mux_owner_generation()
             .ok_or_else(|| {
                 anyhow::anyhow!("tab {} lacks active mux-owner generation", self.tab_id)
             })?;
-        let mut inner = self.inner.lock();
-        anyhow::ensure!(
-            inner.is_active_mux_owner(&mux),
-            "tab {} lost active mux-owner authority",
-            self.tab_id
-        );
+        let mut windows = mux.windows.write();
+        let tab_parents = mux.tab_parents.read();
+        let mut workspace_counts = mux.num_panes_by_workspace.write();
         let (pane_registration, domain_id) = {
             let panes = mux.panes.read();
             let registered = panes.get(&pane_id).ok_or_else(|| {
@@ -7934,12 +8026,43 @@ impl Tab {
         let structural = authority.prepare_new_structural_bind(
             pane_id,
             Arc::clone(&pane),
-            registered_tab,
+            Arc::clone(&registered_tab),
             PaneStructuralLane::Tiled,
             Some((pane_registration, domain_id)),
         )?;
-        let inserted = inner.split_and_insert(pane_index, request, pane)?;
+        anyhow::ensure!(
+            Mux::exact_tab_structural_pane_count(&authority, &registered_tab)? == prior_count,
+            "tab {} structural authority count changed after split preparation",
+            self.tab_id
+        );
+        let prepared_counts = mux.prepare_tab_pane_count_mutation_locked(
+            &windows,
+            &tab_parents,
+            &mut workspace_counts,
+            &[(Arc::clone(&registered_tab), prior_count, next_count)],
+            "bound split insertion",
+        )?;
+        let mut inner = self.inner.lock();
+        anyhow::ensure!(
+            inner.is_active_mux_owner(&mux)
+                && relocation_inner_matches_baseline(&inner, &baseline)?,
+            "tab {} changed after split preparation",
+            self.tab_id
+        );
+        callbacks.topology_notifications =
+            callbacks.prepare_topology_notifications(&mux, self.tab_id)?;
+        let retired_inner = std::mem::replace(&mut *inner, replacement);
         authority.commit_structural_bind(structural, tab_mux_owner_generation);
+        prepared_counts.commit(&mut windows, &mut workspace_counts);
+        drop(inner);
+        drop(workspace_counts);
+        drop(tab_parents);
+        drop(windows);
+        drop(registered_tabs);
+        drop(authority);
+        drop(_registration);
+        drop(retired_inner);
+        callbacks.execute(Some(&mux));
         Ok(inserted)
     }
 
@@ -8548,6 +8671,17 @@ impl Mux {
             desired: target_desired,
         });
 
+        let mut pane_count_deltas = Vec::new();
+        pane_count_deltas
+            .try_reserve_exact(if source_window_id == target_window_id { 1 } else { 2 })
+            .map_err(|error| anyhow::anyhow!("reserve moved-split pane-count deltas: {error}"))?;
+        if source_window_id == target_window_id {
+            pane_count_deltas.push(crate::WindowPaneCountDelta::identity(source_window_id));
+        } else {
+            pane_count_deltas.push(crate::WindowPaneCountDelta::new(source_window_id, 1, 0));
+            pane_count_deltas.push(crate::WindowPaneCountDelta::new(target_window_id, 0, 1));
+        }
+
         let mut retired_source_inner = None;
         let mut retired_target_inner = None;
         {
@@ -8566,8 +8700,8 @@ impl Mux {
                 "exact moved-split source tab left the mux before commit"
             );
             let mut windows = self.windows.write();
+            let parents = self.tab_parents.read();
             {
-                let parents = self.tab_parents.read();
                 let target_parent = parents.get(&target_tab.tab_id()).ok_or_else(|| {
                     anyhow::anyhow!("moved-split target tab lost its indexed window parent")
                 })?;
@@ -8589,59 +8723,23 @@ impl Mux {
                     "moved-split source tab changed exact window parent before commit"
                 );
             }
-            let source_workspace = windows
-                .get(&source_window_id)
-                .expect("validated moved-split source window remains present")
-                .get_workspace()
-                .to_string();
-            let target_workspace = windows
-                .get(&target_window_id)
-                .expect("validated moved-split target window remains present")
-                .get_workspace()
-                .to_string();
-            let mut workspace_counts = (source_workspace != target_workspace)
-                .then(|| self.num_panes_by_workspace.write());
-            let workspace_transfer = if let Some(counts) = workspace_counts.as_mut() {
-                if !counts.contains_key(&target_workspace) {
-                    counts.try_reserve(1).map_err(|error| {
-                        anyhow::anyhow!(
-                            "reserve moved-split target workspace {target_workspace}: {error}"
-                        )
-                    })?;
-                }
-                let source_count = counts.get(&source_workspace).copied().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "moved-split source workspace {source_workspace} lacks its pane count"
-                    )
-                })?;
-                let next_source_count = source_count.checked_sub(1).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "moved-split source workspace {source_workspace} pane count underflow"
-                    )
-                })?;
-                let next_target_count = counts
-                    .get(&target_workspace)
-                    .copied()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "moved-split target workspace {target_workspace} pane count overflow"
-                        )
-                    })?;
-                Some((next_source_count, next_target_count))
-            } else {
-                None
-            };
+            drop(parents);
 
             let (prepared_windows, removed_windows) = if source_tab_retires {
-                let prepared_windows = self.prepare_exact_tab_detach_locked(
+                let (prepared_windows, detach_count_deltas) = self.prepare_exact_tab_detach_locked(
+                    &authority,
                     &windows,
                     std::slice::from_ref(&source_tab),
                     None,
                     false,
                     "guarded moved-split source retirement",
                 )?;
+                anyhow::ensure!(
+                    detach_count_deltas.iter().any(|delta| {
+                        delta.window_id == source_window_id && delta.removals == 1
+                    }),
+                    "retiring moved-split source tab did not carry its exact one-pane count"
+                );
                 let mut removed_windows = Vec::new();
                 removed_windows
                     .try_reserve_exact(prepared_windows.len())
@@ -8662,6 +8760,35 @@ impl Mux {
             } else {
                 (Vec::new(), Vec::new())
             };
+
+            let mut tab_parents = self.tab_parents.write();
+            let target_parent = tab_parents.get(&target_tab.tab_id()).ok_or_else(|| {
+                anyhow::anyhow!("moved-split target tab lost its indexed window parent")
+            })?;
+            anyhow::ensure!(
+                target_parent.matches(&target_tab, target_window_id)
+                    && windows.get(&target_window_id).is_some_and(|window| {
+                        window.iter().any(|tab| Arc::ptr_eq(tab, &target_tab))
+                    }),
+                "moved-split target tab changed exact window parent before commit"
+            );
+            let source_parent = tab_parents.get(&source_tab.tab_id()).ok_or_else(|| {
+                anyhow::anyhow!("moved-split source tab lost its indexed window parent")
+            })?;
+            anyhow::ensure!(
+                source_parent.matches(&source_tab, source_window_id)
+                    && windows.get(&source_window_id).is_some_and(|window| {
+                        window.iter().any(|tab| Arc::ptr_eq(tab, &source_tab))
+                    }),
+                "moved-split source tab changed exact window parent before commit"
+            );
+            let mut workspace_counts = self.num_panes_by_workspace.write();
+            let prepared_counts = self.prepare_pane_count_mutation_locked(
+                &windows,
+                &mut workspace_counts,
+                &pane_count_deltas,
+                "guarded moved split",
+            )?;
 
             if same_tab {
                 let mut target_inner = target_tab.inner.lock();
@@ -8699,6 +8826,7 @@ impl Mux {
                         prepared_authority.commit();
                     },
                 )?;
+                prepared_counts.commit(&mut windows, &mut workspace_counts);
             } else {
                 let source_first = (Arc::as_ptr(&source_tab) as usize)
                     < (Arc::as_ptr(&target_tab) as usize);
@@ -8776,20 +8904,13 @@ impl Mux {
                         debug_assert!(removed
                             .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
                     }
-                    if let (Some(counts), Some((next_source_count, next_target_count))) =
-                        (workspace_counts.as_mut(), workspace_transfer)
-                    {
-                        if next_source_count == 0 {
-                            counts.remove(&source_workspace);
-                        } else {
-                            counts.insert(source_workspace, next_source_count);
-                        }
-                        counts.insert(target_workspace, next_target_count);
-                    }
                 };
                 if source_tab_retires {
-                    self.commit_prepared_window_states_with_trailing_revisions_locked(
+                    self.commit_prepared_window_states_with_prepared_authorities_locked(
                         &mut windows,
+                        &mut tab_parents,
+                        &mut workspace_counts,
+                        prepared_counts,
                         prepared_windows,
                         Vec::new(),
                         Vec::new(),
@@ -8803,6 +8924,7 @@ impl Mux {
                         trailing_revision_count,
                         commit,
                     )?;
+                    prepared_counts.commit(&mut windows, &mut workspace_counts);
                 }
             }
         }
@@ -9153,17 +9275,7 @@ impl Mux {
         for tab in &observed_tabs {
             parent_windows.insert(Arc::as_ptr(tab) as usize, None);
         }
-        let mut workspace_by_window_id = HashMap::new();
-        workspace_by_window_id
-            .try_reserve(windows_snapshot.len())
-            .map_err(|error| anyhow::anyhow!("reserve window workspace index: {error}"))?;
-        for (window_id, workspace, tabs) in &windows_snapshot {
-            anyhow::ensure!(
-                workspace_by_window_id
-                    .insert(*window_id, workspace.clone())
-                    .is_none(),
-                "window snapshot contains duplicate window id {window_id}"
-            );
+        for (window_id, _workspace, tabs) in &windows_snapshot {
             for tab in tabs {
                 let identity = Arc::as_ptr(tab) as usize;
                 let parent = parent_windows.get_mut(&identity).ok_or_else(|| {
@@ -9445,67 +9557,31 @@ impl Mux {
         let mut invalidated_window_ids = invalidated_window_ids.into_iter().collect::<Vec<_>>();
         invalidated_window_ids.sort_unstable();
 
-        let mut workspace_baselines = HashMap::<String, usize>::new();
-        workspace_baselines
-            .try_reserve(workspace_by_window_id.len())
-            .map_err(|error| anyhow::anyhow!("reserve workspace pane baselines: {error}"))?;
-        let mut workspace_deltas = HashMap::<String, (usize, usize)>::new();
-        workspace_deltas
-            .try_reserve(workspace_by_window_id.len())
-            .map_err(|error| anyhow::anyhow!("reserve workspace pane deltas: {error}"))?;
+        let mut pane_count_transitions = Vec::new();
+        pane_count_transitions
+            .try_reserve_exact(observed.len())
+            .map_err(|error| anyhow::anyhow!("reserve reconciled tab pane counts: {error}"))?;
         for (observed_tab, prepared_tab) in observed.iter().zip(&prepared_tabs) {
-            let Some(window_id) = observed_tab.parent_window_id else {
-                continue;
-            };
-            let workspace = workspace_by_window_id.get(&window_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tab {} parent window {window_id} lacks a workspace snapshot",
-                    observed_tab.tab.tab_id
-                )
-            })?;
-            let baseline = workspace_baselines.entry(workspace.clone()).or_default();
-            *baseline = baseline
-                .checked_add(observed_tab.panes.len())
-                .ok_or_else(|| anyhow::anyhow!("workspace pane baseline overflow"))?;
+            let prior_count = observed_tab
+                .non_floating_panes
+                .len()
+                .checked_add(observed_tab.floating_panes.len())
+                .ok_or_else(|| anyhow::anyhow!("reconciled prior pane count overflow"))?;
             let final_floating_count = prepared_tab
                 .replacement
                 .as_ref()
                 .map_or(observed_tab.floating_panes.len(), Vec::len);
-            let desired_count = observed_tab
+            let next_count = observed_tab
                 .non_floating_panes
                 .len()
                 .checked_add(final_floating_count)
-                .ok_or_else(|| anyhow::anyhow!("workspace desired pane count overflow"))?;
-            match desired_count.cmp(&observed_tab.panes.len()) {
-                std::cmp::Ordering::Greater => {
-                    let additions = desired_count - observed_tab.panes.len();
-                    let delta = workspace_deltas.entry(workspace.clone()).or_default();
-                    delta.0 = delta.0.checked_add(additions).ok_or_else(|| {
-                        anyhow::anyhow!("workspace pane addition delta overflow")
-                    })?;
-                }
-                std::cmp::Ordering::Less => {
-                    let removals = observed_tab.panes.len() - desired_count;
-                    let delta = workspace_deltas.entry(workspace.clone()).or_default();
-                    delta.1 = delta.1.checked_add(removals).ok_or_else(|| {
-                        anyhow::anyhow!("workspace pane removal delta overflow")
-                    })?;
-                }
-                std::cmp::Ordering::Equal => {}
-            }
+                .ok_or_else(|| anyhow::anyhow!("reconciled final pane count overflow"))?;
+            pane_count_transitions.push((
+                Arc::clone(&observed_tab.tab),
+                prior_count,
+                next_count,
+            ));
         }
-        let mut workspace_count_plans = Vec::new();
-        workspace_count_plans
-            .try_reserve_exact(workspace_deltas.len())
-            .map_err(|error| anyhow::anyhow!("reserve workspace count plans: {error}"))?;
-        for (workspace, (additions, removals)) in workspace_deltas {
-            if additions == removals {
-                continue;
-            }
-            let baseline = workspace_baselines.get(&workspace).copied().unwrap_or(0);
-            workspace_count_plans.push((workspace, baseline, additions, removals));
-        }
-        workspace_count_plans.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
         let mut stale_registrations = live_registrations
             .iter()
@@ -9769,11 +9845,6 @@ impl Mux {
             .map_err(|error| {
                 anyhow::anyhow!("reserve floating registration commit guards: {error}")
             })?;
-        let mut workspace_count_updates = Vec::new();
-        workspace_count_updates
-            .try_reserve_exact(workspace_count_plans.len())
-            .map_err(|error| anyhow::anyhow!("reserve workspace count updates: {error}"))?;
-
         let (
             published_new,
             new_lifecycle_tickets,
@@ -9805,7 +9876,7 @@ impl Mux {
                     }),
                 "registered tab set changed during floating reconciliation"
             );
-            let windows = self.windows.read();
+            let mut windows = self.windows.write();
             anyhow::ensure!(
                 windows.len() == windows_snapshot.len()
                     && windows_snapshot.iter().all(
@@ -9821,29 +9892,8 @@ impl Mux {
                     }),
                 "window tab topology changed during floating reconciliation"
             );
-
-            let mut workspace_counts = (!workspace_count_plans.is_empty())
-                .then(|| self.num_panes_by_workspace.write());
-            if let Some(counts) = workspace_counts.as_mut() {
-                counts.try_reserve(workspace_count_plans.len()).map_err(|error| {
-                    anyhow::anyhow!("reserve reconciled workspace pane counts: {error}")
-                })?;
-                for (workspace, baseline, additions, removals) in workspace_count_plans {
-                    // This map is a derived cache, not mutation authority.  A
-                    // structurally committed tab operation may have left it
-                    // stale; the exact windows and TabInner snapshots above
-                    // are the revalidated source of truth for this cut.
-                    let final_count = baseline
-                        .checked_add(additions)
-                        .and_then(|count| count.checked_sub(removals))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "workspace {workspace} pane count delta is not representable"
-                            )
-                        })?;
-                    workspace_count_updates.push((workspace, final_count));
-                }
-            }
+            let tab_parents = self.tab_parents.read();
+            let mut workspace_counts = self.num_panes_by_workspace.write();
 
             let prepared_authority = authority
                 .prepare_domain_floating_authority_reconcile(
@@ -9852,6 +9902,13 @@ impl Mux {
                     final_domain_authority,
                     authority_tab_replacements,
                 )?;
+            let prepared_counts = self.prepare_tab_pane_count_mutation_locked(
+                &windows,
+                &tab_parents,
+                &mut workspace_counts,
+                &pane_count_transitions,
+                "domain floating reconciliation",
+            )?;
 
             tab_guards.extend(observed.iter().map(|tab| tab.tab.inner.lock()));
             for (guard, expected) in tab_guards.iter().zip(&observed) {
@@ -9873,7 +9930,6 @@ impl Mux {
                     expected.tab.tab_id
                 );
             }
-
             for prepared in &prepared_new {
                 anyhow::ensure!(
                     prepared.preparation_claim.is_authoritative_locked(),
@@ -10053,15 +10109,7 @@ impl Mux {
                 debug_assert_eq!(guard.size, expected.size);
             }
             authority.commit_domain_floating_authority_reconcile(prepared_authority);
-            if let Some(counts) = workspace_counts.as_mut() {
-                for (workspace, final_count) in workspace_count_updates {
-                    if final_count == 0 {
-                        counts.remove(&workspace);
-                    } else {
-                        counts.insert(workspace, final_count);
-                    }
-                }
-            }
+            prepared_counts.commit(&mut windows, &mut workspace_counts);
 
             for (pane, registration, reader_start_gate) in &mut published_new {
                 debug_assert!(registration.is_same_pane(pane));
@@ -16030,6 +16078,120 @@ mod test {
     }
 
     #[test]
+    fn bound_split_callbacks_reenter_after_all_count_and_topology_authorities_unlock() {
+        let _mux_guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let mux = Arc::new(Mux::new(None));
+        let window = mux.new_empty_window(Some("bound-split-callback".to_string()), None);
+        let window_id = *window;
+        let root = FakePane::new(32_001, size);
+        let tab = attach_floating_reconcile_test_tab(&mux, &root, size, window_id);
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let weak_mux = Arc::downgrade(&mux);
+        let weak_tab = Arc::downgrade(&tab);
+        let probe: Arc<dyn Fn() + Send + Sync> = {
+            let armed = Arc::clone(&armed);
+            let callback_count = Arc::clone(&callback_count);
+            Arc::new(move || {
+                if !armed.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let mux = weak_mux.upgrade().expect("split mux retained by test");
+                let tab = weak_tab.upgrade().expect("split tab retained by test");
+                assert!(
+                    mux.pane_registration.try_lock().is_some(),
+                    "split callback must run after pane registration serialization is released"
+                );
+                assert!(
+                    mux.pane_authority.try_lock().is_some(),
+                    "split callback must run after pane authority is released"
+                );
+                assert!(
+                    mux.tabs.try_write().is_some(),
+                    "split callback must run after tab registry authority is released"
+                );
+                assert!(
+                    mux.windows.try_write().is_some(),
+                    "split callback must run after window authority is released"
+                );
+                assert!(
+                    mux.tab_parents.try_write().is_some(),
+                    "split callback must run after parent authority is released"
+                );
+                assert!(
+                    mux.num_panes_by_workspace.try_write().is_some(),
+                    "split callback must run after workspace-count authority is released"
+                );
+                assert!(
+                    mux.topology.try_lock().is_some(),
+                    "split callback must run after topology revision authority is released"
+                );
+                assert!(
+                    tab.inner.try_lock().is_some(),
+                    "split callback must run after TabInner is released"
+                );
+                let window_count = mux
+                    .get_window(window_id)
+                    .expect("split callback window remains registered")
+                    .structural_pane_count();
+                let workspace_count = mux
+                    .num_panes_by_workspace
+                    .read()
+                    .get("bound-split-callback")
+                    .copied();
+                assert!(
+                    matches!((window_count, workspace_count), (1, Some(1)) | (2, Some(2))),
+                    "split callbacks must observe either the complete pre-commit or complete post-commit count cut"
+                );
+                if window_count == 2 {
+                    callback_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+            })
+        };
+        let inserted = FakePane::new_with_callback_probe(
+            32_002,
+            size,
+            false,
+            false,
+            Arc::clone(&probe),
+        );
+        mux.add_pane(&inserted)
+            .expect("register exact bound-split pane");
+        armed.store(true, std::sync::atomic::Ordering::Release);
+
+        tab.split_and_insert(0, SplitRequest::default(), inserted)
+            .expect("bound split must commit before callbacks reenter");
+
+        assert!(
+            callback_count.load(std::sync::atomic::Ordering::Acquire) >= 1,
+            "bound split must exercise at least one unlocked post-commit pane callback"
+        );
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("bound split window remains registered")
+                .structural_pane_count(),
+            2
+        );
+        assert_eq!(
+            mux.num_panes_by_workspace
+                .read()
+                .get("bound-split-callback")
+                .copied(),
+            Some(2)
+        );
+        drop(window);
+    }
+
+    #[test]
     fn public_floating_remove_retires_exact_state_with_contiguous_revisions_and_unlocked_reentry() {
         let size = TerminalSize {
             rows: 24,
@@ -16520,10 +16682,15 @@ mod test {
                 },
             )
             .expect_err("workspace count overflow must reject before attachment");
-        assert!(
-            format!("{error:#}").contains("workspace public-overflow pane count overflow"),
-            "unexpected public floating overflow error: {:#}",
-            error
+        assert_eq!(
+            error.downcast_ref::<crate::WorkspacePaneCountDeltaRejection>(),
+            Some(&crate::WorkspacePaneCountDeltaRejection {
+                operation: "floating-pane admission",
+                workspace: "public-overflow".to_string(),
+                removals: 0,
+                additions: 1,
+                prior: usize::MAX,
+            }),
         );
         assert!(tab.iter_floating_panes().is_empty());
         assert!(mux
