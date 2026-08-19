@@ -20,7 +20,10 @@ use crate::circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStatus, CircuitStateKind,
     get_or_register_circuit,
 };
-use crate::error::WeztermError;
+use crate::error::{
+    MuxEffectCertainty, MuxObjectIdentity, MuxObjectKind, MuxOperation, MuxRejection,
+    MuxRejectionCode, MuxRetryAuthority, WeztermError,
+};
 use crate::runtime_async::RuntimeTime;
 #[cfg(test)]
 use crate::runtime_async::sleep;
@@ -1161,8 +1164,32 @@ impl CliCaptureContract {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliEffect {
-    ReadOnly,
-    Mutation { operation: &'static str },
+    ReadOnly {
+        operation: MuxOperation,
+        object: Option<MuxObjectIdentity>,
+    },
+    Mutation {
+        operation: MuxOperation,
+        object: Option<MuxObjectIdentity>,
+    },
+}
+
+impl CliEffect {
+    const fn operation(self) -> MuxOperation {
+        match self {
+            Self::ReadOnly { operation, .. } | Self::Mutation { operation, .. } => operation,
+        }
+    }
+
+    const fn object(self) -> Option<MuxObjectIdentity> {
+        match self {
+            Self::ReadOnly { object, .. } | Self::Mutation { object, .. } => object,
+        }
+    }
+
+    const fn is_mutation(self) -> bool {
+        matches!(self, Self::Mutation { .. })
+    }
 }
 
 /// Private provenance used to settle the CLI circuit breaker exactly once.
@@ -2356,7 +2383,13 @@ impl WeztermClient {
         let outcome = self
             .run_cli_mutation_unsettled_with_cx(cx, &args, "split_pane")
             .await;
-        let outcome = Self::map_cli_mutation_pane_error(outcome, pane_id);
+        debug_assert_eq!(
+            Self::cli_object_from_args(&args),
+            Some(MuxObjectIdentity {
+                kind: MuxObjectKind::Pane,
+                id: pane_id,
+            })
+        );
         self.settle_cli_pane_id_mutation("split_pane", outcome)
     }
 
@@ -2596,14 +2629,33 @@ impl WeztermClient {
         args: &[&str],
         pane_id: u64,
     ) -> Result<String> {
-        match self.run_cli_with_cx(cx, args).await {
-            Ok(output) => Ok(output),
-            Err(crate::Error::Wezterm(WeztermError::CommandFailed(ref stderr)))
-                if Self::stderr_is_pane_not_found(stderr) =>
-            {
-                Err(WeztermError::PaneNotFound(pane_id).into())
-            }
-            Err(e) => Err(e),
+        debug_assert_eq!(
+            Self::cli_object_from_args(args),
+            Some(MuxObjectIdentity {
+                kind: MuxObjectKind::Pane,
+                id: pane_id,
+            })
+        );
+        self.run_cli_with_cx(cx, args).await
+    }
+
+    fn cli_object_from_args(args: &[&str]) -> Option<MuxObjectIdentity> {
+        args.windows(2).find_map(|pair| match pair {
+            ["--pane-id", value] => value.parse::<u64>().ok().map(|id| MuxObjectIdentity {
+                kind: MuxObjectKind::Pane,
+                id,
+            }),
+            _ => None,
+        })
+    }
+
+    fn cli_read_operation_from_args(args: &[&str]) -> MuxOperation {
+        if args.contains(&"list") {
+            MuxOperation::ListPanes
+        } else if args.contains(&"get-text") {
+            MuxOperation::ReadPaneText
+        } else {
+            MuxOperation::UnknownRequest
         }
     }
 
@@ -2621,7 +2673,13 @@ impl WeztermClient {
         let outcome = self
             .run_cli_mutation_unsettled_with_cx(cx, args, operation)
             .await;
-        let outcome = Self::map_cli_mutation_pane_error(outcome, pane_id);
+        debug_assert_eq!(
+            Self::cli_object_from_args(args),
+            Some(MuxObjectIdentity {
+                kind: MuxObjectKind::Pane,
+                id: pane_id,
+            })
+        );
         self.circuit_record_mutation_evidence(outcome.circuit_evidence);
         outcome.result
     }
@@ -2638,9 +2696,16 @@ impl WeztermClient {
     /// check and post-execution error categorization are centralized in
     /// [`Self::finalize_cli_output`].
     async fn run_cli_with_cx(&self, cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
-        self.run_cli_effect_with_cx(cx, args, CliEffect::ReadOnly)
-            .await
-            .0
+        self.run_cli_effect_with_cx(
+            cx,
+            args,
+            CliEffect::ReadOnly {
+                operation: Self::cli_read_operation_from_args(args),
+                object: Self::cli_object_from_args(args),
+            },
+        )
+        .await
+        .0
     }
 
     /// Execute a non-idempotent CLI command without fabricating retry safety.
@@ -2648,7 +2713,7 @@ impl WeztermClient {
     /// A pre-spawn checkpoint, missing socket, missing executable, or denied
     /// executable proves the mutation was not admitted. Once process execution
     /// is admitted, timeout/cancellation/I/O loss and non-authoritative command
-    /// failure become [`WeztermError::IndeterminateMutation`]. A successful
+    /// failure becomes a finite indeterminate [`WeztermError::MuxRejection`]. A successful
     /// subprocess response is authoritative and is not overwritten by a Cx
     /// cancellation that races after completion.
     async fn run_cli_mutation_unsettled_with_cx(
@@ -2677,7 +2742,14 @@ impl WeztermClient {
             };
         }
         let (result, circuit_evidence) = self
-            .run_cli_effect_with_cx(cx, args, CliEffect::Mutation { operation })
+            .run_cli_effect_with_cx(
+                cx,
+                args,
+                CliEffect::Mutation {
+                    operation: MuxOperation::from_cli_operation(operation),
+                    object: Self::cli_object_from_args(args),
+                },
+            )
             .await;
         CliMutationOutcome {
             result,
@@ -2752,7 +2824,7 @@ impl WeztermClient {
         {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
-                if let CliEffect::Mutation { operation } = effect {
+                if effect.is_mutation() {
                     // NotFound/PermissionDenied are spawn-time failures for
                     // this command surface and prove no backend mutation ran.
                     // Every other I/O failure may follow child admission.
@@ -2775,7 +2847,11 @@ impl WeztermClient {
                     };
                     return Self::cli_effect_result(
                         effect,
-                        Err(WeztermError::IndeterminateMutation { operation }.into()),
+                        Err(WeztermError::MuxRejection(MuxRejection::indeterminate(
+                            effect.operation(),
+                            effect.object(),
+                        ))
+                        .into()),
                         circuit_evidence,
                     );
                 }
@@ -2797,7 +2873,7 @@ impl WeztermClient {
                 );
             }
             Err(_) => {
-                if let CliEffect::Mutation { operation } = effect {
+                if effect.is_mutation() {
                     let circuit_evidence = if cx.checkpoint().is_ok() {
                         CliMutationCircuitEvidence::BackendFailure
                     } else {
@@ -2805,7 +2881,11 @@ impl WeztermClient {
                     };
                     return Self::cli_effect_result(
                         effect,
-                        Err(WeztermError::IndeterminateMutation { operation }.into()),
+                        Err(WeztermError::MuxRejection(MuxRejection::indeterminate(
+                            effect.operation(),
+                            effect.object(),
+                        ))
+                        .into()),
                         circuit_evidence,
                     );
                 }
@@ -2822,7 +2902,10 @@ impl WeztermClient {
                 }
                 return Self::cli_effect_result(
                     effect,
-                    Err(WeztermError::Timeout(self.timeout_secs).into()),
+                    Err(WeztermError::MuxRejection(MuxRejection::deadline_exceeded(
+                        effect.operation(),
+                    ))
+                    .into()),
                     CliMutationCircuitEvidence::Ignore,
                 );
             }
@@ -2839,7 +2922,7 @@ impl WeztermClient {
         mutation_circuit_evidence: CliMutationCircuitEvidence,
     ) -> (Result<String>, Option<CliMutationCircuitEvidence>) {
         let circuit_evidence = match effect {
-            CliEffect::ReadOnly => None,
+            CliEffect::ReadOnly { .. } => None,
             CliEffect::Mutation { .. } => Some(mutation_circuit_evidence),
         };
         (result, circuit_evidence)
@@ -2850,9 +2933,7 @@ impl WeztermClient {
     ) -> CliMutationCircuitEvidence {
         match result {
             Ok(_) => CliMutationCircuitEvidence::SuccessfulResponse,
-            Err(crate::Error::Wezterm(WeztermError::CommandFailed(stderr)))
-                if Self::stderr_is_pane_not_found(stderr) =>
-            {
+            Err(crate::Error::Wezterm(WeztermError::MuxRejection(_))) => {
                 CliMutationCircuitEvidence::SuccessfulResponse
             }
             Err(_) => CliMutationCircuitEvidence::BackendFailure,
@@ -2864,7 +2945,7 @@ impl WeztermClient {
         effect: CliEffect,
         output: std::process::Output,
     ) -> Result<String> {
-        if matches!(effect, CliEffect::ReadOnly) {
+        if !effect.is_mutation() {
             cx.checkpoint().map_err(|_| {
                 wezterm_cx_error(
                     cx,
@@ -2875,17 +2956,15 @@ impl WeztermClient {
         }
 
         match effect {
-            CliEffect::ReadOnly => Self::finalize_cli_output(output),
-            CliEffect::Mutation { operation } => {
-                Self::finalize_cli_mutation_output(output, operation)
-            }
+            CliEffect::ReadOnly { .. } => Self::finalize_cli_output(output, effect),
+            CliEffect::Mutation { .. } => Self::finalize_cli_mutation_output(output, effect),
         }
     }
 
     /// Shared post-timeout validation: checks exit status, stderr
     /// (truncated safely on char boundaries), and maps common error
     /// strings to structured variants.
-    fn finalize_cli_output(output: std::process::Output) -> Result<String> {
+    fn finalize_cli_output(output: std::process::Output, effect: CliEffect) -> Result<String> {
         if !output.status.success() {
             let stderr_full =
                 crate::runtime_async::process::decode_captured_bytes_lossy(output.stderr);
@@ -2900,20 +2979,182 @@ impl WeztermClient {
                 stderr_full
             };
 
-            // Categorize common error patterns
-            if stderr_str.contains("Connection refused")
-                || (stderr_str.contains("No such file or directory")
-                    && stderr_str.contains("socket"))
-            {
-                return Err(WeztermError::NotRunning.into());
+            if let Some(rejection) = Self::parse_cli_mux_rejection(&stderr_str, effect) {
+                return Err(WeztermError::MuxRejection(rejection).into());
             }
 
-            return Err(WeztermError::CommandFailed(stderr_str).into());
+            if Self::stderr_is_pane_not_found(&stderr_str)
+                && let Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Pane,
+                    id,
+                }) = effect.object()
+            {
+                return Err(WeztermError::MuxRejection(MuxRejection::pane_not_found(
+                    effect.operation(),
+                    id,
+                ))
+                .into());
+            }
+            let rejection = if effect.is_mutation() {
+                MuxRejection::indeterminate(effect.operation(), effect.object())
+            } else {
+                MuxRejection::backend_failure(effect.operation())
+            };
+            return Err(WeztermError::MuxRejection(rejection).into());
         }
 
         Ok(crate::runtime_async::process::decode_captured_bytes_lossy(
             output.stdout,
         ))
+    }
+
+    fn parse_cli_mux_rejection(stderr: &str, cli_effect: CliEffect) -> Option<MuxRejection> {
+        const PREFIX: &str = "FRANKENTERM_MUX_ERROR_V1";
+
+        let payload = stderr
+            .lines()
+            .find_map(|line| line.find(PREFIX).map(|start| &line[start..]))?;
+        let unknown = || MuxRejection {
+            code: MuxRejectionCode::UnknownFuture,
+            operation: cli_effect.operation(),
+            object: None,
+            effect: MuxEffectCertainty::UnknownFuture,
+            retry: MuxRetryAuthority::UnknownFuture,
+        };
+        let parsed = (|| {
+            let mut fields = payload.split_ascii_whitespace();
+            if fields.next()? != PREFIX {
+                return None;
+            }
+            let request_ident = fields
+                .next()?
+                .strip_prefix("request_ident=")?
+                .parse::<u64>()
+                .ok()?;
+            let response_request_ident = fields
+                .next()?
+                .strip_prefix("response_request_ident=")?
+                .parse::<u64>()
+                .ok()?;
+            let operation = fields.next()?.strip_prefix("operation=")?;
+            if !Self::cli_mux_method_matches_operation(operation, cli_effect.operation()) {
+                return None;
+            }
+            let code = match fields.next()?.strip_prefix("code=")? {
+                "pane_not_found" => MuxRejectionCode::PaneNotFound,
+                "tab_not_found" => MuxRejectionCode::TabNotFound,
+                "window_not_found" => MuxRejectionCode::WindowNotFound,
+                "domain_not_found" => MuxRejectionCode::DomainNotFound,
+                "invalid_request" => MuxRejectionCode::InvalidRequest,
+                "policy_rejected" => MuxRejectionCode::PolicyRejected,
+                "cancelled" => MuxRejectionCode::Cancelled,
+                "deadline_exceeded" => MuxRejectionCode::DeadlineExceeded,
+                "quota_exceeded" => MuxRejectionCode::QuotaExceeded,
+                "backend_failure" => MuxRejectionCode::BackendFailure,
+                "indeterminate_mutation" => MuxRejectionCode::IndeterminateMutation,
+                "unknown_future" => MuxRejectionCode::UnknownFuture,
+                _ => return None,
+            };
+            let object = match fields.next()?.strip_prefix("object=")? {
+                "none" => None,
+                value => {
+                    let (kind, id) = value.split_once(':')?;
+                    let kind = match kind {
+                        "pane" => MuxObjectKind::Pane,
+                        "tab" => MuxObjectKind::Tab,
+                        "window" => MuxObjectKind::Window,
+                        "domain" => MuxObjectKind::Domain,
+                        _ => return None,
+                    };
+                    Some(MuxObjectIdentity {
+                        kind,
+                        id: id.parse::<u64>().ok()?,
+                    })
+                }
+            };
+            let effect = match fields.next()?.strip_prefix("effect=")? {
+                "not_applied" => MuxEffectCertainty::NotApplied,
+                "indeterminate" => MuxEffectCertainty::Indeterminate,
+                "unknown_future" => MuxEffectCertainty::UnknownFuture,
+                _ => return None,
+            };
+            let retry = match fields.next()?.strip_prefix("retry=")? {
+                "never" => MuxRetryAuthority::Never,
+                "safe_after_backoff" => MuxRetryAuthority::SafeAfterBackoff,
+                "reconcile_before_retry" => MuxRetryAuthority::ReconcileBeforeRetry,
+                "unknown_future" => MuxRetryAuthority::UnknownFuture,
+                _ => return None,
+            };
+            if fields.next().is_some()
+                || request_ident == 0
+                || request_ident != response_request_ident
+            {
+                return None;
+            }
+            let rejection = MuxRejection {
+                code,
+                operation: cli_effect.operation(),
+                object,
+                effect,
+                retry,
+            };
+            rejection.has_consistent_authority().then_some(rejection)
+        })();
+        Some(parsed.unwrap_or_else(unknown))
+    }
+
+    fn cli_mux_method_matches_operation(method: &str, operation: MuxOperation) -> bool {
+        matches!(
+            (method, operation),
+            ("ping", MuxOperation::ProtocolHandshake)
+                | ("list_panes", MuxOperation::ListPanes)
+                | (
+                    "get_pane_tiered_scrollback_statuses",
+                    MuxOperation::ReadTieredScrollbackStatus
+                )
+                | ("spawn_v2", MuxOperation::Spawn)
+                | ("split_pane", MuxOperation::SplitPane)
+                | ("get_pane_render_changes", MuxOperation::ReadRenderChanges)
+                | ("get_lines", MuxOperation::ReadPaneText)
+                | ("get_semantic_zones", MuxOperation::ReadSemanticZones)
+                | ("write_to_pane" | "send_paste", MuxOperation::SendText)
+                | ("resize", MuxOperation::ResizePane)
+                | ("adjust_pane_size", MuxOperation::AdjustPaneSize)
+                | ("create_floating_pane", MuxOperation::CreateFloatingPane)
+                | ("move_floating_pane", MuxOperation::MoveFloatingPane)
+                | ("set_floating_pane_z", MuxOperation::SetFloatingPaneZ)
+                | ("toggle_floating_pane", MuxOperation::ToggleFloatingPane)
+                | ("remove_floating_pane", MuxOperation::RemoveFloatingPane)
+                | ("swap_to_layout", MuxOperation::SwapLayout)
+                | ("set_layout_cycle", MuxOperation::SetLayoutCycle)
+                | ("cycle_stack", MuxOperation::CycleStack)
+                | ("select_stack_pane", MuxOperation::SelectStackPane)
+                | (
+                    "update_pane_constraints",
+                    MuxOperation::UpdatePaneConstraints
+                )
+                | (
+                    "activate_pane_direction" | "set_focused_pane_id",
+                    MuxOperation::ActivatePane
+                )
+                | ("kill_pane", MuxOperation::KillPane)
+                | ("set_zoomed", MuxOperation::SetPaneZoomed)
+                | ("set_tab_title", MuxOperation::SetTabTitle)
+                | ("set_window_title", MuxOperation::SetWindowTitle)
+                | ("set_window_workspace", MuxOperation::SetWindowWorkspace)
+                | ("set_active_workspace", MuxOperation::SetActiveWorkspace)
+                | ("rename_workspace", MuxOperation::RenameWorkspace)
+                | ("erase_scrollback", MuxOperation::EraseScrollback)
+                | ("search_scrollback", MuxOperation::SearchScrollback)
+                | ("key_down" | "key_up", MuxOperation::KeyInput)
+                | ("mouse_event", MuxOperation::MouseInput)
+                | ("get_image_cell", MuxOperation::ReadImage)
+                | ("get_pane_direction", MuxOperation::ReadPaneDirection)
+                | ("set_configured_palette_for_pane", MuxOperation::SetPalette)
+                | ("list_clients", MuxOperation::ListClients)
+                | ("get_tls_creds", MuxOperation::GetTlsCredentials)
+                | ("set_client_id", MuxOperation::ClientRegistration)
+        )
     }
 
     fn stderr_is_pane_not_found(stderr: &str) -> bool {
@@ -2923,42 +3164,22 @@ impl WeztermClient {
                 || stderr.contains("no such"))
     }
 
-    fn map_cli_mutation_pane_error(
-        mut outcome: CliMutationOutcome<String>,
-        pane_id: u64,
-    ) -> CliMutationOutcome<String> {
-        outcome.result = match outcome.result {
-            Err(crate::Error::Wezterm(WeztermError::CommandFailed(ref stderr)))
-                if Self::stderr_is_pane_not_found(stderr) =>
-            {
-                outcome.circuit_evidence = CliMutationCircuitEvidence::SuccessfulResponse;
-                Err(WeztermError::PaneNotFound(pane_id).into())
-            }
-            result => result,
-        };
-        outcome
-    }
-
     fn finalize_cli_mutation_output(
         output: std::process::Output,
-        operation: &'static str,
+        effect: CliEffect,
     ) -> Result<String> {
-        match Self::finalize_cli_output(output) {
-            Ok(output) => Ok(output),
-            // These finite classes prove rejection before a mux-side effect.
-            Err(error @ crate::Error::Wezterm(WeztermError::NotRunning)) => Err(error),
-            Err(crate::Error::Wezterm(WeztermError::CommandFailed(stderr)))
-                if Self::stderr_is_pane_not_found(&stderr) =>
-            {
-                Err(WeztermError::CommandFailed(stderr).into())
-            }
-            Err(_) => Err(WeztermError::IndeterminateMutation { operation }.into()),
-        }
+        debug_assert!(effect.is_mutation());
+        Self::finalize_cli_output(output, effect)
     }
 
     fn parse_mutation_pane_id(operation: &'static str, output: &str) -> Result<u64> {
-        Self::parse_pane_id(output)
-            .map_err(|_| WeztermError::IndeterminateMutation { operation }.into())
+        Self::parse_pane_id(output).map_err(|_| {
+            WeztermError::MuxRejection(MuxRejection::indeterminate(
+                MuxOperation::from_cli_operation(operation),
+                None,
+            ))
+            .into()
+        })
     }
 
     fn settle_cli_pane_id_mutation(
@@ -3126,7 +3347,8 @@ impl WeztermClient {
     fn direct_mux_error_is_authoritative_response(error: &crate::vendored::DirectMuxError) -> bool {
         matches!(
             error,
-            crate::vendored::DirectMuxError::RemoteError(_)
+            crate::vendored::DirectMuxError::RemoteRejection(_)
+                | crate::vendored::DirectMuxError::RemoteRejectionRequestMismatch { .. }
                 | crate::vendored::DirectMuxError::AlignedUnexpectedResponse { .. }
         )
     }
@@ -3159,13 +3381,125 @@ impl WeztermClient {
         match err {
             crate::vendored::MuxPoolError::Pool(_) => "mux_pool_failure",
             crate::vendored::MuxPoolError::IndeterminateMutation(_) => "mux_indeterminate_mutation",
-            crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(_)) => {
-                "mux_authoritative_rejection"
-            }
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::RemoteRejection(response),
+            ) => response.code.label(),
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::RemoteRejectionRequestMismatch { .. },
+            ) => "mux_rejection_request_mismatch",
             crate::vendored::MuxPoolError::Mux(
                 crate::vendored::DirectMuxError::AlignedUnexpectedResponse { .. },
             ) => "mux_authoritative_response_mismatch",
             crate::vendored::MuxPoolError::Mux(_) => "mux_transport_or_protocol_failure",
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_operation_from_request_ident(request_ident: u64) -> MuxOperation {
+        match codec::Pdu::pdu_name_for_ident(request_ident) {
+            Some("GetCodecVersion") => MuxOperation::ProtocolHandshake,
+            Some("SetClientId") => MuxOperation::ClientRegistration,
+            Some("ListPanes" | "ListPanesCoherent" | "ListPanesOrderedV1") => {
+                MuxOperation::ListPanes
+            }
+            Some("GetPaneTieredScrollbackStatusesV1") => MuxOperation::ReadTieredScrollbackStatus,
+            Some("SpawnV2") => MuxOperation::Spawn,
+            Some("SplitPane") => MuxOperation::SplitPane,
+            Some("GetPaneRenderChanges" | "GetPaneRenderDeliveryV1") => {
+                MuxOperation::ReadRenderChanges
+            }
+            Some("GetLines") => MuxOperation::ReadPaneText,
+            Some("GetSemanticZones") => MuxOperation::ReadSemanticZones,
+            Some("WriteToPane" | "SendPaste") => MuxOperation::SendText,
+            Some("Resize") => MuxOperation::ResizePane,
+            Some("AdjustPaneSize") => MuxOperation::AdjustPaneSize,
+            Some("CreateFloatingPane") => MuxOperation::CreateFloatingPane,
+            Some("MoveFloatingPane") => MuxOperation::MoveFloatingPane,
+            Some("SetFloatingPaneZ") => MuxOperation::SetFloatingPaneZ,
+            Some("ToggleFloatingPane") => MuxOperation::ToggleFloatingPane,
+            Some("RemoveFloatingPane") => MuxOperation::RemoveFloatingPane,
+            Some("SwapToLayout") => MuxOperation::SwapLayout,
+            Some("SetLayoutCycle") => MuxOperation::SetLayoutCycle,
+            Some("CycleStack") => MuxOperation::CycleStack,
+            Some("SelectStackPane") => MuxOperation::SelectStackPane,
+            Some("UpdatePaneConstraints") => MuxOperation::UpdatePaneConstraints,
+            Some("ActivatePaneDirection") => MuxOperation::ActivatePane,
+            Some("KillPane") => MuxOperation::KillPane,
+            Some("SetPaneZoomed") => MuxOperation::SetPaneZoomed,
+            Some("SetFocusedPane") => MuxOperation::SetFocusedPane,
+            Some("TabTitleChanged") => MuxOperation::SetTabTitle,
+            Some("WindowTitleChanged") => MuxOperation::SetWindowTitle,
+            Some("SetWindowWorkspace") => MuxOperation::SetWindowWorkspace,
+            Some("SetActiveWorkspace") => MuxOperation::SetActiveWorkspace,
+            Some("RenameWorkspace") => MuxOperation::RenameWorkspace,
+            Some("EraseScrollbackRequest") => MuxOperation::EraseScrollback,
+            Some("SearchScrollbackRequest") => MuxOperation::SearchScrollback,
+            Some("SendKeyDown" | "SendKeyUp" | "SendKeyDownTracedV1" | "ReliableKeyEventV1") => {
+                MuxOperation::KeyInput
+            }
+            Some("SendMouseEvent") => MuxOperation::MouseInput,
+            Some("GetImageCell") => MuxOperation::ReadImage,
+            Some("GetPaneDirection") => MuxOperation::ReadPaneDirection,
+            Some("SetPalette") => MuxOperation::SetPalette,
+            Some("GetClientList") => MuxOperation::ListClients,
+            Some("GetTlsCreds") => MuxOperation::GetTlsCredentials,
+            _ => MuxOperation::UnknownRequest,
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_rejection_from_wire(response: &codec::ErrorResponse) -> MuxRejection {
+        let operation = Self::mux_operation_from_request_ident(response.request_ident);
+        if response.validate().is_err() {
+            return MuxRejection {
+                code: MuxRejectionCode::UnknownFuture,
+                operation,
+                object: None,
+                effect: MuxEffectCertainty::UnknownFuture,
+                retry: MuxRetryAuthority::UnknownFuture,
+            };
+        }
+        let code = match response.code {
+            codec::MuxErrorCode::PANE_NOT_FOUND => MuxRejectionCode::PaneNotFound,
+            codec::MuxErrorCode::TAB_NOT_FOUND => MuxRejectionCode::TabNotFound,
+            codec::MuxErrorCode::WINDOW_NOT_FOUND => MuxRejectionCode::WindowNotFound,
+            codec::MuxErrorCode::DOMAIN_NOT_FOUND => MuxRejectionCode::DomainNotFound,
+            codec::MuxErrorCode::INVALID_REQUEST => MuxRejectionCode::InvalidRequest,
+            codec::MuxErrorCode::POLICY_REJECTED => MuxRejectionCode::PolicyRejected,
+            codec::MuxErrorCode::CANCELLED => MuxRejectionCode::Cancelled,
+            codec::MuxErrorCode::DEADLINE_EXCEEDED => MuxRejectionCode::DeadlineExceeded,
+            codec::MuxErrorCode::QUOTA_EXCEEDED => MuxRejectionCode::QuotaExceeded,
+            codec::MuxErrorCode::BACKEND_FAILURE => MuxRejectionCode::BackendFailure,
+            codec::MuxErrorCode::INDETERMINATE_MUTATION => MuxRejectionCode::IndeterminateMutation,
+            _ => MuxRejectionCode::UnknownFuture,
+        };
+        let object = response.object.map(|object| MuxObjectIdentity {
+            kind: match object.kind {
+                codec::MuxErrorObjectKind::PANE => MuxObjectKind::Pane,
+                codec::MuxErrorObjectKind::TAB => MuxObjectKind::Tab,
+                codec::MuxErrorObjectKind::WINDOW => MuxObjectKind::Window,
+                codec::MuxErrorObjectKind::DOMAIN => MuxObjectKind::Domain,
+                _ => MuxObjectKind::UnknownFuture,
+            },
+            id: object.id,
+        });
+        let effect = match response.effect {
+            codec::MuxErrorEffect::NOT_APPLIED => MuxEffectCertainty::NotApplied,
+            codec::MuxErrorEffect::INDETERMINATE => MuxEffectCertainty::Indeterminate,
+            _ => MuxEffectCertainty::UnknownFuture,
+        };
+        let retry = match response.retry {
+            codec::MuxErrorRetry::NEVER => MuxRetryAuthority::Never,
+            codec::MuxErrorRetry::SAFE_AFTER_BACKOFF => MuxRetryAuthority::SafeAfterBackoff,
+            codec::MuxErrorRetry::RECONCILE_BEFORE_RETRY => MuxRetryAuthority::ReconcileBeforeRetry,
+            _ => MuxRetryAuthority::UnknownFuture,
+        };
+        MuxRejection {
+            code,
+            operation,
+            object,
+            effect,
+            retry,
         }
     }
 
@@ -3259,9 +3593,26 @@ impl WeztermClient {
                 };
                 runtime_failure(source)
             }
-            crate::vendored::MuxPoolError::IndeterminateMutation(_) => {
-                WeztermError::IndeterminateMutation { operation: op }.into()
-            }
+            crate::vendored::MuxPoolError::IndeterminateMutation(_) => WeztermError::MuxRejection(
+                MuxRejection::indeterminate(MuxOperation::from_cli_operation(op), None),
+            )
+            .into(),
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::RemoteRejection(response),
+            ) => WeztermError::MuxRejection(Self::mux_rejection_from_wire(response)).into(),
+            crate::vendored::MuxPoolError::Mux(
+                crate::vendored::DirectMuxError::RemoteRejectionRequestMismatch {
+                    expected_request_ident,
+                    ..
+                },
+            ) => WeztermError::MuxRejection(MuxRejection {
+                code: MuxRejectionCode::UnknownFuture,
+                operation: Self::mux_operation_from_request_ident(*expected_request_ident),
+                object: None,
+                effect: MuxEffectCertainty::UnknownFuture,
+                retry: MuxRetryAuthority::UnknownFuture,
+            })
+            .into(),
             crate::vendored::MuxPoolError::Mux(mux) if mux.is_cancelled() => runtime_failure(
                 RuntimeOperationSource::Cancelled("mux_transport_context_cancelled".to_string()),
             ),
@@ -6699,10 +7050,14 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn mux_remote_error_records_healthy_framed_response_without_failure() {
-        let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
-            "invalid spawn domain".to_string(),
-        ));
+    fn mux_remote_rejection_records_healthy_framed_response_without_failure() {
+        let err =
+            crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteRejection(
+                codec::ErrorResponse::domain_not_found(
+                    <codec::SpawnV2 as codec::PduWireIdent>::IDENT,
+                    None,
+                ),
+            ));
         assert_mux_recovery_axes(&err, MuxCircuitEvidence::SuccessfulResponse, false);
     }
 
@@ -6727,10 +7082,14 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn mux_remote_error_does_not_fallback_to_cli() {
-        let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
-            "invalid spawn domain".to_string(),
-        ));
+    fn mux_remote_rejection_does_not_fallback_to_cli() {
+        let err =
+            crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteRejection(
+                codec::ErrorResponse::domain_not_found(
+                    <codec::SpawnV2 as codec::PduWireIdent>::IDENT,
+                    None,
+                ),
+            ));
         assert_mux_recovery_axes(&err, MuxCircuitEvidence::SuccessfulResponse, false);
     }
 
@@ -6746,12 +7105,16 @@ mod tests {
         assert_mux_recovery_axes(&aligned, MuxCircuitEvidence::SuccessfulResponse, false);
 
         let prewrite = MuxPoolError::Mux(DirectMuxError::ProvenPreWriteRejection(Box::new(
-            DirectMuxError::RemoteError("synthetic nested error".to_string()),
+            DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(
+                <codec::ListPanes as codec::PduWireIdent>::IDENT,
+            )),
         )));
         assert_mux_recovery_axes(&prewrite, MuxCircuitEvidence::Ignore, false);
 
         let abandoned = MuxPoolError::Mux(DirectMuxError::InFlightScopeAbandoned(Box::new(
-            DirectMuxError::RemoteError("synthetic nested error".to_string()),
+            DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(
+                <codec::ListPanes as codec::PduWireIdent>::IDENT,
+            )),
         )));
         assert_mux_recovery_axes(&abandoned, MuxCircuitEvidence::BackendFailure, false);
     }
@@ -6764,9 +7127,12 @@ mod tests {
             "mux_framed_rejection_settlement_test",
             CircuitBreakerConfig::new(2, 1, Duration::ZERO),
         )));
-        let remote = crate::vendored::MuxPoolError::Mux(
-            crate::vendored::DirectMuxError::RemoteError("finite rejection".to_string()),
-        );
+        let remote =
+            crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteRejection(
+                codec::ErrorResponse::policy_rejected(
+                    <codec::ListPanes as codec::PduWireIdent>::IDENT,
+                ),
+            ));
 
         client.mux_circuit_record_evidence(MuxCircuitEvidence::BackendFailure);
         client.mux_circuit_record_error(&remote);
@@ -6859,8 +7225,10 @@ mod tests {
 
         let cases = [
             (
-                DirectMuxError::RemoteError("unstructured server rejection".to_string()),
-                ProtocolErrorKind::Transient,
+                DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(
+                    <codec::ListPanes as codec::PduWireIdent>::IDENT,
+                )),
+                ProtocolErrorKind::Permanent,
                 false,
                 false,
                 false,
@@ -7045,9 +7413,13 @@ mod tests {
         let mapped = WeztermClient::mux_cancelled_error("send_text_with_cx", err);
         assert!(matches!(
             mapped,
-            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "send_text_with_cx"
-            })
+            crate::Error::Wezterm(WeztermError::MuxRejection(MuxRejection {
+                code: MuxRejectionCode::IndeterminateMutation,
+                operation: MuxOperation::SendText,
+                effect: MuxEffectCertainty::Indeterminate,
+                retry: MuxRetryAuthority::ReconcileBeforeRetry,
+                ..
+            }))
         ));
     }
 
@@ -7108,17 +7480,100 @@ mod tests {
 
     #[cfg(all(feature = "vendored", unix))]
     #[test]
-    fn mux_remote_error_maps_to_command_failed() {
-        let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteError(
-            "credential-bearing-remote-canary".to_string(),
-        ));
+    fn mux_remote_rejection_maps_to_finite_project_rejection() {
+        let err =
+            crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteRejection(
+                codec::ErrorResponse::policy_rejected(
+                    <codec::SpawnV2 as codec::PduWireIdent>::IDENT,
+                ),
+            ));
         let mapped = WeztermClient::mux_cancelled_error("spawn_targeted", err);
-        let crate::Error::Wezterm(WeztermError::CommandFailed(message)) = mapped else {
-            panic!("framed remote rejection must map to a finite command failure");
+        let rendered = mapped.to_string();
+        let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = mapped else {
+            panic!("framed remote rejection must map to a finite project rejection");
         };
-        assert!(message.contains("spawn_targeted"));
-        assert!(message.contains("mux_authoritative_rejection"));
-        assert!(!message.contains("credential-bearing-remote-canary"));
+        assert_eq!(rejection.code, MuxRejectionCode::PolicyRejected);
+        assert_eq!(rejection.operation, MuxOperation::Spawn);
+        assert_eq!(rejection.object, None);
+        assert_eq!(rejection.effect, MuxEffectCertainty::NotApplied);
+        assert_eq!(rejection.retry, MuxRetryAuthority::Never);
+        assert!(!rendered.contains("credential-bearing-remote-canary"));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn direct_and_cli_transports_project_identical_mux_authority() {
+        let direct = WeztermClient::mux_cancelled_error(
+            "spawn_targeted",
+            crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteRejection(
+                codec::ErrorResponse::policy_rejected(
+                    <codec::SpawnV2 as codec::PduWireIdent>::IDENT,
+                ),
+            )),
+        );
+        let crate::Error::Wezterm(WeztermError::MuxRejection(direct)) = direct else {
+            panic!("direct rejection must remain typed");
+        };
+        let cli = WeztermClient::parse_cli_mux_rejection(
+            &format!(
+                "FRANKENTERM_MUX_ERROR_V1 request_ident={ident} response_request_ident={ident} operation=spawn_v2 code=policy_rejected object=none effect=not_applied retry=never",
+                ident = <codec::SpawnV2 as codec::PduWireIdent>::IDENT,
+            ),
+            CliEffect::Mutation {
+                operation: MuxOperation::Spawn,
+                object: None,
+            },
+        )
+        .expect("versioned CLI authority");
+        assert_eq!(direct, cli);
+
+        let direct_indeterminate = MuxRejection::indeterminate(
+            MuxOperation::SendText,
+            Some(MuxObjectIdentity {
+                kind: MuxObjectKind::Pane,
+                id: 77,
+            }),
+        );
+        let cli_indeterminate = WeztermClient::parse_cli_mux_rejection(
+            &format!(
+                "FRANKENTERM_MUX_ERROR_V1 request_ident={ident} response_request_ident={ident} operation=write_to_pane code=indeterminate_mutation object=pane:77 effect=indeterminate retry=reconcile_before_retry",
+                ident = <codec::WriteToPane as codec::PduWireIdent>::IDENT,
+            ),
+            CliEffect::Mutation {
+                operation: MuxOperation::SendText,
+                object: Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Pane,
+                    id: 77,
+                }),
+            },
+        )
+        .expect("versioned CLI indeterminate authority");
+        assert_eq!(direct_indeterminate, cli_indeterminate);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn contradictory_remote_rejection_loses_all_claimed_authority() {
+        let mut response =
+            codec::ErrorResponse::backend_failure(<codec::ListPanes as codec::PduWireIdent>::IDENT);
+        response.effect = codec::MuxErrorEffect::INDETERMINATE;
+        let mapped = WeztermClient::mux_cancelled_error(
+            "list_panes",
+            crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::RemoteRejection(
+                response,
+            )),
+        );
+        let crate::Error::Wezterm(WeztermError::MuxRejection(rejection)) = mapped else {
+            panic!("contradictory remote rejection must remain a typed fail-closed rejection");
+        };
+        assert_eq!(rejection.code, MuxRejectionCode::UnknownFuture);
+        assert_eq!(rejection.operation, MuxOperation::ListPanes);
+        assert_eq!(rejection.object, None);
+        assert_eq!(rejection.effect, MuxEffectCertainty::UnknownFuture);
+        assert_eq!(rejection.retry, MuxRetryAuthority::UnknownFuture);
+        assert!(!crate::retry::is_retryable(&crate::Error::Wezterm(
+            WeztermError::MuxRejection(rejection)
+        )));
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -7173,6 +7628,154 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn versioned_cli_mux_errors_preserve_finite_authority_and_fail_closed() {
+        let cli_effect = CliEffect::Mutation {
+            operation: MuxOperation::SendText,
+            object: Some(MuxObjectIdentity {
+                kind: MuxObjectKind::Pane,
+                id: 77,
+            }),
+        };
+        let cases = [
+            (
+                "pane_not_found",
+                "pane:77",
+                "not_applied",
+                "never",
+                MuxRejectionCode::PaneNotFound,
+            ),
+            (
+                "tab_not_found",
+                "tab:2",
+                "not_applied",
+                "never",
+                MuxRejectionCode::TabNotFound,
+            ),
+            (
+                "window_not_found",
+                "window:3",
+                "not_applied",
+                "never",
+                MuxRejectionCode::WindowNotFound,
+            ),
+            (
+                "domain_not_found",
+                "domain:4",
+                "not_applied",
+                "never",
+                MuxRejectionCode::DomainNotFound,
+            ),
+            (
+                "invalid_request",
+                "none",
+                "not_applied",
+                "never",
+                MuxRejectionCode::InvalidRequest,
+            ),
+            (
+                "policy_rejected",
+                "none",
+                "not_applied",
+                "never",
+                MuxRejectionCode::PolicyRejected,
+            ),
+            (
+                "cancelled",
+                "none",
+                "not_applied",
+                "never",
+                MuxRejectionCode::Cancelled,
+            ),
+            (
+                "deadline_exceeded",
+                "none",
+                "not_applied",
+                "safe_after_backoff",
+                MuxRejectionCode::DeadlineExceeded,
+            ),
+            (
+                "quota_exceeded",
+                "none",
+                "not_applied",
+                "safe_after_backoff",
+                MuxRejectionCode::QuotaExceeded,
+            ),
+            (
+                "backend_failure",
+                "none",
+                "not_applied",
+                "safe_after_backoff",
+                MuxRejectionCode::BackendFailure,
+            ),
+            (
+                "indeterminate_mutation",
+                "pane:77",
+                "indeterminate",
+                "reconcile_before_retry",
+                MuxRejectionCode::IndeterminateMutation,
+            ),
+            (
+                "unknown_future",
+                "none",
+                "unknown_future",
+                "unknown_future",
+                MuxRejectionCode::UnknownFuture,
+            ),
+        ];
+
+        for (code, object, effect, retry, expected_code) in cases {
+            let stderr = format!(
+                "Error: FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code={code} object={object} effect={effect} retry={retry}"
+            );
+            let rejection = WeztermClient::parse_cli_mux_rejection(&stderr, cli_effect)
+                .expect("versioned CLI mux envelope");
+            assert_eq!(rejection.code, expected_code, "{stderr}");
+            assert_eq!(rejection.operation, MuxOperation::SendText);
+            assert!(rejection.has_consistent_authority(), "{stderr}");
+        }
+
+        let finalized = WeztermClient::finalize_cli_mutation_output(
+            synthetic_cli_output(
+                false,
+                "",
+                "Error: FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code=policy_rejected object=none effect=not_applied retry=never",
+            ),
+            cli_effect,
+        )
+        .expect_err("typed CLI rejection must escape as an error");
+        assert!(matches!(
+            finalized,
+            crate::Error::Wezterm(WeztermError::MuxRejection(MuxRejection {
+                code: MuxRejectionCode::PolicyRejected,
+                operation: MuxOperation::SendText,
+                effect: MuxEffectCertainty::NotApplied,
+                retry: MuxRetryAuthority::Never,
+                ..
+            }))
+        ));
+
+        for malformed in [
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=82 operation=write_to_pane code=backend_failure object=none effect=not_applied retry=safe_after_backoff",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code=policy_rejected object=none effect=indeterminate retry=never",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code=policy_rejected object=pane:77 effect=not_applied retry=never",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=write_to_pane code=backend_failure object=none effect=not_applied retry=safe_after_backoff extra=forbidden",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=list_panes code=backend_failure object=none effect=not_applied retry=safe_after_backoff",
+            "FRANKENTERM_MUX_ERROR_V1 request_ident=81 response_request_ident=81 operation=future_operation code=future_code object=none effect=future_effect retry=future_retry",
+        ] {
+            let rejection = WeztermClient::parse_cli_mux_rejection(malformed, cli_effect)
+                .expect("recognized version prefix must fail closed, not fall back to heuristics");
+            assert_eq!(rejection.code, MuxRejectionCode::UnknownFuture);
+            assert_eq!(rejection.object, None);
+            assert_eq!(rejection.effect, MuxEffectCertainty::UnknownFuture);
+            assert_eq!(rejection.retry, MuxRetryAuthority::UnknownFuture);
+            assert!(!crate::retry::is_retryable(&crate::Error::Wezterm(
+                WeztermError::MuxRejection(rejection)
+            )));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cli_mutation_success_is_authoritative_after_late_cancellation() {
         let cx = crate::cx::for_testing();
         cx.cancel_with(
@@ -7183,7 +7786,8 @@ mod tests {
         let mutation = WeztermClient::finalize_cli_effect_after_wait(
             &cx,
             CliEffect::Mutation {
-                operation: "send_text",
+                operation: MuxOperation::SendText,
+                object: None,
             },
             synthetic_cli_output(true, "", ""),
         );
@@ -7191,7 +7795,10 @@ mod tests {
 
         let read = WeztermClient::finalize_cli_effect_after_wait(
             &cx,
-            CliEffect::ReadOnly,
+            CliEffect::ReadOnly {
+                operation: MuxOperation::ReadPaneText,
+                object: None,
+            },
             synthetic_cli_output(true, "pane text", ""),
         )
         .expect_err("a read completed after cancellation must not escape");
@@ -7205,33 +7812,67 @@ mod tests {
     fn cli_mutation_failure_taxonomy_prevents_blind_replay() {
         let pane_rejection = WeztermClient::finalize_cli_mutation_output(
             synthetic_cli_output(false, "", "pane 41 not found"),
-            "kill_pane",
+            CliEffect::Mutation {
+                operation: MuxOperation::KillPane,
+                object: Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Pane,
+                    id: 41,
+                }),
+            },
         );
         assert!(matches!(
             pane_rejection,
-            Err(crate::Error::Wezterm(WeztermError::CommandFailed(detail)))
-                if detail.contains("pane 41 not found")
+            Err(crate::Error::Wezterm(WeztermError::MuxRejection(
+                MuxRejection {
+                    code: MuxRejectionCode::PaneNotFound,
+                    operation: MuxOperation::KillPane,
+                    object: Some(MuxObjectIdentity {
+                        kind: MuxObjectKind::Pane,
+                        id: 41,
+                    }),
+                    effect: MuxEffectCertainty::NotApplied,
+                    retry: MuxRetryAuthority::Never,
+                }
+            )))
         ));
 
         let not_running = WeztermClient::finalize_cli_mutation_output(
             synthetic_cli_output(false, "", "Connection refused"),
-            "send_text",
+            CliEffect::Mutation {
+                operation: MuxOperation::SendText,
+                object: None,
+            },
         );
         assert!(matches!(
             not_running,
-            Err(crate::Error::Wezterm(WeztermError::NotRunning))
+            Err(crate::Error::Wezterm(WeztermError::MuxRejection(
+                MuxRejection {
+                    code: MuxRejectionCode::IndeterminateMutation,
+                    operation: MuxOperation::SendText,
+                    effect: MuxEffectCertainty::Indeterminate,
+                    retry: MuxRetryAuthority::ReconcileBeforeRetry,
+                    ..
+                }
+            )))
         ));
 
         let unknown = WeztermClient::finalize_cli_mutation_output(
             synthetic_cli_output(false, "", "remote response was lost after dispatch"),
-            "send_text",
+            CliEffect::Mutation {
+                operation: MuxOperation::SendText,
+                object: None,
+            },
         )
         .expect_err("unproven mutation rejection must be indeterminate");
         assert!(matches!(
             unknown,
-            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "send_text"
-            })
+            crate::Error::Wezterm(WeztermError::MuxRejection(MuxRejection {
+                code: MuxRejectionCode::IndeterminateMutation,
+                operation: MuxOperation::SendText,
+                effect: MuxEffectCertainty::Indeterminate,
+                retry: MuxRetryAuthority::ReconcileBeforeRetry,
+                ..
+            }))
         ));
         assert!(!unknown.to_string().contains("remote response"));
         assert!(!format!("{unknown:?}").contains("remote response"));
@@ -7251,9 +7892,13 @@ mod tests {
             .expect_err("the pane may exist even when its receipt is malformed");
         assert!(matches!(
             error,
-            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "spawn_targeted"
-            })
+            crate::Error::Wezterm(WeztermError::MuxRejection(MuxRejection {
+                code: MuxRejectionCode::IndeterminateMutation,
+                operation: MuxOperation::Spawn,
+                effect: MuxEffectCertainty::Indeterminate,
+                retry: MuxRetryAuthority::ReconcileBeforeRetry,
+                ..
+            }))
         ));
         assert_eq!(client.circuit_status().consecutive_failures, 1);
     }
@@ -7283,9 +7928,13 @@ mod tests {
             .expect_err("malformed successful receipt must fail the full operation contract");
         assert!(matches!(
             error,
-            crate::Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "spawn_targeted"
-            })
+            crate::Error::Wezterm(WeztermError::MuxRejection(MuxRejection {
+                code: MuxRejectionCode::IndeterminateMutation,
+                operation: MuxOperation::Spawn,
+                effect: MuxEffectCertainty::Indeterminate,
+                retry: MuxRetryAuthority::ReconcileBeforeRetry,
+                ..
+            }))
         ));
         assert_eq!(client.circuit_status().state, CircuitStateKind::Open);
     }
@@ -7302,18 +7951,30 @@ mod tests {
             .circuit_guard()
             .expect("zero cooldown must admit one half-open probe");
 
-        let pane_rejection = WeztermClient::map_cli_mutation_pane_error(
-            CliMutationOutcome {
-                result: Err(WeztermError::CommandFailed("pane 41 not found".to_string()).into()),
-                circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
-            },
-            41,
-        );
+        let pane_rejection = CliMutationOutcome {
+            result: WeztermClient::finalize_cli_mutation_output(
+                synthetic_cli_output(false, "", "pane 41 not found"),
+                CliEffect::Mutation {
+                    operation: MuxOperation::KillPane,
+                    object: Some(MuxObjectIdentity {
+                        kind: MuxObjectKind::Pane,
+                        id: 41,
+                    }),
+                },
+            ),
+            circuit_evidence: CliMutationCircuitEvidence::SuccessfulResponse,
+        };
         client.circuit_record_mutation_evidence(pane_rejection.circuit_evidence);
 
         assert!(matches!(
             pane_rejection.result,
-            Err(crate::Error::Wezterm(WeztermError::PaneNotFound(41)))
+            Err(crate::Error::Wezterm(WeztermError::MuxRejection(
+                MuxRejection {
+                    code: MuxRejectionCode::PaneNotFound,
+                    object: Some(MuxObjectIdentity { id: 41, .. }),
+                    ..
+                }
+            )))
         ));
         assert_eq!(client.circuit_status().state, CircuitStateKind::Closed);
         assert_eq!(client.circuit_status().consecutive_failures, 0);
@@ -7330,15 +7991,20 @@ mod tests {
         let authoritative_failure = WeztermClient::finalize_cli_effect_after_wait(
             &cx,
             CliEffect::Mutation {
-                operation: "send_text",
+                operation: MuxOperation::SendText,
+                object: None,
             },
             synthetic_cli_output(false, "", "remote response failed after dispatch"),
         );
         assert!(matches!(
             &authoritative_failure,
-            Err(crate::Error::Wezterm(WeztermError::IndeterminateMutation {
-                operation: "send_text"
-            }))
+            Err(crate::Error::Wezterm(WeztermError::MuxRejection(
+                MuxRejection {
+                    code: MuxRejectionCode::IndeterminateMutation,
+                    operation: MuxOperation::SendText,
+                    ..
+                }
+            )))
         ));
         let evidence =
             WeztermClient::completed_cli_mutation_circuit_evidence(&authoritative_failure);

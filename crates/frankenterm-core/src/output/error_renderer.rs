@@ -6,8 +6,8 @@
 
 use super::format::{OutputFormat, Style};
 use crate::error::{
-    ConfigError, Error, PaneOperationSource, PatternError, Remediation, StorageError, WeztermError,
-    WorkflowError,
+    ConfigError, Error, MuxRejectionCode, PaneOperationSource, PatternError, Remediation,
+    StorageError, WeztermError, WorkflowError,
 };
 use crate::error_codes::{ErrorCodeDef, get_error_code};
 
@@ -44,6 +44,21 @@ impl ErrorRenderer {
                 WeztermError::SocketNotFound(_) => "FT-1003",
                 WeztermError::CommandFailed(_) => "FT-1020",
                 WeztermError::IndeterminateMutation { .. } => "FT-1024",
+                WeztermError::MuxRejection(rejection) => match rejection.code {
+                    MuxRejectionCode::PaneNotFound => "FT-1010",
+                    MuxRejectionCode::DeadlineExceeded => "FT-1022",
+                    MuxRejectionCode::IndeterminateMutation | MuxRejectionCode::UnknownFuture => {
+                        "FT-1024"
+                    }
+                    MuxRejectionCode::TabNotFound
+                    | MuxRejectionCode::WindowNotFound
+                    | MuxRejectionCode::DomainNotFound
+                    | MuxRejectionCode::InvalidRequest
+                    | MuxRejectionCode::PolicyRejected
+                    | MuxRejectionCode::Cancelled
+                    | MuxRejectionCode::QuotaExceeded
+                    | MuxRejectionCode::BackendFailure => "FT-1020",
+                },
                 WeztermError::ParseError(_) => "FT-1021",
                 WeztermError::OutputTooLarge { .. } => "FT-1023",
                 WeztermError::Timeout(_) => "FT-1022",
@@ -145,6 +160,19 @@ impl ErrorRenderer {
         if let Error::Storage(StorageError::SubmitIdempotency(submit_error)) = error {
             obj["error_class"] = serde_json::json!(submit_error.error_class());
             obj["retryable"] = serde_json::json!(submit_error.is_retryable());
+        }
+
+        if let Error::Wezterm(WeztermError::MuxRejection(rejection)) = error {
+            obj["error_class"] = serde_json::json!(rejection.code.label());
+            obj["operation"] = serde_json::json!(rejection.operation.label());
+            obj["effect"] = serde_json::json!(rejection.effect.label());
+            obj["retry"] = serde_json::json!(rejection.retry.label());
+            if let Some(object) = rejection.object {
+                obj["object"] = serde_json::json!({
+                    "kind": object.kind.label(),
+                    "id": object.id,
+                });
+            }
         }
 
         if let Some(remediation) = error.remediation() {
@@ -1073,6 +1101,28 @@ mod tests {
             source: PaneOperationSource::PaneNotFound,
         };
         assert_eq!(ErrorRenderer::error_code(&error), "FT-1010");
+    }
+
+    #[test]
+    fn mux_rejection_json_is_finite_structured_and_content_free() {
+        use crate::error::{MuxOperation, MuxRejection, WeztermError};
+
+        let error = Error::Wezterm(WeztermError::MuxRejection(MuxRejection::pane_not_found(
+            MuxOperation::ReadPaneText,
+            42,
+        )));
+        let output = ErrorRenderer::new(OutputFormat::Json).render(&error);
+        let parsed: Value = serde_json::from_str(&output).expect("mux rejection JSON output");
+
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["code"], "FT-1010");
+        assert_eq!(parsed["error_class"], "pane_not_found");
+        assert_eq!(parsed["operation"], "read_pane_text");
+        assert_eq!(parsed["effect"], "not_applied");
+        assert_eq!(parsed["retry"], "never");
+        assert_eq!(parsed["object"]["kind"], "pane");
+        assert_eq!(parsed["object"]["id"], 42);
+        assert!(!output.contains("backend-canary"));
     }
 
     #[test]

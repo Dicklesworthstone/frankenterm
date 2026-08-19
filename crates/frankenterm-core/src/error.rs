@@ -517,6 +517,367 @@ impl Error {
     }
 }
 
+/// Finite, transport-independent mux operation identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxOperation {
+    ProtocolHandshake,
+    ClientRegistration,
+    ListPanes,
+    ReadTieredScrollbackStatus,
+    Spawn,
+    SplitPane,
+    ReadRenderChanges,
+    ReadPaneText,
+    ReadSemanticZones,
+    SendText,
+    ResizePane,
+    AdjustPaneSize,
+    CreateFloatingPane,
+    MoveFloatingPane,
+    SetFloatingPaneZ,
+    ToggleFloatingPane,
+    RemoveFloatingPane,
+    SwapLayout,
+    SetLayoutCycle,
+    CycleStack,
+    SelectStackPane,
+    UpdatePaneConstraints,
+    ActivatePane,
+    KillPane,
+    SetPaneZoomed,
+    SetFocusedPane,
+    SetTabTitle,
+    SetWindowTitle,
+    SetWindowWorkspace,
+    SetActiveWorkspace,
+    RenameWorkspace,
+    EraseScrollback,
+    SearchScrollback,
+    KeyInput,
+    MouseInput,
+    ReadImage,
+    ReadPaneDirection,
+    SetPalette,
+    ListClients,
+    GetTlsCredentials,
+    UnknownRequest,
+}
+
+impl MuxOperation {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ProtocolHandshake => "protocol_handshake",
+            Self::ClientRegistration => "client_registration",
+            Self::ListPanes => "list_panes",
+            Self::ReadTieredScrollbackStatus => "read_tiered_scrollback_status",
+            Self::Spawn => "spawn",
+            Self::SplitPane => "split_pane",
+            Self::ReadRenderChanges => "read_render_changes",
+            Self::ReadPaneText => "read_pane_text",
+            Self::ReadSemanticZones => "read_semantic_zones",
+            Self::SendText => "send_text",
+            Self::ResizePane => "resize_pane",
+            Self::AdjustPaneSize => "adjust_pane_size",
+            Self::CreateFloatingPane => "create_floating_pane",
+            Self::MoveFloatingPane => "move_floating_pane",
+            Self::SetFloatingPaneZ => "set_floating_pane_z",
+            Self::ToggleFloatingPane => "toggle_floating_pane",
+            Self::RemoveFloatingPane => "remove_floating_pane",
+            Self::SwapLayout => "swap_layout",
+            Self::SetLayoutCycle => "set_layout_cycle",
+            Self::CycleStack => "cycle_stack",
+            Self::SelectStackPane => "select_stack_pane",
+            Self::UpdatePaneConstraints => "update_pane_constraints",
+            Self::ActivatePane => "activate_pane",
+            Self::KillPane => "kill_pane",
+            Self::SetPaneZoomed => "set_pane_zoomed",
+            Self::SetFocusedPane => "set_focused_pane",
+            Self::SetTabTitle => "set_tab_title",
+            Self::SetWindowTitle => "set_window_title",
+            Self::SetWindowWorkspace => "set_window_workspace",
+            Self::SetActiveWorkspace => "set_active_workspace",
+            Self::RenameWorkspace => "rename_workspace",
+            Self::EraseScrollback => "erase_scrollback",
+            Self::SearchScrollback => "search_scrollback",
+            Self::KeyInput => "key_input",
+            Self::MouseInput => "mouse_input",
+            Self::ReadImage => "read_image",
+            Self::ReadPaneDirection => "read_pane_direction",
+            Self::SetPalette => "set_palette",
+            Self::ListClients => "list_clients",
+            Self::GetTlsCredentials => "get_tls_credentials",
+            Self::UnknownRequest => "unknown_request",
+        }
+    }
+
+    #[must_use]
+    pub fn from_cli_operation(operation: &'static str) -> Self {
+        match operation {
+            "list_panes" | "list_panes_with_cx" => Self::ListPanes,
+            "get_text" | "get_lines" | "get_text_with_cx" => Self::ReadPaneText,
+            "get_semantic_zones" | "get_semantic_zones_with_cx" => Self::ReadSemanticZones,
+            "pane_tiered_scrollback_summary_with_cx"
+            | "pane_tiered_scrollback_summaries_bulk_with_cx" => Self::ReadTieredScrollbackStatus,
+            "spawn" | "spawn_targeted" | "spawn_targeted_with_cx" => Self::Spawn,
+            "split_pane" | "split_pane_with_cx" => Self::SplitPane,
+            "send_text" | "send_text_with_cx" => Self::SendText,
+            "resize" | "resize_pane" => Self::ResizePane,
+            "activate_pane" => Self::ActivatePane,
+            "kill_pane" => Self::KillPane,
+            "set_pane_zoomed" | "zoom_pane" => Self::SetPaneZoomed,
+            _ => Self::UnknownRequest,
+        }
+    }
+}
+
+/// Stable project-level mux rejection code shared by direct and CLI transports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxRejectionCode {
+    PaneNotFound,
+    TabNotFound,
+    WindowNotFound,
+    DomainNotFound,
+    InvalidRequest,
+    PolicyRejected,
+    Cancelled,
+    DeadlineExceeded,
+    QuotaExceeded,
+    BackendFailure,
+    IndeterminateMutation,
+    UnknownFuture,
+}
+
+impl MuxRejectionCode {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PaneNotFound => "pane_not_found",
+            Self::TabNotFound => "tab_not_found",
+            Self::WindowNotFound => "window_not_found",
+            Self::DomainNotFound => "domain_not_found",
+            Self::InvalidRequest => "invalid_request",
+            Self::PolicyRejected => "policy_rejected",
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::BackendFailure => "backend_failure",
+            Self::IndeterminateMutation => "indeterminate_mutation",
+            Self::UnknownFuture => "unknown_future",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxObjectKind {
+    Pane,
+    Tab,
+    Window,
+    Domain,
+    UnknownFuture,
+}
+
+impl MuxObjectKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Tab => "tab",
+            Self::Window => "window",
+            Self::Domain => "domain",
+            Self::UnknownFuture => "unknown_future",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct MuxObjectIdentity {
+    pub kind: MuxObjectKind,
+    pub id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxEffectCertainty {
+    NotApplied,
+    Indeterminate,
+    UnknownFuture,
+}
+
+impl MuxEffectCertainty {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotApplied => "not_applied",
+            Self::Indeterminate => "indeterminate",
+            Self::UnknownFuture => "unknown_future",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxRetryAuthority {
+    Never,
+    SafeAfterBackoff,
+    ReconcileBeforeRetry,
+    UnknownFuture,
+}
+
+impl MuxRetryAuthority {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::SafeAfterBackoff => "safe_after_backoff",
+            Self::ReconcileBeforeRetry => "reconcile_before_retry",
+            Self::UnknownFuture => "unknown_future",
+        }
+    }
+}
+
+/// Content-free rejection authority shared by native mux and CLI fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct MuxRejection {
+    pub code: MuxRejectionCode,
+    pub operation: MuxOperation,
+    pub object: Option<MuxObjectIdentity>,
+    pub effect: MuxEffectCertainty,
+    pub retry: MuxRetryAuthority,
+}
+
+impl MuxRejection {
+    #[must_use]
+    pub const fn pane_not_found(operation: MuxOperation, pane_id: u64) -> Self {
+        Self {
+            code: MuxRejectionCode::PaneNotFound,
+            operation,
+            object: Some(MuxObjectIdentity {
+                kind: MuxObjectKind::Pane,
+                id: pane_id,
+            }),
+            effect: MuxEffectCertainty::NotApplied,
+            retry: MuxRetryAuthority::Never,
+        }
+    }
+
+    #[must_use]
+    pub const fn backend_failure(operation: MuxOperation) -> Self {
+        Self {
+            code: MuxRejectionCode::BackendFailure,
+            operation,
+            object: None,
+            effect: MuxEffectCertainty::NotApplied,
+            retry: MuxRetryAuthority::SafeAfterBackoff,
+        }
+    }
+
+    #[must_use]
+    pub const fn deadline_exceeded(operation: MuxOperation) -> Self {
+        Self {
+            code: MuxRejectionCode::DeadlineExceeded,
+            operation,
+            object: None,
+            effect: MuxEffectCertainty::NotApplied,
+            retry: MuxRetryAuthority::SafeAfterBackoff,
+        }
+    }
+
+    #[must_use]
+    pub const fn indeterminate(operation: MuxOperation, object: Option<MuxObjectIdentity>) -> Self {
+        Self {
+            code: MuxRejectionCode::IndeterminateMutation,
+            operation,
+            object,
+            effect: MuxEffectCertainty::Indeterminate,
+            retry: MuxRetryAuthority::ReconcileBeforeRetry,
+        }
+    }
+
+    /// Whether the finite code, object, effect, and retry fields form one
+    /// internally consistent authority statement.
+    #[must_use]
+    pub const fn has_consistent_authority(self) -> bool {
+        let object_matches = match self.code {
+            MuxRejectionCode::PaneNotFound => matches!(
+                self.object,
+                Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Pane,
+                    ..
+                })
+            ),
+            MuxRejectionCode::TabNotFound => matches!(
+                self.object,
+                Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Tab,
+                    ..
+                })
+            ),
+            MuxRejectionCode::WindowNotFound => matches!(
+                self.object,
+                Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Window,
+                    ..
+                })
+            ),
+            MuxRejectionCode::DomainNotFound => matches!(
+                self.object,
+                None | Some(MuxObjectIdentity {
+                    kind: MuxObjectKind::Domain,
+                    ..
+                })
+            ),
+            MuxRejectionCode::IndeterminateMutation => true,
+            MuxRejectionCode::UnknownFuture => self.object.is_none(),
+            _ => self.object.is_none(),
+        };
+        if !object_matches {
+            return false;
+        }
+
+        match self.code {
+            MuxRejectionCode::IndeterminateMutation => {
+                matches!(self.effect, MuxEffectCertainty::Indeterminate)
+                    && matches!(self.retry, MuxRetryAuthority::ReconcileBeforeRetry)
+            }
+            MuxRejectionCode::DeadlineExceeded
+            | MuxRejectionCode::QuotaExceeded
+            | MuxRejectionCode::BackendFailure => {
+                matches!(self.effect, MuxEffectCertainty::NotApplied)
+                    && matches!(self.retry, MuxRetryAuthority::SafeAfterBackoff)
+            }
+            MuxRejectionCode::UnknownFuture => {
+                matches!(self.effect, MuxEffectCertainty::UnknownFuture)
+                    && matches!(self.retry, MuxRetryAuthority::UnknownFuture)
+            }
+            _ => {
+                matches!(self.effect, MuxEffectCertainty::NotApplied)
+                    && matches!(self.retry, MuxRetryAuthority::Never)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for MuxRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "mux rejection code={} operation={} effect={} retry={}",
+            self.code.label(),
+            self.operation.label(),
+            self.effect.label(),
+            self.retry.label()
+        )?;
+        if let Some(object) = self.object {
+            write!(formatter, " object={}:{}", object.kind.label(), object.id)?;
+        }
+        Ok(())
+    }
+}
+
 /// WezTerm-specific errors
 #[derive(Error, Debug)]
 pub enum WeztermError {
@@ -550,6 +911,10 @@ pub enum WeztermError {
         /// Finite operation identity; never argv, pane text, or stderr.
         operation: &'static str,
     },
+
+    /// Finite mux-side rejection shared by direct and CLI transports.
+    #[error("{0}")]
+    MuxRejection(MuxRejection),
 
     /// JSON parsing failed
     #[error("Failed to parse WezTerm output: {0}")]
@@ -628,6 +993,22 @@ impl WeztermError {
             .command("List panes", "ft list")
             .command("Inspect state", "ft robot state")
             .alternative("Do not blindly replay the mutation; verify its intended postcondition first."),
+            Self::MuxRejection(rejection) => match rejection.retry {
+                MuxRetryAuthority::ReconcileBeforeRetry | MuxRetryAuthority::UnknownFuture => {
+                    Remediation::new(
+                        "Reconcile the live mux state before deciding whether to retry this operation.",
+                    )
+                    .command("List panes", "ft list")
+                    .command("Inspect state", "ft robot state")
+                }
+                MuxRetryAuthority::SafeAfterBackoff => Remediation::new(
+                    "The mux rejected this operation without applying it; retry after bounded backoff.",
+                ),
+                MuxRetryAuthority::Never => {
+                    Remediation::new("Correct the target or request before retrying.")
+                        .command("List panes", "ft list")
+                }
+            },
             Self::ParseError(_) => {
                 Remediation::new("WezTerm returned unexpected output; verify the version.")
                     .command("Check version", "wezterm --version")
@@ -676,6 +1057,20 @@ impl WeztermError {
         use crate::network_reliability::NetworkErrorKind;
         match self {
             Self::Timeout(_) | Self::CommandFailed(_) => NetworkErrorKind::Transient,
+            Self::MuxRejection(rejection) => match rejection.code {
+                MuxRejectionCode::Cancelled
+                | MuxRejectionCode::DeadlineExceeded
+                | MuxRejectionCode::QuotaExceeded
+                | MuxRejectionCode::BackendFailure => NetworkErrorKind::Transient,
+                MuxRejectionCode::PaneNotFound
+                | MuxRejectionCode::TabNotFound
+                | MuxRejectionCode::WindowNotFound
+                | MuxRejectionCode::DomainNotFound
+                | MuxRejectionCode::InvalidRequest
+                | MuxRejectionCode::PolicyRejected
+                | MuxRejectionCode::IndeterminateMutation
+                | MuxRejectionCode::UnknownFuture => NetworkErrorKind::Permanent,
+            },
             Self::CliNotFound
             | Self::NotRunning
             | Self::SocketNotFound(_)

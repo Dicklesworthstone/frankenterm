@@ -538,7 +538,7 @@ where
 #[allow(deprecated)]
 #[must_use]
 pub fn is_retryable(error: &Error) -> bool {
-    use crate::error::{StorageError, WeztermError};
+    use crate::error::{MuxRetryAuthority, StorageError, WeztermError};
 
     match error {
         // Authority failures are fail-closed lifecycle decisions.  Blindly
@@ -560,6 +560,9 @@ pub fn is_retryable(error: &Error) -> bool {
             // The command may already have committed. Reconciliation, not
             // replay, is the only safe next action.
             WeztermError::IndeterminateMutation { .. } => false,
+            WeztermError::MuxRejection(rejection) => {
+                rejection.retry == MuxRetryAuthority::SafeAfterBackoff
+            }
             WeztermError::ParseError(_) => false, // Structural issue
             WeztermError::OutputTooLarge { .. } => false, // Output won't shrink on retry
         },
@@ -1710,6 +1713,48 @@ mod tests {
         assert!(!is_retryable(&Error::Wezterm(WeztermError::PaneNotFound(
             42
         ))));
+    }
+
+    #[test]
+    fn mux_rejection_retry_authority_is_the_only_retry_source() {
+        use crate::error::{
+            MuxEffectCertainty, MuxOperation, MuxRejection, MuxRejectionCode, MuxRetryAuthority,
+            WeztermError,
+        };
+
+        for rejection in [
+            MuxRejection::backend_failure(MuxOperation::ListPanes),
+            MuxRejection::deadline_exceeded(MuxOperation::ReadPaneText),
+        ] {
+            assert!(
+                is_retryable(&Error::Wezterm(WeztermError::MuxRejection(rejection))),
+                "safe-after-backoff authority must permit a bounded retry: {rejection:?}"
+            );
+        }
+
+        for rejection in [
+            MuxRejection::pane_not_found(MuxOperation::ReadPaneText, 42),
+            MuxRejection::indeterminate(MuxOperation::SendText, None),
+            MuxRejection {
+                code: MuxRejectionCode::PolicyRejected,
+                operation: MuxOperation::SendText,
+                object: None,
+                effect: MuxEffectCertainty::NotApplied,
+                retry: MuxRetryAuthority::Never,
+            },
+            MuxRejection {
+                code: MuxRejectionCode::UnknownFuture,
+                operation: MuxOperation::UnknownRequest,
+                object: None,
+                effect: MuxEffectCertainty::UnknownFuture,
+                retry: MuxRetryAuthority::UnknownFuture,
+            },
+        ] {
+            assert!(
+                !is_retryable(&Error::Wezterm(WeztermError::MuxRejection(rejection))),
+                "non-retry or reconciliation authority must fail closed: {rejection:?}"
+            );
+        }
     }
 
     #[test]

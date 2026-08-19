@@ -21,7 +21,7 @@
 //!   (3) `stream_decode` over random buffers — exercises the partial-
 //!       frame path that the mux uses on every read from a socket.
 
-use codec::{CompressionMode, ErrorResponse, Pdu, StreamingPduBuffer};
+use codec::{CompressionMode, ErrorResponse, Pdu, PduWireIdent, Ping, StreamingPduBuffer};
 use proptest::prelude::*;
 
 const COMPRESSED_MASK: u64 = 1 << 63;
@@ -66,9 +66,7 @@ fn split_single_frame(frame: &[u8]) -> (u64, u64, Vec<u8>) {
 
 #[test]
 fn structured_header_helper_uses_real_codec_compression_bit() {
-    let expected = Pdu::ErrorResponse(ErrorResponse {
-        reason: "compressed-flag sentinel".to_string(),
-    });
+    let expected = Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT));
     let mut canonical = Vec::new();
     expected
         .encode_with_mode(&mut canonical, 77, CompressionMode::Never)

@@ -18,8 +18,9 @@ use std::path::PathBuf;
 
 use codec::{
     CompressionMode, DecodedPdu, ErrorResponse, GetCodecVersion, GetCodecVersionResponse,
-    GetTlsCreds, ListPanes, Pdu, Ping, Pong, StreamingPduBuffer, UnitResponse, CODEC_VERSION,
-    CODEC_VERSION_MIN_SUPPORTED,
+    GetTlsCreds, InputSerial, ListPanes, Pdu, PduWireIdent, Ping, Pong, SendPaste,
+    StreamingPduBuffer, UnitResponse, CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED,
+    MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES,
 };
 
 // Mirror private constants from `codec::lib`. Kept in lockstep by the
@@ -355,9 +356,7 @@ fn conformance_pdu_roundtrip_matrix_preserves_serial_payload_and_streaming() {
         Pdu::UnitResponse(UnitResponse {})
     });
     assert_roundtrip_modes("error-response", 65_536, || {
-        Pdu::ErrorResponse(ErrorResponse {
-            reason: "roundtrip-payload".to_string(),
-        })
+        Pdu::ErrorResponse(ErrorResponse::pane_not_found(ListPanes::IDENT, 91))
     });
 }
 
@@ -375,83 +374,56 @@ fn wire_protocol_versioning_codec_roundtrip_conformance_pdu_version_response_mod
 }
 
 // -----------------------------------------------------------------------------
-// 3. Boundary length 0 — ErrorResponse with empty reason
+// 3. Fixed-shape ErrorResponse without an object identity
 // -----------------------------------------------------------------------------
 
 #[test]
-fn conformance_boundary_zero_payload_error_response() {
+fn conformance_fixed_error_response_without_object_round_trips() {
     let mut wire = Vec::new();
-    Pdu::ErrorResponse(ErrorResponse {
-        reason: String::new(),
-    })
+    let expected = ErrorResponse::invalid_request(Ping::IDENT);
+    Pdu::ErrorResponse(expected.clone())
     .encode(&mut wire, 1)
-    .expect("encode empty ErrorResponse");
-    assert_eq!(
-        wire,
-        golden_bytes(
-            "error-response-empty-reason",
-            include_str!("goldens/pdu_error_response_empty_reason.hex"),
-        ),
-        "canonical empty ErrorResponse wire bytes changed"
-    );
+    .expect("encode object-free ErrorResponse");
+    assert!(wire.len() <= MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES);
 
-    let decoded = Pdu::decode(wire.as_slice()).expect("decode empty ErrorResponse");
+    let decoded = Pdu::decode(wire.as_slice()).expect("decode object-free ErrorResponse");
     assert_eq!(decoded.serial, 1);
     match decoded.pdu {
-        Pdu::ErrorResponse(r) => assert_eq!(r.reason, ""),
+        Pdu::ErrorResponse(response) => assert_eq!(response, expected),
         other => panic!("expected ErrorResponse, got {:?}", other),
     }
 }
 
 // -----------------------------------------------------------------------------
-// 4. Boundary length 1 — single-byte payload
+// 4. Fixed-shape ErrorResponse with an exact object identity
 // -----------------------------------------------------------------------------
 
 #[test]
-fn conformance_boundary_one_byte_payload() {
+fn conformance_fixed_error_response_with_object_round_trips() {
     let mut wire = Vec::new();
-    Pdu::ErrorResponse(ErrorResponse {
-        reason: "x".to_string(),
-    })
+    let expected = ErrorResponse::pane_not_found(Ping::IDENT, u64::MAX);
+    Pdu::ErrorResponse(expected.clone())
     .encode(&mut wire, 2)
-    .expect("encode 1-char ErrorResponse");
-    assert_eq!(
-        wire,
-        golden_bytes(
-            "error-response-reason-x",
-            include_str!("goldens/pdu_error_response_reason_x.hex"),
-        ),
-        "canonical one-byte ErrorResponse wire bytes changed"
-    );
+    .expect("encode object-bearing ErrorResponse");
+    assert!(wire.len() <= MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES);
 
-    let decoded = Pdu::decode(wire.as_slice()).expect("decode 1-char ErrorResponse");
+    let decoded = Pdu::decode(wire.as_slice()).expect("decode object-bearing ErrorResponse");
     match decoded.pdu {
-        Pdu::ErrorResponse(r) => assert_eq!(r.reason, "x"),
+        Pdu::ErrorResponse(response) => assert_eq!(response, expected),
         other => panic!("expected ErrorResponse, got {:?}", other),
     }
 }
 
 // -----------------------------------------------------------------------------
-// 5. Boundary length near MAX — 1 MB ErrorResponse (well below cap, still large)
+// 5. PDU0 has a schema-specific body ceiling far below the generic PDU cap.
 // -----------------------------------------------------------------------------
 
 #[test]
-fn conformance_boundary_one_megabyte_payload_round_trip() {
-    let reason = "A".repeat(1024 * 1024);
-    let mut wire = Vec::new();
-    Pdu::ErrorResponse(ErrorResponse {
-        reason: reason.clone(),
-    })
-    .encode(&mut wire, 3)
-    .expect("encode 1MB ErrorResponse");
-
-    let decoded = Pdu::decode(wire.as_slice()).expect("decode 1MB ErrorResponse");
-    match decoded.pdu {
-        Pdu::ErrorResponse(r) => assert_eq!(r.reason.len(), 1024 * 1024),
-        other => panic!("expected ErrorResponse, got {:?}", other),
-    }
-    assert_eq!(decoded.serial, 3);
-    drop(reason);
+fn conformance_error_response_body_above_schema_cap_is_rejected() {
+    let data = vec![0_u8; MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES + 1];
+    let tagged_len = well_formed_len(3, ErrorResponse::IDENT, data.len() as u64);
+    let wire = frame(tagged_len, 3, ErrorResponse::IDENT, &data);
+    assert!(Pdu::decode(wire.as_slice()).is_err());
 }
 
 // -----------------------------------------------------------------------------
@@ -601,9 +573,7 @@ fn conformance_mixed_mux_pdu_roundtrip_preserves_order_under_all_compression_mod
             "error-response-never",
             104,
             CompressionMode::Never,
-            Pdu::ErrorResponse(ErrorResponse {
-                reason: "mux roundtrip marker".to_string(),
-            }),
+            Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT)),
         ),
         (
             "list-panes-auto",
@@ -686,9 +656,7 @@ fn conformance_mux_pdu_roundtrip_decodes_one_byte_chunks_in_order() {
         (
             202,
             CompressionMode::Always,
-            Pdu::ErrorResponse(ErrorResponse {
-                reason: "chunked mux stream".repeat(4),
-            }),
+            Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT)),
         ),
         (
             203,
@@ -879,28 +847,27 @@ fn conformance_stream_decode_is_whole_frame_or_nothing() {
 
 #[test]
 fn conformance_compressed_flag_round_trip() {
-    // zstd compresses repetitive data dramatically. ErrorResponse with a
-    // 256 KB repeated string will exceed COMPRESS_THRESH and trigger auto
-    // compression on the encode side.
-    let reason = "COMPRESSIBLE-".repeat(20_000); // ~260 KB
-    let original = Pdu::ErrorResponse(ErrorResponse {
-        reason: reason.clone(),
+    // zstd compresses repetitive input dramatically. The error envelope is
+    // intentionally fixed and tiny, so exercise compression with bounded
+    // interactive input instead of reintroducing attacker-authored error text.
+    let data = "COMPRESSIBLE-".repeat(20_000); // ~260 KB
+    let original = Pdu::SendPaste(SendPaste {
+        pane_id: 7,
+        data: data.clone(),
+        input_serial: InputSerial::from_millis_since_epoch(1),
     });
     let mut wire = Vec::new();
     original.encode(&mut wire, 88).expect("encode compressed");
 
     // The compressed output should be materially smaller than the source.
     assert!(
-        wire.len() < reason.len() / 2,
-        "compression must shrink a highly repetitive payload by >2x; wire={} reason={}",
+        wire.len() < data.len() / 2,
+        "compression must shrink a highly repetitive payload by >2x; wire={} input={}",
         wire.len(),
-        reason.len()
+        data.len()
     );
 
     let decoded = Pdu::decode(wire.as_slice()).expect("decode compressed");
     assert_eq!(decoded.serial, 88);
-    match decoded.pdu {
-        Pdu::ErrorResponse(r) => assert_eq!(r.reason, reason),
-        other => panic!("expected ErrorResponse, got {:?}", other),
-    }
+    assert_eq!(decoded.pdu, original);
 }

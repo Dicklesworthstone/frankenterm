@@ -185,8 +185,19 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     // free-form payloads. A remote or codec message may itself contain words
     // such as "incompatible" or "timeout" without changing the typed error's
     // transport disposition.
-    if lower.starts_with("remote error:") {
-        return ProtocolErrorKind::Transient;
+    if lower.starts_with("remote mux rejection:") {
+        return if lower.ends_with("deadline_exceeded")
+            || lower.ends_with("quota_exceeded")
+            || lower.ends_with("backend_failure")
+            || lower.ends_with("cancelled")
+        {
+            ProtocolErrorKind::Transient
+        } else {
+            ProtocolErrorKind::Permanent
+        };
+    }
+    if lower.starts_with("remote mux rejection request mismatch:") {
+        return ProtocolErrorKind::Permanent;
     }
     if lower.starts_with("mux ") && (lower.contains(" cancelled:") || lower.contains(" canceled:"))
     {
@@ -376,11 +387,42 @@ pub fn mux_recovery_decision(err: &crate::vendored::DirectMuxError) -> MuxRecove
             cancelled: true,
         },
 
-        // A structured server error is a completed, framed response. Its
-        // application semantics are unknown, so replay is forbidden while the
-        // still-aligned connection remains reusable.
-        DirectMuxError::RemoteError(_) => MuxRecoveryDecision {
-            kind: ProtocolErrorKind::Transient,
+        // A structured server rejection is a completed, framed response. A
+        // fully known v1 envelope carries the retry and cancellation authority
+        // directly; unknown future numeric values remain frame-aligned but
+        // fail closed without replay.
+        DirectMuxError::RemoteRejection(response) => {
+            let known = response.validate().is_ok();
+            let cancelled = known && response.code == codec::MuxErrorCode::CANCELLED;
+            let retry = known && response.retry == codec::MuxErrorRetry::SAFE_AFTER_BACKOFF;
+            let kind = if !known
+                || matches!(
+                    response.code,
+                    codec::MuxErrorCode::PANE_NOT_FOUND
+                        | codec::MuxErrorCode::TAB_NOT_FOUND
+                        | codec::MuxErrorCode::WINDOW_NOT_FOUND
+                        | codec::MuxErrorCode::DOMAIN_NOT_FOUND
+                        | codec::MuxErrorCode::INVALID_REQUEST
+                        | codec::MuxErrorCode::POLICY_REJECTED
+                        | codec::MuxErrorCode::INDETERMINATE_MUTATION
+                ) {
+                ProtocolErrorKind::Permanent
+            } else {
+                ProtocolErrorKind::Transient
+            };
+            MuxRecoveryDecision {
+                kind,
+                retry,
+                connection: Reuse,
+                cancelled,
+            }
+        }
+
+        // The envelope is framed, but it names a different operation than the
+        // serial-correlated request. Preserve the aligned connection while
+        // refusing every effect/retry assertion in the untrusted body.
+        DirectMuxError::RemoteRejectionRequestMismatch { .. } => MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Permanent,
             retry: false,
             connection: Reuse,
             cancelled: false,
@@ -1228,7 +1270,7 @@ mod tests {
             cancelled: false,
         };
         let remote_no_replay = MuxRecoveryDecision {
-            kind: ProtocolErrorKind::Transient,
+            kind: ProtocolErrorKind::Permanent,
             retry: false,
             connection: Reuse,
             cancelled: false,
@@ -1331,7 +1373,16 @@ mod tests {
                 recoverable_retry,
             ),
             (
-                DirectMuxError::RemoteError("client is incompatible with pane".to_string()),
+                DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(
+                    <codec::ListPanes as codec::PduWireIdent>::IDENT,
+                )),
+                remote_no_replay,
+            ),
+            (
+                DirectMuxError::RemoteRejectionRequestMismatch {
+                    expected_request_ident: <codec::ListPanes as codec::PduWireIdent>::IDENT,
+                    got_request_ident: <codec::Ping as codec::PduWireIdent>::IDENT,
+                },
                 remote_no_replay,
             ),
             (
@@ -1471,6 +1522,98 @@ mod tests {
                 "typed error display heuristic must agree for {error:?}"
             );
         }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn every_mux_rejection_code_has_one_finite_recovery_decision() {
+        use crate::vendored::DirectMuxError;
+        use MuxConnectionDisposition::Reuse;
+
+        let request_ident = <codec::ListPanes as codec::PduWireIdent>::IDENT;
+        let permanent = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Permanent,
+            retry: false,
+            connection: Reuse,
+            cancelled: false,
+        };
+        let transient_retry = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: true,
+            connection: Reuse,
+            cancelled: false,
+        };
+        let cancelled = MuxRecoveryDecision {
+            kind: ProtocolErrorKind::Transient,
+            retry: false,
+            connection: Reuse,
+            cancelled: true,
+        };
+        let cases = [
+            (
+                codec::ErrorResponse::pane_not_found(request_ident, 1),
+                permanent,
+            ),
+            (
+                codec::ErrorResponse::tab_not_found(request_ident, 2),
+                permanent,
+            ),
+            (
+                codec::ErrorResponse::window_not_found(request_ident, 3),
+                permanent,
+            ),
+            (
+                codec::ErrorResponse::domain_not_found(request_ident, Some(4)),
+                permanent,
+            ),
+            (
+                codec::ErrorResponse::invalid_request(request_ident),
+                permanent,
+            ),
+            (
+                codec::ErrorResponse::policy_rejected(request_ident),
+                permanent,
+            ),
+            (codec::ErrorResponse::cancelled(request_ident), cancelled),
+            (
+                codec::ErrorResponse::deadline_exceeded(request_ident),
+                transient_retry,
+            ),
+            (
+                codec::ErrorResponse::quota_exceeded(request_ident),
+                transient_retry,
+            ),
+            (
+                codec::ErrorResponse::backend_failure(request_ident),
+                transient_retry,
+            ),
+            (
+                codec::ErrorResponse::indeterminate_mutation(request_ident, None),
+                permanent,
+            ),
+        ];
+
+        for (response, expected) in cases {
+            response.validate().expect("canonical test response");
+            let error = DirectMuxError::RemoteRejection(response);
+            assert_eq!(mux_recovery_decision(&error), expected, "{error:?}");
+            assert_eq!(error.recovery_decision(), expected, "{error:?}");
+            assert_eq!(classify_mux_error(&error), expected.kind, "{error:?}");
+            assert_eq!(
+                classify_error_message(&error.to_string()),
+                expected.kind,
+                "finite display projection drifted for {error:?}"
+            );
+        }
+
+        let mismatch = DirectMuxError::RemoteRejectionRequestMismatch {
+            expected_request_ident: request_ident,
+            got_request_ident: <codec::Ping as codec::PduWireIdent>::IDENT,
+        };
+        assert_eq!(
+            classify_error_message(&mismatch.to_string()),
+            ProtocolErrorKind::Permanent
+        );
     }
 
     #[cfg(all(feature = "vendored", unix))]

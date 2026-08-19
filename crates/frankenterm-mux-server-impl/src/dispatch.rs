@@ -9329,10 +9329,14 @@ mod tests {
         assert_eq!(response.len(), 1);
         assert_eq!(response[0].serial, 3);
         match &response[0].pdu {
-            Pdu::ErrorResponse(codec::ErrorResponse { reason }) => assert!(
-                reason.contains("no such pane"),
-                "trace admission should succeed before the expected missing-pane fixture: {reason}"
-            ),
+            Pdu::ErrorResponse(error) => {
+                assert_eq!(error.code, codec::MuxErrorCode::PANE_NOT_FOUND);
+                assert_eq!(
+                    error.request_ident,
+                    <codec::SendKeyDownTracedV1 as codec::PduWireIdent>::IDENT
+                );
+                error.validate().expect("missing pane error must be canonical");
+            }
             other => panic!("expected missing-pane response after trace admission, got {other:?}"),
         }
     }
@@ -13649,9 +13653,7 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum GeneratedOutboundPdu {
         Pong,
-        ErrorResponse {
-            reason: String,
-        },
+        ErrorResponse,
         GetTlsCredsResponse {
             ca_cert_pem: String,
             client_cert_pem: String,
@@ -13662,9 +13664,9 @@ mod tests {
         fn into_pdu(self) -> Pdu {
             match self {
                 Self::Pong => Pdu::Pong(Pong {}),
-                Self::ErrorResponse { reason } => {
-                    Pdu::ErrorResponse(codec::ErrorResponse { reason })
-                }
+                Self::ErrorResponse => Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                    <codec::Ping as codec::PduWireIdent>::IDENT,
+                )),
                 Self::GetTlsCredsResponse {
                     ca_cert_pem,
                     client_cert_pem,
@@ -13678,12 +13680,12 @@ mod tests {
         fn matches_decoded(&self, decoded: &Pdu) -> bool {
             match (self, decoded) {
                 (Self::Pong, Pdu::Pong(Pong {})) => true,
-                (
-                    Self::ErrorResponse { reason },
-                    Pdu::ErrorResponse(codec::ErrorResponse {
-                        reason: decoded_reason,
-                    }),
-                ) => reason == decoded_reason,
+                (Self::ErrorResponse, Pdu::ErrorResponse(response)) => {
+                    *response
+                        == codec::ErrorResponse::backend_failure(
+                            <codec::Ping as codec::PduWireIdent>::IDENT,
+                        )
+                }
                 (
                     Self::GetTlsCredsResponse {
                         ca_cert_pem,
@@ -14160,7 +14162,7 @@ mod tests {
         let text = "[a-zA-Z0-9 _./-]{0,512}";
         prop_oneof![
             Just(GeneratedOutboundPdu::Pong),
-            text.prop_map(|reason| GeneratedOutboundPdu::ErrorResponse { reason }),
+            Just(GeneratedOutboundPdu::ErrorResponse),
             (text, text).prop_map(|(ca_cert_pem, client_cert_pem)| {
                 GeneratedOutboundPdu::GetTlsCredsResponse {
                     ca_cert_pem,
@@ -16230,8 +16232,9 @@ mod tests {
     fn oversized_outbound_frame_yields_between_bounded_chunks_for_inbound_work() {
         let (item_tx, item_rx) = unbounded();
         let first = Box::new(DecodedPdu {
-            pdu: Pdu::ErrorResponse(codec::ErrorResponse {
-                reason: "z".repeat(OUTBOUND_WRITE_QUANTUM_BYTES * 3),
+            pdu: Pdu::GetTlsCredsResponse(codec::GetTlsCredsResponse {
+                ca_cert_pem: "z".repeat(OUTBOUND_WRITE_QUANTUM_BYTES * 3),
+                client_cert_pem: String::new(),
             }),
             serial: 1,
         });

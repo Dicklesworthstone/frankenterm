@@ -26,9 +26,9 @@
 //! default auto-compression path.
 
 use codec::{
-    CompressionMode, ErrorResponse, InputSerial, MovePaneToNewTab, Pdu, Ping, Pong, Resize,
-    SendPaste, SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane,
-    StreamingPduBuffer, UnitResponse, WriteToPane,
+    CompressionMode, ErrorResponse, InputSerial, MovePaneToNewTab, Pdu, PduWireIdent, Ping, Pong,
+    Resize, SendPaste, SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2,
+    SplitPane, StreamingPduBuffer, UnitResponse, WriteToPane,
 };
 use config::keyassignment::SpawnTabDomain;
 use frankenterm_term::ClipboardSelection;
@@ -95,7 +95,7 @@ enum WireFramingPdu {
     Ping,
     Pong,
     UnitResponse,
-    ErrorResponse(String),
+    ErrorResponse,
     WriteToPane {
         pane_id: usize,
         data: Vec<u8>,
@@ -133,9 +133,9 @@ impl WireFramingPdu {
             Self::Ping => Pdu::Ping(Ping {}),
             Self::Pong => Pdu::Pong(Pong {}),
             Self::UnitResponse => Pdu::UnitResponse(UnitResponse {}),
-            Self::ErrorResponse(reason) => Pdu::ErrorResponse(ErrorResponse {
-                reason: reason.clone(),
-            }),
+            Self::ErrorResponse => {
+                Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT))
+            }
             Self::WriteToPane { pane_id, data } => Pdu::WriteToPane(WriteToPane {
                 pane_id: *pane_id,
                 data: data.clone(),
@@ -206,7 +206,7 @@ fn arb_wire_framing_pdu() -> impl Strategy<Value = WireFramingPdu> {
         Just(WireFramingPdu::Ping),
         Just(WireFramingPdu::Pong),
         Just(WireFramingPdu::UnitResponse),
-        arb_small_string().prop_map(WireFramingPdu::ErrorResponse),
+        Just(WireFramingPdu::ErrorResponse),
         (
             0usize..=4096,
             proptest::collection::vec(any::<u8>(), 0..128)

@@ -158,7 +158,9 @@ impl FuzzPdu {
             Self::Ping => Pdu::Ping(Ping {}),
             Self::PongAsRequest => Pdu::Pong(Pong {}),
             Self::UnitResponseAsRequest => Pdu::UnitResponse(UnitResponse {}),
-            Self::ErrorResponseAsRequest(reason) => Pdu::ErrorResponse(ErrorResponse { reason }),
+            Self::ErrorResponseAsRequest(_) => {
+                Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT))
+            }
             Self::Invalid { ident } => Pdu::Invalid { ident },
             Self::GetCodecVersion => Pdu::GetCodecVersion(GetCodecVersion {}),
             Self::ListPanes => Pdu::ListPanes(ListPanes {}),

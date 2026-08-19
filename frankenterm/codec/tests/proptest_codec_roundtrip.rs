@@ -7,8 +7,9 @@ use codec::{
     GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
     GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesResponse,
     ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse,
-    MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu, Ping,
-    Pong, RemoteTabId, RemoteWindowId, RemoveFloatingPane, RenameWorkspace, ReorderWindowTabsV1,
+    MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu,
+    PduWireIdent, Ping, Pong, RemoteTabId, RemoteWindowId, RemoveFloatingPane, RenameWorkspace,
+    ReorderWindowTabsV1,
     Resize, SampledTraceContextV1, SearchScrollbackRequest, SearchScrollbackResponse,
     SelectStackPane, SendKeyDown, SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste,
     SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
@@ -214,7 +215,19 @@ fn arb_select_stack_pane() -> impl Strategy<Value = SelectStackPane> {
 }
 
 fn arb_error_response() -> impl Strategy<Value = ErrorResponse> {
-    arb_small_string().prop_map(|reason| ErrorResponse { reason })
+    (1_u8..=11, arb_id()).prop_map(|(code, object_id)| match code {
+        1 => ErrorResponse::pane_not_found(GetLines::IDENT, object_id as u64),
+        2 => ErrorResponse::tab_not_found(GetLines::IDENT, object_id as u64),
+        3 => ErrorResponse::window_not_found(GetLines::IDENT, object_id as u64),
+        4 => ErrorResponse::domain_not_found(GetLines::IDENT, Some(object_id as u64)),
+        5 => ErrorResponse::invalid_request(GetLines::IDENT),
+        6 => ErrorResponse::policy_rejected(GetLines::IDENT),
+        7 => ErrorResponse::cancelled(GetLines::IDENT),
+        8 => ErrorResponse::deadline_exceeded(GetLines::IDENT),
+        9 => ErrorResponse::quota_exceeded(GetLines::IDENT),
+        10 => ErrorResponse::backend_failure(GetLines::IDENT),
+        _ => ErrorResponse::indeterminate_mutation(GetLines::IDENT, None),
+    })
 }
 
 fn arb_get_codec_version_response() -> impl Strategy<Value = GetCodecVersionResponse> {

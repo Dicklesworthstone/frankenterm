@@ -4,6 +4,8 @@ use crate::dispatch::EstablishedOrderedWindowAuthority;
 #[cfg(test)]
 use crate::dispatch::established_ordered_window_authority_for_test;
 use anyhow::{Context, anyhow};
+#[cfg(test)]
+use codec::PduWireIdent;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CoherentPaneSnapshot, CreateFloatingPane,
     CycleStack, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
@@ -14,14 +16,15 @@ use codec::{
     GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesCoherent,
     ListPanesCoherentOutcome, ListPanesCoherentResponse, ListPanesResponse, ListPanesTabStackEntry,
     ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse, MoveFloatingPane,
-    MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert, PaneTieredScrollbackStatusEntryV1,
-    PaneTieredScrollbackStatusOutcomeV1, Pdu, Ping, Pong, ReliableInputSchedulerPressureV1,
-    ReliableKeyEventKindV1, ReliableKeyEventOutcomeV1, ReliableKeyEventRejectionV1,
-    ReliableKeyEventRetryV1, ReliableKeyEventV1, ReliableKeyEventV1Response,
-    ReliablePaneRegistrationIdentityV1, RemoveFloatingPane, RenameWorkspace, Resize,
-    SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown,
-    SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId,
-    SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
+    MovePaneToNewTab, MovePaneToNewTabResponse, MuxErrorCode, MuxErrorEffect, MuxErrorObject,
+    MuxErrorObjectKind, MuxErrorRetry, NotifyAlert, PaneTieredScrollbackStatusEntryV1,
+    PaneTieredScrollbackStatusOutcomeV1, Pdu, PduProducer, Ping, Pong,
+    ReliableInputSchedulerPressureV1, ReliableKeyEventKindV1, ReliableKeyEventOutcomeV1,
+    ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventV1,
+    ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1, RemoveFloatingPane,
+    RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
+    SendKeyDown, SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace,
+    SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
     SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
     ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
@@ -142,37 +145,32 @@ fn scheduler_trace_counters(
 fn reject_send_key_down_scheduler_admission(
     outcome: MainThreadReservationOutcome,
 ) -> anyhow::Result<Pdu> {
-    let (label, detail) = match outcome {
+    let (label, rejection) = match outcome {
         MainThreadReservationOutcome::Reserved(_) => {
             unreachable!("reserved input must be spawned instead of rejected")
         }
-        MainThreadReservationOutcome::Coalesced(_) => (
-            "invalid_coalescing",
-            "input work cannot be coalesced without losing a key event",
-        ),
-        MainThreadReservationOutcome::RetryableFull(_) => (
-            "retryable_full",
-            "main-thread input admission is temporarily full; retry this key event",
-        ),
-        MainThreadReservationOutcome::RetiredGeneration(_) => (
-            "retired_generation",
-            "main-thread input scheduler generation retired; retry this key event",
-        ),
-        MainThreadReservationOutcome::InvalidSize(_) => (
-            "invalid_size",
-            "main-thread input admission rejected its configured size",
-        ),
-        MainThreadReservationOutcome::AuthorityExhausted(_) => (
-            "authority_exhausted",
-            "main-thread input scheduler identity authority is exhausted",
-        ),
+        MainThreadReservationOutcome::Coalesced(_) => {
+            ("invalid_coalescing", MuxServerRejection::invalid_request())
+        }
+        MainThreadReservationOutcome::RetryableFull(_) => {
+            ("retryable_full", MuxServerRejection::quota_exceeded())
+        }
+        MainThreadReservationOutcome::RetiredGeneration(_) => {
+            ("retired_generation", MuxServerRejection::quota_exceeded())
+        }
+        MainThreadReservationOutcome::InvalidSize(_) => {
+            ("invalid_size", MuxServerRejection::invalid_request())
+        }
+        MainThreadReservationOutcome::AuthorityExhausted(_) => {
+            ("authority_exhausted", MuxServerRejection::invalid_request())
+        }
         MainThreadReservationOutcome::SchedulerUnavailable => (
             "scheduler_unavailable",
-            "bounded main-thread input scheduler is unavailable; retry this key event",
+            MuxServerRejection::backend_failure(),
         ),
     };
     metrics::counter!("mux.server.input_scheduler_admission", "outcome" => label).increment(1);
-    Err(anyhow!(detail))
+    Err(rejection.into())
 }
 
 fn reliable_input_scheduler_pressure(
@@ -1445,6 +1443,25 @@ pub(crate) struct SessionAuthority {
     incarnation: Arc<SessionIncarnation>,
 }
 
+#[derive(Debug)]
+enum SessionAuthorityError {
+    Retired,
+    OwnerGone,
+    PaneNotFound { pane_id: PaneId },
+}
+
+impl std::fmt::Display for SessionAuthorityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retired => formatter.write_str("mux server session is retired"),
+            Self::OwnerGone => formatter.write_str("mux server session owner no longer exists"),
+            Self::PaneNotFound { pane_id } => write!(formatter, "pane {pane_id} not found"),
+        }
+    }
+}
+
+impl std::error::Error for SessionAuthorityError {}
+
 impl SessionAuthority {
     pub(crate) fn new(mux: &Arc<Mux>) -> Self {
         Self {
@@ -1453,30 +1470,30 @@ impl SessionAuthority {
         }
     }
 
-    fn acquire(&self) -> anyhow::Result<CurrentSession> {
+    fn acquire(&self) -> Result<CurrentSession, SessionAuthorityError> {
         let operation = self
             .incarnation
             .try_acquire()
-            .ok_or_else(|| anyhow!("mux server session is retired"))?;
-        let mux = self
-            .mux
-            .upgrade()
-            .ok_or_else(|| anyhow!("mux server session owner no longer exists"))?;
+            .ok_or(SessionAuthorityError::Retired)?;
+        let mux = self.mux.upgrade().ok_or(SessionAuthorityError::OwnerGone)?;
         Ok(CurrentSession {
             mux,
             _operation: operation,
         })
     }
 
-    fn capture_current_pane(&self, pane_id: PaneId) -> anyhow::Result<PaneRegistrationHandle> {
+    fn capture_current_pane(
+        &self,
+        pane_id: PaneId,
+    ) -> Result<PaneRegistrationHandle, SessionAuthorityError> {
         self.capture_current_pane_opt(pane_id)?
-            .ok_or_else(|| anyhow!("no such pane {pane_id}"))
+            .ok_or(SessionAuthorityError::PaneNotFound { pane_id })
     }
 
     fn capture_current_pane_opt(
         &self,
         pane_id: PaneId,
-    ) -> anyhow::Result<Option<PaneRegistrationHandle>> {
+    ) -> Result<Option<PaneRegistrationHandle>, SessionAuthorityError> {
         let session = self.acquire()?;
         Ok(session.capture_current_pane(pane_id))
     }
@@ -1512,6 +1529,199 @@ impl Deref for CurrentSession {
 impl CurrentSession {
     fn mux(&self) -> &Arc<Mux> {
         &self.mux
+    }
+}
+
+/// Finite server-side rejection descriptor. The original backend error is
+/// never serialized, logged by the response path, or retained by the client.
+#[derive(Clone, Copy, Debug)]
+struct MuxServerRejection {
+    code: MuxErrorCode,
+    object: Option<MuxErrorObject>,
+    effect: MuxErrorEffect,
+    retry: MuxErrorRetry,
+}
+
+impl std::fmt::Display for MuxServerRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "mux request rejected: {}", self.code.label())
+    }
+}
+
+impl std::error::Error for MuxServerRejection {}
+
+impl MuxServerRejection {
+    const fn not_found(code: MuxErrorCode, kind: MuxErrorObjectKind, id: u64) -> Self {
+        Self {
+            code,
+            object: Some(MuxErrorObject { kind, id }),
+            effect: MuxErrorEffect::NOT_APPLIED,
+            retry: MuxErrorRetry::NEVER,
+        }
+    }
+
+    const fn tab_not_found(tab_id: u64) -> Self {
+        Self::not_found(MuxErrorCode::TAB_NOT_FOUND, MuxErrorObjectKind::TAB, tab_id)
+    }
+
+    const fn window_not_found(window_id: u64) -> Self {
+        Self::not_found(
+            MuxErrorCode::WINDOW_NOT_FOUND,
+            MuxErrorObjectKind::WINDOW,
+            window_id,
+        )
+    }
+
+    const fn domain_not_found(domain_id: Option<u64>) -> Self {
+        Self {
+            code: MuxErrorCode::DOMAIN_NOT_FOUND,
+            object: match domain_id {
+                Some(id) => Some(MuxErrorObject {
+                    kind: MuxErrorObjectKind::DOMAIN,
+                    id,
+                }),
+                None => None,
+            },
+            effect: MuxErrorEffect::NOT_APPLIED,
+            retry: MuxErrorRetry::NEVER,
+        }
+    }
+
+    const fn invalid_request() -> Self {
+        Self {
+            code: MuxErrorCode::INVALID_REQUEST,
+            object: None,
+            effect: MuxErrorEffect::NOT_APPLIED,
+            retry: MuxErrorRetry::NEVER,
+        }
+    }
+
+    #[cfg(test)]
+    const fn policy_rejected() -> Self {
+        Self {
+            code: MuxErrorCode::POLICY_REJECTED,
+            object: None,
+            effect: MuxErrorEffect::NOT_APPLIED,
+            retry: MuxErrorRetry::NEVER,
+        }
+    }
+
+    #[cfg(test)]
+    const fn deadline_exceeded() -> Self {
+        Self {
+            code: MuxErrorCode::DEADLINE_EXCEEDED,
+            object: None,
+            effect: MuxErrorEffect::NOT_APPLIED,
+            retry: MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        }
+    }
+
+    const fn quota_exceeded() -> Self {
+        Self {
+            code: MuxErrorCode::QUOTA_EXCEEDED,
+            object: None,
+            effect: MuxErrorEffect::NOT_APPLIED,
+            retry: MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        }
+    }
+
+    const fn backend_failure() -> Self {
+        Self {
+            code: MuxErrorCode::BACKEND_FAILURE,
+            object: None,
+            effect: MuxErrorEffect::NOT_APPLIED,
+            retry: MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MuxRequestErrorContext {
+    request_ident: u64,
+    object: Option<MuxErrorObject>,
+    may_mutate: bool,
+}
+
+impl MuxRequestErrorContext {
+    fn from_request(request: &Pdu) -> Self {
+        let request_ident = request.wire_spec().map_or(0, |spec| {
+            if spec.producer == PduProducer::Client {
+                spec.ident
+            } else {
+                0
+            }
+        });
+        let object = request.pane_id().and_then(|pane_id| {
+            u64::try_from(pane_id).ok().map(|id| MuxErrorObject {
+                kind: MuxErrorObjectKind::PANE,
+                id,
+            })
+        });
+        let observational = matches!(
+            request,
+            Pdu::Ping(_)
+                | Pdu::ListPanes(_)
+                | Pdu::ListPanesCoherent(_)
+                | Pdu::ListPanesOrderedV1(_)
+                | Pdu::ListPanesTabStacks(_)
+                | Pdu::GetClientList(_)
+                | Pdu::GetCodecVersion(_)
+                | Pdu::GetTlsCreds(_)
+                | Pdu::GetImageCell(_)
+                | Pdu::GetLines(_)
+                | Pdu::GetSemanticZones(_)
+                | Pdu::GetPaneDirection(_)
+                | Pdu::GetPaneRenderableDimensions(_)
+                | Pdu::GetPaneTieredScrollbackStatusesV1(_)
+                | Pdu::GetPaneRenderChanges(_)
+                | Pdu::GetPaneRenderDeliveryV1(_)
+                | Pdu::SearchScrollbackRequest(_)
+        );
+        // Unknown client-produced requests fail closed as potentially
+        // mutating. Known observational requests are the only generic errors
+        // allowed to claim NOT_APPLIED without an explicit typed rejection.
+        let may_mutate = request_ident != 0 && !observational;
+        Self {
+            request_ident,
+            object,
+            may_mutate,
+        }
+    }
+
+    fn response_for_error(self, error: &anyhow::Error) -> ErrorResponse {
+        if self.request_ident == 0 {
+            // A peer sent a server-only/unknown PDU in the request direction.
+            // No other code is valid without an exact client-request identity,
+            // and emitting one would make PDU0 fail its own encode validation.
+            return ErrorResponse::invalid_request(0);
+        }
+        if let Some(rejection) = error.downcast_ref::<MuxServerRejection>() {
+            return ErrorResponse::new(
+                self.request_ident,
+                rejection.code,
+                rejection.object,
+                rejection.effect,
+                rejection.retry,
+            );
+        }
+        if let Some(authority) = error.downcast_ref::<SessionAuthorityError>() {
+            return match authority {
+                SessionAuthorityError::Retired => ErrorResponse::cancelled(self.request_ident),
+                SessionAuthorityError::OwnerGone => {
+                    ErrorResponse::backend_failure(self.request_ident)
+                }
+                SessionAuthorityError::PaneNotFound { pane_id } => u64::try_from(*pane_id)
+                    .map_or_else(
+                        |_| ErrorResponse::invalid_request(self.request_ident),
+                        |pane_id| ErrorResponse::pane_not_found(self.request_ident, pane_id),
+                    ),
+            };
+        }
+        if self.may_mutate {
+            ErrorResponse::indeterminate_mutation(self.request_ident, self.object)
+        } else {
+            ErrorResponse::backend_failure(self.request_ident)
+        }
     }
 }
 
@@ -3712,7 +3922,7 @@ fn push_input_dispatch_changes_after_committed_input(
 }
 
 fn session_mux(authority: &SessionAuthority) -> anyhow::Result<CurrentSession> {
-    authority.acquire()
+    authority.acquire().map_err(Into::into)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5863,12 +6073,21 @@ impl SessionHandler {
         let serial = decoded.serial;
         let authority = self.owner.authority();
         let response_authority = authority.clone();
+        let request_error_context = MuxRequestErrorContext::from_request(&decoded.pdu);
         let send_response = move |result: anyhow::Result<Pdu>| {
             let pdu = match result {
                 Ok(pdu) => pdu,
-                Err(err) => Pdu::ErrorResponse(ErrorResponse {
-                    reason: format!("Error: {err:#}"),
-                }),
+                Err(err) => {
+                    let response = request_error_context.response_for_error(&err);
+                    metrics::counter!(
+                        "mux.server.authoritative_rejection",
+                        "code" => response.code.label(),
+                        "effect" => response.effect.label(),
+                        "retry" => response.retry.label(),
+                    )
+                    .increment(1);
+                    Pdu::ErrorResponse(response)
+                }
             };
             log::trace!("{} processing time {:?}", serial, start.elapsed());
             let _ = response_authority.try_run(|| sender.send_control(DecodedPdu { pdu, serial }));
@@ -5887,7 +6106,8 @@ impl SessionHandler {
             (_, None) => Ok(()),
         };
         if let Err(err) = trace_validation {
-            send_response(Err(err));
+            let _ = err;
+            send_response(Err(MuxServerRejection::invalid_request().into()));
             return;
         }
 
@@ -5936,7 +6156,7 @@ impl SessionHandler {
             match authority.capture_current_pane(pane_id) {
                 Ok(registration) => Some(registration),
                 Err(err) => {
-                    send_response(Err(err));
+                    send_response(Err(err.into()));
                     None
                 }
             }
@@ -5960,7 +6180,7 @@ impl SessionHandler {
                     None
                 }
                 Err(err) => {
-                    send_response(Err(err));
+                    send_response(Err(err.into()));
                     None
                 }
             }
@@ -5970,9 +6190,7 @@ impl SessionHandler {
             Pdu::SendKeyDownTracedV1(traced) => {
                 let (request, trace_context) = traced.into_parts();
                 let Some(admission) = input_trace_authority else {
-                    send_response(Err(anyhow!(
-                        "sampled key input admission authority vanished before dispatch"
-                    )));
+                    send_response(Err(MuxServerRejection::invalid_request().into()));
                     return;
                 };
                 debug_assert_eq!(admission.context(), trace_context);
@@ -6852,7 +7070,8 @@ impl SessionHandler {
 
             Pdu::GetPaneTieredScrollbackStatusesV1(request) => {
                 if let Err(error) = request.validate() {
-                    send_response(Err(error.into()));
+                    let _ = error;
+                    send_response(Err(MuxServerRejection::invalid_request().into()));
                     return;
                 }
                 let queued_at = Instant::now();
@@ -7082,7 +7301,9 @@ impl SessionHandler {
                         move || {
                             let mux = session_mux(&authority)?;
                             if mux.get_window(window_id).is_none() {
-                                return Err(anyhow!("no such window {window_id}"));
+                                let id = u64::try_from(window_id)
+                                    .map_err(|_| MuxServerRejection::invalid_request())?;
+                                return Err(MuxServerRejection::window_not_found(id).into());
                             }
                             mux.set_window_title(window_id, &title);
 
@@ -7099,7 +7320,9 @@ impl SessionHandler {
                         move || {
                             let mux = session_mux(&authority)?;
                             if mux.get_tab(tab_id).is_none() {
-                                return Err(anyhow!("no such tab {tab_id}"));
+                                let id = u64::try_from(tab_id)
+                                    .map_err(|_| MuxServerRejection::invalid_request())?;
+                                return Err(MuxServerRejection::tab_not_found(id).into());
                             }
                             mux.set_tab_title(tab_id, &title);
 
@@ -7278,9 +7501,12 @@ impl SessionHandler {
                         catch(
                             move || {
                                 let mux = session_mux(&authority)?;
-                                let tab = mux
-                                    .get_tab(tab_id)
-                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                let tab = mux.get_tab(tab_id).ok_or_else(|| {
+                                    u64::try_from(tab_id).map_or_else(
+                                        |_| MuxServerRejection::invalid_request(),
+                                        MuxServerRejection::tab_not_found,
+                                    )
+                                })?;
                                 tab.swap_to_layout_index(layout_index);
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             },
@@ -7300,9 +7526,12 @@ impl SessionHandler {
                         catch(
                             move || {
                                 let mux = session_mux(&authority)?;
-                                let tab = mux
-                                    .get_tab(tab_id)
-                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                let tab = mux.get_tab(tab_id).ok_or_else(|| {
+                                    u64::try_from(tab_id).map_or_else(
+                                        |_| MuxServerRejection::invalid_request(),
+                                        MuxServerRejection::tab_not_found,
+                                    )
+                                })?;
                                 // Build layout cycle from named presets
                                 let mut layouts = Vec::new();
                                 for name in &layout_names {
@@ -7311,16 +7540,16 @@ impl SessionHandler {
                                         "main-side" => mux::layout::main_side(),
                                         "stacked" => mux::layout::stacked(),
                                         "main-bottom" => mux::layout::main_bottom(),
-                                        other => {
-                                            return Err(anyhow!("unknown layout preset: {other}"));
+                                        _ => {
+                                            return Err(
+                                                MuxServerRejection::invalid_request().into()
+                                            );
                                         }
                                     };
                                     layouts.push(layout);
                                 }
                                 if layouts.is_empty() {
-                                    return Err(anyhow!(
-                                        "layout cycle must have at least one layout"
-                                    ));
+                                    return Err(MuxServerRejection::invalid_request().into());
                                 }
                                 tab.set_layout_cycle(mux::layout::LayoutCycle::new(layouts));
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
@@ -7342,9 +7571,12 @@ impl SessionHandler {
                         catch(
                             move || {
                                 let mux = session_mux(&authority)?;
-                                let tab = mux
-                                    .get_tab(tab_id)
-                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                let tab = mux.get_tab(tab_id).ok_or_else(|| {
+                                    u64::try_from(tab_id).map_or_else(
+                                        |_| MuxServerRejection::invalid_request(),
+                                        MuxServerRejection::tab_not_found,
+                                    )
+                                })?;
                                 if forward {
                                     tab.cycle_stack(slot_index);
                                 } else {
@@ -7369,18 +7601,14 @@ impl SessionHandler {
                         catch(
                             move || {
                                 let mux = session_mux(&authority)?;
-                                let tab = mux
-                                    .get_tab(tab_id)
-                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                let tab = mux.get_tab(tab_id).ok_or_else(|| {
+                                    u64::try_from(tab_id).map_or_else(
+                                        |_| MuxServerRejection::invalid_request(),
+                                        MuxServerRejection::tab_not_found,
+                                    )
+                                })?;
                                 tab.select_stack_pane(slot_index, pane_index)
-                                    .ok_or_else(|| {
-                                        anyhow!(
-                                            "stack slot {} or pane index {} not found in tab {}",
-                                            slot_index,
-                                            pane_index,
-                                            tab_id
-                                        )
-                                    })?;
+                                    .ok_or_else(MuxServerRejection::invalid_request)?;
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             },
                             send_response,
@@ -7420,19 +7648,14 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::RenderApplicationResult(_) | Pdu::RenderApplicationResultV1(_) => {
-                send_response(Err(anyhow!(
-                    "render-application settlement received before the live delivery \
-                     coordinator was activated for this connection"
-                )));
+                send_response(Err(MuxServerRejection::invalid_request().into()));
             }
             Pdu::GetPaneRenderDeliveryV1(_) => {
-                send_response(Err(anyhow!(
-                    "exact render-delivery request received before its live retention and \
-                     settlement coordinator was activated for this connection"
-                )));
+                send_response(Err(MuxServerRejection::invalid_request().into()));
             }
             Pdu::Invalid { ident } => {
-                send_response(Err(anyhow!("invalid PDU identifier {ident}")));
+                let _ = ident;
+                send_response(Err(MuxServerRejection::invalid_request().into()));
             }
             unexpected @ (Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
@@ -7468,12 +7691,12 @@ impl SessionHandler {
             | Pdu::GetPaneTieredScrollbackStatusesV1Response { .. }
             | Pdu::ReliableKeyEventV1Response { .. }
             | Pdu::ErrorResponse { .. }) => {
-                send_response(Err(anyhow!("expected a request, got {unexpected:?}")));
+                let _ = unexpected;
+                send_response(Err(MuxServerRejection::invalid_request().into()));
             }
             unexpected @ Pdu::TopologyEvent { .. } => {
-                send_response(Err(anyhow!(
-                    "expected a request, got server-unilateral topology event {unexpected:?}",
-                )));
+                let _ = unexpected;
+                send_response(Err(MuxServerRejection::invalid_request().into()));
             }
             Pdu::SendKeyDownTracedV1(_) => unreachable!(
                 "sampled key input is normalized only after exact trace admission validation"
@@ -7573,6 +7796,16 @@ async fn domain_spawn_v2(
     client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
     let mux = session_mux(&authority)?;
+    let domain_object_id = match &spawn.domain {
+        config::keyassignment::SpawnTabDomain::DomainId(domain_id) => {
+            u64::try_from(*domain_id).ok()
+        }
+        config::keyassignment::SpawnTabDomain::DefaultDomain
+        | config::keyassignment::SpawnTabDomain::CurrentPaneDomain
+        | config::keyassignment::SpawnTabDomain::DomainName(_) => None,
+    };
+    mux.resolve_spawn_tab_domain(None, &spawn.domain)
+        .map_err(|_| MuxServerRejection::domain_not_found(domain_object_id))?;
 
     let (tab, pane, window_id) = mux
         .mux()
@@ -7972,7 +8205,13 @@ mod tests {
         let Pdu::ErrorResponse(error) = response.pdu else {
             panic!("saturated key admission must return an ErrorResponse");
         };
-        assert!(error.reason.contains("temporarily full"));
+        assert_eq!(error.request_ident, SendKeyDown::IDENT);
+        assert_eq!(error.code, MuxErrorCode::QUOTA_EXCEEDED);
+        assert_eq!(error.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(error.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+        error
+            .validate()
+            .expect("scheduler rejection must be canonical");
         assert_eq!(executor.queue_snapshot().depth, 1);
         assert_eq!(executor.admission_snapshot().active_tasks, 1);
 
@@ -8637,6 +8876,98 @@ mod tests {
         let mut v = captured.lock().unwrap();
         assert_eq!(v.len(), 1, "expected exactly one response PDU");
         v.remove(0)
+    }
+
+    fn expect_error_response(pdu: &Pdu, request_ident: u64, code: MuxErrorCode) -> &ErrorResponse {
+        let Pdu::ErrorResponse(response) = pdu else {
+            panic!("expected ErrorResponse, got {pdu:?}");
+        };
+        assert_eq!(response.request_ident, request_ident);
+        assert_eq!(response.code, code);
+        response
+            .validate()
+            .expect("server must emit canonical finite rejection authority");
+        response
+    }
+
+    #[test]
+    fn server_rejection_taxonomy_emits_exact_finite_authority() {
+        let read_context = MuxRequestErrorContext {
+            request_ident: Ping::IDENT,
+            object: None,
+            may_mutate: false,
+        };
+        let mutation_context = MuxRequestErrorContext {
+            request_ident: KillPane::IDENT,
+            object: Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::PANE,
+                id: 91,
+            }),
+            may_mutate: true,
+        };
+        let cases = [
+            MuxServerRejection::not_found(
+                MuxErrorCode::PANE_NOT_FOUND,
+                MuxErrorObjectKind::PANE,
+                1,
+            ),
+            MuxServerRejection::tab_not_found(2),
+            MuxServerRejection::window_not_found(3),
+            MuxServerRejection::domain_not_found(Some(4)),
+            MuxServerRejection::invalid_request(),
+            MuxServerRejection::policy_rejected(),
+            MuxServerRejection::deadline_exceeded(),
+            MuxServerRejection::quota_exceeded(),
+            MuxServerRejection::backend_failure(),
+        ];
+
+        for rejection in cases {
+            let response = read_context.response_for_error(&anyhow::Error::new(rejection));
+            assert_eq!(response.request_ident, Ping::IDENT);
+            assert_eq!(response.code, rejection.code);
+            assert_eq!(response.object, rejection.object);
+            assert_eq!(response.effect, rejection.effect);
+            assert_eq!(response.retry, rejection.retry);
+            response.validate().expect("canonical typed rejection");
+        }
+
+        let pane_scoped_policy = mutation_context
+            .response_for_error(&anyhow::Error::new(MuxServerRejection::policy_rejected()));
+        assert_eq!(pane_scoped_policy.code, MuxErrorCode::POLICY_REJECTED);
+        assert_eq!(pane_scoped_policy.object, None);
+        pane_scoped_policy
+            .validate()
+            .expect("policy rejection must not inherit unrelated pane authority");
+
+        let cancelled =
+            read_context.response_for_error(&anyhow::Error::new(SessionAuthorityError::Retired));
+        assert_eq!(cancelled.code, MuxErrorCode::CANCELLED);
+        assert_eq!(cancelled.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(cancelled.retry, MuxErrorRetry::NEVER);
+        cancelled.validate().expect("canonical cancellation");
+
+        let indeterminate = mutation_context.response_for_error(&anyhow!(
+            "credential-bearing backend error that must not cross the wire"
+        ));
+        assert_eq!(indeterminate.code, MuxErrorCode::INDETERMINATE_MUTATION);
+        assert_eq!(indeterminate.object, mutation_context.object);
+        assert_eq!(indeterminate.effect, MuxErrorEffect::INDETERMINATE);
+        assert_eq!(indeterminate.retry, MuxErrorRetry::RECONCILE_BEFORE_RETRY);
+        indeterminate
+            .validate()
+            .expect("canonical indeterminate mutation");
+        assert!(!format!("{indeterminate:?}").contains("credential-bearing"));
+
+        let invalid_direction =
+            MuxRequestErrorContext::from_request(&Pdu::UnitResponse(UnitResponse {}))
+                .response_for_error(&anyhow::Error::new(MuxServerRejection::backend_failure()));
+        assert_eq!(invalid_direction.request_ident, 0);
+        assert_eq!(invalid_direction.code, MuxErrorCode::INVALID_REQUEST);
+        assert_eq!(invalid_direction.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(invalid_direction.retry, MuxErrorRetry::NEVER);
+        invalid_direction
+            .validate()
+            .expect("invalid request direction has canonical zero-identity authority");
     }
 
     fn tick_until_response(
@@ -10564,15 +10895,16 @@ mod tests {
             .expect("register replacement pane");
         tick_until_response(&executor, &captured, 1);
 
-        match take_response(&captured).pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(
-                    reason.contains("no longer current"),
-                    "stale kill should report exact-registration loss, got {reason}"
-                );
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        let response = take_response(&captured);
+        let error =
+            expect_error_response(&response.pdu, KillPane::IDENT, MuxErrorCode::PANE_NOT_FOUND);
+        assert_eq!(
+            error.object,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::PANE,
+                id: u64::try_from(pane_id).expect("test pane id fits protocol object id"),
+            })
+        );
         assert!(
             mux.get_pane(pane_id)
                 .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)),
@@ -10682,15 +11014,20 @@ mod tests {
         });
         tick_until_response(&executor, &captured, 1);
 
-        match take_response(&captured).pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(
-                    reason.contains("client registration is no longer current"),
-                    "stale focus should report exact client-registration loss, got {reason}"
-                );
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        let response = take_response(&captured);
+        let error = expect_error_response(
+            &response.pdu,
+            SetFocusedPane::IDENT,
+            MuxErrorCode::PANE_NOT_FOUND,
+        );
+        assert_eq!(
+            error.object,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::PANE,
+                id: u64::try_from(second_pane.pane_id())
+                    .expect("test pane id fits protocol object id"),
+            })
+        );
         assert_eq!(
             tab.get_active_pane().map(|pane| pane.pane_id()),
             Some(first_pane.pane_id()),
@@ -10742,13 +11079,7 @@ mod tests {
 
         let rejected = take_response(&captured);
         assert_eq!(rejected.serial, 902);
-        match rejected.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => assert!(
-                reason.contains("expected a request"),
-                "forbidden SetClipboard should fail request dispatch, got {reason}"
-            ),
-            other => panic!("expected ErrorResponse for forbidden SetClipboard, got {other:?}"),
-        }
+        expect_error_response(&rejected.pdu, 0, MuxErrorCode::INVALID_REQUEST);
         assert_eq!(
             handler.client_input_activity_updates, 0,
             "a rejected server-unilateral PDU must not refresh client activity"
@@ -10847,12 +11178,11 @@ mod tests {
             Some(stale),
         );
         let rejected = take_response(&captured);
-        match rejected.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(reason.contains("stale connection generation"));
-            }
-            other => panic!("expected stale-generation error, got {other:?}"),
-        }
+        expect_error_response(
+            &rejected.pdu,
+            SendKeyDownTracedV1::IDENT,
+            MuxErrorCode::INVALID_REQUEST,
+        );
         assert_eq!(handler.client_input_activity_updates, 0);
         assert_eq!(pane.key_down_count(), 0);
         assert!(handler.per_pane.is_empty());
@@ -12537,15 +12867,7 @@ mod tests {
 
         let resp = take_response(&captured);
         assert_eq!(resp.serial, 200);
-        match resp.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(
-                    reason.contains("invalid PDU"),
-                    "error should mention invalid PDU, got: {reason}"
-                );
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        expect_error_response(&resp.pdu, 0, MuxErrorCode::INVALID_REQUEST);
     }
 
     #[test]
@@ -12626,14 +12948,11 @@ mod tests {
 
         let response = take_response(&captured);
         assert_eq!(response.serial, 202);
-        match response.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => assert!(
-                reason.contains("live retention and settlement coordinator"),
-                "exact-render request must retain its fail-closed activation reason, got: \
-                 {reason}"
-            ),
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        expect_error_response(
+            &response.pdu,
+            codec::GetPaneRenderDeliveryV1::IDENT,
+            MuxErrorCode::INVALID_REQUEST,
+        );
     }
 
     #[test]
@@ -12656,13 +12975,7 @@ mod tests {
 
         let response = take_response(&captured);
         assert_eq!(response.serial, 203);
-        match response.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => assert!(
-                reason.contains("expected a request"),
-                "exact-render server response must be rejected as client input, got: {reason}"
-            ),
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        expect_error_response(&response.pdu, 0, MuxErrorCode::INVALID_REQUEST);
     }
 
     #[test]
@@ -12678,15 +12991,7 @@ mod tests {
 
         let resp = take_response(&captured);
         assert_eq!(resp.serial, 300);
-        match resp.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(
-                    reason.contains("expected a request"),
-                    "error should mention expected request, got: {reason}"
-                );
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        expect_error_response(&resp.pdu, 0, MuxErrorCode::INVALID_REQUEST);
     }
 
     #[test]
@@ -12700,12 +13005,7 @@ mod tests {
         });
 
         let resp = take_response(&captured);
-        match resp.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(reason.contains("expected a request"));
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        expect_error_response(&resp.pdu, 0, MuxErrorCode::INVALID_REQUEST);
     }
 
     #[test]
@@ -12801,18 +13101,11 @@ mod tests {
 
         handler.process_one(DecodedPdu {
             serial: 400,
-            pdu: Pdu::ErrorResponse(ErrorResponse {
-                reason: "test error".to_string(),
-            }),
+            pdu: Pdu::ErrorResponse(ErrorResponse::backend_failure(Ping::IDENT)),
         });
 
         let resp = take_response(&captured);
-        match resp.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(reason.contains("expected a request"));
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        expect_error_response(&resp.pdu, 0, MuxErrorCode::INVALID_REQUEST);
     }
 
     #[test]
@@ -12831,12 +13124,7 @@ mod tests {
         });
 
         let resp = take_response(&captured);
-        match resp.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(reason.contains("expected a request"));
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        expect_error_response(&resp.pdu, 0, MuxErrorCode::INVALID_REQUEST);
     }
 
     #[test]
@@ -12852,12 +13140,7 @@ mod tests {
         });
 
         let resp = take_response(&captured);
-        match resp.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(reason.contains("expected a request"));
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        expect_error_response(&resp.pdu, 0, MuxErrorCode::INVALID_REQUEST);
     }
 
     fn test_client_id(name: &str, pid: u32) -> ClientId {
@@ -14010,10 +14293,12 @@ mod tests {
                 prop_assert_eq!(response.serial, serial);
                 if expect_workspace_error {
                     match &response.pdu {
-                        Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                        Pdu::ErrorResponse(error) => {
                             prop_assert!(
-                                reason.contains("set active workspace before SetClientId"),
-                                "pre-client workspace update returned wrong error after step {}: {:?}: {reason}",
+                                error.validate().is_ok()
+                                    && error.code == MuxErrorCode::INVALID_REQUEST
+                                    && error.request_ident == SetActiveWorkspace::IDENT,
+                                "pre-client workspace update returned wrong authority after step {}: {:?}: {error:?}",
                                 idx,
                                 op
                             );
@@ -14122,10 +14407,11 @@ mod tests {
                     ) => {
                         prop_assert_eq!(response_pane_id, pane_id);
                     }
-                    (_, Pdu::ErrorResponse(ErrorResponse { reason })) => {
+                    (_, Pdu::ErrorResponse(error)) => {
                         prop_assert!(
-                            reason.contains("no such pane"),
-                            "private-session missing-pane path should report absence for {:?}, got {reason}",
+                            error.validate().is_ok()
+                                && error.code == MuxErrorCode::PANE_NOT_FOUND,
+                            "private-session missing-pane path should report finite absence for {:?}, got {error:?}",
                             op
                         );
                     }
@@ -14182,10 +14468,11 @@ mod tests {
                     ) => {
                         prop_assert_eq!(response_pane_id, pane_id);
                     }
-                    (_, Pdu::ErrorResponse(ErrorResponse { reason })) => {
+                    (_, Pdu::ErrorResponse(error)) => {
                         prop_assert!(
-                            reason.contains("no such pane"),
-                            "present-mux missing-pane path should report missing pane for {:?}, got {reason}",
+                            error.validate().is_ok()
+                                && error.code == MuxErrorCode::PANE_NOT_FOUND,
+                            "present-mux missing-pane path should report finite absence for {:?}, got {error:?}",
                             op
                         );
                     }
@@ -14266,35 +14553,39 @@ mod tests {
                     ) => {
                         prop_assert!(tab_stack_entries.is_empty());
                     }
-                    (request, Pdu::ErrorResponse(ErrorResponse { reason })) => {
+                    (request, Pdu::ErrorResponse(error)) => {
                         let expected = match request {
-                            MissingMuxSessionErrorOp::SetWindowWorkspace { .. } => "window",
-                            MissingMuxSessionErrorOp::WindowTitleChanged { .. } => {
-                                "no such window"
+                            MissingMuxSessionErrorOp::SetWindowWorkspace { .. }
+                            | MissingMuxSessionErrorOp::WindowTitleChanged { .. } => {
+                                MuxErrorCode::WINDOW_NOT_FOUND
                             }
-                            MissingMuxSessionErrorOp::TabTitleChanged { .. } => "no such tab",
+                            MissingMuxSessionErrorOp::TabTitleChanged { .. } => {
+                                MuxErrorCode::TAB_NOT_FOUND
+                            }
                             MissingMuxSessionErrorOp::SetFocusedPane { .. }
                             | MissingMuxSessionErrorOp::SetPaneZoomed { .. }
                             | MissingMuxSessionErrorOp::GetPaneDirection { .. }
                             | MissingMuxSessionErrorOp::ActivatePaneDirection { .. }
                             | MissingMuxSessionErrorOp::GetPaneRenderableDimensions { .. }
                             | MissingMuxSessionErrorOp::GetLines { .. }
-                            | MissingMuxSessionErrorOp::GetImageCell { .. } => "no such pane",
+                            | MissingMuxSessionErrorOp::GetImageCell { .. } => {
+                                MuxErrorCode::PANE_NOT_FOUND
+                            }
                             MissingMuxSessionErrorOp::RenameWorkspace { .. }
                             | MissingMuxSessionErrorOp::GetClientList
                             | MissingMuxSessionErrorOp::ListPanes
                             | MissingMuxSessionErrorOp::ListPanesTabStacks => {
                                 prop_assert!(
                                     false,
-                                    "successful empty-session request returned ErrorResponse: {:?}: {reason}",
+                                    "successful empty-session request returned ErrorResponse: {:?}: {error:?}",
                                     request
                                 );
-                                ""
+                                MuxErrorCode::INVALID_REQUEST
                             }
                         };
                         prop_assert!(
-                            reason.contains(expected),
-                            "empty private-session path returned wrong error for {:?}: {reason}",
+                            error.validate().is_ok() && error.code == expected,
+                            "empty private-session path returned wrong authority for {:?}: {error:?}",
                             request
                         );
                     }
@@ -14752,14 +15043,13 @@ mod tests {
     fn catch_helper_forwards_ok() {
         let (sender, captured) = capturing_sender();
         let serial = 700;
+        let error_context = MuxRequestErrorContext::from_request(&Pdu::Ping(Ping {}));
         let send_response = {
             let sender = sender.clone();
             move |result: anyhow::Result<Pdu>| {
                 let pdu = match result {
                     Ok(pdu) => pdu,
-                    Err(err) => Pdu::ErrorResponse(ErrorResponse {
-                        reason: format!("{err:#}"),
-                    }),
+                    Err(err) => Pdu::ErrorResponse(error_context.response_for_error(&err)),
                 };
                 sender.send_control(DecodedPdu { pdu, serial }).ok();
             }
@@ -14783,14 +15073,13 @@ mod tests {
     fn catch_helper_forwards_error() {
         let (sender, captured) = capturing_sender();
         let serial = 701;
+        let error_context = MuxRequestErrorContext::from_request(&Pdu::Ping(Ping {}));
         let send_response = {
             let sender = sender.clone();
             move |result: anyhow::Result<Pdu>| {
                 let pdu = match result {
                     Ok(pdu) => pdu,
-                    Err(err) => Pdu::ErrorResponse(ErrorResponse {
-                        reason: format!("{err:#}"),
-                    }),
+                    Err(err) => Pdu::ErrorResponse(error_context.response_for_error(&err)),
                 };
                 sender.send_control(DecodedPdu { pdu, serial }).ok();
             }
@@ -14807,15 +15096,13 @@ mod tests {
         catch(|| anyhow::bail!("something went wrong"), send_response);
 
         let resp = take_response(&captured);
-        match resp.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(
-                    reason.contains("something went wrong"),
-                    "error should propagate message, got: {reason}"
-                );
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
+        let error = expect_error_response(&resp.pdu, Ping::IDENT, MuxErrorCode::BACKEND_FAILURE);
+        assert_eq!(error.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(error.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+        assert!(
+            !format!("{error:?}").contains("something went wrong"),
+            "arbitrary backend text must not enter the wire envelope"
+        );
     }
 
     #[test]

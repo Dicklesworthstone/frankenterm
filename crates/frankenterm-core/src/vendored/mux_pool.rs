@@ -2342,7 +2342,9 @@ mod tests {
             DirectMuxError::DuplicateRenderBatchPane { pane_id: 7 },
         )));
         assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
-            DirectMuxError::RemoteError("transient".to_string()),
+            DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(
+                <codec::ListPanes as codec::PduWireIdent>::IDENT,
+            )),
         )));
         assert!(!should_fallback_render_batch(&MuxPoolError::Mux(
             DirectMuxError::Cancelled {
@@ -2410,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_error_is_not_retried_and_reuses_aligned_connection() {
+    fn remote_rejection_is_not_retried_and_reuses_aligned_connection() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server(&temp_dir).await;
@@ -2436,14 +2438,18 @@ mod tests {
                     let op_invocations = Arc::clone(&op_invocations);
                     Box::pin(async move {
                         op_invocations.fetch_add(1, AtomicOrdering::Relaxed);
-                        Err::<(), _>(DirectMuxError::RemoteError("request rejected".to_string()))
+                        Err::<(), _>(DirectMuxError::RemoteRejection(
+                            codec::ErrorResponse::policy_rejected(
+                                <codec::ListPanes as codec::PduWireIdent>::IDENT,
+                            ),
+                        ))
                     })
                 })
                 .await
                 .expect_err("remote application error must be returned");
             assert!(matches!(
                 error,
-                MuxPoolError::Mux(DirectMuxError::RemoteError(_))
+                MuxPoolError::Mux(DirectMuxError::RemoteRejection(_))
             ));
             assert_eq!(
                 invocations.load(AtomicOrdering::Relaxed),

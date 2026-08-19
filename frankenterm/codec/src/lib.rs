@@ -16,7 +16,7 @@
 // so mixed graphs must keep the canonical runtime's I/O traits. A smol-only
 // consumer still receives the legacy smol API.
 
-use anyhow::{bail, Context as _, Error};
+use anyhow::{Context as _, Error, anyhow, bail};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 pub use frankenterm_core_audit_types::interaction_flight_recorder_v1::SampledTraceContextV1;
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
@@ -101,7 +101,7 @@ pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize;
 /// range-checked, the chunk cache is capped, and reconstructed output is capped
 /// at [`MAX_PDU_SIZE`].
 pub mod cdc_dedup {
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
     use std::collections::HashMap;
     use std::convert::TryFrom;
 
@@ -3355,6 +3355,12 @@ macro_rules! pdu_capability_use {
 }
 
 macro_rules! pdu_encoded_body_limit {
+    (ErrorResponse, none) => {
+        PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
+            max_decompressed_bytes: MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES,
+            max_zstd_encoded_bytes: MAX_MUX_ERROR_RESPONSE_ZSTD_ENCODED_BYTES,
+        }
+    };
     (ReliableKeyEventV1, none) => {
         PduEncodedBodyLimit::SchemaDecompressedWithZstdBound {
             max_decompressed_bytes: MAX_RELIABLE_KEY_EVENT_V1_DECOMPRESSED_BYTES,
@@ -4133,7 +4139,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 60;
+pub const CODEC_VERSION: usize = 61;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -4157,7 +4163,7 @@ pub const CODEC_VERSION: usize = 60;
 /// at handshake time for the full release cycle before the bump. The CI
 /// guard `scripts/check_codec_version_release_notes.sh` (ft-8smkj) blocks
 /// silent advances.
-pub const CODEC_VERSION_MIN_SUPPORTED: usize = 58;
+pub const CODEC_VERSION_MIN_SUPPORTED: usize = 61;
 
 /// Outcome of [`check_compat`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4241,7 +4247,7 @@ pub fn check_compat(
 // This allows removal of obsolete structs,
 // and defining newer structs as the protocol evolves.
 pdu! {
-    ErrorResponse: 0, 46, server_reply, none,
+    ErrorResponse: 0, 61, server_reply, none,
         inherit_request, inherit_request, inherit_request;
     Ping: 1, 46, client_request, none,
         connection_control, control, control;
@@ -4443,6 +4449,7 @@ impl Pdu {
     #[inline]
     fn validate_before_encode(&self) -> Result<(), Error> {
         match self {
+            Self::ErrorResponse(value) => value.validate()?,
             Self::ListPanesOrderedV1(value) => value.validate()?,
             Self::ListPanesOrderedV1Response(value) => value.validate()?,
             Self::ReorderWindowTabsV1(value) => value.validate()?,
@@ -4868,9 +4875,415 @@ impl Pdu {
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct UnitResponse {}
 
+/// Wire schema for one bounded, content-free mux rejection.
+pub const MUX_ERROR_RESPONSE_SCHEMA_V1: u8 = 1;
+
+/// Maximum decoded body size for PDU0.
+///
+/// The schema is fixed-width apart from one optional fixed-width object
+/// identity. Keeping a little explicit headroom makes the ceiling independent
+/// of varbincode implementation details while preventing a malformed response
+/// from consuming the generic multi-megabyte body allowance.
+pub const MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES: usize = 128;
+pub const MAX_MUX_ERROR_RESPONSE_ZSTD_ENCODED_BYTES: usize = 256;
+
+/// Stable numeric mux rejection code.
+///
+/// Unknown values deliberately remain representable after decoding so a
+/// future peer cannot desynchronize the length-delimited stream. Consumers
+/// must fail closed when [`Self::label`] returns `"unknown"`; local producers
+/// are prevented from emitting unknown values by [`ErrorResponse::validate`].
+#[derive(Deserialize, Serialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[serde(transparent)]
+pub struct MuxErrorCode(pub u16);
+
+impl MuxErrorCode {
+    pub const PANE_NOT_FOUND: Self = Self(1);
+    pub const TAB_NOT_FOUND: Self = Self(2);
+    pub const WINDOW_NOT_FOUND: Self = Self(3);
+    pub const DOMAIN_NOT_FOUND: Self = Self(4);
+    pub const INVALID_REQUEST: Self = Self(5);
+    pub const POLICY_REJECTED: Self = Self(6);
+    pub const CANCELLED: Self = Self(7);
+    pub const DEADLINE_EXCEEDED: Self = Self(8);
+    pub const QUOTA_EXCEEDED: Self = Self(9);
+    pub const BACKEND_FAILURE: Self = Self(10);
+    pub const INDETERMINATE_MUTATION: Self = Self(11);
+
+    #[must_use]
+    pub const fn is_known(self) -> bool {
+        matches!(self.0, 1..=11)
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self.0 {
+            1 => "pane_not_found",
+            2 => "tab_not_found",
+            3 => "window_not_found",
+            4 => "domain_not_found",
+            5 => "invalid_request",
+            6 => "policy_rejected",
+            7 => "cancelled",
+            8 => "deadline_exceeded",
+            9 => "quota_exceeded",
+            10 => "backend_failure",
+            11 => "indeterminate_mutation",
+            _ => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Debug for MuxErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// Stable kind tag for the optional authority object carried by a rejection.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[serde(transparent)]
+pub struct MuxErrorObjectKind(pub u8);
+
+impl MuxErrorObjectKind {
+    pub const PANE: Self = Self(1);
+    pub const TAB: Self = Self(2);
+    pub const WINDOW: Self = Self(3);
+    pub const DOMAIN: Self = Self(4);
+
+    #[must_use]
+    pub const fn is_known(self) -> bool {
+        matches!(self.0, 1..=4)
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self.0 {
+            1 => "pane",
+            2 => "tab",
+            3 => "window",
+            4 => "domain",
+            _ => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Debug for MuxErrorObjectKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// Optional typed mux object identity. No title, domain name, pane text, path,
+/// or backend diagnostic can enter this fixed-shape structure.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Hash, Debug, Clone, Copy)]
+pub struct MuxErrorObject {
+    pub kind: MuxErrorObjectKind,
+    pub id: u64,
+}
+
+/// Server authority over whether a rejected operation may have changed mux
+/// state.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[serde(transparent)]
+pub struct MuxErrorEffect(pub u8);
+
+impl MuxErrorEffect {
+    pub const NOT_APPLIED: Self = Self(1);
+    pub const INDETERMINATE: Self = Self(2);
+
+    #[must_use]
+    pub const fn is_known(self) -> bool {
+        matches!(self.0, 1 | 2)
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self.0 {
+            1 => "not_applied",
+            2 => "indeterminate",
+            _ => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Debug for MuxErrorEffect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// Server authority over automatic replay of a rejected operation.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[serde(transparent)]
+pub struct MuxErrorRetry(pub u8);
+
+impl MuxErrorRetry {
+    pub const NEVER: Self = Self(1);
+    pub const SAFE_AFTER_BACKOFF: Self = Self(2);
+    pub const RECONCILE_BEFORE_RETRY: Self = Self(3);
+
+    #[must_use]
+    pub const fn is_known(self) -> bool {
+        matches!(self.0, 1..=3)
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self.0 {
+            1 => "never",
+            2 => "safe_after_backoff",
+            3 => "reconcile_before_retry",
+            _ => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Debug for MuxErrorRetry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ErrorResponse {
-    pub reason: String,
+    pub schema_version: u8,
+    /// Exact stable PDU identifier of the rejected request. Zero means that a
+    /// valid request identity could not be established.
+    pub request_ident: u64,
+    pub code: MuxErrorCode,
+    pub object: Option<MuxErrorObject>,
+    pub effect: MuxErrorEffect,
+    pub retry: MuxErrorRetry,
+}
+
+impl ErrorResponse {
+    #[must_use]
+    pub const fn new(
+        request_ident: u64,
+        code: MuxErrorCode,
+        object: Option<MuxErrorObject>,
+        effect: MuxErrorEffect,
+        retry: MuxErrorRetry,
+    ) -> Self {
+        Self {
+            schema_version: MUX_ERROR_RESPONSE_SCHEMA_V1,
+            request_ident,
+            code,
+            object,
+            effect,
+            retry,
+        }
+    }
+
+    #[must_use]
+    pub const fn pane_not_found(request_ident: u64, pane_id: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::PANE_NOT_FOUND,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::PANE,
+                id: pane_id,
+            }),
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        )
+    }
+
+    #[must_use]
+    pub const fn tab_not_found(request_ident: u64, tab_id: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::TAB_NOT_FOUND,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::TAB,
+                id: tab_id,
+            }),
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        )
+    }
+
+    #[must_use]
+    pub const fn window_not_found(request_ident: u64, window_id: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::WINDOW_NOT_FOUND,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::WINDOW,
+                id: window_id,
+            }),
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        )
+    }
+
+    #[must_use]
+    pub const fn domain_not_found(request_ident: u64, domain_id: Option<u64>) -> Self {
+        let object = match domain_id {
+            Some(id) => Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::DOMAIN,
+                id,
+            }),
+            None => None,
+        };
+        Self::new(
+            request_ident,
+            MuxErrorCode::DOMAIN_NOT_FOUND,
+            object,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        )
+    }
+
+    #[must_use]
+    pub const fn invalid_request(request_ident: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::INVALID_REQUEST,
+            None,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        )
+    }
+
+    #[must_use]
+    pub const fn policy_rejected(request_ident: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::POLICY_REJECTED,
+            None,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        )
+    }
+
+    #[must_use]
+    pub const fn cancelled(request_ident: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::CANCELLED,
+            None,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        )
+    }
+
+    #[must_use]
+    pub const fn deadline_exceeded(request_ident: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::DEADLINE_EXCEEDED,
+            None,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        )
+    }
+
+    #[must_use]
+    pub const fn quota_exceeded(request_ident: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::QUOTA_EXCEEDED,
+            None,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        )
+    }
+
+    #[must_use]
+    pub const fn backend_failure(request_ident: u64) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::BACKEND_FAILURE,
+            None,
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        )
+    }
+
+    #[must_use]
+    pub const fn indeterminate_mutation(
+        request_ident: u64,
+        object: Option<MuxErrorObject>,
+    ) -> Self {
+        Self::new(
+            request_ident,
+            MuxErrorCode::INDETERMINATE_MUTATION,
+            object,
+            MuxErrorEffect::INDETERMINATE,
+            MuxErrorRetry::RECONCILE_BEFORE_RETRY,
+        )
+    }
+
+    /// Whether every authority-bearing numeric field is understood locally.
+    /// Unknown future values remain framed and decoded but may never authorize
+    /// retry, continuation, or a claim that no mutation occurred.
+    #[must_use]
+    pub fn has_known_authority(&self) -> bool {
+        self.schema_version == MUX_ERROR_RESPONSE_SCHEMA_V1
+            && self.code.is_known()
+            && self.effect.is_known()
+            && self.retry.is_known()
+            && self.object.is_none_or(|object| object.kind.is_known())
+    }
+
+    /// Validate a locally produced envelope before serialization.
+    pub fn validate(&self) -> Result<(), Error> {
+        if !self.has_known_authority() {
+            bail!("mux error response contains unknown authority");
+        }
+        if self.request_ident == 0 {
+            if self.code != MuxErrorCode::INVALID_REQUEST {
+                bail!("mux error response lacks a request identity");
+            }
+        } else {
+            let request = Pdu::wire_spec_for_ident(self.request_ident)
+                .ok_or_else(|| anyhow!("mux error response names an unknown request"))?;
+            if request.producer != PduProducer::Client {
+                bail!("mux error response does not name a client request");
+            }
+        }
+        let object_is_valid = if self.code == MuxErrorCode::PANE_NOT_FOUND {
+            self.object.map(|object| object.kind) == Some(MuxErrorObjectKind::PANE)
+        } else if self.code == MuxErrorCode::TAB_NOT_FOUND {
+            self.object.map(|object| object.kind) == Some(MuxErrorObjectKind::TAB)
+        } else if self.code == MuxErrorCode::WINDOW_NOT_FOUND {
+            self.object.map(|object| object.kind) == Some(MuxErrorObjectKind::WINDOW)
+        } else if self.code == MuxErrorCode::DOMAIN_NOT_FOUND {
+            // A missing default or named domain has no stable numeric identity
+            // to place on the wire, so the domain object is optional.
+            self.object
+                .is_none_or(|object| object.kind == MuxErrorObjectKind::DOMAIN)
+        } else if self.code == MuxErrorCode::INDETERMINATE_MUTATION {
+            // The object is optional for a mutation whose exact affected
+            // resource could not be established before response loss.
+            true
+        } else {
+            self.object.is_none()
+        };
+        if !object_is_valid {
+            bail!("mux error response contains contradictory object authority");
+        }
+        let authority_is_valid = if self.code == MuxErrorCode::INDETERMINATE_MUTATION {
+            self.effect == MuxErrorEffect::INDETERMINATE
+                && self.retry == MuxErrorRetry::RECONCILE_BEFORE_RETRY
+        } else if matches!(
+            self.code,
+            MuxErrorCode::DEADLINE_EXCEEDED
+                | MuxErrorCode::QUOTA_EXCEEDED
+                | MuxErrorCode::BACKEND_FAILURE
+        ) {
+            self.effect == MuxErrorEffect::NOT_APPLIED
+                && self.retry == MuxErrorRetry::SAFE_AFTER_BACKOFF
+        } else {
+            self.effect == MuxErrorEffect::NOT_APPLIED && self.retry == MuxErrorRetry::NEVER
+        };
+        if !authority_is_valid {
+            bail!("mux error response contains contradictory effect or retry authority");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -7229,8 +7642,7 @@ fn flatten_ordered_panes(
         if matches!(tree, PaneNode::Empty) {
             return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                 tree_index,
-                detail:
-                    "ordered pane snapshots cannot recreate an empty tab without size authority",
+                detail: "ordered pane snapshots cannot recreate an empty tab without size authority",
             });
         }
 
@@ -7598,8 +8010,7 @@ pub fn validate_ordered_pane_arena(panes: &PaneArena) -> Result<(), OrderedWindo
             (None, 0) => {
                 return Err(OrderedWindowProtocolError::InvalidPaneTreeDescriptor {
                     tree_index,
-                    detail:
-                        "ordered pane snapshots cannot recreate an empty tab without size authority",
+                    detail: "ordered pane snapshots cannot recreate an empty tab without size authority",
                 });
             }
             (None, _) => {
@@ -14103,9 +14514,11 @@ mod test {
         reset_test_bounded_serialize_growth_events();
         let error = serialize_uncompressed_bounded(&payload, payload.len() - 1, 92, 87)
             .expect_err("an over-limit payload must fail before exceeding its ceiling");
-        assert!(error
-            .downcast_ref::<PduEncodedBodyLimitExceeded>()
-            .is_some());
+        assert!(
+            error
+                .downcast_ref::<PduEncodedBodyLimitExceeded>()
+                .is_some()
+        );
     }
 
     #[test]
@@ -14339,23 +14752,29 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_true_variants() {
-        assert!(Pdu::WriteToPane(WriteToPane {
-            pane_id: 0,
-            data: vec![]
-        })
-        .is_user_input());
-        assert!(Pdu::SendPaste(SendPaste {
-            pane_id: 0,
-            data: String::new(),
-            input_serial: InputSerial::empty(),
-        })
-        .is_user_input());
-        assert!(Pdu::Resize(Resize {
-            containing_tab_id: 0,
-            pane_id: 0,
-            size: TerminalSize::default(),
-        })
-        .is_user_input());
+        assert!(
+            Pdu::WriteToPane(WriteToPane {
+                pane_id: 0,
+                data: vec![]
+            })
+            .is_user_input()
+        );
+        assert!(
+            Pdu::SendPaste(SendPaste {
+                pane_id: 0,
+                data: String::new(),
+                input_serial: InputSerial::empty(),
+            })
+            .is_user_input()
+        );
+        assert!(
+            Pdu::Resize(Resize {
+                containing_tab_id: 0,
+                pane_id: 0,
+                size: TerminalSize::default(),
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -14384,7 +14803,7 @@ mod test {
             "UnitResponse"
         );
         assert_eq!(
-            Pdu::ErrorResponse(ErrorResponse { reason: "x".into() }).pdu_name(),
+            Pdu::ErrorResponse(ErrorResponse::backend_failure(ListPanes::IDENT)).pdu_name(),
             "ErrorResponse"
         );
     }
@@ -14420,9 +14839,7 @@ mod test {
     #[test]
     fn pdu_roundtrip_error_response() {
         let mut buf = Vec::new();
-        let pdu = Pdu::ErrorResponse(ErrorResponse {
-            reason: "something went wrong".into(),
-        });
+        let pdu = Pdu::ErrorResponse(ErrorResponse::pane_not_found(GetLines::IDENT, 42));
         pdu.encode(&mut buf, 100).unwrap();
         let decoded = Pdu::decode(buf.as_slice()).unwrap();
         assert_eq!(decoded.serial, 100);
@@ -15319,8 +15736,10 @@ mod test {
                 }
             )
         );
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1)
+        );
         assert_eq!(EXACT_RENDER_DELIVERY_V1_MIN_CODEC_VERSION, 52);
         assert!(!codec_version_supports_exact_render_delivery_v1(51));
         assert!(codec_version_supports_exact_render_delivery_v1(52));
@@ -17490,7 +17909,9 @@ mod test {
         let shorter_error =
             ensure_exact_render_canonical_payload(&value, &canonical_shorter, "test")
                 .expect_err("canonical serialization shorter than payload must fail");
-        assert!(format!("{shorter_error:#}").contains("canonical serialization is 1 bytes shorter"));
+        assert!(
+            format!("{shorter_error:#}").contains("canonical serialization is 1 bytes shorter")
+        );
     }
 
     #[test]
@@ -17898,12 +18319,14 @@ mod test {
         let error = Pdu::ListPanesOrderedV1Response(malformed)
             .encode_frame(0x872)
             .expect_err("ordinary public encoding must also reject the malformed arena");
-        assert!(error
-            .downcast_ref::<OrderedWindowProtocolError>()
-            .is_some_and(|error| matches!(
-                error,
-                OrderedWindowProtocolError::PaneArenaCardinalityMismatch { .. }
-            )));
+        assert!(
+            error
+                .downcast_ref::<OrderedWindowProtocolError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    OrderedWindowProtocolError::PaneArenaCardinalityMismatch { .. }
+                ))
+        );
         assert_eq!(
             debug_ordered_snapshot_validation_passes(),
             OrderedSnapshotValidationPasses {
@@ -18852,10 +19275,12 @@ mod test {
         assert_eq!(actual.session_incarnation, expected.session_incarnation);
         assert_eq!(actual.topology_revision, expected.topology_revision);
         assert_eq!(actual.panes, expected.panes);
-        assert!(actual
-            .ordered_windows
-            .iter()
-            .eq(expected.ordered_windows.iter()));
+        assert!(
+            actual
+                .ordered_windows
+                .iter()
+                .eq(expected.ordered_windows.iter())
+        );
     }
 
     #[test]
@@ -19469,9 +19894,9 @@ mod test {
     }
 
     #[test]
-    fn codec_v60_adds_reliable_input_and_retains_atomic_v58_minimum() {
-        assert_eq!(CODEC_VERSION, 60);
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 58);
+    fn codec_v61_rejection_schema_requires_atomic_redeploy_after_additive_v60() {
+        assert_eq!(CODEC_VERSION, 61);
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
         assert_eq!(ORDERED_WINDOW_V1_MIN_CODEC_VERSION, 54);
         assert!(!codec_version_supports_ordered_window_v1(50));
         assert!(!codec_version_supports_ordered_window_v1(51));
@@ -19491,7 +19916,15 @@ mod test {
         assert_eq!(
             check_compat(60, 58, 58, 58),
             Ok(CompatDecision::Compatible { agreed: 58 }),
-            "additive traced and reliable input PDUs must preserve the v58 compatibility window"
+            "historical v60 additive PDUs preserved the v58 compatibility window"
+        );
+        assert!(
+            check_compat(61, 61, 60, 58).is_err(),
+            "the fixed-shape PDU0 schema change requires an atomic v61 redeploy"
+        );
+        assert_eq!(
+            check_compat(61, 61, 61, 61),
+            Ok(CompatDecision::Compatible { agreed: 61 })
         );
         assert_eq!(<ListPanesCoherent as PduWireIdent>::IDENT, 81);
         assert_eq!(<RenderApplicationResult as PduWireIdent>::IDENT, 85);
@@ -20557,17 +20990,19 @@ mod test {
 
     #[test]
     fn reliable_key_event_is_classified_as_user_input() {
-        assert!(Pdu::ReliableKeyEventV1(ReliableKeyEventV1 {
-            pane_id: 7,
-            pane_registration: None,
-            event: termwiz::input::KeyEvent {
-                key: termwiz::input::KeyCode::Char('x'),
-                modifiers: termwiz::input::Modifiers::NONE,
-            },
-            input_serial: InputSerial::from_millis_since_epoch(1),
-            kind: ReliableKeyEventKindV1::KeyDown,
-        })
-        .is_user_input());
+        assert!(
+            Pdu::ReliableKeyEventV1(ReliableKeyEventV1 {
+                pane_id: 7,
+                pane_registration: None,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(1),
+                kind: ReliableKeyEventKindV1::KeyDown,
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -20845,7 +21280,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 60);
+        assert_eq!(CODEC_VERSION, 61);
     }
 
     #[test]
@@ -21769,9 +22204,9 @@ mod test {
 
     #[test]
     fn generic_response_plan_inherits_correlated_request_metadata() {
-        let pdu = Pdu::ErrorResponse(ErrorResponse {
-            reason: "bounded failure".to_string(),
-        });
+        let pdu = Pdu::ErrorResponse(ErrorResponse::quota_exceeded(
+            GetPaneTieredScrollbackStatusesV1::IDENT,
+        ));
         let request = <GetPaneTieredScrollbackStatusesV1 as PduWireIdent>::WIRE_SPEC;
         let plan = pdu
             .plan_outbound(
@@ -21982,9 +22417,7 @@ mod test {
                 None,
             ),
             (
-                Pdu::ErrorResponse(ErrorResponse {
-                    reason: large.clone(),
-                }),
+                Pdu::ErrorResponse(ErrorResponse::backend_failure(RenameWorkspace::IDENT)),
                 PduProducer::Server,
                 PduWireRole::CorrelatedReply,
                 Some(<RenameWorkspace as PduWireIdent>::WIRE_SPEC),
@@ -22259,12 +22692,18 @@ mod test {
         }
 
         assert_eq!(TopologyCapabilities::SERVER_SUPPORTED, fenced);
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1));
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1));
-        assert!(!TopologyCapabilities::SERVER_SUPPORTED
-            .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1));
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::ORDERED_WINDOW_STREAM_V1)
+        );
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::WINDOW_REORDER_CAS_V1)
+        );
+        assert!(
+            !TopologyCapabilities::SERVER_SUPPORTED
+                .contains(TopologyCapabilities::EXACT_RENDER_DELIVERY_V1)
+        );
     }
 
     #[test]
@@ -22318,13 +22757,13 @@ mod test {
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
 
     #[test]
-    fn check_compat_current_build_retains_atomic_v58_minimum_through_additive_v60() {
-        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 58);
-        assert_eq!(CODEC_VERSION, 60);
-        assert!(check_compat(58, 58, 57, 56).is_err());
+    fn check_compat_current_build_requires_atomic_v61_error_schema() {
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 61);
+        assert_eq!(CODEC_VERSION, 61);
+        assert!(check_compat(61, 61, 60, 58).is_err());
         assert_eq!(
-            check_compat(60, 58, 58, 58),
-            Ok(CompatDecision::Compatible { agreed: 58 })
+            check_compat(61, 61, 61, 61),
+            Ok(CompatDecision::Compatible { agreed: 61 })
         );
     }
 
@@ -22483,12 +22922,146 @@ mod test {
 
     #[test]
     fn error_response_construction() {
-        let err = ErrorResponse {
-            reason: "test error".into(),
-        };
-        assert_eq!(err.reason, "test error");
+        let err = ErrorResponse::pane_not_found(GetLines::IDENT, 17);
+        assert_eq!(err.schema_version, MUX_ERROR_RESPONSE_SCHEMA_V1);
+        assert_eq!(err.request_ident, GetLines::IDENT);
+        assert_eq!(err.code, MuxErrorCode::PANE_NOT_FOUND);
+        assert_eq!(
+            err.object,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::PANE,
+                id: 17,
+            })
+        );
+        assert_eq!(err.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(err.retry, MuxErrorRetry::NEVER);
         let clone_check = format!("{:?}", err);
-        assert!(clone_check.contains("test error"));
+        assert!(clone_check.contains("pane_not_found"));
+        assert!(!clone_check.contains("reason"));
+    }
+
+    #[test]
+    fn mux_error_response_v1_codes_have_exact_finite_authority() {
+        let request = GetLines::IDENT;
+        let cases = [
+            ErrorResponse::pane_not_found(request, 7),
+            ErrorResponse::tab_not_found(request, 8),
+            ErrorResponse::window_not_found(request, 9),
+            ErrorResponse::domain_not_found(request, Some(10)),
+            ErrorResponse::domain_not_found(request, None),
+            ErrorResponse::invalid_request(request),
+            ErrorResponse::policy_rejected(request),
+            ErrorResponse::cancelled(request),
+            ErrorResponse::deadline_exceeded(request),
+            ErrorResponse::quota_exceeded(request),
+            ErrorResponse::backend_failure(request),
+            ErrorResponse::indeterminate_mutation(
+                request,
+                Some(MuxErrorObject {
+                    kind: MuxErrorObjectKind::PANE,
+                    id: 7,
+                }),
+            ),
+        ];
+
+        for response in cases {
+            response
+                .validate()
+                .expect("canonical authority must validate");
+            let pdu = Pdu::ErrorResponse(response.clone());
+            let frame = pdu
+                .encode_frame_with_mode(31, CompressionMode::Never)
+                .expect("canonical authority must encode");
+            let decoded = Pdu::decode(frame.as_slice()).expect("canonical authority must decode");
+            assert_eq!(decoded.serial, 31);
+            assert_eq!(decoded.pdu, pdu);
+        }
+    }
+
+    #[test]
+    fn mux_error_response_rejects_contradictory_local_authority() {
+        let contradictory = ErrorResponse::new(
+            GetLines::IDENT,
+            MuxErrorCode::PANE_NOT_FOUND,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::TAB,
+                id: 7,
+            }),
+            MuxErrorEffect::INDETERMINATE,
+            MuxErrorRetry::SAFE_AFTER_BACKOFF,
+        );
+        assert!(contradictory.validate().is_err());
+        assert!(
+            Pdu::ErrorResponse(contradictory)
+                .encode_frame_with_mode(1, CompressionMode::Never)
+                .is_err(),
+            "contradictory local authority must fail before serialization"
+        );
+
+        let unrelated_object = ErrorResponse::new(
+            GetLines::IDENT,
+            MuxErrorCode::POLICY_REJECTED,
+            Some(MuxErrorObject {
+                kind: MuxErrorObjectKind::PANE,
+                id: 7,
+            }),
+            MuxErrorEffect::NOT_APPLIED,
+            MuxErrorRetry::NEVER,
+        );
+        assert!(unrelated_object.validate().is_err());
+        assert!(
+            Pdu::ErrorResponse(unrelated_object)
+                .encode_frame_with_mode(2, CompressionMode::Never)
+                .is_err(),
+            "a code without object authority must not smuggle an object identity"
+        );
+    }
+
+    #[test]
+    fn unknown_future_mux_error_remains_aligned_but_has_no_authority() {
+        let future = ErrorResponse::new(
+            GetLines::IDENT,
+            MuxErrorCode(250),
+            None,
+            MuxErrorEffect(251),
+            MuxErrorRetry(252),
+        );
+        let payload = serialize_uncompressed(&future).expect("serialize opaque future fixture");
+        let mut wire = Vec::new();
+        encode_raw(ErrorResponse::IDENT, 41, &payload, false, &mut wire)
+            .expect("encode opaque future response");
+        Pdu::Ping(Ping {})
+            .encode(&mut wire, 42)
+            .expect("encode aligned successor");
+
+        let mut reader = std::io::Cursor::new(wire);
+        let decoded = Pdu::decode(&mut reader).expect("future response must remain decodable");
+        let Pdu::ErrorResponse(decoded_future) = decoded.pdu else {
+            panic!("future response decoded as wrong PDU");
+        };
+        assert_eq!(decoded.serial, 41);
+        assert!(!decoded_future.has_known_authority());
+        assert!(decoded_future.validate().is_err());
+
+        let successor = Pdu::decode(&mut reader).expect("successor frame must remain aligned");
+        assert_eq!(successor.serial, 42);
+        assert_eq!(successor.pdu, Pdu::Ping(Ping {}));
+    }
+
+    #[test]
+    fn mux_error_debug_and_wire_cannot_carry_backend_text() {
+        let canary = "SECRET_REMOTE_STDERR_CANARY";
+        let response = ErrorResponse::backend_failure(ListPanes::IDENT);
+        let debug = format!("{response:?}");
+        let frame = Pdu::ErrorResponse(response)
+            .encode_frame_with_mode(5, CompressionMode::Never)
+            .expect("finite response must encode");
+        assert!(!debug.contains(canary));
+        assert!(
+            !frame
+                .windows(canary.len())
+                .any(|bytes| bytes == canary.as_bytes())
+        );
     }
 
     #[test]
@@ -23253,12 +23826,14 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_set_pane_zoomed() {
-        assert!(Pdu::SetPaneZoomed(SetPaneZoomed {
-            containing_tab_id: 0,
-            pane_id: 0,
-            zoomed: true,
-        })
-        .is_user_input());
+        assert!(
+            Pdu::SetPaneZoomed(SetPaneZoomed {
+                containing_tab_id: 0,
+                pane_id: 0,
+                zoomed: true,
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -23268,12 +23843,14 @@ mod test {
 
     #[test]
     fn server_unilateral_clipboard_is_not_client_input() {
-        assert!(!Pdu::SetClipboard(SetClipboard {
-            pane_id: 55,
-            clipboard: Some("copied".to_string()),
-            selection: ClipboardSelection::Clipboard,
-        })
-        .is_user_input());
+        assert!(
+            !Pdu::SetClipboard(SetClipboard {
+                pane_id: 55,
+                clipboard: Some("copied".to_string()),
+                selection: ClipboardSelection::Clipboard,
+            })
+            .is_user_input()
+        );
     }
 
     // --- Additional encode/decode edge cases ---
@@ -24415,9 +24992,11 @@ mod test {
         assert_eq!(serialized.validate_structure().unwrap().images, 2);
         let (_, images) = serialized.extract_data_checked().unwrap();
         assert_eq!(images.len(), 2);
-        assert!(images
-            .iter()
-            .all(|image| { image.line_idx == 5 && image.cell_idx == 0 }));
+        assert!(
+            images
+                .iter()
+                .all(|image| { image.line_idx == 5 && image.cell_idx == 0 })
+        );
         assert_eq!(
             images.iter().map(|image| image.z_index).collect::<Vec<_>>(),
             vec![-1, 2],

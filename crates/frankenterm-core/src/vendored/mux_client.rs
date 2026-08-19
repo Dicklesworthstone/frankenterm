@@ -222,8 +222,16 @@ pub enum DirectMuxError {
     RetainedStateAccounting { resource: &'static str },
     #[error("codec error: {0}")]
     Codec(String),
-    #[error("remote error: {0}")]
-    RemoteError(String),
+    #[error("remote mux rejection: {code}", code = .0.code.label())]
+    RemoteRejection(codec::ErrorResponse),
+    #[error(
+        "remote mux rejection request mismatch: expected request {expected_request_ident}, got \
+         request {got_request_ident}"
+    )]
+    RemoteRejectionRequestMismatch {
+        expected_request_ident: u64,
+        got_request_ident: u64,
+    },
     #[error("pipeline batch timed out after {timeout_ms}ms")]
     BatchTimeout { timeout_ms: u64 },
     #[error("duplicate pane {pane_id} in render-change batch")]
@@ -1218,6 +1226,14 @@ impl DirectMuxOutboundLease {
             .pdu_name()
     }
 
+    fn request_ident(&self) -> u64 {
+        self.prepared
+            .as_ref()
+            .expect("direct mux outbound lease retains its PDU until encoding")
+            .plan()
+            .ident()
+    }
+
     fn encode_frame(&mut self, serial: u64) -> Result<Vec<u8>, DirectMuxError> {
         self.prepared
             .take()
@@ -1270,7 +1286,12 @@ pub struct DirectMuxClient {
     socket_path: PathBuf,
     read_buf: StreamingPduBuffer,
     serial: u64,
-    outstanding_requests: HashSet<u64>,
+    /// Exact request PDU identity keyed by connection-local correlation serial.
+    ///
+    /// Retaining the identity, rather than only the serial, prevents a validly
+    /// framed ErrorResponse for one operation from lending retry/effect
+    /// authority to a different outstanding operation.
+    outstanding_requests: HashMap<u64, u64>,
     pending_responses: HashMap<u64, RetainedMuxPdu>,
     pending_response_bytes: usize,
     pending_render_changes: PendingRenderChanges,
@@ -1768,7 +1789,7 @@ impl<'a> RenderBatchGuard<'a> {
             return Ok(false);
         };
 
-        self.client.complete_response_serial(decoded.serial)?;
+        let request_ident = self.client.complete_response_serial(decoded.serial)?;
         if self
             .outputs
             .get(response_idx)
@@ -1796,7 +1817,7 @@ impl<'a> RenderBatchGuard<'a> {
         }
         let local_sideband = self.local_sidebands.take(pane_id)?;
         let (reserved_count, reserved_bytes) = self.local_sidebands.totals()?;
-        let resolved = DirectMuxClient::response_from_pdu(decoded.pdu).and_then(|pdu| {
+        let resolved = DirectMuxClient::response_from_pdu(decoded.pdu, request_ident).and_then(|pdu| {
             self.client.resolve_render_change_response_with_sideband(
                 pane_id,
                 pdu,
@@ -1818,7 +1839,7 @@ impl<'a> RenderBatchGuard<'a> {
                 if matches!(
                     &error,
                     DirectMuxError::AlignedUnexpectedResponse { .. }
-                        | DirectMuxError::RemoteError(_)
+                        | DirectMuxError::RemoteRejection(_)
                 ) =>
             {
                 self.remember_first_error(pane_id, error);
@@ -2109,7 +2130,7 @@ impl DirectMuxClient {
             socket_path,
             read_buf: StreamingPduBuffer::new(),
             serial: 0,
-            outstanding_requests: HashSet::new(),
+            outstanding_requests: HashMap::new(),
             pending_responses: HashMap::new(),
             pending_response_bytes: 0,
             pending_render_changes: PendingRenderChanges::default(),
@@ -3126,8 +3147,8 @@ impl DirectMuxClient {
                 continue;
             }
             if let Some(response_idx) = in_flight.take(decoded.serial) {
-                self.complete_response_serial(decoded.serial)?;
-                let response = match Self::response_from_pdu(decoded.pdu) {
+                let request_ident = self.complete_response_serial(decoded.serial)?;
+                let response = match Self::response_from_pdu(decoded.pdu, request_ident) {
                     Ok(response) => response,
                     Err(error) => {
                         return self.fail_batch_scope(error, !in_flight.is_empty(), true);
@@ -3442,7 +3463,7 @@ impl DirectMuxClient {
         self.protocol_state = DirectMuxProtocolState::Poisoned {
             connection_id: self.connection_id,
         };
-        self.outstanding_requests = HashSet::new();
+        self.outstanding_requests = HashMap::new();
         self.pending_responses = HashMap::new();
         self.pending_response_bytes = 0;
         self.pending_render_changes = PendingRenderChanges::default();
@@ -3506,7 +3527,7 @@ impl DirectMuxClient {
                 resource: "outstanding mux requests",
             })?;
         if requested_count > self.config.max_outstanding_requests {
-            let item_bytes = std::mem::size_of::<u64>();
+            let item_bytes = std::mem::size_of::<(u64, u64)>();
             return Err(DirectMuxError::RetentionLimitExceeded {
                 resource: "outstanding mux requests",
                 requested_count,
@@ -3525,18 +3546,27 @@ impl DirectMuxClient {
         self.ensure_outstanding_request_slots(1)
     }
 
-    fn mark_request_outstanding(&mut self, serial: u64) -> Result<(), DirectMuxError> {
+    fn mark_request_outstanding(
+        &mut self,
+        serial: u64,
+        request_ident: u64,
+    ) -> Result<(), DirectMuxError> {
         self.ensure_outstanding_request_capacity()?;
-        if !self.outstanding_requests.insert(serial) {
-            return Err(DirectMuxError::RetainedStateAccounting {
-                resource: "outstanding mux request serials",
-            });
+        match self.outstanding_requests.entry(serial) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(request_ident);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "outstanding mux request serials",
+                });
+            }
         }
         Ok(())
     }
 
     fn validate_response_serial(&self, serial: u64) -> Result<(), DirectMuxError> {
-        if serial == 0 || self.outstanding_requests.contains(&serial) {
+        if serial == 0 || self.outstanding_requests.contains_key(&serial) {
             return Ok(());
         }
         Err(DirectMuxError::ResponseSerialNotOutstanding {
@@ -3545,9 +3575,9 @@ impl DirectMuxClient {
         })
     }
 
-    fn complete_response_serial(&mut self, serial: u64) -> Result<(), DirectMuxError> {
-        if self.outstanding_requests.remove(&serial) {
-            return Ok(());
+    fn complete_response_serial(&mut self, serial: u64) -> Result<u64, DirectMuxError> {
+        if let Some(request_ident) = self.outstanding_requests.remove(&serial) {
+            return Ok(request_ident);
         }
         Err(DirectMuxError::ResponseSerialNotOutstanding {
             connection_id: self.connection_id,
@@ -3555,7 +3585,10 @@ impl DirectMuxClient {
         })
     }
 
-    fn take_pending_response(&mut self, serial: u64) -> Result<Option<Pdu>, DirectMuxError> {
+    fn take_pending_response(
+        &mut self,
+        serial: u64,
+    ) -> Result<Option<(Pdu, u64)>, DirectMuxError> {
         let Some(retained) = self.pending_responses.remove(&serial) else {
             return Ok(None);
         };
@@ -3566,8 +3599,8 @@ impl DirectMuxClient {
                 resource: "pending mux responses",
             })?;
         let pdu = retained.decode(self.connection_id, serial)?;
-        self.complete_response_serial(serial)?;
-        Ok(Some(pdu))
+        let request_ident = self.complete_response_serial(serial)?;
+        Ok(Some((pdu, request_ident)))
     }
 
     /// Plan and charge one exact request before serial allocation or codec
@@ -3635,6 +3668,7 @@ impl DirectMuxClient {
             false,
         )?;
         let pdu_name = outbound.pdu_name();
+        let request_ident = outbound.request_ident();
         tracing::trace!(
             connection_id = self.connection_id,
             request_serial = serial,
@@ -3689,7 +3723,7 @@ impl DirectMuxClient {
                 return Err(error);
             }
         }
-        let tracked = self.mark_request_outstanding(serial);
+        let tracked = self.mark_request_outstanding(serial, request_ident);
         self.settle_transport_result(
             tracked,
             "post-write request correlation accounting failure",
@@ -3732,6 +3766,7 @@ impl DirectMuxClient {
         let serial =
             self.settle_transport_result(serial_result, "request serial allocation failure", true)?;
         let pdu_name = outbound.pdu_name();
+        let request_ident = outbound.request_ident();
         tracing::trace!(
             connection_id = self.connection_id,
             request_serial = serial,
@@ -3809,7 +3844,7 @@ impl DirectMuxClient {
                 return Err(error);
             }
         }
-        let tracked = self.mark_request_outstanding(serial);
+        let tracked = self.mark_request_outstanding(serial, request_ident);
         self.settle_transport_result(
             tracked,
             "post-write request correlation accounting failure",
@@ -3825,25 +3860,25 @@ impl DirectMuxClient {
         let pending = self.take_pending_response(serial);
         let pending =
             self.settle_transport_result(pending, "pending response retention failure", false)?;
-        if let Some(pending) = pending {
+        if let Some((pending, request_ident)) = pending {
             tracing::trace!(
                 connection_id = self.connection_id,
                 request_serial = serial,
                 phase = "response_pending_hit",
                 "served mux response from pending map"
             );
-            return Self::response_from_pdu(pending);
+            return Self::response_from_pdu(pending, request_ident);
         }
         loop {
             let decoded = self.read_next_pdu().await?;
             if decoded.serial == serial {
                 let completed = self.complete_response_serial(serial);
-                self.settle_transport_result(
+                let request_ident = self.settle_transport_result(
                     completed,
                     "response completion accounting failure",
                     false,
                 )?;
-                return Self::response_from_pdu(decoded.pdu);
+                return Self::response_from_pdu(decoded.pdu, request_ident);
             }
             if decoded.serial == 0 {
                 let stashed = self.stash_unilateral_pdu(decoded.pdu);
@@ -3876,7 +3911,7 @@ impl DirectMuxClient {
         let pending = self.take_pending_response(serial);
         let pending =
             self.settle_transport_result(pending, "pending response retention failure", true)?;
-        if let Some(pending) = pending {
+        if let Some((pending, request_ident)) = pending {
             tracing::trace!(
                 connection_id = self.connection_id,
                 request_serial = serial,
@@ -3884,18 +3919,18 @@ impl DirectMuxClient {
                 phase = "response_pending_hit",
                 "served mux response from pending map"
             );
-            return Self::response_from_pdu(pending);
+            return Self::response_from_pdu(pending, request_ident);
         }
         loop {
             let decoded = self.read_next_pdu_with_cx(cx).await?;
             if decoded.serial == serial {
                 let completed = self.complete_response_serial(serial);
-                self.settle_transport_result(
+                let request_ident = self.settle_transport_result(
                     completed,
                     "response completion accounting failure",
                     true,
                 )?;
-                return Self::response_from_pdu(decoded.pdu);
+                return Self::response_from_pdu(decoded.pdu, request_ident);
             }
             if decoded.serial == 0 {
                 let stashed = self.stash_unilateral_pdu(decoded.pdu);
@@ -3915,9 +3950,15 @@ impl DirectMuxClient {
         }
     }
 
-    fn response_from_pdu(pdu: Pdu) -> Result<Pdu, DirectMuxError> {
+    fn response_from_pdu(pdu: Pdu, request_ident: u64) -> Result<Pdu, DirectMuxError> {
         match pdu {
-            Pdu::ErrorResponse(err) => Err(DirectMuxError::RemoteError(err.reason)),
+            Pdu::ErrorResponse(err) if err.request_ident != request_ident => {
+                Err(DirectMuxError::RemoteRejectionRequestMismatch {
+                    expected_request_ident: request_ident,
+                    got_request_ident: err.request_ident,
+                })
+            }
+            Pdu::ErrorResponse(err) => Err(DirectMuxError::RemoteRejection(err)),
             other => Ok(other),
         }
     }
@@ -3930,7 +3971,7 @@ impl DirectMuxClient {
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
         let result = match response {
             Ok(response) => self.resolve_render_change_response(pane_id, response),
-            Err(error @ DirectMuxError::RemoteError(_)) => {
+            Err(error @ DirectMuxError::RemoteRejection(_)) => {
                 if let Err(cleanup_error) = self.invalidate_render_state_for_pane(pane_id) {
                     self.poison_connection(
                         "single render remote-error cleanup accounting failure",
@@ -4008,9 +4049,12 @@ impl DirectMuxClient {
                 }
                 if !liveness.is_alive {
                     self.invalidate_render_state_for_pane(pane_id)?;
-                    return Err(DirectMuxError::RemoteError(format!(
-                        "pane {pane_id} is not alive"
-                    )));
+                    return Err(DirectMuxError::RemoteRejection(
+                        codec::ErrorResponse::pane_not_found(
+                            <GetPaneRenderChanges as codec::PduWireIdent>::IDENT,
+                            pane_id,
+                        ),
+                    ));
                 }
                 if let Some(sideband) = local_sideband {
                     if sideband.payload.pane_id as u64 != pane_id
@@ -6230,7 +6274,9 @@ mod tests {
                 .expect("aligned client should serve a valid request after local rejections");
             assert!(panes.tabs.is_empty());
 
-            client.outstanding_requests.insert(9_001);
+            client
+                .outstanding_requests
+                .insert(9_001, <ListPanes as PduWireIdent>::IDENT);
             let mid_batch_error = client
                 .fail_batch_scope::<()>(
                     cancelled_mux_error("request_write_wait", "later batch admission cancelled"),
@@ -6750,7 +6796,7 @@ mod tests {
                     }),
                 )
                 .expect_err("dead liveness must invalidate retained pane state");
-            assert!(matches!(dead, DirectMuxError::RemoteError(_)));
+            assert!(matches!(dead, DirectMuxError::RemoteRejection(_)));
             assert!(!client.render_change_snapshots.contains_key(27));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
@@ -6916,7 +6962,9 @@ mod tests {
             assert!(!client.connection_poisoned);
             assert_eq!(client.poison_transition_count, 0);
 
-            client.outstanding_requests.insert(9_002);
+            client
+                .outstanding_requests
+                .insert(9_002, <ListPanes as PduWireIdent>::IDENT);
             let ambiguous_targets = [27];
             let mut ambiguous_guard =
                 RenderBatchGuard::new(&mut client, &ambiguous_targets, 1, true);
@@ -7673,9 +7721,11 @@ mod tests {
                                             Pdu::UnitResponse(UnitResponse {})
                                         }
                                         LocalSemanticCase::ErrorResponse => {
-                                            Pdu::ErrorResponse(codec::ErrorResponse {
-                                                reason: "typed-sideband semantic error".to_string(),
-                                            })
+                                            Pdu::ErrorResponse(
+                                                codec::ErrorResponse::backend_failure(
+                                                    <GetPaneRenderChanges as PduWireIdent>::IDENT,
+                                                ),
+                                            )
                                         }
                                     };
                                     write_response_pdu(&mut stream, &response, decoded.serial)
@@ -7713,7 +7763,7 @@ mod tests {
                     case,
                     LocalSemanticCase::DeadPane | LocalSemanticCase::ErrorResponse
                 ) {
-                    assert!(matches!(error, DirectMuxError::RemoteError(_)), "{case:?}");
+                    assert!(matches!(error, DirectMuxError::RemoteRejection(_)), "{case:?}");
                 } else {
                     assert!(
                         matches!(error, DirectMuxError::AlignedUnexpectedResponse { .. }),
@@ -8576,9 +8626,11 @@ mod tests {
                                             Pdu::UnitResponse(UnitResponse {})
                                         }
                                         SemanticCase::ErrorResponse => {
-                                            Pdu::ErrorResponse(codec::ErrorResponse {
-                                                reason: "semantic test remote error".to_string(),
-                                            })
+                                            Pdu::ErrorResponse(
+                                                codec::ErrorResponse::backend_failure(
+                                                    <GetPaneRenderChanges as PduWireIdent>::IDENT,
+                                                ),
+                                            )
                                         }
                                     };
                                     write_response_pdu(&mut stream, &bad_response, bad_serial)
@@ -8642,7 +8694,10 @@ mod tests {
                 let unrelated_response_serial =
                     next_request_serial(&mut client.serial).expect("reserve unrelated serial");
                 client
-                    .mark_request_outstanding(unrelated_response_serial)
+                    .mark_request_outstanding(
+                        unrelated_response_serial,
+                        <ListPanes as PduWireIdent>::IDENT,
+                    )
                     .expect("mark unrelated request outstanding");
                 client
                     .stash_pending_response(
@@ -8658,7 +8713,7 @@ mod tests {
                     .expect_err("semantic response shape must fail after draining");
                 match case {
                     SemanticCase::DeadPane | SemanticCase::ErrorResponse => {
-                        assert!(matches!(error, DirectMuxError::RemoteError(_)), "{case:?}");
+                        assert!(matches!(error, DirectMuxError::RemoteRejection(_)), "{case:?}");
                     }
                     _ => {
                         assert!(
@@ -8774,11 +8829,9 @@ mod tests {
                             Pdu::GetPaneRenderChanges(request) => {
                                 render_request_count += 1;
                                 if matches!(render_request_count, 1 | 3) {
-                                    Pdu::ErrorResponse(codec::ErrorResponse {
-                                        reason: format!(
-                                            "single render remote error {render_request_count}"
-                                        ),
-                                    })
+                                    Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                                        <GetPaneRenderChanges as PduWireIdent>::IDENT,
+                                    ))
                                 } else {
                                     Pdu::GetPaneRenderChangesResponse(test_render_change(
                                         request.pane_id,
@@ -8811,8 +8864,8 @@ mod tests {
             let ambient_error = client
                 .get_pane_render_changes(27)
                 .await
-                .expect_err("ambient ErrorResponse must surface RemoteError");
-            assert!(matches!(ambient_error, DirectMuxError::RemoteError(_)));
+                .expect_err("ambient ErrorResponse must surface RemoteRejection");
+            assert!(matches!(ambient_error, DirectMuxError::RemoteRejection(_)));
             assert!(!client.render_change_snapshots.contains_key(27));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
@@ -8833,8 +8886,8 @@ mod tests {
             let cx_error = client
                 .get_pane_render_changes_with_cx(&cx, 27)
                 .await
-                .expect_err("Cx ErrorResponse must surface RemoteError");
-            assert!(matches!(cx_error, DirectMuxError::RemoteError(_)));
+                .expect_err("Cx ErrorResponse must surface RemoteRejection");
+            assert!(matches!(cx_error, DirectMuxError::RemoteRejection(_)));
             assert!(!client.render_change_snapshots.contains_key(27));
             assert!(client.pending_render_changes.is_empty());
             assert_eq!(client.pending_render_changes.retained_bytes(), 0);
@@ -9235,10 +9288,11 @@ mod tests {
                                     for serial in render_serials.iter().rev().copied() {
                                         write_response_pdu(
                                             &mut stream,
-                                            &Pdu::ErrorResponse(codec::ErrorResponse {
-                                                reason: "drained accounting cleanup error"
-                                                    .to_string(),
-                                            }),
+                                            &Pdu::ErrorResponse(
+                                                codec::ErrorResponse::backend_failure(
+                                                    <GetPaneRenderChanges as PduWireIdent>::IDENT,
+                                                ),
+                                            ),
                                             serial,
                                         )
                                         .await
@@ -11866,10 +11920,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_error_is_not_replayed_and_preserves_connection_alignment() {
-        let err = DirectMuxError::RemoteError("application rejected request".to_string());
+    fn remote_policy_rejection_is_not_replayed_and_preserves_connection_alignment() {
+        let err = DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(
+            <ListPanes as PduWireIdent>::IDENT,
+        ));
         let decision = err.recovery_decision();
-        assert_eq!(decision.kind, ProtocolErrorKind::Transient);
+        assert_eq!(decision.kind, ProtocolErrorKind::Permanent);
         assert!(!decision.retry);
         assert!(!decision.cancelled);
         assert!(matches!(
@@ -11879,11 +11935,128 @@ mod tests {
     }
 
     #[test]
+    fn remote_rejection_must_name_the_exact_serial_correlated_request() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("rejection-request-correlation.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let mut stream = accept_direct_mux_handshake(
+                    listener,
+                    codec::CODEC_VERSION,
+                    codec::CODEC_VERSION_MIN_SUPPORTED,
+                )
+                .await;
+                let mut read_buf = StreamingPduBuffer::new();
+
+                let first = read_test_request_pdu(&mut stream, &mut read_buf).await;
+                assert!(matches!(first.pdu, Pdu::ListPanes(_)));
+                write_response_pdu(
+                    &mut stream,
+                    &Pdu::ErrorResponse(codec::ErrorResponse::policy_rejected(
+                        <codec::Ping as PduWireIdent>::IDENT,
+                    )),
+                    first.serial,
+                )
+                .await
+                .expect("write mismatched rejection");
+
+                let second = read_test_request_pdu(&mut stream, &mut read_buf).await;
+                assert!(matches!(second.pdu, Pdu::ListPanes(_)));
+                write_response_pdu(&mut stream, &empty_list_panes_response(), second.serial)
+                    .await
+                    .expect("write aligned successor response");
+            });
+
+            let mut client = DirectMuxClient::connect(direct_mux_client_config(socket_path))
+                .await
+                .expect("connect");
+            let error = client
+                .list_panes()
+                .await
+                .expect_err("a rejection for another request must carry no authority");
+            assert!(matches!(
+                error,
+                DirectMuxError::RemoteRejectionRequestMismatch {
+                    expected_request_ident,
+                    got_request_ident,
+                } if expected_request_ident == <ListPanes as PduWireIdent>::IDENT
+                    && got_request_ident == <codec::Ping as PduWireIdent>::IDENT
+            ));
+            assert!(!client.connection_poisoned);
+            assert!(client.outstanding_requests.is_empty());
+
+            let aligned = client
+                .list_panes()
+                .await
+                .expect("mismatch is framed and must preserve stream alignment");
+            assert!(aligned.tabs.is_empty());
+            assert!(!client.connection_poisoned);
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn duplicate_request_serial_does_not_replace_its_original_identity() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("duplicate-request-serial.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+            let server = task::spawn(async move {
+                accept_direct_mux_handshake(
+                    listener,
+                    codec::CODEC_VERSION,
+                    codec::CODEC_VERSION_MIN_SUPPORTED,
+                )
+                .await
+            });
+
+            let mut client = DirectMuxClient::connect(direct_mux_client_config(socket_path))
+                .await
+                .expect("connect");
+            let serial = 9_001;
+            client
+                .mark_request_outstanding(serial, <ListPanes as PduWireIdent>::IDENT)
+                .expect("reserve original request identity");
+            let error = client
+                .mark_request_outstanding(serial, <codec::Ping as PduWireIdent>::IDENT)
+                .expect_err("duplicate serial must fail without replacing its incumbent");
+            assert!(matches!(
+                error,
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "outstanding mux request serials"
+                }
+            ));
+            assert_eq!(
+                client.outstanding_requests.get(&serial),
+                Some(&<ListPanes as PduWireIdent>::IDENT)
+            );
+            assert_eq!(
+                client
+                    .complete_response_serial(serial)
+                    .expect("complete original reservation"),
+                <ListPanes as PduWireIdent>::IDENT
+            );
+            assert!(client.outstanding_requests.is_empty());
+            drop(client);
+            drop(server.await.expect("server task"));
+        });
+    }
+
+    #[test]
     fn subscription_retries_only_replayable_errors_on_reusable_connections() {
         for err in [
             DirectMuxError::ReadTimeout,
             DirectMuxError::Disconnected,
-            DirectMuxError::RemoteError("application rejected request".to_string()),
+            DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(
+                <ListPanes as PduWireIdent>::IDENT,
+            )),
             cancelled_mux_error("response_read_wait", "scope ended"),
         ] {
             assert!(
@@ -11992,7 +12165,9 @@ mod tests {
             DirectMuxError::SerialExhausted,
             DirectMuxError::InputSerialExhausted,
             DirectMuxError::Codec("bad frame".to_string()),
-            DirectMuxError::RemoteError("denied".to_string()),
+            DirectMuxError::RemoteRejection(codec::ErrorResponse::policy_rejected(
+                <ListPanes as PduWireIdent>::IDENT,
+            )),
             DirectMuxError::BatchTimeout { timeout_ms: 5000 },
             DirectMuxError::UnexpectedResponse {
                 expected: "Pong".to_string(),
@@ -13707,9 +13882,9 @@ mod tests {
             (Pdu::Pong(codec::Pong {}), 2),
             (Pdu::UnitResponse(UnitResponse {}), 3),
             (
-                Pdu::ErrorResponse(codec::ErrorResponse {
-                    reason: "test error".to_string(),
-                }),
+                Pdu::ErrorResponse(codec::ErrorResponse::backend_failure(
+                    <Ping as PduWireIdent>::IDENT,
+                )),
                 4,
             ),
         ];

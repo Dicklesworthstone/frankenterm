@@ -19,7 +19,7 @@ use crate::Result;
 use crate::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
 use crate::concurrent_map::PaneMap;
 use crate::consistent_hash::HashRing;
-use crate::error::{StorageError, WeztermError};
+use crate::error::{MuxObjectKind, MuxRejectionCode, StorageError, WeztermError};
 use crate::patterns::AgentType;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
@@ -892,6 +892,21 @@ fn classify_backend_error(error: &crate::Error) -> ShardBackendErrorClass {
             WeztermError::IndeterminateMutation { .. } => {
                 ShardBackendErrorClass::IndeterminateMutation
             }
+            WeztermError::MuxRejection(rejection) => match rejection.code {
+                MuxRejectionCode::PaneNotFound => ShardBackendErrorClass::PaneNotFound,
+                MuxRejectionCode::Cancelled => ShardBackendErrorClass::Cancelled,
+                MuxRejectionCode::DeadlineExceeded => ShardBackendErrorClass::TimedOut,
+                MuxRejectionCode::IndeterminateMutation | MuxRejectionCode::UnknownFuture => {
+                    ShardBackendErrorClass::IndeterminateMutation
+                }
+                MuxRejectionCode::TabNotFound
+                | MuxRejectionCode::WindowNotFound
+                | MuxRejectionCode::DomainNotFound
+                | MuxRejectionCode::InvalidRequest
+                | MuxRejectionCode::PolicyRejected
+                | MuxRejectionCode::QuotaExceeded
+                | MuxRejectionCode::BackendFailure => ShardBackendErrorClass::CommandFailed,
+            },
         },
         crate::Error::Storage(
             StorageError::IndeterminateMutation { .. }
@@ -1280,6 +1295,17 @@ impl ShardedWeztermClient {
                 WeztermError::CommandFailed(_) => WeztermError::CommandFailed(finite_detail()),
                 WeztermError::IndeterminateMutation { .. } => {
                     WeztermError::IndeterminateMutation { operation: op }
+                }
+                WeztermError::MuxRejection(mut rejection) => {
+                    if let (Some(global_pane_id), Some(object)) = (pane_id, rejection.object)
+                        && object.kind == MuxObjectKind::Pane
+                    {
+                        rejection.object = Some(crate::error::MuxObjectIdentity {
+                            kind: MuxObjectKind::Pane,
+                            id: global_pane_id,
+                        });
+                    }
+                    WeztermError::MuxRejection(rejection)
                 }
                 WeztermError::ParseError(_) => WeztermError::ParseError(finite_detail()),
                 WeztermError::OutputTooLarge { len, cap, .. } => WeztermError::OutputTooLarge {
@@ -4987,6 +5013,43 @@ mod tests {
     #[allow(deprecated)]
     #[test]
     fn sharded_backend_projection_preserves_retry_authority_and_redacts_details() {
+        use crate::error::{MuxOperation, MuxRejection};
+
+        let typed_missing = ShardedWeztermClient::backend_error(
+            ShardId(3),
+            "get_text",
+            Some(77),
+            crate::Error::Wezterm(WeztermError::MuxRejection(MuxRejection::pane_not_found(
+                MuxOperation::ReadPaneText,
+                5,
+            ))),
+        );
+        let crate::Error::Wezterm(WeztermError::MuxRejection(typed_missing)) = typed_missing else {
+            panic!("typed mux rejection must survive sharding projection");
+        };
+        assert_eq!(typed_missing.code, MuxRejectionCode::PaneNotFound);
+        assert_eq!(typed_missing.operation, MuxOperation::ReadPaneText);
+        assert_eq!(typed_missing.object.map(|object| object.id), Some(77));
+        assert!(!crate::retry::is_retryable(&crate::Error::Wezterm(
+            WeztermError::MuxRejection(typed_missing)
+        )));
+
+        let typed_backend = ShardedWeztermClient::backend_error(
+            ShardId(3),
+            "list_panes",
+            None,
+            crate::Error::Wezterm(WeztermError::MuxRejection(MuxRejection::backend_failure(
+                MuxOperation::ListPanes,
+            ))),
+        );
+        let crate::Error::Wezterm(WeztermError::MuxRejection(typed_backend)) = typed_backend else {
+            panic!("retry authority must survive sharding projection");
+        };
+        assert_eq!(typed_backend.code, MuxRejectionCode::BackendFailure);
+        assert!(crate::retry::is_retryable(&crate::Error::Wezterm(
+            WeztermError::MuxRejection(typed_backend)
+        )));
+
         let indeterminate = ShardedWeztermClient::backend_error(
             ShardId(3),
             "split_pane",
