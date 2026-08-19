@@ -2144,6 +2144,8 @@ mod pane_registration_handle {
         pane: Arc<dyn Pane>,
         generation: Arc<PaneRegistrationGeneration>,
         retirement: Arc<PaneRetirementTracker>,
+        admitted_domain_id: DomainId,
+        admitted_domain: Option<Weak<dyn Domain>>,
         _operation: PaneRegistrationOperationLease,
     }
 
@@ -2206,14 +2208,17 @@ mod pane_registration_handle {
             &self.pane
         }
 
+        pub(crate) fn admitted_domain_id(&self) -> DomainId {
+            self.admitted_domain_id
+        }
+
+        pub(crate) fn admitted_domain(&self) -> Option<&Weak<dyn Domain>> {
+            self.admitted_domain.as_ref()
+        }
+
         pub(crate) fn exact_location(&self) -> anyhow::Result<(DomainId, WindowId, Arc<Tab>)> {
-            let registration = self.registration();
             self.owner
-                .indexed_pane_location(
-                    self.pane_id(),
-                    Some(&registration),
-                    Some(&self.pane),
-                )
+                .indexed_pane_location_for_operation(self)
                 .map(|(domain_id, window_id, tab, _lane)| (domain_id, window_id, tab))
                 .ok_or_else(|| {
                     anyhow!(
@@ -2735,22 +2740,31 @@ mod pane_registration_handle {
             if !Arc::ptr_eq(&retirement, &owner.pane_retirements) {
                 return None;
             }
-            let is_current = {
+            let (admitted_domain_id, admitted_domain) = {
+                let _domain_registration = owner.domain_registration.lock();
                 let _registration = owner.pane_registration.lock();
-                owner
+                let domain_id = owner
                     .panes
                     .read()
                     .get(&self.generation.pane_id)
-                    .is_some_and(|registered| {
+                    .filter(|registered| {
                         Arc::ptr_eq(&registered.pane, &pane)
                             && Arc::ptr_eq(&registered.generation, &self.generation)
                     })
+                    .map(|registered| registered.domain_id)?;
+                if owner.retired_domain_ids.lock().contains(&domain_id) {
+                    return None;
+                }
+                let exact_domain = owner.domains.read().get(&domain_id).map(Arc::downgrade);
+                (domain_id, exact_domain)
             };
-            is_current.then_some(PaneOperationGuard {
+            Some(PaneOperationGuard {
                 owner,
                 pane,
                 generation: Arc::clone(&self.generation),
                 retirement,
+                admitted_domain_id,
+                admitted_domain,
                 _operation: operation,
             })
         }
@@ -2976,172 +2990,61 @@ mod pane_registration_handle {
         }
 
         pub(crate) fn retire_batch_if_current(registrations: Vec<Self>) -> usize {
-            struct Candidate {
-                pane: Arc<dyn Pane>,
-                generation: Arc<PaneRegistrationGeneration>,
-                operation: PaneRegistrationOperationLease,
-            }
-
             struct OwnerBatch {
                 owner: Arc<Mux>,
-                candidates: Vec<Candidate>,
+                candidates: Vec<PaneBatchRetirementCandidate>,
             }
 
-            let mut owners = Vec::<OwnerBatch>::new();
-            for registration in registrations {
-                let Some(operation) = registration.generation.try_acquire() else {
-                    continue;
-                };
-                let Some(pane) = registration.pane.upgrade() else {
-                    continue;
-                };
-                let Some(owner) = registration.generation.owner.upgrade() else {
-                    continue;
-                };
-                let candidate = Candidate {
-                    pane,
-                    generation: registration.generation,
-                    operation,
-                };
-                if let Some(batch) = owners
-                    .iter_mut()
-                    .find(|batch| Arc::ptr_eq(&batch.owner, &owner))
-                {
-                    batch.candidates.push(candidate);
-                } else {
-                    owners.push(OwnerBatch {
-                        owner,
-                        candidates: vec![candidate],
+            let batch_result = (|| -> anyhow::Result<_> {
+                let mut owners = HashMap::<usize, OwnerBatch>::new();
+                owners.try_reserve(registrations.len()).map_err(|error| {
+                    anyhow!("reserve pane retirement owner directory: {error}")
+                })?;
+                for registration in registrations {
+                    let Some(operation) = registration.generation.try_acquire() else {
+                        continue;
+                    };
+                    let Some(pane) = registration.pane.upgrade() else {
+                        continue;
+                    };
+                    let Some(owner) = registration.generation.owner.upgrade() else {
+                        continue;
+                    };
+                    let owner_identity = Arc::as_ptr(&owner) as usize;
+                    let batch = match owners.entry(owner_identity) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                            OwnerBatch {
+                                owner,
+                                candidates: Vec::new(),
+                            },
+                        ),
+                    };
+                    batch.candidates.try_reserve(1).map_err(|error| {
+                        anyhow!("reserve pane retirement candidate: {error}")
+                    })?;
+                    batch.candidates.push(PaneBatchRetirementCandidate {
+                        pane,
+                        generation: registration.generation,
+                        operation,
                     });
                 }
-            }
-
-            let mut retired = 0;
-            for OwnerBatch { owner, candidates } in owners {
-                let (removed, rejected, output_batches) = {
-                    let _registration = owner.pane_registration.lock();
-                    let (removed, rejected) = {
-                        let mut panes = owner.panes.write();
-                        let mut removed = Vec::new();
-                        let mut rejected = Vec::new();
-                        for candidate in candidates {
-                            let pane_id = candidate.generation.pane_id;
-                            let matches = panes.get(&pane_id).is_some_and(|registered| {
-                                Arc::ptr_eq(&registered.pane, &candidate.pane)
-                                    && Arc::ptr_eq(&registered.generation, &candidate.generation)
-                            });
-                            if !matches {
-                                rejected.push(candidate);
-                                continue;
-                            }
-                            let registered = panes
-                                .remove(&pane_id)
-                                .expect("exact batch candidate was just validated");
-                            let pane = Arc::clone(&registered.pane);
-                            let generation = Arc::clone(&registered.generation);
-                            drop(registered);
-                            removed.push((pane_id, pane, generation, candidate.operation));
-                        }
-                        (removed, rejected)
-                    };
-
-                    {
-                        let mut retiring = owner.retiring_pane_ids.lock();
-                        for (pane_id, _, _, _) in &removed {
-                            retiring.insert(*pane_id);
-                        }
-                    }
-
-                    let output_batches = {
-                        let mut pending = owner.pending_pane_output.lock();
-                        removed
-                            .iter()
-                            .filter_map(|(pane_id, _, generation, _)| {
-                                let matches = pending.queued.get(pane_id).is_some_and(|batch| {
-                                    Arc::ptr_eq(&batch.generation, generation)
-                                });
-                                matches.then(|| pending.queued.remove(pane_id)).flatten()
-                            })
-                            .collect::<Vec<_>>()
-                    };
-
-                    let removal_topology = removed
-                        .iter()
-                        .map(|(pane_id, _, _, _)| {
-                            owner
-                                .envelope_notification(MuxNotification::PaneRemoved(*pane_id))
-                                .topology
-                        })
-                        .collect::<Vec<_>>();
-                    let tickets = {
-                        let mut pending = owner.pending_pane_lifecycle.lock();
-                        removed
-                            .iter()
-                            .zip(removal_topology)
-                            .map(|((pane_id, _, generation, _), topology)| {
-                                let ready = Arc::new(AtomicBool::new(false));
-                                pending.by_pane.entry(*pane_id).or_default().push_back(
-                                    PendingPaneLifecycleNotification {
-                                        notification: PaneLifecycleNotification::Removed(*pane_id),
-                                        topology,
-                                        ready: Arc::clone(&ready),
-                                        reader_start_gate: None,
-                                        cleanup_complete: Some(Arc::clone(
-                                            &generation.cleanup_complete,
-                                        )),
-                                        removal_follow_up: PaneRemovalFollowUp::None,
-                                    },
-                                );
-                                PaneLifecycleNotificationTicket {
-                                    pane_id: *pane_id,
-                                    ready,
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    };
-
-                    let removed = removed
-                        .into_iter()
-                        .zip(tickets)
-                        .map(
-                            |((pane_id, pane, generation, operation), lifecycle_notification)| {
-                                (
-                                    RemovedPaneRegistration {
-                                        pane_id,
-                                        pane,
-                                        generation,
-                                        lifecycle_notification,
-                                    },
-                                    operation,
-                                )
-                            },
-                        )
-                        .collect::<Vec<_>>();
-                    (removed, rejected, output_batches)
-                };
-
-                // Rejected candidates may own the final operation lease of an
-                // already-retired generation. Dropping them can synchronously
-                // run pane cleanup and lifecycle subscribers, so it must happen
-                // after every registry and topology guard has been released.
-                drop(rejected);
-                for output_batch in output_batches {
-                    histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
-                    output_batch.seal();
+                Ok(owners)
+            })();
+            let owners = match batch_result {
+                Ok(owners) => owners,
+                Err(error) => {
+                    log::error!(
+                        "refusing pane retirement batch before mutation: {error:#}"
+                    );
+                    return 0;
                 }
-                let pane_ids = removed
-                    .iter()
-                    .map(|(removed, _)| removed.pane_id)
-                    .collect::<Vec<_>>();
-                owner.discard_removed_pane_states(&pane_ids);
-                retired += removed.len();
-                for (removed, operation) in removed {
-                    owner.finish_pane_removal(removed, true);
-                    drop(operation);
-                }
-                owner.recompute_pane_count();
-            }
-            retired
+            };
+
+            owners
+                .into_values()
+                .map(|batch| batch.owner.retire_exact_batch_candidates(batch.candidates))
+                .sum()
         }
 
         fn resolve_current(
@@ -4078,6 +3981,160 @@ struct RemovedPaneRegistration {
     lifecycle_notification: PaneLifecycleNotificationTicket,
 }
 
+struct PaneBatchRetirementCandidate {
+    pane: Arc<dyn Pane>,
+    generation: Arc<PaneRegistrationGeneration>,
+    operation: PaneRegistrationOperationLease,
+}
+
+struct PreparedTabPaneRetirementCandidate {
+    group_index: usize,
+    pane_id: PaneId,
+    pane: Arc<dyn Pane>,
+    generation: Arc<PaneRegistrationGeneration>,
+    authority: Option<PreparedLivePaneRegistrationRemoval>,
+    output_current: bool,
+    revision_offset: u64,
+}
+
+struct PreparedTabPanePreparationCancellation {
+    pane_id: PaneId,
+    pane: Weak<dyn Pane>,
+}
+
+/// Allocation-complete live-registration retirement staged under the exact
+/// tab snapshots that authorize it.
+///
+/// The retained guards close the gap between validation and the surrounding
+/// window/tab/structural commit.  A caller must reserve the returned number of
+/// trailing topology revisions before making any of those mutations, then
+/// consume this token in the same callback-free cut.
+struct PreparedTabPaneRetirement<'a> {
+    live: Vec<PreparedTabPaneRetirementCandidate>,
+    preparation_cancellations: Vec<PreparedTabPanePreparationCancellation>,
+    preparations: parking_lot::MutexGuard<'a, HashMap<PaneId, PanePreparation>>,
+    panes: RwLockWriteGuard<'a, HashMap<PaneId, LivePaneRegistration>>,
+    retiring: parking_lot::MutexGuard<'a, HashSet<PaneId>>,
+    pending_output: parking_lot::MutexGuard<'a, PendingPaneOutputNotifications>,
+    lifecycle_enqueue: Option<PreparedPaneLifecycleBatchEnqueue<'a>>,
+    lifecycle_notifications: Vec<PreparedPaneLifecycleBatchNotification>,
+    removed_panes_by_group: Vec<Vec<RemovedPaneRegistration>>,
+    output_batches_by_group: Vec<Vec<Arc<PaneOutputBatch>>>,
+    removed_live: Vec<LivePaneRegistration>,
+    removed_ids: HashSet<PaneId>,
+}
+
+struct CommittedTabPaneRetirement {
+    removed_panes_by_group: Vec<Vec<RemovedPaneRegistration>>,
+    output_batches_by_group: Vec<Vec<Arc<PaneOutputBatch>>>,
+    removed_live: Vec<LivePaneRegistration>,
+    removed_ids: HashSet<PaneId>,
+}
+
+impl PreparedTabPaneRetirement<'_> {
+    fn revision_count(&self) -> usize {
+        self.live.len()
+    }
+
+    fn commit(
+        self,
+        authority: &mut PaneAuthorityIndex,
+        first_revision: Option<TopologyRevision>,
+    ) -> CommittedTabPaneRetirement {
+        let PreparedTabPaneRetirement {
+            mut live,
+            preparation_cancellations,
+            mut preparations,
+            mut panes,
+            mut retiring,
+            mut pending_output,
+            lifecycle_enqueue,
+            mut lifecycle_notifications,
+            mut removed_panes_by_group,
+            mut output_batches_by_group,
+            mut removed_live,
+            removed_ids,
+        } = self;
+        debug_assert_eq!(first_revision.is_some(), !live.is_empty());
+
+        for cancellation in preparation_cancellations {
+            let preparation = preparations
+                .get_mut(&cancellation.pane_id)
+                .expect("prepared pane cancellation remains present");
+            debug_assert!(Weak::ptr_eq(&preparation.pane, &cancellation.pane));
+            preparation.cancelled = true;
+        }
+
+        for candidate in &mut live {
+            authority.commit_live_registration_removal(
+                candidate
+                    .authority
+                    .take()
+                    .expect("prepared tab pane retains exact authority"),
+            );
+            let registered = panes
+                .remove(&candidate.pane_id)
+                .expect("prepared tab pane remains registered");
+            debug_assert!(Arc::ptr_eq(&registered.pane, &candidate.pane));
+            debug_assert!(Arc::ptr_eq(
+                &registered.generation,
+                &candidate.generation
+            ));
+            let inserted = retiring.insert(candidate.pane_id);
+            debug_assert!(inserted);
+            if candidate.output_current {
+                output_batches_by_group[candidate.group_index].push(
+                    pending_output
+                        .queued
+                        .remove(&candidate.pane_id)
+                        .expect("prepared tab pane output remains queued"),
+                );
+            }
+            removed_live.push(registered);
+
+            let first_revision = first_revision
+                .expect("live tab pane retirement retains topology authority");
+            lifecycle_notifications
+                .push(PreparedPaneLifecycleBatchNotification {
+                    notification: PaneLifecycleNotification::Removed(candidate.pane_id),
+                    topology: MuxTopologyStamp::Revision(TopologyRevision::new(
+                        first_revision
+                            .get()
+                            .checked_add(candidate.revision_offset)
+                            .expect("reserved tab pane retirement revisions cannot overflow"),
+                    )),
+                    reader_start_gate: None,
+                    cleanup_complete: Some(Arc::clone(
+                        &candidate.generation.cleanup_complete,
+                    )),
+                    removal_follow_up: PaneRemovalFollowUp::None,
+                });
+        }
+
+        let tickets = lifecycle_enqueue
+            .map(|enqueue| enqueue.enqueue(lifecycle_notifications))
+            .unwrap_or_default();
+        debug_assert_eq!(tickets.len(), live.len());
+        for (candidate, ticket) in live.into_iter().zip(tickets) {
+            removed_panes_by_group[candidate.group_index].push(
+                RemovedPaneRegistration {
+                    pane_id: candidate.pane_id,
+                    pane: candidate.pane,
+                    generation: candidate.generation,
+                    lifecycle_notification: ticket,
+                },
+            );
+        }
+
+        CommittedTabPaneRetirement {
+            removed_panes_by_group,
+            output_batches_by_group,
+            removed_live,
+            removed_ids,
+        }
+    }
+}
+
 struct RemovedTabRegistration {
     structural_panes: Vec<Arc<dyn Pane>>,
     removed_panes: Vec<RemovedPaneRegistration>,
@@ -4197,6 +4254,13 @@ struct PreparedLivePaneRegistrationInsert {
     bind_existing_domain: Option<Weak<dyn Domain>>,
 }
 
+struct PreparedLivePaneRegistrationRemoval {
+    pane_id: PaneId,
+    pane: Arc<dyn Pane>,
+    domain_id: DomainId,
+    registration: PaneRegistrationHandle,
+}
+
 struct PreparedStructuralPaneBind {
     pane_id: PaneId,
     pane: Arc<dyn Pane>,
@@ -4223,6 +4287,27 @@ pub(crate) struct DesiredPaneStructuralState {
     pub(crate) domain_id: DomainId,
 }
 
+/// One exact structural owner after an in-mux relocation.
+///
+/// A pane whose live registry entry survived admission carries both live
+/// metadata fields. A pane detached after an exact operation guard was
+/// admitted carries neither. Partial metadata is never a valid authority
+/// state, and relocation must not recreate a retired numeric registry slot.
+pub(crate) struct RelocatedPaneStructuralState {
+    pub(crate) pane_id: PaneId,
+    pub(crate) pane: Arc<dyn Pane>,
+    pub(crate) lane: PaneStructuralLane,
+    pub(crate) registration: Option<PaneRegistrationHandle>,
+    pub(crate) domain_id: Option<DomainId>,
+}
+
+/// Complete current and successor ownership for one affected exact tab.
+pub(crate) struct StructuralRelocationTabReplacement {
+    pub(crate) tab: Arc<Tab>,
+    pub(crate) current: Vec<ExactPaneStructuralState>,
+    pub(crate) desired: Vec<RelocatedPaneStructuralState>,
+}
+
 struct PreparedPaneStructuralOwner {
     pane_id: PaneId,
     owner: PaneStructuralOwnerRegistration,
@@ -4236,6 +4321,85 @@ struct PreparedTabStructuralReplacement {
     next_structural_generation: u64,
 }
 
+pub(crate) struct PreparedStructuralRelocation<'authority> {
+    authority: &'authority mut PaneAuthorityIndex,
+    tab_replacements: Vec<PreparedDomainAuthorityTabReplacement>,
+    next_structural_generation: u64,
+}
+
+impl PreparedStructuralRelocation<'_> {
+    /// Commit while retaining the exact authority write cut used for
+    /// preparation. The lifetime-bound token prevents an intervening writer
+    /// from replacing a live generation or structural owner between preflight
+    /// and the caller's callback-free topology commit.
+    pub(crate) fn commit(self) {
+        let Self {
+            authority,
+            tab_replacements,
+            next_structural_generation,
+        } = self;
+        for replacement in &tab_replacements {
+            for pane_id in &replacement.current_pane_ids {
+                let removed = authority.structural_by_pane_id.remove(pane_id);
+                debug_assert!(removed.is_some_and(|owner| {
+                    owner.matches_tab(&replacement.tab)
+                }));
+            }
+            authority
+                .pane_ids_by_tab
+                .remove(&replacement.tab.tab_id());
+        }
+        for replacement in tab_replacements {
+            if let Some(members) = replacement.replacement_members {
+                let prior = authority
+                    .pane_ids_by_tab
+                    .insert(replacement.tab.tab_id(), members);
+                debug_assert!(prior.is_none());
+            }
+            for owner in replacement.replacement {
+                let prior = authority
+                    .structural_by_pane_id
+                    .insert(owner.pane_id, owner.owner);
+                debug_assert!(prior.is_none());
+            }
+        }
+        authority.next_structural_generation = next_structural_generation;
+        #[cfg(test)]
+        if let Err(error) = authority.validate_complete_structural_bijection() {
+            panic!(
+                "structural relocation broke the authority bijection: {:#}",
+                error
+            );
+        }
+    }
+}
+
+pub(crate) struct ExactPaneAuthorityState {
+    pub(crate) pane_id: PaneId,
+    pub(crate) pane: Arc<dyn Pane>,
+    pub(crate) registration: PaneRegistrationHandle,
+}
+
+pub(crate) struct DomainAuthorityTabReplacement {
+    pub(crate) tab: Arc<Tab>,
+    pub(crate) current: Vec<ExactPaneStructuralState>,
+    pub(crate) desired: Vec<DesiredPaneStructuralState>,
+}
+
+struct PreparedDomainAuthorityTabReplacement {
+    tab: Arc<Tab>,
+    current_pane_ids: Vec<PaneId>,
+    replacement: Vec<PreparedPaneStructuralOwner>,
+    replacement_members: Option<TabStructuralOwnerRegistrations>,
+}
+
+pub(crate) struct PreparedDomainFloatingAuthorityReconcile {
+    domain_id: DomainId,
+    final_domain_registrations: Option<DomainPaneRegistrations>,
+    tab_replacements: Vec<PreparedDomainAuthorityTabReplacement>,
+    next_structural_generation: u64,
+}
+
 impl PaneAuthorityIndex {
     fn prepare_live_registration_insert(
         &mut self,
@@ -4244,11 +4408,26 @@ impl PaneAuthorityIndex {
         domain_id: DomainId,
         expected_domain: Option<&Arc<dyn Domain>>,
     ) -> anyhow::Result<PreparedLivePaneRegistrationInsert> {
+        anyhow::ensure!(
+            self.registrations_by_domain.iter().all(|(other_domain_id, registrations)| {
+                *other_domain_id == domain_id
+                    || !registrations.pane_registrations.contains_key(&pane_id)
+            }),
+            "pane {pane_id} is stranded in another domain-registration directory"
+        );
         if let Some(owner) = self.structural_by_pane_id.get(&pane_id) {
             anyhow::ensure!(
                 owner.matches_pane(pane),
                 "pane {pane_id} has a different exact structural allocation"
             );
+            let exact_tab = owner.tab.upgrade().ok_or_else(|| {
+                anyhow!("pane {pane_id} structural owner retains a dead tab allocation")
+            })?;
+            anyhow::ensure!(
+                owner.matches_tab(&exact_tab),
+                "pane {pane_id} structural owner retains a stale tab generation"
+            );
+            self.validate_structural_reverse_exact(pane_id, &exact_tab)?;
             anyhow::ensure!(
                 owner.registration.is_none(),
                 "pane {pane_id} structural owner already carries a live registration"
@@ -4339,44 +4518,111 @@ impl PaneAuthorityIndex {
         }
     }
 
-    fn remove_live_registration(
-        &mut self,
+    fn prepare_live_registration_removal(
+        &self,
         pane_id: PaneId,
         pane: &Arc<dyn Pane>,
         domain_id: DomainId,
+        expected_domain: Option<&Arc<dyn Domain>>,
         registration: &PaneRegistrationHandle,
-    ) -> bool {
-        let removed = self
-            .registrations_by_domain
-            .get_mut(&domain_id)
-            .and_then(|registrations| {
-                registrations
-                    .pane_registrations
-                    .get(&pane_id)
-                    .is_some_and(|current| current.same_registration(registration))
-                    .then(|| registrations.pane_registrations.remove(&pane_id))
-                    .flatten()
-            })
-            .is_some();
-        if self
+    ) -> anyhow::Result<PreparedLivePaneRegistrationRemoval> {
+        anyhow::ensure!(
+            registration.pane_id() == pane_id && registration.is_same_pane(pane),
+            "pane {pane_id} removal registration names another exact allocation"
+        );
+        let registrations = self
             .registrations_by_domain
             .get(&domain_id)
-            .is_some_and(|registrations| registrations.pane_registrations.is_empty())
-        {
-            self.registrations_by_domain.remove(&domain_id);
+            .ok_or_else(|| anyhow!("domain {domain_id} lacks a pane-registration directory"))?;
+        anyhow::ensure!(
+            registrations.matches_domain(expected_domain),
+            "domain {domain_id} pane directory names another exact domain allocation"
+        );
+        anyhow::ensure!(
+            registrations
+                .pane_registrations
+                .get(&pane_id)
+                .is_some_and(|current| current.same_registration(registration)),
+            "pane {pane_id} lacks its exact domain-registration generation"
+        );
+        anyhow::ensure!(
+            self.registrations_by_domain.iter().all(|(other_domain_id, registrations)| {
+                *other_domain_id == domain_id
+                    || !registrations.pane_registrations.contains_key(&pane_id)
+            }),
+            "pane {pane_id} is duplicated across domain-registration directories"
+        );
+        if let Some(owner) = self.structural_by_pane_id.get(&pane_id) {
+            anyhow::ensure!(
+                owner.matches_pane(pane)
+                    && owner.domain_id == Some(domain_id)
+                    && owner.registration.as_ref().is_some_and(|current| {
+                        current.same_registration(registration)
+                    }),
+                "pane {pane_id} structural-owner live metadata disagrees with removal authority"
+            );
+            let tab = owner
+                .tab
+                .upgrade()
+                .ok_or_else(|| anyhow!("pane {pane_id} structural owner tab was dropped"))?;
+            let tab_id = tab.tab_id();
+            anyhow::ensure!(
+                owner.matches_tab(&tab)
+                    && self
+                        .pane_ids_by_tab
+                        .get(&tab_id)
+                        .is_some_and(|members| {
+                            members.matches_tab(&tab) && members.pane_ids.contains(&pane_id)
+                        }),
+                "pane {pane_id} structural-owner reverse directory is inconsistent"
+            );
+            anyhow::ensure!(
+                self.pane_ids_by_tab.iter().all(|(candidate_tab_id, members)| {
+                    *candidate_tab_id == tab_id || !members.pane_ids.contains(&pane_id)
+                }),
+                "pane {pane_id} appears in more than one structural reverse directory"
+            );
+        } else {
+            anyhow::ensure!(
+                self.pane_ids_by_tab
+                    .values()
+                    .all(|members| !members.pane_ids.contains(&pane_id)),
+                "ownerless pane {pane_id} remains stranded in a structural reverse directory"
+            );
         }
-        if let Some(owner) = self.structural_by_pane_id.get_mut(&pane_id) {
-            if owner.matches_pane(pane)
-                && owner
-                    .registration
-                    .as_ref()
-                    .is_some_and(|current| current.same_registration(registration))
-            {
-                owner.registration = None;
-                owner.domain_id = None;
-            }
+        Ok(PreparedLivePaneRegistrationRemoval {
+            pane_id,
+            pane: Arc::clone(pane),
+            domain_id,
+            registration: registration.clone(),
+        })
+    }
+
+    fn commit_live_registration_removal(
+        &mut self,
+        prepared: PreparedLivePaneRegistrationRemoval,
+    ) {
+        let registrations = self
+            .registrations_by_domain
+            .get_mut(&prepared.domain_id)
+            .expect("prepared domain-registration directory remains present");
+        let removed = registrations
+            .pane_registrations
+            .remove(&prepared.pane_id)
+            .expect("prepared exact domain registration remains present");
+        debug_assert!(removed.same_registration(&prepared.registration));
+        if registrations.pane_registrations.is_empty() {
+            self.registrations_by_domain.remove(&prepared.domain_id);
         }
-        removed
+        if let Some(owner) = self.structural_by_pane_id.get_mut(&prepared.pane_id) {
+            debug_assert!(owner.matches_pane(&prepared.pane));
+            debug_assert_eq!(owner.domain_id, Some(prepared.domain_id));
+            debug_assert!(owner.registration.as_ref().is_some_and(|current| {
+                current.same_registration(&prepared.registration)
+            }));
+            owner.registration = None;
+            owner.domain_id = None;
+        }
     }
 
     fn contains_live_registration(
@@ -4391,6 +4637,34 @@ impl PaneAuthorityIndex {
             .is_some_and(|current| current.same_registration(registration))
     }
 
+    /// Validate one exact pane -> domain registration in O(1) for production.
+    /// The map is private and all writers are serialized by this mutex; tests
+    /// additionally scan every domain bucket so planted duplicate authority is
+    /// rejected without taxing large-session mutations in release builds.
+    fn validate_live_registration_exact(
+        &self,
+        pane_id: PaneId,
+        domain_id: DomainId,
+        registration: &PaneRegistrationHandle,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.contains_live_registration(pane_id, domain_id, registration),
+            "pane {pane_id} lacks exact live domain {domain_id} authority"
+        );
+        #[cfg(test)]
+        anyhow::ensure!(
+            self.registrations_by_domain
+                .values()
+                .filter(|registrations| {
+                    registrations.pane_registrations.contains_key(&pane_id)
+                })
+                .count()
+                == 1,
+            "pane {pane_id} appears in more than one domain-registration directory"
+        );
+        Ok(())
+    }
+
     fn domain_directory_matches(
         &self,
         domain_id: DomainId,
@@ -4399,6 +4673,95 @@ impl PaneAuthorityIndex {
         self.registrations_by_domain
             .get(&domain_id)
             .is_some_and(|registrations| registrations.matches_domain(expected))
+    }
+
+    /// Validate the exact forward/reverse structural-index pair.
+    ///
+    /// Production writers can resolve the authoritative reverse bucket in
+    /// O(1) from the forward owner. The index is private and every mutation is
+    /// serialized by this mutex, so an additional all-tab uniqueness scan
+    /// would turn stable pane lookup into an O(session tabs) operation. Tests
+    /// retain the exhaustive planted-corruption oracle below.
+    fn validate_structural_reverse_exact(
+        &self,
+        pane_id: PaneId,
+        tab: &Arc<Tab>,
+    ) -> anyhow::Result<()> {
+        let members = self.pane_ids_by_tab.get(&tab.tab_id()).ok_or_else(|| {
+            anyhow!(
+                "tab {} reverse structural-owner directory omits pane {pane_id}",
+                tab.tab_id()
+            )
+        })?;
+        anyhow::ensure!(
+            members.matches_tab(tab) && members.pane_ids.contains(&pane_id),
+            "pane {pane_id} reverse structural-owner authority names another exact tab"
+        );
+        #[cfg(test)]
+        anyhow::ensure!(
+            self.pane_ids_by_tab
+                .iter()
+                .filter(|(_, candidate)| candidate.pane_ids.contains(&pane_id))
+                .count()
+                == 1,
+            "pane {pane_id} appears in more than one reverse structural-owner directory"
+        );
+        Ok(())
+    }
+
+    /// Exhaustive test-only oracle for the private forward/reverse ownership
+    /// bijection. Production operations deliberately use the O(1) exact
+    /// reverse check above; planted-corruption tests use this full census to
+    /// prove that an omitted forward or reverse entry can never be silently
+    /// carried through a transaction.
+    #[cfg(test)]
+    fn validate_complete_structural_bijection(&self) -> anyhow::Result<()> {
+        let reverse_members = self.pane_ids_by_tab.values().try_fold(
+            0usize,
+            |count, members| {
+                anyhow::ensure!(
+                    !members.pane_ids.is_empty(),
+                    "structural reverse index retains an empty tab bucket"
+                );
+                count
+                    .checked_add(members.pane_ids.len())
+                    .ok_or_else(|| anyhow!("structural reverse-member count overflow"))
+            },
+        )?;
+        anyhow::ensure!(
+            reverse_members == self.structural_by_pane_id.len(),
+            "structural forward/reverse cardinality differs: {} forward, {reverse_members} reverse",
+            self.structural_by_pane_id.len()
+        );
+
+        for (pane_id, owner) in &self.structural_by_pane_id {
+            let tab = owner.tab.upgrade().ok_or_else(|| {
+                anyhow!("pane {pane_id} structural owner retains a dead tab allocation")
+            })?;
+            anyhow::ensure!(
+                owner.matches_tab(&tab),
+                "pane {pane_id} structural owner retains a stale tab generation"
+            );
+            self.validate_structural_reverse_exact(*pane_id, &tab)?;
+        }
+        for (tab_id, members) in &self.pane_ids_by_tab {
+            let tab = members.tab.upgrade().ok_or_else(|| {
+                anyhow!("tab {tab_id} reverse structural owner retains a dead allocation")
+            })?;
+            anyhow::ensure!(
+                members.matches_tab(&tab),
+                "tab {tab_id} reverse structural owner retains a stale generation"
+            );
+            for pane_id in &members.pane_ids {
+                anyhow::ensure!(
+                    self.structural_by_pane_id
+                        .get(pane_id)
+                        .is_some_and(|owner| owner.matches_tab(&tab)),
+                    "tab {tab_id} reverse structural owner has no exact forward pane {pane_id}"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn prepare_structural_bind(
@@ -4435,6 +4798,7 @@ impl PaneAuthorityIndex {
                 registration_matches,
                 "pane {pane_id} structural owner registration disagrees with live authority"
             );
+            self.validate_structural_reverse_exact(pane_id, &tab)?;
             return Ok(PreparedStructuralPaneBind {
                 pane_id,
                 pane,
@@ -4510,14 +4874,14 @@ impl PaneAuthorityIndex {
         self.prepare_structural_bind(pane_id, pane, tab, lane, registration)
     }
 
-    fn commit_structural_bind(&mut self, mut prepared: PreparedStructuralPaneBind) {
+    fn commit_structural_bind(
+        &mut self,
+        mut prepared: PreparedStructuralPaneBind,
+        tab_mux_owner_generation: u64,
+    ) {
         if prepared.unchanged {
             return;
         }
-        let tab_mux_owner_generation = prepared
-            .tab
-            .active_mux_owner_generation()
-            .expect("structural owner commit requires active tab authority");
         if let Some(mut members) = prepared.new_tab_members.take() {
             members.mux_owner_generation = tab_mux_owner_generation;
             let inserted = members.pane_ids.insert(prepared.pane_id);
@@ -4562,6 +4926,12 @@ impl PaneAuthorityIndex {
         if !matches {
             return false;
         }
+        if self
+            .validate_structural_reverse_exact(pane_id, tab)
+            .is_err()
+        {
+            return false;
+        }
         self.structural_by_pane_id.remove(&pane_id);
         if let Some(members) = self.pane_ids_by_tab.get_mut(&tab.tab_id()) {
             debug_assert!(members.matches_tab(tab));
@@ -4588,6 +4958,7 @@ impl PaneAuthorityIndex {
             owner.matches_pane(pane) && owner.matches_tab(tab),
             "pane {pane_id} structural-owner authority names another exact allocation"
         );
+        self.validate_structural_reverse_exact(pane_id, tab)?;
         anyhow::ensure!(
             lane.is_none_or(|lane| owner.lane == lane),
             "pane {pane_id} structural-owner lane {:?} does not match {:?}",
@@ -4606,12 +4977,921 @@ impl PaneAuthorityIndex {
         Ok(())
     }
 
+    /// Prepare a complete exact-owner transfer across a bounded set of tabs.
+    ///
+    /// This transaction neither publishes nor retires a live pane generation:
+    /// every desired owner must be one of the supplied current exact owners,
+    /// and its live-or-detached metadata must remain byte-for-byte equivalent.
+    /// That makes the operation suitable for guarded moves after a concurrent
+    /// local registry detach without numerically re-authorizing the pane.
+    /// The caller holds `domain_registration`, then `pane_registration`, then
+    /// this authority mutex through the final topology commit.
+    pub(crate) fn prepare_structural_relocation<'authority>(
+        &'authority mut self,
+        mux: &Mux,
+        operation_witnesses: &[&PaneOperationGuard],
+        replacements: Vec<StructuralRelocationTabReplacement>,
+    ) -> anyhow::Result<PreparedStructuralRelocation<'authority>> {
+        #[cfg(test)]
+        self.validate_complete_structural_bijection()?;
+        anyhow::ensure!(
+            !replacements.is_empty(),
+            "structural relocation must affect at least one exact tab"
+        );
+        let current_count = replacements.iter().try_fold(0usize, |count, replacement| {
+            count
+                .checked_add(replacement.current.len())
+                .ok_or_else(|| anyhow!("current relocation owner count overflow"))
+        })?;
+        let desired_count = replacements.iter().try_fold(0usize, |count, replacement| {
+            count
+                .checked_add(replacement.desired.len())
+                .ok_or_else(|| anyhow!("desired relocation owner count overflow"))
+        })?;
+        let current_tab_bucket_count = replacements
+            .iter()
+            .filter(|replacement| !replacement.current.is_empty())
+            .count();
+        let desired_tab_bucket_count = replacements
+            .iter()
+            .filter(|replacement| !replacement.desired.is_empty())
+            .count();
+        anyhow::ensure!(
+            current_count == desired_count,
+            "structural relocation changes owner cardinality from {current_count} to {desired_count}"
+        );
+        // The caller holds `pane_registration`, so this callback-free snapshot
+        // cannot change before the prepared relocation commits. Keeping the
+        // read guard only for preflight preserves the canonical
+        // pane-authority -> panes lock order without extending the final cut.
+        let live_panes = mux.panes.read();
+        let exact_domains = mux.domains.read();
+        let retired_domain_ids = mux.retired_domain_ids.lock();
+        let mut witnesses_by_pane = HashMap::<PaneId, &PaneOperationGuard>::new();
+        witnesses_by_pane
+            .try_reserve(operation_witnesses.len())
+            .map_err(|error| anyhow!("reserve relocation operation witnesses: {error}"))?;
+        for operation in operation_witnesses {
+            let admitted_domain_id = operation.admitted_domain_id();
+            anyhow::ensure!(
+                std::ptr::eq(operation.owner().as_ref(), mux),
+                "pane {} relocation witness belongs to another mux",
+                operation.pane_id()
+            );
+            anyhow::ensure!(
+                !retired_domain_ids.contains(&admitted_domain_id),
+                "pane {} relocation witness names retired domain {admitted_domain_id}",
+                operation.pane_id()
+            );
+            let exact_domain = exact_domains.get(&admitted_domain_id);
+            let domain_is_current = match (operation.admitted_domain(), exact_domain) {
+                (Some(expected), Some(current)) => {
+                    Weak::ptr_eq(expected, &Arc::downgrade(current))
+                }
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            };
+            anyhow::ensure!(
+                domain_is_current,
+                "pane {} relocation witness names a missing or replaced domain {admitted_domain_id}",
+                operation.pane_id()
+            );
+            anyhow::ensure!(
+                witnesses_by_pane
+                    .insert(operation.pane_id(), *operation)
+                    .is_none(),
+                "pane {} has more than one relocation witness",
+                operation.pane_id()
+            );
+        }
+
+        struct CurrentRelocationOwner {
+            tab_identity: usize,
+            pane: Arc<dyn Pane>,
+            lane: PaneStructuralLane,
+            registration: Option<PaneRegistrationHandle>,
+            domain_id: Option<DomainId>,
+            generation: u64,
+            guard_witnessed: bool,
+        }
+        struct ObservedRelocationTab {
+            tab: Arc<Tab>,
+            tab_identity: usize,
+            mux_owner_generation: u64,
+            current_pane_ids: Vec<PaneId>,
+            desired: Vec<RelocatedPaneStructuralState>,
+        }
+
+        let mut affected_tab_ids = HashSet::new();
+        affected_tab_ids
+            .try_reserve(replacements.len())
+            .map_err(|error| anyhow!("reserve relocation tab ids: {error}"))?;
+        let mut affected_tab_identities = HashSet::new();
+        affected_tab_identities
+            .try_reserve(replacements.len())
+            .map_err(|error| anyhow!("reserve relocation tab identities: {error}"))?;
+        let mut current_owners = HashMap::<PaneId, CurrentRelocationOwner>::new();
+        current_owners
+            .try_reserve(current_count)
+            .map_err(|error| anyhow!("reserve current relocation owners: {error}"))?;
+        let mut current_identities = HashSet::new();
+        current_identities
+            .try_reserve(current_count)
+            .map_err(|error| anyhow!("reserve current relocation identities: {error}"))?;
+        let mut observed_tabs = Vec::new();
+        observed_tabs
+            .try_reserve_exact(replacements.len())
+            .map_err(|error| anyhow!("reserve observed relocation tabs: {error}"))?;
+
+        for replacement in replacements {
+            let tab_id = replacement.tab.tab_id();
+            let tab_identity = Arc::as_ptr(&replacement.tab) as usize;
+            anyhow::ensure!(
+                affected_tab_ids.insert(tab_id)
+                    && affected_tab_identities.insert(tab_identity),
+                "tab {tab_id} appears more than once in one structural relocation"
+            );
+            let mux_owner_generation = replacement
+                .tab
+                .active_mux_owner_generation()
+                .ok_or_else(|| anyhow!("tab {tab_id} lacks active mux-owner generation"))?;
+            let indexed = self.pane_ids_by_tab.get(&tab_id);
+            anyhow::ensure!(
+                indexed.is_none_or(|members| members.matches_tab(&replacement.tab)),
+                "tab {tab_id} structural directory names another exact allocation"
+            );
+            anyhow::ensure!(
+                indexed.is_some() == !replacement.current.is_empty(),
+                "tab {tab_id} retains an empty or missing reverse structural directory"
+            );
+            anyhow::ensure!(
+                indexed.map_or(0, |members| members.pane_ids.len())
+                    == replacement.current.len(),
+                "tab {tab_id} structural index cardinality {} differs from relocation topology {}",
+                indexed.map_or(0, |members| members.pane_ids.len()),
+                replacement.current.len()
+            );
+
+            let mut current_pane_ids = Vec::new();
+            current_pane_ids
+                .try_reserve_exact(replacement.current.len())
+                .map_err(|error| anyhow!("reserve tab {tab_id} current relocation ids: {error}"))?;
+            for state in replacement.current {
+                let identity = Arc::as_ptr(&state.pane).cast::<()>() as usize;
+                anyhow::ensure!(
+                    current_identities.insert(identity),
+                    "one exact pane allocation has more than one current relocation owner"
+                );
+                let owner = self
+                    .structural_by_pane_id
+                    .get(&state.pane_id)
+                    .ok_or_else(|| {
+                        anyhow!("pane {} lacks structural-owner authority", state.pane_id)
+                    })?;
+                anyhow::ensure!(
+                    owner.matches_pane(&state.pane)
+                        && owner.matches_tab(&replacement.tab)
+                        && owner.lane == state.lane
+                        && indexed.is_some_and(|members| {
+                            members.pane_ids.contains(&state.pane_id)
+                        }),
+                    "pane {} structural authority disagrees with relocation tab {tab_id}",
+                    state.pane_id
+                );
+                self.validate_structural_reverse_exact(state.pane_id, &replacement.tab)?;
+                let (registration, domain_id) = match (
+                    owner.registration.as_ref(),
+                    owner.domain_id,
+                ) {
+                    (Some(registration), Some(domain_id)) => {
+                        anyhow::ensure!(
+                            registration.pane_id() == state.pane_id
+                                && registration.is_same_pane(&state.pane),
+                            "pane {} live relocation authority is not exact-current",
+                            state.pane_id
+                        );
+                        self.validate_live_registration_exact(
+                            state.pane_id,
+                            domain_id,
+                            registration,
+                        )?;
+                        anyhow::ensure!(
+                            live_panes.get(&state.pane_id).is_some_and(|registered| {
+                                registered.domain_id == domain_id
+                                    && registration.matches_live_registration(registered)
+                            }),
+                            "pane {} live relocation authority disagrees with the mux registry",
+                            state.pane_id
+                        );
+                        let exact_domain = exact_domains.get(&domain_id);
+                        anyhow::ensure!(
+                            self.domain_directory_matches(domain_id, exact_domain)
+                                && !retired_domain_ids.contains(&domain_id),
+                            "pane {} live relocation directory names a missing, replaced, or retired domain",
+                            state.pane_id
+                        );
+                        (Some(registration.clone()), Some(domain_id))
+                    }
+                    (None, None) => {
+                        anyhow::ensure!(
+                            !live_panes.contains_key(&state.pane_id),
+                            "detached pane {} still occupies a live mux registry slot",
+                            state.pane_id
+                        );
+                        #[cfg(test)]
+                        anyhow::ensure!(
+                            self.registrations_by_domain.values().all(|registrations| {
+                                !registrations
+                                    .pane_registrations
+                                    .contains_key(&state.pane_id)
+                            }),
+                            "detached pane {} remains in a domain-registration directory",
+                            state.pane_id
+                        );
+                        (None, None)
+                    }
+                    _ => anyhow::bail!(
+                        "pane {} structural owner has partial live metadata",
+                        state.pane_id
+                    ),
+                };
+                let guard_witnessed = if let Some(operation) =
+                    witnesses_by_pane.remove(&state.pane_id)
+                {
+                    anyhow::ensure!(
+                        operation.is_same_pane(&state.pane),
+                        "pane {} relocation witness names another exact allocation",
+                        state.pane_id
+                    );
+                    let witness = operation.registration();
+                    let exact_witness = match &registration {
+                        Some(current) => {
+                            domain_id.is_some_and(|domain_id| {
+                                operation.admitted_domain_id() == domain_id
+                                    && current.same_registration(&witness)
+                            })
+                        }
+                        None => witness.guards_detached_topology(mux, &state.pane),
+                    };
+                    anyhow::ensure!(
+                        exact_witness,
+                        "pane {} relocation witness no longer authorizes its live-or-detached generation",
+                        state.pane_id
+                    );
+                    true
+                } else {
+                    false
+                };
+                anyhow::ensure!(
+                    current_owners
+                        .insert(
+                            state.pane_id,
+                            CurrentRelocationOwner {
+                                tab_identity,
+                                pane: Arc::clone(&state.pane),
+                                lane: state.lane,
+                                registration,
+                                domain_id,
+                                generation: owner.generation,
+                                guard_witnessed,
+                            },
+                        )
+                        .is_none(),
+                    "pane {} has more than one current structural owner",
+                    state.pane_id
+                );
+                current_pane_ids.push(state.pane_id);
+            }
+            observed_tabs.push(ObservedRelocationTab {
+                tab: replacement.tab,
+                tab_identity,
+                mux_owner_generation,
+                current_pane_ids,
+                desired: replacement.desired,
+            });
+        }
+
+        // Relocation preserves total owner cardinality. Commit removes every
+        // affected forward/reverse entry before inserting its successor, so
+        // the existing map capacities are already sufficient. Reserving the
+        // full desired cardinality here would spuriously grow large-session
+        // authority maps on an exact no-op move.
+        let mut desired_ids = HashSet::new();
+        desired_ids
+            .try_reserve(desired_count)
+            .map_err(|error| anyhow!("reserve desired relocation ids: {error}"))?;
+        let mut desired_identities = HashSet::new();
+        desired_identities
+            .try_reserve(desired_count)
+            .map_err(|error| anyhow!("reserve desired relocation identities: {error}"))?;
+        let mut prepared_tabs = Vec::new();
+        prepared_tabs
+            .try_reserve_exact(observed_tabs.len())
+            .map_err(|error| anyhow!("reserve prepared relocation tabs: {error}"))?;
+        let mut next_generation = self.next_structural_generation;
+
+        for observed in observed_tabs {
+            let ObservedRelocationTab {
+                tab,
+                tab_identity,
+                mux_owner_generation,
+                current_pane_ids,
+                desired,
+            } = observed;
+            let tab_id = tab.tab_id();
+            let mut replacement_members = if desired.is_empty() {
+                None
+            } else {
+                let mut pane_ids = HashSet::new();
+                pane_ids
+                    .try_reserve(desired.len())
+                    .map_err(|error| {
+                        anyhow!("reserve tab {tab_id} relocated members: {error}")
+                    })?;
+                Some(TabStructuralOwnerRegistrations {
+                    tab: Arc::downgrade(&tab),
+                    mux_owner_generation,
+                    pane_ids,
+                })
+            };
+            let mut replacement_owners = Vec::new();
+            replacement_owners
+                .try_reserve_exact(desired.len())
+                .map_err(|error| {
+                    anyhow!("reserve tab {tab_id} relocated structural owners: {error}")
+                })?;
+            for state in desired {
+                let identity = Arc::as_ptr(&state.pane).cast::<()>() as usize;
+                anyhow::ensure!(
+                    desired_ids.insert(state.pane_id),
+                    "pane {} has more than one desired relocation owner",
+                    state.pane_id
+                );
+                anyhow::ensure!(
+                    desired_identities.insert(identity),
+                    "one exact pane allocation has more than one desired relocation owner"
+                );
+                anyhow::ensure!(
+                    replacement_members
+                        .as_mut()
+                        .is_some_and(|members| members.pane_ids.insert(state.pane_id)),
+                    "tab {tab_id} desired relocation contains duplicate pane {}",
+                    state.pane_id
+                );
+                anyhow::ensure!(
+                    state.registration.is_some() == state.domain_id.is_some(),
+                    "pane {} desired relocation has partial live metadata",
+                    state.pane_id
+                );
+                if let Some(registration) = &state.registration {
+                    anyhow::ensure!(
+                        registration.pane_id() == state.pane_id
+                            && registration.is_same_pane(&state.pane),
+                        "pane {} desired relocation registration names another exact allocation",
+                        state.pane_id
+                    );
+                }
+                let current = current_owners.remove(&state.pane_id).ok_or_else(|| {
+                    anyhow!(
+                        "pane {} desired relocation was not a current affected owner",
+                        state.pane_id
+                    )
+                })?;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&current.pane, &state.pane),
+                    "pane {} desired relocation changes exact allocation",
+                    state.pane_id
+                );
+                let same_registration = match (&current.registration, &state.registration) {
+                    (Some(current), Some(desired)) => current.same_registration(desired),
+                    (None, None) => true,
+                    (Some(_), None) | (None, Some(_)) => false,
+                };
+                anyhow::ensure!(
+                    same_registration && current.domain_id == state.domain_id,
+                    "pane {} desired relocation changes live-or-detached authority",
+                    state.pane_id
+                );
+                let generation = if current.tab_identity == tab_identity
+                    && current.lane == state.lane
+                {
+                    current.generation
+                } else {
+                    anyhow::ensure!(
+                        current.guard_witnessed,
+                        "pane {} relocation changes structural owner without an exact operation guard",
+                        state.pane_id
+                    );
+                    next_generation = next_generation
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("pane structural-owner generation exhausted"))?;
+                    next_generation
+                };
+                replacement_owners.push(PreparedPaneStructuralOwner {
+                    pane_id: state.pane_id,
+                    owner: PaneStructuralOwnerRegistration {
+                        pane: Arc::downgrade(&state.pane),
+                        tab: Arc::downgrade(&tab),
+                        tab_mux_owner_generation: mux_owner_generation,
+                        lane: state.lane,
+                        registration: state.registration,
+                        domain_id: state.domain_id,
+                        generation,
+                    },
+                });
+            }
+            prepared_tabs.push(PreparedDomainAuthorityTabReplacement {
+                tab,
+                current_pane_ids,
+                replacement: replacement_owners,
+                replacement_members,
+            });
+        }
+        anyhow::ensure!(
+            current_owners.is_empty(),
+            "structural relocation drops one or more current exact owners"
+        );
+        anyhow::ensure!(
+            witnesses_by_pane.is_empty(),
+            "one or more relocation witnesses do not name a current affected pane"
+        );
+        self.pane_ids_by_tab
+            .try_reserve(desired_tab_bucket_count.saturating_sub(current_tab_bucket_count))
+            .map_err(|error| anyhow!("reserve relocated tab-owner directories: {error}"))?;
+
+        Ok(PreparedStructuralRelocation {
+            authority: self,
+            tab_replacements: prepared_tabs,
+            next_structural_generation: next_generation,
+        })
+    }
+
+    fn prepare_domain_floating_authority_reconcile(
+        &mut self,
+        domain_id: DomainId,
+        expected_domain: &Arc<dyn Domain>,
+        final_domain: Vec<ExactPaneAuthorityState>,
+        replacements: Vec<DomainAuthorityTabReplacement>,
+    ) -> anyhow::Result<PreparedDomainFloatingAuthorityReconcile> {
+        #[cfg(test)]
+        self.validate_complete_structural_bijection()?;
+        let existing_domain = self.registrations_by_domain.get(&domain_id);
+        anyhow::ensure!(
+            existing_domain.is_none_or(|registrations| {
+                registrations.matches_domain(Some(expected_domain))
+            }),
+            "domain {domain_id} pane directory names another exact domain allocation"
+        );
+
+        let mut final_domain_registrations = HashMap::new();
+        final_domain_registrations
+            .try_reserve(final_domain.len())
+            .map_err(|error| anyhow!("reserve final domain pane directory: {error}"))?;
+        let mut final_identities = HashSet::new();
+        final_identities
+            .try_reserve(final_domain.len())
+            .map_err(|error| anyhow!("reserve final domain pane identities: {error}"))?;
+        for state in final_domain {
+            anyhow::ensure!(
+                state.registration.pane_id() == state.pane_id
+                    && state.registration.is_same_pane(&state.pane),
+                "pane {} final domain registration names another exact allocation",
+                state.pane_id
+            );
+            anyhow::ensure!(
+                final_identities.insert(Arc::as_ptr(&state.pane).cast::<()>() as usize),
+                "one exact pane allocation appears more than once in final domain {domain_id}"
+            );
+            anyhow::ensure!(
+                self.registrations_by_domain.iter().all(|(other_domain_id, registrations)| {
+                    *other_domain_id == domain_id
+                        || !registrations
+                            .pane_registrations
+                            .contains_key(&state.pane_id)
+                }),
+                "pane {} is indexed by another domain",
+                state.pane_id
+            );
+            anyhow::ensure!(
+                final_domain_registrations
+                    .insert(state.pane_id, state.registration)
+                    .is_none(),
+                "final domain {domain_id} contains duplicate pane id {}",
+                state.pane_id
+            );
+        }
+        let needs_domain_directory_slot = !final_domain_registrations.is_empty()
+            && !self.registrations_by_domain.contains_key(&domain_id);
+
+        let mut affected_tabs = HashMap::<TabId, usize>::new();
+        affected_tabs
+            .try_reserve(replacements.len())
+            .map_err(|error| anyhow!("reserve affected authority tabs: {error}"))?;
+        let mut affected_tab_identities = HashSet::new();
+        affected_tab_identities
+            .try_reserve(replacements.len())
+            .map_err(|error| anyhow!("reserve affected exact tab identities: {error}"))?;
+        let current_count = replacements.iter().try_fold(0usize, |count, replacement| {
+            count
+                .checked_add(replacement.current.len())
+                .ok_or_else(|| anyhow!("current structural owner count overflow"))
+        })?;
+        let desired_count = replacements.iter().try_fold(0usize, |count, replacement| {
+            count
+                .checked_add(replacement.desired.len())
+                .ok_or_else(|| anyhow!("desired structural owner count overflow"))
+        })?;
+        let current_tab_bucket_count = replacements
+            .iter()
+            .filter(|replacement| !replacement.current.is_empty())
+            .count();
+        let desired_tab_bucket_count = replacements
+            .iter()
+            .filter(|replacement| !replacement.desired.is_empty())
+            .count();
+        let mut current_ids = HashSet::new();
+        current_ids
+            .try_reserve(current_count)
+            .map_err(|error| anyhow!("reserve current structural owner ids: {error}"))?;
+        let mut current_identities = HashSet::new();
+        current_identities
+            .try_reserve(current_count)
+            .map_err(|error| anyhow!("reserve current structural identities: {error}"))?;
+        let mut foreign_current = HashMap::<
+            PaneId,
+            (
+                usize,
+                usize,
+                PaneStructuralLane,
+                PaneRegistrationHandle,
+                DomainId,
+            ),
+        >::new();
+        foreign_current
+            .try_reserve(current_count)
+            .map_err(|error| anyhow!("reserve foreign structural owners: {error}"))?;
+
+        struct ObservedReplacement {
+            tab: Arc<Tab>,
+            mux_owner_generation: u64,
+            current_pane_ids: Vec<PaneId>,
+            desired: Vec<DesiredPaneStructuralState>,
+        }
+        let mut observed = Vec::<ObservedReplacement>::new();
+        observed
+            .try_reserve_exact(replacements.len())
+            .map_err(|error| anyhow!("reserve authority tab replacements: {error}"))?;
+
+        for replacement in replacements {
+            let tab_id = replacement.tab.tab_id();
+            let tab_identity = Arc::as_ptr(&replacement.tab) as usize;
+            anyhow::ensure!(
+                affected_tabs.insert(tab_id, tab_identity).is_none()
+                    && affected_tab_identities.insert(tab_identity),
+                "tab {tab_id} appears more than once in one authority reconciliation"
+            );
+            let mux_owner_generation = replacement
+                .tab
+                .active_mux_owner_generation()
+                .ok_or_else(|| anyhow!("tab {tab_id} lacks active mux-owner generation"))?;
+            let indexed = self.pane_ids_by_tab.get(&tab_id);
+            anyhow::ensure!(
+                indexed.is_none_or(|members| members.matches_tab(&replacement.tab)),
+                "tab {tab_id} structural directory names another exact allocation"
+            );
+            anyhow::ensure!(
+                indexed.is_some() == !replacement.current.is_empty(),
+                "tab {tab_id} retains an empty or missing reverse structural directory"
+            );
+            anyhow::ensure!(
+                indexed.map_or(0, |members| members.pane_ids.len())
+                    == replacement.current.len(),
+                "tab {tab_id} structural index cardinality differs from topology"
+            );
+            let mut current_pane_ids = Vec::new();
+            current_pane_ids
+                .try_reserve_exact(replacement.current.len())
+                .map_err(|error| anyhow!("reserve tab {tab_id} current owners: {error}"))?;
+            for state in replacement.current {
+                let identity = Arc::as_ptr(&state.pane).cast::<()>() as usize;
+                anyhow::ensure!(
+                    current_ids.insert(state.pane_id),
+                    "pane {} has more than one current structural owner",
+                    state.pane_id
+                );
+                anyhow::ensure!(
+                    current_identities.insert(identity),
+                    "one exact pane allocation has more than one current structural owner"
+                );
+                let owner = self
+                    .structural_by_pane_id
+                    .get(&state.pane_id)
+                    .ok_or_else(|| {
+                        anyhow!("pane {} lacks structural-owner authority", state.pane_id)
+                    })?;
+                anyhow::ensure!(
+                    owner.matches_pane(&state.pane)
+                        && owner.matches_tab(&replacement.tab)
+                        && owner.lane == state.lane
+                        && indexed.is_some_and(|members| {
+                            members.pane_ids.contains(&state.pane_id)
+                        }),
+                    "pane {} structural authority disagrees with tab {tab_id}",
+                    state.pane_id
+                );
+                self.validate_structural_reverse_exact(state.pane_id, &replacement.tab)?;
+                let (registration, registered_domain_id) = match (
+                    owner.registration.as_ref(),
+                    owner.domain_id,
+                ) {
+                    (Some(registration), Some(registered_domain_id)) => {
+                        (registration, registered_domain_id)
+                    }
+                    _ => anyhow::bail!(
+                        "pane {} structural owner lacks complete live metadata",
+                        state.pane_id
+                    ),
+                };
+                anyhow::ensure!(
+                    self.contains_live_registration(
+                        state.pane_id,
+                        registered_domain_id,
+                        registration,
+                    ),
+                    "pane {} structural owner lacks exact domain authority",
+                    state.pane_id
+                );
+                if registered_domain_id != domain_id {
+                    foreign_current.insert(
+                        state.pane_id,
+                        (
+                            tab_identity,
+                            identity,
+                            state.lane,
+                            registration.clone(),
+                            registered_domain_id,
+                        ),
+                    );
+                }
+                current_pane_ids.push(state.pane_id);
+            }
+            observed.push(ObservedReplacement {
+                tab: replacement.tab,
+                mux_owner_generation,
+                current_pane_ids,
+                desired: replacement.desired,
+            });
+        }
+
+        let final_structural_len = self
+            .structural_by_pane_id
+            .len()
+            .checked_sub(current_count)
+            .and_then(|remaining| remaining.checked_add(desired_count))
+            .ok_or_else(|| anyhow!("reconciled structural-owner cardinality overflow"))?;
+        let structural_growth =
+            final_structural_len.saturating_sub(self.structural_by_pane_id.len());
+        let final_tab_bucket_len = self
+            .pane_ids_by_tab
+            .len()
+            .checked_sub(current_tab_bucket_count)
+            .and_then(|remaining| remaining.checked_add(desired_tab_bucket_count))
+            .ok_or_else(|| anyhow!("reconciled tab-directory cardinality overflow"))?;
+        let tab_bucket_growth = final_tab_bucket_len.saturating_sub(self.pane_ids_by_tab.len());
+        let mut desired_ids = HashSet::new();
+        desired_ids
+            .try_reserve(desired_count)
+            .map_err(|error| anyhow!("reserve desired structural ids: {error}"))?;
+        let mut desired_identities = HashSet::new();
+        desired_identities
+            .try_reserve(desired_count)
+            .map_err(|error| anyhow!("reserve desired structural identities: {error}"))?;
+        let mut prepared_tabs = Vec::new();
+        prepared_tabs
+            .try_reserve_exact(observed.len())
+            .map_err(|error| anyhow!("reserve prepared authority tabs: {error}"))?;
+        let mut next_generation = self.next_structural_generation;
+
+        for replacement in observed {
+            let ObservedReplacement {
+                tab,
+                mux_owner_generation,
+                current_pane_ids,
+                desired,
+            } = replacement;
+            let tab_id = tab.tab_id();
+            let tab_identity = Arc::as_ptr(&tab) as usize;
+            let mut replacement_members = if desired.is_empty() {
+                None
+            } else {
+                let mut pane_ids = HashSet::new();
+                pane_ids
+                    .try_reserve(desired.len())
+                    .map_err(|error| {
+                        anyhow!("reserve tab {tab_id} desired structural members: {error}")
+                    })?;
+                Some(TabStructuralOwnerRegistrations {
+                    tab: Arc::downgrade(&tab),
+                    mux_owner_generation,
+                    pane_ids,
+                })
+            };
+            let mut replacement_owners = Vec::new();
+            replacement_owners
+                .try_reserve_exact(desired.len())
+                .map_err(|error| {
+                    anyhow!("reserve tab {tab_id} desired structural owners: {error}")
+                })?;
+            for state in desired {
+                let identity = Arc::as_ptr(&state.pane).cast::<()>() as usize;
+                anyhow::ensure!(
+                    state.registration.pane_id() == state.pane_id
+                        && state.registration.is_same_pane(&state.pane),
+                    "pane {} desired registration names another exact allocation",
+                    state.pane_id
+                );
+                anyhow::ensure!(
+                    desired_ids.insert(state.pane_id),
+                    "pane {} has more than one desired structural owner",
+                    state.pane_id
+                );
+                anyhow::ensure!(
+                    desired_identities.insert(identity),
+                    "one exact pane allocation has more than one desired structural owner"
+                );
+                anyhow::ensure!(
+                    replacement_members
+                        .as_mut()
+                        .is_some_and(|members| members.pane_ids.insert(state.pane_id)),
+                    "tab {tab_id} desired topology contains duplicate pane {}",
+                    state.pane_id
+                );
+                if state.domain_id == domain_id {
+                    anyhow::ensure!(
+                        final_domain_registrations
+                            .get(&state.pane_id)
+                            .is_some_and(|registration| {
+                                registration.same_registration(&state.registration)
+                            }),
+                        "pane {} desired owner is absent from final domain authority",
+                        state.pane_id
+                    );
+                } else {
+                    let Some((
+                        expected_tab,
+                        expected_identity,
+                        expected_lane,
+                        expected_registration,
+                        expected_domain_id,
+                    )) = foreign_current.remove(&state.pane_id)
+                    else {
+                        anyhow::bail!(
+                            "foreign pane {} was introduced or moved by domain {domain_id} reconciliation",
+                            state.pane_id
+                        );
+                    };
+                    anyhow::ensure!(
+                        expected_tab == tab_identity
+                            && expected_identity == identity
+                            && expected_lane == state.lane
+                            && expected_domain_id == state.domain_id
+                            && expected_registration.same_registration(&state.registration),
+                        "foreign pane {} changed during domain {domain_id} reconciliation",
+                        state.pane_id
+                    );
+                }
+                if let Some(owner) = self.structural_by_pane_id.get(&state.pane_id) {
+                    anyhow::ensure!(
+                        current_ids.contains(&state.pane_id),
+                        "pane {} is structurally owned outside the reconciled tabs",
+                        state.pane_id
+                    );
+                    anyhow::ensure!(
+                        owner.matches_pane(&state.pane)
+                            || state.domain_id == domain_id,
+                        "foreign pane {} desired identity changed",
+                        state.pane_id
+                    );
+                }
+                let unchanged_generation = self
+                    .structural_by_pane_id
+                    .get(&state.pane_id)
+                    .filter(|owner| {
+                        owner.matches_pane(&state.pane)
+                            && owner.matches_tab(&tab)
+                            && owner.lane == state.lane
+                            && owner.domain_id == Some(state.domain_id)
+                            && owner.registration.as_ref().is_some_and(|registration| {
+                                registration.same_registration(&state.registration)
+                            })
+                    })
+                    .map(|owner| owner.generation);
+                let generation = match unchanged_generation {
+                    Some(generation) => generation,
+                    None => {
+                        next_generation = next_generation.checked_add(1).ok_or_else(|| {
+                            anyhow!("pane structural-owner generation exhausted")
+                        })?;
+                        next_generation
+                    }
+                };
+                replacement_owners.push(PreparedPaneStructuralOwner {
+                    pane_id: state.pane_id,
+                    owner: PaneStructuralOwnerRegistration {
+                        pane: Arc::downgrade(&state.pane),
+                        tab: Arc::downgrade(&tab),
+                        tab_mux_owner_generation: mux_owner_generation,
+                        lane: state.lane,
+                        registration: Some(state.registration),
+                        domain_id: Some(state.domain_id),
+                        generation,
+                    },
+                });
+            }
+            prepared_tabs.push(PreparedDomainAuthorityTabReplacement {
+                tab,
+                current_pane_ids,
+                replacement: replacement_owners,
+                replacement_members,
+            });
+        }
+        anyhow::ensure!(
+            foreign_current.is_empty(),
+            "domain {domain_id} reconciliation removed a foreign-domain structural owner"
+        );
+        anyhow::ensure!(
+            final_domain_registrations
+                .keys()
+                .all(|pane_id| desired_ids.contains(pane_id)),
+            "final domain {domain_id} contains an ownerless live pane"
+        );
+
+        if needs_domain_directory_slot {
+            self.registrations_by_domain.try_reserve(1).map_err(|error| {
+                anyhow!("reserve final domain-registration directory: {error}")
+            })?;
+        }
+        if structural_growth != 0 {
+            self.structural_by_pane_id
+                .try_reserve(structural_growth)
+                .map_err(|error| anyhow!("reserve reconciled structural growth: {error}"))?;
+        }
+        if tab_bucket_growth != 0 {
+            self.pane_ids_by_tab
+                .try_reserve(tab_bucket_growth)
+                .map_err(|error| anyhow!("reserve reconciled tab-directory growth: {error}"))?;
+        }
+
+        let final_domain_registrations = (!final_domain_registrations.is_empty()).then(|| {
+            DomainPaneRegistrations {
+                domain: Some(Arc::downgrade(expected_domain)),
+                pane_registrations: final_domain_registrations,
+            }
+        });
+        Ok(PreparedDomainFloatingAuthorityReconcile {
+            domain_id,
+            final_domain_registrations,
+            tab_replacements: prepared_tabs,
+            next_structural_generation: next_generation,
+        })
+    }
+
+    fn commit_domain_floating_authority_reconcile(
+        &mut self,
+        prepared: PreparedDomainFloatingAuthorityReconcile,
+    ) {
+        if let Some(registrations) = prepared.final_domain_registrations {
+            self.registrations_by_domain
+                .insert(prepared.domain_id, registrations);
+        } else {
+            self.registrations_by_domain.remove(&prepared.domain_id);
+        }
+        for replacement in &prepared.tab_replacements {
+            for pane_id in &replacement.current_pane_ids {
+                self.structural_by_pane_id.remove(pane_id);
+            }
+            self.pane_ids_by_tab.remove(&replacement.tab.tab_id());
+        }
+        for replacement in prepared.tab_replacements {
+            if let Some(members) = replacement.replacement_members {
+                self.pane_ids_by_tab
+                    .insert(replacement.tab.tab_id(), members);
+            }
+            for owner in replacement.replacement {
+                self.structural_by_pane_id.insert(owner.pane_id, owner.owner);
+            }
+        }
+        self.next_structural_generation = prepared.next_structural_generation;
+    }
+
     fn prepare_tab_structural_replacement(
         &mut self,
         tab: Arc<Tab>,
         current: &[ExactPaneStructuralState],
         desired: Vec<DesiredPaneStructuralState>,
     ) -> anyhow::Result<PreparedTabStructuralReplacement> {
+        #[cfg(test)]
+        self.validate_complete_structural_bijection()?;
         let mux_owner_generation = tab.active_mux_owner_generation().ok_or_else(|| {
             anyhow!("tab {} lacks active mux-owner generation", tab.tab_id())
         })?;
@@ -4619,6 +5899,11 @@ impl PaneAuthorityIndex {
         anyhow::ensure!(
             indexed.is_none_or(|members| members.matches_tab(&tab)),
             "tab {} structural-owner directory names another exact allocation",
+            tab.tab_id()
+        );
+        anyhow::ensure!(
+            indexed.is_some() == !current.is_empty(),
+            "tab {} retains an empty or missing reverse structural directory",
             tab.tab_id()
         );
         anyhow::ensure!(
@@ -4671,12 +5956,10 @@ impl PaneAuthorityIndex {
                 tab.tab_id(),
                 state.pane_id
             );
+            self.validate_structural_reverse_exact(state.pane_id, &tab)?;
             match (&owner.registration, owner.domain_id) {
-                (Some(registration), Some(domain_id)) => anyhow::ensure!(
-                    self.contains_live_registration(state.pane_id, domain_id, registration),
-                    "pane {} structural owner lacks exact domain-registration authority",
-                    state.pane_id
-                ),
+                (Some(registration), Some(domain_id)) => self
+                    .validate_live_registration_exact(state.pane_id, domain_id, registration)?,
                 (None, None) => {}
                 _ => anyhow::bail!(
                     "pane {} structural owner has partial live-registration metadata",
@@ -4686,12 +5969,8 @@ impl PaneAuthorityIndex {
             current_pane_ids.push(state.pane_id);
         }
 
-        self.structural_by_pane_id
-            .try_reserve(desired.len())
-            .map_err(|error| anyhow!("reserve replacement structural owners: {error}"))?;
-        self.pane_ids_by_tab
-            .try_reserve(1)
-            .map_err(|error| anyhow!("reserve replacement tab structural directory: {error}"))?;
+        let structural_growth = desired.len().saturating_sub(current.len());
+        let tab_bucket_growth = usize::from(current.is_empty() && !desired.is_empty());
         let mut replacement_members = if desired.is_empty() {
             None
         } else {
@@ -4734,15 +6013,11 @@ impl PaneAuthorityIndex {
                 tab.tab_id(),
                 state.pane_id
             );
-            anyhow::ensure!(
-                self.contains_live_registration(
-                    state.pane_id,
-                    state.domain_id,
-                    &state.registration,
-                ),
-                "pane {} replacement lacks exact domain-registration authority",
-                state.pane_id
-            );
+            self.validate_live_registration_exact(
+                state.pane_id,
+                state.domain_id,
+                &state.registration,
+            )?;
             let generation = match self.structural_by_pane_id.get(&state.pane_id) {
                 Some(owner) => {
                     anyhow::ensure!(
@@ -4790,6 +6065,19 @@ impl PaneAuthorityIndex {
             });
         }
 
+        if structural_growth != 0 {
+            self.structural_by_pane_id
+                .try_reserve(structural_growth)
+                .map_err(|error| anyhow!("reserve replacement structural growth: {error}"))?;
+        }
+        if tab_bucket_growth != 0 {
+            self.pane_ids_by_tab
+                .try_reserve(tab_bucket_growth)
+                .map_err(|error| {
+                    anyhow!("reserve replacement tab structural-directory growth: {error}")
+                })?;
+        }
+
         Ok(PreparedTabStructuralReplacement {
             tab,
             current_pane_ids,
@@ -4825,7 +6113,7 @@ impl PaneAuthorityIndex {
         &self,
         tab: &Arc<Tab>,
         panes: &[Arc<dyn Pane>],
-    ) -> anyhow::Result<Vec<PaneId>> {
+    ) -> anyhow::Result<Vec<(PaneId, Arc<dyn Pane>)>> {
         let indexed = self.pane_ids_by_tab.get(&tab.tab_id());
         anyhow::ensure!(
             indexed.is_none_or(|members| members.matches_tab(tab)),
@@ -4839,13 +6127,17 @@ impl PaneAuthorityIndex {
             indexed.map_or(0, |members| members.pane_ids.len()),
             panes.len()
         );
-        let mut pane_ids = Vec::new();
-        pane_ids
+        let mut candidates = Vec::new();
+        candidates
             .try_reserve_exact(panes.len())
             .map_err(|error| anyhow!("reserve tab structural retirement: {error}"))?;
         let Some(indexed) = indexed else {
-            return Ok(pane_ids);
+            return Ok(candidates);
         };
+        let mut pane_ids_by_identity = HashMap::new();
+        pane_ids_by_identity
+            .try_reserve(indexed.pane_ids.len())
+            .map_err(|error| anyhow!("reserve tab structural retirement identities: {error}"))?;
         for pane_id in &indexed.pane_ids {
             let owner = self.structural_by_pane_id.get(pane_id).ok_or_else(|| {
                 anyhow!("tab {} indexes missing structural pane {pane_id}", tab.tab_id())
@@ -4855,26 +6147,57 @@ impl PaneAuthorityIndex {
                 "tab {} structural member {pane_id} names another exact tab",
                 tab.tab_id()
             );
+            match (&owner.registration, owner.domain_id) {
+                (Some(registration), Some(domain_id)) => anyhow::ensure!(
+                    self.contains_live_registration(*pane_id, domain_id, registration),
+                    "pane {pane_id} structural owner lacks exact domain-registration authority"
+                ),
+                (None, None) => {}
+                _ => anyhow::bail!(
+                    "pane {pane_id} structural owner has partial live-registration metadata"
+                ),
+            }
+            let identity = Weak::as_ptr(&owner.pane) as *const () as usize;
             anyhow::ensure!(
-                panes.iter().any(|pane| owner.matches_pane(pane)),
-                "tab {} structural member {pane_id} is absent from exact topology",
+                pane_ids_by_identity.insert(identity, *pane_id).is_none(),
+                "tab {} indexes one exact pane allocation more than once",
                 tab.tab_id()
             );
-            pane_ids.push(*pane_id);
         }
-        Ok(pane_ids)
+        for pane in panes {
+            let identity = Arc::as_ptr(pane) as *const () as usize;
+            let pane_id = pane_ids_by_identity.remove(&identity).ok_or_else(|| {
+                anyhow!(
+                    "tab {} exact topology contains a pane without structural authority",
+                    tab.tab_id()
+                )
+            })?;
+            candidates.push((pane_id, Arc::clone(pane)));
+        }
+        anyhow::ensure!(
+            pane_ids_by_identity.is_empty(),
+            "tab {} structural authority contains a pane absent from exact topology",
+            tab.tab_id()
+        );
+        Ok(candidates)
     }
 
-    fn commit_tab_structural_removal(&mut self, tab: &Arc<Tab>, pane_ids: &[PaneId]) {
-        if pane_ids.is_empty() {
+    fn commit_tab_structural_removal(
+        &mut self,
+        tab: &Arc<Tab>,
+        candidates: &[(PaneId, Arc<dyn Pane>)],
+    ) {
+        if candidates.is_empty() {
             debug_assert!(!self.pane_ids_by_tab.contains_key(&tab.tab_id()));
             return;
         }
         let removed_members = self.pane_ids_by_tab.remove(&tab.tab_id());
         debug_assert!(removed_members.is_some());
-        for pane_id in pane_ids {
+        for (pane_id, pane) in candidates {
             let removed = self.structural_by_pane_id.remove(pane_id);
-            debug_assert!(removed.is_some_and(|owner| owner.matches_tab(tab)));
+            debug_assert!(removed.is_some_and(|owner| {
+                owner.matches_tab(tab) && owner.matches_pane(pane)
+            }));
         }
     }
 }
@@ -4916,25 +6239,6 @@ impl TabParentRegistration {
             .upgrade()
             .is_some_and(|registered| Arc::ptr_eq(&registered, tab))
     }
-}
-
-/// Revision-coherent exact location of one registered pane.
-///
-/// A stable session resolves the same pane for every key event.  Repeating the
-/// historical all-tabs/all-panes scan on that path made input latency grow
-/// with unrelated session size.  This cache is safe without mutation hooks in
-/// every `Tab` method because a hit revalidates the exact registration, tab,
-/// parent, and structural pane presence inside the same topology revision in
-/// which the location was censused. A revision change causes one exact cold
-/// refresh; subsequent stable key events avoid every unrelated tab.
-#[derive(Clone)]
-struct PaneLocationCacheEntry {
-    registration: PaneRegistrationHandle,
-    pane: Weak<dyn Pane>,
-    tab: Weak<Tab>,
-    domain_id: DomainId,
-    window_id: WindowId,
-    topology_revision: TopologyRevision,
 }
 
 /// Discriminant key for the high-rate Alert variants we dedupe per pane.
@@ -5089,13 +6393,8 @@ pub struct Mux {
     #[cfg(test)]
     tab_parent_write_cuts: AtomicUsize,
     pane_authority: Mutex<PaneAuthorityIndex>,
-    pane_location_cache: RwLock<HashMap<PaneId, PaneLocationCacheEntry>>,
     #[cfg(test)]
-    pane_location_cache_hits: AtomicUsize,
-    #[cfg(test)]
-    pane_location_full_scans: AtomicUsize,
-    #[cfg(test)]
-    pane_location_scan_tab_probes: AtomicUsize,
+    pane_authority_lookup_probes: AtomicUsize,
     panes: RwLock<HashMap<PaneId, LivePaneRegistration>>,
     pane_retirements: Arc<PaneRetirementTracker>,
     pane_preparations: Mutex<HashMap<PaneId, PanePreparation>>,
@@ -6004,13 +7303,8 @@ impl Mux {
             #[cfg(test)]
             tab_parent_write_cuts: AtomicUsize::new(0),
             pane_authority: Mutex::new(PaneAuthorityIndex::default()),
-            pane_location_cache: RwLock::new(HashMap::new()),
             #[cfg(test)]
-            pane_location_cache_hits: AtomicUsize::new(0),
-            #[cfg(test)]
-            pane_location_full_scans: AtomicUsize::new(0),
-            #[cfg(test)]
-            pane_location_scan_tab_probes: AtomicUsize::new(0),
+            pane_authority_lookup_probes: AtomicUsize::new(0),
             panes: RwLock::new(HashMap::new()),
             pane_retirements: Arc::new(PaneRetirementTracker::default()),
             pane_preparations: Mutex::new(HashMap::new()),
@@ -6907,6 +8201,27 @@ impl Mux {
     }
 
     /// Commit one allocation-prepared mutation spanning one or more windows.
+    fn commit_prepared_window_states_locked(
+        &self,
+        windows: &mut HashMap<WindowId, Window>,
+        prepared: Vec<(WindowId, PreparedWindowState)>,
+        attached_tabs: Vec<(TabId, WindowId)>,
+        created_windows: Vec<WindowId>,
+        removed_windows: Vec<WindowId>,
+    ) -> anyhow::Result<()> {
+        self.commit_prepared_window_states_with_trailing_revisions_locked(
+            windows,
+            prepared,
+            attached_tabs,
+            created_windows,
+            removed_windows,
+            0,
+            |_| (),
+        )
+    }
+
+    /// Commit a window transaction and an allocation-complete trailing
+    /// topology transaction under one contiguous revision reservation.
     ///
     /// Lock order is `windows -> tab_parents -> topology ->
     /// pending_window_notifications -> provisional_windows` when
@@ -6917,14 +8232,16 @@ impl Mux {
     /// completes before the first window or parent-index field changes; the
     /// post-reservation suffix contains only exact lookups, swaps, scalar
     /// assignments, and pushes into pre-reserved capacity.
-    fn commit_prepared_window_states_locked(
+    fn commit_prepared_window_states_with_trailing_revisions_locked<R>(
         &self,
         windows: &mut HashMap<WindowId, Window>,
         mut prepared: Vec<(WindowId, PreparedWindowState)>,
         attached_tabs: Vec<(TabId, WindowId)>,
         mut created_windows: Vec<WindowId>,
         mut removed_windows: Vec<WindowId>,
-    ) -> anyhow::Result<()> {
+        trailing_revision_count: usize,
+        commit_trailing: impl FnOnce(Option<TopologyRevision>) -> R,
+    ) -> anyhow::Result<R> {
         anyhow::ensure!(!prepared.is_empty(), "window transaction is empty");
         prepared.sort_unstable_by_key(|(window_id, _)| *window_id);
         anyhow::ensure!(
@@ -7143,7 +8460,20 @@ impl Mux {
             .queue
             .try_reserve(prepared.len().saturating_add(1))
             .map_err(|error| anyhow!("reserve frozen window transaction delivery: {error}"))?;
-        let revision = topology.reserve_revision().map_err(anyhow::Error::new)?;
+        let revision_count = trailing_revision_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("window topology revision count overflow"))?;
+        let revision = topology
+            .reserve_revisions(revision_count)
+            .map_err(anyhow::Error::new)?;
+        let first_trailing_revision = (trailing_revision_count != 0).then(|| {
+            TopologyRevision::new(
+                revision
+                    .get()
+                    .checked_add(1)
+                    .expect("reserved trailing topology revisions cannot overflow"),
+            )
+        });
 
         for (window_id, state) in prepared {
             let window = windows
@@ -7189,7 +8519,24 @@ impl Mux {
             },
             activity: None,
         });
-        Ok(())
+        Ok(commit_trailing(first_trailing_revision))
+    }
+
+    /// Reserve one contiguous pane-retirement revision range and run its
+    /// allocation-complete commit while topology authority remains held.
+    fn commit_with_reserved_pane_retirement_revisions<R>(
+        &self,
+        revision_count: usize,
+        commit: impl FnOnce(Option<TopologyRevision>) -> R,
+    ) -> anyhow::Result<R> {
+        if revision_count == 0 {
+            return Ok(commit(None));
+        }
+        let mut topology = self.topology.lock();
+        let first_revision = topology
+            .reserve_revisions(revision_count)
+            .map_err(anyhow::Error::new)?;
+        Ok(commit(Some(first_revision)))
     }
 
     fn flush_window_notifications(&self) {
@@ -7325,14 +8672,6 @@ impl Mux {
     // removed concurrently may still observe the current notification if it
     // was present in the snapshot; removals only affect future notifications.
     pub(crate) fn dispatch_notification_envelope(&self, envelope: MuxNotificationEnvelope) {
-        if let MuxNotification::PaneRemoved(pane_id) = &envelope.notification {
-            // Numeric pane identifiers may eventually be reused.  Drop the
-            // retired generation's location promptly so long-running churn is
-            // bounded by currently relevant pane IDs rather than historical
-            // session cardinality.  Exact-Arc and revision checks already make
-            // a retained entry safe; this is the memory-bound half.
-            self.pane_location_cache.write().remove(pane_id);
-        }
         let subscribers = self
             .subscribers
             .read()
@@ -7379,20 +8718,6 @@ impl Mux {
             reader_start_gate,
             None,
             PaneRemovalFollowUp::None,
-        )
-    }
-
-    fn enqueue_pane_removal_notification_locked(
-        &self,
-        pane_id: PaneId,
-        generation: &Arc<PaneRegistrationGeneration>,
-        removal_follow_up: PaneRemovalFollowUp,
-    ) -> PaneLifecycleNotificationTicket {
-        self.enqueue_pane_lifecycle_notification_with_cleanup_locked(
-            PaneLifecycleNotification::Removed(pane_id),
-            None,
-            Some(Arc::clone(&generation.cleanup_complete)),
-            removal_follow_up,
         )
     }
 
@@ -8056,29 +9381,6 @@ impl Mux {
         }
     }
 
-    /// Detach the open output batch for an exact retiring generation.
-    ///
-    /// The caller holds `pane_registration`. The batch remains in the
-    /// scheduled vector so an already-queued drain can encounter it safely,
-    /// but exact `Arc` comparison prevents that delayed drain from erasing a
-    /// replacement generation's marker.
-    fn take_pending_pane_output_batch_locked(
-        &self,
-        pane_id: PaneId,
-        generation: &Arc<PaneRegistrationGeneration>,
-    ) -> Option<Arc<PaneOutputBatch>> {
-        let mut pending = self.pending_pane_output.lock();
-        let matches = pending
-            .queued
-            .get(&pane_id)
-            .is_some_and(|batch| Arc::ptr_eq(&batch.generation, generation));
-        if matches {
-            pending.queued.remove(&pane_id)
-        } else {
-            None
-        }
-    }
-
     fn discard_removed_pane_states(&self, pane_ids: &[PaneId]) {
         if pane_ids.is_empty() {
             return;
@@ -8424,6 +9726,19 @@ impl Mux {
 
     #[cfg(test)]
     fn remove_pane_registration_if_same(&self, pane_id: PaneId, expected: &Arc<dyn Pane>) -> bool {
+        let _domain_registration = self.domain_registration.lock();
+        let _registration = self.pane_registration.lock();
+        let domain_id = {
+            let panes = self.panes.read();
+            let Some(registered) = panes
+                .get(&pane_id)
+                .filter(|registered| Arc::ptr_eq(&registered.pane, expected))
+            else {
+                return false;
+            };
+            registered.domain_id
+        };
+        let expected_domain = self.domains.read().get(&domain_id).cloned();
         let mut authority = self.pane_authority.lock();
         let mut panes = self.panes.write();
         let Some(registered) = panes
@@ -8432,19 +9747,25 @@ impl Mux {
         else {
             return false;
         };
-        let domain_id = registered.domain_id;
         let handle = PaneRegistrationHandle::new(&registered.pane, &registered.generation);
-        if !authority.contains_live_registration(pane_id, domain_id, &handle) {
-            return false;
-        }
-        let removed = authority.remove_live_registration(
+        let Ok(prepared) = authority.prepare_live_registration_removal(
             pane_id,
             expected,
             domain_id,
+            expected_domain.as_ref(),
             &handle,
-        );
-        debug_assert!(removed);
-        panes.remove(&pane_id);
+        ) else {
+            return false;
+        };
+        authority.commit_live_registration_removal(prepared);
+        let removed = panes
+            .remove(&pane_id)
+            .expect("prepared exact test pane remains registered");
+        drop(panes);
+        drop(authority);
+        drop(_registration);
+        drop(_domain_registration);
+        drop(removed);
         true
     }
 
@@ -8518,25 +9839,6 @@ impl Mux {
             generation,
             active: true,
         }))
-    }
-
-    /// Cancel the current preparation for this ID, optionally requiring exact
-    /// pane-instance identity. The caller must hold `pane_registration`.
-    fn cancel_pane_preparation_locked(
-        &self,
-        pane_id: PaneId,
-        expected: Option<&Arc<dyn Pane>>,
-    ) -> bool {
-        let mut claims = self.pane_preparations.lock();
-        let Some(preparing) = claims.get_mut(&pane_id) else {
-            return false;
-        };
-        if !expected.is_none_or(|expected| Weak::ptr_eq(&preparing.pane, &Arc::downgrade(expected)))
-        {
-            return false;
-        }
-        preparing.cancelled = true;
-        true
     }
 
     /// Perform fallible pane callbacks after the caller owns the per-ID
@@ -8619,46 +9921,6 @@ impl Mux {
             prepared_authority,
         );
         Ok(())
-    }
-
-    fn insert_tab_registration_locked(self: &Arc<Self>, tab: &Arc<Tab>) -> Result<bool, Error> {
-        let tab_id = tab.tab_id();
-        let mut tabs = self.tabs.write();
-        if let Some(existing) = tabs.get(&tab_id) {
-            if Arc::ptr_eq(existing, tab) {
-                anyhow::ensure!(
-                    tab.has_active_mux_owner(self),
-                    "tab identifier {tab_id} is registered without active mux-owner authority"
-                );
-                return Ok(false);
-            }
-            return Err(anyhow!(
-                "tab identifier {tab_id} is already registered to a different tab instance"
-            ));
-        }
-        // This is the final fallible registration step. Keep the tab map
-        // write-locked through the infallible insertion so another mux cannot
-        // win a cross-owner registration race after validation.
-        tab.bind_mux_owner(self)?;
-        tabs.insert(tab_id, Arc::clone(tab));
-        Ok(true)
-    }
-
-    fn tab_registration_needs_insert_locked(&self, tab: &Arc<Tab>) -> Result<bool, Error> {
-        let tab_id = tab.tab_id();
-        if let Some(existing) = self.tabs.read().get(&tab_id) {
-            if Arc::ptr_eq(existing, tab) {
-                anyhow::ensure!(
-                    tab.has_active_mux_owner(self),
-                    "tab identifier {tab_id} is registered without active mux-owner authority"
-                );
-                return Ok(false);
-            }
-            return Err(anyhow!(
-                "tab identifier {tab_id} is already registered to a different tab instance"
-            ));
-        }
-        Ok(true)
     }
 
     #[cfg(test)]
@@ -8976,7 +10238,7 @@ impl Mux {
                     topology.reserve_revision().map_err(anyhow::Error::new)?,
                 );
 
-                let prior = panes.insert(
+                let _prior = panes.insert(
                     pane_id,
                     LivePaneRegistration {
                         pane: Arc::clone(pane),
@@ -8984,7 +10246,6 @@ impl Mux {
                         domain_id: preparation_claim.domain_id,
                     },
                 );
-                debug_assert!(prior.is_none());
                 authority.insert_live_registration(
                     pane_id,
                     pane,
@@ -9000,7 +10261,6 @@ impl Mux {
                     PaneRemovalFollowUp::None,
                 );
                 let registration = commit_guard.finalize();
-                debug_assert!(registration.same_registration(&expected_registration));
                 Ok((lifecycle_notification, registration))
             })();
             preparation_claim.retire_locked();
@@ -9040,7 +10300,11 @@ impl Mux {
                     ));
                 }
                 None => {
-                    tab.bind_mux_owner_if_structurally_empty(self)?;
+                    tabs.try_reserve(1).map_err(|error| {
+                        anyhow!("reserve empty tab registration {}: {error}", tab.tab_id())
+                    })?;
+                    let binding = tab.prepare_mux_owner_binding_if_structurally_empty(self)?;
+                    binding.commit();
                     tabs.insert(tab.tab_id(), Arc::clone(tab));
                     true
                 }
@@ -9059,7 +10323,15 @@ impl Mux {
         let pane = tab
             .get_active_pane()
             .ok_or_else(|| anyhow!("tab MUST have an active pane"))?;
-        let active_pane_id = pane.pane_id();
+        let structural = tab.snapshot_structural_states_for_authority()?;
+        anyhow::ensure!(
+            structural.len() == 1
+                && structural[0].lane == PaneStructuralLane::Tiled
+                && Arc::ptr_eq(&structural[0].pane, &pane),
+            "add_tab_and_active_pane requires exactly one admitted tiled pane in tab {}",
+            tab.tab_id()
+        );
+        let active_pane_id = structural[0].pane_id;
         let mut preparation_claim = self.claim_pane_preparation(&pane)?;
         let prepared = match preparation_claim.as_ref() {
             Some(claim) => Some(self.prepare_claimed_pane_registration(
@@ -9085,14 +10357,29 @@ impl Mux {
             None => (None, None),
         };
         let publication_result = {
+            let _domain_registration = self.domain_registration.lock();
             let _registration = self.pane_registration.lock();
             let result = (|| -> Result<Option<_>, Error> {
-                let tab_needs_insert = self.tab_registration_needs_insert_locked(tab)?;
-
                 match preparation_claim.as_ref() {
                     None => {
                         let pane_id = active_pane_id;
                         let mut authority = self.pane_authority.lock();
+                        let tab_id = tab.tab_id();
+                        let mut tabs = self.tabs.write();
+                        let tab_needs_insert = match tabs.get(&tab_id) {
+                            Some(existing) if Arc::ptr_eq(existing, tab) => false,
+                            Some(_) => {
+                                return Err(anyhow!(
+                                    "tab identifier {tab_id} is already registered to a different tab instance"
+                                ));
+                            }
+                            None => true,
+                        };
+                        if tab_needs_insert {
+                            tabs.try_reserve(1).map_err(|error| {
+                                anyhow!("reserve tab registration {tab_id}: {error}")
+                            })?;
+                        }
                         let panes = self.panes.read();
                         let registered = panes.get(&pane_id).ok_or_else(|| {
                             anyhow!("active pane {pane_id} lost its exact registration")
@@ -9101,31 +10388,56 @@ impl Mux {
                             Arc::ptr_eq(&registered.pane, &pane),
                             "active pane {pane_id} was replaced before tab publication"
                         );
+                        let registered_domain_id = registered.domain_id;
                         let registration =
                             PaneRegistrationHandle::new(&pane, &registered.generation);
                         anyhow::ensure!(
                             authority.contains_live_registration(
                                 pane_id,
-                                registered.domain_id,
+                                registered_domain_id,
                                 &registration,
                             ),
                             "active pane {pane_id} lacks exact domain-registration authority"
                         );
-                        let structural = authority.prepare_structural_bind(
+                        let expected_domain = self.domains.read().get(&registered_domain_id).cloned();
+                        anyhow::ensure!(
+                            authority.domain_directory_matches(
+                                registered_domain_id,
+                                expected_domain.as_ref(),
+                            ),
+                            "active pane {pane_id} domain directory changed exact identity"
+                        );
+                        drop(panes);
+                        if !tab_needs_insert {
+                            anyhow::ensure!(
+                                tab.contains_exact_single_tiled_pane_for_mux(self, &pane),
+                                "registered tab {tab_id} changed exact topology or mux authority"
+                            );
+                            authority.validate_structural_owner_exact(
+                                pane_id,
+                                &pane,
+                                tab,
+                                Some(PaneStructuralLane::Tiled),
+                                Some(&registration),
+                            )?;
+                            return Ok(None);
+                        }
+
+                        let structural = authority.prepare_new_structural_bind(
                             pane_id,
                             Arc::clone(&pane),
                             Arc::clone(tab),
                             PaneStructuralLane::Tiled,
-                            Some((registration, registered.domain_id)),
+                            Some((registration, registered_domain_id)),
                         )?;
-                        anyhow::ensure!(
-                            tab.contains_exact_pane_callback_free(&pane),
-                            "active pane {pane_id} is absent from tab {}",
-                            tab.tab_id()
+                        let tab_binding = tab
+                            .prepare_mux_owner_binding_with_exact_single_tiled_pane(self, &pane)?;
+                        let tab_mux_owner_generation = tab_binding.commit();
+                        tabs.insert(tab_id, Arc::clone(tab));
+                        authority.commit_structural_bind(
+                            structural,
+                            tab_mux_owner_generation,
                         );
-                        let tab_was_inserted = self.insert_tab_registration_locked(tab)?;
-                        debug_assert_eq!(tab_was_inserted, tab_needs_insert);
-                        authority.commit_structural_bind(structural);
                         Ok(None)
                     }
                     Some(claim) => {
@@ -9149,13 +10461,21 @@ impl Mux {
                             .commit()?;
                         let registration =
                             PaneRegistrationHandle::new(&pane, &claim.generation);
+                        anyhow::ensure!(
+                            !self.retired_domain_ids.lock().contains(&claim.domain_id),
+                            "active pane {pane_id} belongs to retired domain {}",
+                            claim.domain_id
+                        );
+                        let expected_domain =
+                            self.domains.read().get(&claim.domain_id).cloned();
                         let mut authority = self.pane_authority.lock();
                         let prepared_authority = authority.prepare_live_registration_insert(
                             pane_id,
                             &pane,
                             claim.domain_id,
+                            expected_domain.as_ref(),
                         )?;
-                        let structural = authority.prepare_structural_bind(
+                        let structural = authority.prepare_new_structural_bind(
                             pane_id,
                             Arc::clone(&pane),
                             Arc::clone(tab),
@@ -9172,10 +10492,16 @@ impl Mux {
                             }
                             None => true,
                         };
-                        anyhow::ensure!(
-                            tab.contains_exact_pane_callback_free(&pane),
-                            "active pane {pane_id} is absent from tab {tab_id}"
-                        );
+                        if tab_needs_insert {
+                            tabs.try_reserve(1).map_err(|error| {
+                                anyhow!("reserve tab registration {tab_id}: {error}")
+                            })?;
+                        } else {
+                            anyhow::ensure!(
+                                tab.contains_exact_single_tiled_pane_for_mux(self, &pane),
+                                "registered tab {tab_id} changed exact topology or mux authority"
+                            );
+                        }
                         let mut panes = self.panes.write();
                         if let Some(existing) = panes.get(&pane_id) {
                             if Arc::ptr_eq(&existing.pane, &pane) {
@@ -9188,20 +10514,39 @@ impl Mux {
                         panes.try_reserve(1).map_err(|error| {
                             anyhow!("reserve pane registration {pane_id}: {error}")
                         })?;
-                        // Owner binding is the last fallible step. The pane
-                        // commit guard rolls its slot back if binding rejects;
-                        // after this branch all publication is infallible.
-                        // Bind only a newly inserted tab; an existing exact
-                        // registration must already carry active authority.
-                        if tab_needs_insert {
-                            tab.bind_mux_owner(self)?;
+                        drop(panes);
+                        let tab_binding = if tab_needs_insert {
+                            Some(
+                                tab.prepare_mux_owner_binding_with_exact_single_tiled_pane(
+                                    self, &pane,
+                                )?,
+                            )
                         } else {
-                            anyhow::ensure!(
-                                tab.has_active_mux_owner(self),
-                                "tab identifier {tab_id} is registered without active mux-owner authority"
-                            );
-                        }
-                        panes.insert(
+                            None
+                        };
+                        let existing_tab_generation = if tab_needs_insert {
+                            0
+                        } else {
+                            tab.active_mux_owner_generation().ok_or_else(|| {
+                                anyhow!("tab {tab_id} lost mux-owner authority")
+                            })?
+                        };
+                        let mut panes = self.panes.write();
+                        anyhow::ensure!(
+                            !panes.contains_key(&pane_id),
+                            "pane identifier {pane_id} became registered before final publication"
+                        );
+                        let lifecycle_enqueue = self.prepare_pane_lifecycle_enqueue(pane_id)?;
+                        let mut topology = self.topology.lock();
+                        let topology_stamp = MuxTopologyStamp::Revision(
+                            topology.reserve_revision().map_err(anyhow::Error::new)?,
+                        );
+
+                        let tab_mux_owner_generation = match tab_binding {
+                            Some(binding) => binding.commit(),
+                            None => existing_tab_generation,
+                        };
+                        let _prior = panes.insert(
                             pane_id,
                             LivePaneRegistration {
                                 pane: Arc::clone(&pane),
@@ -9219,15 +10564,15 @@ impl Mux {
                             registration,
                             prepared_authority,
                         );
-                        authority.commit_structural_bind(structural);
-                        drop(panes);
-                        drop(tabs);
-
-                        let lifecycle_notification = self
-                            .enqueue_pane_lifecycle_notification_locked(
-                                PaneLifecycleNotification::Added(pane_id),
-                                reader_start_gate.take(),
-                            );
+                        authority
+                            .commit_structural_bind(structural, tab_mux_owner_generation);
+                        let lifecycle_notification = lifecycle_enqueue.enqueue(
+                            PaneLifecycleNotification::Added(pane_id),
+                            topology_stamp,
+                            reader_start_gate.take(),
+                            None,
+                            PaneRemovalFollowUp::None,
+                        );
                         let registration = commit_guard.finalize();
                         Ok(Some((lifecycle_notification, registration)))
                     }
@@ -9258,83 +10603,160 @@ impl Mux {
         expected_generation: Option<&Arc<PaneRegistrationGeneration>>,
         removal_follow_up: PaneRemovalFollowUp,
     ) -> Option<RemovedPaneRegistration> {
-        let (removed, needs_cleanup, cleanup_only_fence_owned, output_batch) = {
+        let transaction = (|| -> anyhow::Result<_> {
+            let _domain_registration = self.domain_registration.lock();
             let _registration = self.pane_registration.lock();
-            let preparation_cancelled = if expected_generation.is_none() {
-                self.cancel_pane_preparation_locked(pane_id, expected)
-            } else {
-                false
-            };
-            let registration = {
-                let mut authority = self.pane_authority.lock();
-                let mut panes = self.panes.write();
-                let matches = panes.get(&pane_id).is_some_and(|registered| {
-                    expected.is_none_or(|expected| Arc::ptr_eq(&registered.pane, expected))
-                        && expected_generation.is_none_or(|generation| {
-                            Arc::ptr_eq(&registered.generation, generation)
-                        })
+            let candidate_domain_id = self.panes.read().get(&pane_id).and_then(|registered| {
+                (expected.is_none_or(|expected| Arc::ptr_eq(&registered.pane, expected))
+                    && expected_generation.is_none_or(|generation| {
+                        Arc::ptr_eq(&registered.generation, generation)
+                    }))
+                .then_some(registered.domain_id)
+            });
+            let expected_domain = candidate_domain_id
+                .and_then(|domain_id| self.domains.read().get(&domain_id).cloned());
+            if let Some(domain) = expected_domain.as_ref() {
+                anyhow::ensure!(
+                    self.domains_by_name
+                        .read()
+                        .values()
+                        .any(|registered| Arc::ptr_eq(registered, domain)),
+                    "pane {pane_id} domain lacks its exact name-index registration"
+                );
+            }
+            let mut authority = self.pane_authority.lock();
+            let mut preparations = self.pane_preparations.lock();
+            let mut panes = self.panes.write();
+
+            let registration_matches = panes.get(&pane_id).is_some_and(|registered| {
+                expected.is_none_or(|expected| Arc::ptr_eq(&registered.pane, expected))
+                    && expected_generation.is_none_or(|generation| {
+                        Arc::ptr_eq(&registered.generation, generation)
+                    })
+            });
+            let preparation_matches = expected_generation.is_none()
+                && preparations.get(&pane_id).is_some_and(|preparing| {
+                    expected.is_none_or(|expected| {
+                        Weak::ptr_eq(&preparing.pane, &Arc::downgrade(expected))
+                    })
                 });
-                if matches {
-                    let registered = panes
-                        .get(&pane_id)
-                        .expect("matched pane registration remains present");
-                    let pane = Arc::clone(&registered.pane);
-                    let generation = Arc::clone(&registered.generation);
-                    let domain_id = registered.domain_id;
-                    let handle = PaneRegistrationHandle::new(&pane, &generation);
-                    if !authority.contains_live_registration(pane_id, domain_id, &handle) {
-                        log::error!(
-                            "refusing pane {pane_id} retirement: domain-registration index is missing its exact generation"
-                        );
-                        None
-                    } else {
-                        let removed = authority.remove_live_registration(
-                            pane_id,
-                            &pane,
-                            domain_id,
-                            &handle,
-                        );
-                        debug_assert!(removed);
-                        let registered = panes
-                            .remove(&pane_id)
-                            .expect("validated pane registration remains present");
-                        drop(registered);
-                        Some((pane, generation))
-                    }
-                } else {
-                    None
-                }
-            };
+
             // An unqualified removal remains the authoritative stale-state
             // sweep even when no registry entry survives. Fence that cleanup
             // so it cannot erase state belonging to a concurrent replacement.
-            let needs_cleanup =
-                expected.is_none() || preparation_cancelled || registration.is_some();
-            let fence_inserted = needs_cleanup && self.retiring_pane_ids.lock().insert(pane_id);
-            let cleanup_only_fence_owned = fence_inserted && registration.is_none();
-            let output_batch = registration.as_ref().and_then(|(_, generation)| {
-                self.take_pending_pane_output_batch_locked(pane_id, generation)
-            });
-            let removed = registration.map(|(pane, generation)| {
-                let lifecycle_notification = self.enqueue_pane_removal_notification_locked(
-                    pane_id,
-                    &generation,
-                    removal_follow_up,
-                );
-                RemovedPaneRegistration {
-                    pane_id,
-                    pane,
-                    generation,
-                    lifecycle_notification,
+            let needs_cleanup = expected.is_none() || preparation_matches || registration_matches;
+            if !needs_cleanup {
+                return Ok((None, None, false, false, None));
+            }
+
+            let mut retiring = self.retiring_pane_ids.lock();
+            if !retiring.contains(&pane_id) {
+                retiring
+                    .try_reserve(1)
+                    .map_err(|error| anyhow!("reserve pane {pane_id} retirement fence: {error}"))?;
+            }
+
+            let Some(registered) = registration_matches
+                .then(|| panes.get(&pane_id))
+                .flatten()
+            else {
+                if preparation_matches {
+                    preparations
+                        .get_mut(&pane_id)
+                        .expect("matched pane preparation remains present")
+                        .cancelled = true;
                 }
-            });
-            (
-                removed,
-                needs_cleanup,
-                cleanup_only_fence_owned,
+                let cleanup_only_fence_owned = retiring.insert(pane_id);
+                return Ok((
+                    None,
+                    None,
+                    true,
+                    cleanup_only_fence_owned,
+                    None,
+                ));
+            };
+
+            anyhow::ensure!(
+                !preparations.contains_key(&pane_id),
+                "live pane {pane_id} also owns an in-flight preparation"
+            );
+            anyhow::ensure!(
+                !retiring.contains(&pane_id)
+                    && !self.pane_retirements.has_in_flight_retirement(pane_id),
+                "live pane {pane_id} already owns a retirement fence"
+            );
+
+            let pane = Arc::clone(&registered.pane);
+            let generation = Arc::clone(&registered.generation);
+            let domain_id = registered.domain_id;
+            let handle = PaneRegistrationHandle::new(&pane, &generation);
+            let prepared_authority = authority.prepare_live_registration_removal(
+                pane_id,
+                &pane,
+                domain_id,
+                expected_domain.as_ref(),
+                &handle,
+            )?;
+
+            // Output producers consult this queue before lifecycle/topology
+            // authority. Preserve that ordering while retaining every guard
+            // through the final allocation-free removal cut.
+            let mut pending_output = self.pending_pane_output.lock();
+            let output_is_current = pending_output
+                .queued
+                .get(&pane_id)
+                .is_some_and(|batch| Arc::ptr_eq(&batch.generation, &generation));
+            let lifecycle_enqueue = self.prepare_pane_lifecycle_enqueue(pane_id)?;
+            let mut topology = self.topology.lock();
+            let topology_stamp = MuxTopologyStamp::Revision(
+                topology.reserve_revision().map_err(anyhow::Error::new)?,
+            );
+
+            authority.commit_live_registration_removal(prepared_authority);
+            let removed_live = panes
+                .remove(&pane_id)
+                .expect("prepared exact pane registration remains present");
+            let fence_inserted = retiring.insert(pane_id);
+            debug_assert!(fence_inserted);
+            let output_batch = output_is_current
+                .then(|| pending_output.queued.remove(&pane_id))
+                .flatten();
+            let lifecycle_notification = lifecycle_enqueue.enqueue(
+                PaneLifecycleNotification::Removed(pane_id),
+                topology_stamp,
+                None,
+                Some(Arc::clone(&generation.cleanup_complete)),
+                removal_follow_up,
+            );
+            let removed = RemovedPaneRegistration {
+                pane_id,
+                pane,
+                generation,
+                lifecycle_notification,
+            };
+            Ok((
+                Some(removed),
+                Some(removed_live),
+                true,
+                false,
                 output_batch,
-            )
-        };
+            ))
+        })();
+        let (removed, removed_live, needs_cleanup, cleanup_only_fence_owned, output_batch) =
+            match transaction {
+                Ok(result) => result,
+                Err(error) => {
+                    log::error!(
+                        "refusing pane {pane_id} retirement before transactional commit: {error:#}"
+                    );
+                    return None;
+                }
+            };
+
+        // Dropping the live registration retires its generation and can arm
+        // deferred cleanup. Do so only after every mux/index/queue lock from
+        // the final cut has been released.
+        drop(removed_live);
 
         if let Some(output_batch) = output_batch {
             histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
@@ -9348,6 +10770,298 @@ impl Mux {
             self.retiring_pane_ids.lock().remove(&pane_id);
         }
         removed
+    }
+
+    fn retire_exact_batch_candidates(
+        &self,
+        candidates: Vec<PaneBatchRetirementCandidate>,
+    ) -> usize {
+        struct CurrentCandidate {
+            candidate: PaneBatchRetirementCandidate,
+            domain_id: DomainId,
+            expected_domain: Option<Arc<dyn Domain>>,
+        }
+
+        struct PreparedCandidate {
+            candidate: PaneBatchRetirementCandidate,
+            authority: PreparedLivePaneRegistrationRemoval,
+            output_current: bool,
+        }
+
+        struct BatchCommit {
+            removed: Vec<(RemovedPaneRegistration, PaneRegistrationOperationLease)>,
+            removed_live: Vec<LivePaneRegistration>,
+            rejected: Vec<PaneBatchRetirementCandidate>,
+            output_batches: Vec<Arc<PaneOutputBatch>>,
+            removed_ids: HashSet<PaneId>,
+        }
+
+        let transaction = (|| -> anyhow::Result<BatchCommit> {
+            let candidate_count = candidates.len();
+            let mut current = Vec::<CurrentCandidate>::new();
+            let mut rejected = Vec::<PaneBatchRetirementCandidate>::new();
+            let mut seen_current_ids = HashSet::<PaneId>::new();
+            let mut prepared = Vec::<PreparedCandidate>::new();
+            let mut lifecycle_ids = Vec::<PaneId>::new();
+            let mut lifecycle_notifications =
+                Vec::<PreparedPaneLifecycleBatchNotification>::new();
+            let mut committed = Vec::<PaneBatchRetirementCandidate>::new();
+            let mut removed_live = Vec::<LivePaneRegistration>::new();
+            let mut removed = Vec::<(
+                RemovedPaneRegistration,
+                PaneRegistrationOperationLease,
+            )>::new();
+            let mut output_batches = Vec::<Arc<PaneOutputBatch>>::new();
+            let mut removed_ids = HashSet::<PaneId>::new();
+            for allocation in [
+                current.try_reserve_exact(candidate_count),
+                rejected.try_reserve_exact(candidate_count),
+                prepared.try_reserve_exact(candidate_count),
+                lifecycle_ids.try_reserve_exact(candidate_count),
+                lifecycle_notifications.try_reserve_exact(candidate_count),
+                committed.try_reserve_exact(candidate_count),
+                removed_live.try_reserve_exact(candidate_count),
+                removed.try_reserve_exact(candidate_count),
+                output_batches.try_reserve_exact(candidate_count),
+            ] {
+                allocation.map_err(|error| {
+                    anyhow!("reserve exact pane retirement batch storage: {error}")
+                })?;
+            }
+            seen_current_ids
+                .try_reserve(candidate_count)
+                .map_err(|error| anyhow!("reserve pane retirement identity set: {error}"))?;
+            removed_ids
+                .try_reserve(candidate_count)
+                .map_err(|error| anyhow!("reserve retired pane identity set: {error}"))?;
+
+            let _domain_registration = self.domain_registration.lock();
+            let _registration = self.pane_registration.lock();
+            {
+                let panes = self.panes.read();
+                for candidate in candidates {
+                    let pane_id = candidate.generation.pane_id;
+                    let Some(registered) = panes.get(&pane_id).filter(|registered| {
+                        Arc::ptr_eq(&registered.pane, &candidate.pane)
+                            && Arc::ptr_eq(&registered.generation, &candidate.generation)
+                    }) else {
+                        rejected.push(candidate);
+                        continue;
+                    };
+                    if !seen_current_ids.insert(pane_id) {
+                        rejected.push(candidate);
+                        continue;
+                    }
+                    current.push(CurrentCandidate {
+                        candidate,
+                        domain_id: registered.domain_id,
+                        expected_domain: None,
+                    });
+                }
+            }
+
+            if current.is_empty() {
+                return Ok(BatchCommit {
+                    removed,
+                    removed_live,
+                    rejected,
+                    output_batches,
+                    removed_ids,
+                });
+            }
+
+            {
+                let domains = self.domains.read();
+                let domains_by_name = self.domains_by_name.read();
+                for current in &mut current {
+                    current.expected_domain = domains.get(&current.domain_id).cloned();
+                    if let Some(domain) = current.expected_domain.as_ref() {
+                        anyhow::ensure!(
+                            domains_by_name
+                                .values()
+                                .any(|registered| Arc::ptr_eq(registered, domain)),
+                            "pane {} domain lacks its exact name-index registration",
+                            current.candidate.generation.pane_id
+                        );
+                    }
+                }
+            }
+
+            let mut authority = self.pane_authority.lock();
+            let preparations = self.pane_preparations.lock();
+            let mut panes = self.panes.write();
+            for current in current {
+                let pane_id = current.candidate.generation.pane_id;
+                anyhow::ensure!(
+                    !preparations.contains_key(&pane_id),
+                    "live pane {pane_id} also owns an in-flight preparation"
+                );
+                let registered = panes.get(&pane_id).ok_or_else(|| {
+                    anyhow!("pane {pane_id} retired before batch commit")
+                })?;
+                anyhow::ensure!(
+                    registered.domain_id == current.domain_id
+                        && Arc::ptr_eq(&registered.pane, &current.candidate.pane)
+                        && Arc::ptr_eq(
+                            &registered.generation,
+                            &current.candidate.generation
+                        ),
+                    "pane {pane_id} changed exact generation before batch commit"
+                );
+                let registration = PaneRegistrationHandle::new(
+                    &current.candidate.pane,
+                    &current.candidate.generation,
+                );
+                let prepared_authority = authority.prepare_live_registration_removal(
+                    pane_id,
+                    &current.candidate.pane,
+                    current.domain_id,
+                    current.expected_domain.as_ref(),
+                    &registration,
+                )?;
+                lifecycle_ids.push(pane_id);
+                removed_ids.insert(pane_id);
+                prepared.push(PreparedCandidate {
+                    candidate: current.candidate,
+                    authority: prepared_authority,
+                    output_current: false,
+                });
+            }
+
+            let mut retiring = self.retiring_pane_ids.lock();
+            anyhow::ensure!(
+                lifecycle_ids.iter().all(|pane_id| {
+                    !retiring.contains(pane_id)
+                        && !self.pane_retirements.has_in_flight_retirement(*pane_id)
+                }),
+                "a live pane in the batch already owns a retirement fence"
+            );
+            retiring
+                .try_reserve(lifecycle_ids.len())
+                .map_err(|error| anyhow!("reserve pane retirement fences: {error}"))?;
+
+            let mut pending_output = self.pending_pane_output.lock();
+            for prepared in &mut prepared {
+                let pane_id = prepared.candidate.generation.pane_id;
+                if let Some(batch) = pending_output.queued.get(&pane_id) {
+                    anyhow::ensure!(
+                        Arc::ptr_eq(&batch.generation, &prepared.candidate.generation),
+                        "pane {pane_id} output marker names another generation"
+                    );
+                    prepared.output_current = true;
+                }
+            }
+            let lifecycle_enqueue = self.prepare_pane_lifecycle_batch_enqueue(&lifecycle_ids)?;
+            let mut topology = self.topology.lock();
+            let first_revision = topology
+                .reserve_revisions(lifecycle_ids.len())
+                .map_err(anyhow::Error::new)?;
+            for (index, prepared) in prepared.iter().enumerate() {
+                let offset = u64::try_from(index)
+                    .map_err(|_| anyhow!("pane retirement revision offset overflow"))?;
+                lifecycle_notifications.push(PreparedPaneLifecycleBatchNotification {
+                    notification: PaneLifecycleNotification::Removed(
+                        prepared.candidate.generation.pane_id,
+                    ),
+                    topology: MuxTopologyStamp::Revision(TopologyRevision::new(
+                        first_revision
+                            .get()
+                            .checked_add(offset)
+                            .expect("reserved pane retirement revisions cannot overflow"),
+                    )),
+                    reader_start_gate: None,
+                    cleanup_complete: Some(Arc::clone(
+                        &prepared.candidate.generation.cleanup_complete,
+                    )),
+                    removal_follow_up: PaneRemovalFollowUp::None,
+                });
+            }
+
+            for prepared in prepared {
+                let pane_id = prepared.candidate.generation.pane_id;
+                authority.commit_live_registration_removal(prepared.authority);
+                let registered = panes
+                    .remove(&pane_id)
+                    .expect("prepared batch pane remains registered");
+                debug_assert!(Arc::ptr_eq(&registered.pane, &prepared.candidate.pane));
+                debug_assert!(Arc::ptr_eq(
+                    &registered.generation,
+                    &prepared.candidate.generation
+                ));
+                let inserted = retiring.insert(pane_id);
+                debug_assert!(inserted);
+                if prepared.output_current {
+                    output_batches.push(
+                        pending_output
+                            .queued
+                            .remove(&pane_id)
+                            .expect("prepared output batch remains queued"),
+                    );
+                }
+                removed_live.push(registered);
+                committed.push(prepared.candidate);
+            }
+            let tickets = lifecycle_enqueue.enqueue(lifecycle_notifications);
+            for (candidate, ticket) in committed.into_iter().zip(tickets) {
+                let PaneBatchRetirementCandidate {
+                    pane,
+                    generation,
+                    operation,
+                } = candidate;
+                removed.push((
+                    RemovedPaneRegistration {
+                        pane_id: generation.pane_id,
+                        pane,
+                        generation,
+                        lifecycle_notification: ticket,
+                    },
+                    operation,
+                ));
+            }
+
+            Ok(BatchCommit {
+                removed,
+                removed_live,
+                rejected,
+                output_batches,
+                removed_ids,
+            })
+        })();
+
+        let BatchCommit {
+            removed,
+            removed_live,
+            rejected,
+            output_batches,
+            removed_ids,
+        } = match transaction {
+            Ok(committed) => committed,
+            Err(error) => {
+                log::error!(
+                    "refusing exact pane retirement batch before transactional commit: {error:#}"
+                );
+                return 0;
+            }
+        };
+
+        // Live-registration drops and rejected operation leases can run
+        // retirement cleanup. Keep both outside the registry/index cut.
+        drop(removed_live);
+        drop(rejected);
+        for output_batch in output_batches {
+            histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
+            output_batch.seal();
+        }
+        self.discard_removed_pane_states_set(&removed_ids);
+        let retired = removed.len();
+        for (removed, operation) in removed {
+            self.finish_pane_removal(removed, true);
+            drop(operation);
+        }
+        if retired != 0 {
+            self.recompute_pane_count();
+        }
+        retired
     }
 
     fn finish_pane_removal(&self, removed: RemovedPaneRegistration, kill: bool) {
@@ -9415,7 +11129,8 @@ impl Mux {
             return None;
         }
 
-        let (removed_panes, output_batches) = {
+        let committed = {
+            let _domain_registration = self.domain_registration.lock();
             let _registration = self.pane_registration.lock();
             let mut authority = self.pane_authority.lock();
             let mut tabs = self.tabs.write();
@@ -9454,10 +11169,10 @@ impl Mux {
                 }));
             }
             let result = tab.with_pane_snapshot_for_retirement(self, |pane_snapshot| {
-                let structural_ids = match authority
+                let pane_candidates = match authority
                     .prepare_tab_structural_removal(&tab, &pane_snapshot)
                 {
-                    Ok(ids) => ids,
+                    Ok(candidates) => candidates,
                     Err(error) => {
                         log::error!(
                             "refusing tab retirement before structural-index commit: {error:#}"
@@ -9465,222 +11180,324 @@ impl Mux {
                         return None;
                     }
                 };
-                let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
-                if let Err(error) = self.validate_tab_pane_candidates_for_removal_locked(
+                let prepared_retirement = match self
+                    .prepare_tab_pane_candidates_for_removal_locked(
                     &authority,
-                    &pane_candidates,
+                    std::slice::from_ref(&pane_candidates),
                 ) {
-                    log::error!(
-                        "refusing tab retirement before domain-index commit: {error:#}"
-                    );
-                    return None;
-                }
-                if !prepared_windows.is_empty() {
-                    if let Err(error) = self.commit_prepared_window_states_locked(
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        log::error!(
+                            "refusing tab retirement before terminal-pane commit: {error:#}"
+                        );
+                        return None;
+                    }
+                };
+                let revision_count = prepared_retirement.revision_count();
+                let commit = |first_revision| {
+                    let removed = tabs.remove(&tab_id);
+                    debug_assert!(removed.is_some_and(|removed| Arc::ptr_eq(&removed, &tab)));
+                    authority.commit_tab_structural_removal(&tab, &pane_candidates);
+                    prepared_retirement.commit(&mut authority, first_revision)
+                };
+                let committed = if prepared_windows.is_empty() {
+                    self.commit_with_reserved_pane_retirement_revisions(revision_count, commit)
+                } else {
+                    self.commit_prepared_window_states_with_trailing_revisions_locked(
                         &mut windows,
                         prepared_windows,
                         Vec::new(),
                         Vec::new(),
                         removed_windows,
-                    ) {
-                        log::error!("refusing tab retirement window commit: {error:#}");
-                        return None;
+                        revision_count,
+                        commit,
+                    )
+                };
+                match committed {
+                    Ok(committed) => Some(committed),
+                    Err(error) => {
+                        log::error!("refusing tab retirement commit: {error:#}");
+                        None
                     }
                 }
-                tabs.remove(&tab_id);
-                authority.commit_tab_structural_removal(&tab, &structural_ids);
-                Some(self.take_tab_pane_candidates_for_removal_locked(
-                    &mut authority,
-                    pane_candidates,
-                ))
             })?;
             result
         };
-        self.finish_taken_tab_pane_state(&removed_panes, output_batches);
+        let CommittedTabPaneRetirement {
+            mut removed_panes_by_group,
+            mut output_batches_by_group,
+            removed_live,
+            removed_ids,
+        } = committed;
+        let removed_panes = removed_panes_by_group
+            .pop()
+            .expect("one tab retirement retains one removed-pane group");
+        debug_assert!(removed_panes_by_group.is_empty());
+        let output_batches = output_batches_by_group
+            .pop()
+            .expect("one tab retirement retains one output-batch group");
+        debug_assert!(output_batches_by_group.is_empty());
+        drop(removed_live);
+        self.finish_taken_tab_pane_state(&removed_ids, output_batches);
         Some((tab, removed_panes))
     }
 
-    /// Resolve callback-free structural pane pointers to the numeric slots
-    /// already owned by the pane registry or an in-flight preparation. The
-    /// caller holds `pane_registration`, so the two maps cannot change between
-    /// this census and retirement.
-    fn resolve_tab_pane_candidates_locked(
-        &self,
-        pane_snapshot: Vec<Arc<dyn Pane>>,
-    ) -> Vec<(PaneId, Arc<dyn Pane>)> {
-        self.resolve_tab_pane_candidate_batches_locked(std::slice::from_ref(&pane_snapshot))
-            .pop()
-            .expect("one pane snapshot produces one candidate batch")
-    }
-
-    /// Batch variant of [`Self::resolve_tab_pane_candidates_locked`]. A
-    /// window can own many tabs, so scanning the global pane registries once
-    /// avoids turning close latency into `tabs * registered_panes` work.
-    fn resolve_tab_pane_candidate_batches_locked(
-        &self,
-        pane_snapshots: &[Vec<Arc<dyn Pane>>],
-    ) -> Vec<Vec<(PaneId, Arc<dyn Pane>)>> {
-        if pane_snapshots.iter().all(Vec::is_empty) {
-            return pane_snapshots.iter().map(|_| Vec::new()).collect();
-        }
-        let preparations = self.pane_preparations.lock();
-        let panes = self.panes.read();
-        let structural_identities = pane_snapshots
-            .iter()
-            .flatten()
-            .map(|pane| Arc::as_ptr(pane) as *const () as usize)
-            .collect::<HashSet<_>>();
-        let mut pane_ids_by_identity = HashMap::with_capacity(structural_identities.len());
-        for (pane_id, registered) in panes.iter() {
-            let identity = Arc::as_ptr(&registered.pane) as *const () as usize;
-            if structural_identities.contains(&identity) {
-                pane_ids_by_identity.insert(identity, *pane_id);
-            }
-        }
-        for (pane_id, preparing) in preparations.iter() {
-            let identity = Weak::as_ptr(&preparing.pane) as *const () as usize;
-            if structural_identities.contains(&identity) {
-                pane_ids_by_identity.entry(identity).or_insert(*pane_id);
-            }
-        }
-        pane_snapshots
-            .iter()
-            .map(|snapshot| {
-                snapshot
-                    .iter()
-                    .filter_map(|pane| {
-                        let identity = Arc::as_ptr(pane) as *const () as usize;
-                        let pane_id = pane_ids_by_identity.remove(&identity)?;
-                        Some((pane_id, Arc::clone(pane)))
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
-    /// Remove the pane-registry entries in one already-authorized tab
-    /// snapshot. The caller holds `pane_registration` and has already removed
-    /// the exact tab from `tabs`.
-    fn take_tab_pane_candidates_for_removal_locked(
-        &self,
-        authority: &mut PaneAuthorityIndex,
-        pane_candidates: Vec<(PaneId, Arc<dyn Pane>)>,
-    ) -> (Vec<RemovedPaneRegistration>, Vec<Arc<PaneOutputBatch>>) {
-        for (pane_id, expected) in &pane_candidates {
-            self.cancel_pane_preparation_locked(*pane_id, Some(expected));
-        }
-        let removed_panes = {
-            let mut panes = self.panes.write();
-            pane_candidates
-                .into_iter()
-                .filter_map(|(pane_id, expected)| {
-                    let registered = panes
-                        .get(&pane_id)
-                        .filter(|registered| Arc::ptr_eq(&registered.pane, &expected))?;
-                    let pane = Arc::clone(&registered.pane);
-                    let generation = Arc::clone(&registered.generation);
-                    let domain_id = registered.domain_id;
-                    let registration = PaneRegistrationHandle::new(&pane, &generation);
-                    debug_assert!(authority.contains_live_registration(
-                        pane_id,
-                        domain_id,
-                        &registration,
-                    ));
-                    let removed = authority.remove_live_registration(
-                        pane_id,
-                        &pane,
-                        domain_id,
-                        &registration,
-                    );
-                    debug_assert!(removed);
-                    let registered = panes
-                        .remove(&pane_id)
-                        .expect("validated tab pane remains registered");
-                    drop(registered);
-                    Some((pane_id, pane, generation))
-                })
-                .collect::<Vec<_>>()
-        };
-        {
-            let mut retiring = self.retiring_pane_ids.lock();
-            for (pane_id, _, _) in &removed_panes {
-                retiring.insert(*pane_id);
-            }
-        }
-        let output_batches = removed_panes
-            .iter()
-            .filter_map(|(pane_id, _, generation)| {
-                self.take_pending_pane_output_batch_locked(*pane_id, generation)
-            })
-            .collect::<Vec<_>>();
-        let removed_panes = removed_panes
-            .into_iter()
-            .map(|(pane_id, pane, generation)| {
-                let lifecycle_notification = self.enqueue_pane_removal_notification_locked(
-                    pane_id,
-                    &generation,
-                    PaneRemovalFollowUp::None,
-                );
-                RemovedPaneRegistration {
-                    pane_id,
-                    pane,
-                    generation,
-                    lifecycle_notification,
-                }
-            })
-            .collect::<Vec<_>>();
-        (removed_panes, output_batches)
-    }
-
-    /// Validate every exact live registration that a tab retirement will
-    /// remove before window/tab topology commits. The caller holds both
-    /// `pane_registration` and `pane_authority`, so a successful check remains
-    /// stable through the infallible removal phase.
-    fn validate_tab_pane_candidates_for_removal_locked(
-        &self,
+    /// Prepare every fallible part of terminally retiring the exact live pane
+    /// registrations represented by one or more frozen tab snapshots.
+    ///
+    /// The caller holds `domain_registration`, `pane_registration`, and
+    /// `pane_authority`; the frozen tab locks remain held by the surrounding
+    /// structural transaction. The returned guards keep preparation, live,
+    /// fence, output, and lifecycle state stable until the caller has reserved
+    /// topology authority and is ready to commit all layers together.
+    fn prepare_tab_pane_candidates_for_removal_locked<'a>(
+        &'a self,
         authority: &PaneAuthorityIndex,
-        pane_candidates: &[(PaneId, Arc<dyn Pane>)],
-    ) -> anyhow::Result<()> {
-        let panes = self.panes.read();
-        for (pane_id, expected) in pane_candidates {
-            let Some(registered) = panes
-                .get(pane_id)
-                .filter(|registered| Arc::ptr_eq(&registered.pane, expected))
-            else {
-                continue;
-            };
-            let registration =
-                PaneRegistrationHandle::new(&registered.pane, &registered.generation);
-            anyhow::ensure!(
-                authority.contains_live_registration(
-                    *pane_id,
-                    registered.domain_id,
-                    &registration,
-                ),
-                "pane {pane_id} lacks its exact domain-registration index entry"
-            );
+        pane_candidate_batches: &[Vec<(PaneId, Arc<dyn Pane>)>],
+    ) -> anyhow::Result<PreparedTabPaneRetirement<'a>> {
+        let candidate_count = pane_candidate_batches.iter().try_fold(
+            0usize,
+            |count, candidates| {
+                count
+                    .checked_add(candidates.len())
+                    .ok_or_else(|| anyhow!("tab pane retirement candidate count overflow"))
+            },
+        )?;
+
+        let mut live = Vec::new();
+        let mut preparation_cancellations = Vec::new();
+        let mut lifecycle_ids = Vec::new();
+        let mut lifecycle_notifications = Vec::new();
+        let mut removed_live = Vec::new();
+        for allocation in [
+            live.try_reserve_exact(candidate_count),
+            preparation_cancellations.try_reserve_exact(candidate_count),
+            lifecycle_ids.try_reserve_exact(candidate_count),
+            lifecycle_notifications.try_reserve_exact(candidate_count),
+            removed_live.try_reserve_exact(candidate_count),
+        ] {
+            allocation.map_err(|error| {
+                anyhow!("reserve exact tab pane retirement storage: {error}")
+            })?;
         }
-        Ok(())
+
+        let mut removed_ids = HashSet::new();
+        removed_ids
+            .try_reserve(candidate_count)
+            .map_err(|error| anyhow!("reserve tab pane retirement identity set: {error}"))?;
+        let mut seen_ids = HashSet::new();
+        seen_ids
+            .try_reserve(candidate_count)
+            .map_err(|error| anyhow!("reserve tab pane candidate identity set: {error}"))?;
+
+        let mut removed_panes_by_group = Vec::new();
+        let mut output_batches_by_group = Vec::new();
+        removed_panes_by_group
+            .try_reserve_exact(pane_candidate_batches.len())
+            .map_err(|error| anyhow!("reserve tab pane retirement groups: {error}"))?;
+        output_batches_by_group
+            .try_reserve_exact(pane_candidate_batches.len())
+            .map_err(|error| anyhow!("reserve tab pane output groups: {error}"))?;
+        for candidates in pane_candidate_batches {
+            let mut removed = Vec::new();
+            removed
+                .try_reserve_exact(candidates.len())
+                .map_err(|error| anyhow!("reserve grouped removed panes: {error}"))?;
+            removed_panes_by_group.push(removed);
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(candidates.len())
+                .map_err(|error| anyhow!("reserve grouped pane output batches: {error}"))?;
+            output_batches_by_group.push(output);
+        }
+
+        let domains = self.domains.read();
+        let domains_by_name = self.domains_by_name.read();
+        let preparations = self.pane_preparations.lock();
+        let panes = self.panes.write();
+        for (group_index, candidates) in pane_candidate_batches.iter().enumerate() {
+            for (pane_id, expected) in candidates {
+                anyhow::ensure!(
+                    seen_ids.insert(*pane_id),
+                    "pane {pane_id} appears more than once in one tab retirement transaction"
+                );
+                let owner = authority.structural_by_pane_id.get(pane_id).ok_or_else(|| {
+                    anyhow!("pane {pane_id} lacks prepared structural retirement authority")
+                })?;
+                anyhow::ensure!(
+                    owner.matches_pane(expected),
+                    "pane {pane_id} structural retirement names another exact allocation"
+                );
+                let owner_is_live = match (&owner.registration, owner.domain_id) {
+                    (Some(_), Some(_)) => true,
+                    (None, None) => false,
+                    _ => anyhow::bail!(
+                        "pane {pane_id} structural owner has partial live-registration metadata"
+                    ),
+                };
+                match panes.get(pane_id) {
+                    Some(registered) => {
+                        anyhow::ensure!(
+                            owner_is_live,
+                            "live pane {pane_id} lacks live structural-owner metadata"
+                        );
+                        anyhow::ensure!(
+                            Arc::ptr_eq(&registered.pane, expected),
+                            "pane {pane_id} changed exact allocation before tab retirement"
+                        );
+                        anyhow::ensure!(
+                            !preparations.contains_key(pane_id),
+                            "live pane {pane_id} also owns an in-flight preparation"
+                        );
+                        let expected_domain = domains.get(&registered.domain_id).cloned();
+                        if let Some(domain) = expected_domain.as_ref() {
+                            anyhow::ensure!(
+                                domains_by_name
+                                    .values()
+                                    .any(|registered| Arc::ptr_eq(registered, domain)),
+                                "pane {pane_id} domain lacks its exact name-index registration"
+                            );
+                        }
+                        let generation = Arc::clone(&registered.generation);
+                        let registration = PaneRegistrationHandle::new(expected, &generation);
+                        let prepared_authority = authority.prepare_live_registration_removal(
+                            *pane_id,
+                            expected,
+                            registered.domain_id,
+                            expected_domain.as_ref(),
+                            &registration,
+                        )?;
+                        let revision_offset = u64::try_from(live.len())
+                            .map_err(|_| anyhow!("tab pane retirement revision offset overflow"))?;
+                        lifecycle_ids.push(*pane_id);
+                        debug_assert!(removed_ids.insert(*pane_id));
+                        live.push(PreparedTabPaneRetirementCandidate {
+                            group_index,
+                            pane_id: *pane_id,
+                            pane: Arc::clone(expected),
+                            generation,
+                            authority: Some(prepared_authority),
+                            output_current: false,
+                            revision_offset,
+                        });
+                    }
+                    None => {
+                        anyhow::ensure!(
+                            !owner_is_live,
+                            "live structural pane {pane_id} is absent from the live registry"
+                        );
+                        if let Some(preparation) = preparations.get(pane_id) {
+                            anyhow::ensure!(
+                                Weak::ptr_eq(&preparation.pane, &Arc::downgrade(expected)),
+                                "pane {pane_id} preparation names another exact allocation"
+                            );
+                            preparation_cancellations.push(
+                                PreparedTabPanePreparationCancellation {
+                                    pane_id: *pane_id,
+                                    pane: Arc::downgrade(expected),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        drop(domains_by_name);
+        drop(domains);
+
+        let mut retiring = self.retiring_pane_ids.lock();
+        anyhow::ensure!(
+            seen_ids.iter().all(|pane_id| {
+                !retiring.contains(pane_id)
+                    && !self
+                        .pane_retirements
+                        .has_in_flight_retirement(*pane_id)
+            }),
+            "a tab pane already owns a retirement fence"
+        );
+        retiring
+            .try_reserve(live.len())
+            .map_err(|error| anyhow!("reserve tab pane retirement fences: {error}"))?;
+
+        let pending_output = self.pending_pane_output.lock();
+        for candidate in &mut live {
+            if let Some(batch) = pending_output.queued.get(&candidate.pane_id) {
+                anyhow::ensure!(
+                    Arc::ptr_eq(&batch.generation, &candidate.generation),
+                    "pane {} output marker names another generation",
+                    candidate.pane_id
+                );
+                candidate.output_current = true;
+            }
+        }
+        // Lock-order contract for a terminal tab/window cut:
+        // pending_pane_lifecycle -> topology -> pending_window_notifications.
+        // Legacy envelope construction reserves topology and releases that
+        // guard before it acquires either pending queue, so no live path holds
+        // the reverse pair. The returned lifecycle guard intentionally stays
+        // held through the contiguous revision reservation and window commit.
+        let lifecycle_enqueue = if lifecycle_ids.is_empty() {
+            None
+        } else {
+            Some(self.prepare_pane_lifecycle_batch_enqueue(&lifecycle_ids)?)
+        };
+
+        Ok(PreparedTabPaneRetirement {
+            live,
+            preparation_cancellations,
+            preparations,
+            panes,
+            retiring,
+            pending_output,
+            lifecycle_enqueue,
+            lifecycle_notifications,
+            removed_panes_by_group,
+            output_batches_by_group,
+            removed_live,
+            removed_ids,
+        })
     }
 
     fn finish_taken_tab_pane_state(
         &self,
-        removed_panes: &[RemovedPaneRegistration],
+        removed_ids: &HashSet<PaneId>,
         output_batches: Vec<Arc<PaneOutputBatch>>,
     ) {
         for output_batch in output_batches {
             histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
             output_batch.seal();
         }
-        let pane_ids = removed_panes
-            .iter()
-            .map(|removed| removed.pane_id)
-            .collect::<Vec<_>>();
-        self.discard_removed_pane_states(&pane_ids);
+        self.discard_removed_pane_states_set(removed_ids);
+    }
+
+    /// Diagnose a missing/mismatched reverse parent without taxing the normal
+    /// indexed path. More than one forward parent is always corruption.
+    fn find_exact_tab_forward_parent_locked(
+        windows: &HashMap<WindowId, Window>,
+        tab: &Arc<Tab>,
+        operation: &'static str,
+    ) -> anyhow::Result<Option<WindowId>> {
+        let mut parent = None;
+        for (window_id, window) in windows {
+            if !window
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, tab))
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                parent.replace(*window_id).is_none(),
+                "{operation}: exact tab {} appears in more than one window",
+                tab.tab_id()
+            );
+        }
+        Ok(parent)
     }
 
     /// Allocation-prepare the complete exact-parentage sweep before any tab,
-    /// pane, or window registry changes.
+    /// pane, or window registry changes. The normal path is O(removals) via
+    /// `tab_parents`; a missing or mismatched reverse entry triggers a rare
+    /// forward census so corruption can never masquerade as an unattached tab.
     fn prepare_exact_tab_detach_locked(
         &self,
         windows: &HashMap<WindowId, Window>,
@@ -9700,6 +11517,11 @@ impl Mux {
             .map_err(|error| anyhow!("reserve {operation} indexed parents: {error}"))?;
         for tab in removals {
             let Some(parent) = parents.get(&tab.tab_id()) else {
+                anyhow::ensure!(
+                    Self::find_exact_tab_forward_parent_locked(windows, tab, operation)?.is_none(),
+                    "{operation}: exact tab {} has window membership but no parent authority",
+                    tab.tab_id()
+                );
                 continue;
             };
             if !parent.is_same_tab(tab) {
@@ -9708,9 +11530,22 @@ impl Mux {
                     "{operation}: tab {} parent index names a different exact generation",
                     tab.tab_id()
                 );
+                anyhow::ensure!(
+                    Self::find_exact_tab_forward_parent_locked(windows, tab, operation)?.is_none(),
+                    "{operation}: exact tab {} remains in a window while its parent index names a same-id successor",
+                    tab.tab_id()
+                );
                 continue;
             }
             if excluded_window == Some(parent.window_id) {
+                anyhow::ensure!(
+                    windows.get(&parent.window_id).is_some_and(|window| {
+                        window.iter().any(|candidate| Arc::ptr_eq(candidate, tab))
+                    }),
+                    "{operation}: excluded parent window {} omits exact tab {}",
+                    parent.window_id,
+                    tab.tab_id()
+                );
                 continue;
             }
             let identities = removals_by_window.entry(parent.window_id).or_default();
@@ -9754,7 +11589,8 @@ impl Mux {
         operation: &PaneOperationGuard,
     ) -> Option<(Arc<Tab>, Vec<RemovedPaneRegistration>)> {
         let tab_id = expected.tab_id();
-        let (removed_panes, output_batches) = {
+        let committed = {
+            let _domain_registration = self.domain_registration.lock();
             let _registration = self.pane_registration.lock();
             let mut authority = self.pane_authority.lock();
             let mut tabs = self.tabs.write();
@@ -9798,10 +11634,10 @@ impl Mux {
                 self,
                 operation,
                 |pane_snapshot| {
-                    let structural_ids = match authority
+                    let pane_candidates = match authority
                         .prepare_tab_structural_removal(expected, &pane_snapshot)
                     {
-                        Ok(ids) => ids,
+                        Ok(candidates) => candidates,
                         Err(error) => {
                             log::error!(
                                 "refusing witnessed tab retirement before structural-index commit: {error:#}"
@@ -9809,41 +11645,71 @@ impl Mux {
                             return None;
                         }
                     };
-                    let pane_candidates = self.resolve_tab_pane_candidates_locked(pane_snapshot);
-                    if let Err(error) = self.validate_tab_pane_candidates_for_removal_locked(
-                        &authority,
-                        &pane_candidates,
-                    ) {
-                        log::error!(
-                            "refusing witnessed tab retirement before domain-index commit: {error:#}"
+                    let prepared_retirement = match self
+                        .prepare_tab_pane_candidates_for_removal_locked(
+                            &authority,
+                            std::slice::from_ref(&pane_candidates),
+                        ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            log::error!(
+                                "refusing witnessed tab retirement before terminal-pane commit: {error:#}"
+                            );
+                            return None;
+                        }
+                    };
+                    let revision_count = prepared_retirement.revision_count();
+                    let commit = |first_revision| {
+                        let removed = tabs.remove(&tab_id);
+                        debug_assert!(
+                            removed.is_some_and(|removed| Arc::ptr_eq(&removed, expected))
                         );
-                        return None;
-                    }
-                    if !prepared_windows.is_empty() {
-                        if let Err(error) = self.commit_prepared_window_states_locked(
+                        authority.commit_tab_structural_removal(expected, &pane_candidates);
+                        prepared_retirement.commit(&mut authority, first_revision)
+                    };
+                    let committed = if prepared_windows.is_empty() {
+                        self.commit_with_reserved_pane_retirement_revisions(
+                            revision_count,
+                            commit,
+                        )
+                    } else {
+                        self.commit_prepared_window_states_with_trailing_revisions_locked(
                             &mut windows,
                             prepared_windows,
                             Vec::new(),
                             Vec::new(),
                             removed_windows,
-                        ) {
-                            log::error!(
-                                "refusing witnessed tab retirement window commit: {error:#}"
-                            );
-                            return None;
+                            revision_count,
+                            commit,
+                        )
+                    };
+                    match committed {
+                        Ok(committed) => Some(committed),
+                        Err(error) => {
+                            log::error!("refusing witnessed tab retirement commit: {error:#}");
+                            None
                         }
                     }
-                    tabs.remove(&tab_id);
-                    authority.commit_tab_structural_removal(expected, &structural_ids);
-                    Some(self.take_tab_pane_candidates_for_removal_locked(
-                        &mut authority,
-                        pane_candidates,
-                    ))
                 },
             )?;
             result
         };
-        self.finish_taken_tab_pane_state(&removed_panes, output_batches);
+        let CommittedTabPaneRetirement {
+            mut removed_panes_by_group,
+            mut output_batches_by_group,
+            removed_live,
+            removed_ids,
+        } = committed;
+        let removed_panes = removed_panes_by_group
+            .pop()
+            .expect("one witnessed tab retirement retains one removed-pane group");
+        debug_assert!(removed_panes_by_group.is_empty());
+        let output_batches = output_batches_by_group
+            .pop()
+            .expect("one witnessed tab retirement retains one output-batch group");
+        debug_assert!(output_batches_by_group.is_empty());
+        drop(removed_live);
+        self.finish_taken_tab_pane_state(&removed_ids, output_batches);
         Some((Arc::clone(expected), removed_panes))
     }
 
@@ -9988,7 +11854,8 @@ impl Mux {
         window_id: WindowId,
         expected: Option<(&Arc<Tab>, &PaneOperationGuard)>,
     ) -> Option<RemovedWindowRegistration> {
-        let mut removed_tabs = {
+        let (mut removed_tabs, removed_live, removed_ids) = {
+            let _domain_registration = self.domain_registration.lock();
             let _registration = self.pane_registration.lock();
             let mut authority = self.pane_authority.lock();
             let mut tabs = self.tabs.write();
@@ -10060,22 +11927,18 @@ impl Mux {
                 &retired_tabs,
                 expected,
                 |pane_snapshots| {
-                    let pane_candidate_batches =
-                        self.resolve_tab_pane_candidate_batches_locked(&pane_snapshots);
-                    let mut structural_removals = Vec::new();
-                    if structural_removals
+                    let mut pane_candidate_batches = Vec::new();
+                    if pane_candidate_batches
                         .try_reserve_exact(retired_tabs.len())
                         .is_err()
                     {
                         return None;
                     }
-                    for ((tab, snapshot), candidates) in retired_tabs
-                        .iter()
-                        .zip(&pane_snapshots)
-                        .zip(&pane_candidate_batches)
-                    {
-                        let ids = match authority.prepare_tab_structural_removal(tab, snapshot) {
-                            Ok(ids) => ids,
+                    for (tab, snapshot) in retired_tabs.iter().zip(&pane_snapshots) {
+                        let candidates = match authority
+                            .prepare_tab_structural_removal(tab, snapshot)
+                        {
+                            Ok(candidates) => candidates,
                             Err(error) => {
                                 log::error!(
                                     "refusing window retirement before structural-index commit: {error:#}"
@@ -10083,18 +11946,7 @@ impl Mux {
                                 return None;
                             }
                         };
-                        if let Err(error) = self
-                            .validate_tab_pane_candidates_for_removal_locked(
-                                &authority,
-                                candidates,
-                            )
-                        {
-                            log::error!(
-                                "refusing window retirement before domain-index commit: {error:#}"
-                            );
-                            return None;
-                        }
-                        structural_removals.push(ids);
+                        pane_candidate_batches.push(candidates);
                     }
                     let mut removed_tab_state = Vec::new();
                     if removed_tab_state
@@ -10103,68 +11955,107 @@ impl Mux {
                     {
                         return None;
                     }
-                    if !prepared_windows.is_empty() {
-                        let removed_windows = if was_provisional {
-                            Vec::new()
-                        } else {
-                            let mut removed = Vec::new();
-                            if removed.try_reserve_exact(1).is_err() {
-                                return None;
-                            }
-                            removed.push(window_id);
-                            removed
-                        };
-                        if let Err(error) = self.commit_prepared_window_states_locked(
+                    let removed_windows = if prepared_windows.is_empty() || was_provisional {
+                        Vec::new()
+                    } else {
+                        let mut removed = Vec::new();
+                        if removed.try_reserve_exact(1).is_err() {
+                            return None;
+                        }
+                        removed.push(window_id);
+                        removed
+                    };
+                    let prepared_retirement = match self
+                        .prepare_tab_pane_candidates_for_removal_locked(
+                            &authority,
+                            &pane_candidate_batches,
+                        ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            log::error!(
+                                "refusing window retirement before terminal-pane commit: {error:#}"
+                            );
+                            return None;
+                        }
+                    };
+                    let revision_count = prepared_retirement.revision_count();
+                    let commit_terminal = |first_revision| {
+                        for tab in &retired_tabs {
+                            let removed = tabs.remove(&tab.tab_id());
+                            debug_assert!(
+                                removed.is_some_and(|removed| Arc::ptr_eq(&removed, tab))
+                            );
+                        }
+                        for (tab, pane_candidates) in
+                            retired_tabs.iter().zip(&pane_candidate_batches)
+                        {
+                            authority.commit_tab_structural_removal(tab, pane_candidates);
+                        }
+                        prepared_retirement.commit(&mut authority, first_revision)
+                    };
+                    let committed = if prepared_windows.is_empty() {
+                        self.commit_with_reserved_pane_retirement_revisions(
+                            revision_count,
+                            |first_revision| {
+                                if was_provisional {
+                                    windows
+                                        .remove(&window_id)
+                                        .expect("validated provisional window remains present");
+                                    self.provisional_windows.lock().remove(&window_id);
+                                }
+                                commit_terminal(first_revision)
+                            },
+                        )
+                    } else {
+                        self.commit_prepared_window_states_with_trailing_revisions_locked(
                             &mut windows,
                             prepared_windows,
                             Vec::new(),
                             Vec::new(),
                             removed_windows,
-                        ) {
+                            revision_count,
+                            commit_terminal,
+                        )
+                    };
+                    let CommittedTabPaneRetirement {
+                        removed_panes_by_group,
+                        output_batches_by_group,
+                        removed_live,
+                        removed_ids,
+                    } = match committed {
+                        Ok(committed) => committed,
+                        Err(error) => {
                             log::error!("refusing window retirement commit: {error:#}");
                             return None;
                         }
-                    }
-                    if was_provisional {
-                        windows
-                            .remove(&window_id)
-                            .expect("validated provisional window remains present");
-                        self.provisional_windows.lock().remove(&window_id);
-                    }
-                    for tab in &retired_tabs {
-                        tabs.remove(&tab.tab_id());
-                    }
-                    for (((tab, structural_panes), structural_ids), pane_candidates) in
-                        retired_tabs
-                            .iter()
-                            .zip(pane_snapshots)
-                            .zip(structural_removals)
-                            .zip(pane_candidate_batches)
+                    };
+                    debug_assert_eq!(removed_panes_by_group.len(), pane_snapshots.len());
+                    debug_assert_eq!(output_batches_by_group.len(), pane_snapshots.len());
+                    for ((structural_panes, removed_panes), output_batches) in pane_snapshots
+                        .into_iter()
+                        .zip(removed_panes_by_group)
+                        .zip(output_batches_by_group)
                     {
-                        authority.commit_tab_structural_removal(tab, &structural_ids);
-                        let (removed_panes, output_batches) = self
-                            .take_tab_pane_candidates_for_removal_locked(
-                                &mut authority,
-                                pane_candidates,
-                            );
                         removed_tab_state.push(RemovedTabRegistration {
                             structural_panes,
                             removed_panes,
                             output_batches,
                         });
                     }
-                    Some(removed_tab_state)
+                    Some((removed_tab_state, removed_live, removed_ids))
                 },
             )?;
             removed_tabs
         };
 
+        drop(removed_live);
         for removed in &mut removed_tabs {
-            self.finish_taken_tab_pane_state(
-                &removed.removed_panes,
-                std::mem::take(&mut removed.output_batches),
-            );
+            for output_batch in std::mem::take(&mut removed.output_batches) {
+                histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
+                output_batch.seal();
+            }
         }
+        self.discard_removed_pane_states_set(&removed_ids);
         Some(RemovedWindowRegistration { removed_tabs })
     }
 
@@ -11372,11 +13263,11 @@ impl Mux {
     }
 
     pub fn resolve_pane_id(&self, pane_id: PaneId) -> Option<(DomainId, WindowId, TabId)> {
+        #[cfg(test)]
+        self.pane_authority_lookup_probes
+            .fetch_add(1, Ordering::Relaxed);
         self.indexed_pane_location(pane_id, None, None)
             .map(|(domain_id, window_id, tab, _lane)| {
-                #[cfg(test)]
-                self.pane_location_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
                 (domain_id, window_id, tab.tab_id())
             })
     }
@@ -11387,12 +13278,12 @@ impl Mux {
         expected_registration: Option<&PaneRegistrationHandle>,
         expected_pane: Option<&Arc<dyn Pane>>,
     ) -> Option<(DomainId, WindowId, Arc<Tab>, PaneStructuralLane)> {
-        let entry = self
-            .pane_authority
-            .lock()
-            .structural_by_pane_id
-            .get(&pane_id)
-            .cloned()?;
+        // Keep one authority cut from the initial exact-owner lookup through
+        // the domain/tab/parent validation. Releasing and reacquiring this
+        // mutex doubled contention on the key path; the explicit comparisons
+        // below remain as fail-closed index-integrity checks.
+        let authority = self.pane_authority.lock();
+        let entry = authority.structural_by_pane_id.get(&pane_id).cloned()?;
         let registration = entry.registration.as_ref()?;
         if expected_registration.is_some_and(|expected| {
             !expected.same_registration(registration)
@@ -11410,7 +13301,6 @@ impl Mux {
         if registration.pane_id() != pane_id {
             return None;
         }
-        let authority = self.pane_authority.lock();
         let still_current = authority
             .structural_by_pane_id
             .get(&pane_id)
@@ -11436,6 +13326,13 @@ impl Mux {
         {
             return None;
         }
+        let domains = self.domains.read();
+        let exact_domain = domains.get(&domain_id);
+        if !authority.domain_directory_matches(domain_id, exact_domain)
+            || self.retired_domain_ids.lock().contains(&domain_id)
+        {
+            return None;
+        }
         let tabs = self.tabs.read();
         if !tabs
             .get(&tab_id)
@@ -11456,6 +13353,152 @@ impl Mux {
             return None;
         }
         Some((domain_id, window_id, tab, entry.lane))
+    }
+
+    /// Resolve the current structural location for one already-admitted pane
+    /// operation.
+    ///
+    /// An admitted operation owns an exact-generation retirement lease.  A
+    /// concurrent local detach may therefore remove the numeric live-registry
+    /// slot while the operation is still entitled to finish against the same
+    /// exact pane allocation.  This path accepts that detached state without
+    /// weakening [`Mux::resolve_pane_id`]: the public numeric lookup remains
+    /// live-only, while this lookup requires the non-cloneable guard, its
+    /// admitted domain allocation, an empty same-ID live slot, and exact
+    /// structural/reverse/parent authority.
+    fn indexed_pane_location_for_operation(
+        &self,
+        operation: &PaneOperationGuard,
+    ) -> Option<(DomainId, WindowId, Arc<Tab>, PaneStructuralLane)> {
+        if !std::ptr::eq(operation.owner().as_ref(), self) {
+            return None;
+        }
+
+        let pane_id = operation.pane_id();
+        let admitted_domain_id = operation.admitted_domain_id();
+        let registration = operation.registration();
+        let _domain_registration = self.domain_registration.lock();
+        let _pane_registration = self.pane_registration.lock();
+
+        if self
+            .retired_domain_ids
+            .lock()
+            .contains(&admitted_domain_id)
+        {
+            return None;
+        }
+        let current_domain = self
+            .domains
+            .read()
+            .get(&admitted_domain_id)
+            .cloned();
+        let domain_is_current = match (operation.admitted_domain(), current_domain.as_ref()) {
+            (Some(expected), Some(current)) => {
+                Weak::ptr_eq(expected, &Arc::downgrade(current))
+            }
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if !domain_is_current {
+            return None;
+        }
+
+        // `pane_registration` keeps the live slot stable while the remaining
+        // authority and topology indexes are checked in their canonical order.
+        let live_slot = self.panes.read().get(&pane_id).map(|registered| {
+            registration.matches_live_registration(registered)
+                && registered.domain_id == admitted_domain_id
+        });
+
+        let authority = self.pane_authority.lock();
+        let entry = authority.structural_by_pane_id.get(&pane_id)?;
+        if !entry.matches_pane(operation.pane()) {
+            return None;
+        }
+        let pane = entry.pane.upgrade()?;
+        if !Arc::ptr_eq(&pane, operation.pane()) {
+            return None;
+        }
+        let tab = entry.tab.upgrade()?;
+        let tab_id = tab.tab_id();
+        if !entry.matches_tab(&tab)
+            || authority
+                .validate_structural_reverse_exact(pane_id, &tab)
+                .is_err()
+        {
+            return None;
+        }
+
+        match live_slot {
+            Some(true) => {
+                if entry.domain_id != Some(admitted_domain_id)
+                    || !entry
+                        .registration
+                        .as_ref()
+                        .is_some_and(|current| current.same_registration(&registration))
+                    || !authority.contains_live_registration(
+                        pane_id,
+                        admitted_domain_id,
+                        &registration,
+                    )
+                    || !authority.domain_directory_matches(
+                        admitted_domain_id,
+                        current_domain.as_ref(),
+                    )
+                {
+                    return None;
+                }
+            }
+            None => {
+                let admitted_directory_is_current = authority
+                    .registrations_by_domain
+                    .get(&admitted_domain_id)
+                    .is_none_or(|registrations| {
+                        registrations.matches_domain(current_domain.as_ref())
+                    });
+                if entry.registration.is_some()
+                    || entry.domain_id.is_some()
+                    || !admitted_directory_is_current
+                    || authority
+                        .registrations_by_domain
+                        .values()
+                        .any(|registrations| {
+                            registrations.pane_registrations.contains_key(&pane_id)
+                        })
+                    || !registration.guards_detached_topology(self, operation.pane())
+                {
+                    return None;
+                }
+            }
+            Some(false) => return None,
+        }
+
+        let tabs = self.tabs.read();
+        if !tabs
+            .get(&tab_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &tab))
+        {
+            return None;
+        }
+        let windows = self.windows.read();
+        let parents = self.tab_parents.read();
+        let parent = parents.get(&tab_id)?;
+        let window_id = parent
+            .matches(&tab, parent.window_id)
+            .then_some(parent.window_id)?;
+        if !windows
+            .get(&window_id)
+            .is_some_and(|window| window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab)))
+        {
+            return None;
+        }
+
+        Some((
+            admitted_domain_id,
+            window_id,
+            tab,
+            entry.lane,
+        ))
     }
 
     pub fn domain_was_detached(&self, domain: DomainId) {
@@ -11632,13 +13675,27 @@ impl Mux {
         }
         match domain {
             SpawnTabDomain::CurrentPaneDomain => {
-                let domain_id = target.with_pane(|pane| pane.domain_id());
-                self.get_domain(domain_id).ok_or_else(|| {
+                let domain_id = target.admitted_domain_id();
+                let _registration = self.domain_registration.lock();
+                anyhow::ensure!(
+                    !self.retired_domain_ids.lock().contains(&domain_id),
+                    "exact pane registration {} resolved to retired domain id {domain_id}",
+                    target.pane_id()
+                );
+                let current = self.domains.read().get(&domain_id).cloned().ok_or_else(|| {
                     anyhow!(
                         "exact pane registration {} resolved to missing domain id {domain_id}",
                         target.pane_id()
                     )
-                })
+                })?;
+                anyhow::ensure!(
+                    target
+                        .admitted_domain()
+                        .is_some_and(|expected| Weak::ptr_eq(expected, &Arc::downgrade(&current))),
+                    "exact pane registration {} resolved to a replaced domain id {domain_id}",
+                    target.pane_id()
+                );
+                Ok(current)
             }
             _ => self.resolve_spawn_tab_domain(None, domain),
         }
@@ -11986,7 +14043,7 @@ impl Mux {
         {
             anyhow::bail!("client registration is no longer current");
         }
-        let (domain_id, _src_window, src_tab) = target.exact_location()?;
+        let (domain_id, _src_window, _src_tab) = target.exact_location()?;
         let domain = self.get_domain(domain_id).ok_or_else(|| {
             anyhow!(
                 "domain {domain_id} of exact pane registration {} not found",
@@ -12001,50 +14058,374 @@ impl Mux {
             return Ok(receipt);
         }
 
-        let window_builder;
-        let (window_id, size) = if let Some(window_id) = window_id {
-            let window = self
-                .get_window_mut(window_id)
-                .ok_or_else(|| anyhow!("window_id {} not found on this server", window_id))?;
-            let tab = window
-                .get_active()
-                .ok_or_else(|| anyhow!("window {} has no tabs", window_id))?;
-            let size = tab.get_size();
+        // The domain callback above is an async extension point. Re-resolve
+        // exact guarded topology after it returns so a delayed local fallback
+        // can never commit against a stale source tab/window pair.
+        let (_domain_id, source_window_id, source_tab) = target.exact_location()?;
 
-            (window_id, size)
+        self.bind_window_notification_owner();
+        let mut unpublished_window = None;
+        let (destination_window_id, destination_size) = if let Some(window_id) = window_id {
+            let windows = self.windows.read();
+            let window = windows
+                .get(&window_id)
+                .ok_or_else(|| anyhow!("window_id {window_id} not found on this server"))?;
+            let active_tab = window
+                .get_active()
+                .ok_or_else(|| anyhow!("window {window_id} has no tabs"))?;
+            (window_id, active_tab.get_size())
         } else {
-            window_builder = self.new_empty_window(workspace_for_new_window, None);
-            (*window_builder, src_tab.get_size())
+            let workspace = workspace_for_new_window
+                .unwrap_or_else(|| self.active_workspace());
+            let window = Window::new_for_owner(
+                Some(workspace),
+                None,
+                Arc::downgrade(self),
+            );
+            let window_id = window.window_id();
+            let size = source_tab.get_size();
+            unpublished_window = Some(window);
+            (window_id, size)
         };
 
-        let pane = src_tab
-            .remove_exact_pane_for_move(self, target.pane())
-            .ok_or_else(|| {
-                anyhow!(
-                    "exact pane registration {} was not in its containing tab",
-                    target.pane_id()
-                )
-            })?;
-
-        let tab = Arc::new(Tab::new(&size));
-        tab.assign_pane(&pane);
-        pane.resize(size)?;
-        // The pane already has exact operation authority. Its numeric registry
-        // slot may have been retired after admission, so committing the new
-        // tab must not attempt to re-register or re-authorize it.
-        self.add_tab_no_panes(&tab)?;
-        self.add_tab_to_window(&tab, window_id)?;
-
-        if src_tab.is_dead() {
-            self.remove_tab(src_tab.tab_id());
+        let mut prepared = source_tab.prepare_guarded_move_to_new_tab(
+            self,
+            &target,
+            destination_size,
+        )?;
+        if unpublished_window.is_some() {
+            anyhow::ensure!(
+                prepared.source_size_at_preparation() == destination_size,
+                "move source tab changed size while preparing its new window"
+            );
         }
+        let destination_tab = Arc::clone(prepared.destination_tab());
+        let committed_size = prepared.destination_size();
+        let source_tab_retires = prepared.source_tab_retires();
+        let trailing_revision_count = prepared.reserve_topology_notifications()?;
+        let mut authority_replacements = prepared.take_authority_replacements()?;
+        let mut unpublished_window_state = unpublished_window
+            .as_ref()
+            .map(|window| window.prepare_insert(0, &destination_tab))
+            .transpose()?;
+
+        let committed = {
+            let _domain_registration = self.domain_registration.lock();
+            let _pane_registration = self.pane_registration.lock();
+            let mut authority = self.pane_authority.lock();
+            let mut tabs = self.tabs.write();
+            anyhow::ensure!(
+                tabs.get(&source_tab.tab_id())
+                    .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab)),
+                "exact move source tab left the mux before commit"
+            );
+            anyhow::ensure!(
+                !tabs.contains_key(&destination_tab.tab_id()),
+                "unpublished move destination tab id {} is already registered",
+                destination_tab.tab_id()
+            );
+            if !source_tab_retires {
+                tabs.try_reserve(1).map_err(|error| {
+                    anyhow!(
+                        "reserve move destination tab {}: {error}",
+                        destination_tab.tab_id()
+                    )
+                })?;
+            }
+
+            let mut windows = self.windows.write();
+            {
+                let parents = self.tab_parents.read();
+                let source_parent = parents.get(&source_tab.tab_id()).ok_or_else(|| {
+                    anyhow!("move source tab lost its indexed window parent")
+                })?;
+                anyhow::ensure!(
+                    source_parent.matches(&source_tab, source_window_id)
+                        && windows.get(&source_window_id).is_some_and(|window| {
+                            window
+                                .iter()
+                                .any(|tab| Arc::ptr_eq(tab, &source_tab))
+                        }),
+                    "move source tab changed exact window parent before commit"
+                );
+            }
+            anyhow::ensure!(
+                unpublished_window.is_some()
+                    || windows.contains_key(&destination_window_id),
+                "move destination window {destination_window_id} left the mux before commit"
+            );
+            if unpublished_window.is_some() {
+                anyhow::ensure!(
+                    !windows.contains_key(&destination_window_id),
+                    "unpublished move destination window id {destination_window_id} is already registered"
+                );
+                windows.try_reserve(1).map_err(|error| {
+                    anyhow!(
+                        "reserve unpublished move destination window {destination_window_id}: {error}"
+                    )
+                })?;
+            }
+
+            let source_workspace = windows
+                .get(&source_window_id)
+                .expect("validated move source window remains present")
+                .get_workspace()
+                .to_string();
+            let destination_workspace = unpublished_window
+                .as_ref()
+                .map(|window| window.get_workspace().to_string())
+                .unwrap_or_else(|| {
+                    windows
+                        .get(&destination_window_id)
+                        .expect("validated move destination window remains present")
+                        .get_workspace()
+                        .to_string()
+                });
+
+            let mut prepared_windows = Vec::new();
+            prepared_windows
+                .try_reserve_exact(2)
+                .map_err(|error| anyhow!("reserve move-to-new-tab window states: {error}"))?;
+            let mut removed_windows = Vec::new();
+            removed_windows
+                .try_reserve_exact(1)
+                .map_err(|error| anyhow!("reserve move source-window retirement: {error}"))?;
+
+            if unpublished_window.is_some() {
+                prepared_windows.push((
+                    destination_window_id,
+                    unpublished_window_state
+                        .take()
+                        .expect("unpublished destination retained its prepared state"),
+                ));
+                if source_tab_retires {
+                    let source_states = self.prepare_exact_tab_detach_locked(
+                        &windows,
+                        std::slice::from_ref(&source_tab),
+                        None,
+                        false,
+                        "guarded move-to-new-tab source retirement",
+                    )?;
+                    {
+                        let provisional = self.provisional_windows.lock();
+                        removed_windows.extend(source_states.iter().filter_map(
+                            |(window_id, state)| {
+                                (state.frozen().ordered_tabs().is_empty()
+                                    && !provisional.contains(window_id))
+                                .then_some(*window_id)
+                            },
+                        ));
+                    }
+                    prepared_windows.extend(source_states);
+                }
+            } else if source_window_id == destination_window_id {
+                let window = windows
+                    .get(&source_window_id)
+                    .expect("validated same-window move destination remains present");
+                let state = if source_tab_retires {
+                    window
+                        .prepare_replace_exact(&source_tab, &destination_tab)?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "exact move source tab left window {source_window_id} before replacement"
+                            )
+                        })?
+                } else {
+                    let source_index = window
+                        .iter()
+                        .position(|tab| Arc::ptr_eq(tab, &source_tab))
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "exact move source tab left window {source_window_id} before insertion"
+                            )
+                        })?;
+                    let destination_index = source_index.checked_add(1).ok_or_else(|| {
+                        anyhow!("move destination tab index overflow")
+                    })?;
+                    window.prepare_insert(destination_index, &destination_tab)?
+                };
+                prepared_windows.push((source_window_id, state));
+            } else {
+                let destination = windows
+                    .get(&destination_window_id)
+                    .expect("validated move destination window remains present");
+                prepared_windows.push((
+                    destination_window_id,
+                    destination.prepare_insert(destination.len(), &destination_tab)?,
+                ));
+                if source_tab_retires {
+                    let source_states = self.prepare_exact_tab_detach_locked(
+                        &windows,
+                        std::slice::from_ref(&source_tab),
+                        None,
+                        false,
+                        "guarded cross-window move source retirement",
+                    )?;
+                    {
+                        let provisional = self.provisional_windows.lock();
+                        removed_windows.extend(source_states.iter().filter_map(
+                            |(window_id, state)| {
+                                (state.frozen().ordered_tabs().is_empty()
+                                    && !provisional.contains(window_id))
+                                .then_some(*window_id)
+                            },
+                        ));
+                    }
+                    prepared_windows.extend(source_states);
+                }
+            }
+
+            let mut attached_tabs = Vec::new();
+            attached_tabs
+                .try_reserve_exact(1)
+                .map_err(|error| anyhow!("reserve move destination attachment: {error}"))?;
+            attached_tabs.push((destination_tab.tab_id(), destination_window_id));
+            let mut created_windows = Vec::new();
+            if unpublished_window.is_some() {
+                created_windows
+                    .try_reserve_exact(1)
+                    .map_err(|error| anyhow!("reserve move destination creation: {error}"))?;
+                created_windows.push(destination_window_id);
+            }
+
+            let mut workspace_counts = (source_workspace != destination_workspace)
+                .then(|| self.num_panes_by_workspace.write());
+            let workspace_transfer = if let Some(counts) = workspace_counts.as_mut() {
+                if !counts.contains_key(&destination_workspace) {
+                    counts.try_reserve(1).map_err(|error| {
+                        anyhow!(
+                            "reserve move destination workspace {destination_workspace}: {error}"
+                        )
+                    })?;
+                }
+                let source_count = counts.get(&source_workspace).copied().ok_or_else(|| {
+                    anyhow!(
+                        "move source workspace {source_workspace} lacks its pane count"
+                    )
+                })?;
+                let next_source_count = source_count.checked_sub(1).ok_or_else(|| {
+                    anyhow!("move source workspace {source_workspace} pane count underflow")
+                })?;
+                let next_destination_count = counts
+                    .get(&destination_workspace)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "move destination workspace {destination_workspace} pane count overflow"
+                        )
+                    })?;
+                Some((
+                    source_workspace,
+                    destination_workspace,
+                    next_source_count,
+                    next_destination_count,
+                ))
+            } else {
+                None
+            };
+
+            let tab_locks = prepared.lock_for_commit(
+                self,
+                &source_tab,
+                &destination_tab,
+            )?;
+            {
+                let panes = self.panes.read();
+                for replacement in &mut authority_replacements {
+                    for state in &mut replacement.desired {
+                        match panes.get(&state.pane_id) {
+                            Some(registered) => {
+                                anyhow::ensure!(
+                                    Arc::ptr_eq(&registered.pane, &state.pane),
+                                    "pane {} move registry slot names another exact allocation",
+                                    state.pane_id
+                                );
+                                state.registration = Some(PaneRegistrationHandle::new(
+                                    &registered.pane,
+                                    &registered.generation,
+                                ));
+                                state.domain_id = Some(registered.domain_id);
+                            }
+                            None => {
+                                state.registration = None;
+                                state.domain_id = None;
+                            }
+                        }
+                    }
+                }
+            }
+            let prepared_authority = authority.prepare_structural_relocation(
+                self,
+                &[&target],
+                authority_replacements,
+            )?;
+
+            let inserted_unpublished_window = if let Some(window) = unpublished_window.take() {
+                let prior = windows.insert(destination_window_id, window);
+                debug_assert!(prior.is_none());
+                true
+            } else {
+                false
+            };
+            let commit_result = self
+                .commit_prepared_window_states_with_trailing_revisions_locked(
+                    &mut windows,
+                    prepared_windows,
+                    attached_tabs,
+                    created_windows,
+                    removed_windows,
+                    trailing_revision_count,
+                    |first_revision| {
+                        let committed = tab_locks.commit(self, prepared, first_revision);
+                        prepared_authority.commit();
+                        if source_tab_retires {
+                            let removed = tabs.remove(&source_tab.tab_id());
+                            debug_assert!(removed
+                                .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
+                        }
+                        let prior = tabs.insert(
+                            destination_tab.tab_id(),
+                            Arc::clone(&destination_tab),
+                        );
+                        debug_assert!(prior.is_none());
+                        if let (
+                            Some(counts),
+                            Some((
+                                source_workspace,
+                                destination_workspace,
+                                next_source_count,
+                                next_destination_count,
+                            )),
+                        ) = (workspace_counts.as_mut(), workspace_transfer)
+                        {
+                            if next_source_count == 0 {
+                                counts.remove(&source_workspace);
+                            } else {
+                                counts.insert(source_workspace, next_source_count);
+                            }
+                            counts.insert(destination_workspace, next_destination_count);
+                        }
+                        committed
+                    },
+                );
+            if commit_result.is_err() && inserted_unpublished_window {
+                let removed = windows.remove(&destination_window_id);
+                debug_assert!(removed.is_some());
+            }
+            commit_result?
+        };
+
+        self.flush_window_notifications();
+        committed.execute(self);
 
         Ok(MoveCommitReceipt::from_exact_parts(
-            pane,
+            Arc::clone(target.pane()),
             target.registration(),
-            tab,
-            window_id,
-            size,
+            destination_tab,
+            destination_window_id,
+            committed_size,
         ))
     }
 
@@ -15216,6 +17597,56 @@ mod tests {
     }
 
     #[test]
+    fn indexed_lookup_rejects_a_live_pane_once_its_domain_is_retired() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(167, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain).expect("register test domain");
+
+        assert_eq!(
+            mux.resolve_pane_id(pane.pane_id()),
+            Some((domain.domain_id(), window_id, tab.tab_id()))
+        );
+        let topology_before = mux
+            .topology_snapshot_authority()
+            .expect("capture topology before retired-domain fence");
+        let structural_generation_before = mux
+            .pane_authority
+            .lock()
+            .structural_by_pane_id
+            .get(&pane.pane_id())
+            .expect("pane retains structural authority")
+            .generation;
+
+        assert!(mux.retired_domain_ids.lock().insert(domain.domain_id()));
+        assert!(mux
+            .get_domain(domain.domain_id())
+            .is_some_and(|current| Arc::ptr_eq(&current, &domain)));
+        assert_eq!(
+            mux.resolve_pane_id(pane.pane_id()),
+            None,
+            "a retained teardown Arc must not authorize a retired domain"
+        );
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("retired-domain lookup must not exhaust topology"),
+            topology_before
+        );
+        assert_eq!(
+            mux.pane_authority
+                .lock()
+                .structural_by_pane_id
+                .get(&pane.pane_id())
+                .expect("failed lookup preserves structural authority")
+                .generation,
+            structural_generation_before
+        );
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn guarded_moved_split_survives_both_registry_detaches_after_admission() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
@@ -15277,7 +17708,7 @@ mod tests {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
         let (pane, kills) = KillCountingPane::new(172, test_size());
-        let (source_tab, _source_window_id) =
+        let (source_tab, source_window_id) =
             register_attached_test_pane(&global_guard, &mux, &pane);
         let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
         mux.add_domain(&domain).expect("register test domain");
@@ -15298,6 +17729,7 @@ mod tests {
                 .any(|current| Arc::ptr_eq(current, &pane)),
             "pruning must retain the detached pane while its move guard is live"
         );
+        mux.pane_count_recomputes.store(0, Ordering::Relaxed);
 
         let receipt = promise::spawn::block_on(mux.move_pane_to_new_tab_guarded(
             guard,
@@ -15311,15 +17743,236 @@ mod tests {
         assert!(receipt.registration().same_registration(&registration));
         receipt.with_pane(|current| assert!(std::ptr::eq(current, pane.as_ref())));
         assert!(mux.get_tab(source_tab.tab_id()).is_none());
+        assert!(mux.get_window(source_window_id).is_none());
         assert!(mux.get_tab(receipt.tab_id()).is_some_and(|tab| {
             tab.iter_all_panes()
                 .iter()
                 .any(|current| Arc::ptr_eq(current, &pane))
         }));
+        assert_eq!(
+            mux.get_window(receipt.window_id())
+                .expect("new exact window is published with the move")
+                .get_workspace(),
+            "guarded-move-test"
+        );
         assert!(
             mux.get_pane(pane.pane_id()).is_none(),
             "commit must not reconstruct registry authority from the raw pane ID"
         );
+        assert_eq!(
+            mux.num_panes_by_workspace
+                .read()
+                .get("guarded-move-test")
+                .copied(),
+            Some(1)
+        );
+        assert!(!mux
+            .num_panes_by_workspace
+            .read()
+            .contains_key(DEFAULT_WORKSPACE));
+        assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
+        mux.assert_tab_parent_index_matches_windows();
+        let authority = mux.pane_authority.lock();
+        let owner = authority
+            .structural_by_pane_id
+            .get(&pane.pane_id())
+            .expect("detached pane retains structural authority in its new tab");
+        assert!(owner.matches_pane(&pane));
+        assert!(owner.matches_tab(
+            &mux.get_tab(receipt.tab_id())
+                .expect("receipt tab remains exact-current")
+        ));
+        assert!(owner.registration.is_none() && owner.domain_id.is_none());
+        drop(authority);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn guarded_move_to_new_tab_replaces_an_empty_source_at_the_same_window_slot() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(173, test_size());
+        let (source_tab, window_id) =
+            register_attached_test_pane(&global_guard, &mux, &pane);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain).expect("register test domain");
+        let guard = mux
+            .capture_pane_operation(pane.pane_id())
+            .expect("admit exact same-window move");
+        let before = mux
+            .window_order_snapshot(window_id)
+            .expect("snapshot source window")
+            .expect("source window remains present");
+        mux.pane_count_recomputes.store(0, Ordering::Relaxed);
+
+        let receipt = promise::spawn::block_on(mux.move_pane_to_new_tab_guarded(
+            guard,
+            Some(window_id),
+            None,
+            None,
+        ))
+        .expect("same-window sole-pane move commits atomically");
+
+        assert_eq!(receipt.window_id(), window_id);
+        assert_ne!(receipt.tab_id(), source_tab.tab_id());
+        assert!(mux.get_tab(source_tab.tab_id()).is_none());
+        let after = mux
+            .window_order_snapshot(window_id)
+            .expect("snapshot replacement window")
+            .expect("same window survives exact replacement");
+        assert_eq!(after.ordered_tab_ids().collect::<Vec<_>>(), [receipt.tab_id()]);
+        assert_eq!(after.active_tab_id(), Some(receipt.tab_id()));
+        assert_eq!(after.order_revision().get(), before.order_revision().get() + 1);
+        assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            mux.num_panes_by_workspace
+                .read()
+                .get(DEFAULT_WORKSPACE)
+                .copied(),
+            Some(1)
+        );
+        mux.assert_tab_parent_index_matches_windows();
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn guarded_move_to_new_tab_inserts_immediately_after_a_nonempty_source_without_recount() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(174, test_size());
+        let (companion, companion_kills) = KillCountingPane::new(175, test_size());
+        let (source_tab, window_id) =
+            register_attached_test_pane(&global_guard, &mux, &pane);
+        mux.add_pane(&companion)
+            .expect("register same-tab companion pane");
+        source_tab
+            .split_and_insert(0, SplitRequest::default(), Arc::clone(&companion))
+            .expect("attach exact companion pane to source tab");
+        mux.recompute_pane_count();
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain).expect("register test domain");
+        let guard = mux
+            .capture_pane_operation(pane.pane_id())
+            .expect("admit exact nonempty-source move");
+        mux.pane_count_recomputes.store(0, Ordering::Relaxed);
+
+        let receipt = promise::spawn::block_on(mux.move_pane_to_new_tab_guarded(
+            guard,
+            Some(window_id),
+            None,
+            None,
+        ))
+        .expect("same-window nonempty-source move commits atomically");
+
+        let order = mux
+            .window_order_snapshot(window_id)
+            .expect("snapshot same-window insertion")
+            .expect("source window remains present")
+            .ordered_tab_ids()
+            .collect::<Vec<_>>();
+        assert_eq!(order, [source_tab.tab_id(), receipt.tab_id()]);
+        assert!(source_tab
+            .iter_all_panes()
+            .iter()
+            .all(|current| !Arc::ptr_eq(current, &pane)));
+        assert!(source_tab
+            .iter_all_panes()
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &companion)));
+        assert!(mux.get_tab(receipt.tab_id()).is_some_and(|tab| {
+            tab.iter_all_panes()
+                .iter()
+                .any(|current| Arc::ptr_eq(current, &pane))
+        }));
+        assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            mux.num_panes_by_workspace
+                .read()
+                .get(DEFAULT_WORKSPACE)
+                .copied(),
+            Some(2)
+        );
+        mux.assert_tab_parent_index_matches_windows();
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        assert_eq!(companion_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn guarded_move_to_new_tab_topology_exhaustion_is_zero_mutation() {
+        let global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(176, test_size());
+        let (source_tab, window_id) =
+            register_attached_test_pane(&global_guard, &mux, &pane);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain).expect("register test domain");
+        let guard = mux
+            .capture_pane_operation(pane.pane_id())
+            .expect("admit exact exhaustion move");
+        let window_before = mux
+            .window_order_snapshot(window_id)
+            .expect("snapshot exhaustion source window")
+            .expect("source window remains present");
+        let tab_count_before = mux.tabs.read().len();
+        let window_count_before = mux.windows.read().len();
+        let workspace_counts_before = mux.num_panes_by_workspace.read().clone();
+        let structural_generation_before = mux
+            .pane_authority
+            .lock()
+            .structural_by_pane_id
+            .get(&pane.pane_id())
+            .expect("source retains structural authority")
+            .generation;
+        {
+            let mut topology = mux.topology.lock();
+            topology.revision = TopologyRevision(u64::MAX - 1);
+            topology.exhausted = false;
+        }
+        mux.pane_count_recomputes.store(0, Ordering::Relaxed);
+
+        let error = promise::spawn::block_on(mux.move_pane_to_new_tab_guarded(
+            guard,
+            Some(window_id),
+            None,
+            None,
+        ))
+        .expect_err("topology exhaustion must reject before publication");
+
+        assert!(format!("{error:#}").contains("topology revision space is exhausted"));
+        assert!(mux
+            .get_tab(source_tab.tab_id())
+            .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
+        assert!(source_tab
+            .iter_all_panes()
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &pane)));
+        let window_after = mux
+            .window_order_snapshot(window_id)
+            .expect("snapshot rejected move")
+            .expect("source window survives rejected move");
+        assert_eq!(
+            window_after.ordered_tab_ids().collect::<Vec<_>>(),
+            window_before.ordered_tab_ids().collect::<Vec<_>>()
+        );
+        assert_eq!(window_after.order_revision(), window_before.order_revision());
+        assert_eq!(mux.tabs.read().len(), tab_count_before);
+        assert_eq!(mux.windows.read().len(), window_count_before);
+        assert_eq!(*mux.num_panes_by_workspace.read(), workspace_counts_before);
+        assert_eq!(
+            mux.pane_authority
+                .lock()
+                .structural_by_pane_id
+                .get(&pane.pane_id())
+                .expect("rejected move preserves source authority")
+                .generation,
+            structural_generation_before
+        );
+        assert_eq!(
+            mux.topology.lock().revision,
+            TopologyRevision(u64::MAX - 1)
+        );
+        assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
+        mux.assert_tab_parent_index_matches_windows();
         assert_eq!(kills.load(Ordering::SeqCst), 0);
     }
 
@@ -22375,7 +25028,7 @@ mod tests {
     #[test]
     fn indexed_tab_parent_resolution_has_constant_work_at_large_session_counts() {
         for count in [1_024usize, 4_096, 16_384] {
-            let mux = Mux::new(None);
+            let mux = Arc::new(Mux::new(None));
             let mut expected = Vec::new();
             expected
                 .try_reserve_exact(count)
@@ -22394,6 +25047,8 @@ mod tests {
                 for _ in 0..count {
                     let tab = Arc::new(Tab::new(&test_size()));
                     let tab_id = tab.tab_id();
+                    tab.bind_mux_owner_if_structurally_empty(&mux)
+                        .expect("bind indexed parent scale tab");
                     let mut window = Window::new(Some("parent-scale".to_string()), None);
                     let window_id = window.window_id();
                     window.push(&tab).expect("seed exact window membership");
@@ -22426,7 +25081,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_location_cache_makes_stable_key_path_constant_after_one_large_session_scan() {
+    fn pane_authority_index_keeps_stable_key_path_independent_of_unrelated_tabs() {
         let _guard = global_test_lock();
         Mux::shutdown();
 
@@ -22454,6 +25109,8 @@ mod tests {
             for _ in 0..UNRELATED_TABS {
                 let tab = Arc::new(Tab::new(&test_size()));
                 let tab_id = tab.tab_id();
+                tab.bind_mux_owner_if_structurally_empty(&mux)
+                    .expect("bind unrelated empty tab to exact mux");
                 let mut window = Window::new(Some("pane-location-scale".to_string()), None);
                 let window_id = window.window_id();
                 window.push(&tab).expect("seed unrelated exact membership");
@@ -22466,23 +25123,13 @@ mod tests {
         }
         mux.assert_tab_parent_index_matches_windows();
 
-        let scans_before = mux.pane_location_full_scans.load(Ordering::Relaxed);
-        let probes_before = mux.pane_location_scan_tab_probes.load(Ordering::Relaxed);
-        let hits_before = mux.pane_location_cache_hits.load(Ordering::Relaxed);
+        let probes_before = mux.pane_authority_lookup_probes.load(Ordering::Relaxed);
         assert_eq!(
             mux.resolve_pane_id(912_001),
             Some((pane.domain_id(), original_window_id, target_tab.tab_id()))
         );
-        let scans_after_cold = mux.pane_location_full_scans.load(Ordering::Relaxed);
-        let probes_after_cold = mux.pane_location_scan_tab_probes.load(Ordering::Relaxed);
-        assert_eq!(scans_after_cold.saturating_sub(scans_before), 1);
-        assert_eq!(
-            probes_after_cold.saturating_sub(probes_before),
-            UNRELATED_TABS + 1,
-            "the planted cold miss must expose the former all-tab work"
-        );
 
-        assert!(mux.set_tab_title(target_tab.tab_id(), "cache-refreshes-after-title-revision"));
+        assert!(mux.set_tab_title(target_tab.tab_id(), "index-survives-title-revision"));
 
         for _ in 0..STABLE_LOOKUPS {
             assert_eq!(
@@ -22491,25 +25138,16 @@ mod tests {
             );
         }
         assert_eq!(
-            mux.pane_location_full_scans.load(Ordering::Relaxed),
-            scans_after_cold + 1,
-            "one revision change must cause one exact refresh, not one global scan per keypress"
-        );
-        assert_eq!(
-            mux.pane_location_scan_tab_probes.load(Ordering::Relaxed),
-            probes_after_cold + UNRELATED_TABS + 1,
-            "one revision refresh must be the only additional unrelated-tab census"
-        );
-        assert_eq!(
-            mux.pane_location_cache_hits
+            mux.pane_authority_lookup_probes
                 .load(Ordering::Relaxed)
-                .saturating_sub(hits_before),
-            STABLE_LOOKUPS - 1,
+                .saturating_sub(probes_before),
+            STABLE_LOOKUPS + 1,
+            "each lookup performs one exact authority probe regardless of unrelated tab count",
         );
 
-        // A real topology transaction invalidates the revision fence.  The
-        // next lookup must perform exactly one new census and cache the new
-        // parent rather than returning the old window.
+        // Parent reattachment updates the exact parent index in the same
+        // window transaction; resolution must immediately return the new
+        // parent without a global refresh scan.
         let destination = mux.new_empty_window(Some("pane-location-scale".to_string()), None);
         let destination_window_id = *destination;
         mux.move_tab_between_windows(target_tab.tab_id(), destination_window_id, None)
@@ -22519,9 +25157,10 @@ mod tests {
             Some((pane.domain_id(), destination_window_id, target_tab.tab_id()))
         );
         assert_eq!(
-            mux.pane_location_full_scans.load(Ordering::Relaxed),
-            scans_after_cold + 2,
-            "one topology change should cause one cold refresh"
+            mux.pane_authority_lookup_probes
+                .load(Ordering::Relaxed)
+                .saturating_sub(probes_before),
+            STABLE_LOOKUPS + 2,
         );
 
         drop(destination);
@@ -22529,7 +25168,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_location_cache_rejects_duplicate_exact_structural_owners() {
+    fn pane_authority_index_rejects_duplicate_exact_structural_owners_before_publication() {
         let _guard = global_test_lock();
         Mux::shutdown();
 
@@ -22541,24 +25180,22 @@ mod tests {
             mux.resolve_pane_id(912_002),
             Some((pane.domain_id(), first_window_id, first_tab.tab_id()))
         );
-        assert!(mux.pane_location_cache.read().contains_key(&912_002));
-
-        // Seed the malformed topology through the ordinary public surfaces:
-        // an already-registered exact pane must never become a cacheable
-        // HashMap-order-dependent owner merely because a second tab points at
-        // it.
+        // The public publication surface must reject a second exact owner
+        // before binding or registering the duplicate tab.
         let duplicate_tab = Arc::new(Tab::new(&test_size()));
         duplicate_tab.assign_pane(&pane);
-        mux.add_tab_and_active_pane(&duplicate_tab)
-            .expect("the duplicate-owner fixture reuses the existing pane registration");
-        let duplicate_window = mux.new_empty_window(None, None);
-        mux.add_tab_to_window(&duplicate_tab, *duplicate_window)
-            .expect("attach duplicate-owner fixture");
+        let error = mux
+            .add_tab_and_active_pane(&duplicate_tab)
+            .expect_err("one exact pane allocation cannot acquire a second tab owner");
+        assert!(format!("{error:#}").contains("structurally owned"));
+        assert!(mux.get_tab(duplicate_tab.tab_id()).is_none());
+        assert!(!duplicate_tab.has_active_mux_owner(&mux));
 
-        assert_eq!(mux.resolve_pane_id(912_002), None);
-        assert!(mux.pane_location_cache.read().get(&912_002).is_none());
+        assert_eq!(
+            mux.resolve_pane_id(912_002),
+            Some((pane.domain_id(), first_window_id, first_tab.tab_id()))
+        );
 
-        drop(duplicate_window);
         Mux::shutdown();
     }
 
@@ -22580,7 +25217,10 @@ mod tests {
                 tabs.try_reserve_exact(window_tab_count)
                     .expect("reserve membership-preserving scale tabs");
                 for _ in 0..window_tab_count {
-                    tabs.push(Arc::new(Tab::new(&test_size())));
+                    let tab = Arc::new(Tab::new(&test_size()));
+                    tab.bind_mux_owner_if_structurally_empty(&mux)
+                        .expect("bind membership-preserving scale tab");
+                    tabs.push(tab);
                 }
                 window
                     .seed_tabs_for_scale_test(&tabs)

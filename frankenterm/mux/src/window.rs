@@ -5,6 +5,7 @@ use config::GuiPosition;
 #[cfg(test)]
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -449,6 +450,206 @@ impl Window {
             None,
             true,
         )
+    }
+
+    /// Prepare an exact in-place tab-generation replacement.
+    ///
+    /// The old allocation must occur exactly once. The new allocation and its
+    /// numeric ID must both be absent, so a delayed caller cannot overwrite a
+    /// successor or create ambiguous membership. The replacement keeps the
+    /// same slot and active index, migrates saved-active and tab-stack identity,
+    /// and reserves exactly one ordered-window revision through
+    /// [`Self::prepare_complete_state`]. No callback or primary mutation occurs
+    /// while preparing this value.
+    pub(crate) fn prepare_replace_exact(
+        &self,
+        old: &Arc<Tab>,
+        new: &Arc<Tab>,
+    ) -> anyhow::Result<Option<PreparedWindowState>> {
+        let old_id = old.tab_id();
+        let new_id = new.tab_id();
+        let mut old_index = None;
+        for (index, candidate) in self.tabs.iter().enumerate() {
+            anyhow::ensure!(
+                !Arc::ptr_eq(candidate, new) && candidate.tab_id() != new_id,
+                "window {} already contains replacement tab {new_id}",
+                self.id,
+            );
+            if Arc::ptr_eq(candidate, old) {
+                anyhow::ensure!(
+                    old_index.replace(index).is_none(),
+                    "window {} contains exact tab {old_id} more than once",
+                    self.id,
+                );
+            }
+        }
+        let Some(old_index) = old_index else {
+            return Ok(None);
+        };
+
+        let stack_entries = self.tab_stacks.overview_entries();
+        anyhow::ensure!(
+            self.tab_stacks.stack_for_tab(new_id).is_none()
+                && stack_entries.iter().all(|entry| entry.tab_id != new_id),
+            "window {} tab stacks already contain replacement tab {new_id}",
+            self.id,
+        );
+        let old_stack_entries = stack_entries
+            .iter()
+            .filter(|entry| entry.tab_id == old_id)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            old_stack_entries.len() <= 1,
+            "window {} tab stacks contain tab {old_id} more than once",
+            self.id,
+        );
+        match (
+            self.tab_stacks.stack_for_tab(old_id),
+            old_stack_entries.first(),
+        ) {
+            (None, None) => {}
+            (Some(stack_id), Some(entry)) if stack_id == entry.stack_id => {}
+            _ => anyhow::bail!(
+                "window {} tab-stack indexes disagree for exact tab {old_id}",
+                self.id,
+            ),
+        }
+
+        let mut tabs = self.tabs.clone();
+        tabs[old_index] = Arc::clone(new);
+
+        let mut final_tab_ids = HashSet::new();
+        final_tab_ids.try_reserve(tabs.len())?;
+        for tab in &tabs {
+            anyhow::ensure!(
+                final_tab_ids.insert(tab.tab_id()),
+                "window {} replacement contains duplicate tab id {}",
+                self.id,
+                tab.tab_id(),
+            );
+        }
+
+        let mut tab_stacks = self.tab_stacks.clone();
+        if let Some(old_stack_entry) = old_stack_entries.first() {
+            let stack_id = old_stack_entry.stack_id;
+            let members = tab_stacks
+                .tabs_in_stack(stack_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "window {} tab stack {:?} is missing while replacing tab {old_id}",
+                        self.id,
+                        stack_id,
+                    )
+                })?
+                .to_vec();
+            anyhow::ensure!(
+                members.get(old_stack_entry.position) == Some(&old_id)
+                    && members.iter().filter(|tab_id| **tab_id == old_id).count() == 1,
+                "window {} tab stack {:?} has inconsistent position for tab {old_id}",
+                self.id,
+                stack_id,
+            );
+            let visible_id = tab_stacks.visible_tab(stack_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "window {} tab stack {:?} has no visible member",
+                    self.id,
+                    stack_id,
+                )
+            })?;
+            let visible_index = members
+                .iter()
+                .position(|tab_id| *tab_id == visible_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "window {} tab stack {:?} visible member is absent",
+                        self.id,
+                        stack_id,
+                    )
+                })?;
+            let original_members = members;
+            let mut replacement_members = original_members.clone();
+            replacement_members[old_stack_entry.position] = new_id;
+            let removed = tab_stacks.remove_stack(stack_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "window {} tab stack {:?} disappeared while replacing tab {old_id}",
+                    self.id,
+                    stack_id,
+                )
+            })?;
+            anyhow::ensure!(
+                removed == original_members,
+                "window {} tab stack {:?} changed while replacing tab {old_id}",
+                self.id,
+                stack_id,
+            );
+            tab_stacks
+                .create_stack(stack_id, replacement_members.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "window {} cannot rebuild tab stack {:?} while replacing tab {old_id}: {error:?}",
+                        self.id,
+                        stack_id,
+                    )
+                })?;
+            if visible_index != 0 {
+                let delta = isize::try_from(visible_index).map_err(|_| {
+                    anyhow::anyhow!(
+                        "window {} tab stack {:?} visible index is not representable",
+                        self.id,
+                        stack_id,
+                    )
+                })?;
+                anyhow::ensure!(
+                    tab_stacks.cycle_visible(stack_id, delta)
+                        == replacement_members.get(visible_index).copied(),
+                    "window {} cannot restore tab stack {:?} visible member",
+                    self.id,
+                    stack_id,
+                );
+            }
+        }
+
+        let final_stack_entries = tab_stacks.overview_entries();
+        anyhow::ensure!(
+            final_stack_entries
+                .iter()
+                .all(|entry| final_tab_ids.contains(&entry.tab_id)),
+            "window {} replacement would retain a dangling tab-stack member",
+            self.id,
+        );
+        anyhow::ensure!(
+            final_stack_entries
+                .iter()
+                .all(|entry| entry.tab_id != old_id),
+            "window {} replacement would retain old tab {old_id} in a tab stack",
+            self.id,
+        );
+        anyhow::ensure!(
+            tab_stacks.stack_for_tab(old_id).is_none()
+                && final_stack_entries.iter().all(|entry| {
+                    tab_stacks.stack_for_tab(entry.tab_id) == Some(entry.stack_id)
+                })
+                && final_tab_ids.iter().all(|tab_id| {
+                    tab_stacks.stack_for_tab(*tab_id).is_none_or(|stack_id| {
+                        final_stack_entries
+                            .iter()
+                            .any(|entry| entry.tab_id == *tab_id && entry.stack_id == stack_id)
+                    })
+                }),
+            "window {} replacement would leave inconsistent tab-stack indexes",
+            self.id,
+        );
+
+        let last_active = self
+            .last_active
+            .map(|tab_id| if tab_id == old_id { new_id } else { tab_id });
+        anyhow::ensure!(
+            last_active.is_none_or(|tab_id| final_tab_ids.contains(&tab_id)),
+            "window {} replacement would retain dangling last-active tab {last_active:?}",
+            self.id,
+        );
+        self.prepare_complete_state(tabs, self.active, last_active, tab_stacks, None, true)
+            .map(Some)
     }
 
     pub(crate) fn prepare_reorder_exact(
@@ -2446,6 +2647,247 @@ mod tests {
         assert!(window
             .get_active()
             .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+    }
+
+    #[test]
+    fn exact_tab_replacement_preserves_slot_active_and_visible_stack_identity() {
+        let first = test_tab();
+        let old = test_tab();
+        let third = test_tab();
+        let new = test_tab();
+        let old_id = old.tab_id();
+        let new_id = new.tab_id();
+        let stack_id = TabStackId(42);
+
+        let mut window = Window::new(None, None);
+        for tab in [&first, &old, &third] {
+            window.push(tab).expect("append replacement fixture tab");
+        }
+        window.set_active_without_saving(1);
+        window.last_active = Some(old_id);
+        window
+            .create_tab_stack(stack_id, vec![first.tab_id(), old_id, third.tab_id()])
+            .expect("create replacement fixture stack");
+        assert_eq!(window.tab_stacks.cycle_visible(stack_id, 1), Some(old_id));
+
+        let revision_before = window.order_revision();
+        let pointers_before = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
+        let stacks_before = window.tab_stacks.clone();
+        let prepared = window
+            .prepare_replace_exact(&old, &new)
+            .expect("exact replacement must prepare")
+            .expect("present exact old tab must produce a replacement");
+
+        assert_eq!(window.order_revision(), revision_before);
+        assert_eq!(
+            window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            pointers_before
+        );
+        assert_eq!(window.tab_stacks, stacks_before);
+
+        window.commit_prepared_state(prepared);
+        assert_eq!(
+            window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            vec![Arc::as_ptr(&first), Arc::as_ptr(&new), Arc::as_ptr(&third)],
+        );
+        assert_eq!(window.get_active_idx(), 1);
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &new))
+        );
+        assert_eq!(window.last_active, Some(new_id));
+        assert_eq!(window.tab_stack_for_tab(old_id), None);
+        assert_eq!(window.tab_stack_for_tab(new_id), Some(stack_id));
+        assert_eq!(window.tab_stack_visible_tab(stack_id), Some(new_id));
+        assert_eq!(
+            window
+                .tab_stack_entries()
+                .into_iter()
+                .map(|entry| (entry.tab_id, entry.position, entry.is_visible))
+                .collect::<Vec<_>>(),
+            vec![
+                (first.tab_id(), 0, false),
+                (new_id, 1, true),
+                (third.tab_id(), 2, false),
+            ],
+        );
+        assert_eq!(window.order_revision().get(), revision_before.get() + 1);
+    }
+
+    #[test]
+    fn exact_tab_replacement_preserves_unrelated_active_and_stack_visibility() {
+        let old = test_tab();
+        let middle = test_tab();
+        let active = test_tab();
+        let new = test_tab();
+        let old_id = old.tab_id();
+        let stack_id = TabStackId(43);
+
+        let mut window = Window::new(None, None);
+        for tab in [&old, &middle, &active] {
+            window
+                .push(tab)
+                .expect("append inactive replacement fixture tab");
+        }
+        window.set_active_without_saving(2);
+        window.last_active = Some(old_id);
+        window
+            .create_tab_stack(stack_id, vec![old_id, middle.tab_id(), active.tab_id()])
+            .expect("create inactive replacement fixture stack");
+        assert_eq!(
+            window.tab_stacks.cycle_visible(stack_id, 2),
+            Some(active.tab_id())
+        );
+
+        let prepared = window
+            .prepare_replace_exact(&old, &new)
+            .expect("inactive exact replacement must prepare")
+            .expect("present inactive exact tab must produce a replacement");
+        window.commit_prepared_state(prepared);
+
+        assert!(
+            window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
+        );
+        assert_eq!(window.get_active_idx(), 2);
+        assert_eq!(window.last_active, Some(new.tab_id()));
+        assert_eq!(
+            window.tab_stack_visible_tab(stack_id),
+            Some(active.tab_id())
+        );
+        assert_eq!(
+            window
+                .tab_stack_entries()
+                .into_iter()
+                .map(|entry| entry.tab_id)
+                .collect::<Vec<_>>(),
+            vec![new.tab_id(), middle.tab_id(), active.tab_id()],
+        );
+    }
+
+    #[test]
+    fn exact_tab_replacement_failures_leave_window_unchanged() {
+        let old = test_tab();
+        let existing_new = test_tab();
+        let absent = test_tab();
+        let replacement = test_tab();
+        let mut window = Window::new(None, None);
+        window.push(&old).expect("append old tab");
+        window
+            .push(&existing_new)
+            .expect("append existing replacement tab");
+        window.set_active_without_saving(1);
+        window.last_active = Some(old.tab_id());
+        window
+            .create_tab_stack(TabStackId(44), vec![old.tab_id(), existing_new.tab_id()])
+            .expect("create failure fixture stack");
+
+        let assert_unchanged = |window: &Window,
+                                pointers: &[*const Tab],
+                                active: usize,
+                                last_active: Option<TabId>,
+                                stacks: &TabStackState,
+                                revision: WindowOrderRevision| {
+            assert_eq!(
+                window
+                    .iter()
+                    .map(Arc::as_ptr)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                pointers
+            );
+            assert_eq!(window.get_active_idx(), active);
+            assert_eq!(window.last_active, last_active);
+            assert_eq!(&window.tab_stacks, stacks);
+            assert_eq!(window.order_revision(), revision);
+        };
+        let pointers = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
+        let active = window.get_active_idx();
+        let last_active = window.last_active;
+        let stacks = window.tab_stacks.clone();
+        let revision = window.order_revision();
+
+        assert!(
+            window
+                .prepare_replace_exact(&absent, &replacement)
+                .expect("absent old tab is not malformed")
+                .is_none()
+        );
+        assert_unchanged(&window, &pointers, active, last_active, &stacks, revision);
+
+        let existing_error = match window.prepare_replace_exact(&old, &existing_new) {
+            Err(error) => error,
+            Ok(_) => panic!("an already-present replacement must be rejected"),
+        };
+        assert!(
+            existing_error
+                .to_string()
+                .contains("already contains replacement")
+        );
+        assert_unchanged(&window, &pointers, active, last_active, &stacks, revision);
+
+        window.last_active = Some(replacement.tab_id());
+        let dangling_last_active = window.last_active;
+        let dangling_error = match window.prepare_replace_exact(&old, &replacement) {
+            Err(error) => error,
+            Ok(_) => panic!("a dangling saved-active tab must be rejected"),
+        };
+        assert!(dangling_error.to_string().contains("dangling last-active"));
+        assert_unchanged(
+            &window,
+            &pointers,
+            active,
+            dangling_last_active,
+            &stacks,
+            revision,
+        );
+        window.last_active = last_active;
+
+        window.tabs.push(Arc::clone(&old));
+        let duplicate_pointers = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
+        let duplicate_stacks = window.tab_stacks.clone();
+        let duplicate_revision = window.order_revision();
+        let duplicate_error = match window.prepare_replace_exact(&old, &replacement) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate exact old tab must be rejected"),
+        };
+        assert!(duplicate_error.to_string().contains("more than once"));
+        assert_unchanged(
+            &window,
+            &duplicate_pointers,
+            active,
+            last_active,
+            &duplicate_stacks,
+            duplicate_revision,
+        );
+    }
+
+    #[test]
+    fn exact_tab_replacement_revision_exhaustion_is_zero_mutation() {
+        let old = test_tab();
+        let active = test_tab();
+        let new = test_tab();
+        let mut window = Window::new(None, None);
+        window.push(&old).expect("append old tab");
+        window.push(&active).expect("append active tab");
+        window.set_active_without_saving(1);
+        window.set_order_revision_for_test(WindowOrderRevision::new(u64::MAX - 1));
+        let pointers_before = window.iter().map(Arc::as_ptr).collect::<Vec<_>>();
+        let active_before = window.get_active().map(Arc::as_ptr);
+
+        let error = match window.prepare_replace_exact(&old, &new) {
+            Err(error) => error,
+            Ok(_) => panic!("terminal revision must reject exact replacement"),
+        };
+        assert!(error.to_string().contains("revision space is exhausted"));
+        assert_eq!(
+            window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            pointers_before
+        );
+        assert_eq!(window.get_active().map(Arc::as_ptr), active_before);
+        assert_eq!(window.order_revision().get(), u64::MAX - 1);
     }
 
     #[test]
