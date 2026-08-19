@@ -2714,7 +2714,7 @@ Each cockpit response includes `action_receipts` — what mitigations have alrea
 
 ### Conformance artifact
 
-The retained remote-reduced conformance artifact lives at [`tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json`](tests/e2e/artifacts/goal-line/ft-rz0eb.4/resource_cockpit_conformance/20260513T172634Z/summary.json). It proves the v1 schema/runtime lane; target-class proof is governed by [`docs/perf/target-class-hardware.md`](docs/perf/target-class-hardware.md) and is currently `skipped_not_proven`.
+The resource-cockpit conformance lane is the e2e script [`tests/e2e/test_ft_rz0eb_4_resource_cockpit_conformance.sh`](tests/e2e/test_ft_rz0eb_4_resource_cockpit_conformance.sh) (the dated `tests/e2e/artifacts/goal-line/.../summary.json` snapshot is no longer in the tree). Target-class proof is governed by [`docs/perf/target-class-hardware.md`](docs/perf/target-class-hardware.md) and is currently `skipped_not_proven`.
 
 ---
 
