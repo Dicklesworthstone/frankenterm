@@ -1063,7 +1063,9 @@ pub struct PanePreparationCancelled {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum DomainRegistrationError {
-    #[error("domain identifier {domain_id} ({domain_name}) has been retired and cannot be reused")]
+    #[error(
+        "domain identifier {domain_id} ({domain_name}) is awaiting exact-generation retirement cleanup"
+    )]
     RetiredIdentifier {
         domain_id: DomainId,
         domain_name: String,
@@ -1093,6 +1095,237 @@ pub enum DomainRegistrationError {
         domain_id: DomainId,
         domain_name: String,
     },
+}
+
+/// One exact registration of a domain in every mux-owned domain index.
+///
+/// The public domain object is intentionally paired with a process-local
+/// generation. Numeric IDs, names, and even the same `Arc<dyn Domain>` may be
+/// reused after an earlier generation has fully quiesced; only this record is
+/// authoritative for one registration lifetime.
+struct LiveDomainRegistration {
+    domain_id: DomainId,
+    domain_name: String,
+    domain: Arc<dyn Domain>,
+    generation: Arc<DomainRegistrationGeneration>,
+}
+
+impl LiveDomainRegistration {
+    fn new(domain_id: DomainId, domain_name: String, domain: Arc<dyn Domain>) -> Arc<Self> {
+        Arc::new(Self {
+            domain_id,
+            domain_name,
+            domain,
+            generation: Arc::new(DomainRegistrationGeneration::new(domain_id)),
+        })
+    }
+
+    fn matches_domain(&self, domain: &Arc<dyn Domain>) -> bool {
+        Arc::ptr_eq(&self.domain, domain)
+    }
+}
+
+const DOMAIN_REGISTRATION_RETIRED: usize = 1usize << (usize::BITS - 1);
+const DOMAIN_REGISTRATION_OPERATION_MASK: usize = DOMAIN_REGISTRATION_RETIRED - 1;
+
+/// Admission and cleanup state for one exact domain registration.
+///
+/// Retirement closes admission atomically. The last already-admitted guard
+/// claims cleanup exactly once; it never revokes a callback that was admitted
+/// before retirement.
+struct DomainRegistrationGeneration {
+    domain_id: DomainId,
+    operation_state: AtomicUsize,
+    cleanup_claimed: AtomicBool,
+}
+
+impl DomainRegistrationGeneration {
+    fn new(domain_id: DomainId) -> Self {
+        Self {
+            domain_id,
+            operation_state: AtomicUsize::new(0),
+            cleanup_claimed: AtomicBool::new(false),
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        let mut state = self.operation_state.load(Ordering::Acquire);
+        loop {
+            if state & DOMAIN_REGISTRATION_RETIRED != 0 {
+                return false;
+            }
+            let active = state & DOMAIN_REGISTRATION_OPERATION_MASK;
+            let Some(next) = active.checked_add(1) else {
+                return false;
+            };
+            if next > DOMAIN_REGISTRATION_OPERATION_MASK {
+                return false;
+            }
+            match self.operation_state.compare_exchange_weak(
+                state,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    /// Close admission. The caller has already installed the exact generation
+    /// in the bounded retirement tracker while holding `domain_registration`.
+    fn retire(&self) -> (bool, bool) {
+        let mut state = self.operation_state.load(Ordering::Acquire);
+        loop {
+            if state & DOMAIN_REGISTRATION_RETIRED != 0 {
+                return (false, false);
+            }
+            match self.operation_state.compare_exchange_weak(
+                state,
+                state | DOMAIN_REGISTRATION_RETIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let cleanup_ready = state & DOMAIN_REGISTRATION_OPERATION_MASK == 0
+                        && self
+                            .cleanup_claimed
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok();
+                    return (true, cleanup_ready);
+                }
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    fn release_operation(&self) -> bool {
+        let previous = self.operation_state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous & DOMAIN_REGISTRATION_OPERATION_MASK > 0,
+            "domain operation count must not underflow"
+        );
+        previous & DOMAIN_REGISTRATION_RETIRED != 0
+            && previous & DOMAIN_REGISTRATION_OPERATION_MASK == 1
+            && self
+                .cleanup_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    fn is_retired(&self) -> bool {
+        self.operation_state.load(Ordering::Acquire) & DOMAIN_REGISTRATION_RETIRED != 0
+    }
+
+    #[cfg(test)]
+    fn active_operations(&self) -> usize {
+        self.operation_state.load(Ordering::Acquire) & DOMAIN_REGISTRATION_OPERATION_MASK
+    }
+}
+
+/// Bounded same-ID reuse fence for domain generations that are retiring.
+///
+/// Entries exist only from logical retirement until exact indexed cleanup
+/// completes. Unlike the former permanent tombstone set, quiescent IDs leave
+/// no process-lifetime residue.
+#[derive(Default)]
+struct DomainRetirementTracker {
+    generations: Mutex<HashMap<DomainId, Arc<DomainRegistrationGeneration>>>,
+}
+
+impl DomainRetirementTracker {
+    fn begin(
+        &self,
+        generation: &Arc<DomainRegistrationGeneration>,
+    ) -> Result<bool, std::collections::TryReserveError> {
+        let mut generations = self.generations.lock();
+        if let Some(current) = generations.get(&generation.domain_id) {
+            return Ok(Arc::ptr_eq(current, generation));
+        }
+        generations.try_reserve(1)?;
+        generations.insert(generation.domain_id, Arc::clone(generation));
+        Ok(true)
+    }
+
+    fn finish(&self, generation: &Arc<DomainRegistrationGeneration>) {
+        let mut generations = self.generations.lock();
+        if generations
+            .get(&generation.domain_id)
+            .is_some_and(|current| Arc::ptr_eq(current, generation))
+        {
+            generations.remove(&generation.domain_id);
+        }
+    }
+
+    fn contains(&self, domain_id: DomainId) -> bool {
+        self.generations.lock().contains_key(&domain_id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.generations.lock().len()
+    }
+}
+
+/// Non-cloneable authority for one operation admitted against an exact live
+/// domain registration.
+///
+/// The guard retains the exact domain and its generation across awaits and
+/// callback rollback. Retirement may begin while it is live, but same-ID
+/// replacement and destructive teardown remain fenced until it is dropped.
+pub struct DomainOperationGuard {
+    owner: Arc<Mux>,
+    registration: Arc<LiveDomainRegistration>,
+}
+
+impl std::fmt::Debug for DomainOperationGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DomainOperationGuard")
+            .field("domain_id", &self.registration.domain_id)
+            .field("domain_name", &self.registration.domain_name)
+            .field(
+                "generation",
+                &(Arc::as_ptr(&self.registration.generation) as usize),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for DomainOperationGuard {
+    type Target = dyn Domain;
+
+    fn deref(&self) -> &Self::Target {
+        self.registration.domain.as_ref()
+    }
+}
+
+impl Drop for DomainOperationGuard {
+    fn drop(&mut self) {
+        if self.registration.generation.release_operation() {
+            self.owner
+                .finalize_domain_retirement(Arc::clone(&self.registration));
+        }
+    }
+}
+
+impl DomainOperationGuard {
+    pub fn domain_id(&self) -> DomainId {
+        self.registration.domain_id
+    }
+
+    pub fn domain_name(&self) -> &str {
+        &self.registration.domain_name
+    }
+
+    fn domain_arc(&self) -> &Arc<dyn Domain> {
+        &self.registration.domain
+    }
+
+    fn same_registration(&self, registration: &Arc<LiveDomainRegistration>) -> bool {
+        Arc::ptr_eq(&self.registration, registration)
+    }
 }
 
 pub(crate) fn try_reserve_usize_ids(
@@ -2206,7 +2439,7 @@ mod pane_registration_handle {
         generation: Arc<PaneRegistrationGeneration>,
         retirement: Arc<PaneRetirementTracker>,
         admitted_domain_id: DomainId,
-        admitted_domain: Option<Weak<dyn Domain>>,
+        admitted_domain: Option<Weak<LiveDomainRegistration>>,
         _operation: PaneRegistrationOperationLease,
     }
 
@@ -2273,7 +2506,7 @@ mod pane_registration_handle {
             self.admitted_domain_id
         }
 
-        pub(crate) fn admitted_domain(&self) -> Option<&Weak<dyn Domain>> {
+        fn admitted_domain(&self) -> Option<&Weak<LiveDomainRegistration>> {
             self.admitted_domain.as_ref()
         }
 
@@ -2816,7 +3049,12 @@ mod pane_registration_handle {
                 if owner.retired_domain_ids.lock().contains(&domain_id) {
                     return None;
                 }
-                let exact_domain = owner.domains.read().get(&domain_id).map(Arc::downgrade);
+                let exact_domain = owner
+                    .domain_registrations
+                    .read()
+                    .get(&domain_id)
+                    .filter(|registration| !registration.generation.is_retired())
+                    .map(Arc::downgrade);
                 (domain_id, exact_domain)
             };
             Some(PaneOperationGuard {
@@ -5187,7 +5425,7 @@ impl PaneAuthorityIndex {
         // read guard only for preflight preserves the canonical
         // pane-authority -> panes lock order without extending the final cut.
         let live_panes = mux.panes.read();
-        let exact_domains = mux.domains.read();
+        let exact_domains = mux.domain_registrations.read();
         let retired_domain_ids = mux.retired_domain_ids.lock();
         let mut witnesses_by_pane = HashMap::<PaneId, &PaneOperationGuard>::new();
         witnesses_by_pane
@@ -5209,6 +5447,7 @@ impl PaneAuthorityIndex {
             let domain_is_current = match (operation.admitted_domain(), exact_domain) {
                 (Some(expected), Some(current)) => {
                     Weak::ptr_eq(expected, &Arc::downgrade(current))
+                        && !current.generation.is_retired()
                 }
                 (None, None) => true,
                 (Some(_), None) | (None, Some(_)) => false,
@@ -6572,9 +6811,16 @@ pub struct Mux {
     activity_count: Arc<AtomicUsize>,
     activity_prune_state: Arc<ActivityPruneState>,
     default_domain: RwLock<Option<Arc<dyn Domain>>>,
+    default_domain_registration: RwLock<Option<Arc<LiveDomainRegistration>>>,
     domains: RwLock<HashMap<DomainId, Arc<dyn Domain>>>,
     domains_by_name: RwLock<HashMap<String, Arc<dyn Domain>>>,
+    domain_registrations: RwLock<HashMap<DomainId, Arc<LiveDomainRegistration>>>,
+    domain_registrations_by_name: RwLock<HashMap<String, Arc<LiveDomainRegistration>>>,
     domain_registration: Mutex<()>,
+    domain_retirements: Arc<DomainRetirementTracker>,
+    // Compatibility projection used by existing final-cut checks in Tab.
+    // Unlike the former process-lifetime tombstone set, entries are removed
+    // only after the exact generation and its indexed cleanup quiesce.
     retired_domain_ids: Mutex<HashSet<DomainId>>,
     subscribers: RwLock<HashMap<usize, Arc<MuxSubscriber>>>,
     pending_pane_output: Mutex<PendingPaneOutputNotifications>,
@@ -7449,13 +7695,22 @@ impl Mux {
     pub fn new(default_domain: Option<Arc<dyn Domain>>) -> Self {
         let mut domains = HashMap::new();
         let mut domains_by_name = HashMap::new();
+        let mut domain_registrations = HashMap::new();
+        let mut domain_registrations_by_name = HashMap::new();
+        let mut default_domain_registration = None;
         if let Some(default_domain) = default_domain.as_ref() {
-            domains.insert(default_domain.domain_id(), Arc::clone(default_domain));
-
-            domains_by_name.insert(
-                default_domain.domain_name().to_string(),
+            let domain_id = default_domain.domain_id();
+            let domain_name = default_domain.domain_name().to_string();
+            let registration = LiveDomainRegistration::new(
+                domain_id,
+                domain_name.clone(),
                 Arc::clone(default_domain),
             );
+            domains.insert(domain_id, Arc::clone(default_domain));
+            domains_by_name.insert(domain_name.clone(), Arc::clone(default_domain));
+            domain_registrations.insert(domain_id, Arc::clone(&registration));
+            domain_registrations_by_name.insert(domain_name, Arc::clone(&registration));
+            default_domain_registration = Some(registration);
         }
 
         let agent = if config::configuration().mux_enable_ssh_agent {
@@ -7490,9 +7745,13 @@ impl Mux {
             activity_count: Arc::new(AtomicUsize::new(0)),
             activity_prune_state: Arc::new(ActivityPruneState::default()),
             default_domain: RwLock::new(default_domain),
+            default_domain_registration: RwLock::new(default_domain_registration),
             domains_by_name: RwLock::new(domains_by_name),
             domains: RwLock::new(domains),
+            domain_registrations: RwLock::new(domain_registrations),
+            domain_registrations_by_name: RwLock::new(domain_registrations_by_name),
             domain_registration: Mutex::new(()),
+            domain_retirements: Arc::new(DomainRetirementTracker::default()),
             retired_domain_ids: Mutex::new(HashSet::new()),
             subscribers: RwLock::new(HashMap::new()),
             pending_pane_output: Mutex::new(PendingPaneOutputNotifications::default()),
@@ -10260,23 +10519,42 @@ impl Mux {
         let domain_id = domain.domain_id();
         let domain_name = domain.domain_name().to_string();
         let _registration = self.domain_registration.lock();
-        let exact_id = self
-            .domains
+        let exact_registration = self
+            .domain_registrations
             .read()
             .get(&domain_id)
-            .is_some_and(|registered| Arc::ptr_eq(registered, domain));
-        let exact_name = self
-            .domains_by_name
-            .read()
-            .get(&domain_name)
-            .is_some_and(|registered| Arc::ptr_eq(registered, domain));
-        if self.retired_domain_ids.lock().contains(&domain_id) || !exact_id || !exact_name {
+            .cloned();
+        let exact = exact_registration.as_ref().is_some_and(|registered| {
+            registered.matches_domain(domain)
+                && registered.domain_name == domain_name
+                && self
+                    .domain_registrations_by_name
+                    .read()
+                    .get(&domain_name)
+                    .is_some_and(|by_name| Arc::ptr_eq(by_name, registered))
+                && self
+                    .domains
+                    .read()
+                    .get(&domain_id)
+                    .is_some_and(|by_id| Arc::ptr_eq(by_id, domain))
+                && self
+                    .domains_by_name
+                    .read()
+                    .get(&domain_name)
+                    .is_some_and(|by_name| Arc::ptr_eq(by_name, domain))
+        });
+        if !exact
+            || exact_registration
+                .as_ref()
+                .is_some_and(|registered| registered.generation.is_retired())
+        {
             return Err(DomainRegistrationError::DefaultNotRegistered {
                 domain_id,
                 domain_name,
             });
         }
         *self.default_domain.write() = Some(Arc::clone(domain));
+        *self.default_domain_registration.write() = exact_registration;
         Ok(())
     }
 
@@ -10298,7 +10576,9 @@ impl Mux {
         let _registration = self.domain_registration.lock();
         let _pane_registration = self.pane_registration.lock();
 
-        if self.retired_domain_ids.lock().contains(&domain_id) {
+        if self.domain_retirements.contains(domain_id)
+            || self.retired_domain_ids.lock().contains(&domain_id)
+        {
             return Err(DomainRegistrationError::RetiredIdentifier {
                 domain_id,
                 domain_name,
@@ -10308,15 +10588,26 @@ impl Mux {
         let mut authority = self.pane_authority.lock();
         let mut domains = self.domains.write();
         let mut domains_by_name = self.domains_by_name.write();
+        let mut registrations = self.domain_registrations.write();
+        let mut registrations_by_name = self.domain_registrations_by_name.write();
         if let Some(existing) = domains.get(&domain_id) {
             if Arc::ptr_eq(existing, domain) {
                 let exact_name = domains_by_name
                     .get(&domain_name)
                     .is_some_and(|registered| Arc::ptr_eq(registered, domain));
-                if !exact_name {
+                let exact_registration = registrations.get(&domain_id);
+                let exact_registration_name = registrations_by_name.get(&domain_name);
+                let exact_generation = exact_registration.is_some_and(|registered| {
+                    registered.matches_domain(domain)
+                        && registered.domain_name == domain_name
+                        && exact_registration_name
+                            .is_some_and(|by_name| Arc::ptr_eq(by_name, registered))
+                        && !registered.generation.is_retired()
+                });
+                if !exact_name || !exact_generation {
                     return Err(DomainRegistrationError::RegistryInconsistent {
                         detail: format!(
-                            "identifier {domain_id} exact registration is missing name {domain_name}"
+                            "identifier {domain_id} exact registration is missing live shared record/name {domain_name}"
                         ),
                     });
                 }
@@ -10401,6 +10692,22 @@ impl Mux {
                 detail: format!("reserve domain name entry: {error}"),
             }
         })?;
+        registrations.try_reserve(1).map_err(|error| {
+            DomainRegistrationError::RegistryInconsistent {
+                detail: format!("reserve exact domain registration entry: {error}"),
+            }
+        })?;
+        registrations_by_name.try_reserve(1).map_err(|error| {
+            DomainRegistrationError::RegistryInconsistent {
+                detail: format!("reserve exact domain registration name entry: {error}"),
+            }
+        })?;
+
+        let live_registration = LiveDomainRegistration::new(
+            domain_id,
+            domain_name.clone(),
+            Arc::clone(&domain_arc),
+        );
 
         if bind_domain_directory {
             authority
@@ -10411,6 +10718,13 @@ impl Mux {
         }
         domains_by_name.insert(domain_name, Arc::clone(&domain_arc));
         domains.insert(domain_id, Arc::clone(&domain_arc));
+        registrations_by_name.insert(
+            live_registration.domain_name.clone(),
+            Arc::clone(&live_registration),
+        );
+        registrations.insert(domain_id, Arc::clone(&live_registration));
+        drop(registrations_by_name);
+        drop(registrations);
         drop(domains_by_name);
         drop(domains);
         drop(authority);
@@ -10418,6 +10732,7 @@ impl Mux {
         let mut default_domain = self.default_domain.write();
         if default_domain.is_none() {
             *default_domain = Some(domain_arc);
+            *self.default_domain_registration.write() = Some(live_registration);
         }
         Ok(())
     }
@@ -14620,13 +14935,14 @@ impl Mux {
             return None;
         }
         let current_domain = self
-            .domains
+            .domain_registrations
             .read()
             .get(&admitted_domain_id)
             .cloned();
         let domain_is_current = match (operation.admitted_domain(), current_domain.as_ref()) {
             (Some(expected), Some(current)) => {
                 Weak::ptr_eq(expected, &Arc::downgrade(current))
+                    && !current.generation.is_retired()
             }
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
@@ -14675,7 +14991,9 @@ impl Mux {
                     )
                     || !authority.domain_directory_matches(
                         admitted_domain_id,
-                        current_domain.as_ref(),
+                        current_domain
+                            .as_ref()
+                            .map(|registration| &registration.domain),
                     )
                 {
                     return None;
@@ -14686,7 +15004,9 @@ impl Mux {
                     .registrations_by_domain
                     .get(&admitted_domain_id)
                     .is_none_or(|registrations| {
-                        registrations.matches_domain(current_domain.as_ref())
+                        registrations.matches_domain(
+                            current_domain.as_ref().map(|registration| &registration.domain),
+                        )
                     });
                 if entry.registration.is_some()
                     || entry.domain_id.is_some()
