@@ -5,9 +5,9 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.15.0` tag has a published GitHub Release; `backup-before-rewrite` is a tag only.
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.15.0` tag has a published GitHub Release; `backup-before-rewrite` is a tag only. The `v0.15.0` release was source-only and was superseded by the complete `v0.15.1` platform release.
 
-Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) (2026-08-20). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
+Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) (2026-08-20). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
 
 ## Version Timeline
 
@@ -15,7 +15,8 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.0...main) | HEAD | — | Next release |
+| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main) | HEAD | — | Next release |
+| [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1) | Release | 2026-08-20 | Complete platform artifacts and macOS GUI installation |
 | [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | Sampled paste tracing over additive PDU99 |
 | [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | Pane-input argv privacy and release-contract repair |
 | [v0.14.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.0) | Release | 2026-08-20 | Mux authority, scheduler admission, recorder truth, and protocol hardening |
@@ -24,11 +25,24 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- development on `main` since [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0)
+## [Unreleased] -- development on `main` since [v0.15.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1)
 
-Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.0...main>
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
 No changes yet.
+
+---
+
+## [0.15.1] -- 2026-08-20 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.1>
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.0...v0.15.1>
+
+### Release-contract repair
+
+- Restores the full native release process after `v0.15.0` was published without binary assets.
+- Ships verified CLI archives for Linux x86_64, Linux arm64, macOS arm64, and Windows x86_64, plus the complete macOS `FrankenTerm.app` bundle.
+- Restores formatter-clean source, per-asset SHA-256 sidecars, aggregate `SHA256SUMS`, local macOS GUI installation, LaunchServices registration, and Dock refresh.
 
 ---
 
@@ -36,6 +50,8 @@ No changes yet.
 
 GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0>
 Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.1...v0.15.0>
+
+This release was published with source archives only and no installable binary assets. It is superseded by `v0.15.1`.
 
 ### Sampled paste tracing
 
