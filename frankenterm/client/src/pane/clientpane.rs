@@ -1,13 +1,13 @@
 use crate::client::{
-    admit_interactive_rpc_now, ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope,
+    ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope, admit_interactive_rpc_now,
 };
-use crate::domain::{lock_or_recover, ClientInner};
+use crate::domain::{ClientInner, lock_or_recover};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
-    hydrate_lines, hydrate_render_application_lines, RenderableInner, RenderablePaneBinding,
-    RenderableState,
+    RenderableInner, RenderablePaneBinding, RenderableState, hydrate_lines,
+    hydrate_render_application_lines,
 };
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use codec::*;
 use config::configuration;
@@ -2065,6 +2065,66 @@ impl ClientPane {
         self.remote_pane_id
     }
 
+    /// Send one sampled paste without placing its content in trace metadata.
+    /// Peers below the additive traced-paste dialect receive the unchanged
+    /// PDU13 request; the context is consumed rather than retained across a
+    /// later connection generation.
+    pub fn send_paste_with_trace_context(
+        &self,
+        text: &str,
+        trace_context: SampledTraceContextV1,
+    ) -> anyhow::Result<()> {
+        self.dispatch_paste(text, Some(trace_context))
+    }
+
+    fn dispatch_paste(
+        &self,
+        text: &str,
+        trace_context: Option<SampledTraceContextV1>,
+    ) -> anyhow::Result<()> {
+        if let Some(trace_context) = trace_context {
+            validate_sampled_paste_trace_context(&trace_context)
+                .context("validating sampled paste before input-serial allocation")?;
+            if text.len() > MAX_SEND_PASTE_TRACED_V1_DECOMPRESSED_BYTES {
+                bail!(
+                    "sampled paste payload exceeds the fixed {}-byte decoded ceiling",
+                    MAX_SEND_PASTE_TRACED_V1_DECOMPRESSED_BYTES
+                );
+            }
+        }
+        let input_serial = InputSerial::try_now()
+            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
+        let client = Arc::clone(&self.client);
+        let request = SendPaste {
+            pane_id: self.remote_pane_id,
+            data: text.to_owned(),
+            input_serial,
+        };
+        let renderable = self.renderable.lock();
+        let mut inner = renderable.inner.borrow_mut();
+        match trace_context {
+            Some(trace_context)
+                if client
+                    .client
+                    .agreed_codec_version()
+                    .is_some_and(|version| version >= SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION) =>
+            {
+                dispatch_interactive_rpc(
+                    client.client.send_paste_traced_v1(SendPasteTracedV1 {
+                        request,
+                        trace_context,
+                    }),
+                    "send_paste_traced_v1",
+                )?;
+            }
+            _ => dispatch_interactive_rpc(client.client.send_paste(request), "send_paste")?,
+        }
+        inner.input_serial = input_serial;
+        inner.predict_from_paste(text);
+        inner.update_last_send();
+        Ok(())
+    }
+
     pub(crate) fn belongs_to_client(&self, client: &ClientInner) -> bool {
         std::ptr::eq(self.client.as_ref(), client)
     }
@@ -2266,28 +2326,7 @@ impl Pane for ClientPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
-        let input_serial = InputSerial::try_now()
-            .ok_or_else(|| anyhow::anyhow!("process-local input serial space exhausted"))?;
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let data = text.to_owned();
-        let request = client.client.send_paste(SendPaste {
-            pane_id: remote_pane_id,
-            data,
-            input_serial,
-        });
-        // Serialize exact transport admission with speculative publication.
-        // The first poll is bounded to validation + try_send, so holding this
-        // authority cannot park the GUI thread; it prevents a fast dispatch
-        // acknowledgement from reconciling before the matching prediction is
-        // visible in the pane ledger.
-        let renderable = self.renderable.lock();
-        let mut inner = renderable.inner.borrow_mut();
-        dispatch_interactive_rpc(request, "send_paste")?;
-        inner.input_serial = input_serial;
-        inner.predict_from_paste(text);
-        inner.update_last_send();
-        Ok(())
+        self.dispatch_paste(text, None)
     }
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
@@ -2586,14 +2625,14 @@ impl std::io::Write for PaneWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{Client, TestRpcPeer, TEST_RENDER_CONNECTION_IDENTITY};
-    use crate::domain::ClientDomainConfig;
     use crate::MuxTestScope;
+    use crate::client::{Client, TEST_RENDER_CONNECTION_IDENTITY, TestRpcPeer};
+    use crate::domain::ClientDomainConfig;
     use config::UnixDomain;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::{Mux, MuxNotification, MuxSessionIncarnation};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use termwiz::cell::{CellAttributes, SemanticType};
 
     const SUCCESSOR_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
@@ -2628,6 +2667,13 @@ mod tests {
                 nonce_lo: 0x4142_4344_4546_4748,
             },
             sampler_algorithm: RecorderSamplerAlgorithm::SplitMix64V1,
+        }
+    }
+
+    fn sampled_paste_context() -> SampledTraceContextV1 {
+        SampledTraceContextV1 {
+            path: InteractionTracePath::Paste,
+            ..sampled_reliable_key_context()
         }
     }
 
@@ -2759,9 +2805,11 @@ mod tests {
             Some(context),
             "authority probe must retain context for the first effect-eligible attempt"
         );
-        assert!(inner
-            .reliable_input_queue
-            .bind_front_pane_authority(&expected, pane_registration));
+        assert!(
+            inner
+                .reliable_input_queue
+                .bind_front_pane_authority(&expected, pane_registration)
+        );
 
         let (first, consumed) = inner
             .reliable_input_queue
@@ -2897,9 +2945,11 @@ mod tests {
             ReliableInputWireAttempt::Unsampled(_)
         ));
         assert_eq!(consumed, Some(context));
-        assert!(inner
-            .reliable_input_queue
-            .restore_front_trace_context(&expected, consumed));
+        assert!(
+            inner
+                .reliable_input_queue
+                .restore_front_trace_context(&expected, consumed)
+        );
 
         let (v62_attempt, consumed_again) = inner
             .reliable_input_queue
@@ -3032,9 +3082,11 @@ mod tests {
             second_wire.request.input_serial,
             second_request.input_serial
         );
-        assert!(inner
-            .reliable_input_queue
-            .complete_front(&second, "applied"));
+        assert!(
+            inner
+                .reliable_input_queue
+                .complete_front(&second, "applied")
+        );
         assert!(inner.reliable_input_queue.state.lock().pending.is_empty());
         assert!(peer.is_empty());
     }
@@ -3118,6 +3170,26 @@ mod tests {
             after_paste, before,
             "rejected paste must not advance prediction authority"
         );
+    }
+
+    #[test]
+    fn sampled_paste_uses_pdu99_once_and_preserves_operational_bytes() {
+        let (inner, peer) = test_client_inner_with_rpc_peer(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let payload = "private paste bytes\nwith ordering";
+
+        pane.send_paste_with_trace_context(payload, sampled_paste_context())
+            .expect("sampled paste should enter the live test transport");
+        let request = promise::spawn::block_on(peer.respond_next_unit())
+            .expect("test peer should receive sampled paste");
+        let Pdu::SendPasteTracedV1(traced) = request else {
+            panic!("sampled paste used unexpected wire request");
+        };
+        assert_eq!(traced.request.pane_id, 29);
+        assert_eq!(traced.request.data, payload);
+        assert!(!traced.request.input_serial.is_empty());
+        assert_eq!(traced.trace_context.path, InteractionTracePath::Paste);
+        assert!(peer.is_empty());
     }
 
     #[test]
@@ -3205,9 +3277,11 @@ mod tests {
             state.pending.front().unwrap().clone()
         };
         let remote_authority = ReliablePaneRegistrationIdentityV1::from_bytes([0x61; 16]);
-        assert!(inner
-            .reliable_input_queue
-            .bind_front_pane_authority(&first, remote_authority));
+        assert!(
+            inner
+                .reliable_input_queue
+                .bind_front_pane_authority(&first, remote_authority)
+        );
         assert_eq!(*pane_authority.lock(), Some(remote_authority));
         let mut state = inner.reliable_input_queue.state.lock();
         assert!(
@@ -3363,9 +3437,11 @@ mod tests {
             state.worker_running = true;
         }
 
-        assert!(inner
-            .reliable_input_queue
-            .retire_front_pane_authority(&first, "pane_registration_mismatch"));
+        assert!(
+            inner
+                .reliable_input_queue
+                .retire_front_pane_authority(&first, "pane_registration_mismatch")
+        );
         assert_eq!(*first_authority_cache.lock(), None);
         assert_eq!(*second_authority_cache.lock(), Some(second_authority));
         let state = inner.reliable_input_queue.state.lock();

@@ -6471,6 +6471,11 @@ fn dispatch_client_request_with_decode_interval(
                 topology.stream_id,
                 codec::CODEC_VERSION,
             )?),
+            Pdu::SendPasteTracedV1(request) => Some(AdmittedInputTraceV1::admit_paste(
+                request,
+                topology.stream_id,
+                codec::CODEC_VERSION,
+            )?),
             _ => None,
         };
         if let (Some(admission), Some(interval)) = (input_trace_authority.as_mut(), decode_interval)

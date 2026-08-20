@@ -23,10 +23,10 @@ use codec::{
     ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventTracedV1,
     ReliableKeyEventV1, ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1,
     RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
-    SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace,
-    SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
-    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
-    ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
+    SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SendPasteTracedV1,
+    SetActiveWorkspace, SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
+    SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
+    TabTitleChanged, ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
@@ -36,11 +36,13 @@ use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
 use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceClockDomain, InteractionTraceCorrelation,
     InteractionTraceCounterUnavailability, InteractionTraceCounters, InteractionTraceGenerations,
-    InteractionTraceObservationBoundary, InteractionTraceProducer, InteractionTraceRunId,
-    InteractionTraceSchedulerQueueEvidence, InteractionTraceStage, InteractionTraceStageOutcome,
-    InteractionTraceTimestamp, InteractionTraceTopology,
+    InteractionTraceObservationBoundary, InteractionTracePath, InteractionTraceProducer,
+    InteractionTraceRunId, InteractionTraceSchedulerQueueEvidence, InteractionTraceStage,
+    InteractionTraceStageOutcome, InteractionTraceTimestamp, InteractionTraceTopology,
 };
-use frankenterm_core_audit_types::renderer_scenario_catalog::RendererKeypressTraceStage;
+use frankenterm_core_audit_types::renderer_scenario_catalog::{
+    RendererKeypressTraceStage, RendererPasteTraceStage,
+};
 use frankenterm_flight_recorder::{
     ClockStamp, EventFields, FlightRecorder, ProducerHandle, RecordOutcome, RecorderConfig,
     RecorderError, TraceAdmission, TraceToken,
@@ -635,7 +637,7 @@ impl SessionTraceProducer {
     fn server_stage_fields(
         &self,
         token: TraceToken,
-        stage: RendererKeypressTraceStage,
+        stage: InteractionTraceStage,
         topology: InteractionTraceTopology,
         started_at: Instant,
         completed_at_instant: Instant,
@@ -692,7 +694,6 @@ impl SessionTraceProducer {
                     None,
                 )
             });
-        let stage = InteractionTraceStage::Keypress(stage);
         match EventFields::new(
             u64::from(stage.ordinal()),
             u64::from(stage.ordinal()) + 1,
@@ -726,7 +727,7 @@ impl SessionTraceProducer {
         }
     }
 
-    fn record_reliable_dispatch(
+    fn record_input_dispatch(
         &self,
         admission: &AdmittedInputTraceV1,
         topology: InteractionTraceTopology,
@@ -755,9 +756,27 @@ impl SessionTraceProducer {
         let Some(token) = self.admit_remote_trace(admission.context) else {
             return false;
         };
+        let (decode_stage, dispatch_stage) = match admission.context.path {
+            InteractionTracePath::Keypress => (
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode),
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait),
+            ),
+            InteractionTracePath::Paste => (
+                InteractionTraceStage::Paste(RendererPasteTraceStage::ServerReadableDecode),
+                InteractionTraceStage::Paste(RendererPasteTraceStage::ServerDispatchMuxWait),
+            ),
+            InteractionTracePath::ResizeZoom => {
+                metrics::counter!(
+                    "mux.server.trace_event",
+                    "outcome" => "wrong_input_trace_path"
+                )
+                .increment(2);
+                return false;
+            }
+        };
         let Some(k4) = self.server_stage_fields(
             token,
-            RendererKeypressTraceStage::ServerReadableDecode,
+            decode_stage,
             topology,
             decode_started_at,
             decode_completed_at,
@@ -767,7 +786,7 @@ impl SessionTraceProducer {
         };
         let Some(k5) = self.server_stage_fields(
             token,
-            RendererKeypressTraceStage::ServerDispatchMuxWait,
+            dispatch_stage,
             topology,
             decode_completed_at,
             dispatch_started_at,
@@ -1523,15 +1542,23 @@ pub(crate) struct AdmittedInputTraceV1 {
     context: SampledTraceContextV1,
     stream_id: TopologyStreamId,
     pane_id: PaneId,
-    pane_registration: Option<ReliablePaneRegistrationIdentityV1>,
     input_serial: InputSerial,
-    kind: ReliableKeyEventKindV1,
+    request_identity: AdmittedInputTraceRequestIdentity,
     decode_started_at: Option<Instant>,
     decode_completed_at: Option<Instant>,
     scheduler_enqueue: Rc<Cell<Option<MainThreadEnqueueReceipt>>>,
     trace_producer: Option<Rc<SessionTraceProducer>>,
     #[cfg(test)]
     effect_barrier: Option<TraceEffectBarrier>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmittedInputTraceRequestIdentity {
+    ReliableKey {
+        pane_registration: Option<ReliablePaneRegistrationIdentityV1>,
+        kind: ReliableKeyEventKindV1,
+    },
+    Paste,
 }
 
 #[cfg(test)]
@@ -1572,9 +1599,44 @@ impl AdmittedInputTraceV1 {
             context: request.trace_context,
             stream_id,
             pane_id: request.request.pane_id,
-            pane_registration: request.request.pane_registration,
             input_serial: request.request.input_serial,
-            kind: request.request.kind,
+            request_identity: AdmittedInputTraceRequestIdentity::ReliableKey {
+                pane_registration: request.request.pane_registration,
+                kind: request.request.kind,
+            },
+            decode_started_at: None,
+            decode_completed_at: None,
+            scheduler_enqueue: Rc::new(Cell::new(None)),
+            trace_producer: None,
+            #[cfg(test)]
+            effect_barrier: None,
+        })
+    }
+
+    pub(crate) fn admit_paste(
+        request: &SendPasteTracedV1,
+        stream_id: TopologyStreamId,
+        local_codec_version: usize,
+    ) -> anyhow::Result<Self> {
+        if local_codec_version < codec::SEND_PASTE_TRACED_V1_MIN_CODEC_VERSION {
+            return Err(anyhow!(
+                "sampled paste is unavailable in this codec dialect"
+            ));
+        }
+        if stream_id.as_bytes() == [0; 16] {
+            return Err(anyhow!(
+                "sampled paste has no live connection-generation authority"
+            ));
+        }
+        request
+            .validate()
+            .context("validating sampled paste context")?;
+        Ok(Self {
+            context: request.trace_context,
+            stream_id,
+            pane_id: request.request.pane_id,
+            input_serial: request.request.input_serial,
+            request_identity: AdmittedInputTraceRequestIdentity::Paste,
             decode_started_at: None,
             decode_completed_at: None,
             scheduler_enqueue: Rc::new(Cell::new(None)),
@@ -1603,12 +1665,44 @@ impl AdmittedInputTraceV1 {
             ));
         }
         if self.pane_id != request.request.pane_id
-            || self.pane_registration != request.request.pane_registration
             || self.input_serial != request.request.input_serial
-            || self.kind != request.request.kind
+            || self.request_identity
+                != (AdmittedInputTraceRequestIdentity::ReliableKey {
+                    pane_registration: request.request.pane_registration,
+                    kind: request.request.kind,
+                })
         {
             return Err(anyhow!(
                 "sampled key input request identity differs from its admission authority"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_paste_request(
+        &self,
+        request: &SendPasteTracedV1,
+        current_stream_id: TopologyStreamId,
+    ) -> anyhow::Result<()> {
+        request
+            .validate()
+            .context("revalidating sampled paste context")?;
+        if self.stream_id != current_stream_id {
+            return Err(anyhow!(
+                "sampled paste belongs to a stale connection generation"
+            ));
+        }
+        if self.context != request.trace_context {
+            return Err(anyhow!(
+                "sampled paste context differs from its admission authority"
+            ));
+        }
+        if self.pane_id != request.request.pane_id
+            || self.input_serial != request.request.input_serial
+            || self.request_identity != AdmittedInputTraceRequestIdentity::Paste
+        {
+            return Err(anyhow!(
+                "sampled paste request identity differs from its admission authority"
             ));
         }
         Ok(())
@@ -6498,11 +6592,17 @@ impl SessionHandler {
             (Pdu::ReliableKeyEventTracedV1(_), None) => Err(anyhow!(
                 "sampled reliable key input lacks server admission authority"
             )),
+            (Pdu::SendPasteTracedV1(request), Some(admission)) => {
+                admission.validate_for_paste_request(request, self.topology_stream_id)
+            }
+            (Pdu::SendPasteTracedV1(_), None) => {
+                Err(anyhow!("sampled paste lacks server admission authority"))
+            }
             (Pdu::SendKeyDownTracedV1(_), _) => Err(anyhow!(
                 "retired PDU95 sampled legacy input is not a server endpoint"
             )),
             (_, Some(_)) => Err(anyhow!(
-                "sampled key input authority was attached to an unrelated request"
+                "sampled input authority was attached to an unrelated request"
             )),
             (_, None) => Ok(()),
         };
@@ -6607,6 +6707,16 @@ impl SessionHandler {
                 debug_assert_eq!(admission.context(), trace_context);
                 debug_assert_eq!(admission.stream_id(), self.topology_stream_id);
                 (Pdu::ReliableKeyEventV1(request), Some(admission))
+            }
+            Pdu::SendPasteTracedV1(traced) => {
+                let (request, trace_context) = traced.into_parts();
+                let Some(admission) = input_trace_authority else {
+                    send_response(Err(MuxServerRejection::invalid_request().into()));
+                    return;
+                };
+                debug_assert_eq!(admission.context(), trace_context);
+                debug_assert_eq!(admission.stream_id(), self.topology_stream_id);
+                (Pdu::SendPaste(request), Some(admission))
             }
             pdu => (pdu, None),
         };
@@ -7034,6 +7144,77 @@ impl SessionHandler {
                 let registration = pane_authority.registration();
                 let per_pane = self.per_pane_for_registration(&registration);
                 let estimated_bytes = main_thread_rpc_estimated_bytes(data.len());
+                if let Some(trace_authority) = admitted_input_trace {
+                    let (request_authority, pane_operation) = pane_authority.into_parts();
+                    let trace_producer = trace_authority.trace_producer.as_ref().map(Rc::clone);
+                    let scheduler_enqueue = Rc::clone(&trace_authority.scheduler_enqueue);
+                    let reservation = match try_reserve_main_thread(
+                        MainThreadServiceClass::Input,
+                        estimated_bytes,
+                    ) {
+                        MainThreadReservationOutcome::Reserved(reservation) => reservation,
+                        rejected => {
+                            send_response(reject_main_thread_rpc_scheduler_admission(rejected));
+                            return;
+                        }
+                    };
+                    let spawned = reservation.spawn_local(async move {
+                        let result = (|| {
+                            request_authority.ensure_effect_admitted()?;
+                            let trace_topology = trace_producer.as_ref().and_then(|_| {
+                                pane_operation.exact_location_ids().ok().and_then(
+                                    |(_, window_id, tab_id)| {
+                                        trace_topology_from_mux_ids(
+                                            window_id,
+                                            tab_id,
+                                            pane_operation.pane_id(),
+                                        )
+                                    },
+                                )
+                            });
+                            if trace_producer.is_some() && trace_topology.is_none() {
+                                metrics::counter!(
+                                    "mux.server.trace_event",
+                                    "outcome" => "topology_unavailable"
+                                )
+                                .increment(2);
+                                return Err(MuxServerRejection::invalid_request().into());
+                            }
+                            let dispatch_started_at = Instant::now();
+                            pane_operation
+                                .with_pane(|pane| {
+                                    catch_recoverable(
+                                        RecoverablePanicSite::MuxPaneCallback,
+                                        AssertUnwindSafe(|| pane.send_paste(&data)),
+                                    )
+                                })
+                                .map_err(|_| MuxServerRejection::invalid_request())??;
+                            if let (Some(producer), Some(topology)) =
+                                (trace_producer.as_ref(), trace_topology)
+                            {
+                                producer.record_input_dispatch(
+                                    &trace_authority,
+                                    topology,
+                                    dispatch_started_at,
+                                );
+                            }
+                            let _ = registration.try_with_current(|pane| {
+                                push_input_dispatch_changes_after_committed_input(
+                                    &pane,
+                                    sender,
+                                    per_pane,
+                                    input_serial,
+                                    "paste",
+                                );
+                            });
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        })();
+                        send_response(result);
+                    });
+                    scheduler_enqueue.set(Some(spawned.initial_enqueue_receipt()));
+                    spawned.detach();
+                    return;
+                }
                 schedule_main_thread_rpc(
                     MainThreadServiceClass::Input,
                     estimated_bytes,
@@ -7394,7 +7575,7 @@ impl SessionHandler {
                                                 trace_authority.as_ref(),
                                                 trace_topology,
                                             ) {
-                                                producer.record_reliable_dispatch(
+                                                producer.record_input_dispatch(
                                                     admission,
                                                     topology,
                                                     dispatch_started_at,
@@ -8382,6 +8563,9 @@ impl SessionHandler {
             Pdu::ReliableKeyEventTracedV1(_) => unreachable!(
                 "PDU98 is normalized to PDU96 only after exact trace admission validation"
             ),
+            Pdu::SendPasteTracedV1(_) => unreachable!(
+                "PDU99 is normalized to PDU13 only after exact trace admission validation"
+            ),
         }
     }
 }
@@ -8746,6 +8930,99 @@ mod tests {
                 Some(admission),
             );
         }
+
+        fn paste_request(&self, input_serial: u64, data: &str) -> SendPasteTracedV1 {
+            SendPasteTracedV1 {
+                request: SendPaste {
+                    pane_id: self.pane.pane_id(),
+                    data: data.to_owned(),
+                    input_serial: InputSerial::from_millis_since_epoch(input_serial),
+                },
+                trace_context: SampledTraceContextV1 {
+                    path: InteractionTracePath::Paste,
+                    ..sampled_key_context()
+                },
+            }
+        }
+
+        fn paste_admission(&self, request: &SendPasteTracedV1) -> AdmittedInputTraceV1 {
+            let mut admission = AdmittedInputTraceV1::admit_paste(
+                request,
+                self.stream_id,
+                codec::CODEC_VERSION,
+            )
+            .expect("sampled paste receives connection authority");
+            self.handler.record_decoded_input_trace(
+                Some(&self.producer),
+                &mut admission,
+                self.authority.clock_origin,
+                Instant::now(),
+            );
+            admission
+        }
+
+        fn dispatch_paste(
+            &mut self,
+            rpc_serial: u64,
+            request: SendPasteTracedV1,
+            admission: AdmittedInputTraceV1,
+        ) {
+            self.handler.process_one_with_dispatch_authority(
+                DecodedPdu {
+                    serial: rpc_serial,
+                    pdu: Pdu::SendPasteTracedV1(request),
+                },
+                None,
+                Some(admission),
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_paste_applies_once_and_records_content_free_p4_p5() {
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_007, None));
+        let mut harness = SampledReliableHarness::new(
+            Arc::clone(&pane),
+            Arc::clone(&recorder),
+            0x45,
+            "sampled-paste",
+            45_001,
+        );
+        let private_content = "api-key=do-not-record-this";
+        let request = harness.paste_request(73, private_content);
+        let admission = harness.paste_admission(&request);
+
+        harness.dispatch_paste(74, request, admission);
+        harness
+            .executor
+            .tick()
+            .expect("sampled paste runnable should execute");
+        drain_simple_executor(&harness.executor);
+
+        assert_eq!(pane.paste_count(), 1);
+        assert!(
+            harness
+                .captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|decoded| decoded.pdu == Pdu::UnitResponse(UnitResponse {})),
+            "sampled paste retains the ordinary unit response"
+        );
+        let events = freeze_trace_events(&recorder);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].stage,
+            InteractionTraceStage::Paste(RendererPasteTraceStage::ServerReadableDecode)
+        );
+        assert_eq!(
+            events[1].stage,
+            InteractionTraceStage::Paste(RendererPasteTraceStage::ServerDispatchMuxWait)
+        );
+        let encoded = serde_json::to_string(&events).expect("trace fragment should serialize");
+        assert!(!encoded.contains(private_content));
+        assert!(!encoded.contains("api-key"));
     }
 
     #[test]
@@ -8838,9 +9115,11 @@ mod tests {
             context: sampled_key_context(),
             stream_id: topology_stream(9),
             pane_id: 303,
-            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x33; 16])),
             input_serial: InputSerial::from_millis_since_epoch(11),
-            kind: ReliableKeyEventKindV1::KeyDown,
+            request_identity: AdmittedInputTraceRequestIdentity::ReliableKey {
+                pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x33; 16])),
+                kind: ReliableKeyEventKindV1::KeyDown,
+            },
             decode_started_at: Some(k4_start),
             decode_completed_at: Some(k4_end),
             scheduler_enqueue: Rc::new(Cell::new(Some(MainThreadEnqueueReceipt {
@@ -8862,7 +9141,7 @@ mod tests {
             trace_producer: None,
             effect_barrier: None,
         };
-        assert!(producer.record_reliable_dispatch(&admission, topology, k5_end));
+        assert!(producer.record_input_dispatch(&admission, topology, k5_end));
 
         let events = freeze_trace_events(&recorder);
         assert_eq!(events.len(), 2);
@@ -9635,7 +9914,7 @@ mod tests {
             .producer
             .server_stage_fields(
                 filler_token,
-                RendererKeypressTraceStage::ServerReadableDecode,
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode),
                 topology,
                 harness.authority.clock_origin,
                 Instant::now(),
