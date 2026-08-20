@@ -1,13 +1,13 @@
 use crate::client::{
-    ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope, admit_interactive_rpc_now,
+    admit_interactive_rpc_now, ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope,
 };
-use crate::domain::{ClientInner, lock_or_recover};
+use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
-    RenderableInner, RenderablePaneBinding, RenderableState, hydrate_lines,
-    hydrate_render_application_lines,
+    hydrate_lines, hydrate_render_application_lines, RenderableInner, RenderablePaneBinding,
+    RenderableState,
 };
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use codec::*;
 use config::configuration;
@@ -2625,14 +2625,14 @@ impl std::io::Write for PaneWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MuxTestScope;
-    use crate::client::{Client, TEST_RENDER_CONNECTION_IDENTITY, TestRpcPeer};
+    use crate::client::{Client, TestRpcPeer, TEST_RENDER_CONNECTION_IDENTITY};
     use crate::domain::ClientDomainConfig;
+    use crate::MuxTestScope;
     use config::UnixDomain;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::{Mux, MuxNotification, MuxSessionIncarnation};
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
     use termwiz::cell::{CellAttributes, SemanticType};
 
     const SUCCESSOR_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
@@ -2805,11 +2805,9 @@ mod tests {
             Some(context),
             "authority probe must retain context for the first effect-eligible attempt"
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .bind_front_pane_authority(&expected, pane_registration)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .bind_front_pane_authority(&expected, pane_registration));
 
         let (first, consumed) = inner
             .reliable_input_queue
@@ -2945,11 +2943,9 @@ mod tests {
             ReliableInputWireAttempt::Unsampled(_)
         ));
         assert_eq!(consumed, Some(context));
-        assert!(
-            inner
-                .reliable_input_queue
-                .restore_front_trace_context(&expected, consumed)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .restore_front_trace_context(&expected, consumed));
 
         let (v62_attempt, consumed_again) = inner
             .reliable_input_queue
@@ -3082,11 +3078,9 @@ mod tests {
             second_wire.request.input_serial,
             second_request.input_serial
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .complete_front(&second, "applied")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .complete_front(&second, "applied"));
         assert!(inner.reliable_input_queue.state.lock().pending.is_empty());
         assert!(peer.is_empty());
     }
@@ -3279,11 +3273,9 @@ mod tests {
             state.pending.front().unwrap().clone()
         };
         let remote_authority = ReliablePaneRegistrationIdentityV1::from_bytes([0x61; 16]);
-        assert!(
-            inner
-                .reliable_input_queue
-                .bind_front_pane_authority(&first, remote_authority)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .bind_front_pane_authority(&first, remote_authority));
         assert_eq!(*pane_authority.lock(), Some(remote_authority));
         let mut state = inner.reliable_input_queue.state.lock();
         assert!(
@@ -3439,11 +3431,9 @@ mod tests {
             state.worker_running = true;
         }
 
-        assert!(
-            inner
-                .reliable_input_queue
-                .retire_front_pane_authority(&first, "pane_registration_mismatch")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .retire_front_pane_authority(&first, "pane_registration_mismatch"));
         assert_eq!(*first_authority_cache.lock(), None);
         assert_eq!(*second_authority_cache.lock(), Some(second_authority));
         let state = inner.reliable_input_queue.state.lock();
