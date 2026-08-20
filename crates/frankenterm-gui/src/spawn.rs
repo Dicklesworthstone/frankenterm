@@ -1,11 +1,11 @@
 use anyhow::{Context, anyhow, bail, ensure};
 use config::TermConfig;
 use config::keyassignment::SpawnCommand;
-use mux::Mux;
 use mux::activity::Activity;
-use mux::domain::{Domain, SplitSource};
+use mux::domain::SplitSource;
 use mux::tab::{FloatingPaneRect, SplitRequest};
 use mux::window::WindowId as MuxWindowId;
+use mux::{DomainOperationGuard, Mux};
 use portable_pty::CommandBuilder;
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
@@ -19,7 +19,7 @@ pub enum SpawnWhere {
 }
 
 pub async fn attach_domain_to_window_or_spawn_recovery(
-    domain: Arc<dyn Domain>,
+    domain: &DomainOperationGuard,
     window_id: MuxWindowId,
     command: Option<CommandBuilder>,
     command_dir: Option<String>,

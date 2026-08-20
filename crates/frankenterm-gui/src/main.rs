@@ -26,9 +26,9 @@ use frankenterm_font::FontConfiguration;
 use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_mux_server_impl::update_mux_domains;
 use frankenterm_toast_notification::*;
-use mux::Mux;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
+use mux::{DomainOperationGuard, Mux};
 use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
@@ -368,9 +368,14 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     };
 
     let domain: Arc<dyn Domain> = Arc::new(mux::ssh::RemoteSshDomain::with_ssh_domain(&dom)?);
+    let domain_id = domain.domain_id();
     let mux = Mux::try_get().context("mux singleton is not available")?;
     mux.add_domain(&domain)?;
-    mux.set_default_domain(&domain)?;
+    let domain_guard = mux.get_domain(domain_id).ok_or_else(|| {
+        anyhow::anyhow!("SSH domain {domain_id} retired before becoming the default domain")
+    })?;
+    drop(domain);
+    mux.set_default_domain_guard(&domain_guard)?;
 
     let should_publish = false;
     async_run_terminal_gui(cmd, start_command, should_publish).await
@@ -468,7 +473,7 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
 
 fn have_panes_in_domain_and_ws(
     mux: &Mux,
-    domain: &Arc<dyn Domain>,
+    domain: &DomainOperationGuard,
     workspace: &Option<String>,
 ) -> bool {
     let window_ids = workspace.as_ref().map_or_else(
@@ -484,12 +489,17 @@ fn have_panes_in_domain_and_ws(
 async fn spawn_tab_in_domain_if_mux_is_empty(
     cmd: Option<CommandBuilder>,
     is_connecting: bool,
-    domain: Option<Arc<dyn Domain>>,
+    domain: Option<DomainOperationGuard>,
     workspace: Option<String>,
 ) -> anyhow::Result<()> {
     let mux = Mux::try_get().context("mux singleton is not available")?;
 
-    let domain = domain.unwrap_or_else(|| mux.default_domain());
+    let domain = match domain {
+        Some(domain) => domain,
+        None => mux
+            .default_domain()
+            .context("resolving the default mux domain for initial tab spawn")?,
+    };
 
     if !is_connecting && have_panes_in_domain_and_ws(&mux, &domain, &workspace) {
         return Ok(());
@@ -511,11 +521,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     let config = config::configuration();
     let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
     crate::spawn::attach_domain_to_window_or_spawn_recovery(
-        Arc::clone(&domain),
-        window_id,
-        cmd,
-        None,
-        dpi as u32,
+        &domain, window_id, cmd, None, dpi as u32,
     )
     .await?;
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
@@ -736,29 +742,37 @@ enum Publish {
 }
 
 impl Publish {
-    pub fn resolve(mux: &Arc<Mux>, config: &ConfigHandle, always_new_process: bool) -> Self {
-        if mux.default_domain().domain_name() != config.default_domain.as_deref().unwrap_or("local")
-        {
-            return Self::NoConnect;
+    pub fn resolve(
+        mux: &Arc<Mux>,
+        config: &ConfigHandle,
+        always_new_process: bool,
+    ) -> anyhow::Result<Self> {
+        let default_domain = mux
+            .default_domain()
+            .context("resolving the default mux domain before GUI publication")?;
+        if default_domain.domain_name() != config.default_domain.as_deref().unwrap_or("local") {
+            return Ok(Self::NoConnect);
         }
 
         if always_new_process {
-            return Self::NoConnect;
+            return Ok(Self::NoConnect);
         }
 
         if config::is_config_overridden() {
             // They're using a specific config file: assume that it is
             // different from the running gui
             log::trace!("skip existing gui: config is different");
-            return Self::NoConnect;
+            return Ok(Self::NoConnect);
         }
 
-        match frankenterm_client::discovery::resolve_gui_sock_path(
-            &crate::termwindow::get_window_class(),
-        ) {
-            Ok(path) => Self::TryPath(path),
-            Err(_) => Self::NoConnectButShouldPublish,
-        }
+        Ok(
+            match frankenterm_client::discovery::resolve_gui_sock_path(
+                &crate::termwindow::get_window_class(),
+            ) {
+                Ok(path) => Self::TryPath(path),
+                Err(_) => Self::NoConnectButShouldPublish,
+            },
+        )
     }
 
     pub fn should_publish(&self) -> bool {
@@ -891,12 +905,16 @@ impl Publish {
 }
 
 fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::Result<()> {
+    let dispatch_config = frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::production(
+        frankenterm_mux_server_impl::dispatch::DispatchIoPreference::Auto,
+    )
+    .context("configure embedded production mux dispatch tracing")?;
     let mut listener = frankenterm_mux_server_impl::local::LocalListener::with_domain(
         &config::UnixDomain {
             socket_path: Some(unix_socket_path.clone()),
             ..Default::default()
         },
-        frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::default(),
+        dispatch_config,
     )?;
     std::thread::Builder::new()
         .name("ft-gui-mux-server".to_string())
@@ -950,7 +968,7 @@ fn setup_mux(
             default_name
         )
     })?;
-    mux.set_default_domain(&domain)?;
+    mux.set_default_domain_guard(&domain)?;
 
     Ok(mux)
 }
@@ -1050,7 +1068,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         &mux,
         &config,
         opts.always_new_process || opts.position.is_some(),
-    );
+    )?;
     log::trace!("{:?}", publish);
     if publish.try_spawn(
         cmd.clone(),
@@ -1249,6 +1267,66 @@ fn maybe_show_configuration_error_window() {
 mod tests {
     use super::*;
     use frankenterm_core::macos_backend_select::{BackendFallbackReason, MacosBackend};
+
+    #[test]
+    fn exact_default_domain_setter_rejects_foreign_guard() {
+        let foreign_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("foreign-default").expect("create foreign local domain"));
+        let foreign_domain_id = foreign_domain.domain_id();
+        let foreign_mux = Arc::new(Mux::new(Some(foreign_domain)));
+        let foreign_guard = foreign_mux
+            .get_domain(foreign_domain_id)
+            .expect("foreign mux should admit its exact domain guard");
+
+        let local_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("local-default").expect("create local domain"));
+        let local_mux = Arc::new(Mux::new(Some(local_domain)));
+        let original_default = local_mux
+            .default_domain()
+            .expect("local mux should retain its initial default");
+        assert!(matches!(
+            local_mux.set_default_domain_guard(&foreign_guard),
+            Err(mux::DomainRegistrationError::DefaultNotRegistered { .. })
+        ));
+        assert!(
+            local_mux
+                .default_domain()
+                .is_ok_and(|current| current.same_registration(&original_default)),
+            "rejecting a foreign guard must not mutate the exact local default"
+        );
+    }
+
+    #[test]
+    fn ssh_default_domain_source_reacquires_guard_before_releasing_creator_arc() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn async_run_ssh(")
+            .expect("SSH command implementation must remain present");
+        let end = source[start..]
+            .find("\nfn run_ssh(")
+            .map(|offset| start + offset)
+            .expect("SSH command implementation must remain bounded");
+        let body = &source[start..end];
+        let raw_setter = ["mux.set_default_", "domain(&domain)"].concat();
+        assert!(
+            !body.contains(&raw_setter),
+            "SSH setup must not publish its creator Arc through the raw default setter"
+        );
+
+        let reacquire = body
+            .find("mux.get_domain(domain_id)")
+            .expect("SSH setup must reacquire an exact registered guard");
+        let release_creator = body
+            .find("drop(domain)")
+            .expect("SSH setup must release its raw creator Arc explicitly");
+        let guarded_setter = body
+            .find("mux.set_default_domain_guard(&domain_guard)")
+            .expect("SSH setup must publish only through the exact guard setter");
+        assert!(
+            reacquire < release_creator && release_creator < guarded_setter,
+            "the exact guard must exist before creator release and guarded default publication"
+        );
+    }
 
     #[test]
     fn gui_macos_backend_defaults_to_core_selector_auto_path() {

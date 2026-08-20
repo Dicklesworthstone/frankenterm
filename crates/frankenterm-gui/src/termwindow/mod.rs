@@ -6887,7 +6887,7 @@ impl TermWindow {
                             .get_domain_by_name(&domain_name)
                             .ok_or_else(|| anyhow!("{} is not a valid domain name", domain_name))?;
                         crate::spawn::attach_domain_to_window_or_spawn_recovery(
-                            domain, window, None, None, dpi,
+                            &domain, window, None, None, dpi,
                         )
                         .await?;
 
