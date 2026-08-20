@@ -6,6 +6,7 @@
 #![allow(clippy::ignored_unit_patterns)]
 
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 use frankenterm_core::input_latency::{
     INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION, INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION,
@@ -16,6 +17,14 @@ use frankenterm_core::input_latency::{
     MAX_INPUT_LATENCY_EVIDENCE_WINDOW, Percentile, StageBudget, evaluate_budget, generate_report,
     percentile_nearest_rank,
 };
+
+fn input_latency_proptest_config() -> ProptestConfig {
+    let mut config = ProptestConfig::with_cases(100);
+    config.failure_persistence = Some(Box::new(FileFailurePersistence::WithSource(
+        "proptest-regressions",
+    )));
+    config
+}
 
 // =============================================================================
 // Strategies
@@ -149,7 +158,7 @@ fn assert_invalid_gate_and_report(
 // =============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(input_latency_proptest_config())]
 
     #[test]
     fn input_latency_stage_serde_roundtrip(stage in arb_stage()) {
@@ -273,7 +282,7 @@ proptest! {
 // =============================================================================
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(100))]
+    #![proptest_config(input_latency_proptest_config())]
 
     #[test]
     fn stage_all_covers_all_variants(_dummy in 0u8..1) {

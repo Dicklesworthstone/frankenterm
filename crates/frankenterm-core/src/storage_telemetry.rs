@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(telem.registry.counter_value(COUNTER_EVENTS_APPENDED), 0);
         assert_eq!(telem.registry.counter_value(COUNTER_BATCHES_PROCESSED), 0);
         assert_eq!(telem.registry.counter_value(COUNTER_BYTES_WRITTEN), 0);
-        assert_eq!(telem.snapshot().append_rate_ewma, 0.0);
+        assert!(telem.snapshot().append_rate_ewma.abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2536,6 +2536,6 @@ mod tests {
         assert!(sqlite_snapshot.health.is_none());
         assert!(sqlite_snapshot.lag.is_none());
         assert_eq!(sqlite_snapshot.health_tier, StorageHealthTier::Green);
-        assert_eq!(sqlite_snapshot.append_rate_ewma, 0.0);
+        assert!(sqlite_snapshot.append_rate_ewma.abs() < f64::EPSILON);
     }
 }
