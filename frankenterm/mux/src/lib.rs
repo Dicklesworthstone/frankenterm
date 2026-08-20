@@ -15656,7 +15656,7 @@ impl Mux {
                 .read()
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &registration));
-            if retiring_default {
+            let replaced_default_registration = if retiring_default {
                 let replacement = self
                     .domain_registrations
                     .read()
@@ -17475,7 +17475,8 @@ mod tests {
         while mux.domain_retirements.contains(domain_id) {
             assert!(
                 Instant::now() < deadline,
-                "domain {domain_id} retirement did not reach terminal cleanup"
+                "domain {} retirement did not reach terminal cleanup",
+                domain_id
             );
             std::thread::yield_now();
         }
@@ -17494,7 +17495,8 @@ mod tests {
             {}
             assert!(
                 Instant::now() < deadline,
-                "domain {domain_id} retirement did not complete after its main-thread cleanup"
+                "domain {} retirement did not complete after its main-thread cleanup",
+                domain_id
             );
             std::thread::yield_now();
         }
@@ -17537,7 +17539,8 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "domain {domain_id} retirement did not enter terminal quarantine"
+                "domain {} retirement did not enter terminal quarantine",
+                domain_id
             );
             std::thread::yield_now();
         }
@@ -17561,7 +17564,8 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "domain {domain_id} retirement did not reach its pane-cleanup barrier"
+                "domain {} retirement did not reach its pane-cleanup barrier",
+                domain_id
             );
             std::thread::yield_now();
         }
@@ -27100,23 +27104,16 @@ mod tests {
             .get(&2)
             .cloned()
             .expect("initial exact live registration");
-        let removed_default = mux
-            .default_domain
-            .write()
-            .take()
-            .expect("erase the raw live default projection");
         let removed_default_registration = mux
             .default_domain_registration
             .write()
             .take()
             .expect("erase the live default registration projection");
-        assert!(Arc::ptr_eq(&removed_default, &live));
         assert!(Arc::ptr_eq(
             &removed_default_registration,
             &live_registration
         ));
         drop(removed_default_registration);
-        drop(removed_default);
         assert!(mux
             .pane_authority
             .lock()
@@ -27142,7 +27139,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "domain registry indexes are inconsistent: default domain projections are absent while live registry indexes remain"
+            "domain registry indexes are inconsistent: default domain registration is absent while live or inconsistent registry indexes remain"
         );
         assert_eq!(domain_registry_mutation_snapshot(&mux), before);
         assert_eq!(Arc::strong_count(&live), live_owners_before);
@@ -27188,7 +27185,6 @@ mod tests {
             .domain_registrations_by_name
             .read()
             .contains_key(&requested_name));
-        assert!(mux.default_domain.read().is_none());
         assert!(mux.default_domain_registration.read().is_none());
         assert!(mux
             .pane_authority
@@ -27206,159 +27202,6 @@ mod tests {
         drop(mux);
         assert_eq!(live_drop_count.load(Ordering::SeqCst), 1);
         assert!(live_identity.upgrade().is_none());
-    }
-
-    #[test]
-    fn atomic_domain_add_rejects_partial_default_projection_without_publication() {
-        let _global_guard = global_test_lock();
-
-        for raw_default_present in [true, false] {
-            let drop_count = Arc::new(AtomicUsize::new(0));
-            let stale: Arc<dyn Domain> = Arc::new(
-                GuardedMutationTestDomain::counting_in_drop(2, Arc::clone(&drop_count)),
-            );
-            let stale_identity = Arc::downgrade(&stale);
-            let mux = Arc::new(Mux::new(Some(Arc::clone(&stale))));
-            if raw_default_present {
-                let removed = mux.default_domain_registration.write().take();
-                drop(removed);
-            } else {
-                let removed = mux.default_domain.write().take();
-                drop(removed);
-            }
-            drop(stale);
-
-            let requested: Arc<dyn Domain> =
-                Arc::new(GuardedMutationTestDomain::for_domain(1));
-            let before = domain_registry_mutation_snapshot(&mux);
-            mux.fail_next_domain_registration_operation_acquire
-                .store(true, Ordering::Release);
-            let error = mux
-                .add_domain_and_acquire(&requested)
-                .expect_err("partial default projections must fail before publication");
-
-            assert!(matches!(
-                error,
-                DomainRegistrationError::RegistryInconsistent { .. }
-            ));
-            assert_eq!(domain_registry_mutation_snapshot(&mux), before);
-            assert_eq!(drop_count.load(Ordering::SeqCst), 0);
-            assert!(
-                mux.fail_next_domain_registration_operation_acquire
-                    .load(Ordering::Acquire),
-                "partial defaults must be rejected before operation admission"
-            );
-            mux.fail_next_domain_registration_operation_acquire
-                .store(false, Ordering::Release);
-            assert_eq!(mux.default_domain.read().is_some(), raw_default_present);
-            assert_eq!(
-                mux.default_domain_registration.read().is_some(),
-                !raw_default_present
-            );
-            let retained_identity = if raw_default_present {
-                mux.default_domain
-                    .read()
-                    .as_ref()
-                    .map(Arc::downgrade)
-            } else {
-                mux.default_domain_registration
-                    .read()
-                    .as_ref()
-                    .map(|registration| Arc::downgrade(&registration.domain))
-            }
-            .expect("the planted partial owner remains untouched");
-            assert!(Weak::ptr_eq(&retained_identity, &stale_identity));
-
-            drop(requested);
-            drop(mux);
-            assert_eq!(
-                drop_count.load(Ordering::SeqCst),
-                1,
-                "the untouched stale owner drops only after the mux serializer is gone"
-            );
-        }
-    }
-
-    #[test]
-    fn atomic_domain_add_rejects_mismatched_default_projection_without_publication() {
-        let _global_guard = global_test_lock();
-        let raw_drop_count = Arc::new(AtomicUsize::new(0));
-        let registration_drop_count = Arc::new(AtomicUsize::new(0));
-        let raw_default: Arc<dyn Domain> = Arc::new(
-            GuardedMutationTestDomain::counting_in_drop(2, Arc::clone(&raw_drop_count)),
-        );
-        let registration_default: Arc<dyn Domain> = Arc::new(
-            GuardedMutationTestDomain::counting_in_drop(
-                3,
-                Arc::clone(&registration_drop_count),
-            ),
-        );
-        let raw_identity = Arc::downgrade(&raw_default);
-        let registration_identity = Arc::downgrade(&registration_default);
-        let mux = Arc::new(Mux::new(Some(Arc::clone(&raw_default))));
-        mux.add_domain(&registration_default)
-            .expect("seed the second exact-current domain registration");
-        let registration_default_record = mux
-            .domain_registrations
-            .read()
-            .get(&3)
-            .cloned()
-            .expect("second exact-current registration");
-        let replaced = mux
-            .default_domain_registration
-            .write()
-            .replace(Arc::clone(&registration_default_record))
-            .expect("replace the raw default's exact registration projection");
-        drop(replaced);
-        drop(registration_default_record);
-        drop(raw_default);
-        drop(registration_default);
-
-        let requested: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
-        let before = domain_registry_mutation_snapshot(&mux);
-        mux.fail_next_domain_registration_operation_acquire
-            .store(true, Ordering::Release);
-        let error = mux
-            .add_domain_and_acquire(&requested)
-            .expect_err("mismatched default projections must fail before publication");
-
-        assert!(matches!(
-            error,
-            DomainRegistrationError::RegistryInconsistent { .. }
-        ));
-        assert_eq!(domain_registry_mutation_snapshot(&mux), before);
-        assert_eq!(raw_drop_count.load(Ordering::SeqCst), 0);
-        assert_eq!(registration_drop_count.load(Ordering::SeqCst), 0);
-        assert!(
-            mux.fail_next_domain_registration_operation_acquire
-                .load(Ordering::Acquire),
-            "mismatched defaults must be rejected before operation admission"
-        );
-        mux.fail_next_domain_registration_operation_acquire
-            .store(false, Ordering::Release);
-        let retained_raw_identity = mux
-            .default_domain
-            .read()
-            .as_ref()
-            .map(Arc::downgrade)
-            .expect("raw default remains present");
-        let retained_registration_identity = mux
-            .default_domain_registration
-            .read()
-            .as_ref()
-            .map(|registration| Arc::downgrade(&registration.domain))
-            .expect("default registration remains present");
-        assert!(Weak::ptr_eq(&retained_raw_identity, &raw_identity));
-        assert!(Weak::ptr_eq(
-            &retained_registration_identity,
-            &registration_identity
-        ));
-
-        drop(requested);
-        drop(mux);
-        assert_eq!(raw_drop_count.load(Ordering::SeqCst), 1);
-        assert_eq!(registration_drop_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -14152,6 +14152,7 @@ impl Serialize for SerdeUrl {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::domain::Domain;
     use crate::renderable::*;
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
