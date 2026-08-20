@@ -665,7 +665,9 @@ pub fn create_send_action(step: u32, pane_id: u64, text_len: usize) -> PlannedAc
     PlannedAction::new(
         step,
         ActionType::SendText,
-        format!("Inject {text_len} characters via wezterm cli send-text --pane-id {pane_id}"),
+        format!(
+            "Inject {text_len} characters through the direct mux transport into pane {pane_id}"
+        ),
     )
 }
 
@@ -827,6 +829,8 @@ mod tests {
         assert_eq!(action.action_type, ActionType::SendText);
         assert!(action.description.contains("100 characters"));
         assert!(action.description.contains("42"));
+        assert!(action.description.contains("direct mux transport"));
+        assert!(!action.description.contains("cli send-text"));
     }
 
     #[test]

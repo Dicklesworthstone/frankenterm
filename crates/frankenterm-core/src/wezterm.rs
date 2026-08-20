@@ -1405,8 +1405,10 @@ impl WeztermClient {
     /// Attach a mux connection pool for direct socket communication.
     ///
     /// When a pool is attached, operations like `list_panes()` and `send_text()`
-    /// try the pool first. Implicit-socket clients may use CLI failover for a
-    /// canonically replayable transport failure. Pool admission, cancellation,
+    /// try the pool first. Read-only and payload-free operations may use CLI
+    /// failover for a canonically replayable transport failure. Pane input is
+    /// never placed in subprocess argv, so `send_text()` fails closed when the
+    /// direct mux transport is unavailable. Pool admission, cancellation,
     /// remote rejection, and indeterminate mutation errors do not fail over;
     /// explicit-socket clients never fail over.
     #[cfg(all(feature = "vendored", unix))]
@@ -2107,10 +2109,9 @@ impl WeztermClient {
     }
 
     /// Cx-first send_text (ft-xbnl0.2.3). Defaults to paste mode + newline.
-    /// The mux-pool fast path uses `pool.send_paste_with_cx(cx)` /
-    /// `pool.write_to_pane_with_cx(cx)`. CLI failover is limited to eligible
-    /// pre-mutation transport errors; an indeterminate mutation is surfaced
-    /// without replay.
+    /// The mux-pool path uses `pool.send_paste_with_cx(cx)` /
+    /// `pool.write_to_pane_with_cx(cx)`. Pane text is never passed through CLI
+    /// argv; unavailable direct transport fails closed before mutation.
     pub async fn send_text_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2510,14 +2511,13 @@ impl WeztermClient {
         })
     }
 
-    /// Cx-first `send_text_impl` (ft-xbnl0.2.3). The mux-pool fast
-    /// path uses `pool.write_to_pane_with_cx(cx)` /
-    /// `pool.send_paste_with_cx(cx)`. For an eligible pre-mutation transport
-    /// failure, CLI failover uses
-    /// `run_cli_mutation_with_pane_check_with_cx`, preserving the same
-    /// cancellation context without overwriting a committed response at a
-    /// late checkpoint. Pool admission, cancellation, and indeterminate
-    /// mutation errors surface without replay.
+    /// Cx-first `send_text_impl` (ft-xbnl0.2.3). The mux-pool path uses
+    /// `pool.write_to_pane_with_cx(cx)` / `pool.send_paste_with_cx(cx)`.
+    /// The legacy CLI accepts pane text only as a positional argument, which
+    /// exposes arbitrary user input in subprocess argv. There is therefore no
+    /// CLI fallback for this operation: unavailable direct transport fails
+    /// closed with finite `NotApplied` authority and never constructs a child
+    /// command containing `text`.
     #[cfg(all(feature = "vendored", unix))]
     async fn send_text_impl_with_cx(
         &self,
@@ -2532,7 +2532,7 @@ impl WeztermClient {
         );
         if let Some(ref pool) = self.mux_pool {
             if !self.mux_circuit_guard() {
-                tracing::debug!("mux connection circuit open; falling back to CLI send");
+                tracing::debug!("mux connection circuit open; CLI pane-input fallback disabled");
             } else {
                 let data = if no_newline {
                     text.to_string()
@@ -2557,54 +2557,38 @@ impl WeztermClient {
                         }
                         tracing::debug!(
                             failure_class = Self::mux_error_public_code(&e),
-                            "mux pool send_with_cx failed, falling back to CLI"
+                            "mux pool send_with_cx failed; CLI pane-input fallback disabled"
                         );
                     }
                 }
             }
         }
-        let pane_id_str = pane_id.to_string();
-        let mut args = vec!["cli", "send-text", "--pane-id", &pane_id_str];
-        if no_paste {
-            args.push("--no-paste");
-        }
-        if no_newline {
-            args.push("--no-newline");
-        }
-        args.push("--");
-        args.push(text);
-        self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "send_text")
-            .await?;
-        Ok(())
+        Self::reject_cli_pane_input_fallback()
     }
 
     /// Stub `send_text_impl_with_cx` for configurations without
-    /// vendored+unix+asupersync — delegates to the explicit-Cx CLI path.
+    /// vendored+unix+asupersync. The legacy CLI cannot carry pane input over
+    /// bounded stdin, so this path fails closed before subprocess construction.
     #[cfg(not(all(feature = "vendored", unix)))]
     async fn send_text_impl_with_cx(
         &self,
-        cx: &crate::cx::Cx,
-        pane_id: u64,
-        text: &str,
-        no_paste: bool,
-        no_newline: bool,
+        _cx: &crate::cx::Cx,
+        _pane_id: u64,
+        _text: &str,
+        _no_paste: bool,
+        _no_newline: bool,
     ) -> Result<()> {
         frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
             "wezterm::WeztermClient::send_text_impl_with_cx",
         );
-        let pane_id_str = pane_id.to_string();
-        let mut args = vec!["cli", "send-text", "--pane-id", &pane_id_str];
-        if no_paste {
-            args.push("--no-paste");
-        }
-        if no_newline {
-            args.push("--no-newline");
-        }
-        args.push("--");
-        args.push(text);
-        self.run_cli_mutation_with_pane_check_with_cx(cx, &args, pane_id, "send_text")
-            .await?;
-        Ok(())
+        Self::reject_cli_pane_input_fallback()
+    }
+
+    fn reject_cli_pane_input_fallback() -> Result<()> {
+        Err(
+            WeztermError::MuxRejection(MuxRejection::backend_failure(MuxOperation::SendText))
+                .into(),
+        )
     }
 
     /// Run a CLI command with pane-specific error handling under an explicit
@@ -3243,9 +3227,9 @@ impl WeztermClient {
         match e.kind() {
             std::io::ErrorKind::NotFound => WeztermError::CliNotFound,
             std::io::ErrorKind::PermissionDenied => {
-                WeztermError::CommandFailed("Permission denied".to_string())
+                WeztermError::CommandFailed("bridge CLI process admission was denied".to_string())
             }
-            _ => WeztermError::CommandFailed(e.to_string()),
+            _ => WeztermError::CommandFailed("bridge CLI I/O failure".to_string()),
         }
     }
 
@@ -6720,7 +6704,61 @@ mod tests {
     fn categorize_io_error_permission_denied() {
         let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let wez_err = WeztermClient::categorize_io_error(&e);
-        assert!(matches!(wez_err, WeztermError::CommandFailed(_)));
+        assert!(matches!(
+            wez_err,
+            WeztermError::CommandFailed(message)
+                if message == "bridge CLI process admission was denied"
+        ));
+    }
+
+    #[test]
+    fn categorize_io_error_never_echoes_backend_detail() {
+        let error = std::io::Error::other("credential-bearing-backend-error-canary");
+        let categorized = WeztermClient::categorize_io_error(&error);
+        let display = categorized.to_string();
+        let debug = format!("{categorized:?}");
+        assert_eq!(display, "Command failed: bridge CLI I/O failure");
+        assert!(!display.contains("credential-bearing-backend-error-canary"));
+        assert!(!debug.contains("credential-bearing-backend-error-canary"));
+    }
+
+    #[test]
+    fn pane_input_without_direct_mux_fails_closed_without_echoing_payload() {
+        run_async_test(async {
+            let client = WeztermClient::new();
+            let cx = crate::cx::for_request();
+            let payload = "argv-secret-canary --token=hunter2\n";
+
+            let errors = [
+                client
+                    .send_text_with_cx(&cx, 41, payload)
+                    .await
+                    .expect_err("plain send must reject the unsafe CLI fallback"),
+                client
+                    .send_text_no_paste_with_cx(&cx, 41, payload)
+                    .await
+                    .expect_err("no-paste send must reject the unsafe CLI fallback"),
+                client
+                    .send_text_with_options_with_cx(&cx, 41, payload, true, true)
+                    .await
+                    .expect_err("optioned send must reject the unsafe CLI fallback"),
+            ];
+
+            for error in errors {
+                assert!(matches!(
+                    &error,
+                    crate::Error::Wezterm(WeztermError::MuxRejection(MuxRejection {
+                        code: MuxRejectionCode::BackendFailure,
+                        operation: MuxOperation::SendText,
+                        object: None,
+                        effect: MuxEffectCertainty::NotApplied,
+                        retry: MuxRetryAuthority::SafeAfterBackoff,
+                    }))
+                ));
+                assert!(!error.to_string().contains(payload));
+                assert!(!format!("{error:?}").contains(payload));
+            }
+        });
     }
 
     #[test]
