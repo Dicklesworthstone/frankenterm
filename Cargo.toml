@@ -115,7 +115,7 @@ default-members = [
 # - optional frontends (mcp/web/tui/browser) are feature-gated
 
 [workspace.package]
-version = "0.14.1"
+version = "0.15.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Dicklesworthstone"]

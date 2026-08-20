@@ -3174,13 +3174,15 @@ mod tests {
 
     #[test]
     fn sampled_paste_uses_pdu99_once_and_preserves_operational_bytes() {
+        let _scope = MuxTestScope::enter();
+        let executor = promise::spawn::ScopedExecutor::new();
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
         let pane = test_client_pane(&inner, 40, 29);
         let payload = "private paste bytes\nwith ordering";
 
         pane.send_paste_with_trace_context(payload, sampled_paste_context())
             .expect("sampled paste should enter the live test transport");
-        let request = promise::spawn::block_on(peer.respond_next_unit())
+        let request = promise::spawn::block_on(executor.run(peer.respond_next_unit()))
             .expect("test peer should receive sampled paste");
         let Pdu::SendPasteTracedV1(traced) = request else {
             panic!("sampled paste used unexpected wire request");

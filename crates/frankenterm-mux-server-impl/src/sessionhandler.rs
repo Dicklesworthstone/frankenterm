@@ -8946,12 +8946,9 @@ mod tests {
         }
 
         fn paste_admission(&self, request: &SendPasteTracedV1) -> AdmittedInputTraceV1 {
-            let mut admission = AdmittedInputTraceV1::admit_paste(
-                request,
-                self.stream_id,
-                codec::CODEC_VERSION,
-            )
-            .expect("sampled paste receives connection authority");
+            let mut admission =
+                AdmittedInputTraceV1::admit_paste(request, self.stream_id, codec::CODEC_VERSION)
+                    .expect("sampled paste receives connection authority");
             self.handler.record_decoded_input_trace(
                 Some(&self.producer),
                 &mut admission,
@@ -9020,7 +9017,7 @@ mod tests {
             events[1].stage,
             InteractionTraceStage::Paste(RendererPasteTraceStage::ServerDispatchMuxWait)
         );
-        let encoded = serde_json::to_string(&events).expect("trace fragment should serialize");
+        let encoded = format!("{events:?}");
         assert!(!encoded.contains(private_content));
         assert!(!encoded.contains("api-key"));
     }

@@ -4488,6 +4488,7 @@ impl Pdu {
             Self::GetPaneTieredScrollbackStatusesV1(value) => value.validate()?,
             Self::GetPaneTieredScrollbackStatusesV1Response(value) => value.validate()?,
             Self::SendKeyDownTracedV1(value) => value.validate()?,
+            Self::SendPasteTracedV1(value) => value.validate()?,
             Self::ReliableKeyEventV1(value) => value.validate()?,
             Self::ReliableKeyEventV1Response(value) => value.validate()?,
             Self::ReliableKeyEventTracedV1(value) => value.validate()?,

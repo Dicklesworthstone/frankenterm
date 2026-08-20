@@ -5,9 +5,9 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.14.1` tag has a published GitHub Release; `backup-before-rewrite` is a tag only.
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.15.0` tag has a published GitHub Release; `backup-before-rewrite` is a tag only.
 
-Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) (2026-08-20). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
+Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) (2026-08-20). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
 
 ## Version Timeline
 
@@ -15,7 +15,8 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.1...main) | HEAD | — | Next release |
+| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.0...main) | HEAD | — | Next release |
+| [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0) | Release | 2026-08-20 | Sampled paste tracing over additive PDU99 |
 | [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | Pane-input argv privacy and release-contract repair |
 | [v0.14.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.0) | Release | 2026-08-20 | Mux authority, scheduler admission, recorder truth, and protocol hardening |
 | [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) | Release | 2026-07-28 | Test-suite honesty + tx/capture/redaction; full platform matrix |
@@ -23,11 +24,24 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 ---
 
-## [Unreleased] -- development on `main` since [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1)
+## [Unreleased] -- development on `main` since [v0.15.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0)
 
-Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.1...main>
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.0...main>
 
 No changes yet.
+
+---
+
+## [0.15.0] -- 2026-08-20 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.15.0>
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.1...v0.15.0>
+
+### Sampled paste tracing
+
+- Adds additive codec v63 PDU99 `SendPasteTracedV1` while preserving byte-identical PDU13 paste traffic for older supported peers.
+- Carries content-free sampled trace authority from the client to server K4/K5 stages without copying paste content into trace events.
+- Validates traced-paste path, serial, and payload bounds before framing, and retains the ordinary paste path below negotiated codec v63.
 
 ---
 

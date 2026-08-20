@@ -1247,10 +1247,11 @@ impl RpcProtocolAuthority {
         // placed in one of the historical numeric gaps must remain dormant by
         // default instead of inheriting authority from a broad `<=` cutoff.
         // Above the legacy surface, only the fenced-topology trio and the
-        // explicitly coordinated reliable-input request/reply are active.
+        // explicitly coordinated reliable-input request/reply and sampled
+        // paste request are active.
         matches!(
             spec.ident,
-            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=98
+            0..=4 | 8..=14 | 20 | 22..=78 | 81..=83 | 96..=99
         )
     }
 
@@ -8814,7 +8815,14 @@ impl TestRpcPeer {
         let prepared = lease
             .claim_for_reader()?
             .ok_or_else(|| anyhow!("test unit-response RPC was cancelled before reader claim"))?;
-        let request = prepared.pdu().clone();
+        let request = match prepared.pdu() {
+            Pdu::SendPaste(request) => Pdu::SendPaste(request.clone()),
+            Pdu::SendPasteTracedV1(request) => Pdu::SendPasteTracedV1(request.clone()),
+            other => bail!(
+                "test unit-response RPC peer received unexpected {}",
+                other.pdu_name()
+            ),
+        };
         promise
             .send(Ok(Pdu::UnitResponse(UnitResponse {})))
             .await
@@ -10633,7 +10641,7 @@ mod tests {
         expected.push(20);
         expected.extend(22..=78);
         expected.extend(81..=83);
-        expected.extend(96..=98);
+        expected.extend(96..=99);
 
         let actual = Pdu::all_wire_specs()
             .iter()
