@@ -23,5 +23,9 @@ default = []
 # Opt-in: use asupersync runtime for `promise::spawn::block_on`.
 async-asupersync = ["dep:asupersync"]
 
+# Exposes the retired unclassified scheduler harness only to dependent-crate
+# unit tests. Shipping targets must use the bounded admission API.
+test-support = []
+
 [dev-dependencies]
 proptest = "1.8.0"

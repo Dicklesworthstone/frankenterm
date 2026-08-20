@@ -3,12 +3,12 @@ use async_executor::Executor;
 use flume::bounded;
 #[cfg(test)]
 use flume::unbounded;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -16,7 +16,9 @@ use thiserror::Error;
 
 pub use async_task::{Runnable, Task};
 pub type SpawnFunc = Box<dyn FnOnce() + Send>;
+#[cfg(any(test, feature = "test-support"))]
 pub type ScheduleFunc = Box<dyn Fn(Runnable) + Send + Sync + 'static>;
+#[cfg(any(test, feature = "test-support"))]
 type SharedScheduleFunc = Arc<dyn Fn(Runnable) + Send + Sync + 'static>;
 pub type MainThreadBoundScheduleFunc = Box<
     dyn Fn(Runnable, MainThreadAdmissionReceipt) -> MainThreadEnqueueReceipt
@@ -942,15 +944,20 @@ impl<F: Future> Future for MainThreadAdmittedFuture<F> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn no_scheduler_configured(_: Runnable) {
     panic!("no scheduler has been configured");
 }
 
+#[cfg(any(test, feature = "test-support"))]
 lazy_static::lazy_static! {
     static ref ON_MAIN_THREAD: Mutex<SharedScheduleFunc> =
         Mutex::new(Arc::new(no_scheduler_configured));
     static ref ON_MAIN_THREAD_LOW_PRI: Mutex<SharedScheduleFunc> =
         Mutex::new(Arc::new(no_scheduler_configured));
+}
+
+lazy_static::lazy_static! {
     static ref BOUND_MAIN_THREAD_SCHEDULER: Mutex<Option<Arc<MainThreadSchedulerBinding>>> =
         Mutex::new(None);
     static ref SCOPED_EXECUTOR: Mutex<ScopedExecutorRegistry> =
@@ -959,6 +966,153 @@ lazy_static::lazy_static! {
 }
 
 static SCHEDULER_CONFIGURED: AtomicBool = AtomicBool::new(false);
+
+const BACKGROUND_TASK_CAPACITY: usize = 4_096;
+const BACKGROUND_ESTIMATED_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct BackgroundAdmissionState {
+    active_tasks: usize,
+    active_estimated_bytes: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum BackgroundSpawnError {
+    #[error("background task estimated size must be nonzero")]
+    ZeroEstimatedBytes,
+    #[error(
+        "background task capacity exhausted: active={active}, capacity={capacity}"
+    )]
+    TaskCapacityExhausted { active: usize, capacity: usize },
+    #[error(
+        "background estimated-byte capacity exhausted: active={active}, requested={requested}, capacity={capacity}"
+    )]
+    EstimatedByteCapacityExhausted {
+        active: usize,
+        requested: usize,
+        capacity: usize,
+    },
+    #[error("background executor worker could not start: {0}")]
+    WorkerUnavailable(String),
+}
+
+#[derive(Debug)]
+struct BackgroundTaskPermit {
+    estimated_bytes: usize,
+}
+
+impl Drop for BackgroundTaskPermit {
+    fn drop(&mut self) {
+        let mut state = lock_or_recover(&BACKGROUND_ADMISSION);
+        state.active_tasks = state.active_tasks.saturating_sub(1);
+        state.active_estimated_bytes = state
+            .active_estimated_bytes
+            .saturating_sub(self.estimated_bytes);
+    }
+}
+
+/// Capacity reserved for one Send-capable background I/O future.
+///
+/// The future is constructed only after this reservation succeeds. Spawning is
+/// infallible because one executor worker and the exact task/byte capacity are
+/// already owned by the reservation.
+#[derive(Debug)]
+#[must_use = "a background reservation must be spawned or dropped"]
+pub struct BackgroundSpawnReservation {
+    executor: Arc<Executor<'static>>,
+    permit: BackgroundTaskPermit,
+}
+
+impl BackgroundSpawnReservation {
+    pub fn spawn<F>(self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let Self { executor, permit } = self;
+        executor
+            .spawn(async move {
+                let _permit = permit;
+                future.await;
+            })
+            .detach();
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref BACKGROUND_ADMISSION: Mutex<BackgroundAdmissionState> =
+        Mutex::new(BackgroundAdmissionState::default());
+    static ref BACKGROUND_EXECUTOR: std::result::Result<Arc<Executor<'static>>, String> =
+        start_background_executor();
+}
+
+fn start_background_executor() -> std::result::Result<Arc<Executor<'static>>, String> {
+    let executor = Arc::new(Executor::new());
+    let worker_executor = Arc::clone(&executor);
+    #[cfg(feature = "async-asupersync")]
+    let worker = {
+        // This worker owns a dedicated reactor. Reusing ASUPERSYNC_RUNTIME here
+        // would hold its current-thread `block_on` forever and starve unrelated
+        // synchronous I/O bridges.
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|err| err.to_string())?;
+        std::thread::Builder::new()
+            .name("promise-background-io".to_string())
+            .spawn(move || {
+                runtime.block_on(worker_executor.run(std::future::pending::<()>()))
+            })
+    };
+    #[cfg(not(feature = "async-asupersync"))]
+    let worker = std::thread::Builder::new()
+        .name("promise-background-io".to_string())
+        .spawn(move || {
+            async_io::block_on(worker_executor.run(std::future::pending::<()>()))
+        });
+
+    worker.map(|_worker| executor).map_err(|err| err.to_string())
+}
+
+/// Reserve bounded background I/O capacity before constructing a future.
+pub fn try_reserve_background_task(
+    estimated_bytes: usize,
+) -> std::result::Result<BackgroundSpawnReservation, BackgroundSpawnError> {
+    if estimated_bytes == 0 {
+        return Err(BackgroundSpawnError::ZeroEstimatedBytes);
+    }
+    let executor = match &*BACKGROUND_EXECUTOR {
+        Ok(executor) => Arc::clone(executor),
+        Err(err) => return Err(BackgroundSpawnError::WorkerUnavailable(err.clone())),
+    };
+    let mut state = lock_or_recover(&BACKGROUND_ADMISSION);
+    if state.active_tasks >= BACKGROUND_TASK_CAPACITY {
+        return Err(BackgroundSpawnError::TaskCapacityExhausted {
+            active: state.active_tasks,
+            capacity: BACKGROUND_TASK_CAPACITY,
+        });
+    }
+    let Some(next_estimated_bytes) = state.active_estimated_bytes.checked_add(estimated_bytes)
+    else {
+        return Err(BackgroundSpawnError::EstimatedByteCapacityExhausted {
+            active: state.active_estimated_bytes,
+            requested: estimated_bytes,
+            capacity: BACKGROUND_ESTIMATED_BYTE_CAPACITY,
+        });
+    };
+    if next_estimated_bytes > BACKGROUND_ESTIMATED_BYTE_CAPACITY {
+        return Err(BackgroundSpawnError::EstimatedByteCapacityExhausted {
+            active: state.active_estimated_bytes,
+            requested: estimated_bytes,
+            capacity: BACKGROUND_ESTIMATED_BYTE_CAPACITY,
+        });
+    }
+    state.active_tasks += 1;
+    state.active_estimated_bytes = next_estimated_bytes;
+    drop(state);
+    Ok(BackgroundSpawnReservation {
+        executor,
+        permit: BackgroundTaskPermit { estimated_bytes },
+    })
+}
 
 #[cfg(feature = "async-asupersync")]
 static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
@@ -1053,6 +1207,7 @@ fn schedule_runnable(runnable: Runnable, high_pri: bool) {
     capture_scheduler(high_pri)(runnable);
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn capture_scheduler(high_pri: bool) -> SharedScheduleFunc {
     let guard = if high_pri {
         lock_or_recover(&ON_MAIN_THREAD)
@@ -1064,8 +1219,8 @@ fn capture_scheduler(high_pri: bool) -> SharedScheduleFunc {
 
 pub fn is_scheduler_configured() -> bool {
     SCHEDULER_CONFIGURED.load(Ordering::Relaxed)
-        || lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER).is_some()
         || lock_or_recover(&SCOPED_EXECUTOR).executor.is_some()
+        || lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER).is_some()
 }
 
 /// Publish one exact admission-aware scheduler generation.
@@ -1084,11 +1239,18 @@ pub fn set_bounded_main_thread_scheduler(binding: Arc<MainThreadSchedulerBinding
 }
 
 fn capture_bounded_main_thread_scheduler() -> Option<Arc<MainThreadSchedulerBinding>> {
-    lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER)
+    let scoped = lock_or_recover(&SCOPED_EXECUTOR)
+        .binding
         .as_ref()
-        .map(Arc::clone)
+        .map(Arc::clone);
+    scoped.or_else(|| {
+        lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER)
+            .as_ref()
+            .map(Arc::clone)
+    })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn clear_bounded_main_thread_scheduler() {
     let previous = {
         let mut current = lock_or_recover(&BOUND_MAIN_THREAD_SCHEDULER);
@@ -1100,13 +1262,13 @@ fn clear_bounded_main_thread_scheduler() {
     drop(previous);
 }
 
-/// Set callbacks for scheduling normal and low priority futures.
-/// Why this and not "just tokio"?  In a GUI application there is typically
-/// a special GUI processing loop that may need to run on the "main thread",
-/// so we can't just run a tokio/mio loop in that context.
-/// This particular crate has no real knowledge of how that plumbing works,
-/// it just provides the abstraction for scheduling the work.
-/// This function allows the embedding application to set that up.
+/// Install the retired unclassified scheduler harness for fault-injection
+/// tests.
+///
+/// Shipping embeddings use [`set_bounded_main_thread_scheduler`]. This seam is
+/// deliberately absent from default production builds so a new producer
+/// cannot bypass service-class, byte-budget, and exact-generation admission.
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_schedulers(main: ScheduleFunc, low_pri: ScheduleFunc) {
     clear_bounded_main_thread_scheduler();
     *lock_or_recover(&ON_MAIN_THREAD) = Arc::from(main);
@@ -1332,11 +1494,11 @@ where
 }
 
 /// Spawn a new thread to execute the provided function.
-/// Returns a JoinHandle that implements the Future trait
-/// and that can be used to await and yield the return value
-/// from the thread.
+/// Returns a future that can be awaited to yield the return value from the
+/// thread. The future is driven by its caller's executor; completion does not
+/// enqueue a second runnable on the main-thread scheduler.
 /// Can be called from any thread.
-pub fn spawn_into_new_thread<F, T>(f: F) -> Task<Result<T>>
+pub fn spawn_into_new_thread<F, T>(f: F) -> impl Future<Output = Result<T>> + Send
 where
     F: FnOnce() -> Result<T>,
     F: Send + 'static,
@@ -1356,14 +1518,15 @@ where
     }
     drop(tx);
 
-    spawn_into_main_thread(async move {
+    async move {
         match rx.into_recv_async().await {
             Ok(result) => result,
             Err(_) => Err(anyhow!("thread terminated without providing a result")),
         }
-    })
+    }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn get_scoped() -> Option<Arc<Executor<'static>>> {
     lock_or_recover(&SCOPED_EXECUTOR)
         .executor
@@ -1376,6 +1539,7 @@ fn get_scoped() -> Option<Arc<Executor<'static>>> {
 /// This function can be called from any thread.
 /// If you are on the main thread already, consider using
 /// spawn() instead to lift the `Send` requirement.
+#[cfg(any(test, feature = "test-support"))]
 pub fn spawn_into_main_thread<F, R>(future: F) -> Task<R>
 where
     F: Future<Output = R> + Send + 'static,
@@ -1396,6 +1560,7 @@ where
 /// spawns.
 /// If you are on the main thread already, consider using `spawn_with_low_priority`
 /// instead to lift the `Send` requirement.
+#[cfg(any(test, feature = "test-support"))]
 pub fn spawn_into_main_thread_with_low_priority<F, R>(future: F) -> Task<R>
 where
     F: Future<Output = R> + Send + 'static,
@@ -1411,6 +1576,7 @@ where
 }
 
 /// Spawn a future with normal priority.
+#[cfg(any(test, feature = "test-support"))]
 pub fn spawn<F, R>(future: F) -> Task<R>
 where
     F: Future<Output = R> + 'static,
@@ -1424,6 +1590,7 @@ where
 
 /// Spawn a future with low priority; it will be polled only after
 /// all other normal priority items are processed.
+#[cfg(any(test, feature = "test-support"))]
 pub fn spawn_with_low_priority<F, R>(future: F) -> Task<R>
 where
     F: Future<Output = R> + 'static,
@@ -1553,9 +1720,11 @@ struct SimpleExecutorBoundedItem {
 struct SimpleExecutorQueueState {
     admitted_high: VecDeque<SimpleExecutorBoundedItem>,
     admitted_low: VecDeque<SimpleExecutorBoundedItem>,
+    #[cfg(any(test, feature = "test-support"))]
     legacy: VecDeque<SpawnFunc>,
     admitted_estimated_bytes: usize,
     high_priority_streak: usize,
+    #[cfg(any(test, feature = "test-support"))]
     prefer_admitted: bool,
 }
 
@@ -1579,15 +1748,18 @@ impl SimpleExecutorQueue {
                 // bounded by the shared task-lifetime authority.
                 admitted_high: VecDeque::with_capacity(limits.task_capacity()),
                 admitted_low: VecDeque::with_capacity(limits.task_capacity()),
+                #[cfg(any(test, feature = "test-support"))]
                 legacy: VecDeque::new(),
                 admitted_estimated_bytes: 0,
                 high_priority_streak: 0,
+                #[cfg(any(test, feature = "test-support"))]
                 prefer_admitted: true,
             }),
             available: Condvar::new(),
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn enqueue_legacy(&self, func: SpawnFunc) {
         lock_or_recover(&self.state).legacy.push_back(func);
         self.available.notify_one();
@@ -1709,6 +1881,7 @@ impl SimpleExecutorQueue {
         Some(item)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn pop_locked(state: &mut SimpleExecutorQueueState) -> Option<SpawnFunc> {
         let have_admitted = !state.admitted_high.is_empty() || !state.admitted_low.is_empty();
         let have_legacy = !state.legacy.is_empty();
@@ -1722,6 +1895,11 @@ impl SimpleExecutorQueue {
             state.prefer_admitted = !state.prefer_admitted;
         }
         result
+    }
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    fn pop_locked(state: &mut SimpleExecutorQueueState) -> Option<SpawnFunc> {
+        Self::pop_admitted_locked(state).map(|item| item.func)
     }
 
     fn try_pop(&self) -> Option<SpawnFunc> {
@@ -1775,20 +1953,23 @@ impl SimpleExecutor {
         let identity = try_allocate_main_thread_scheduler_identity()?;
         let queue = Arc::new(SimpleExecutorQueue::new(identity, limits));
 
-        let legacy_high = Arc::clone(&queue);
-        let legacy_low = Arc::clone(&queue);
-        set_schedulers(
-            Box::new(move |task| {
-                legacy_high.enqueue_legacy(Box::new(move || {
-                    task.run();
-                }));
-            }),
-            Box::new(move |task| {
-                legacy_low.enqueue_legacy(Box::new(move || {
-                    task.run();
-                }));
-            }),
-        );
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let legacy_high = Arc::clone(&queue);
+            let legacy_low = Arc::clone(&queue);
+            set_schedulers(
+                Box::new(move |task| {
+                    legacy_high.enqueue_legacy(Box::new(move || {
+                        task.run();
+                    }));
+                }),
+                Box::new(move |task| {
+                    legacy_low.enqueue_legacy(Box::new(move || {
+                        task.run();
+                    }));
+                }),
+            );
+        }
         let admitted_high = Arc::clone(&queue);
         let admitted_low = Arc::clone(&queue);
         let binding = Arc::new(MainThreadSchedulerBinding::new(
@@ -1861,9 +2042,143 @@ impl SimpleExecutor {
     }
 }
 
+impl Drop for SimpleExecutor {
+    fn drop(&mut self) {
+        // A dropped executor can no longer service admitted work. Retire its
+        // exact generation so a racing producer receives a terminal rejection
+        // and keeps its fallback authority instead of enqueueing onto a queue
+        // that will never be ticked again. A newer replacement owns a distinct
+        // binding, so retiring this generation cannot affect it.
+        self.binding.retire();
+    }
+}
+
+#[derive(Default)]
+struct ScopedExecutorQueueState {
+    queued: HashMap<NonZeroU64, (Instant, usize)>,
+    estimated_bytes: usize,
+}
+
+struct ScopedExecutorQueue {
+    executor: Weak<Executor<'static>>,
+    identity: MainThreadSchedulerIdentity,
+    limits: MainThreadAdmissionLimits,
+    state: Mutex<ScopedExecutorQueueState>,
+}
+
+impl ScopedExecutorQueue {
+    fn new(
+        executor: &Arc<Executor<'static>>,
+        identity: MainThreadSchedulerIdentity,
+        limits: MainThreadAdmissionLimits,
+    ) -> Self {
+        Self {
+            executor: Arc::downgrade(executor),
+            identity,
+            limits,
+            state: Mutex::new(ScopedExecutorQueueState {
+                queued: HashMap::with_capacity(limits.task_capacity()),
+                estimated_bytes: 0,
+            }),
+        }
+    }
+
+    fn enqueue(
+        self: &Arc<Self>,
+        runnable: Runnable,
+        admission: MainThreadAdmissionReceipt,
+    ) -> MainThreadEnqueueReceipt {
+        assert_eq!(
+            (admission.queue_id, admission.scheduler_generation),
+            (self.identity.queue_id, self.identity.scheduler_generation),
+            "admitted runnable was sent to a different ScopedExecutor generation"
+        );
+        let enqueued_at = Instant::now();
+        let Some(executor) = self.executor.upgrade() else {
+            // The outer scope retires its binding before dropping the executor.
+            // A waker already owned by a cancelled task may race that teardown;
+            // dropping its inert runnable is the exact absorbing action. It must
+            // not panic on the arbitrary thread that delivered the stale wake.
+            drop(runnable);
+            return MainThreadEnqueueReceipt {
+                queue_id: admission.queue_id,
+                scheduler_generation: admission.scheduler_generation,
+                task_ticket: admission.task_ticket,
+                enqueued_at,
+                snapshot_after_enqueue: MainThreadQueueSnapshot::new(
+                    0,
+                    self.limits.task_capacity(),
+                    0,
+                    self.limits.estimated_byte_capacity(),
+                    None,
+                    true,
+                )
+                .expect("retired ScopedExecutor queue snapshot is valid"),
+            };
+        };
+        let estimated_bytes = admission.estimated_bytes.get();
+        let mut state = lock_or_recover(&self.state);
+        let previous = state
+            .queued
+            .insert(admission.task_ticket, (enqueued_at, estimated_bytes));
+        assert!(
+            previous.is_none(),
+            "one ScopedExecutor task ticket was enqueued more than once"
+        );
+        state.estimated_bytes = state
+            .estimated_bytes
+            .checked_add(estimated_bytes)
+            .expect("ScopedExecutor queued byte count overflow");
+        let oldest_enqueued_at = state.queued.values().map(|(queued_at, _)| *queued_at).min();
+        let snapshot_after_enqueue = MainThreadQueueSnapshot::new(
+            state.queued.len(),
+            self.limits.task_capacity(),
+            state.estimated_bytes,
+            self.limits.estimated_byte_capacity(),
+            oldest_enqueued_at,
+            false,
+        )
+        .expect("ScopedExecutor queue accounting must remain internally consistent");
+        drop(state);
+
+        let queue = Arc::clone(self);
+        executor
+            .spawn(async move {
+                queue.dequeue(admission.task_ticket, estimated_bytes);
+                let _ = runnable.run();
+            })
+            .detach();
+
+        MainThreadEnqueueReceipt {
+            queue_id: admission.queue_id,
+            scheduler_generation: admission.scheduler_generation,
+            task_ticket: admission.task_ticket,
+            enqueued_at,
+            snapshot_after_enqueue,
+        }
+    }
+
+    fn dequeue(&self, task_ticket: NonZeroU64, estimated_bytes: usize) {
+        let mut state = lock_or_recover(&self.state);
+        let removed = state
+            .queued
+            .remove(&task_ticket)
+            .expect("ScopedExecutor runnable dequeued without queue authority");
+        assert_eq!(
+            removed.1, estimated_bytes,
+            "ScopedExecutor runnable byte authority changed while queued"
+        );
+        state.estimated_bytes = state
+            .estimated_bytes
+            .checked_sub(estimated_bytes)
+            .expect("ScopedExecutor queued byte count underflow");
+    }
+}
+
 #[derive(Default)]
 struct ScopedExecutorRegistry {
     executor: Option<Arc<Executor<'static>>>,
+    binding: Option<Arc<MainThreadSchedulerBinding>>,
     owner: Option<ThreadId>,
     depth: usize,
 }
@@ -1886,6 +2201,10 @@ impl ScopedExecutor {
         loop {
             match (&registry.executor, registry.owner.as_ref()) {
                 (Some(executor), Some(current_owner)) if current_owner == &owner => {
+                    assert!(
+                        registry.binding.is_some(),
+                        "scoped executor registry lost its bounded scheduler binding"
+                    );
                     let executor = Arc::clone(executor);
                     registry.depth = registry
                         .depth
@@ -1906,8 +2225,33 @@ impl ScopedExecutor {
                             });
                 }
                 (None, None) => {
+                    assert!(
+                        registry.binding.is_none(),
+                        "scoped executor registry retained a binding without an executor"
+                    );
                     let executor = Arc::new(Executor::new());
+                    let limits = MainThreadAdmissionLimits::new(
+                        SIMPLE_EXECUTOR_TASK_CAPACITY,
+                        SIMPLE_EXECUTOR_ESTIMATED_BYTE_CAPACITY,
+                        SIMPLE_EXECUTOR_CRITICAL_TASK_RESERVE,
+                        SIMPLE_EXECUTOR_CRITICAL_ESTIMATED_BYTE_RESERVE,
+                    )
+                    .expect("ScopedExecutor limits are valid");
+                    let identity = try_allocate_main_thread_scheduler_identity()
+                        .expect("ScopedExecutor scheduler identity authority exhausted");
+                    let queue = Arc::new(ScopedExecutorQueue::new(&executor, identity, limits));
+                    let high_queue = Arc::clone(&queue);
+                    let low_queue = Arc::clone(&queue);
+                    let binding = Arc::new(MainThreadSchedulerBinding::new(
+                        identity,
+                        limits,
+                        Box::new(move |runnable, admission| {
+                            high_queue.enqueue(runnable, admission)
+                        }),
+                        Box::new(move |runnable, admission| low_queue.enqueue(runnable, admission)),
+                    ));
                     registry.executor = Some(Arc::clone(&executor));
+                    registry.binding = Some(binding);
                     registry.owner = Some(owner);
                     registry.depth = 1;
                     return Self {
@@ -1956,18 +2300,31 @@ impl Drop for ScopedExecutor {
                 .expect("scoped executor nesting depth underflow");
             if registry.depth == 0 {
                 registry.owner = None;
-                registry.executor.take()
+                let registered = registry
+                    .executor
+                    .take()
+                    .expect("outermost scoped executor release lost its registered executor");
+                let binding = registry
+                    .binding
+                    .take()
+                    .expect("outermost scoped executor release lost its bounded scheduler binding");
+                Some((registered, binding))
             } else {
                 None
             }
         };
 
-        // The executor owns detached futures whose destructors may query this
-        // registry. Drop every final reference outside the mutex, and only then
-        // admit another thread's scope; otherwise a destructor could dispatch
-        // into an unrelated replacement executor.
+        // The executor and binding own detached futures and wake callbacks
+        // whose destructors may query this registry. Retire and drop them
+        // outside the mutex, and only then admit another thread's scope;
+        // otherwise a destructor could dispatch into an unrelated replacement
+        // executor.
         let released_registry = registered.is_some();
-        drop(registered);
+        if let Some((registered, binding)) = registered {
+            binding.retire();
+            drop(binding);
+            drop(registered);
+        }
         drop(executor);
         if released_registry {
             SCOPED_EXECUTOR_AVAILABLE.notify_one();
@@ -1986,6 +2343,19 @@ mod tests {
     // Serialize spawn tests that touch global scheduler state
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
+    struct StoredWakerFuture {
+        slot: Arc<StdMutex<Option<std::task::Waker>>>,
+    }
+
+    impl Future for StoredWakerFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            *self.slot.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
     fn admission_controller(
         task_capacity: usize,
         estimated_byte_capacity: usize,
@@ -2003,6 +2373,172 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn first_party_main_thread_producers_require_explicit_admission() {
+        fn scan_rust_sources(
+            directory: &std::path::Path,
+            scheduler_api: &std::path::Path,
+            offenders: &mut Vec<std::path::PathBuf>,
+        ) {
+            let entries = std::fs::read_dir(directory)
+                .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
+            for entry in entries {
+                let entry = entry.unwrap_or_else(|error| {
+                    panic!("read entry below {}: {error}", directory.display())
+                });
+                let source_path = entry.path();
+                if source_path.is_dir() {
+                    scan_rust_sources(&source_path, scheduler_api, offenders);
+                    continue;
+                }
+                if source_path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs")
+                    || source_path == scheduler_api
+                {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&source_path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", source_path.display()));
+                let executable = source
+                    .lines()
+                    .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                    .collect::<String>();
+                let compact = executable
+                    .chars()
+                    .filter(|character| !character.is_ascii_whitespace())
+                    .collect::<String>();
+                if compact.contains("spawn_into_main_thread(")
+                    || compact.contains("spawn_into_main_thread_with_low_priority(")
+                    || compact.contains("promise::spawn::spawn(")
+                    || compact.contains("promise::spawn::spawn_with_low_priority(")
+                    || compact.contains("usepromise::spawn::spawn;")
+                    || compact.contains("usepromise::spawn::spawnas")
+                    || compact.contains("usepromise::spawn::spawn_with_low_priority;")
+                    || compact.contains("usepromise::spawn::spawn_with_low_priorityas")
+                    || compact
+                        .split("usepromise::spawn::{")
+                        .skip(1)
+                        .any(|imports| {
+                            imports.split('}').next().is_some_and(|names| {
+                                names.split(',').any(|name| {
+                                    name == "spawn"
+                                        || name.starts_with("spawnas")
+                                        || name == "spawn_with_low_priority"
+                                        || name.starts_with("spawn_with_low_priorityas")
+                                })
+                            })
+                        })
+                {
+                    offenders.push(source_path);
+                }
+            }
+        }
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("promise crate is nested under the workspace frankenterm directory");
+        let scheduler_api = manifest_dir.join("src/spawn.rs");
+        let mut offenders = Vec::new();
+        scan_rust_sources(&workspace.join("crates"), &scheduler_api, &mut offenders);
+        scan_rust_sources(
+            &workspace.join("frankenterm"),
+            &scheduler_api,
+            &mut offenders,
+        );
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "first-party main-thread producers must reserve an explicit service class and byte budget before constructing work: {:#?}",
+            offenders,
+        );
+    }
+
+    #[test]
+    fn unclassified_scheduler_api_is_absent_from_default_production_builds() {
+        let source = include_str!("spawn.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("spawn.rs must retain one explicit unit-test module")
+            .0;
+        let gate = "#[cfg(any(test, feature = \"test-support\"))]";
+        for signature in [
+            "pub type ScheduleFunc =",
+            "pub fn set_schedulers(",
+            "pub fn spawn_into_main_thread<",
+            "pub fn spawn_into_main_thread_with_low_priority<",
+            "pub fn spawn<F, R>(future: F)",
+            "pub fn spawn_with_low_priority<F, R>(future: F)",
+        ] {
+            let offset = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("missing retired API signature {}", signature));
+            let preceding_line = production[..offset]
+                .lines()
+                .next_back()
+                .expect("retired API signature must have a preceding gate")
+                .trim();
+            assert_eq!(
+                preceding_line, gate,
+                "retired API {signature} escaped the explicit test-support gate"
+            );
+        }
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let window_scheduler = manifest_dir
+            .parent()
+            .expect("promise and window are sibling crates")
+            .join("window/src/spawn.rs");
+        let window_source = std::fs::read_to_string(&window_scheduler)
+            .unwrap_or_else(|error| panic!("read {}: {error}", window_scheduler.display()));
+        assert!(
+            !window_source.contains("promise::spawn::set_schedulers("),
+            "the shipping window scheduler must publish only bounded admission authority"
+        );
+    }
+
+    #[test]
+    fn background_reservation_is_bounded_before_future_construction() {
+        let _lock = lock_or_recover(&TEST_LOCK);
+        assert!(matches!(
+            try_reserve_background_task(0),
+            Err(BackgroundSpawnError::ZeroEstimatedBytes)
+        ));
+
+        let mut reservations = Vec::with_capacity(BACKGROUND_TASK_CAPACITY);
+        for _ in 0..BACKGROUND_TASK_CAPACITY {
+            reservations.push(
+                try_reserve_background_task(1)
+                    .expect("each exact background task slot should reserve once"),
+            );
+        }
+        assert!(matches!(
+            try_reserve_background_task(1),
+            Err(BackgroundSpawnError::TaskCapacityExhausted {
+                active: BACKGROUND_TASK_CAPACITY,
+                capacity: BACKGROUND_TASK_CAPACITY,
+            })
+        ));
+        drop(reservations);
+        assert!(try_reserve_background_task(1).is_ok());
+    }
+
+    #[test]
+    fn reserved_background_future_runs_off_the_main_thread_queue() {
+        let _lock = lock_or_recover(&TEST_LOCK);
+        let reservation = try_reserve_background_task(4 * 1024)
+            .expect("background I/O capacity should be available");
+        let (tx, rx) = flume::bounded(1);
+        reservation.spawn(async move {
+            tx.send(std::thread::current().name().map(str::to_owned))
+                .expect("test receiver should remain live");
+        });
+        let worker_name = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background worker should poll the reserved future");
+        assert_eq!(worker_name.as_deref(), Some("promise-background-io"));
     }
 
     #[test]
@@ -3085,6 +3621,63 @@ mod tests {
         let result = block_on(exec.run(async { t1.await + t2.await + t3.await }));
         assert_eq!(result, 6);
         drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_supports_bounded_main_thread_reservations() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Input, 64) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("scoped bounded reservation was rejected: {:?}", other),
+        };
+        let admitted = reservation.spawn(async { 123_u32 });
+        assert_eq!(
+            admitted
+                .initial_enqueue_receipt()
+                .snapshot_after_enqueue
+                .depth,
+            1
+        );
+        let result = block_on(exec.run(admitted.into_task()));
+        assert_eq!(result, 123);
+        drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_retirement_absorbs_late_admitted_wake_without_panicking() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec = ScopedExecutor::new();
+        let waker_slot = Arc::new(StdMutex::new(None));
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Input, 64) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            other => panic!("scoped bounded reservation was rejected: {:?}", other),
+        };
+        reservation
+            .spawn(StoredWakerFuture {
+                slot: Arc::clone(&waker_slot),
+            })
+            .into_task()
+            .detach();
+        block_on(exec.run(std::future::poll_fn(|cx| {
+            if waker_slot.lock().unwrap().is_some() {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })));
+        drop(exec);
+
+        let late_waker = waker_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("admitted future stored its exact scheduler waker");
+        assert!(
+            std::thread::spawn(move || late_waker.wake()).join().is_ok(),
+            "a late admitted wake must be absorbed after scoped scheduler retirement"
+        );
     }
 
     #[test]
