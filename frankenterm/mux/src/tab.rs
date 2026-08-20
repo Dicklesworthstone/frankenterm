@@ -15081,7 +15081,7 @@ mod test {
     }
 
     #[test]
-    fn guarded_moved_split_rejects_replaced_admitted_domain_without_mutation() {
+    fn guarded_moved_split_rejects_retired_admitted_domain_without_mutation() {
         let size = TerminalSize {
             rows: 24,
             cols: 80,
@@ -15123,22 +15123,14 @@ mod test {
             })
         };
 
-        let replacement_domain: Arc<dyn Domain> =
-            Arc::new(FloatingReconcileTestDomain { domain_id: 1 });
-        {
-            let _domain_registration = mux.domain_registration.lock();
-            let _pane_registration = mux.pane_registration.lock();
-            mux.domains
-                .write()
-                .insert(1, Arc::clone(&replacement_domain));
-            mux.domains_by_name.write().insert(
-                replacement_domain.domain_name().to_string(),
-                Arc::clone(&replacement_domain),
-            );
-        }
+        assert!(mux.domain_was_detached_if_same(&original_domain));
+        assert!(
+            mux.get_domain(original_domain.domain_id()).is_none(),
+            "logical retirement must close new admission before relocation"
+        );
 
         mux.commit_guarded_moved_split(&target_guard, &source_guard, SplitRequest::default())
-            .expect_err("a replaced admitted domain must reject exact relocation");
+            .expect_err("a retired admitted domain must reject exact relocation");
 
         assert_eq!(mux.topology.lock().revision, topology_before);
         assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);

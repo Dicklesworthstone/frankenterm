@@ -3511,7 +3511,7 @@ impl TmuxCmdQueue {
     }
 
     #[cfg(test)]
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.split_cleanup_entries.is_empty()
             && self.split_transaction_entries.is_empty()
             && self.durable_entries.is_empty()

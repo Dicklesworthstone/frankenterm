@@ -4778,7 +4778,7 @@ mod tests {
             "retired domain generation must release its remote reservation directory"
         );
         assert!(
-            tmux_domain.inner.cmd_queue.lock().len() == 0,
+            tmux_domain.inner.cmd_queue.lock().is_empty(),
             "retired domain teardown must not retain orphaned command authority"
         );
         drop(domain_fence);

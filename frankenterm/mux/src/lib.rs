@@ -25115,11 +25115,11 @@ mod tests {
 
         assert_eq!(
             observed.lock().as_slice(),
-            &[((
+            &[(
                 "rename",
                 MuxTopologyStamp::Revision(TopologyRevision::new(before.get() + 1)),
                 "new-workspace".to_string(),
-            ))],
+            )],
             "one grouped event must replace unordered per-window and per-client derivatives",
         );
         assert_eq!(mux.active_workspace_for_client(&client), "new-workspace");
@@ -25259,18 +25259,22 @@ mod tests {
             .topology_snapshot_authority()
             .expect("topology authority should remain live")
             .1;
-        let removal_revision = removal_revisions.lock().last().copied();
+        assert!(
+            during_callback > before,
+            "window retirement must reserve topology authority before the detachable callback"
+        );
 
         detach_release_tx
             .send(())
             .expect("release detachable-domain callback");
         remover.join().expect("window removal should complete");
+        mux.flush_window_notifications();
         assert!(
             window_was_removed,
             "the window registry mutation precedes the detachable-domain callback",
         );
-        let removal_revision = removal_revision.expect(
-            "the frozen window-retirement transaction must be published before the detachable callback starts",
+        let removal_revision = removal_revisions.lock().last().copied().expect(
+            "the frozen window-retirement transaction must be delivered after the detachable callback releases",
         );
         assert_eq!(
             removal_revisions.lock().as_slice(),
