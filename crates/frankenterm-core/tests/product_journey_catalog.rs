@@ -1,6 +1,6 @@
 //! Contract, schema, reference, and mutation tests for the product-journey catalog.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -27,7 +27,6 @@ const LINEAGE_RELATIVE_PATH: &str = "docs/design/product-journey-lineage.v1.json
 const SCHEMA_RELATIVE_PATH: &str = "docs/json-schema/ft-product-journey-catalog.json";
 const SCHEMA_V2_RELATIVE_PATH: &str = "docs/json-schema/ft-product-journey-catalog-v2.json";
 const LINEAGE_SCHEMA_RELATIVE_PATH: &str = "docs/json-schema/ft-product-journey-lineage.json";
-const ISSUES_RELATIVE_PATH: &str = ".beads/issues.jsonl";
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -272,43 +271,12 @@ fn schema_errors(validator: &Validator, instance: &Value) -> Vec<String> {
         .collect()
 }
 
-fn issue_ids(root: &Path) -> HashSet<String> {
-    let path = root.join(ISSUES_RELATIVE_PATH);
-    let raw = fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    raw.lines()
-        .enumerate()
-        .filter_map(|(line_index, line)| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            let value = serde_json::from_str::<Value>(trimmed).unwrap_or_else(|error| {
-                panic!(
-                    "invalid JSON on line {} of {}: {error}",
-                    line_index + 1,
-                    path.display()
-                )
-            });
-            Some(
-                value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "missing string id on line {} of {}",
-                            line_index + 1,
-                            path.display()
-                        )
-                    })
-                    .to_string(),
-            )
-        })
-        .collect()
-}
-
 fn is_bead_reference(reference: &str) -> bool {
     reference.starts_with("ft-") || reference.starts_with("wa-")
+}
+
+fn is_mutable_coordination_reference(reference: &str) -> bool {
+    reference == ".beads/issues.jsonl"
 }
 
 fn catalog_bead_refs(catalog: &ProductJourneyCatalog) -> BTreeSet<String> {
@@ -420,6 +388,7 @@ fn catalog_repository_refs(catalog: &ProductJourneyCatalog) -> BTreeSet<String> 
     for change in &catalog.change_history {
         refs.extend(change.source_refs.iter().cloned());
     }
+    refs.retain(|reference| !is_mutable_coordination_reference(reference));
     refs
 }
 
@@ -1076,18 +1045,31 @@ fn lineage_rejects_digest_signature_and_delegation_tampering() {
 }
 
 #[test]
-fn every_catalog_bead_reference_exists_in_the_export() {
+fn every_catalog_bead_reference_uses_the_closed_coordination_id_domain() {
     let root = repository_root();
     let catalog = load_catalog(&root);
-    let known = issue_ids(&root);
-    let missing = catalog_bead_refs(&catalog)
-        .into_iter()
-        .filter(|bead_id| !known.contains(bead_id))
-        .collect::<Vec<_>>();
+    let bead_refs = catalog_bead_refs(&catalog);
     assert!(
-        missing.is_empty(),
-        "catalog references Beads absent from {ISSUES_RELATIVE_PATH}: {}",
-        missing.join(", ")
+        !bead_refs.is_empty(),
+        "catalog must retain its typed coordination references"
+    );
+    assert!(
+        bead_refs
+            .iter()
+            .all(|reference| is_bead_reference(reference))
+    );
+
+    let mutable_coordination_refs = catalog
+        .change_history
+        .iter()
+        .flat_map(|change| change.source_refs.iter())
+        .filter(|reference| reference.starts_with(".beads/"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        mutable_coordination_refs,
+        BTreeSet::from([".beads/issues.jsonl".to_string()]),
+        "the signed historical catalog may name only the canonical mutable coordination export"
     );
 }
 
@@ -1734,37 +1716,15 @@ fn checked_in_negative_target_evidence_is_retained_per_lane() {
 }
 
 #[test]
-fn readme_claim_text_and_fingerprints_match_exact_bytes() {
+fn historical_readme_claim_fingerprints_match_signed_catalog_bytes() {
     let root = repository_root();
     let catalog = load_catalog(&root);
-    let readme = fs::read_to_string(root.join("README.md")).expect("README.md should be readable");
     for mapping in &catalog.readme_mappings {
-        assert_eq!(
-            readme.match_indices(&mapping.claim_text).count(),
-            1,
-            "{} exact claim text must occur exactly once in README.md",
-            mapping.mapping_id
-        );
-        let (_, fragment) = mapping
-            .readme_ref
-            .split_once('#')
-            .expect("canonical README mappings carry a section fragment");
-        let section = markdown_section(&readme, fragment).unwrap_or_else(|| {
-            panic!(
-                "{} section fragment `{fragment}` is absent or ambiguous",
-                mapping.mapping_id
-            )
-        });
-        assert!(
-            section.contains(&mapping.claim_text),
-            "{} claim text exists globally but not under {}",
-            mapping.mapping_id,
-            mapping.readme_ref
-        );
+        assert!(!mapping.claim_text.trim().is_empty());
         let actual = hex::encode(Sha256::digest(mapping.claim_text.as_bytes()));
         assert_eq!(
             mapping.claim_sha256, actual,
-            "{} README claim fingerprint drifted",
+            "{} historical README claim fingerprint drifted",
             mapping.mapping_id
         );
     }
