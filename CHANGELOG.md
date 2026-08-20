@@ -27,6 +27,15 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.13.0...mai
 
 1,271 non-merge commits after the v0.13.0 tag. This is a navigation aid, not an exhaustive dump: the dominant landed work is mux exact-owner/census/codec authority, plus the 2026-08-19 janitor docs-reorg.
 
+### Delivered capability
+
+- Mux exact-owner/census/codec authority on post-0.13 `main`.
+- Root ELF/scratch removed; planning/wizard cluster now under `docs/planning/`.
+
+### Closed workstreams
+
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankenterm/blob/main/.beads/issues.jsonl).
+
 ### Janitor docs-reorg (2026-08-19)
 
 Root ELF/scratch and the planning/wizard cluster left the repository root and now live under `docs/`.
