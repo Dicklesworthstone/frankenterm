@@ -1,13 +1,13 @@
 use crate::client::{
-    ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope, admit_interactive_rpc_now,
+    admit_interactive_rpc_now, ClientOutboundAdmissionError, RpcConsumerKind, RpcGenerationScope,
 };
-use crate::domain::{ClientInner, lock_or_recover};
+use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
-    RenderableInner, RenderablePaneBinding, RenderableState, hydrate_lines,
-    hydrate_render_application_lines,
+    hydrate_lines, hydrate_render_application_lines, RenderableInner, RenderablePaneBinding,
+    RenderableState,
 };
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use codec::*;
 use config::configuration;
@@ -52,20 +52,30 @@ where
     F: Future<Output = anyhow::Result<T>> + 'static,
     T: 'static,
 {
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Input,
+        4 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!(
+            "main-thread scheduler rejected interactive mux RPC {operation} before transport admission: {rejected:?}"
+        ),
+    };
     let Some(request) = admit_interactive_rpc_now(request)? else {
         return Ok(());
     };
-    promise::spawn::spawn(async move {
-        if let Err(error) = request.await {
-            metrics::counter!(
-                "mux.client.interactive_rpc.detached_error.total",
-                "operation" => operation,
-            )
-            .increment(1);
-            log::debug!("detached interactive mux RPC {operation} failed: {error:#}");
-        }
-    })
-    .detach();
+    reservation
+        .spawn_local(async move {
+            if let Err(error) = request.await {
+                metrics::counter!(
+                    "mux.client.interactive_rpc.detached_error.total",
+                    "operation" => operation,
+                )
+                .increment(1);
+                log::debug!("detached interactive mux RPC {operation} failed: {error:#}");
+            }
+        })
+        .detach();
     Ok(())
 }
 
@@ -218,7 +228,7 @@ impl ReliableInputQueue {
             validate_sampled_keypress_trace_context(&trace_context)
                 .context("validating sampled reliable key input before queue admission")?;
         }
-        let start_worker = {
+        let worker_reservation = {
             let mut state = self.state.lock();
             if state.domain_detached || client.is_detached() {
                 bail!("cannot enqueue reliable input for a detached client domain");
@@ -232,32 +242,56 @@ impl ReliableInputQueue {
                     RELIABLE_INPUT_QUEUE_CAPACITY
                 );
             }
+            let worker_reservation = if state.worker_running {
+                None
+            } else {
+                let reservation = match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Input,
+                    64 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                    }
+                    rejected => {
+                        drop(state);
+                        metrics::counter!(
+                            "mux.client.reliable_input_queue",
+                            "outcome" => "scheduler_rejected"
+                        )
+                        .increment(1);
+                        bail!(
+                            "main-thread scheduler rejected reliable-input worker before queue mutation: {rejected:?}"
+                        );
+                    }
+                };
+                state.worker_running = true;
+                Some(reservation)
+            };
             state.pending.push_back(QueuedReliableInput {
                 registration,
                 pane_authority,
                 request,
                 trace_context,
             });
-            if state.worker_running {
-                false
-            } else {
-                state.worker_running = true;
-                true
-            }
+            worker_reservation
         };
         metrics::counter!("mux.client.reliable_input_queue", "outcome" => "enqueued").increment(1);
-        if start_worker {
-            Self::start_worker_now(Arc::clone(self), Arc::downgrade(client));
+        if let Some(reservation) = worker_reservation {
+            Self::start_worker_now(Arc::clone(self), Arc::downgrade(client), reservation);
         }
         Ok(())
     }
 
-    fn start_worker_now(queue: Arc<Self>, client: Weak<ClientInner>) {
+    fn start_worker_now(
+        queue: Arc<Self>,
+        client: Weak<ClientInner>,
+        reservation: promise::spawn::MainThreadSpawnReservation,
+    ) {
         let mut worker: Pin<Box<dyn Future<Output = ()>>> = Box::pin(Self::run(queue, client));
         let waker = futures::task::noop_waker();
         let mut context = TaskContext::from_waker(&waker);
         if worker.as_mut().poll(&mut context).is_pending() {
-            promise::spawn::spawn(worker).detach();
+            reservation.spawn_local(worker).detach();
         }
     }
 
@@ -2087,22 +2121,42 @@ impl Pane for ClientPane {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         let palette = self.configured_palette.lock().clone();
-        let request = client.client.set_configured_palette_for_pane(SetPalette {
+        let request = SetPalette {
             pane_id: remote_pane_id,
             palette: Arc::new(palette),
-        });
-        promise::spawn::spawn(async move {
-            let registration_is_current = mux_registration
-                .load()
-                .is_some_and(|current| current.same_registration(&registration))
-                && registration.try_with_current(|_| ()).is_some();
-            if !registration_is_current {
-                return Ok(());
-            }
+        };
+        let rpc = client.client.rpc_scope();
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn(async move {
+                        let registration_is_current = mux_registration
+                            .load()
+                            .is_some_and(|current| current.same_registration(&registration))
+                            && registration.try_with_current(|_| ()).is_some();
+                        if !registration_is_current {
+                            return Ok(());
+                        }
 
-            request.await.map(|_| ())
-        })
-        .detach();
+                        rpc.set_configured_palette_for_pane(request)
+                            .await
+                            .map(|_| ())
+                    })
+                    .detach();
+            }
+            rejected => {
+                let abort = client.client.abort_rpc_transport_generation(
+                    &rpc,
+                    "pane-bind palette scheduler admission failed",
+                );
+                log::error!(
+                    "main-thread scheduler rejected pane-bind palette convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                );
+            }
+        }
     }
 
     fn get_metadata(&self) -> Value {
@@ -2260,7 +2314,9 @@ impl Pane for ClientPane {
             pane_id: remote_pane_id,
             zoomed,
         });
-        promise::spawn::spawn(request).detach();
+        if let Err(error) = dispatch_interactive_rpc(request, "set pane zoom") {
+            log::error!("failed to schedule pane zoom convergence: {error:#}");
+        }
         inner.update_last_send();
     }
 
@@ -2292,7 +2348,7 @@ impl Pane for ClientPane {
                 pane_id: remote_pane_id,
                 size,
             });
-            promise::spawn::spawn(request).detach();
+            dispatch_interactive_rpc(request, "resize pane")?;
             inner.update_last_send();
         }
         Ok(())
@@ -2348,7 +2404,9 @@ impl Pane for ClientPane {
             let request = client.client.kill_pane(KillPane {
                 pane_id: remote_pane_id,
             });
-            promise::spawn::spawn(request).detach();
+            if let Err(error) = dispatch_interactive_rpc(request, "kill pane") {
+                log::error!("failed to schedule explicit remote pane kill: {error:#}");
+            }
         }
     }
 
@@ -2398,7 +2456,9 @@ impl Pane for ClientPane {
             pane_id: remote_pane_id,
             erase_mode,
         });
-        promise::spawn::spawn(request).detach();
+        if let Err(error) = dispatch_interactive_rpc(request, "erase scrollback") {
+            log::error!("failed to schedule remote scrollback erase: {error:#}");
+        }
     }
 
     fn advise_focus(&self) {
@@ -2413,7 +2473,9 @@ impl Pane for ClientPane {
             let request = client.client.set_focused_pane_id(SetFocusedPane {
                 pane_id: remote_pane_id,
             });
-            promise::spawn::spawn(request).detach();
+            if let Err(error) = dispatch_interactive_rpc(request, "set focused pane") {
+                log::error!("failed to schedule remote focused-pane convergence: {error:#}");
+            }
         }
     }
 
@@ -2471,7 +2533,9 @@ impl Pane for ClientPane {
             pane_id: remote_pane_id,
             palette: Arc::new(palette),
         });
-        promise::spawn::spawn(request).detach();
+        if let Err(error) = dispatch_interactive_rpc(request, "set configured pane palette") {
+            log::error!("failed to schedule configured palette convergence: {error:#}");
+        }
         self.config.lock().replace(config);
         // Implicit hyperlink rules are selected by each GUI window when it
         // borrows lines for rendering. Do not walk the complete remote line
@@ -2522,14 +2586,14 @@ impl std::io::Write for PaneWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MuxTestScope;
-    use crate::client::{Client, TEST_RENDER_CONNECTION_IDENTITY, TestRpcPeer};
+    use crate::client::{Client, TestRpcPeer, TEST_RENDER_CONNECTION_IDENTITY};
     use crate::domain::ClientDomainConfig;
+    use crate::MuxTestScope;
     use config::UnixDomain;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::{Mux, MuxNotification, MuxSessionIncarnation};
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
     use termwiz::cell::{CellAttributes, SemanticType};
 
     const SUCCESSOR_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
@@ -2695,11 +2759,9 @@ mod tests {
             Some(context),
             "authority probe must retain context for the first effect-eligible attempt"
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .bind_front_pane_authority(&expected, pane_registration)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .bind_front_pane_authority(&expected, pane_registration));
 
         let (first, consumed) = inner
             .reliable_input_queue
@@ -2835,11 +2897,9 @@ mod tests {
             ReliableInputWireAttempt::Unsampled(_)
         ));
         assert_eq!(consumed, Some(context));
-        assert!(
-            inner
-                .reliable_input_queue
-                .restore_front_trace_context(&expected, consumed)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .restore_front_trace_context(&expected, consumed));
 
         let (v62_attempt, consumed_again) = inner
             .reliable_input_queue
@@ -2972,11 +3032,9 @@ mod tests {
             second_wire.request.input_serial,
             second_request.input_serial
         );
-        assert!(
-            inner
-                .reliable_input_queue
-                .complete_front(&second, "applied")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .complete_front(&second, "applied"));
         assert!(inner.reliable_input_queue.state.lock().pending.is_empty());
         assert!(peer.is_empty());
     }
@@ -3147,11 +3205,9 @@ mod tests {
             state.pending.front().unwrap().clone()
         };
         let remote_authority = ReliablePaneRegistrationIdentityV1::from_bytes([0x61; 16]);
-        assert!(
-            inner
-                .reliable_input_queue
-                .bind_front_pane_authority(&first, remote_authority)
-        );
+        assert!(inner
+            .reliable_input_queue
+            .bind_front_pane_authority(&first, remote_authority));
         assert_eq!(*pane_authority.lock(), Some(remote_authority));
         let mut state = inner.reliable_input_queue.state.lock();
         assert!(
@@ -3163,6 +3219,44 @@ mod tests {
         );
         state.pending.clear();
         state.worker_running = false;
+    }
+
+    #[test]
+    fn reliable_input_scheduler_rejection_precedes_queue_mutation() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 44, 30);
+        let pane_for_mux: Arc<dyn Pane> = pane;
+        mux.add_pane(&pane_for_mux)
+            .expect("reliable-input rejection test pane should register");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("reliable-input rejection test needs exact pane authority");
+
+        let error = inner
+            .reliable_input_queue
+            .enqueue(
+                &inner,
+                registration,
+                Arc::new(Mutex::new(None)),
+                ReliableKeyEventV1 {
+                    pane_id: 30,
+                    pane_registration: None,
+                    event: KeyEvent {
+                        key: KeyCode::Char('r'),
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    input_serial: InputSerial::from_millis_since_epoch(1),
+                    kind: ReliableKeyEventKindV1::KeyDown,
+                },
+            )
+            .expect_err("the test harness has no bounded main-thread generation");
+        assert!(error.to_string().contains("before queue mutation"));
+        let state = inner.reliable_input_queue.state.lock();
+        assert!(state.pending.is_empty());
+        assert!(!state.worker_running);
     }
 
     #[test]
@@ -3269,11 +3363,9 @@ mod tests {
             state.worker_running = true;
         }
 
-        assert!(
-            inner
-                .reliable_input_queue
-                .retire_front_pane_authority(&first, "pane_registration_mismatch")
-        );
+        assert!(inner
+            .reliable_input_queue
+            .retire_front_pane_authority(&first, "pane_registration_mismatch"));
         assert_eq!(*first_authority_cache.lock(), None);
         assert_eq!(*second_authority_cache.lock(), Some(second_authority));
         let state = inner.reliable_input_queue.state.lock();

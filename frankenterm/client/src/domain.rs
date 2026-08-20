@@ -1,21 +1,20 @@
 use crate::client::{
-    Client, RpcConsumerKind, RpcGenerationAbortGuard, RpcGenerationScope,
-    with_mux_rpc_bootstrap_timeout,
+    with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
+    RpcGenerationScope,
 };
 use crate::pane::{ClientPane, ReliableInputQueue};
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::client::ClientId;
 use mux::connui::{ConnectionUI, ConnectionUIParams};
-use mux::domain::{Domain, DomainId, DomainState, alloc_domain_id};
-use mux::pane::{Pane, PaneId, reserve_pane_ids};
+use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState};
+use mux::pane::{reserve_pane_ids, Pane, PaneId};
 use mux::tab::{
-    DomainFloatingPaneState, PaneArena, PaneArenaNode, PaneArenaPreparationScratch, PaneEntry,
-    PaneNode, PreparedPaneTree, SplitRequest, Tab, TabId,
-    prepare_pane_tree_from_arena_with_scratch,
+    prepare_pane_tree_from_arena_with_scratch, DomainFloatingPaneState, PaneArena, PaneArenaNode,
+    PaneArenaPreparationScratch, PaneEntry, PaneNode, PreparedPaneTree, SplitRequest, Tab, TabId,
 };
 use mux::window::WindowId;
 use mux::{
@@ -789,15 +788,17 @@ fn ensure_pane_arena_append_order_is_sound(
             );
         }
         for (index, tab) in window.iter().enumerate() {
-            let attached_remote_tab = local_to_remote_tab.get(&tab.tab_id()).copied().ok_or_else(
-                || {
-                    anyhow!(
+            let attached_remote_tab =
+                local_to_remote_tab
+                    .get(&tab.tab_id())
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!(
                         "ordered pane arena mapped window {remote_window_id} contains unmapped or \
                          foreign local tab {}",
                         tab.tab_id()
                     )
-                },
-            )?;
+                    })?;
             if desired_remote_tabs[index] != attached_remote_tab {
                 bail!(
                     "ordered pane arena window {remote_window_id} requires an atomic existing-window \
@@ -1661,16 +1662,33 @@ fn mux_notify_client_domain(
                 if let Some(request) =
                     active_workspace_sync_request(inner.owner_client_id.as_ref(), &client_id, &mux)
                 {
-                    let rpc = inner.client.set_active_workspace(request);
+                    let rpc = inner.client.rpc_scope();
                     let mux = Arc::clone(&mux);
-                    promise::spawn::spawn(async move {
-                        if !client_inner_is_current(&mux, &domain, &inner) {
-                            return Ok(());
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        4 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                                .spawn(async move {
+                                    if !client_inner_is_current(&mux, &domain, &inner) {
+                                        return Ok(());
+                                    }
+                                    let _ = rpc.set_active_workspace(request).await;
+                                    anyhow::Result::<()>::Ok(())
+                                })
+                                .detach();
                         }
-                        let _ = rpc.await;
-                        anyhow::Result::<()>::Ok(())
-                    })
-                    .detach();
+                        rejected => {
+                            let abort = inner.client.abort_rpc_transport_generation(
+                                &rpc,
+                                "active-workspace metadata scheduler admission failed",
+                            );
+                            log::error!(
+                                "main-thread scheduler rejected active-workspace convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1681,20 +1699,38 @@ fn mux_notify_client_domain(
             if let Some(inner) = client_domain.inner() {
                 if inner.should_forward_local_metadata() {
                     let mux = Arc::clone(&mux);
-                    promise::spawn::spawn(async move {
-                        if !client_inner_is_current(&mux, &domain, &inner) {
-                            return Ok(());
+                    let rpc = inner.client.rpc_scope();
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        4 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                                .spawn(async move {
+                                    if !client_inner_is_current(&mux, &domain, &inner) {
+                                        return Ok(());
+                                    }
+                                    update_remote_workspace_rename(
+                                        mux,
+                                        domain,
+                                        inner,
+                                        old_workspace,
+                                        new_workspace,
+                                    )
+                                    .await
+                                })
+                                .detach();
                         }
-                        update_remote_workspace_rename(
-                            mux,
-                            domain,
-                            inner,
-                            old_workspace,
-                            new_workspace,
-                        )
-                        .await
-                    })
-                    .detach();
+                        rejected => {
+                            let abort = inner.client.abort_rpc_transport_generation(
+                                &rpc,
+                                "workspace-rename metadata scheduler admission failed",
+                            );
+                            log::error!(
+                                "main-thread scheduler rejected workspace-rename convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1712,44 +1748,75 @@ fn mux_notify_client_domain(
             // domain lookup or transport work while the originating mux
             // mutation is still unwinding.
             let mux = Arc::clone(&mux);
-            promise::spawn::spawn_into_main_thread(async move {
-                if !mux
-                    .get_domain(local_domain_id)
-                    .is_some_and(|current| current.same_registration(&domain))
-                {
-                    return;
+            let rpc = observed_inner.client.rpc_scope();
+            match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                4 * 1024,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                    reservation
+                        .spawn(async move {
+                            if !mux
+                                .get_domain(local_domain_id)
+                                .is_some_and(|current| current.same_registration(&domain))
+                            {
+                                return;
+                            }
+                            let client_domain = match domain.downcast_ref::<ClientDomain>() {
+                                Some(domain) => domain,
+                                None => return,
+                            };
+                            if let Some(remote_window_id) =
+                                client_domain.local_to_remote_window_id(window_id)
+                            {
+                                let Some(inner) = client_domain.inner() else {
+                                    return;
+                                };
+                                if !client_inner_is_current(&mux, &domain, &inner) {
+                                    return;
+                                }
+                                let request = codec::SetWindowWorkspace {
+                                    window_id: remote_window_id,
+                                    workspace,
+                                };
+                                if let Err(error) = update_remote_workspace(
+                                    Arc::clone(&mux),
+                                    domain,
+                                    inner,
+                                    request,
+                                )
+                                .await
+                                {
+                                    log::error!(
+                                        "failed to converge rejected remote workspace update for window \
+                                         {remote_window_id}: {error:#}"
+                                    );
+                                }
+                            } else {
+                                log::debug!(
+                                    "local window id {window_id} has no known remote window \
+                                    id while reconciling a local WindowWorkspaceChanged event"
+                                );
+                            }
+                        })
+                        .detach();
                 }
-                let client_domain = match domain.downcast_ref::<ClientDomain>() {
-                    Some(domain) => domain,
-                    None => return,
-                };
-                if let Some(remote_window_id) = client_domain.local_to_remote_window_id(window_id) {
-                    let Some(inner) = client_domain.inner() else {
-                        return;
-                    };
-                    if !client_inner_is_current(&mux, &domain, &inner) {
-                        return;
-                    }
-                    let request = codec::SetWindowWorkspace {
-                        window_id: remote_window_id,
-                        workspace,
-                    };
-                    if let Err(error) =
-                        update_remote_workspace(Arc::clone(&mux), domain, inner, request).await
-                    {
-                        log::error!(
-                            "failed to converge rejected remote workspace update for window \
-                             {remote_window_id}: {error:#}"
-                        );
-                    }
-                } else {
-                    log::debug!(
-                        "local window id {window_id} has no known remote window \
-                        id while reconciling a local WindowWorkspaceChanged event"
+                rejected => {
+                    metrics::counter!(
+                        "mux.client.metadata_scheduler_admission",
+                        "operation" => "window workspace",
+                        "outcome" => "generation_abort"
+                    )
+                    .increment(1);
+                    let abort = observed_inner.client.abort_rpc_transport_generation(
+                        &rpc,
+                        "workspace metadata scheduler admission failed",
+                    );
+                    log::error!(
+                        "main-thread scheduler rejected remote workspace convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
                     );
                 }
-            })
-            .detach();
+            }
         }
         MuxNotification::TabTitleChanged { tab_id, title } => {
             if let Some(remote_tab_id) = client_domain.local_to_remote_tab_id(tab_id) {
@@ -1757,19 +1824,37 @@ fn mux_notify_client_domain(
                     if !inner.should_forward_local_metadata() {
                         return true;
                     }
-                    let rpc = inner.client.set_tab_title(codec::TabTitleChanged {
+                    let request = codec::TabTitleChanged {
                         tab_id: remote_tab_id,
                         title,
-                    });
+                    };
+                    let rpc = inner.client.rpc_scope();
                     let mux = Arc::clone(&mux);
-                    promise::spawn::spawn(async move {
-                        if !client_inner_is_current(&mux, &domain, &inner) {
-                            return Ok(());
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        4 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                                .spawn(async move {
+                                    if !client_inner_is_current(&mux, &domain, &inner) {
+                                        return Ok(());
+                                    }
+                                    rpc.set_tab_title(request).await?;
+                                    anyhow::Result::<()>::Ok(())
+                                })
+                                .detach();
                         }
-                        rpc.await?;
-                        anyhow::Result::<()>::Ok(())
-                    })
-                    .detach();
+                        rejected => {
+                            let abort = inner.client.abort_rpc_transport_generation(
+                                &rpc,
+                                "tab-title metadata scheduler admission failed",
+                            );
+                            log::error!(
+                                "main-thread scheduler rejected tab-title convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1782,41 +1867,60 @@ fn mux_notify_client_domain(
                     return true;
                 }
                 let mux = Arc::clone(&mux);
-                promise::spawn::spawn_into_main_thread(async move {
-                    // De-bounce the title propagation.
-                    // There is a bit of a race condition with these async
-                    // updates that can trigger a cycle of WindowTitleChanged
-                    // PDUs being exchanged between client and server if the
-                    // title is changed twice in quick succession.
-                    // To avoid that, here on the client, we wait a second
-                    // and then report the now-current name of the window, rather
-                    // than propagating the title encoded in the MuxNotification.
-                    promise::spawn::sleep(std::time::Duration::from_secs(1)).await;
-                    if !client_inner_is_current(&mux, &domain, &inner) {
-                        return Ok(());
-                    }
-                    let Some(client_domain) = domain.downcast_ref::<ClientDomain>() else {
-                        return Ok(());
-                    };
-                    let Some(remote_window_id) = client_domain.local_to_remote_window_id(window_id)
-                    else {
-                        return Ok(());
-                    };
-                    let title = mux
-                        .get_window(window_id)
-                        .map(|win| win.get_title().to_string());
-                    if let Some(title) = title {
-                        inner
-                            .client
-                            .set_window_title(codec::WindowTitleChanged {
-                                window_id: remote_window_id,
-                                title,
+                let rpc = inner.client.rpc_scope();
+                match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    4 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                            .spawn(async move {
+                                // De-bounce the title propagation.
+                                promise::spawn::sleep(std::time::Duration::from_secs(1)).await;
+                                if !client_inner_is_current(&mux, &domain, &inner) {
+                                    return Ok(());
+                                }
+                                let Some(client_domain) = domain.downcast_ref::<ClientDomain>()
+                                else {
+                                    return Ok(());
+                                };
+                                let Some(remote_window_id) =
+                                    client_domain.local_to_remote_window_id(window_id)
+                                else {
+                                    return Ok(());
+                                };
+                                let title = mux
+                                    .get_window(window_id)
+                                    .map(|win| win.get_title().to_string());
+                                if let Some(title) = title {
+                                    inner
+                                        .client
+                                        .set_window_title(codec::WindowTitleChanged {
+                                            window_id: remote_window_id,
+                                            title,
+                                        })
+                                        .await?;
+                                }
+                                anyhow::Result::<()>::Ok(())
                             })
-                            .await?;
+                            .detach();
                     }
-                    anyhow::Result::<()>::Ok(())
-                })
-                .detach();
+                    rejected => {
+                        metrics::counter!(
+                            "mux.client.metadata_scheduler_admission",
+                            "operation" => "window title",
+                            "outcome" => "generation_abort"
+                        )
+                        .increment(1);
+                        let abort = inner.client.abort_rpc_transport_generation(
+                            &rpc,
+                            "window title scheduler admission failed",
+                        );
+                        log::error!(
+                            "main-thread scheduler rejected remote title convergence; aborted exact RPC generation ({abort:?}): {rejected:?}"
+                        );
+                    }
+                }
             }
         }
         _ => {}
@@ -3237,12 +3341,10 @@ impl ClientDomain {
             pending_float_mappings.len(),
             reconcile_receipt.registered_pane_ids.len()
         );
-        debug_assert!(
-            pending_float_mappings
-                .iter()
-                .map(|(_, local_pane_id)| *local_pane_id)
-                .eq(reconcile_receipt.registered_pane_ids.iter().copied())
-        );
+        debug_assert!(pending_float_mappings
+            .iter()
+            .map(|(_, local_pane_id)| *local_pane_id)
+            .eq(reconcile_receipt.registered_pane_ids.iter().copied()));
 
         for (pane, alt_screen_active) in pending_tiled_sync {
             if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
@@ -5410,11 +5512,10 @@ mod tests {
             inner.remote_to_local_pane_id(&mux, 61),
             Some(pane.pane_id())
         );
-        assert!(
-            pane.downcast_ref::<ClientPane>()
-                .expect("resolved pane should be a client pane")
-                .is_alt_screen_active()
-        );
+        assert!(pane
+            .downcast_ref::<ClientPane>()
+            .expect("resolved pane should be a client pane")
+            .is_alt_screen_active());
     }
 
     #[test]

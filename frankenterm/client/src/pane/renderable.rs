@@ -1513,6 +1513,19 @@ impl RenderableInner {
             self.release_exact_fetch_reservations(&to_fetch, &fetch_token);
             return;
         }
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            64 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                self.release_exact_fetch_reservations(&to_fetch, &fetch_token);
+                log::error!(
+                    "main-thread scheduler rejected render-line fetch; released exact fetch reservations for retry: {rejected:?}"
+                );
+                return;
+            }
+        };
 
         let Some(registration) = self.mux_registration.load() else {
             for range in to_fetch.iter() {
@@ -1546,30 +1559,31 @@ impl RenderableInner {
             lines: to_fetch.clone().into(),
         });
 
-        promise::spawn::spawn(async move {
-            let result = request.await;
+        reservation
+            .spawn_local(async move {
+                let result = request.await;
 
-            let result = match result {
-                Ok(result) if result.pane_id == remote_pane_id => {
-                    hydrate_lines(&rpc, remote_pane_id, result.lines).await
-                }
-                Ok(result) => Err(anyhow::anyhow!(
-                    "GetLines response pane mismatch: expected {remote_pane_id}, got {}",
-                    result.pane_id
-                )),
-                Err(err) => Err(err),
-            };
-            Self::apply_lines(
-                registration,
-                renderable,
-                local_pane_id,
-                rpc,
-                result,
-                to_fetch,
-                fetch_token,
-            )
-        })
-        .detach();
+                let result = match result {
+                    Ok(result) if result.pane_id == remote_pane_id => {
+                        hydrate_lines(&rpc, remote_pane_id, result.lines).await
+                    }
+                    Ok(result) => Err(anyhow::anyhow!(
+                        "GetLines response pane mismatch: expected {remote_pane_id}, got {}",
+                        result.pane_id
+                    )),
+                    Err(err) => Err(err),
+                };
+                Self::apply_lines(
+                    registration,
+                    renderable,
+                    local_pane_id,
+                    rpc,
+                    result,
+                    to_fetch,
+                    fetch_token,
+                )
+            })
+            .detach();
     }
 
     fn apply_lines(
@@ -1676,6 +1690,18 @@ impl RenderableInner {
         let Some(renderable) = self.renderable.upgrade() else {
             return Ok(());
         };
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            16 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                log::error!(
+                    "main-thread scheduler rejected liveness poll before state mutation; next poll remains eligible: {rejected:?}"
+                );
+                return Ok(());
+            }
+        };
 
         self.last_poll = Instant::now();
         self.poll_in_progress.store(true, Ordering::SeqCst);
@@ -1686,8 +1712,9 @@ impl RenderableInner {
         let request = rpc.get_pane_render_changes(GetPaneRenderChanges {
             pane_id: remote_pane_id,
         });
-        promise::spawn::spawn(async move {
-            let response = request.await;
+        reservation
+            .spawn_local(async move {
+                let response = request.await;
             let cleared = registration.try_with_current(|_| {
                 let renderable = renderable.lock();
                 let inner = renderable.inner.borrow();
@@ -1730,9 +1757,9 @@ impl RenderableInner {
                     local_pane_id
                 );
             }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+                Ok::<(), anyhow::Error>(())
+            })
+            .detach();
         Ok(())
     }
 }

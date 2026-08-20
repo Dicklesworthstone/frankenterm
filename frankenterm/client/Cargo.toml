@@ -43,3 +43,6 @@ wezterm-uds = { workspace = true, default-features = false, features = ["async-a
 winapi = { workspace=true, features = [
     "winuser",
 ]}
+
+[dev-dependencies]
+promise = { workspace = true, features = ["test-support"] }

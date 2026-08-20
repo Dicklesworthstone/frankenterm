@@ -43,8 +43,8 @@ fn pane_writer_write_is_nonblocking_and_spawns_the_rpc() {
         "PaneWriter::write must construct the remote pane-write RPC"
     );
     assert!(
-        executable.contains("promise::spawn::spawn(request).detach()"),
-        "PaneWriter::write must detach the constructed RPC onto the runtime"
+        executable.contains("dispatch_interactive_rpc(request, \"write_to_pane\")"),
+        "PaneWriter::write must use explicit bounded input admission for the constructed RPC"
     );
     for forbidden in ["block_on(", "block_on_io("] {
         assert!(

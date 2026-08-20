@@ -84,6 +84,21 @@ impl MouseState {
 
     pub fn next(state: Arc<Mutex<Self>>) -> bool {
         let mut mouse = state.lock();
+        if mouse.pending.load(Ordering::SeqCst) || mouse.queue.is_empty() {
+            return false;
+        }
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                log::error!(
+                    "main-thread scheduler rejected queued mouse input; retained the exact queued event for retry: {rejected:?}"
+                );
+                return false;
+            }
+        };
         if let Some(QueuedMouseEvent { event, scope }) = mouse.pop() {
             let state = Arc::clone(&state);
             mouse.pending.store(true, Ordering::SeqCst);
@@ -93,17 +108,18 @@ impl MouseState {
                 event,
             });
 
-            promise::spawn::spawn(async move {
-                request.await.ok();
+            reservation
+                .spawn_local(async move {
+                    request.await.ok();
 
-                let mouse = state.lock();
-                mouse.pending.store(false, Ordering::SeqCst);
-                drop(mouse);
+                    let mouse = state.lock();
+                    mouse.pending.store(false, Ordering::SeqCst);
+                    drop(mouse);
 
-                Self::next(Arc::clone(&state));
-                Ok::<(), anyhow::Error>(())
-            })
-            .detach();
+                    Self::next(Arc::clone(&state));
+                    Ok::<(), anyhow::Error>(())
+                })
+                .detach();
             true
         } else {
             false

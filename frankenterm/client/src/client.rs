@@ -1,16 +1,16 @@
 use crate::domain::{ClientDomain, ClientDomainConfig, ClientInner};
 use crate::pane::ClientPane;
-use anyhow::{Context, anyhow, bail};
-use asupersync::Cx;
+use anyhow::{anyhow, bail, Context};
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
-use async_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
+use asupersync::Cx;
+use async_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
-use config::{SshDomain, TlsDomainClient, UnixDomain, UnixTarget, configuration};
+use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
 use filedescriptor::FileDescriptor;
-use futures::future::{Either, ready, select};
+use futures::future::{ready, select, Either};
 use futures::pin_mut;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
@@ -24,9 +24,13 @@ use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use portable_pty::Child;
-use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
+use promise::spawn::{
+    MainThreadReservationOutcome, MainThreadServiceClass, MainThreadSpawnReservation,
+    try_reserve_main_thread,
+};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque};
 use std::convert::TryFrom;
-use std::future::{Future, poll_fn};
+use std::future::{poll_fn, Future};
 use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
@@ -35,7 +39,7 @@ use std::num::NonZeroU64;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
@@ -54,6 +58,7 @@ const MAX_RPC_READINESS_PUBLICATIONS: usize = 64;
 const MAX_RPC_READINESS_WAITERS: usize = 64;
 const MUX_RPC_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 const TOPOLOGY_FENCE_MIN_CODEC_VERSION: usize = 49;
+const CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES: usize = 4 * 1024;
 const CLIENT_OUTBOUND_NONINTERACTIVE_SLOTS: usize = 4_096;
 const CLIENT_OUTBOUND_RESERVED_SLOTS: usize = 64;
 const CLIENT_OUTBOUND_TOTAL_SLOTS: usize =
@@ -70,6 +75,19 @@ pub(crate) const TEST_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
         TopologyStreamId::from_bytes([0x35; 16]),
         MuxSessionIncarnation::from_bytes([0x57; 16]),
     );
+
+fn reserve_client_main_thread(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+) -> anyhow::Result<MainThreadSpawnReservation> {
+    match try_reserve_main_thread(service_class, estimated_bytes) {
+        MainThreadReservationOutcome::Reserved(reservation) => Ok(reservation),
+        rejected => Err(anyhow!(
+            "main-thread scheduler rejected {operation} before task construction: {rejected:?}"
+        )),
+    }
+}
 
 #[derive(Error, Debug)]
 #[error("Timeout")]
@@ -194,7 +212,9 @@ impl std::fmt::Display for RpcRetirementStage {
 /// the operation even though no matching reply reached this client.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RpcTransportError {
-    #[error("mux client RPC transport unavailable for attempt {attempt_id} ({request}) at {stage}")]
+    #[error(
+        "mux client RPC transport unavailable for attempt {attempt_id} ({request}) at {stage}"
+    )]
     Unavailable {
         attempt_id: NonZeroU64,
         request: &'static str,
@@ -4256,9 +4276,12 @@ fn process_unilateral(
     let Some(dispatch) = authority.resolve_current()? else {
         return Ok(());
     };
-    promise::spawn::spawn_into_main_thread(async move {
-        apply_unilateral_on_main_thread(dispatch, decoded).await
-    })
+    reserve_client_main_thread(
+        MainThreadServiceClass::Topology,
+        CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES,
+        "unilateral client update",
+    )?
+    .spawn(async move { apply_unilateral_on_main_thread(dispatch, decoded).await })
     .detach();
     Ok(())
 }
@@ -4277,9 +4300,13 @@ async fn process_unilateral_with_barrier(
     let Some(dispatch) = authority.resolve_current()? else {
         return Ok(());
     };
-    promise::spawn::spawn_into_main_thread(async move {
-        apply_unilateral_on_main_thread(dispatch, decoded).await
-    })
+    reserve_client_main_thread(
+        MainThreadServiceClass::Topology,
+        CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES,
+        "barriered unilateral client update",
+    )?
+    .spawn(async move { apply_unilateral_on_main_thread(dispatch, decoded).await })
+    .into_task()
     .await
 }
 
@@ -5401,38 +5428,57 @@ fn spawn_pre_ready_unilateral_replay(
     let mut abort_guard = replay_scope
         .fatal_abort_guard("pre-ready unilateral replay failed or was cancelled")
         .expect("an exact pre-ready replay scope always has a generation");
-    promise::spawn::spawn(async move {
-        let result = async {
-            for queued in batch {
-                let decoded = queued.decode()?;
-                process_unilateral_with_barrier(&dispatch_authority, decoded)
-                    .await
-                    .context("replaying a pre-ready unilateral PDU")?;
+    let reservation = match reserve_client_main_thread(
+        MainThreadServiceClass::Topology,
+        replayed_bytes.saturating_add(4 * 1024),
+        "pre-ready unilateral replay",
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            metrics::counter!(
+                "mux.client.rpc.readiness_replay_completion.total",
+                "outcome" => "scheduler_rejected"
+            )
+            .increment(1);
+            log::error!(
+                "failed to schedule mandatory pre-ready unilateral replay; exact RPC generation will be aborted: {error:#}"
+            );
+            return;
+        }
+    };
+    reservation
+        .spawn(async move {
+            let result = async {
+                for queued in batch {
+                    let decoded = queued.decode()?;
+                    process_unilateral_with_barrier(&dispatch_authority, decoded)
+                        .await
+                        .context("replaying a pre-ready unilateral PDU")?;
+                }
+                anyhow::Result::<()>::Ok(())
+            }
+            .await;
+
+            let completion = ReaderMessage::FinishReadyReplay {
+                generation,
+                reader_sender: reader_sender.clone(),
+                replayed_pdus,
+                replayed_bytes,
+                result,
+            };
+            match reader_sender.try_send(completion) {
+                Ok(()) => abort_guard.disarm(),
+                Err(_) => {
+                    metrics::counter!(
+                        "mux.client.rpc.readiness_replay_completion.total",
+                        "outcome" => "reader_queue_unavailable"
+                    )
+                    .increment(1);
+                }
             }
             anyhow::Result::<()>::Ok(())
-        }
-        .await;
-
-        let completion = ReaderMessage::FinishReadyReplay {
-            generation,
-            reader_sender: reader_sender.clone(),
-            replayed_pdus,
-            replayed_bytes,
-            result,
-        };
-        match reader_sender.try_send(completion) {
-            Ok(()) => abort_guard.disarm(),
-            Err(_) => {
-                metrics::counter!(
-                    "mux.client.rpc.readiness_replay_completion.total",
-                    "outcome" => "reader_queue_unavailable"
-                )
-                .increment(1);
-            }
-        }
-        anyhow::Result::<()>::Ok(())
-    })
-    .detach();
+        })
+        .detach();
 }
 
 fn commit_rpc_transport_ready(
@@ -8058,25 +8104,44 @@ impl Client {
                                     match reconnect_dispatch_authority.resolve_current() {
                                         Ok(Some(dispatch)) => {
                                             let rpc = dispatch.bootstrap_rpc_scope();
-                                            promise::spawn::spawn_into_main_thread(async move {
-                                                if !dispatch.rpc_generation_is_live() {
-                                                    return Ok(());
+                                            match reserve_client_main_thread(
+                                                MainThreadServiceClass::Topology,
+                                                CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES,
+                                                "reconnect reattach",
+                                            ) {
+                                                Ok(reservation) => {
+                                                    reservation
+                                                        .spawn(async move {
+                                                            if !dispatch.rpc_generation_is_live() {
+                                                                return;
+                                                            }
+                                                            let result =
+                                                                ClientDomain::reattach_if_current(
+                                                                    Arc::clone(&dispatch.mux),
+                                                                    &dispatch.domain,
+                                                                    Arc::clone(&dispatch.inner),
+                                                                    rpc,
+                                                                    reattach_ui,
+                                                                )
+                                                                .await;
+                                                            if !dispatch.rpc_generation_is_live() {
+                                                                return;
+                                                            }
+                                                            if let Err(err) = result {
+                                                                log::error!(
+                                                                    "reconnected mux client reattach failed: {err:#}"
+                                                                );
+                                                            }
+                                                        })
+                                                        .detach();
+                                                    reconnected = true;
                                                 }
-                                                let result = ClientDomain::reattach_if_current(
-                                                    Arc::clone(&dispatch.mux),
-                                                    &dispatch.domain,
-                                                    Arc::clone(&dispatch.inner),
-                                                    rpc,
-                                                    reattach_ui,
-                                                )
-                                                .await;
-                                                if !dispatch.rpc_generation_is_live() {
-                                                    return Ok(());
+                                                Err(err) => {
+                                                    log::error!(
+                                                        "cannot schedule reconnect reattach for domain {local_domain_id}: {err:#}"
+                                                    );
                                                 }
-                                                result
-                                            })
-                                            .detach();
-                                            reconnected = true;
+                                            }
                                         }
                                         Ok(None) => {
                                             log::error!(
@@ -8128,18 +8193,35 @@ impl Client {
                     .close_rpc_transport(&receiver, "mux client reconnect loop terminated");
                 match reconnect_dispatch_authority.resolve_current() {
                     Ok(Some(dispatch)) => {
-                        promise::spawn::spawn_into_main_thread(async move {
-                            if !dispatch.is_current() {
-                                return Ok(());
+                        match reserve_client_main_thread(
+                            MainThreadServiceClass::Topology,
+                            CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES,
+                            "final client detach",
+                        ) {
+                            Ok(reservation) => reservation
+                                .spawn(async move {
+                                    if !dispatch.is_current() {
+                                        return;
+                                    }
+                                    let client_domain = dispatch.client_domain();
+                                    if !dispatch.is_current() {
+                                        return;
+                                    }
+                                    let _ =
+                                        client_domain.perform_detach_if_current(&dispatch.inner);
+                                })
+                                .detach(),
+                            Err(err) => {
+                                metrics::counter!(
+                                    "mux.client.final_detach_scheduler_admission",
+                                    "outcome" => "terminal_rejection"
+                                )
+                                .increment(1);
+                                log::error!(
+                                    "final mux client detach was not scheduled; exact client generation remains fenced by the closed transport: {err:#}"
+                                );
                             }
-                            let client_domain = dispatch.client_domain();
-                            if !dispatch.is_current() {
-                                return Ok(());
-                            }
-                            let _ = client_domain.perform_detach_if_current(&dispatch.inner);
-                            anyhow::Result::<()>::Ok(())
-                        })
-                        .detach();
+                        }
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -8988,11 +9070,9 @@ mod tests {
         let records = logger.records.lock().expect("test logger lock");
         assert_eq!(records.len(), MAX_CAPTURED_COMPAT_WARNINGS);
         assert!(records.iter().all(|record| record.starts_with("WARN ")));
-        assert!(
-            records
-                .last()
-                .is_some_and(|record| record.ends_with("server=31"))
-        );
+        assert!(records
+            .last()
+            .is_some_and(|record| record.ends_with("server=31")));
     }
 
     fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -10338,11 +10418,9 @@ mod tests {
             .expect("register pending readiness participant");
         let error = asupersync_block_on(client.publish_rpc_transport_ready(&rpc, &guard))
             .expect_err("readiness must fail before bootstrap establishes protocol authority");
-        assert!(
-            error
-                .to_string()
-                .contains("before codec negotiation and client registration are established")
-        );
+        assert!(error
+            .to_string()
+            .contains("before codec negotiation and client registration are established"));
         assert_eq!(
             client
                 .rpc_transport
@@ -10795,10 +10873,8 @@ mod tests {
         let reader_abort = rpc_transport
             .reader_abort_for(generation)
             .expect("test reader has generation abort authority");
-        assert!(
-            rpc_transport
-                .request_generation_abort(&reader_abort, "ready-operation cancellation race",)
-        );
+        assert!(rpc_transport
+            .request_generation_abort(&reader_abort, "ready-operation cancellation race",));
 
         let error =
             asupersync_block_on(rpc_transport.complete_before_reader_stop(
@@ -10846,11 +10922,9 @@ mod tests {
             .reader_abort_for(successor_generation)
             .expect("successor has fresh reader abort authority");
 
-        assert!(
-            !authority
-                .rpc_transport
-                .request_generation_abort(&first_abort, "stale first-generation cancellation",)
-        );
+        assert!(!authority
+            .rpc_transport
+            .request_generation_abort(&first_abort, "stale first-generation cancellation",));
         assert!(first_abort.cause().is_none());
         assert!(successor_abort.cause().is_none());
         assert_eq!(
@@ -11093,10 +11167,8 @@ mod tests {
         let reader_abort = rpc_transport
             .reader_abort_for(generation)
             .expect("test reader has generation abort authority");
-        assert!(
-            rpc_transport
-                .request_generation_abort(&reader_abort, "test exact-generation predicate split",)
-        );
+        assert!(rpc_transport
+            .request_generation_abort(&reader_abort, "test exact-generation predicate split",));
 
         assert!(
             rpc_transport.reader_abort_for(generation).is_err(),
@@ -11113,16 +11185,12 @@ mod tests {
         let generation =
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
-        assert!(
-            authority
-                .register_participant()
-                .expect("register first readiness participant")
-        );
-        assert!(
-            authority
-                .register_participant()
-                .expect("register duplicate readiness participant")
-        );
+        assert!(authority
+            .register_participant()
+            .expect("register first readiness participant"));
+        assert!(authority
+            .register_participant()
+            .expect("register duplicate readiness participant"));
 
         assert!(
             !authority.release_participant(true),
@@ -11145,11 +11213,9 @@ mod tests {
         let generation =
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
-        assert!(
-            authority
-                .register_participant()
-                .expect("register readiness participant")
-        );
+        assert!(authority
+            .register_participant()
+            .expect("register readiness participant"));
         assert!(
             authority.release_participant(true),
             "the last cancelled participant must commit one abort"
@@ -11157,19 +11223,15 @@ mod tests {
         let error = authority
             .mark_ready()
             .expect_err("publication cannot race past a committed last-participant abort");
-        assert!(
-            error
-                .to_string()
-                .contains("lost all readiness participants")
-        );
+        assert!(error
+            .to_string()
+            .contains("lost all readiness participants"));
         let error = authority
             .register_participant()
             .expect_err("a late participant cannot resurrect aborted authority");
-        assert!(
-            error
-                .to_string()
-                .contains("already committed readiness abort")
-        );
+        assert!(error
+            .to_string()
+            .contains("already committed readiness abort"));
     }
 
     #[test]
@@ -11178,11 +11240,9 @@ mod tests {
             NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("generation is nonzero");
         let authority = RpcReadinessAuthority::new(generation);
         for _ in 0..MAX_RPC_READINESS_PARTICIPANTS {
-            assert!(
-                authority
-                    .register_participant()
-                    .expect("participant below the bound must register")
-            );
+            assert!(authority
+                .register_participant()
+                .expect("participant below the bound must register"));
         }
         let error = authority
             .register_participant()
@@ -11700,11 +11760,9 @@ mod tests {
             .try_recv()
             .expect("retirement must complete the queued publication")
             .expect_err("a retired readiness publication must fail");
-        assert!(
-            retired
-                .to_string()
-                .contains("retired before reader admission")
-        );
+        assert!(retired
+            .to_string()
+            .contains("retired before reader admission"));
         assert_eq!(stale_authority.state.lock().queued_publications, 0);
         successor
             .activate_rpc_transport()
@@ -12753,12 +12811,10 @@ mod tests {
             .set_stage(first_serial, RpcRetirementStage::AwaitingResponse)
             .expect("track the first request as emitted");
         first.fail_all("first transport disconnected");
-        assert!(
-            first_rx
-                .try_recv()
-                .expect("first waiter must retire")
-                .is_err()
-        );
+        assert!(first_rx
+            .try_recv()
+            .expect("first waiter must retire")
+            .is_err());
         first_probe.assert_balanced();
 
         let (_sender, receiver) = unbounded();
@@ -12835,21 +12891,17 @@ mod tests {
         first
             .complete(first_serial, Pdu::Pong(Pong {}))
             .expect("first connection reply should enqueue");
-        assert!(
-            first_rx
-                .try_recv()
-                .expect("first connection completion")
-                .is_ok()
-        );
+        assert!(first_rx
+            .try_recv()
+            .expect("first connection completion")
+            .is_ok());
         assert_eq!(probe.pending(), 1.0);
 
         drop(second);
-        assert!(
-            second_rx
-                .try_recv()
-                .expect("PendingReplies::drop must wake the live waiter")
-                .is_err()
-        );
+        assert!(second_rx
+            .try_recv()
+            .expect("PendingReplies::drop must wake the live waiter")
+            .is_err());
         assert_eq!(probe.pending(), 0.0);
         assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
         assert_eq!(RpcMetricProbe::counter(&probe.transport_failed_live), 1);
@@ -12963,12 +13015,10 @@ mod tests {
         );
 
         pending.fail_all("wire serial space exhausted");
-        assert!(
-            max_rx
-                .try_recv()
-                .expect("the maximum-serial waiter must retire exactly once")
-                .is_err()
-        );
+        assert!(max_rx
+            .try_recv()
+            .expect("the maximum-serial waiter must retire exactly once")
+            .is_err());
         probe.assert_balanced();
     }
 
@@ -12997,12 +13047,10 @@ mod tests {
                 pending_request: "Ping",
             } if serial == original_serial
         ));
-        assert!(
-            collision_rx
-                .try_recv()
-                .expect("collision should wake the caller")
-                .is_err()
-        );
+        assert!(collision_rx
+            .try_recv()
+            .expect("collision should wake the caller")
+            .is_err());
         assert_eq!(pending.map.len(), 1);
         assert_eq!(
             pending
@@ -13466,12 +13514,10 @@ mod tests {
                 header_len
             );
             pending.fail_after_decode_error(&error);
-            assert!(
-                completion_rx
-                    .try_recv()
-                    .expect("terminal cleanup wakes the pending caller exactly once")
-                    .is_err()
-            );
+            assert!(completion_rx
+                .try_recv()
+                .expect("terminal cleanup wakes the pending caller exactly once")
+                .is_err());
             assert!(matches!(
                 completion_rx.try_recv(),
                 Err(async_channel::TryRecvError::Empty) | Err(async_channel::TryRecvError::Closed)
@@ -13529,12 +13575,10 @@ mod tests {
             header_len
         );
         pending.fail_after_decode_error(&error);
-        assert!(
-            completion_rx
-                .try_recv()
-                .expect("terminal cleanup wakes the pending caller")
-                .is_err()
-        );
+        assert!(completion_rx
+            .try_recv()
+            .expect("terminal cleanup wakes the pending caller")
+            .is_err());
         probe.assert_balanced();
     }
 
@@ -13669,12 +13713,10 @@ mod tests {
             );
 
             pending.fail_after_decode_error(&error);
-            assert!(
-                completion_rx
-                    .try_recv()
-                    .expect("terminal teardown must retire the pending caller")
-                    .is_err()
-            );
+            assert!(completion_rx
+                .try_recv()
+                .expect("terminal teardown must retire the pending caller")
+                .is_err());
             probe.assert_balanced();
         }
     }
@@ -14347,12 +14389,10 @@ mod tests {
 
             pending.fail_after_decode_error(&error);
             if let Some(completion_rx) = completion_rx {
-                assert!(
-                    completion_rx
-                        .try_recv()
-                        .expect("live waiter must be woken by terminal teardown")
-                        .is_err()
-                );
+                assert!(completion_rx
+                    .try_recv()
+                    .expect("live waiter must be woken by terminal teardown")
+                    .is_err());
             }
             assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 0);
             probe.assert_balanced();
@@ -14431,12 +14471,10 @@ mod tests {
         );
 
         pending.fail_after_decode_error(&error);
-        assert!(
-            completion_rx
-                .try_recv()
-                .expect("retirement must wake the live response waiter")
-                .is_err()
-        );
+        assert!(completion_rx
+            .try_recv()
+            .expect("retirement must wake the live response waiter")
+            .is_err());
         probe.assert_balanced();
     }
 
@@ -14465,12 +14503,10 @@ mod tests {
             duplicate_error,
             PendingRpcError::UnmatchedSerial { serial, .. } if serial == completed_serial
         ));
-        assert!(
-            duplicate_witness_rx
-                .try_recv()
-                .expect("duplicate reply must wake every other live waiter")
-                .is_err()
-        );
+        assert!(duplicate_witness_rx
+            .try_recv()
+            .expect("duplicate reply must wake every other live waiter")
+            .is_err());
         duplicate_probe.assert_balanced();
 
         let (mut full_pending, full_probe) = pending_replies_for_test();
@@ -14496,18 +14532,14 @@ mod tests {
             full_error,
             PendingRpcError::ReplyChannelFull { serial, .. } if serial == full_serial
         ));
-        assert!(
-            full_rx
-                .try_recv()
-                .expect("prefilled reply must remain intact")
-                .is_ok()
-        );
-        assert!(
-            full_witness_rx
-                .try_recv()
-                .expect("full reply channel must wake every other live waiter")
-                .is_err()
-        );
+        assert!(full_rx
+            .try_recv()
+            .expect("prefilled reply must remain intact")
+            .is_ok());
+        assert!(full_witness_rx
+            .try_recv()
+            .expect("full reply channel must wake every other live waiter")
+            .is_err());
         full_probe.assert_balanced();
     }
 
@@ -14549,12 +14581,10 @@ mod tests {
             0.0,
             "header rejection must retire the transport and clear every waiter"
         );
-        assert!(
-            live_rx
-                .try_recv()
-                .expect("transport teardown must wake the admitted waiter")
-                .is_err()
-        );
+        assert!(live_rx
+            .try_recv()
+            .expect("transport teardown must wake the admitted waiter")
+            .is_err());
         probe.assert_balanced();
     }
 
@@ -15697,12 +15727,10 @@ mod tests {
             session_incarnation,
             snapshot_revision: TopologyRevision::new(snapshot_revision),
         };
-        assert!(
-            coordinator
-                .commit(authority)
-                .expect("initial coherent snapshot should commit")
-                .is_empty()
-        );
+        assert!(coordinator
+            .commit(authority)
+            .expect("initial coherent snapshot should commit")
+            .is_empty());
         (coordinator, authority)
     }
 
@@ -16300,12 +16328,10 @@ mod tests {
                     .expect("snapshot should await its exact commit"),
                 ClientTopologyResponseAction::AwaitCommit
             ));
-            assert!(
-                coordinator
-                    .commit(authority)
-                    .expect("snapshot should establish its connection-scoped stream")
-                    .is_empty()
-            );
+            assert!(coordinator
+                .commit(authority)
+                .expect("snapshot should establish its connection-scoped stream")
+                .is_empty());
             (coordinator, authority)
         };
         let (mut old_topology, old_authority) = establish(1, &old_snapshot);
@@ -16395,12 +16421,10 @@ mod tests {
             }
             _ => unreachable!("same-ID helper always returns a coherent response"),
         };
-        assert!(
-            old_topology
-                .commit(late_old_authority)
-                .expect("retired coordinator may settle only its own snapshot")
-                .is_empty()
-        );
+        assert!(old_topology
+            .commit(late_old_authority)
+            .expect("retired coordinator may settle only its own snapshot")
+            .is_empty());
         assert_eq!(
             new_state(&new_topology),
             before_stale_delivery,
@@ -16417,11 +16441,9 @@ mod tests {
                 },
             })))
             .expect_err("an old-session event must not target reused successor identifiers");
-        assert!(
-            stale_event_error
-                .to_string()
-                .contains("wrong established stream identity")
-        );
+        assert!(stale_event_error
+            .to_string()
+            .contains("wrong established stream identity"));
         assert_eq!(
             new_state(&new_topology),
             before_stale_delivery,
@@ -16616,12 +16638,9 @@ mod tests {
             .expect("live generation has exact reader abort authority");
         assert!(authority.generation_is_current());
 
-        assert!(
-            authority.rpc_transport.request_generation_abort(
-                &reader_abort,
-                "test cancellation before reader teardown",
-            )
-        );
+        assert!(authority
+            .rpc_transport
+            .request_generation_abort(&reader_abort, "test cancellation before reader teardown",));
         assert!(
             authority.generation_is_current(),
             "identity authority must remain current so final detach can resolve its owner"

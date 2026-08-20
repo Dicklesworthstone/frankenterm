@@ -148,19 +148,23 @@ mod mux_test_scope_tests {
         let _scope = MuxTestScope::enter();
         let ran = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
-        let ran_in_task = Arc::clone(&ran);
         let probe = DropProbe(Arc::clone(&dropped));
 
-        promise::spawn::spawn(async move {
-            let _probe = probe;
-            ran_in_task.store(true, Ordering::SeqCst);
-        })
-        .detach();
+        let outcome = promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            4 * 1024,
+        );
+        assert!(matches!(
+            outcome,
+            promise::spawn::MainThreadReservationOutcome::SchedulerUnavailable
+        ));
 
         assert!(!ran.load(Ordering::SeqCst));
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(probe);
         assert!(
             dropped.load(Ordering::SeqCst),
-            "rejecting the runnable must cancel and drop its future immediately"
+            "rejected admission must leave future construction and disposal with the producer"
         );
     }
 
