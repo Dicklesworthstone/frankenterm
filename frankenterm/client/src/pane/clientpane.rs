@@ -188,6 +188,7 @@ impl ReliableInputQueue {
         });
     }
 
+    #[cfg(test)]
     fn enqueue(
         self: &Arc<Self>,
         client: &Arc<ClientInner>,

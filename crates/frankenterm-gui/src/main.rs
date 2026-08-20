@@ -349,7 +349,7 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let start_command = StartCommand {
+    let mut start_command = StartCommand {
         always_new_process: true,
         class: opts.class,
         cwd: None,
@@ -368,17 +368,16 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     };
 
     let domain: Arc<dyn Domain> = Arc::new(mux::ssh::RemoteSshDomain::with_ssh_domain(&dom)?);
-    let domain_id = domain.domain_id();
     let mux = Mux::try_get().context("mux singleton is not available")?;
-    mux.add_domain(&domain)?;
-    let domain_guard = mux.get_domain(domain_id).ok_or_else(|| {
-        anyhow::anyhow!("SSH domain {domain_id} retired before becoming the default domain")
-    })?;
+    let domain_guard = mux.add_domain_and_acquire(&domain)?;
+    start_command.domain = Some(domain_guard.domain_name().to_string());
     drop(domain);
     mux.set_default_domain_guard(&domain_guard)?;
 
     let should_publish = false;
-    async_run_terminal_gui(cmd, start_command, should_publish).await
+    let result = async_run_terminal_gui(cmd, start_command, should_publish).await;
+    drop(domain_guard);
+    result
 }
 
 fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -413,14 +412,14 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
         baud: opts.baud,
     };
 
-    let start_command = StartCommand {
+    let mut start_command = StartCommand {
         always_new_process: true,
         class: opts.class,
         cwd: None,
         no_auto_connect: true,
         position: opts.position,
         workspace: None,
-        domain: Some(serial_domain.name.clone()),
+        domain: None,
         ..Default::default()
     };
 
@@ -428,10 +427,14 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
 
     let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_serial_domain(serial_domain)?);
     let mux = Mux::try_get().context("mux singleton is not available")?;
-    mux.add_domain(&domain)?;
+    let domain_guard = mux.add_domain_and_acquire(&domain)?;
+    start_command.domain = Some(domain_guard.domain_name().to_string());
+    drop(domain);
 
     let should_publish = false;
-    async_run_terminal_gui(cmd, start_command, should_publish).await
+    let result = async_run_terminal_gui(cmd, start_command, should_publish).await;
+    drop(domain_guard);
+    result
 }
 
 fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Result<()> {
@@ -944,7 +947,7 @@ fn setup_mux(
     default_domain_name: Option<&str>,
     default_workspace_name: Option<&str>,
 ) -> anyhow::Result<Arc<Mux>> {
-    let mux = Arc::new(mux::Mux::new(Some(local_domain.clone())));
+    let mux = Arc::new(mux::Mux::new(Some(local_domain)));
     Mux::set_mux(&mux);
     let client_id = Arc::new(mux::client::ClientId::new());
     mux.register_client(client_id.clone());
@@ -1268,6 +1271,222 @@ mod tests {
     use super::*;
     use frankenterm_core::macos_backend_select::{BackendFallbackReason, MacosBackend};
 
+    type GuardedStartupFuture = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), futures::channel::oneshot::Canceled>>>,
+    >;
+
+    fn poll_guarded_startup(
+        future: &mut GuardedStartupFuture,
+    ) -> std::task::Poll<Result<(), futures::channel::oneshot::Canceled>> {
+        use std::future::Future as _;
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        future.as_mut().poll(&mut context)
+    }
+
+    fn park_startup_guard(
+        domain_guard: DomainOperationGuard,
+    ) -> (futures::channel::oneshot::Sender<()>, GuardedStartupFuture) {
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+        let mut guarded_start: GuardedStartupFuture = Box::pin(async move {
+            let result = release_rx.await;
+            drop(domain_guard);
+            result
+        });
+        assert!(
+            matches!(
+                poll_guarded_startup(&mut guarded_start),
+                std::task::Poll::Pending
+            ),
+            "startup must park while retaining its exact domain guard"
+        );
+        (release_tx, guarded_start)
+    }
+
+    fn release_startup_guard(
+        release_tx: futures::channel::oneshot::Sender<()>,
+        mut guarded_start: GuardedStartupFuture,
+    ) {
+        release_tx.send(()).expect("release guarded startup await");
+        assert!(matches!(
+            poll_guarded_startup(&mut guarded_start),
+            std::task::Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn ssh_exact_selector_fails_instead_of_retargeting_local_fallback() {
+        let local: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("ssh-local-fallback").expect("create local fallback"));
+        let local_id = local.domain_id();
+        let mux = Arc::new(Mux::new(Some(local)));
+        let local_guard = mux
+            .get_domain(local_id)
+            .expect("local fallback must remain exactly registered");
+
+        let ssh: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("ssh-startup-race").expect("create guarded SSH domain"));
+        let ssh_id = ssh.domain_id();
+        let ssh_guard = mux
+            .add_domain_and_acquire(&ssh)
+            .expect("atomically publish and acquire SSH domain");
+        let start_selector = ssh_guard.domain_name().to_string();
+        mux.set_default_domain_guard(&ssh_guard)
+            .expect("exact SSH guard should become default");
+        assert!(
+            mux.default_domain()
+                .is_ok_and(|current| current.same_registration(&ssh_guard)),
+            "SSH must be the exact default before the planted retirement"
+        );
+
+        let retirement_ssh = Arc::clone(&ssh);
+        let same_id_successor = Arc::clone(&ssh);
+        drop(ssh);
+        let (release_guard_tx, guarded_start) = park_startup_guard(ssh_guard);
+        let mux_for_retirement = Arc::clone(&mux);
+        let (race_tx, race_rx) = std::sync::mpsc::sync_channel(0);
+        let retirement = std::thread::spawn(move || {
+            let retired = mux_for_retirement.domain_was_detached_if_same(&retirement_ssh);
+            let same_id_rejected = matches!(
+                mux_for_retirement.add_domain(&retirement_ssh),
+                Err(mux::DomainRegistrationError::RetiredIdentifier { .. })
+            );
+            race_tx
+                .send((retired, same_id_rejected))
+                .expect("report deterministic SSH retirement race");
+        });
+        let (retired, same_id_rejected) = race_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("SSH retirement must reach its same-ID probe");
+        assert!(retired, "racing retirement must close the exact SSH domain");
+        assert!(
+            same_id_rejected,
+            "same-ID SSH publication must stay fenced while startup awaits"
+        );
+        assert!(
+            mux.default_domain()
+                .is_ok_and(|current| current.same_registration(&local_guard)),
+            "retiring SSH may promote local only as the ambient default"
+        );
+        assert!(
+            mux.get_domain_by_name(&start_selector).is_none(),
+            "the explicit SSH selector must fail closed instead of resolving local"
+        );
+        assert_ne!(
+            local_guard.domain_name(),
+            start_selector,
+            "the planted fallback must be observably different from SSH"
+        );
+        retirement
+            .join()
+            .expect("SSH retirement thread must not panic");
+
+        release_startup_guard(release_guard_tx, guarded_start);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match mux.add_domain(&same_id_successor) {
+                Ok(()) => break,
+                Err(mux::DomainRegistrationError::RetiredIdentifier { .. }) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "SSH guard release did not release the same-ID fence"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("unexpected same-ID SSH publication failure: {error}"),
+            }
+        }
+        assert!(
+            mux.get_domain_by_name(&start_selector)
+                .is_some_and(|current| {
+                    current.domain_id() == ssh_id
+                        && current.is_same_domain(&same_id_successor)
+                        && !current.same_registration(&local_guard)
+                }),
+            "the explicit selector may resolve only the re-admitted SSH registration"
+        );
+    }
+
+    #[test]
+    fn serial_exact_name_rejects_distinct_id_retarget_until_guard_release() {
+        let name = "serial-startup-race";
+        let mux = Arc::new(Mux::new(None));
+        let serial: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new(name).expect("create guarded serial domain"));
+        let serial_id = serial.domain_id();
+        let serial_guard = mux
+            .add_domain_and_acquire(&serial)
+            .expect("atomically publish and acquire serial domain");
+        let start_selector = serial_guard.domain_name().to_string();
+        let distinct_same_name: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new(name).expect("create distinct same-name domain"));
+        let replacement_id = distinct_same_name.domain_id();
+        assert_ne!(
+            serial_id, replacement_id,
+            "same-name negative control must use a distinct numeric ID"
+        );
+        assert!(!serial_guard.is_same_domain(&distinct_same_name));
+
+        let retirement_serial = Arc::clone(&serial);
+        let contender = Arc::clone(&distinct_same_name);
+        drop(serial);
+        let (release_guard_tx, guarded_start) = park_startup_guard(serial_guard);
+        let mux_for_retirement = Arc::clone(&mux);
+        let (race_tx, race_rx) = std::sync::mpsc::sync_channel(0);
+        let retirement = std::thread::spawn(move || {
+            let retired = mux_for_retirement.domain_was_detached_if_same(&retirement_serial);
+            let same_name_rejected = matches!(
+                mux_for_retirement.add_domain(&contender),
+                Err(mux::DomainRegistrationError::NameInUse { .. })
+            );
+            race_tx
+                .send((retired, same_name_rejected))
+                .expect("report deterministic serial name-retirement race");
+        });
+        let (retired, same_name_rejected) = race_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("serial retirement must reach its same-name probe");
+        assert!(
+            retired,
+            "racing retirement must close the exact serial domain"
+        );
+        assert!(
+            same_name_rejected,
+            "distinct-ID same-name publication must stay fenced while startup awaits"
+        );
+        assert!(
+            mux.get_domain_by_name(&start_selector).is_none(),
+            "serial name must fail closed instead of retargeting the contender"
+        );
+        retirement
+            .join()
+            .expect("serial retirement thread must not panic");
+
+        release_startup_guard(release_guard_tx, guarded_start);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match mux.add_domain(&distinct_same_name) {
+                Ok(()) => break,
+                Err(mux::DomainRegistrationError::NameInUse { .. }) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "serial guard release did not release the exact-name fence"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("unexpected same-name publication failure: {error}"),
+            }
+        }
+        assert!(
+            mux.get_domain_by_name(&start_selector)
+                .is_some_and(|current| {
+                    current.domain_id() == replacement_id
+                        && current.is_same_domain(&distinct_same_name)
+                }),
+            "serial name may retarget only after the old exact guard releases"
+        );
+    }
+
     #[test]
     fn exact_default_domain_setter_rejects_foreign_guard() {
         let foreign_domain: Arc<dyn Domain> =
@@ -1297,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_default_domain_source_reacquires_guard_before_releasing_creator_arc() {
+    fn ssh_default_domain_source_holds_atomic_guard_through_terminal_start() {
         let source = include_str!("main.rs");
         let start = source
             .find("async fn async_run_ssh(")
@@ -1308,23 +1527,116 @@ mod tests {
             .expect("SSH command implementation must remain bounded");
         let body = &source[start..end];
         let raw_setter = ["mux.set_default_", "domain(&domain)"].concat();
+        let split_add = ["mux.add_", "domain(&domain)"].concat();
         assert!(
             !body.contains(&raw_setter),
             "SSH setup must not publish its creator Arc through the raw default setter"
         );
+        assert!(
+            !body.contains(&split_add),
+            "SSH setup must not split domain publication from exact guard admission"
+        );
 
-        let reacquire = body
-            .find("mux.get_domain(domain_id)")
-            .expect("SSH setup must reacquire an exact registered guard");
+        let atomic_add = ["mux.add_domain_", "and_acquire(&domain)"].concat();
+        let atomic_add = body
+            .find(&atomic_add)
+            .expect("SSH setup must atomically publish and acquire its exact guard");
+        let exact_name = body
+            .find("start_command.domain = Some(domain_guard.domain_name().to_string())")
+            .expect("SSH setup must derive its selector from the exact guard");
         let release_creator = body
             .find("drop(domain)")
             .expect("SSH setup must release its raw creator Arc explicitly");
         let guarded_setter = body
             .find("mux.set_default_domain_guard(&domain_guard)")
             .expect("SSH setup must publish only through the exact guard setter");
+        let stored_await = [
+            "let result = async_run_terminal_gui(",
+            "cmd, start_command, should_publish).await;",
+        ]
+        .concat();
+        let stored_await = body
+            .find(&stored_await)
+            .expect("SSH setup must store the terminal-start result while its guard is live");
+        let release_guard = body
+            .find("drop(domain_guard)")
+            .expect("SSH setup must explicitly release its exact guard");
         assert!(
-            reacquire < release_creator && release_creator < guarded_setter,
-            "the exact guard must exist before creator release and guarded default publication"
+            atomic_add < exact_name
+                && exact_name < release_creator
+                && release_creator < guarded_setter
+                && guarded_setter < stored_await
+                && stored_await < release_guard,
+            "SSH must retain atomic default-domain authority through terminal startup"
+        );
+    }
+
+    #[test]
+    fn serial_domain_source_holds_atomic_name_guard_through_terminal_start() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn async_run_serial(")
+            .expect("serial command implementation must remain present");
+        let end = source[start..]
+            .find("\nfn run_serial(")
+            .map(|offset| start + offset)
+            .expect("serial command implementation must remain bounded");
+        let body = &source[start..end];
+        let split_add = ["mux.add_", "domain(&domain)"].concat();
+        assert!(
+            !body.contains(&split_add),
+            "serial setup must not split domain publication from exact guard admission"
+        );
+        let atomic_add = ["mux.add_domain_", "and_acquire(&domain)"].concat();
+        let atomic_add = body
+            .find(&atomic_add)
+            .expect("serial setup must atomically publish and acquire its exact guard");
+        let exact_name = body
+            .find("start_command.domain = Some(domain_guard.domain_name().to_string())")
+            .expect("serial setup must derive its name selector from the exact guard");
+        let release_creator = body
+            .find("drop(domain)")
+            .expect("serial setup must release its raw creator Arc explicitly");
+        let stored_await = [
+            "let result = async_run_terminal_gui(",
+            "cmd, start_command, should_publish).await;",
+        ]
+        .concat();
+        let stored_await = body
+            .find(&stored_await)
+            .expect("serial setup must store terminal-start result while its guard is live");
+        let release_guard = body
+            .find("drop(domain_guard)")
+            .expect("serial setup must explicitly release its exact guard");
+        assert!(
+            atomic_add < exact_name
+                && exact_name < release_creator
+                && release_creator < stored_await
+                && stored_await < release_guard,
+            "serial must retain its atomic exact-name authority through terminal startup"
+        );
+    }
+
+    #[test]
+    fn setup_mux_moves_local_domain_without_retaining_creator_arc() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn setup_mux(")
+            .expect("mux setup implementation must remain present");
+        let end = source[start..]
+            .find("\nfn build_initial_mux(")
+            .map(|offset| start + offset)
+            .expect("mux setup implementation must remain bounded");
+        let body = &source[start..end];
+        let moved = ["Mux::new(Some(", "local_domain))"].concat();
+        let cloned = ["local_domain.", "clone()"].concat();
+        assert!(
+            body.contains(&moved),
+            "mux setup must transfer its sole local-domain creator Arc"
+        );
+        assert!(
+            !body.contains(&cloned),
+            "mux setup must not retain an extra local-domain creator Arc"
         );
     }
 

@@ -8860,27 +8860,43 @@ mod tests {
     #[test]
     fn reconnect_dispatch_source_borrows_domain_guard_through_post_await_check() {
         let source = include_str!("client.rs");
+        let dispatch_start =
+            ["match reconnect_dispatch_authority.", "resolve_current() {"].concat();
+        let none_branch = ["Ok(None)", " => {"].concat();
+        let start = source
+            .find(&dispatch_start)
+            .expect("production reconnect dispatch match must remain present");
+        let end = source[start..]
+            .find(&none_branch)
+            .map(|offset| start + offset + none_branch.len())
+            .expect("production reconnect dispatch match must retain its Ok(None) branch");
+        let reconnect_dispatch = &source[start..end];
         let raw_domain_clone = ["Arc::clone(&dispatch.", "domain)"].concat();
         let borrowed_domain = ["&dispatch.", "domain,"].concat();
         assert!(
-            !source.contains(&raw_domain_clone),
+            !reconnect_dispatch.contains(&raw_domain_clone),
             "reconnect dispatch must never clone a raw Domain Arc out of its exact guard"
         );
         assert_eq!(
-            source.matches(&borrowed_domain).count(),
+            reconnect_dispatch.matches(&borrowed_domain).count(),
             1,
             "the reconnect call must borrow exactly one dispatch-owned domain guard"
         );
 
-        let reconnect = source
+        let reconnect = reconnect_dispatch
             .find("let result = ClientDomain::reattach_if_current(")
             .expect("production reconnect dispatch call must remain present");
-        let after_reconnect = &source[reconnect..];
-        let await_end = after_reconnect
+        let await_end = reconnect_dispatch[reconnect..]
             .find(".await;")
+            .map(|offset| reconnect + offset + ".await;".len())
             .expect("production reconnect call must remain awaited");
+        let post_check = ["if !dispatch.", "rpc_generation_is_live()"].concat();
+        let post_check_position = reconnect_dispatch[await_end..]
+            .find(&post_check)
+            .map(|offset| await_end + offset)
+            .expect("production reconnect dispatch must retain its liveness check");
         assert!(
-            after_reconnect[await_end..].contains("if !dispatch.rpc_generation_is_live()"),
+            post_check_position > await_end,
             "dispatch and its domain guard must stay alive through the post-await liveness check"
         );
     }
