@@ -5,9 +5,9 @@ All notable changes to FrankenTerm (`ft`) are documented in this file.
 Organized by landed capabilities, not raw diff order. Each section describes what shipped and why it matters. Commit links point to the canonical GitHub repository at <https://github.com/Dicklesworthstone/frankenterm>.
 
 - **Default branch**: `main`
-- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.14.0` tag has a published GitHub Release; `backup-before-rewrite` is a tag only.
+- **Tags & GitHub Releases**: listed under [Tags & Releases](#tags--releases). Every `v0.2.0`–`v0.14.1` tag has a published GitHub Release; `backup-before-rewrite` is a tag only.
 
-Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.14.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.0) (2026-08-20). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
+Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) (2026-06-29) through [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) (2026-08-20). The previously omitted [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) GitHub Release (published 2026-07-28) remains a first-class version row.
 
 ## Version Timeline
 
@@ -15,18 +15,32 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.0...main) | HEAD | — | Next release |
+| [Unreleased](https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.1...main) | HEAD | — | Next release |
+| [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | Pane-input argv privacy and release-contract repair |
 | [v0.14.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.0) | Release | 2026-08-20 | Mux authority, scheduler admission, recorder truth, and protocol hardening |
 | [v0.13.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) | Release | 2026-07-28 | Test-suite honesty + tx/capture/redaction; full platform matrix |
 | [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) | Release | 2026-06-29 | asupersync 0.3.5 churn fix + window-maximize persistence |
 
 ---
 
-## [Unreleased] -- development on `main` since [v0.14.0](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.0)
+## [Unreleased] -- development on `main` since [v0.14.1](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1)
 
-Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.0...main>
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.1...main>
 
 No changes yet.
+
+---
+
+## [0.14.1] -- 2026-08-20 (GitHub Release)
+
+GitHub Release: <https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1>
+Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.0...v0.14.1>
+
+### Security and release correctness
+
+- Pane input now stays on the direct mux transport. If that transport is unavailable, the operation fails closed instead of exposing arbitrary terminal input in subprocess arguments.
+- Bridge I/O failures now return finite diagnostics that cannot echo backend or credential-bearing error details.
+- Signed historical product-catalog tests no longer depend on mutable ambient Beads or README state, and the workspace-wide Rust formatting gate is restored.
 
 ---
 
@@ -807,10 +821,11 @@ Migration: re-run `ft setup --wezterm` to update your `wezterm.lua`. The ft-mana
 
 Current refs do not include a `v0.1.0` tag; the `0.1.0` sections above are changelog milestones reconstructed from history, not published GitHub Releases.
 
-`Kind` distinguishes a published GitHub Release from a plain git tag. Every `v0.2.0`–`v0.14.0` tag below has a GitHub Release; `backup-before-rewrite` does not.
+`Kind` distinguishes a published GitHub Release from a plain git tag. Every `v0.2.0`–`v0.14.1` tag below has a GitHub Release; `backup-before-rewrite` does not.
 
 | Tag / Ref | Kind | Date | Points to | Description |
 |-----------|------|------|-----------|-------------|
+| [`v0.14.1`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.1) | Release | 2026-08-20 | tag `v0.14.1` | Pane-input argv privacy and release-contract repair |
 | [`v0.14.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.14.0) | Release | 2026-08-20 | tag `v0.14.0` | Mux authority, scheduler admission, recorder truth, and protocol hardening |
 | [`v0.13.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0) | Release | 2026-07-28 | [`c366f3ac9`](https://github.com/Dicklesworthstone/frankenterm/commit/c366f3ac95a2a53d6d86e438f1432bdcf4981f26) | Test-suite honesty (ft-nam3s) + tx/capture/redaction hardening; full platform matrix returns |
 | [`v0.12.0`](https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0) | Release | 2026-06-29 | tag `v0.12.0` | asupersync 0.3.5 churn fix + window-maximize persistence |
@@ -881,7 +896,7 @@ Current refs do not include a `v0.1.0` tag; the `0.1.0` sections above are chang
 ---
 
 <!-- Links -->
-[Unreleased]: https://github.com/Dicklesworthstone/frankenterm/compare/v0.13.0...main
+[Unreleased]: https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.1...main
 [0.13.0]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0
 [0.12.0]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0
 [0.1.0]: https://github.com/Dicklesworthstone/frankenterm/commits/main/?after=backup-before-rewrite
