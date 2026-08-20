@@ -50,6 +50,9 @@ const AUTHORITY_EXHAUSTED: u8 = 1;
 const LIFECYCLE_ACTIVE: u8 = 0;
 const LIFECYCLE_CLOSING: u8 = 1;
 const LIFECYCLE_CLOSED: u8 = 2;
+const TRACE_IDENTITY_EMPTY: u8 = 0;
+const TRACE_IDENTITY_WRITING: u8 = 1;
+const TRACE_IDENTITY_OCCUPIED: u8 = 2;
 const ADMISSION_SEALED: u64 = 1 << 63;
 const IN_FLIGHT_MASK: u64 = ADMISSION_SEALED - 1;
 const COUNTER_EXHAUSTED: u64 = u64::MAX;
@@ -141,11 +144,20 @@ impl RecorderConfig {
                 .map_err(|_| RecorderError::CapacityArithmeticOverflow)?;
         let padded_counter_bytes_per_shard = u32::try_from(size_of::<CachePadded<ShardCounters>>())
             .map_err(|_| RecorderError::CapacityArithmeticOverflow)?;
+        let shard_count_for_reservation = usize::from(shard_count).max(1);
+        let total_slots_for_reservation =
+            usize::try_from(total_slots).map_err(|_| RecorderError::CapacityArithmeticOverflow)?;
+        let trace_identity_slots_per_shard =
+            total_slots_for_reservation.div_ceil(shard_count_for_reservation);
+        let trace_identity_bytes_per_shard = trace_identity_slots_per_shard
+            .checked_mul(size_of::<ConsumedTraceIdentitySlot>())
+            .ok_or(RecorderError::CapacityArithmeticOverflow)?;
         let shard_metadata_bytes_per_shard = u32::try_from(
             size_of::<AtomicBool>()
                 .checked_add(size_of::<usize>())
                 .and_then(|bytes| bytes.checked_add(size_of::<FlightRecorder>()))
                 .and_then(|bytes| bytes.checked_add(size_of::<RecorderWorkspace>()))
+                .and_then(|bytes| bytes.checked_add(trace_identity_bytes_per_shard))
                 .and_then(|bytes| {
                     FIXED_BOOKKEEPING_WORDS_PER_SHARD
                         .checked_mul(size_of::<usize>())
@@ -463,6 +475,19 @@ pub enum RecordOutcome {
         accounting_authority: RecorderAccountingAuthority,
     },
     ClockInvalid {
+        accounting_authority: RecorderAccountingAuthority,
+    },
+    /// The exact trace identity already published this recorder's
+    /// once-per-trace historical pair. The duplicate pair is suppressed
+    /// atomically and the caller's operational behavior remains independent.
+    DuplicateTraceContext {
+        accounting_authority: RecorderAccountingAuthority,
+    },
+    /// The preallocated exact identity authority was temporarily or
+    /// permanently unavailable. This includes a colliding identity slot whose
+    /// finite atomic publication is in progress; the caller fails closed
+    /// instead of waiting on another producer.
+    TraceIdentityAuthorityUnavailable {
         accounting_authority: RecorderAccountingAuthority,
     },
 }
@@ -883,6 +908,54 @@ impl Drop for ProducerHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumedTraceIdentityClaim {
+    Claimed,
+    Duplicate,
+    Unavailable,
+}
+
+/// One preallocated exact trace-ID slot.
+///
+/// The state word publishes the three numeric identity words with
+/// release/acquire ordering. A writer owns `WRITING` for only the finite
+/// sequence of atomic stores below, so a colliding concurrent claimant can
+/// fail closed without observing a torn identity or allocating, locking, or
+/// waiting on the hot path.
+#[derive(Debug, Default)]
+struct ConsumedTraceIdentitySlot {
+    state: AtomicU8,
+    run_nonce_hi: AtomicU64,
+    run_nonce_lo: AtomicU64,
+    sequence: AtomicU64,
+}
+
+impl ConsumedTraceIdentitySlot {
+    fn matches(&self, trace_id: InteractionTraceId) -> bool {
+        self.run_nonce_hi.load(Ordering::Relaxed) == trace_id.run_id.epoch_nonce_hi
+            && self.run_nonce_lo.load(Ordering::Relaxed) == trace_id.run_id.epoch_nonce_lo
+            && self.sequence.load(Ordering::Relaxed) == trace_id.sequence
+    }
+
+    fn publish(&self, trace_id: InteractionTraceId) {
+        self.run_nonce_hi
+            .store(trace_id.run_id.epoch_nonce_hi, Ordering::Relaxed);
+        self.run_nonce_lo
+            .store(trace_id.run_id.epoch_nonce_lo, Ordering::Relaxed);
+        self.sequence.store(trace_id.sequence, Ordering::Relaxed);
+        self.state.store(TRACE_IDENTITY_OCCUPIED, Ordering::Release);
+    }
+}
+
+fn consumed_trace_identity_hash(trace_id: InteractionTraceId) -> u64 {
+    let mut value = trace_id.run_id.epoch_nonce_hi.rotate_left(17)
+        ^ trace_id.run_id.epoch_nonce_lo.rotate_left(41)
+        ^ trace_id.sequence;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 #[derive(Debug)]
 struct RecorderShard {
     queue: CachePadded<ArrayQueue<RawInteractionEvent>>,
@@ -901,6 +974,8 @@ struct ShardCounters {
     closing: AtomicU64,
     clock_invalid: AtomicU64,
     epoch_mismatch: AtomicU64,
+    duplicate_trace_context: AtomicU64,
+    trace_identity_authority_unavailable: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -917,6 +992,7 @@ pub struct FlightRecorder {
     recorder_instance_id: u64,
     config: RecorderConfig,
     shards: Vec<RecorderShard>,
+    consumed_trace_identities: Vec<ConsumedTraceIdentitySlot>,
     next_trace_sequence: AtomicU64,
     lifecycle: AtomicU8,
     accounting_authority: AtomicU8,
@@ -962,6 +1038,7 @@ impl FlightRecorder {
         let mut frozen_events = Vec::new();
         let mut conversion_workspace = Vec::new();
         let mut serialization_workspace = Vec::new();
+        let mut consumed_trace_identities = Vec::new();
         if enabled {
             let requested_frozen_events = usize::try_from(config.capacity.total_slots)
                 .map_err(|_| RecorderError::CapacityArithmeticOverflow)?;
@@ -973,6 +1050,17 @@ impl FlightRecorder {
                 requested_frozen_events,
                 frozen_events.capacity(),
             )?;
+            consumed_trace_identities
+                .try_reserve_exact(requested_frozen_events)
+                .map_err(|_| RecorderError::AllocationFailed("consumed trace identities"))?;
+            reject_allocator_over_reservation(
+                "consumed trace identities",
+                requested_frozen_events,
+                consumed_trace_identities.capacity(),
+            )?;
+            for _ in 0..requested_frozen_events {
+                consumed_trace_identities.push(ConsumedTraceIdentitySlot::default());
+            }
             // Keep the allocation identical to the manifest's checked memory
             // equation. This workspace converts at most one bounded trace at
             // a time; it must not grow with the recorder's global slot count.
@@ -1008,6 +1096,7 @@ impl FlightRecorder {
             recorder_instance_id,
             config,
             shards,
+            consumed_trace_identities,
             next_trace_sequence: AtomicU64::new(1),
             lifecycle: AtomicU8::new(LIFECYCLE_ACTIVE),
             accounting_authority: AtomicU8::new(AUTHORITY_EXACT),
@@ -1147,6 +1236,56 @@ impl FlightRecorder {
         }
     }
 
+    fn claim_consumed_trace_identity(
+        &self,
+        trace_id: InteractionTraceId,
+    ) -> ConsumedTraceIdentityClaim {
+        let slot_count = self.consumed_trace_identities.len();
+        if slot_count == 0 {
+            return ConsumedTraceIdentityClaim::Unavailable;
+        }
+        let slot_count_u64 = u64::try_from(slot_count)
+            .expect("recorder trace-identity slot count is bounded by u32 capacity");
+        let first = usize::try_from(consumed_trace_identity_hash(trace_id) % slot_count_u64)
+            .expect("bounded trace-identity index fits usize");
+
+        for offset in 0..slot_count {
+            let index = first.wrapping_add(offset) % slot_count;
+            let slot = &self.consumed_trace_identities[index];
+            loop {
+                match slot.state.load(Ordering::Acquire) {
+                    TRACE_IDENTITY_EMPTY => {
+                        match slot.state.compare_exchange(
+                            TRACE_IDENTITY_EMPTY,
+                            TRACE_IDENTITY_WRITING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                slot.publish(trace_id);
+                                return ConsumedTraceIdentityClaim::Claimed;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    TRACE_IDENTITY_WRITING => {
+                        // Fail closed instead of waiting on a producer that
+                        // may have been descheduled after reserving the slot.
+                        return ConsumedTraceIdentityClaim::Unavailable;
+                    }
+                    TRACE_IDENTITY_OCCUPIED => {
+                        if slot.matches(trace_id) {
+                            return ConsumedTraceIdentityClaim::Duplicate;
+                        }
+                        break;
+                    }
+                    _ => return ConsumedTraceIdentityClaim::Unavailable,
+                }
+            }
+        }
+        ConsumedTraceIdentityClaim::Unavailable
+    }
+
     /// Publish one fixed-size numeric event through the producer's queue.
     pub fn record(
         &self,
@@ -1167,6 +1306,66 @@ impl FlightRecorder {
             return RecordOutcome::OutsideEpoch;
         };
         self.record_after_admission(shard, admission, token, fields)
+    }
+
+    /// Publish exactly two fixed-size numeric events through one producer
+    /// admission, or publish neither.
+    ///
+    /// A producer handle exclusively owns its shard, and freezing cannot
+    /// drain that shard while the admission guard is live. The implementation
+    /// can therefore validate and encode both events, prove that two queue
+    /// slots remain, and only then perform the two infallible pushes. This is
+    /// the fixed-size transactional seam for trace stages whose contract does
+    /// not permit an observable partial prefix.
+    pub fn record_pair(
+        &self,
+        producer: &ProducerHandle,
+        token: TraceToken,
+        fields: [&EventFields; 2],
+    ) -> RecordOutcome {
+        if self.config.mode == RecorderMode::Off {
+            return RecordOutcome::Off;
+        }
+        let Some(shard) = self.shard_for_handle(producer) else {
+            return RecordOutcome::WrongRecorder;
+        };
+        if token.recorder_instance_id != self.recorder_instance_id {
+            return RecordOutcome::WrongRecorder;
+        }
+        let Some(admission) = self.claim_active_admission(shard) else {
+            return RecordOutcome::OutsideEpoch;
+        };
+        self.record_pair_after_admission(shard, admission, token, fields)
+    }
+
+    /// Publish one exact two-event historical pair at most once for a sampled
+    /// trace identity in this recorder epoch.
+    ///
+    /// Duplicate identity detection linearizes after both events validate and
+    /// after two queue slots are proven available, but before either queue
+    /// mutation. The exact identity is therefore consumed iff the pair is
+    /// about to publish atomically. A duplicate or unavailable identity
+    /// authority records neither event and never changes the caller's
+    /// operational side-effect outcome.
+    pub fn record_historical_pair_once(
+        &self,
+        producer: &ProducerHandle,
+        token: TraceToken,
+        fields: [&EventFields; 2],
+    ) -> RecordOutcome {
+        if self.config.mode == RecorderMode::Off {
+            return RecordOutcome::Off;
+        }
+        let Some(shard) = self.shard_for_handle(producer) else {
+            return RecordOutcome::WrongRecorder;
+        };
+        if token.recorder_instance_id != self.recorder_instance_id {
+            return RecordOutcome::WrongRecorder;
+        }
+        let Some(admission) = self.claim_active_admission(shard) else {
+            return RecordOutcome::OutsideEpoch;
+        };
+        self.record_pair_after_admission_with_identity(shard, admission, token, fields, true)
     }
 
     fn record_after_admission(
@@ -1211,6 +1410,104 @@ impl FlightRecorder {
         }
         RecordOutcome::Recorded {
             accounting_authority: self.increment(&shard.counters.recorded),
+        }
+    }
+
+    fn record_pair_after_admission(
+        &self,
+        shard: &RecorderShard,
+        admission: AdmissionGuard<'_>,
+        token: TraceToken,
+        fields: [&EventFields; 2],
+    ) -> RecordOutcome {
+        self.record_pair_after_admission_with_identity(shard, admission, token, fields, false)
+    }
+
+    fn record_pair_after_admission_with_identity(
+        &self,
+        shard: &RecorderShard,
+        admission: AdmissionGuard<'_>,
+        token: TraceToken,
+        fields: [&EventFields; 2],
+        consume_trace_identity: bool,
+    ) -> RecordOutcome {
+        const PAIR_LEN: u64 = 2;
+
+        let _admission = match self.finish_event_admission_by(shard, admission, PAIR_LEN) {
+            Ok(admission) => admission,
+            Err(accounting_authority) => {
+                return RecordOutcome::Closing {
+                    accounting_authority,
+                };
+            }
+        };
+        if token.recorder_instance_id != self.recorder_instance_id {
+            return RecordOutcome::WrongRecorder;
+        }
+        if token.local_epoch_id != self.config.epoch_id || token.context.validate().is_err() {
+            return RecordOutcome::EpochMismatch {
+                accounting_authority: self.increment_by(&shard.counters.epoch_mismatch, PAIR_LEN),
+            };
+        }
+        if fields.iter().any(|fields| !fields.matches_token(token)) {
+            return RecordOutcome::EpochMismatch {
+                accounting_authority: self.increment_by(&shard.counters.epoch_mismatch, PAIR_LEN),
+            };
+        }
+        if fields
+            .iter()
+            .any(|fields| fields.clock.validate(fields.producer).is_err())
+        {
+            return RecordOutcome::ClockInvalid {
+                accounting_authority: self.increment_by(&shard.counters.clock_invalid, PAIR_LEN),
+            };
+        }
+
+        // Encode both payloads before inspecting capacity so no validation or
+        // conversion step can fail after the first queue mutation.
+        let prior_dropped = exact_counter_value(&shard.counters.queue_full);
+        let raw = [
+            RawInteractionEvent::encode(token, fields[0], prior_dropped),
+            RawInteractionEvent::encode(token, fields[1], prior_dropped),
+        ];
+        let remaining = shard.queue.capacity().saturating_sub(shard.queue.len());
+        if remaining < raw.len() {
+            return RecordOutcome::QueueFull {
+                accounting_authority: self.increment_by(&shard.counters.queue_full, PAIR_LEN),
+            };
+        }
+
+        if consume_trace_identity {
+            match self.claim_consumed_trace_identity(token.trace_id()) {
+                ConsumedTraceIdentityClaim::Claimed => {}
+                ConsumedTraceIdentityClaim::Duplicate => {
+                    return RecordOutcome::DuplicateTraceContext {
+                        accounting_authority: self
+                            .increment_by(&shard.counters.duplicate_trace_context, PAIR_LEN),
+                    };
+                }
+                ConsumedTraceIdentityClaim::Unavailable => {
+                    return RecordOutcome::TraceIdentityAuthorityUnavailable {
+                        accounting_authority: self.increment_by(
+                            &shard.counters.trace_identity_authority_unavailable,
+                            PAIR_LEN,
+                        ),
+                    };
+                }
+            }
+        }
+
+        // `ProducerHandle` is the shard's exclusive producer and the live
+        // admission excludes the sole consumer (`try_freeze`). The capacity
+        // proof above therefore makes both pushes infallible as one fixed pair.
+        for event in raw {
+            shard
+                .queue
+                .push(event)
+                .expect("exclusive producer pair capacity changed after preflight");
+        }
+        RecordOutcome::Recorded {
+            accounting_authority: self.increment_by(&shard.counters.recorded, PAIR_LEN),
         }
     }
 
@@ -1389,6 +1686,14 @@ impl FlightRecorder {
             exact &= checked_add_counter(&mut event.closing, &shard.counters.closing);
             exact &= checked_add_counter(&mut event.clock_invalid, &shard.counters.clock_invalid);
             exact &= checked_add_counter(&mut event.epoch_mismatch, &shard.counters.epoch_mismatch);
+            exact &= checked_add_counter(
+                &mut event.duplicate_trace_context,
+                &shard.counters.duplicate_trace_context,
+            );
+            exact &= checked_add_counter(
+                &mut event.trace_identity_authority_unavailable,
+                &shard.counters.trace_identity_authority_unavailable,
+            );
         }
         if !exact {
             self.accounting_authority
@@ -1474,10 +1779,19 @@ impl FlightRecorder {
         shard: &RecorderShard,
         admission: AdmissionGuard<'a>,
     ) -> Result<AdmissionGuard<'a>, RecorderAccountingAuthority> {
+        self.finish_event_admission_by(shard, admission, 1)
+    }
+
+    fn finish_event_admission_by<'a>(
+        &self,
+        shard: &RecorderShard,
+        admission: AdmissionGuard<'a>,
+        event_count: u64,
+    ) -> Result<AdmissionGuard<'a>, RecorderAccountingAuthority> {
         if self.lifecycle.load(Ordering::SeqCst) == LIFECYCLE_ACTIVE {
             Ok(admission)
         } else {
-            let authority = self.increment(&shard.counters.closing);
+            let authority = self.increment_by(&shard.counters.closing, event_count);
             drop(admission);
             Err(authority)
         }
@@ -1530,9 +1844,17 @@ impl FlightRecorder {
     }
 
     fn increment(&self, counter: &AtomicU64) -> RecorderAccountingAuthority {
+        self.increment_by(counter, 1)
+    }
+
+    fn increment_by(&self, counter: &AtomicU64, amount: u64) -> RecorderAccountingAuthority {
+        debug_assert!(amount > 0, "recorder counters only accept positive deltas");
         let mut observed = counter.load(Ordering::Relaxed);
         loop {
-            if observed >= LAST_EXACT_COUNTER_VALUE {
+            let next = observed.checked_add(amount);
+            if observed >= LAST_EXACT_COUNTER_VALUE
+                || next.is_none_or(|next| next > LAST_EXACT_COUNTER_VALUE)
+            {
                 if observed != COUNTER_EXHAUSTED {
                     let _ = counter.compare_exchange_weak(
                         observed,
@@ -1547,7 +1869,7 @@ impl FlightRecorder {
             }
             match counter.compare_exchange_weak(
                 observed,
-                observed + 1,
+                next.expect("checked exact counter addition must be present"),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -2679,6 +3001,8 @@ mod tests {
         );
         assert_eq!(one.config().capacity().total_slots, 64);
         assert_eq!(eight.config().capacity().total_slots, 64);
+        assert_eq!(one.consumed_trace_identities.len(), 64);
+        assert_eq!(eight.consumed_trace_identities.len(), 64);
         assert!(
             one.config()
                 .capacity()
@@ -2697,7 +3021,9 @@ mod tests {
         assert!(
             usize::try_from(one.config().capacity().shard_metadata_bytes_per_shard)
                 .expect("metadata reservation fits usize")
-                >= size_of::<FlightRecorder>() + size_of::<RecorderWorkspace>()
+                >= size_of::<FlightRecorder>()
+                    + size_of::<RecorderWorkspace>()
+                    + 64 * size_of::<ConsumedTraceIdentitySlot>()
         );
     }
 
@@ -3205,6 +3531,275 @@ mod tests {
         );
         assert_eq!(token.local_epoch_id(), recorder.config().epoch_id());
         assert_ne!(token.trace_id().run_id, recorder.config().local_run_id());
+    }
+
+    #[test]
+    fn atomic_pair_with_one_remaining_slot_records_neither_event() {
+        let recorder = FlightRecorder::new(config(1, 3)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let filler = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        for ordinal in 0..2 {
+            assert!(matches!(
+                recorder.record(
+                    &producer,
+                    filler,
+                    &fields_for(1, stage(InteractionTracePath::Keypress, ordinal)),
+                ),
+                RecordOutcome::Recorded { .. }
+            ));
+        }
+        let pair = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        let k4 = fields_for(
+            1,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode),
+        );
+        let k5 = fields_for(
+            1,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait),
+        );
+        assert!(matches!(
+            recorder.record_pair(&producer, pair, [&k4, &k5]),
+            RecordOutcome::QueueFull {
+                accounting_authority: RecorderAccountingAuthority::Exact,
+            }
+        ));
+
+        let frozen = recorder.try_freeze().expect("bounded recorder freezes");
+        assert_eq!(frozen.len(), 2);
+        assert!(
+            frozen
+                .events
+                .iter()
+                .all(|event| event.trace_id() != Some(pair.trace_id())),
+            "a one-slot remainder must not retain a partial pair prefix"
+        );
+        assert_eq!(frozen.accounting().event.recorded, 2);
+        assert_eq!(frozen.accounting().event.queue_full, 2);
+        assert_eq!(
+            frozen.accounting().event.checked_sampled_event_attempts(),
+            Ok(4)
+        );
+    }
+
+    #[test]
+    fn atomic_pair_with_two_remaining_slots_records_exactly_both_events() {
+        let recorder = FlightRecorder::new(config(1, 2)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        let k4 = fields_for(
+            1,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode),
+        );
+        let k5 = fields_for(
+            1,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait),
+        );
+        assert!(matches!(
+            recorder.record_pair(&producer, token, [&k4, &k5]),
+            RecordOutcome::Recorded {
+                accounting_authority: RecorderAccountingAuthority::Exact,
+            }
+        ));
+
+        let frozen = recorder.try_freeze().expect("bounded recorder freezes");
+        assert_eq!(frozen.len(), 2);
+        assert_eq!(frozen.accounting().event.recorded, 2);
+        assert_eq!(frozen.accounting().event.queue_full, 0);
+        assert_eq!(
+            frozen
+                .events
+                .iter()
+                .map(|event| event.stage_ordinal)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+    }
+
+    #[test]
+    fn historical_pair_consumes_one_exact_trace_identity_across_concurrent_shards() {
+        let recorder = FlightRecorder::new(config(2, 4)).expect("recorder allocates");
+        let context = SampledTraceContextV1 {
+            schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+            trace_id: InteractionTraceId::new(run(101), 17)
+                .expect("remote trace identity is valid"),
+            path: InteractionTracePath::Keypress,
+            origin_recorder_epoch_id: epoch(102),
+            sampler_algorithm: recorder.config().sampler().algorithm,
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for shard_index in 0..2 {
+            let recorder = Arc::clone(&recorder);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                let producer = recorder
+                    .register_producer(shard_index)
+                    .expect("worker claims its exclusive shard");
+                let token = match recorder.admit_remote_trace(&producer, context) {
+                    TraceAdmission::Admitted { token, .. } => token,
+                    other => panic!("remote context must be admitted, got {other:?}"),
+                };
+                let k4 = fields_for(
+                    u64::try_from(shard_index).expect("shard index fits u64") + 1,
+                    InteractionTraceStage::Keypress(
+                        RendererKeypressTraceStage::ServerReadableDecode,
+                    ),
+                );
+                let k5 = fields_for(
+                    u64::try_from(shard_index).expect("shard index fits u64") + 1,
+                    InteractionTraceStage::Keypress(
+                        RendererKeypressTraceStage::ServerDispatchMuxWait,
+                    ),
+                );
+                barrier.wait();
+                recorder.record_historical_pair_once(&producer, token, [&k4, &k5])
+            }));
+        }
+
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("historical-pair worker exits"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RecordOutcome::Recorded { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(
+                        outcome,
+                        RecordOutcome::DuplicateTraceContext { .. }
+                            | RecordOutcome::TraceIdentityAuthorityUnavailable { .. }
+                    )
+                })
+                .count(),
+            1
+        );
+
+        let frozen = recorder.try_freeze().expect("bounded recorder freezes");
+        assert_eq!(frozen.len(), 2);
+        assert_eq!(frozen.accounting().trace.sampled_in, 2);
+        assert_eq!(frozen.accounting().event.recorded, 2);
+        assert_eq!(
+            frozen
+                .accounting()
+                .event
+                .duplicate_trace_context
+                .checked_add(
+                    frozen
+                        .accounting()
+                        .event
+                        .trace_identity_authority_unavailable
+                ),
+            Some(2)
+        );
+        assert_eq!(
+            frozen.accounting().event.checked_sampled_event_attempts(),
+            Ok(4)
+        );
+        assert!(!frozen.accounting().event.is_lossless());
+        let mut events = Vec::with_capacity(frozen.len());
+        assert_eq!(
+            frozen.export_into(&mut events),
+            ExportOutcome::Completed { exported_events: 2 }
+        );
+        assert_eq!(
+            events.iter().map(|event| event.stage).collect::<Vec<_>>(),
+            vec![
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode),
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait,),
+            ]
+        );
+    }
+
+    #[test]
+    fn atomic_pair_with_invalid_second_event_records_neither_event() {
+        let recorder = FlightRecorder::new(config(1, 2)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        let k4 = fields_for(
+            1,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode),
+        );
+        let mut invalid_k5 = fields_for(
+            1,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait),
+        );
+        invalid_k5.clock.completed_at.clock_domain.clock_id += 1;
+        assert!(matches!(
+            recorder.record_pair(&producer, token, [&k4, &invalid_k5]),
+            RecordOutcome::ClockInvalid {
+                accounting_authority: RecorderAccountingAuthority::Exact,
+            }
+        ));
+
+        let frozen = recorder.try_freeze().expect("bounded recorder freezes");
+        assert!(frozen.is_empty());
+        assert_eq!(frozen.accounting().event.recorded, 0);
+        assert_eq!(frozen.accounting().event.clock_invalid, 2);
+        assert_eq!(
+            frozen.accounting().event.checked_sampled_event_attempts(),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn atomic_pair_losing_concurrent_close_cut_records_neither_event() {
+        let recorder = FlightRecorder::new(config(1, 2)).expect("recorder allocates");
+        let producer = recorder.register_producer(0).expect("producer registers");
+        let token = admitted_local(&recorder, &producer, InteractionTracePath::Keypress);
+        let admission = recorder
+            .claim_active_admission(&recorder.shards[0])
+            .expect("pair admission linearizes before the close cut");
+        let close_visible = Arc::new(Barrier::new(2));
+        let pair_released = Arc::new(Barrier::new(2));
+        let closer_recorder = Arc::clone(&recorder);
+        let thread_close_cut = Arc::clone(&close_visible);
+        let closer_release = Arc::clone(&pair_released);
+        let closer = thread::spawn(move || {
+            assert_eq!(
+                closer_recorder.begin_close(),
+                CloseOutcome::Draining {
+                    in_flight_operations: 1,
+                }
+            );
+            thread_close_cut.wait();
+            closer_release.wait();
+            closer_recorder
+                .try_freeze()
+                .expect("pair rejection leaves the closing recorder quiescent")
+        });
+        close_visible.wait();
+        let k4 = fields_for(
+            1,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode),
+        );
+        let k5 = fields_for(
+            1,
+            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait),
+        );
+        assert!(matches!(
+            recorder
+                .record_pair_after_admission(&recorder.shards[0], admission, token, [&k4, &k5],),
+            RecordOutcome::Closing {
+                accounting_authority: RecorderAccountingAuthority::Exact,
+            }
+        ));
+        pair_released.wait();
+
+        let frozen = closer.join().expect("concurrent closer exits cleanly");
+        assert!(frozen.is_empty());
+        assert_eq!(frozen.accounting().event.recorded, 0);
+        assert_eq!(frozen.accounting().event.closing, 2);
+        assert_eq!(
+            frozen.accounting().event.checked_sampled_event_attempts(),
+            Ok(2)
+        );
     }
 
     #[test]

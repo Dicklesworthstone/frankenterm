@@ -429,6 +429,23 @@ pub struct RecorderEventAccountingV1 {
     pub closing: u64,
     pub clock_invalid: u64,
     pub epoch_mismatch: u64,
+    /// Events intentionally suppressed because their exact sampled trace
+    /// identity had already published the same once-per-trace historical
+    /// stage group in this recorder epoch.
+    ///
+    /// This field is additive to the persisted v1 manifest. Old manifests
+    /// deserialize it as zero; new manifests retain an explicit, non-lossless
+    /// accounting outcome instead of misclassifying a duplicate as capacity
+    /// pressure or an epoch mismatch.
+    #[serde(default)]
+    pub duplicate_trace_context: u64,
+    /// Events suppressed because the bounded exact trace-identity authority
+    /// could not admit another identity, either because its fixed table was
+    /// exhausted or because a colliding slot was being published concurrently.
+    /// The outcome remains explicit and fail-closed instead of waiting on a
+    /// descheduled producer or weakening exactness.
+    #[serde(default)]
+    pub trace_identity_authority_unavailable: u64,
 }
 
 impl RecorderEventAccountingV1 {
@@ -438,6 +455,8 @@ impl RecorderEventAccountingV1 {
             .and_then(|total| total.checked_add(self.closing))
             .and_then(|total| total.checked_add(self.clock_invalid))
             .and_then(|total| total.checked_add(self.epoch_mismatch))
+            .and_then(|total| total.checked_add(self.duplicate_trace_context))
+            .and_then(|total| total.checked_add(self.trace_identity_authority_unavailable))
             .ok_or(RecorderContractError::AccountingOverflow { domain: "event" })
     }
 
@@ -447,6 +466,8 @@ impl RecorderEventAccountingV1 {
             && self.closing == 0
             && self.clock_invalid == 0
             && self.epoch_mismatch == 0
+            && self.duplicate_trace_context == 0
+            && self.trace_identity_authority_unavailable == 0
     }
 }
 
@@ -1126,6 +1147,8 @@ mod tests {
                 closing: 0,
                 clock_invalid: 0,
                 epoch_mismatch: 0,
+                duplicate_trace_context: 0,
+                trace_identity_authority_unavailable: 0,
             },
             accounting_authority: RecorderAccountingAuthority::Exact,
             shutdown: RecorderShutdownStatusV1::Completed { frozen_events: 14 },
@@ -1450,8 +1473,11 @@ mod tests {
             closing: 3,
             clock_invalid: 4,
             epoch_mismatch: 5,
+            duplicate_trace_context: 6,
+            trace_identity_authority_unavailable: 7,
         };
-        assert_eq!(events.checked_sampled_event_attempts(), Ok(15));
+        assert_eq!(events.checked_sampled_event_attempts(), Ok(28));
+        assert!(!events.is_lossless());
 
         let overflow = RecorderTraceAccountingV1 {
             sampled_in: u64::MAX,
@@ -1468,6 +1494,8 @@ mod tests {
             closing: 0,
             clock_invalid: 0,
             epoch_mismatch: 0,
+            duplicate_trace_context: 0,
+            trace_identity_authority_unavailable: 0,
         };
         assert!(matches!(
             event_overflow.checked_sampled_event_attempts(),
@@ -1911,6 +1939,26 @@ mod tests {
         let decoded: RecorderEpochManifestV1 =
             serde_json::from_value(encoded.clone()).expect("manifest deserializes");
         assert_eq!(decoded, manifest);
+
+        let mut prior_accounting_schema = encoded.clone();
+        prior_accounting_schema["event_accounting"]
+            .as_object_mut()
+            .expect("event accounting is an object")
+            .remove("duplicate_trace_context");
+        prior_accounting_schema["event_accounting"]
+            .as_object_mut()
+            .expect("event accounting is an object")
+            .remove("trace_identity_authority_unavailable");
+        let prior_decoded: RecorderEpochManifestV1 =
+            serde_json::from_value(prior_accounting_schema)
+                .expect("additive duplicate accounting defaults for prior manifests");
+        assert_eq!(prior_decoded.event_accounting.duplicate_trace_context, 0);
+        assert_eq!(
+            prior_decoded
+                .event_accounting
+                .trace_identity_authority_unavailable,
+            0
+        );
 
         let mut missing = encoded.clone();
         missing.as_object_mut().unwrap().remove("capacity");

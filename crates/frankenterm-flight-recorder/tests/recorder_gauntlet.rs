@@ -1163,6 +1163,8 @@ fn external_marker_loss_cannot_demote_or_promote_internal_certification() {
             closing: 0,
             clock_invalid: 0,
             epoch_mismatch: 0,
+            duplicate_trace_context: 0,
+            trace_identity_authority_unavailable: 0,
         },
         accounting_authority: RecorderAccountingAuthority::Exact,
         shutdown: RecorderShutdownStatusV1::Completed { frozen_events: 1 },
