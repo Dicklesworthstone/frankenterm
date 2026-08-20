@@ -18,11 +18,11 @@
 
 use anyhow::{anyhow, bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
-pub use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
-    RecorderEpochId, RecorderSamplerAlgorithm, SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
-    SampledTraceContextV1,
-};
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::RecorderContractError;
+pub use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
+    RecorderEpochId, RecorderSamplerAlgorithm, SampledTraceContextV1,
+    SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
+};
 pub use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceId, InteractionTracePath, InteractionTraceRunId,
 };
@@ -21214,10 +21214,11 @@ mod test {
     }
 
     #[test]
-    fn reliable_key_event_traced_wrapper_rejects_invalid_context_and_inner_request_before_framing() {
+    fn reliable_key_event_traced_wrapper_rejects_invalid_context_and_inner_request_before_framing()
+    {
         let request = ReliableKeyEventV1 {
             pane_id: 7,
-            pane_registration: None,
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x5a; 16])),
             event: termwiz::input::KeyEvent {
                 key: termwiz::input::KeyCode::Char('x'),
                 modifiers: termwiz::input::Modifiers::NONE,
@@ -21246,6 +21247,42 @@ mod test {
                 .expect_err("invalid traced reliable input must fail before framing");
             assert!(encoded.is_empty());
         }
+    }
+
+    #[test]
+    fn reliable_key_event_traced_wrapper_rejects_missing_authority_during_raw_decode() {
+        let malformed = ReliableKeyEventTracedV1 {
+            request: ReliableKeyEventV1 {
+                pane_id: 7,
+                pane_registration: None,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(11),
+                kind: ReliableKeyEventKindV1::KeyDown,
+            },
+            trace_context: sampled_key_trace_context(),
+        };
+        let (payload, compressed) = serialize_with_mode(&malformed, CompressionMode::Never)
+            .expect("missing-authority hostile fixture should remain serializable");
+        assert!(!compressed);
+        let mut frame = Vec::new();
+        encode_raw(
+            <ReliableKeyEventTracedV1 as PduWireIdent>::IDENT,
+            31,
+            &payload,
+            false,
+            &mut frame,
+        )
+        .expect("missing-authority hostile fixture should frame");
+
+        let error = Pdu::decode(frame.as_slice())
+            .expect_err("PDU98 without exact pane authority must fail during decode");
+        assert!(matches!(
+            error.downcast_ref::<SampledInputTraceContextError>(),
+            Some(SampledInputTraceContextError::MissingPaneRegistration)
+        ));
     }
 
     #[test]
@@ -21284,7 +21321,7 @@ mod test {
     fn reliable_key_event_is_classified_as_user_input() {
         let request = ReliableKeyEventV1 {
             pane_id: 7,
-            pane_registration: None,
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x5a; 16])),
             event: termwiz::input::KeyEvent {
                 key: termwiz::input::KeyCode::Char('x'),
                 modifiers: termwiz::input::Modifiers::NONE,
@@ -21293,13 +21330,11 @@ mod test {
             kind: ReliableKeyEventKindV1::KeyDown,
         };
         assert!(Pdu::ReliableKeyEventV1(request.clone()).is_user_input());
-        assert!(
-            Pdu::ReliableKeyEventTracedV1(ReliableKeyEventTracedV1 {
-                request,
-                trace_context: sampled_key_trace_context(),
-            })
-            .is_user_input()
-        );
+        assert!(Pdu::ReliableKeyEventTracedV1(ReliableKeyEventTracedV1 {
+            request,
+            trace_context: sampled_key_trace_context(),
+        })
+        .is_user_input());
     }
 
     #[test]

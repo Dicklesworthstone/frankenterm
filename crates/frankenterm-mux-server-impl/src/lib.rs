@@ -440,17 +440,23 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
 
     if is_standalone_mux {
         if let Some(name) = &config.default_mux_server_domain {
-            if let Some(dom) = mux.get_domain_by_name(name) {
-                if dom.is::<ClientDomain>() {
-                    anyhow::bail!("default_mux_server_domain cannot be set to a client domain!");
-                }
-                mux.set_default_domain(&dom)?;
+            let dom = mux.get_domain_by_name(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "configured default_mux_server_domain={name:?} does not match any registered domain"
+                )
+            })?;
+            if dom.is::<ClientDomain>() {
+                anyhow::bail!("default_mux_server_domain cannot be set to a client domain!");
             }
+            mux.set_default_domain_guard(&dom)?;
         }
     } else if let Some(name) = &config.default_domain {
-        if let Some(dom) = mux.get_domain_by_name(name) {
-            mux.set_default_domain(&dom)?;
-        }
+        let dom = mux.get_domain_by_name(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "configured default_domain={name:?} does not match any registered domain"
+            )
+        })?;
+        mux.set_default_domain_guard(&dom)?;
     }
 
     Ok(())
@@ -512,10 +518,18 @@ mod tests {
     }
 
     fn make_test_handle(ssh_domains: Vec<SshDomain>) -> ConfigHandle {
+        make_test_handle_with(ssh_domains, |_| {})
+    }
+
+    fn make_test_handle_with(
+        ssh_domains: Vec<SshDomain>,
+        configure: impl FnOnce(&mut Config),
+    ) -> ConfigHandle {
         let mut config = Config::default_config();
         config.unix_domains.clear();
         config.tls_clients.clear();
         config.ssh_domains = Some(ssh_domains);
+        configure(&mut config);
         config::use_this_configuration(config);
         config::configuration()
     }
@@ -922,6 +936,181 @@ mod tests {
             "should use RemoteSshDomain for non-multiplexed SSH"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn update_mux_domains_honors_explicit_default_domain() -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+        let raw_ssh = SshDomain {
+            name: "configured-default".to_string(),
+            remote_address: "default.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let handle = make_test_handle_with(vec![raw_ssh], |config| {
+            config.default_domain = Some("configured-default".to_string());
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+
+        update_mux_domains(&handle)?;
+
+        assert_eq!(mux.default_domain()?.domain_name(), "configured-default");
+        Ok(())
+    }
+
+    #[test]
+    fn update_mux_domains_rejects_missing_default_domain_with_key_and_value() -> anyhow::Result<()>
+    {
+        let _state = ScopedTestState::acquire();
+        let handle = make_test_handle_with(vec![], |config| {
+            config.default_domain = Some("missing-client-default".to_string());
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+
+        let error = update_mux_domains(&handle).expect_err("missing configured default must fail");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("default_domain"));
+        assert!(rendered.contains("missing-client-default"));
+        Ok(())
+    }
+
+    #[test]
+    fn update_mux_domains_reload_reports_missing_default_instead_of_stale_success()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+        let first = SshDomain {
+            name: "first-default".to_string(),
+            remote_address: "first.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let first_handle = make_test_handle_with(vec![first], |config| {
+            config.default_domain = Some("first-default".to_string());
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&first_handle)?;
+        assert_eq!(mux.default_domain()?.domain_name(), "first-default");
+
+        let reloaded_handle = make_test_handle_with(vec![], |config| {
+            config.default_domain = Some("missing-after-reload".to_string());
+        });
+        let error = update_mux_domains(&reloaded_handle)
+            .expect_err("reload must report an explicit missing default");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("default_domain"));
+        assert!(rendered.contains("missing-after-reload"));
+        assert_eq!(
+            mux.default_domain()?.domain_name(),
+            "first-default",
+            "failed reload may retain prior state only behind an explicit error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_mux_domains_for_server_honors_explicit_default_mux_server_domain()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+        let raw_ssh = SshDomain {
+            name: "server-default".to_string(),
+            remote_address: "server.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let handle = make_test_handle_with(vec![raw_ssh], |config| {
+            config.default_mux_server_domain = Some("server-default".to_string());
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+
+        update_mux_domains_for_server(&handle)?;
+
+        assert_eq!(mux.default_domain()?.domain_name(), "server-default");
+        Ok(())
+    }
+
+    #[test]
+    fn update_mux_domains_for_server_rejects_missing_default_with_key_and_value()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+        let handle = make_test_handle_with(vec![], |config| {
+            config.default_mux_server_domain = Some("missing-server-default".to_string());
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+
+        let error = update_mux_domains_for_server(&handle)
+            .expect_err("missing configured mux-server default must fail");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("default_mux_server_domain"));
+        assert!(rendered.contains("missing-server-default"));
+        Ok(())
+    }
+
+    #[test]
+    fn update_mux_domains_for_server_reload_reports_missing_default_instead_of_stale_success()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+        let first = SshDomain {
+            name: "first-server-default".to_string(),
+            remote_address: "first-server.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let first_handle = make_test_handle_with(vec![first], |config| {
+            config.default_mux_server_domain = Some("first-server-default".to_string());
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains_for_server(&first_handle)?;
+        assert_eq!(mux.default_domain()?.domain_name(), "first-server-default");
+
+        let reloaded_handle = make_test_handle_with(vec![], |config| {
+            config.default_mux_server_domain = Some("missing-server-after-reload".to_string());
+        });
+        let error = update_mux_domains_for_server(&reloaded_handle)
+            .expect_err("server reload must report an explicit missing default");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("default_mux_server_domain"));
+        assert!(rendered.contains("missing-server-after-reload"));
+        assert_eq!(
+            mux.default_domain()?.domain_name(),
+            "first-server-default",
+            "failed server reload may retain prior state only behind an explicit error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_mux_domains_for_server_preserves_client_domain_rejection() -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+        let client_ssh = SshDomain {
+            name: "client-domain".to_string(),
+            remote_address: "client.example:22".to_string(),
+            multiplexing: SshMultiplexing::WezTerm,
+            ..SshDomain::default()
+        };
+        let handle = make_test_handle_with(vec![client_ssh], |config| {
+            config.default_mux_server_domain = Some("client-domain".to_string());
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+
+        let error = update_mux_domains_for_server(&handle)
+            .expect_err("a client domain cannot become the standalone server default");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("cannot be set to a client domain"));
         Ok(())
     }
 

@@ -20,14 +20,13 @@ use codec::{
     MuxErrorObjectKind, MuxErrorRetry, NotifyAlert, PaneTieredScrollbackStatusEntryV1,
     PaneTieredScrollbackStatusOutcomeV1, Pdu, PduProducer, PduWireRole, Ping, Pong,
     ReliableInputSchedulerPressureV1, ReliableKeyEventKindV1, ReliableKeyEventOutcomeV1,
-    ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventV1,
-    ReliableKeyEventTracedV1, ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1,
-    RemoveFloatingPane,
-    RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
-    SendKeyDown, SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace,
-    SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
-    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
-    ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
+    ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventTracedV1,
+    ReliableKeyEventV1, ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1,
+    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
+    SelectStackPane, SendKeyDown, SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste,
+    SetActiveWorkspace, SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
+    SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
+    TabTitleChanged, ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
@@ -37,9 +36,9 @@ use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
 use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceClockDomain, InteractionTraceCorrelation,
     InteractionTraceCounterUnavailability, InteractionTraceCounters, InteractionTraceGenerations,
-    InteractionTraceObservationBoundary, InteractionTraceProducer,
+    InteractionTraceObservationBoundary, InteractionTraceProducer, InteractionTraceRunId,
     InteractionTraceSchedulerQueueEvidence, InteractionTraceStage, InteractionTraceStageOutcome,
-    InteractionTraceRunId, InteractionTraceTimestamp, InteractionTraceTopology,
+    InteractionTraceTimestamp, InteractionTraceTopology,
 };
 use frankenterm_core_audit_types::renderer_scenario_catalog::RendererKeypressTraceStage;
 use frankenterm_flight_recorder::{
@@ -64,6 +63,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
@@ -356,8 +357,7 @@ impl DispatchTraceAuthority {
             let bytes = *uuid::Uuid::new_v4().as_bytes();
             (
                 u64::from_le_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-                    bytes[7],
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]),
                 u64::from_le_bytes([
                     bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
@@ -548,7 +548,7 @@ impl SessionTraceProducer {
         }
     }
 
-    fn record_server_stage(
+    fn server_stage_fields(
         &self,
         token: TraceToken,
         stage: RendererKeypressTraceStage,
@@ -556,21 +556,21 @@ impl SessionTraceProducer {
         started_at: Instant,
         completed_at_instant: Instant,
         scheduler_enqueue: Option<MainThreadEnqueueReceipt>,
-    ) {
+    ) -> Option<EventFields> {
         let Some(producer) = self.producer_identity() else {
             metrics::counter!(
                 "mux.server.trace_event",
                 "outcome" => "producer_identity_exhausted"
             )
             .increment(1);
-            return;
+            return None;
         };
         let (Some(started_at), Some(completed_at)) = (
             self.timestamp_at(started_at),
             self.timestamp_at(completed_at_instant),
         ) else {
             metrics::counter!("mux.server.trace_event", "outcome" => "clock_invalid").increment(1);
-            return;
+            return None;
         };
         let scheduler_counters = scheduler_enqueue.and_then(|receipt| {
             let enqueued_at = self.timestamp_at(receipt.enqueued_at)?;
@@ -609,7 +609,7 @@ impl SessionTraceProducer {
                 )
             });
         let stage = InteractionTraceStage::Keypress(stage);
-        let fields = match EventFields::new(
+        match EventFields::new(
             u64::from(stage.ordinal()),
             u64::from(stage.ordinal()) + 1,
             Some(u64::from(stage.ordinal())),
@@ -632,59 +632,85 @@ impl SessionTraceProducer {
             InteractionTraceObservationBoundary::InternalState,
             None,
         ) {
-            Ok(fields) => fields,
+            Ok(fields) => Some(fields),
             Err(error) => {
                 log::warn!("refusing invalid mux-server trace event: {error}");
                 metrics::counter!("mux.server.trace_event", "outcome" => "invalid_fields")
                     .increment(1);
-                return;
+                None
             }
-        };
-        let outcome = self
-            .authority
-            .recorder
-            .record(&self.producer, token, &fields);
-        let outcome = match outcome {
-            RecordOutcome::Recorded { .. } => "recorded",
-            RecordOutcome::QueueFull { .. } => "queue_full",
-            RecordOutcome::Closing { .. } | RecordOutcome::OutsideEpoch => "closing",
-            RecordOutcome::Off => "off",
-            RecordOutcome::WrongRecorder | RecordOutcome::EpochMismatch { .. } => {
-                "authority_rejected"
-            }
-            RecordOutcome::ClockInvalid { .. } => "clock_invalid",
-        };
-        metrics::counter!("mux.server.trace_event", "outcome" => outcome).increment(1);
+        }
     }
 
-    fn record_mux_dispatch_start(
+    fn record_reliable_dispatch(
         &self,
         admission: &AdmittedInputTraceV1,
+        topology: InteractionTraceTopology,
         dispatch_started_at: Instant,
-    ) {
+    ) -> bool {
         if admission.stream_id != self.topology_stream_id {
             metrics::counter!(
                 "mux.server.trace_event",
                 "outcome" => "connection_generation_mismatch"
             )
             .increment(1);
-            return;
+            return false;
         }
-        let (Some(token), Some(topology), Some(dispatch_queued_at)) = (
-            admission.recorder_token,
-            admission.topology,
-            admission.dispatch_queued_at,
+        let (Some(decode_started_at), Some(decode_completed_at), Some(scheduler_enqueue)) = (
+            admission.decode_started_at,
+            admission.decode_completed_at,
+            admission.scheduler_enqueue.get(),
         ) else {
-            return;
+            metrics::counter!(
+                "mux.server.trace_event",
+                "outcome" => "dispatch_authority_incomplete"
+            )
+            .increment(1);
+            return false;
         };
-        self.record_server_stage(
+        let Some(token) = self.admit_remote_trace(admission.context) else {
+            return false;
+        };
+        let Some(k4) = self.server_stage_fields(
+            token,
+            RendererKeypressTraceStage::ServerReadableDecode,
+            topology,
+            decode_started_at,
+            decode_completed_at,
+            None,
+        ) else {
+            return false;
+        };
+        let Some(k5) = self.server_stage_fields(
             token,
             RendererKeypressTraceStage::ServerDispatchMuxWait,
             topology,
-            dispatch_queued_at,
+            decode_completed_at,
             dispatch_started_at,
-            admission.scheduler_enqueue.get(),
-        );
+            Some(scheduler_enqueue),
+        ) else {
+            return false;
+        };
+        let outcome =
+            self.authority
+                .recorder
+                .record_historical_pair_once(&self.producer, token, [&k4, &k5]);
+        let (outcome, recorded) = match outcome {
+            RecordOutcome::Recorded { .. } => ("recorded", true),
+            RecordOutcome::QueueFull { .. } => ("queue_full", false),
+            RecordOutcome::Closing { .. } | RecordOutcome::OutsideEpoch => ("closing", false),
+            RecordOutcome::Off => ("off", false),
+            RecordOutcome::WrongRecorder | RecordOutcome::EpochMismatch { .. } => {
+                ("authority_rejected", false)
+            }
+            RecordOutcome::ClockInvalid { .. } => ("clock_invalid", false),
+            RecordOutcome::DuplicateTraceContext { .. } => ("duplicate_trace_context", false),
+            RecordOutcome::TraceIdentityAuthorityUnavailable { .. } => {
+                ("trace_identity_authority_unavailable", false)
+            }
+        };
+        metrics::counter!("mux.server.trace_event", "outcome" => outcome).increment(2);
+        recorded
     }
 }
 
@@ -1398,11 +1424,12 @@ impl Drop for SessionOperationLease {
 ///
 /// This contains the frozen numeric trace context, the unpredictable
 /// topology-stream identity allocated for this connection, the existing
-/// content-free pane/input-serial request identity, and (after recorder
-/// admission) the exact thread-affine producer that owns the trace shard.
-/// Key-event content never enters the authority object. The intentionally
-/// non-`Clone` token is constructed and revalidated before client-activity
-/// bookkeeping or pane mutation, then consumed by the one admitted dispatch.
+/// content-free pane/input-serial request identity, and (after decode binding)
+/// the exact thread-affine producer that owns the trace shard. Key-event
+/// content never enters the authority object. This intentionally non-`Clone`
+/// authority is revalidated before client-activity bookkeeping or pane
+/// mutation; recorder admission remains deferred until a successful reliable
+/// dispatch is ready to publish its atomic K4/K5 pair.
 #[derive(Debug)]
 pub(crate) struct AdmittedInputTraceV1 {
     context: SampledTraceContextV1,
@@ -1411,11 +1438,27 @@ pub(crate) struct AdmittedInputTraceV1 {
     pane_registration: Option<ReliablePaneRegistrationIdentityV1>,
     input_serial: InputSerial,
     kind: ReliableKeyEventKindV1,
-    recorder_token: Option<TraceToken>,
-    topology: Option<InteractionTraceTopology>,
-    dispatch_queued_at: Option<Instant>,
+    decode_started_at: Option<Instant>,
+    decode_completed_at: Option<Instant>,
     scheduler_enqueue: Rc<Cell<Option<MainThreadEnqueueReceipt>>>,
     trace_producer: Option<Rc<SessionTraceProducer>>,
+    #[cfg(test)]
+    effect_barrier: Option<TraceEffectBarrier>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct TraceEffectBarrier {
+    topology_frozen: Arc<Barrier>,
+    detach_complete: Arc<Barrier>,
+}
+
+#[cfg(test)]
+impl TraceEffectBarrier {
+    fn wait_for_detach(&self) {
+        self.topology_frozen.wait();
+        self.detach_complete.wait();
+    }
 }
 
 impl AdmittedInputTraceV1 {
@@ -1444,11 +1487,12 @@ impl AdmittedInputTraceV1 {
             pane_registration: request.request.pane_registration,
             input_serial: request.request.input_serial,
             kind: request.request.kind,
-            recorder_token: None,
-            topology: None,
-            dispatch_queued_at: None,
+            decode_started_at: None,
+            decode_completed_at: None,
             scheduler_enqueue: Rc::new(Cell::new(None)),
             trace_producer: None,
+            #[cfg(test)]
+            effect_barrier: None,
         })
     }
 
@@ -5882,6 +5926,16 @@ fn unregister_owned_client(mux: &Mux, client_id: &Arc<ClientId>) {
     let _ = mux.unregister_client_if_same(client_id);
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ReliableInputTestFault {
+    #[default]
+    None,
+    BeginSideEffectFalse,
+    CommitAppliedFalse,
+    CancelAfterEnqueue,
+}
+
 pub struct SessionHandler {
     to_write_tx: PduSender,
     owner: SessionOwner,
@@ -5890,6 +5944,8 @@ pub struct SessionHandler {
     client_id: Option<Arc<ClientId>>,
     #[cfg(test)]
     client_input_activity_updates: usize,
+    #[cfg(test)]
+    reliable_input_test_fault: ReliableInputTestFault,
     proxy_client_id: Option<ClientId>,
 }
 
@@ -5930,6 +5986,8 @@ impl SessionHandler {
             client_id: None,
             #[cfg(test)]
             client_input_activity_updates: 0,
+            #[cfg(test)]
+            reliable_input_test_fault: ReliableInputTestFault::None,
             proxy_client_id: None,
         }
     }
@@ -5950,7 +6008,9 @@ impl SessionHandler {
         let Some(trace_producer) = trace_producer else {
             return;
         };
-        if trace_producer.topology_stream_id != admission.stream_id {
+        if trace_producer.topology_stream_id != admission.stream_id
+            || self.topology_stream_id != admission.stream_id
+        {
             metrics::counter!(
                 "mux.server.trace_remote_admission",
                 "outcome" => "connection_generation_mismatch"
@@ -5958,51 +6018,33 @@ impl SessionHandler {
             .increment(1);
             return;
         }
-        let Ok(session) = self.owner.authority().acquire() else {
+        if decode_completed_at < decode_started_at {
             metrics::counter!(
                 "mux.server.trace_remote_admission",
-                "outcome" => "session_retired"
+                "outcome" => "decode_clock_invalid"
             )
             .increment(1);
             return;
-        };
-        let Some((_, window_id, tab_id)) = session.resolve_pane_id(admission.pane_id) else {
+        }
+        if admission.decode_started_at.is_some()
+            || admission.decode_completed_at.is_some()
+            || admission.trace_producer.is_some()
+        {
             metrics::counter!(
                 "mux.server.trace_remote_admission",
-                "outcome" => "pane_location_unresolved"
+                "outcome" => "duplicate_decode_authority"
             )
             .increment(1);
             return;
-        };
-        let Some(topology) = trace_topology_from_mux_ids(window_id, tab_id, admission.pane_id)
-        else {
-            metrics::counter!(
-                "mux.server.trace_remote_admission",
-                "outcome" => "topology_id_exhausted"
-            )
-            .increment(1);
-            return;
-        };
-        drop(session);
-
-        let Some(token) = trace_producer.admit_remote_trace(admission.context) else {
-            return;
-        };
-        trace_producer.record_server_stage(
-            token,
-            RendererKeypressTraceStage::ServerReadableDecode,
-            topology,
-            decode_started_at,
-            decode_completed_at,
-            None,
-        );
-        admission.recorder_token = Some(token);
-        admission.topology = Some(topology);
-        // K4 ends at decode completion; K5 begins at that same boundary so
-        // request validation, exact-topology admission, recorder publication,
-        // scheduling, and mux-main queue wait cannot disappear into an
-        // unmeasured gap between the two server stages.
-        admission.dispatch_queued_at = Some(decode_completed_at);
+        }
+        // Capture only immutable decode evidence here. Recorder admission and
+        // both K4/K5 publications are deferred until the queued task has
+        // revalidated client, pane, serial, and scheduler authority and
+        // committed the one reliable side effect as Applied. A typed retry,
+        // failed callback, or cancelled runnable therefore cannot leave an
+        // orphan K4 event behind.
+        admission.decode_started_at = Some(decode_started_at);
+        admission.decode_completed_at = Some(decode_completed_at);
         admission.trace_producer = Some(Rc::clone(trace_producer));
     }
 
@@ -6170,11 +6212,14 @@ impl SessionHandler {
         };
 
         let trace_validation = match (&decoded.pdu, input_trace_authority.as_ref()) {
-            (Pdu::SendKeyDownTracedV1(request), Some(admission)) => {
+            (Pdu::ReliableKeyEventTracedV1(request), Some(admission)) => {
                 admission.validate_for_request(request, self.topology_stream_id)
             }
-            (Pdu::SendKeyDownTracedV1(_), None) => Err(anyhow!(
-                "sampled key input lacks server admission authority"
+            (Pdu::ReliableKeyEventTracedV1(_), None) => Err(anyhow!(
+                "sampled reliable key input lacks server admission authority"
+            )),
+            (Pdu::SendKeyDownTracedV1(_), _) => Err(anyhow!(
+                "retired PDU95 sampled legacy input is not a server endpoint"
             )),
             (_, Some(_)) => Err(anyhow!(
                 "sampled key input authority was attached to an unrelated request"
@@ -6263,7 +6308,7 @@ impl SessionHandler {
         }
 
         let (pdu, admitted_input_trace) = match decoded.pdu {
-            Pdu::SendKeyDownTracedV1(traced) => {
+            Pdu::ReliableKeyEventTracedV1(traced) => {
                 let (request, trace_context) = traced.into_parts();
                 let Some(admission) = input_trace_authority else {
                     send_response(Err(MuxServerRejection::invalid_request().into()));
@@ -6271,7 +6316,7 @@ impl SessionHandler {
                 };
                 debug_assert_eq!(admission.context(), trace_context);
                 debug_assert_eq!(admission.stream_id(), self.topology_stream_id);
-                (Pdu::SendKeyDown(request), Some(admission))
+                (Pdu::ReliableKeyEventV1(request), Some(admission))
             }
             pdu => (pdu, None),
         };
@@ -6289,11 +6334,7 @@ impl SessionHandler {
                             mux.mux()
                                 .set_window_workspace(window_id, &workspace)
                                 .map_err(|error| {
-                                    map_window_mutation_error(
-                                        window_id,
-                                        "set workspace",
-                                        error,
-                                    )
+                                    map_window_mutation_error(window_id, "set workspace", error)
                                 })?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
@@ -6550,8 +6591,7 @@ impl SessionHandler {
                     catch(
                         move || {
                             let mux = session_mux(&authority)?;
-                            mux.mux()
-                                .rename_workspace(&old_workspace, &new_workspace)?;
+                            mux.mux().rename_workspace(&old_workspace, &new_workspace)?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -6787,6 +6827,14 @@ impl SessionHandler {
             }
 
             Pdu::ReliableKeyEventV1(request) => {
+                let trace_authority = admitted_input_trace;
+                let trace_producer = trace_authority
+                    .as_ref()
+                    .and_then(|admission| admission.trace_producer.as_ref().map(Rc::clone));
+                let sampled_trace = trace_producer.is_some();
+                let scheduler_enqueue = trace_authority
+                    .as_ref()
+                    .map(|admission| Rc::clone(&admission.scheduler_enqueue));
                 let registration = match authority.capture_current_pane(request.pane_id) {
                     Ok(registration) => registration,
                     Err(_) => {
@@ -6828,15 +6876,30 @@ impl SessionHandler {
                     ReliableKeyEventKindV1::KeyDown => ReliableInputKeyKind::KeyDown,
                     ReliableKeyEventKindV1::KeyUp => ReliableInputKeyKind::KeyUp,
                 };
-                let claim = match authority.acquire() {
-                    Ok(session) => session.claim_reliable_key_event(
-                        self.client_id.as_ref(),
-                        &registration,
-                        request.input_serial.get(),
-                        mux_kind,
-                        &request.event,
-                    ),
-                    Err(_) => ReliableInputClaimOutcome::ClientRegistrationRetired,
+                let (claim, pane_operation) = match authority.acquire() {
+                    Ok(session) => {
+                        let Some(pane_operation) = registration.operation_guard(session.mux())
+                        else {
+                            send_response(Ok(reliable_key_response(
+                                &request,
+                                ReliableKeyEventOutcomeV1::Rejected(
+                                    ReliableKeyEventRejectionV1::PaneUnavailable,
+                                ),
+                            )));
+                            return;
+                        };
+                        (
+                            session.claim_reliable_key_event(
+                                self.client_id.as_ref(),
+                                &registration,
+                                request.input_serial.get(),
+                                mux_kind,
+                                &request.event,
+                            ),
+                            Some(pane_operation),
+                        )
+                    }
+                    Err(_) => (ReliableInputClaimOutcome::ClientRegistrationRetired, None),
                 };
                 let mut permit = match reliable_input_claim_outcome(claim) {
                     Ok(permit) => permit,
@@ -6844,6 +6907,15 @@ impl SessionHandler {
                         send_response(Ok(reliable_key_response(&request, outcome)));
                         return;
                     }
+                };
+                let Some(pane_operation) = pane_operation else {
+                    send_response(Ok(reliable_key_response(
+                        &request,
+                        ReliableKeyEventOutcomeV1::Rejected(
+                            ReliableKeyEventRejectionV1::OutcomeUnknown,
+                        ),
+                    )));
+                    return;
                 };
                 let reservation = match try_reserve_main_thread(
                     MainThreadServiceClass::Input,
@@ -6860,6 +6932,21 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
                 let client_id = self.client_id.clone();
+                #[cfg(test)]
+                let force_begin_side_effect_failure =
+                    self.reliable_input_test_fault == ReliableInputTestFault::BeginSideEffectFalse;
+                #[cfg(not(test))]
+                let force_begin_side_effect_failure = false;
+                #[cfg(test)]
+                let force_commit_applied_failure =
+                    self.reliable_input_test_fault == ReliableInputTestFault::CommitAppliedFalse;
+                #[cfg(not(test))]
+                let force_commit_applied_failure = false;
+                #[cfg(test)]
+                let cancel_after_enqueue =
+                    self.reliable_input_test_fault == ReliableInputTestFault::CancelAfterEnqueue;
+                #[cfg(not(test))]
+                let cancel_after_enqueue = false;
                 let spawned = reservation.spawn_local(async move {
                     let outcome = match authority.acquire() {
                         Ok(session) => {
@@ -6872,14 +6959,56 @@ impl SessionHandler {
                                     },
                                 )
                             } else {
-                                registration
-                                    .try_with_current(|pane| {
-                                        if !permit.begin_side_effect() {
-                                            return ReliableKeyEventOutcomeV1::Rejected(
-                                                ReliableKeyEventRejectionV1::OutcomeUnknown,
-                                            );
-                                        }
-                                        let callback = catch_recoverable(
+                                let trace_topology = if trace_producer.is_some()
+                                    && trace_authority.is_some()
+                                {
+                                    pane_operation
+                                        .exact_location_ids()
+                                        .ok()
+                                        .and_then(|(_, window_id, tab_id)| {
+                                            trace_topology_from_mux_ids(
+                                                window_id,
+                                                tab_id,
+                                                pane_operation.pane_id(),
+                                            )
+                                        })
+                                } else {
+                                    None
+                                };
+                                if trace_producer.is_some()
+                                    && trace_authority.is_some()
+                                    && trace_topology.is_none()
+                                {
+                                    metrics::counter!(
+                                        "mux.server.trace_event",
+                                        "outcome" => "topology_unavailable"
+                                    )
+                                    .increment(2);
+                                }
+                                let trace_topology_unavailable = trace_producer.is_some()
+                                    && trace_authority.is_some()
+                                    && trace_topology.is_none();
+                                if trace_topology_unavailable {
+                                    ReliableKeyEventOutcomeV1::Rejected(
+                                        ReliableKeyEventRejectionV1::PaneUnavailable,
+                                    )
+                                } else if force_begin_side_effect_failure
+                                    || !permit.begin_side_effect()
+                                {
+                                    ReliableKeyEventOutcomeV1::Rejected(
+                                        ReliableKeyEventRejectionV1::OutcomeUnknown,
+                                    )
+                                } else {
+                                    let dispatch_started_at = Instant::now();
+                                    #[cfg(test)]
+                                    if let Some(barrier) = trace_authority
+                                        .as_ref()
+                                        .and_then(|admission| admission.effect_barrier.as_ref())
+                                    {
+                                        barrier.wait_for_detach();
+                                    }
+                                    let callback = pane_operation.with_pane(|pane| {
+                                        catch_recoverable(
                                             RecoverablePanicSite::MuxPaneCallback,
                                             AssertUnwindSafe(|| match request.kind {
                                                 ReliableKeyEventKindV1::KeyDown => pane.key_down(
@@ -6891,38 +7020,51 @@ impl SessionHandler {
                                                     request.event.modifiers,
                                                 ),
                                             }),
-                                        );
-                                        match callback {
-                                            Ok(Ok(())) => {
-                                                if permit.commit_applied() {
-                                                    ReliableKeyEventOutcomeV1::Applied
-                                                } else {
-                                                    ReliableKeyEventOutcomeV1::Rejected(
-                                                        ReliableKeyEventRejectionV1::OutcomeUnknown,
-                                                    )
-                                                }
-                                            }
-                                            Ok(Err(error)) => {
-                                                log::warn!(
-                                                    "reliable key pane callback failed after invocation: {error:#}"
+                                        )
+                                    });
+                                    match callback {
+                                        Ok(Ok(()))
+                                            if !force_commit_applied_failure
+                                                && permit.commit_applied() =>
+                                        {
+                                            if let (
+                                                Some(producer),
+                                                Some(admission),
+                                                Some(topology),
+                                            ) = (
+                                                trace_producer.as_ref(),
+                                                trace_authority.as_ref(),
+                                                trace_topology,
+                                            ) {
+                                                producer.record_reliable_dispatch(
+                                                    admission,
+                                                    topology,
+                                                    dispatch_started_at,
                                                 );
-                                                ReliableKeyEventOutcomeV1::Rejected(
-                                                    ReliableKeyEventRejectionV1::OutcomeUnknown,
-                                                )
                                             }
-                                            Err(_panic) => {
-                                                log::warn!(
-                                                    "reliable key pane callback panicked after invocation"
-                                                );
-                                                ReliableKeyEventOutcomeV1::Rejected(
-                                                    ReliableKeyEventRejectionV1::OutcomeUnknown,
-                                                )
-                                            }
+                                            ReliableKeyEventOutcomeV1::Applied
                                         }
-                                    })
-                                    .unwrap_or(ReliableKeyEventOutcomeV1::Rejected(
-                                        ReliableKeyEventRejectionV1::PaneUnavailable,
-                                    ))
+                                        Ok(Ok(())) => ReliableKeyEventOutcomeV1::Rejected(
+                                            ReliableKeyEventRejectionV1::OutcomeUnknown,
+                                        ),
+                                        Ok(Err(error)) => {
+                                            log::warn!(
+                                                "reliable key pane callback failed after invocation: {error:#}"
+                                            );
+                                            ReliableKeyEventOutcomeV1::Rejected(
+                                                ReliableKeyEventRejectionV1::OutcomeUnknown,
+                                            )
+                                        }
+                                        Err(_panic) => {
+                                            log::warn!(
+                                                "reliable key pane callback panicked after invocation"
+                                            );
+                                            ReliableKeyEventOutcomeV1::Rejected(
+                                                ReliableKeyEventRejectionV1::OutcomeUnknown,
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(_) => ReliableKeyEventOutcomeV1::Retry(
@@ -6947,7 +7089,18 @@ impl SessionHandler {
                         });
                     }
                 });
-                record_send_key_down_scheduler_receipt(spawned.initial_enqueue_receipt(), false);
+                let enqueue_receipt = spawned.initial_enqueue_receipt();
+                if let Some(scheduler_enqueue) = scheduler_enqueue {
+                    // The runnable cannot close K5 until the owner thread
+                    // ticks it. Publish the exact enqueue receipt before this
+                    // dispatch turn returns to that loop.
+                    scheduler_enqueue.set(Some(enqueue_receipt));
+                }
+                record_send_key_down_scheduler_receipt(enqueue_receipt, sampled_trace);
+                if cancel_after_enqueue {
+                    drop(spawned);
+                    return;
+                }
                 spawned.detach();
             }
 
@@ -6963,16 +7116,10 @@ impl SessionHandler {
                 };
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
-                let trace_authority = admitted_input_trace;
-                let trace_producer = trace_authority
-                    .as_ref()
-                    .and_then(|admission| admission.trace_producer.as_ref().map(Rc::clone));
-                let sampled_trace = trace_authority
-                    .as_ref()
-                    .is_some_and(|admission| admission.recorder_token.is_some());
-                let scheduler_enqueue = trace_authority
-                    .as_ref()
-                    .map(|admission| Rc::clone(&admission.scheduler_enqueue));
+                debug_assert!(
+                    admitted_input_trace.is_none(),
+                    "retired PDU95 must never attach trace authority to legacy input"
+                );
                 let reservation = match try_reserve_main_thread(
                     MainThreadServiceClass::Input,
                     SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
@@ -6987,16 +7134,6 @@ impl SessionHandler {
                     catch(
                         move || {
                             with_current_pane(&authority, &registration, |pane| {
-                                if let (Some(producer), Some(admission)) =
-                                    (trace_producer.as_ref(), trace_authority.as_ref())
-                                {
-                                    // End K5 only after the queued task has
-                                    // revalidated the exact session and pane
-                                    // registration. A retired session or
-                                    // replaced pane therefore cannot fabricate
-                                    // a performed mux-dispatch stage.
-                                    producer.record_mux_dispatch_start(admission, Instant::now());
-                                }
                                 pane.key_down(event.key, event.modifiers)?;
                                 push_input_dispatch_changes_after_committed_input(
                                     pane,
@@ -7012,14 +7149,7 @@ impl SessionHandler {
                     );
                 });
                 let enqueue_receipt = spawned.initial_enqueue_receipt();
-                if let Some(scheduler_enqueue) = scheduler_enqueue {
-                    // The server's SimpleExecutor callback only publishes the
-                    // runnable, and only its owner thread can tick it. Store
-                    // the exact enqueue receipt before this dispatch turn can
-                    // return to that main-thread loop and close K5.
-                    scheduler_enqueue.set(Some(enqueue_receipt));
-                }
-                record_send_key_down_scheduler_receipt(enqueue_receipt, sampled_trace);
+                record_send_key_down_scheduler_receipt(enqueue_receipt, false);
                 spawned.detach();
             }
             Pdu::SendKeyUp(SendKeyUp { pane_id, event }) => {
@@ -7777,8 +7907,11 @@ impl SessionHandler {
                 let _ = unexpected;
                 send_response(Err(MuxServerRejection::invalid_request().into()));
             }
-            Pdu::SendKeyDownTracedV1(_) => unreachable!(
-                "sampled key input is normalized only after exact trace admission validation"
+            Pdu::SendKeyDownTracedV1(_) => {
+                unreachable!("retired PDU95 is rejected before legacy input dispatch")
+            }
+            Pdu::ReliableKeyEventTracedV1(_) => unreachable!(
+                "PDU98 is normalized to PDU96 only after exact trace admission validation"
             ),
         }
     }
@@ -7874,6 +8007,18 @@ async fn domain_spawn_v2(
     spawn: SpawnV2,
     client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
+    domain_spawn_v2_with_resolution_hook(authority, spawn, client_id, |_, _| {}).await
+}
+
+async fn domain_spawn_v2_with_resolution_hook<HOOK>(
+    authority: SessionAuthority,
+    spawn: SpawnV2,
+    client_id: Option<Arc<ClientId>>,
+    on_resolved: HOOK,
+) -> anyhow::Result<Pdu>
+where
+    HOOK: FnOnce(&Arc<Mux>, &mux::DomainOperationGuard),
+{
     let mux = session_mux(&authority)?;
     let domain_object_id = match &spawn.domain {
         config::keyassignment::SpawnTabDomain::DomainId(domain_id) => {
@@ -7883,14 +8028,17 @@ async fn domain_spawn_v2(
         | config::keyassignment::SpawnTabDomain::CurrentPaneDomain
         | config::keyassignment::SpawnTabDomain::DomainName(_) => None,
     };
-    mux.resolve_spawn_tab_domain(None, &spawn.domain)
+    let domain = mux
+        .resolve_spawn_tab_domain(None, &spawn.domain)
         .map_err(|_| MuxServerRejection::domain_not_found(domain_object_id))?;
+    let frozen_domain = config::keyassignment::SpawnTabDomain::DomainId(domain.domain_id());
+    on_resolved(mux.mux(), &domain);
 
-    let (tab, pane, window_id) = mux
+    let spawn_result = mux
         .mux()
         .spawn_tab_or_window(
             spawn.window_id,
-            spawn.domain,
+            frozen_domain,
             spawn.command,
             spawn.command_dir,
             spawn.size,
@@ -7899,7 +8047,9 @@ async fn domain_spawn_v2(
             None, // optional gui window position
             client_id,
         )
-        .await?;
+        .await;
+    drop(domain);
+    let (tab, pane, window_id) = spawn_result?;
 
     Ok::<Pdu, anyhow::Error>(Pdu::SpawnResponse(SpawnResponse {
         pane_id: pane.pane_id(),
@@ -7963,15 +8113,17 @@ mod tests {
     use frankenterm_core_audit_types::interaction_trace_v2::{
         InteractionTraceId, InteractionTracePath, InteractionTraceRunId,
     };
-    use mux::domain::DomainId;
+    use mux::domain::{Domain, DomainId, DomainState};
     use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use parking_lot::{MappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
     use promise::spawn::{
-        MainThreadAdmissionLimits, MainThreadSpawnOutcome, SimpleExecutor, try_spawn_with_admission,
+        MainThreadAdmissionLimits, MainThreadQueueSnapshot, MainThreadSpawnOutcome, SimpleExecutor,
+        try_spawn_with_admission,
     };
     use proptest::prelude::*;
     use rangeset::RangeSet;
     use std::collections::{HashMap, HashSet};
+    use std::num::NonZeroU64;
     use std::ops::Range;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7982,6 +8134,10 @@ mod tests {
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
 
     fn trace_recorder(shard_count: u16) -> Arc<FlightRecorder> {
+        trace_recorder_with_slots(shard_count, u32::from(shard_count) * 4)
+    }
+
+    fn trace_recorder_with_slots(shard_count: u16, total_slots: u32) -> Arc<FlightRecorder> {
         let config = frankenterm_flight_recorder::RecorderConfig::new(
             RecorderEpochId {
                 nonce_hi: 1,
@@ -7994,7 +8150,7 @@ mod tests {
             RecorderMode::Certification,
             RecorderSamplerConfigV1::certification(),
             shard_count,
-            u32::from(shard_count) * 4,
+            total_slots,
             8 * 1024 * 1024,
         )
         .expect("test trace-recorder configuration must be valid");
@@ -8020,6 +8176,130 @@ mod tests {
 
     fn topology_stream(byte: u8) -> TopologyStreamId {
         TopologyStreamId::from_bytes([byte; 16])
+    }
+
+    struct SampledReliableHarness {
+        executor: SimpleExecutor,
+        pane: Arc<FakePane>,
+        pane_registration: ReliablePaneRegistrationIdentityV1,
+        mux: Arc<Mux>,
+        _mux_guard: ScopedMux,
+        recorder: Arc<FlightRecorder>,
+        authority: Arc<DispatchTraceAuthority>,
+        producer: Rc<SessionTraceProducer>,
+        handler: SessionHandler,
+        captured: Arc<Mutex<Vec<DecodedPdu>>>,
+        stream_id: TopologyStreamId,
+    }
+
+    impl SampledReliableHarness {
+        fn new(
+            pane: Arc<FakePane>,
+            recorder: Arc<FlightRecorder>,
+            stream_byte: u8,
+            client_name: &str,
+            client_process_id: u32,
+        ) -> Self {
+            Self::new_with_executor(
+                pane,
+                recorder,
+                stream_byte,
+                client_name,
+                client_process_id,
+                SimpleExecutor::new(),
+            )
+        }
+
+        fn new_with_executor(
+            pane: Arc<FakePane>,
+            recorder: Arc<FlightRecorder>,
+            stream_byte: u8,
+            client_name: &str,
+            client_process_id: u32,
+            executor: SimpleExecutor,
+        ) -> Self {
+            let pane_for_tab: Arc<dyn Pane> = pane.clone();
+            let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+            tab.assign_pane(&pane_for_tab);
+            let (mux, mux_guard) = install_tab_with_window(&tab, &[]);
+            let registration = mux
+                .capture_pane_registration(&pane_for_tab)
+                .expect("sampled harness pane retains exact wire authority");
+            let pane_registration =
+                ReliablePaneRegistrationIdentityV1::from_bytes(registration.wire_identity());
+            let stream_id = topology_stream(stream_byte);
+            let authority = DispatchTraceAuthority::new(Arc::clone(&recorder));
+            let producer = authority
+                .claim_session(stream_id)
+                .expect("sampled harness connection claims one recorder shard");
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new_for_session_with_topology_stream(
+                sender,
+                SessionOwner::new(Arc::clone(&mux)),
+                stream_id,
+            );
+            handler.process_one(DecodedPdu {
+                serial: 1,
+                pdu: Pdu::SetClientId(SetClientId {
+                    client_id: test_client_id(client_name, client_process_id),
+                    is_proxy: false,
+                }),
+            });
+            assert_eq!(
+                take_response(&captured).pdu,
+                Pdu::UnitResponse(UnitResponse {})
+            );
+            Self {
+                executor,
+                pane,
+                pane_registration,
+                mux,
+                _mux_guard: mux_guard,
+                recorder,
+                authority,
+                producer,
+                handler,
+                captured,
+                stream_id,
+            }
+        }
+
+        fn request(&self, input_serial: u64) -> ReliableKeyEventTracedV1 {
+            let mut request = sampled_key_request();
+            request.request.pane_id = self.pane.pane_id();
+            request.request.pane_registration = Some(self.pane_registration);
+            request.request.input_serial = InputSerial::from_millis_since_epoch(input_serial);
+            request
+        }
+
+        fn admission(&self, request: &ReliableKeyEventTracedV1) -> AdmittedInputTraceV1 {
+            let mut admission =
+                AdmittedInputTraceV1::admit(request, self.stream_id, codec::CODEC_VERSION)
+                    .expect("sampled harness request receives connection authority");
+            self.handler.record_decoded_input_trace(
+                Some(&self.producer),
+                &mut admission,
+                self.authority.clock_origin,
+                Instant::now(),
+            );
+            admission
+        }
+
+        fn dispatch(
+            &mut self,
+            rpc_serial: u64,
+            request: ReliableKeyEventTracedV1,
+            admission: AdmittedInputTraceV1,
+        ) {
+            self.handler.process_one_with_dispatch_authority(
+                DecodedPdu {
+                    serial: rpc_serial,
+                    pdu: Pdu::ReliableKeyEventTracedV1(request),
+                },
+                None,
+                Some(admission),
+            );
+        }
     }
 
     #[test]
@@ -8071,15 +8351,31 @@ mod tests {
     }
 
     #[test]
+    fn production_trace_authority_is_bounded_low_mode() {
+        let authority = DispatchTraceAuthority::production_low()
+            .expect("release-default trace authority must allocate");
+        let config = authority.recorder.config();
+        assert_eq!(config.mode(), RecorderMode::Low);
+        assert_eq!(config.sampler().numerator, 1);
+        assert_eq!(
+            config.sampler().denominator,
+            PRODUCTION_TRACE_SAMPLE_DENOMINATOR
+        );
+        assert_eq!(config.capacity().shard_count, PRODUCTION_TRACE_SHARDS);
+        assert_eq!(config.capacity().total_slots, PRODUCTION_TRACE_TOTAL_SLOTS);
+        assert_eq!(
+            config.capacity().configured_byte_ceiling,
+            PRODUCTION_TRACE_BYTE_CEILING
+        );
+    }
+
+    #[test]
     fn server_trace_producer_records_exact_k4_k5_prefix_without_content() {
         let recorder = trace_recorder(1);
         let authority = DispatchTraceAuthority::new(Arc::clone(&recorder));
         let producer = authority
             .claim_session(topology_stream(9))
             .expect("connection must claim its producer before request dispatch");
-        let token = producer
-            .admit_remote_trace(sampled_key_context())
-            .expect("certification recorder must admit the sampled remote trace");
         let topology = InteractionTraceTopology {
             window_id: 101,
             tab_id: 202,
@@ -8092,27 +8388,35 @@ mod tests {
         let k5_end = k4_end
             .checked_add(std::time::Duration::from_nanos(7))
             .expect("test instant addition must fit");
-
-        producer.record_server_stage(
-            token,
-            RendererKeypressTraceStage::ServerReadableDecode,
-            topology,
-            k4_start,
-            k4_end,
-            None,
-        );
         let admission = AdmittedInputTraceV1 {
             context: sampled_key_context(),
             stream_id: topology_stream(9),
             pane_id: 303,
+            pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x33; 16])),
             input_serial: InputSerial::from_millis_since_epoch(11),
-            recorder_token: Some(token),
-            topology: Some(topology),
-            dispatch_queued_at: Some(k4_end),
-            scheduler_enqueue: Rc::new(Cell::new(None)),
+            kind: ReliableKeyEventKindV1::KeyDown,
+            decode_started_at: Some(k4_start),
+            decode_completed_at: Some(k4_end),
+            scheduler_enqueue: Rc::new(Cell::new(Some(MainThreadEnqueueReceipt {
+                queue_id: NonZeroU64::new(1).expect("test queue ID is nonzero"),
+                scheduler_generation: NonZeroU64::new(2)
+                    .expect("test scheduler generation is nonzero"),
+                task_ticket: NonZeroU64::new(3).expect("test task ticket is nonzero"),
+                enqueued_at: k4_end,
+                snapshot_after_enqueue: MainThreadQueueSnapshot::new(
+                    1,
+                    4,
+                    SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
+                    SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES * 4,
+                    Some(k4_end),
+                    false,
+                )
+                .expect("test scheduler queue snapshot is canonical"),
+            }))),
             trace_producer: None,
+            effect_barrier: None,
         };
-        producer.record_mux_dispatch_start(&admission, k5_end);
+        assert!(producer.record_reliable_dispatch(&admission, topology, k5_end));
 
         let events = freeze_trace_events(&recorder);
         assert_eq!(events.len(), 2);
@@ -8160,7 +8464,25 @@ mod tests {
             SessionOwner::new(Arc::clone(&mux)),
             stream_id,
         );
-        let request = sampled_key_request();
+        handler.process_one(DecodedPdu {
+            serial: 913,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("sampled-trace-success", 41_011),
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        let registration = mux
+            .capture_pane_registration(&pane_for_tab)
+            .expect("sampled trace pane must retain an exact registration");
+        let mut request = sampled_key_request();
+        request.request.pane_registration = Some(ReliablePaneRegistrationIdentityV1::from_bytes(
+            registration.wire_identity(),
+        ));
+        let operational_retry = request.request.clone();
         let mut admission = AdmittedInputTraceV1::admit(&request, stream_id, codec::CODEC_VERSION)
             .expect("valid sampled request must receive connection authority");
         let decode_started_at = authority.clock_origin;
@@ -8171,12 +8493,15 @@ mod tests {
             decode_started_at,
             decode_completed_at,
         );
-        assert!(admission.recorder_token.is_some());
+        assert_eq!(admission.decode_started_at, Some(decode_started_at));
+        assert_eq!(admission.decode_completed_at, Some(decode_completed_at));
+        assert!(admission.trace_producer.is_some());
+        assert!(admission.scheduler_enqueue.get().is_none());
 
         handler.process_one_with_dispatch_authority(
             DecodedPdu {
                 serial: 914,
-                pdu: Pdu::SendKeyDownTracedV1(request),
+                pdu: Pdu::ReliableKeyEventTracedV1(request),
             },
             None,
             Some(admission),
@@ -8192,6 +8517,37 @@ mod tests {
         assert_eq!(pane.key_down_count(), 1, "the key must be applied once");
         assert_eq!(executor.queue_snapshot().depth, 0);
         assert_eq!(executor.admission_snapshot().active_tasks, 0);
+        handler.process_one(DecodedPdu {
+            serial: 915,
+            pdu: Pdu::ReliableKeyEventV1(operational_retry),
+        });
+        let responses = captured.lock().unwrap();
+        assert!(responses.iter().any(|response| {
+            response.serial == 914
+                && matches!(
+                    &response.pdu,
+                    Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                        outcome: ReliableKeyEventOutcomeV1::Applied,
+                        ..
+                    })
+                )
+        }));
+        assert!(responses.iter().any(|response| {
+            response.serial == 915
+                && matches!(
+                    &response.pdu,
+                    Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                        outcome: ReliableKeyEventOutcomeV1::DuplicateApplied,
+                        ..
+                    })
+                )
+        }));
+        drop(responses);
+        assert_eq!(
+            pane.key_down_count(),
+            1,
+            "an unsampled PDU96 retry must not repeat the reliable side effect"
+        );
         let events = freeze_trace_events(&recorder);
         assert_eq!(events.len(), 2);
         assert_eq!(
@@ -8249,6 +8605,647 @@ mod tests {
     }
 
     #[test]
+    fn repeated_sampled_context_applies_both_inputs_but_exports_one_valid_k4_k5_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder_with_slots(1, 8);
+        let pane = Arc::new(FakePane::new_with_id(7_100, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            20,
+            "sampled-context-replay",
+            42_100,
+        );
+        let (_, window_id, tab_id) = harness
+            .mux
+            .resolve_pane_id(harness.pane.pane_id())
+            .expect("attached sampled pane has exact topology");
+        let topology = trace_topology_from_mux_ids(window_id, tab_id, harness.pane.pane_id())
+            .expect("sampled pane topology is encodable");
+        let prefix_token = harness
+            .producer
+            .admit_remote_trace(sampled_key_context())
+            .expect("valid sampled prefix receives remote trace authority");
+        let producer_identity = harness
+            .producer
+            .producer_identity()
+            .expect("sampled prefix producer identity is encodable");
+        let prefix_timestamp = harness
+            .producer
+            .timestamp_at(harness.authority.clock_origin)
+            .expect("recorder origin is in its own clock domain");
+        for stage in [
+            RendererKeypressTraceStage::KeyAppkitReceipt,
+            RendererKeypressTraceStage::GuiKeyMappingComplete,
+            RendererKeypressTraceStage::ClientRpcEnqueue,
+            RendererKeypressTraceStage::ClientEncodeSocketFlush,
+        ] {
+            let stage = InteractionTraceStage::Keypress(stage);
+            let ordinal = u64::from(stage.ordinal());
+            let fields = EventFields::new(
+                ordinal,
+                ordinal + 1,
+                (ordinal > 0).then_some(ordinal),
+                stage,
+                InteractionTraceStageOutcome::Performed,
+                producer_identity,
+                topology,
+                ClockStamp {
+                    started_at: prefix_timestamp,
+                    completed_at: prefix_timestamp,
+                },
+                InteractionTraceCorrelation::Uncorrelated,
+                InteractionTraceCounters::default(),
+                InteractionTraceCounterUnavailability::all_available(),
+                InteractionTraceGenerations::default(),
+                None,
+                InteractionTraceObservationBoundary::InternalState,
+                None,
+            )
+            .expect("client prefix fixture satisfies intrinsic trace invariants");
+            assert!(matches!(
+                recorder.record(&harness.producer.producer, prefix_token, &fields),
+                RecordOutcome::Recorded { .. }
+            ));
+        }
+
+        for (rpc_serial, input_serial) in [(2, 100), (3, 101)] {
+            let request = harness.request(input_serial);
+            assert_eq!(request.trace_context, sampled_key_context());
+            let admission = harness.admission(&request);
+            harness.dispatch(rpc_serial, request, admission);
+            tick_until_response(&harness.executor, &harness.captured, 2);
+            drain_simple_executor(&harness.executor);
+
+            let mut captured = harness.captured.lock().unwrap();
+            assert!(captured.iter().any(|response| {
+                response.serial == rpc_serial
+                    && matches!(
+                        &response.pdu,
+                        Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                            outcome: ReliableKeyEventOutcomeV1::Applied,
+                            ..
+                        })
+                    )
+            }));
+            captured.clear();
+        }
+
+        assert_eq!(
+            harness.pane.key_down_count(),
+            2,
+            "duplicate trace identity must never couple to reliable input behavior"
+        );
+        let mut frozen = recorder
+            .try_freeze()
+            .expect("quiescent duplicate-context recorder must freeze");
+        assert_eq!(
+            frozen.len(),
+            6,
+            "one fixture K0-K3 prefix and one atomic K4/K5 pair may remain"
+        );
+        assert_eq!(
+            frozen.accounting().trace.sampled_in,
+            3,
+            "the fixture prefix and both operational attempts admit the same context"
+        );
+        assert_eq!(frozen.accounting().event.recorded, 6);
+        assert_eq!(frozen.accounting().event.duplicate_trace_context, 2);
+        assert!(!frozen.accounting().event.is_lossless());
+
+        let mut events = Vec::with_capacity(frozen.len());
+        assert_eq!(
+            frozen.export_into(&mut events),
+            frankenterm_flight_recorder::ExportOutcome::Completed { exported_events: 6 }
+        );
+        assert_eq!(
+            events.iter().map(|event| event.stage).collect::<Vec<_>>(),
+            vec![
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::KeyAppkitReceipt,),
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::GuiKeyMappingComplete,),
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ClientRpcEnqueue,),
+                InteractionTraceStage::Keypress(
+                    RendererKeypressTraceStage::ClientEncodeSocketFlush,
+                ),
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode,),
+                InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait,),
+            ]
+        );
+        let mut json_lines = Vec::new();
+        assert!(matches!(
+            frozen.write_json_lines(&mut json_lines),
+            frankenterm_flight_recorder::ExportWriteOutcome::Completed {
+                exported_events: 6,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sampled_scheduler_full_retry_records_no_k4_k5_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let blocker = match try_spawn_with_admission(
+            MainThreadServiceClass::Topology,
+            4 * 1024,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected scheduler blocker admission, got {outcome:?}"),
+        };
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_101, None));
+        let mut harness = SampledReliableHarness::new_with_executor(
+            pane,
+            Arc::clone(&recorder),
+            21,
+            "sampled-scheduler-full",
+            42_101,
+            executor,
+        );
+        let request = harness.request(101);
+        let admission = harness.admission(&request);
+        harness.dispatch(2, request, admission);
+
+        let response = take_response(&harness.captured);
+        assert!(matches!(
+            response.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Retry(ReliableKeyEventRetryV1::SchedulerFull(
+                    _
+                )),
+                ..
+            })
+        ));
+        assert_eq!(harness.pane.key_down_count(), 0);
+        drop(blocker);
+        assert!(harness.executor.try_tick().unwrap());
+        assert!(
+            freeze_trace_events(&recorder).is_empty(),
+            "scheduler-full retry must publish neither K4 nor K5"
+        );
+    }
+
+    #[test]
+    fn sampled_duplicate_pending_retry_records_no_k4_k5_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_102, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            22,
+            "sampled-duplicate-pending",
+            42_102,
+        );
+        let request = harness.request(102);
+        harness.handler.process_one(DecodedPdu {
+            serial: 2,
+            pdu: Pdu::ReliableKeyEventV1(request.request.clone()),
+        });
+        assert_eq!(harness.executor.queue_snapshot().depth, 1);
+
+        let admission = harness.admission(&request);
+        harness.dispatch(3, request, admission);
+        let duplicate = take_response(&harness.captured);
+        assert_eq!(duplicate.serial, 3);
+        assert!(matches!(
+            duplicate.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Retry(
+                    ReliableKeyEventRetryV1::DuplicatePending { .. }
+                ),
+                ..
+            })
+        ));
+
+        tick_until_response(&harness.executor, &harness.captured, 2);
+        drain_simple_executor(&harness.executor);
+        assert_eq!(harness.pane.key_down_count(), 1);
+        assert!(
+            freeze_trace_events(&recorder).is_empty(),
+            "a sampled duplicate-pending attempt and unsampled winner publish no pair"
+        );
+    }
+
+    #[test]
+    fn sampled_retired_client_runnable_records_no_k4_k5_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_103, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            23,
+            "sampled-retired-client",
+            42_103,
+        );
+        let request = harness.request(103);
+        let admission = harness.admission(&request);
+        harness.dispatch(2, request, admission);
+        let retired = harness
+            .handler
+            .client_id
+            .as_ref()
+            .expect("sampled harness registered its client");
+        let replacement = Arc::new(retired.as_ref().clone());
+        harness.mux.register_client(replacement);
+
+        harness.executor.tick().expect("run retired-client task");
+        let response = take_response(&harness.captured);
+        assert!(matches!(
+            response.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Retry(
+                    ReliableKeyEventRetryV1::ClientRegistrationTransition { .. }
+                ),
+                ..
+            })
+        ));
+        assert_eq!(harness.pane.key_down_count(), 0);
+        assert!(freeze_trace_events(&recorder).is_empty());
+    }
+
+    #[test]
+    fn sampled_retired_pane_before_claim_records_no_k4_k5_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_104, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            24,
+            "sampled-retired-pane",
+            42_104,
+        );
+        let request = harness.request(104);
+        let admission = harness.admission(&request);
+        harness.mux.remove_pane(harness.pane.pane_id());
+        harness.dispatch(2, request, admission);
+
+        let response = take_response(&harness.captured);
+        assert!(matches!(
+            response.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Rejected(
+                    ReliableKeyEventRejectionV1::PaneUnavailable
+                ),
+                ..
+            })
+        ));
+        assert_eq!(harness.pane.key_down_count(), 0);
+        assert!(freeze_trace_events(&recorder).is_empty());
+    }
+
+    #[test]
+    fn sampled_cancelled_runnable_records_no_k4_k5_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_105, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            25,
+            "sampled-runnable-cancel",
+            42_105,
+        );
+        harness.handler.reliable_input_test_fault = ReliableInputTestFault::CancelAfterEnqueue;
+        let request = harness.request(105);
+        let admission = harness.admission(&request);
+        harness.dispatch(2, request, admission);
+        assert_eq!(harness.executor.queue_snapshot().depth, 1);
+        assert!(harness.captured.lock().unwrap().is_empty());
+
+        assert!(harness.executor.try_tick().unwrap());
+        assert_eq!(harness.executor.queue_snapshot().depth, 0);
+        assert_eq!(harness.pane.key_down_count(), 0);
+        assert!(harness.captured.lock().unwrap().is_empty());
+        assert!(freeze_trace_events(&recorder).is_empty());
+    }
+
+    #[test]
+    fn sampled_begin_side_effect_failure_records_no_pair_and_exact_retry_applies() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_106, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            26,
+            "sampled-begin-false",
+            42_106,
+        );
+        harness.handler.reliable_input_test_fault = ReliableInputTestFault::BeginSideEffectFalse;
+        let request = harness.request(106);
+        let retry = request.request.clone();
+        let admission = harness.admission(&request);
+        harness.dispatch(2, request, admission);
+        harness.executor.tick().expect("run begin-false task");
+        let rejected = take_response(&harness.captured);
+        assert!(matches!(
+            rejected.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Rejected(
+                    ReliableKeyEventRejectionV1::OutcomeUnknown
+                ),
+                ..
+            })
+        ));
+        assert_eq!(harness.pane.key_down_count(), 0);
+
+        harness.handler.reliable_input_test_fault = ReliableInputTestFault::None;
+        harness.handler.process_one(DecodedPdu {
+            serial: 3,
+            pdu: Pdu::ReliableKeyEventV1(retry),
+        });
+        tick_until_response(&harness.executor, &harness.captured, 2);
+        drain_simple_executor(&harness.executor);
+        assert_eq!(harness.pane.key_down_count(), 1);
+        assert!(freeze_trace_events(&recorder).is_empty());
+    }
+
+    #[test]
+    fn sampled_commit_failure_records_no_pair_and_retry_remains_outcome_unknown() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_107, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            27,
+            "sampled-commit-false",
+            42_107,
+        );
+        harness.handler.reliable_input_test_fault = ReliableInputTestFault::CommitAppliedFalse;
+        let request = harness.request(107);
+        let retry = request.request.clone();
+        let admission = harness.admission(&request);
+        harness.dispatch(2, request, admission);
+        harness.executor.tick().expect("run commit-false task");
+        let rejected = take_response(&harness.captured);
+        assert!(matches!(
+            rejected.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Rejected(
+                    ReliableKeyEventRejectionV1::OutcomeUnknown
+                ),
+                ..
+            })
+        ));
+        assert_eq!(harness.pane.key_down_count(), 1);
+
+        harness.handler.reliable_input_test_fault = ReliableInputTestFault::None;
+        harness.handler.process_one(DecodedPdu {
+            serial: 3,
+            pdu: Pdu::ReliableKeyEventV1(retry),
+        });
+        let retry_response = take_response(&harness.captured);
+        assert!(matches!(
+            retry_response.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Rejected(
+                    ReliableKeyEventRejectionV1::OutcomeUnknown
+                ),
+                ..
+            })
+        ));
+        assert_eq!(harness.pane.key_down_count(), 1);
+        assert!(freeze_trace_events(&recorder).is_empty());
+    }
+
+    #[test]
+    fn sampled_callback_error_and_panic_record_no_k4_k5_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let cases: [(&str, Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>); 2] = [
+            (
+                "error",
+                Arc::new(|| Err(anyhow!("injected sampled key callback failure"))),
+            ),
+            (
+                "panic",
+                Arc::new(|| -> anyhow::Result<()> {
+                    panic!("injected sampled key callback panic")
+                }),
+            ),
+        ];
+        for (index, (label, probe)) in cases.into_iter().enumerate() {
+            let recorder = trace_recorder(1);
+            let pane = Arc::new(FakePane::new_with_key_down_probe(7_108 + index, probe));
+            let mut harness = SampledReliableHarness::new(
+                pane,
+                Arc::clone(&recorder),
+                u8::try_from(28 + index).unwrap(),
+                "sampled-callback-failure",
+                42_108 + u32::try_from(index).unwrap(),
+            );
+            let request = harness.request(108 + u64::try_from(index).unwrap());
+            let admission = harness.admission(&request);
+            harness.dispatch(2, request, admission);
+            harness.executor.tick().expect("run callback-failure task");
+
+            let rejected = take_response(&harness.captured);
+            assert!(matches!(
+                rejected.pdu,
+                Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                    outcome: ReliableKeyEventOutcomeV1::Rejected(
+                        ReliableKeyEventRejectionV1::OutcomeUnknown
+                    ),
+                    ..
+                })
+            ));
+            assert_eq!(harness.pane.key_down_count(), 1, "{label} callback count");
+            assert!(
+                freeze_trace_events(&recorder).is_empty(),
+                "{label} callback must publish neither K4 nor K5"
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_pair_queue_full_preserves_applied_input_and_records_no_partial_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder_with_slots(1, 1);
+        let pane = Arc::new(FakePane::new_with_id(7_110, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            30,
+            "sampled-pair-full",
+            42_110,
+        );
+        let (_, window_id, tab_id) = harness
+            .mux
+            .resolve_pane_id(harness.pane.pane_id())
+            .expect("sampled full-queue pane has exact topology");
+        let topology = trace_topology_from_mux_ids(window_id, tab_id, harness.pane.pane_id())
+            .expect("sampled full-queue topology is representable");
+        let mut filler_context = sampled_key_context();
+        filler_context.trace_id.sequence += 100;
+        let filler_token = harness
+            .producer
+            .admit_remote_trace(filler_context)
+            .expect("filler trace receives recorder admission");
+        let filler = harness
+            .producer
+            .server_stage_fields(
+                filler_token,
+                RendererKeypressTraceStage::ServerReadableDecode,
+                topology,
+                harness.authority.clock_origin,
+                Instant::now(),
+                None,
+            )
+            .expect("filler trace fields are canonical");
+        assert!(matches!(
+            recorder.record(&harness.producer.producer, filler_token, &filler),
+            RecordOutcome::Recorded { .. }
+        ));
+
+        let request = harness.request(110);
+        let admission = harness.admission(&request);
+        harness.dispatch(2, request, admission);
+        tick_until_response(&harness.executor, &harness.captured, 2);
+        drain_simple_executor(&harness.executor);
+        assert_eq!(harness.pane.key_down_count(), 1);
+        assert!(harness.captured.lock().unwrap().iter().any(|response| {
+            response.serial == 2
+                && matches!(
+                    &response.pdu,
+                    Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                        outcome: ReliableKeyEventOutcomeV1::Applied,
+                        ..
+                    })
+                )
+        }));
+
+        let events = freeze_trace_events(&recorder);
+        assert_eq!(events.len(), 1, "only the planted filler may remain");
+        assert_eq!(events[0].trace_id, filler_context.trace_id);
+        assert_eq!(recorder.accounting_snapshot().event.queue_full, 2);
+    }
+
+    #[test]
+    fn sampled_pair_closing_preserves_applied_input_and_records_no_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_111, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            31,
+            "sampled-pair-closing",
+            42_111,
+        );
+        assert_eq!(
+            recorder.begin_close(),
+            frankenterm_flight_recorder::CloseOutcome::Ready
+        );
+        let request = harness.request(111);
+        let admission = harness.admission(&request);
+        harness.dispatch(2, request, admission);
+        tick_until_response(&harness.executor, &harness.captured, 2);
+        drain_simple_executor(&harness.executor);
+
+        assert_eq!(harness.pane.key_down_count(), 1);
+        assert!(harness.captured.lock().unwrap().iter().any(|response| {
+            response.serial == 2
+                && matches!(
+                    &response.pdu,
+                    Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                        outcome: ReliableKeyEventOutcomeV1::Applied,
+                        ..
+                    })
+                )
+        }));
+        assert!(freeze_trace_events(&recorder).is_empty());
+    }
+
+    #[test]
+    fn sampled_detach_after_topology_freeze_applies_and_records_exact_pair() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let recorder = trace_recorder(1);
+        let pane = Arc::new(FakePane::new_with_id(7_112, None));
+        let mut harness = SampledReliableHarness::new(
+            pane,
+            Arc::clone(&recorder),
+            32,
+            "sampled-detach-barrier",
+            42_112,
+        );
+        let (_, window_id, tab_id) = harness
+            .mux
+            .resolve_pane_id(harness.pane.pane_id())
+            .expect("detach-barrier pane has exact initial topology");
+        let expected_topology =
+            trace_topology_from_mux_ids(window_id, tab_id, harness.pane.pane_id())
+                .expect("detach-barrier topology is representable");
+        let topology_frozen = Arc::new(Barrier::new(2));
+        let detach_complete = Arc::new(Barrier::new(2));
+        let request = harness.request(112);
+        let mut admission = harness.admission(&request);
+        admission.effect_barrier = Some(TraceEffectBarrier {
+            topology_frozen: Arc::clone(&topology_frozen),
+            detach_complete: Arc::clone(&detach_complete),
+        });
+        harness.dispatch(2, request, admission);
+
+        let detached_mux = Arc::clone(&harness.mux);
+        let detached_pane_id = harness.pane.pane_id();
+        let detacher = thread::spawn(move || {
+            topology_frozen.wait();
+            detached_mux.remove_pane(detached_pane_id);
+            detach_complete.wait();
+        });
+        harness.executor.tick().expect("run detach-barrier task");
+        detacher.join().expect("detach-barrier worker exits");
+        drain_simple_executor(&harness.executor);
+
+        let response = take_response(&harness.captured);
+        assert!(matches!(
+            response.pdu,
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                outcome: ReliableKeyEventOutcomeV1::Applied,
+                ..
+            })
+        ));
+        assert_eq!(harness.pane.key_down_count(), 1);
+        let events = freeze_trace_events(&recorder);
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.topology == expected_topology)
+        );
+    }
+
+    #[test]
     fn server_trace_send_key_down_saturation_returns_retryable_error_without_key_side_effect() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
@@ -8275,7 +9272,14 @@ mod tests {
 
         handler.process_one(DecodedPdu {
             serial: 915,
-            pdu: Pdu::SendKeyDown(sampled_key_request().request),
+            pdu: Pdu::SendKeyDown(SendKeyDown {
+                pane_id: 7_007,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(11),
+            }),
         });
 
         assert_eq!(pane.key_down_count(), 0);
@@ -8459,7 +9463,7 @@ mod tests {
     }
 
     #[test]
-    fn server_trace_dispatch_retirement_keeps_k5_and_key_side_effect_absent() {
+    fn server_trace_dispatch_retirement_records_no_pair_or_key_side_effect() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -8482,7 +9486,24 @@ mod tests {
             SessionOwner::new(Arc::clone(&mux)),
             stream_id,
         );
-        let request = sampled_key_request();
+        handler.process_one(DecodedPdu {
+            serial: 914,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("sampled-trace-retirement", 41_012),
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        let registration = mux
+            .capture_pane_registration(&pane_for_tab)
+            .expect("sampled trace pane must retain an exact registration");
+        let mut request = sampled_key_request();
+        request.request.pane_registration = Some(ReliablePaneRegistrationIdentityV1::from_bytes(
+            registration.wire_identity(),
+        ));
         let mut admission = AdmittedInputTraceV1::admit(&request, stream_id, codec::CODEC_VERSION)
             .expect("valid sampled request must receive connection authority");
         let decode_started_at = authority.clock_origin;
@@ -8496,7 +9517,7 @@ mod tests {
         handler.process_one_with_dispatch_authority(
             DecodedPdu {
                 serial: 915,
-                pdu: Pdu::SendKeyDownTracedV1(request),
+                pdu: Pdu::ReliableKeyEventTracedV1(request),
             },
             None,
             Some(admission),
@@ -8514,12 +9535,10 @@ mod tests {
             "retired session must not emit a response from queued work"
         );
         let events = freeze_trace_events(&recorder);
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].stage,
-            InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerReadableDecode)
+        assert!(
+            events.is_empty(),
+            "a retired runnable must publish neither K4 nor K5"
         );
-        assert!(events[0].duration_ns().is_ok());
     }
 
     fn sampled_key_context() -> SampledTraceContextV1 {
@@ -8541,15 +9560,17 @@ mod tests {
         }
     }
 
-    fn sampled_key_request() -> SendKeyDownTracedV1 {
-        SendKeyDownTracedV1 {
-            request: SendKeyDown {
+    fn sampled_key_request() -> ReliableKeyEventTracedV1 {
+        ReliableKeyEventTracedV1 {
+            request: ReliableKeyEventV1 {
                 pane_id: 7_007,
+                pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x55; 16])),
                 event: termwiz::input::KeyEvent {
                     key: termwiz::input::KeyCode::Char('x'),
                     modifiers: termwiz::input::Modifiers::NONE,
                 },
                 input_serial: InputSerial::from_millis_since_epoch(11),
+                kind: ReliableKeyEventKindV1::KeyDown,
             },
             trace_context: sampled_key_context(),
         }
@@ -8599,6 +9620,7 @@ mod tests {
         changed_lines: Mutex<RangeSet<StableRowIndex>>,
         changed_since_seqnos: Mutex<Vec<SequenceNo>>,
         key_down_count: AtomicUsize,
+        key_down_probe: Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
         paste_count: AtomicUsize,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         tiered_scrollback_status_probe: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -8635,6 +9657,7 @@ mod tests {
                 changed_lines: Mutex::new(RangeSet::new()),
                 changed_since_seqnos: Mutex::new(Vec::new()),
                 key_down_count: AtomicUsize::new(0),
+                key_down_probe: None,
                 paste_count: AtomicUsize::new(0),
                 state: Mutex::new(FakePaneState {
                     cursor_position: StableCursorPosition {
@@ -8672,6 +9695,15 @@ mod tests {
         ) -> Self {
             let mut pane = Self::new_with_id(pane_id, None);
             pane.callback_probe = Some(callback_probe);
+            pane
+        }
+
+        fn new_with_key_down_probe(
+            pane_id: PaneId,
+            key_down_probe: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+        ) -> Self {
+            let mut pane = Self::new_with_id(pane_id, None);
+            pane.key_down_probe = Some(key_down_probe);
             pane
         }
 
@@ -8833,6 +9865,9 @@ mod tests {
 
         fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
             self.key_down_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(probe) = &self.key_down_probe {
+                probe()?;
+            }
             Ok(())
         }
 
@@ -8867,6 +9902,184 @@ mod tests {
         fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
             self.state.lock().unwrap().working_dir.clone()
         }
+    }
+
+    struct SpawnRoutingTestDomain {
+        domain_id: DomainId,
+        domain_name: &'static str,
+        pane: Mutex<Option<Arc<dyn Pane>>>,
+        spawn_count: Arc<AtomicUsize>,
+    }
+
+    impl SpawnRoutingTestDomain {
+        fn new(
+            domain_id: DomainId,
+            domain_name: &'static str,
+            pane: Option<Arc<dyn Pane>>,
+            spawn_count: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                domain_id,
+                domain_name,
+                pane: Mutex::new(pane),
+                spawn_count,
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Domain for SpawnRoutingTestDomain {
+        async fn spawn_pane(
+            &self,
+            mux: &Arc<Mux>,
+            _size: TerminalSize,
+            _command: Option<portable_pty::CommandBuilder>,
+            _command_dir: Option<String>,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            let pane = self
+                .pane
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow!("routing test domain has no prepared pane"))?;
+            mux.add_pane(&pane)?;
+            Ok(pane)
+        }
+
+        fn detachable(&self) -> bool {
+            false
+        }
+
+        fn domain_id(&self) -> DomainId {
+            self.domain_id
+        }
+
+        fn domain_name(&self) -> &str {
+            self.domain_name
+        }
+
+        async fn attach(
+            &self,
+            _mux: &Arc<Mux>,
+            _owner_client_id: Option<Arc<ClientId>>,
+            _window_id: Option<mux::window::WindowId>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn detach(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn state(&self) -> DomainState {
+            DomainState::Attached
+        }
+    }
+
+    fn routing_spawn_request(domain: config::keyassignment::SpawnTabDomain) -> SpawnV2 {
+        SpawnV2 {
+            domain,
+            window_id: None,
+            command: None,
+            command_dir: None,
+            size: test_tab_size(),
+            workspace: "routing-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn domain_spawn_v2_default_retarget_holds_exact_a_through_spawn() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let a_spawns = Arc::new(AtomicUsize::new(0));
+        let b_spawns = Arc::new(AtomicUsize::new(0));
+        let a_pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(8_201, None));
+        let domain_a: Arc<dyn Domain> = Arc::new(SpawnRoutingTestDomain::new(
+            0,
+            "routing-a",
+            Some(a_pane),
+            Arc::clone(&a_spawns),
+        ));
+        let domain_b: Arc<dyn Domain> = Arc::new(SpawnRoutingTestDomain::new(
+            1,
+            "routing-b",
+            None,
+            Arc::clone(&b_spawns),
+        ));
+        let mux = Arc::new(Mux::new(Some(domain_a)));
+        mux.add_domain(&domain_b)
+            .expect("register routing domain B");
+
+        let response = block_on(domain_spawn_v2_with_resolution_hook(
+            SessionAuthority::new(&mux),
+            routing_spawn_request(config::keyassignment::SpawnTabDomain::DefaultDomain),
+            None,
+            |mux, resolved| {
+                assert_eq!(resolved.domain_id(), 0);
+                let replacement = mux.get_domain(1).expect("routing domain B remains live");
+                mux.set_default_domain_guard(&replacement)
+                    .expect("retarget default to B at the causal barrier");
+            },
+        ))
+        .expect("the frozen A selection should spawn successfully");
+
+        assert!(matches!(response, Pdu::SpawnResponse(_)));
+        assert_eq!(a_spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(b_spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            mux.default_domain()
+                .expect("retargeted default remains live")
+                .domain_id(),
+            1
+        );
+    }
+
+    #[test]
+    fn domain_spawn_v2_name_retarget_cannot_admit_b_while_exact_a_is_held() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let a_spawns = Arc::new(AtomicUsize::new(0));
+        let b_spawns = Arc::new(AtomicUsize::new(0));
+        let domain_a: Arc<dyn Domain> = Arc::new(SpawnRoutingTestDomain::new(
+            0,
+            "shared-routing-name",
+            None,
+            Arc::clone(&a_spawns),
+        ));
+        let domain_b: Arc<dyn Domain> = Arc::new(SpawnRoutingTestDomain::new(
+            1,
+            "shared-routing-name",
+            None,
+            Arc::clone(&b_spawns),
+        ));
+        let mux = Arc::new(Mux::new(Some(domain_a)));
+        let domain_b_for_barrier = Arc::clone(&domain_b);
+
+        let result = block_on(domain_spawn_v2_with_resolution_hook(
+            SessionAuthority::new(&mux),
+            routing_spawn_request(config::keyassignment::SpawnTabDomain::DomainName(
+                "shared-routing-name".to_string(),
+            )),
+            None,
+            move |mux, resolved| {
+                assert_eq!(resolved.domain_id(), 0);
+                assert!(
+                    mux.domain_was_detached_if_guard(resolved),
+                    "retire exact A at the causal barrier"
+                );
+                assert!(
+                    mux.add_domain(&domain_b_for_barrier).is_err(),
+                    "A's retained guard must prevent same-name B from replacing it"
+                );
+            },
+        ));
+
+        assert!(result.is_err(), "retired A must fail closed");
+        assert_eq!(a_spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(b_spawns.load(Ordering::SeqCst), 0);
     }
 
     fn sample_tiered_scrollback_status(cold_spill_lines_total: u64) -> PaneTieredScrollbackStatus {
@@ -10430,9 +11643,9 @@ mod tests {
     fn sampled_input_admission_rejects_old_codec_zero_and_stale_generations() {
         let request = sampled_key_request();
         let current_stream = TopologyStreamId::from_bytes([0x92; 16]);
-        let prior_dialect = codec::SAMPLED_INPUT_TRACE_V1_MIN_CODEC_VERSION - 1;
+        let prior_dialect = codec::RELIABLE_KEY_EVENT_TRACED_V1_MIN_CODEC_VERSION - 1;
         let error = AdmittedInputTraceV1::admit(&request, current_stream, prior_dialect)
-            .expect_err("pre-v59 dialect must reject the traced-input PDU");
+            .expect_err("pre-v62 dialect must reject the reliable traced-input PDU");
         assert!(format!("{error:#}").contains("unavailable in this codec dialect"));
 
         let error = AdmittedInputTraceV1::admit(
@@ -11282,11 +12495,17 @@ mod tests {
             Pdu::UnitResponse(UnitResponse {})
         );
 
-        let request = sampled_key_request();
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("sampled input pane must retain an exact registration");
+        let mut request = sampled_key_request();
+        request.request.pane_registration = Some(ReliablePaneRegistrationIdentityV1::from_bytes(
+            registration.wire_identity(),
+        ));
         handler.process_one_with_dispatch_authority(
             DecodedPdu {
                 serial: 911,
-                pdu: Pdu::SendKeyDownTracedV1(request.clone()),
+                pdu: Pdu::ReliableKeyEventTracedV1(request.clone()),
             },
             None,
             None,
@@ -11303,7 +12522,7 @@ mod tests {
         handler.process_one_with_dispatch_authority(
             DecodedPdu {
                 serial: 912,
-                pdu: Pdu::SendKeyDownTracedV1(request.clone()),
+                pdu: Pdu::ReliableKeyEventTracedV1(request.clone()),
             },
             None,
             Some(stale),
@@ -11311,7 +12530,7 @@ mod tests {
         let rejected = take_response(&captured);
         expect_error_response(
             &rejected.pdu,
-            SendKeyDownTracedV1::IDENT,
+            ReliableKeyEventTracedV1::IDENT,
             MuxErrorCode::INVALID_REQUEST,
         );
         assert_eq!(handler.client_input_activity_updates, 0);
@@ -11324,7 +12543,7 @@ mod tests {
         handler.process_one_with_dispatch_authority(
             DecodedPdu {
                 serial: 913,
-                pdu: Pdu::SendKeyDownTracedV1(request),
+                pdu: Pdu::ReliableKeyEventTracedV1(request),
             },
             None,
             Some(admitted),
@@ -11355,7 +12574,11 @@ mod tests {
             .expect("committed key input must retain its request serial");
         assert_eq!(
             responses.remove(correlated_index).pdu,
-            Pdu::UnitResponse(UnitResponse {})
+            Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                pane_id: 7_007,
+                input_serial: expected_input_serial,
+                outcome: ReliableKeyEventOutcomeV1::Applied,
+            })
         );
         let render_fence = responses
             .pop()
@@ -11368,6 +12591,98 @@ mod tests {
             }
             other => panic!("expected input-correlated render fence, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pdu98_missing_pane_authority_records_nothing_and_leaves_serial_unclaimed() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane = Arc::new(FakePane::new_with_id(7_007, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register missing-authority test pane");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("capture exact missing-authority test pane");
+
+        let stream_id = topology_stream(12);
+        let recorder = trace_recorder(1);
+        let trace_authority = DispatchTraceAuthority::new(Arc::clone(&recorder));
+        let trace_producer = trace_authority
+            .claim_session(stream_id)
+            .expect("test connection must own a recorder producer");
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(Arc::clone(&mux)),
+            stream_id,
+        );
+        handler.process_one(DecodedPdu {
+            serial: 916,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: test_client_id("sampled-trace-missing-pane-authority", 41_013),
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+
+        let mut malformed = sampled_key_request();
+        malformed.request.pane_registration = None;
+        let admission_error =
+            AdmittedInputTraceV1::admit(&malformed, stream_id, codec::CODEC_VERSION)
+                .expect_err("PDU98 without pane authority must fail before recorder admission");
+        assert!(format!("{admission_error:#}").contains("pane registration identity"));
+        handler.process_one_with_dispatch_authority(
+            DecodedPdu {
+                serial: 917,
+                pdu: Pdu::ReliableKeyEventTracedV1(malformed.clone()),
+            },
+            None,
+            None,
+        );
+        let rejected = take_response(&captured);
+        expect_error_response(
+            &rejected.pdu,
+            ReliableKeyEventTracedV1::IDENT,
+            MuxErrorCode::INVALID_REQUEST,
+        );
+        assert_eq!(handler.client_input_activity_updates, 0);
+        assert_eq!(pane.key_down_count(), 0);
+
+        let mut operational = malformed.request;
+        operational.pane_registration = Some(ReliablePaneRegistrationIdentityV1::from_bytes(
+            registration.wire_identity(),
+        ));
+        handler.process_one(DecodedPdu {
+            serial: 918,
+            pdu: Pdu::ReliableKeyEventV1(operational.clone()),
+        });
+        tick_until_response(&executor, &captured, 2);
+        drain_simple_executor(&executor);
+        assert_eq!(pane.key_down_count(), 1);
+        assert!(captured.lock().unwrap().iter().any(|response| {
+            response.serial == 918
+                && matches!(
+                    &response.pdu,
+                    Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
+                        pane_id: 7_007,
+                        input_serial,
+                        outcome: ReliableKeyEventOutcomeV1::Applied,
+                    }) if *input_serial == operational.input_serial
+                )
+        }));
+
+        drop(trace_producer);
+        assert!(
+            freeze_trace_events(&recorder).is_empty(),
+            "missing-authority PDU98 and its later unsampled PDU96 must publish no K4/K5"
+        );
     }
 
     #[test]
@@ -12964,7 +14279,7 @@ mod tests {
             mux::tab::TabStackId(7),
             vec![first_id, second_id],
         )
-            .unwrap();
+        .unwrap();
 
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);

@@ -274,9 +274,10 @@ fn run() -> anyhow::Result<()> {
 
     let executor = promise::spawn::SimpleExecutor::new();
 
-    let dispatch_config = frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::new(
+    let dispatch_config = frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::production(
         opts.dispatch_io_backend.into(),
-    );
+    )
+    .context("configure production mux dispatch tracing")?;
 
     spawn_listener(dispatch_config).map_err(|e| {
         log::error!("problem spawning listeners: {:?}", e);
@@ -334,7 +335,7 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         true
     });
 
-    let domain = mux.default_domain();
+    let domain = mux.default_domain()?;
 
     {
         if let Err(err) = config::with_lua_config_on_main_thread(trigger_mux_startup).await {
@@ -356,8 +357,7 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
             .attach(&mux, owner_client_id, Some(*window_id))
             .await?;
 
-        let _tab = mux
-            .default_domain()
+        let _tab = domain
             .spawn(&mux, config.initial_size(0, None), cmd, None, *window_id)
             .await?;
     }

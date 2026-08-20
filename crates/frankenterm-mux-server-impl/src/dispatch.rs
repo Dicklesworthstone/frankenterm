@@ -780,6 +780,18 @@ impl DispatchRuntimeConfig {
         }
     }
 
+    /// Construct the release-default binary mux dispatch authority.
+    ///
+    /// Every accepted connection receives one explicitly registered producer
+    /// from a bounded low-mode recorder. The authority is process-owned by the
+    /// caller's cloned config; no test constructor or global singleton is
+    /// required for PDU98 admission.
+    pub fn production(preference: DispatchIoPreference) -> anyhow::Result<Self> {
+        let authority = DispatchTraceAuthority::production_low()
+            .context("constructing production mux dispatch trace authority")?;
+        Ok(Self::new(preference).with_trace_authority(authority))
+    }
+
     #[must_use]
     pub const fn preference(&self) -> DispatchIoPreference {
         self.preference
@@ -6423,6 +6435,15 @@ fn dispatch_client_request_with_decode_interval(
             anyhow::bail!("mux client request used reserved server-unilateral serial zero");
         }
 
+        if matches!(&decoded.pdu, Pdu::SendKeyDownTracedV1(_)) {
+            metrics::counter!(
+                "mux.dispatch.protocol_error",
+                "reason" => "retired_pdu95_sampled_legacy_input"
+            )
+            .increment(1);
+            anyhow::bail!("retired PDU95 sampled legacy input is not a server endpoint");
+        }
+
         let wire_spec = decoded
             .pdu
             .wire_spec()
@@ -6445,7 +6466,7 @@ fn dispatch_client_request_with_decode_interval(
         }
 
         let mut input_trace_authority = match &decoded.pdu {
-            Pdu::SendKeyDownTracedV1(request) => Some(AdmittedInputTraceV1::admit(
+            Pdu::ReliableKeyEventTracedV1(request) => Some(AdmittedInputTraceV1::admit(
                 request,
                 topology.stream_id,
                 codec::CODEC_VERSION,
@@ -6501,6 +6522,17 @@ enum ClientDecodeError {
 fn select_dormant_client_body(
     header: &codec::PduFrameHeader,
 ) -> anyhow::Result<codec::PduBodyDisposition> {
+    if header.ident() == <codec::SendKeyDownTracedV1 as codec::PduWireIdent>::IDENT {
+        metrics::counter!(
+            "mux.dispatch.protocol_error",
+            "reason" => "retired_pdu95_sampled_legacy_input"
+        )
+        .increment(1);
+        anyhow::bail!(
+            "mux client PDU ident {} is the retired PDU95 sampled legacy-input family",
+            header.ident()
+        );
+    }
     let belongs_to_exact_render =
         Pdu::wire_spec_for_ident(header.ident()).is_some_and(|spec| match spec.capability {
             codec::PduCapabilityUse::Negotiates(capability)
@@ -7056,7 +7088,8 @@ mod tests {
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
     use async_channel::unbounded;
     use codec::{
-        CompressionMode, InputSerial, Ping, Pong, SampledTraceContextV1, SendKeyDown,
+        CompressionMode, InputSerial, Ping, Pong, ReliableKeyEventKindV1, ReliableKeyEventTracedV1,
+        ReliableKeyEventV1, ReliablePaneRegistrationIdentityV1, SampledTraceContextV1, SendKeyDown,
         SendKeyDownTracedV1, WriteToPane,
     };
     use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
@@ -7074,15 +7107,17 @@ mod tests {
     use std::io;
     use std::io::Cursor;
 
-    fn sampled_key_request() -> SendKeyDownTracedV1 {
-        SendKeyDownTracedV1 {
-            request: SendKeyDown {
+    fn sampled_key_request() -> ReliableKeyEventTracedV1 {
+        ReliableKeyEventTracedV1 {
+            request: ReliableKeyEventV1 {
                 pane_id: 7_007,
+                pane_registration: Some(ReliablePaneRegistrationIdentityV1::from_bytes([0x44; 16])),
                 event: termwiz::input::KeyEvent {
                     key: termwiz::input::KeyCode::Char('x'),
                     modifiers: termwiz::input::Modifiers::NONE,
                 },
                 input_serial: InputSerial::from_millis_since_epoch(11),
+                kind: ReliableKeyEventKindV1::KeyDown,
             },
             trace_context: SampledTraceContextV1 {
                 schema_version: SAMPLED_TRACE_CONTEXT_SCHEMA_VERSION,
@@ -7100,6 +7135,20 @@ mod tests {
                 },
                 sampler_algorithm: RecorderSamplerAlgorithm::SplitMix64V1,
             },
+        }
+    }
+
+    fn retired_sampled_key_request() -> SendKeyDownTracedV1 {
+        SendKeyDownTracedV1 {
+            request: SendKeyDown {
+                pane_id: 7_007,
+                event: termwiz::input::KeyEvent {
+                    key: termwiz::input::KeyCode::Char('x'),
+                    modifiers: termwiz::input::Modifiers::NONE,
+                },
+                input_serial: InputSerial::from_millis_since_epoch(11),
+            },
+            trace_context: sampled_key_request().trace_context,
         }
     }
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -9302,6 +9351,27 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rejects_retired_pdu95_before_handler_mutation() {
+        let mux = Arc::new(Mux::new(None));
+        let (sender, captured) = capturing_pdu_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let topology = idle_topology_coordinator();
+
+        let error = dispatch_client_request(
+            &mut handler,
+            &topology,
+            DecodedPdu {
+                serial: 3,
+                pdu: Pdu::SendKeyDownTracedV1(retired_sampled_key_request()),
+            },
+        )
+        .expect_err("retired PDU95 must never reach legacy input dispatch");
+        assert!(format!("{error:#}").contains("retired PDU95"));
+        assert!(captured.lock().is_empty());
+        assert_eq!(mux.iter_clients().len(), 0);
+    }
+
+    #[test]
     fn dispatch_binds_sampled_input_to_its_exact_connection_stream() {
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
@@ -9320,7 +9390,7 @@ mod tests {
             &topology,
             DecodedPdu {
                 serial: 3,
-                pdu: Pdu::SendKeyDownTracedV1(sampled_key_request()),
+                pdu: Pdu::ReliableKeyEventTracedV1(sampled_key_request()),
             },
         )
         .expect("valid sampled input should reach the session handler");
@@ -9333,7 +9403,7 @@ mod tests {
                 assert_eq!(error.code, codec::MuxErrorCode::PANE_NOT_FOUND);
                 assert_eq!(
                     error.request_ident,
-                    <codec::SendKeyDownTracedV1 as codec::PduWireIdent>::IDENT
+                    <codec::ReliableKeyEventTracedV1 as codec::PduWireIdent>::IDENT
                 );
                 error
                     .validate()
@@ -9423,6 +9493,30 @@ mod tests {
                 "dormant PDU {ident} body must remain completely unread"
             );
         }
+    }
+
+    #[test]
+    fn retired_pdu95_header_is_rejected_before_body_admission() {
+        // len=33, serial=1, and PDU95 are one-byte LEB128 values. The opaque
+        // body deliberately is not a valid schema: retirement is enforced at
+        // the header selector before any legacy input bytes are inspected.
+        let ident = <codec::SendKeyDownTracedV1 as codec::PduWireIdent>::IDENT;
+        let mut wire = vec![33, 1, u8::try_from(ident).expect("PDU95 fits one byte")];
+        wire.extend_from_slice(&[0xa5; 31]);
+        let mut stream = PartialFrameDisconnectStream::new(wire, usize::MAX);
+        let (_terminal, terminal_rx) = DispatchTerminal::channel();
+
+        let error =
+            promise::spawn::block_on(decode_client_pdu_or_terminal(&mut stream, &terminal_rx))
+                .expect_err("retired PDU95 must fail from its header");
+        let ClientDecodeError::Decode(error) = error else {
+            panic!("expected retired-family header error, got {error:?}");
+        };
+        assert!(
+            format!("{error:#}").contains("retired PDU95"),
+            "unexpected retired-family error: {error:#}"
+        );
+        assert_eq!(stream.cursor, 3, "retired PDU95 body must remain unread");
     }
 
     #[test]
@@ -16587,6 +16681,21 @@ mod tests {
             total_frames - OUTBOUND_WRITE_QUANTUM_FRAMES,
             "the next turn must retain the ordered outbound suffix",
         );
+    }
+
+    #[test]
+    fn production_dispatch_config_owns_one_shared_trace_authority() {
+        let config = DispatchRuntimeConfig::production(DispatchIoPreference::Poll)
+            .expect("production dispatch tracing must configure");
+        assert_eq!(config.preference(), DispatchIoPreference::Poll);
+        let first = config
+            .trace_authority()
+            .expect("production config must carry explicit trace authority");
+        let second = config
+            .clone()
+            .trace_authority()
+            .expect("cloned listener config must retain trace authority");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
