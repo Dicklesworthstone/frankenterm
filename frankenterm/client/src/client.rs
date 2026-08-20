@@ -8624,6 +8624,22 @@ pub(crate) struct TestReliableWireRequest {
 
 #[cfg(test)]
 impl TestRpcPeer {
+    pub(crate) fn activate_reconnect_generation(
+        &self,
+        client: &Client,
+    ) -> anyhow::Result<NonZeroU64> {
+        if !self.receiver.is_empty() {
+            bail!("test reconnect activation requires an empty outbound queue");
+        }
+        let current = client.test_dispatch_authority(Weak::new());
+        let successor = current.advance_generation(&self.receiver)?;
+        successor.activate_rpc_transport()?;
+        client
+            .rpc_transport
+            .active_generation()
+            .ok_or_else(|| anyhow!("test reconnect generation did not become live"))
+    }
+
     pub(crate) fn replace_ready_generation(
         &self,
         client: &Client,
