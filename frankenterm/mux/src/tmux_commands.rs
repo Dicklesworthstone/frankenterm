@@ -48,8 +48,14 @@ pub(crate) enum TmuxCommandClass {
 
 #[derive(Clone, Debug)]
 pub(crate) enum TmuxSplitFailureAuthority {
-    Pending { request_id: u64 },
-    Reconciliation { request_id: u64 },
+    Pending {
+        request_id: u64,
+        target_pane_id: TmuxPaneId,
+    },
+    Reconciliation {
+        request_id: u64,
+        target_pane_id: TmuxPaneId,
+    },
     Compensation(Arc<TmuxSplitCleanupObligation>),
 }
 
@@ -2042,7 +2048,7 @@ fn parse_sigil_number(text: &str) -> anyhow::Result<u64> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-enum SplitPaneIdentityParse {
+pub(crate) enum SplitPaneIdentityParse {
     Exact(TmuxPaneId),
     RecoverableTrailingOutput {
         pane_id: TmuxPaneId,
@@ -2064,7 +2070,7 @@ fn parse_exact_split_pane_identity(identity: &str) -> anyhow::Result<TmuxPaneId>
         .context("split-window pane identity is outside the supported range")
 }
 
-fn parse_split_pane_identity(output: &str) -> SplitPaneIdentityParse {
+pub(crate) fn parse_split_pane_identity(output: &str) -> SplitPaneIdentityParse {
     let identities: Vec<_> = output
         .lines()
         .map(str::trim)
@@ -2901,6 +2907,7 @@ impl TmuxCommand for SplitPane {
     fn split_failure_authority(&self) -> Option<TmuxSplitFailureAuthority> {
         Some(TmuxSplitFailureAuthority::Pending {
             request_id: self.request_id,
+            target_pane_id: self.pane_id,
         })
     }
 
@@ -3025,6 +3032,7 @@ impl TmuxCommand for ReconcileSplitPane {
     fn split_failure_authority(&self) -> Option<TmuxSplitFailureAuthority> {
         Some(TmuxSplitFailureAuthority::Reconciliation {
             request_id: self.request_id,
+            target_pane_id: self.target_pane_id,
         })
     }
 

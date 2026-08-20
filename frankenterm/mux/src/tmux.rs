@@ -8,6 +8,7 @@ use crate::tmux_commands::{
     ReconcileSplitPane, SplitPane, TmuxCommand, TmuxCommandClass, TmuxCommandPreparation,
     TmuxConditionalCommit, TmuxConditionalCommitIntent, TmuxConditionalCommitLease,
     TmuxConditionalCommitTarget, TmuxPreparationPrerequisite, TmuxSplitFailureAuthority,
+    SplitPaneIdentityParse, parse_split_pane_identity,
 };
 use crate::tmux_pty::TmuxChildState;
 use crate::window::WindowId;
@@ -2826,6 +2827,7 @@ impl TmuxCmdQueue {
                 command.split_failure_authority(),
                 Some(TmuxSplitFailureAuthority::Reconciliation {
                     request_id: current,
+                    ..
                 }) if current == request_id
             )
         }) else {
@@ -2847,6 +2849,7 @@ impl TmuxCmdQueue {
                 command.split_failure_authority(),
                 Some(TmuxSplitFailureAuthority::Pending {
                     request_id: current,
+                    ..
                 }) if current == request_id
             )
         }) else {
@@ -4498,7 +4501,20 @@ impl Drop for SendScheduleLease {
 
 struct ResponseBarrierLease {
     owner: Arc<TmuxDomainState>,
+    abandoned_split_result: Option<(TmuxSplitFailureAuthority, Guarded)>,
     completed: bool,
+}
+
+impl ResponseBarrierLease {
+    fn recover(&mut self, reason: &'static str) {
+        if let Some((authority, response)) = self.abandoned_split_result.take() {
+            self.owner
+                .recover_abandoned_split_result(authority, &response, reason);
+        } else {
+            self.owner.transition_to_exit_and_schedule_detach();
+        }
+        self.completed = true;
+    }
 }
 
 impl Drop for ResponseBarrierLease {
@@ -4509,7 +4525,7 @@ impl Drop for ResponseBarrierLease {
                  stranding the protocol barrier",
                 self.owner.domain_id
             );
-            self.owner.transition_to_exit_and_schedule_detach();
+            self.recover("command_result_task_cancelled");
         }
     }
 }
@@ -5306,14 +5322,14 @@ impl TmuxDomainState {
                     obligation.finish_claimed(false, "tmux split compensation timed out");
                 }
             }
-            Some(TmuxSplitFailureAuthority::Pending { request_id }) => {
+            Some(TmuxSplitFailureAuthority::Pending { request_id, .. }) => {
                 self.fail_split_reconciliation(
                     request_id,
                     "split command I/O ended before an exact response",
                     Vec::new(),
                 );
             }
-            Some(TmuxSplitFailureAuthority::Reconciliation { request_id }) => {
+            Some(TmuxSplitFailureAuthority::Reconciliation { request_id, .. }) => {
                 self.fail_split_reconciliation(
                     request_id,
                     "split reconciliation I/O ended before an exact response",
@@ -5732,10 +5748,10 @@ impl TmuxDomainState {
         let next_permits = permits
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("tmux remote split identity permit overflow"))?;
-        reservations.try_reserve(next_permits).map_err(|error| {
+        reservations.try_reserve(1).map_err(|error| {
             anyhow::anyhow!("reserve tmux split identity before command admission: {error}")
         })?;
-        cleanup_obligations.try_reserve(next_permits).map_err(|error| {
+        cleanup_obligations.try_reserve(1).map_err(|error| {
             anyhow::anyhow!("reserve tmux split cleanup authority before command admission: {error}")
         })?;
         let remote_panes = self.remote_panes.lock();
@@ -5902,6 +5918,7 @@ impl TmuxDomainState {
                     "tmux split request {request_id} could not reserve remote pane {pane_id}: {error:#}"
                 );
                 let _ = pending.promise.err(anyhow::anyhow!(message.clone()));
+                self.record_split_quarantine(request_id, vec![pane_id], message.clone());
                 self.transition_to_exit_and_schedule_detach();
                 Err(anyhow::anyhow!(message))
             }
@@ -6629,8 +6646,8 @@ impl TmuxDomainState {
                             } else {
                                 TmuxIoOperationKind::Command
                             };
+                            drop(cmd_queue);
                             if !self.claim_io_response(io_kind, generation) {
-                                drop(cmd_queue);
                                 if !self.is_terminal() {
                                     log::error!(
                                         "tmux domain {} could not claim guarded response for \
@@ -6642,7 +6659,6 @@ impl TmuxDomainState {
                                 }
                                 return None;
                             }
-                            drop(cmd_queue);
                             if let Err(err) = self.signal_io_response(generation) {
                                 log::error!(
                                     "tmux domain {} could not cancel response deadline for \
@@ -7311,10 +7327,10 @@ impl TmuxDomainState {
     fn send_next_command(self: &Arc<Self>) {
         if let Err(err) = self.send_next_command_inner() {
             log::error!(
-                "failed to transmit a tmux command for domain {}: {err:#}; detaching the domain",
+                "failed to transmit a tmux command for domain {}: {err:#}; failing the bounded sender lane",
                 self.domain_id
             );
-            self.transition_to_exit_and_schedule_detach();
+            self.fail_sender_operation("sender_admission_failed");
         }
     }
 
@@ -7333,16 +7349,23 @@ impl TmuxDomainState {
 
         let (command, generation, io_kind) = loop {
             if preparation_budget == 0 {
+                let lifecycle = self.lifecycle.lock();
                 let _cmd_queue = self.cmd_queue.lock();
-                let _ = self.transition_state(State::Sending, State::Idle);
+                let _ = self.transition_state_with_lifecycle(
+                    &lifecycle,
+                    State::Sending,
+                    State::Idle,
+                );
                 return Ok(());
             }
             let (prepared_command, conditional_commit_lease, superseded) = {
+                let lifecycle = self.lifecycle.lock();
                 let mut cmd_queue = self.cmd_queue.as_ref().lock();
                 let prepared_command = match cmd_queue.take_next_for_sender_preparation() {
                     Some(Ok(command)) => Some(command),
                     Some(Err(stale)) => {
                         drop(cmd_queue);
+                        drop(lifecycle);
                         drop(stale);
                         preparation_budget -= 1;
                         TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
@@ -7354,7 +7377,11 @@ impl TmuxDomainState {
                     // Close the empty-check/Idle transition race under the
                     // mailbox lock. A later producer observes Idle and owns
                     // the next scheduling edge.
-                    let _ = self.transition_state(State::Sending, State::Idle);
+                    let _ = self.transition_state_with_lifecycle(
+                        &lifecycle,
+                        State::Sending,
+                        State::Idle,
+                    );
                     return Ok(());
                 };
                 let conditional_commit_lease = cmd_queue.prepared_conditional_commit();
@@ -7389,6 +7416,7 @@ impl TmuxDomainState {
                     } else {
                         TmuxIoOperationKind::Command
                     };
+                    let mut lifecycle = self.lifecycle.lock();
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     if !cmd_queue.prepared_install_authority_is_current(
                         generation,
@@ -7396,6 +7424,7 @@ impl TmuxDomainState {
                     ) {
                         cmd_queue.release_prepared();
                         drop(cmd_queue);
+                        drop(lifecycle);
                         drop(prepared_command);
                         drop(command);
                         metrics::counter!(
@@ -7406,9 +7435,14 @@ impl TmuxDomainState {
                         TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
                         continue;
                     }
-                    if !self.transition_state(State::Sending, State::WaitingForResponse) {
+                    if !self.transition_state_with_lifecycle(
+                        &lifecycle,
+                        State::Sending,
+                        State::WaitingForResponse,
+                    ) {
                         cmd_queue.release_prepared();
                         drop(cmd_queue);
+                        drop(lifecycle);
                         drop(prepared_command);
                         drop(command);
                         TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
@@ -7423,7 +7457,7 @@ impl TmuxDomainState {
                             "tmux command mailbox closed or already had an in-flight command during sender reservation"
                         );
                     }
-                    if !self.install_io_operation(io_kind, generation) {
+                    if !Self::install_io_operation_locked(&mut lifecycle, io_kind, generation) {
                         anyhow::bail!(
                             "tmux domain {} could not install the unique I/O lease for generation \
                              {generation}",
@@ -7433,6 +7467,10 @@ impl TmuxDomainState {
                     break (command, generation, io_kind);
                 }
                 TmuxCommandPreparation::Suppressed | TmuxCommandPreparation::Discarded => {
+                    anyhow::ensure!(
+                        !prepared_command.is_split_transaction(),
+                        "tmux split transaction was suppressed or discarded during sender preparation"
+                    );
                     let mut cmd_queue = self.cmd_queue.lock();
                     if let Some(lease) = retry_lease.as_ref() {
                         cmd_queue.retire_conditional_commit_if_current(lease);
@@ -7442,6 +7480,10 @@ impl TmuxDomainState {
                     TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
                 }
                 TmuxCommandPreparation::Retryable { prerequisite } => {
+                    anyhow::ensure!(
+                        !prepared_command.is_split_transaction(),
+                        "tmux split transaction became retryable during sender preparation"
+                    );
                     let mut cmd_queue = self.cmd_queue.lock();
                     let retry_is_current = retry_lease
                         .as_ref()
@@ -7857,8 +7899,28 @@ impl Domain for TmuxDomain {
                     "duplicate tmux split request id {request_id}"
                 );
             }
-            self.inner
-                .require_send_schedule("split-pane command admission")?;
+            if let Err(error) = self
+                .inner
+                .require_send_schedule("split-pane command admission")
+            {
+                let removed = self
+                    .inner
+                    .cmd_queue
+                    .lock()
+                    .remove_queued_pending_split(request_id);
+                if !removed {
+                    log::error!(
+                        "tmux split request {request_id} lost its queued command after sender scheduling failed"
+                    );
+                }
+                let _ = self.inner.fail_pending_split(
+                    request_id,
+                    anyhow::anyhow!(
+                        "tmux split request {request_id} could not schedule its admitted command: {error:#}"
+                    ),
+                );
+                return Err(error);
+            }
             drop(active_operation);
 
             let remote = future
