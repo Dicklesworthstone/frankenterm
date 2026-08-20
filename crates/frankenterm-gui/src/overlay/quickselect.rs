@@ -2029,6 +2029,21 @@ impl QuickSelectRenderable {
                 return;
             };
             let run = search_run_identity(run_id, pane.get_current_seqno(), dims, top);
+            let reservation = match super::reserve_overlay_main_thread(
+                promise::spawn::MainThreadServiceClass::Interactive,
+                32 * 1024,
+                "quick-select search",
+            ) {
+                Ok(reservation) => reservation,
+                Err(err) => {
+                    self.clear_selection();
+                    self.mark_search_ui_dirty();
+                    log::error!(
+                        "{err:#}; ended the exact quick-select run before task construction"
+                    );
+                    return;
+                }
+            };
             self.searching.replace(PendingSearch {
                 run,
                 range: range.clone(),
@@ -2046,7 +2061,7 @@ impl QuickSelectRenderable {
             let preparation_gate = Arc::clone(&self.search_preparation_gate);
             let (abort, registration) = AbortHandle::new_pair();
             self.search_abort = Some(abort);
-            promise::spawn::spawn(async move {
+            reservation.spawn_local(async move {
                 let limit = Some(SEARCH_RESULT_REQUEST_LIMIT);
                 let preparation_range = range.clone();
                 let completion = Abortable::new(
@@ -2226,6 +2241,23 @@ impl QuickSelectRenderable {
         retry_attempt: u8,
         is_initial_run: bool,
     ) {
+        let reservation = match super::reserve_overlay_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            4 * 1024,
+            "quick-select retry",
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                self.cancel_search_task();
+                self.cancel_retry();
+                self.searching.take();
+                self.mark_search_ui_dirty();
+                log::error!(
+                    "{err:#}; ended the exact quick-select run instead of losing a retry"
+                );
+                return;
+            }
+        };
         self.cancel_search_task();
         self.cancel_retry();
         let delay = search_retry_delay(retry_attempt);
@@ -2238,7 +2270,7 @@ impl QuickSelectRenderable {
         let (abort, registration) = AbortHandle::new_pair();
         self.retry_abort = Some(abort);
         self.mark_search_ui_dirty();
-        promise::spawn::spawn(async move {
+        reservation.spawn_local(async move {
             if Abortable::new(sleep(delay), registration).await.is_err() {
                 return anyhow::Result::<()>::Ok(());
             }

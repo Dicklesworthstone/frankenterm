@@ -71,14 +71,28 @@ pub fn spawn_command_impl(
 ) {
     let spawn = spawn.clone();
 
-    promise::spawn::spawn(async move {
-        if let Err(err) =
-            spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config).await
-        {
-            log::error!("Failed to spawn: {:#}", err);
+    match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        8 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation
+                .spawn_local(async move {
+                    if let Err(err) =
+                        spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config)
+                            .await
+                    {
+                        log::error!("Failed to spawn: {err:#}");
+                    }
+                })
+                .detach();
         }
-    })
-    .detach();
+        rejected => {
+            log::error!(
+                "main-thread scheduler rejected GUI spawn command before task construction: {rejected:?}"
+            );
+        }
+    }
 }
 
 pub async fn spawn_command_internal(

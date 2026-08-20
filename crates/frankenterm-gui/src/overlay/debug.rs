@@ -252,12 +252,21 @@ pub fn show_debug_overlay(
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("debug overlay Lua host missing before eval"))?;
 
-            let (host_res, text) = block_on(promise::spawn::spawn_into_main_thread(async move {
-                evaluate_trampoline(passed_host, line)
-                    .recv_async()
-                    .await
-                    .map_err(|e| mlua::Error::external(format!("{:#}", e)))
-            }))?;
+            let reservation = super::reserve_overlay_main_thread(
+                promise::spawn::MainThreadServiceClass::Interactive,
+                super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES.saturating_add(line.len()),
+                "debug REPL evaluation",
+            )?;
+            let (host_res, text) = block_on(
+                reservation
+                    .spawn(async move {
+                        evaluate_trampoline(passed_host, line)
+                            .recv_async()
+                            .await
+                            .map_err(|e| mlua::Error::external(format!("{:#}", e)))
+                    })
+                    .into_task(),
+            )?;
 
             host.replace(host_res);
 
@@ -307,10 +316,25 @@ mod tests {
 // the result back to the caller without blocking the gui thread.
 fn evaluate_trampoline(host: LuaReplHost, expr: String) -> Receiver<(LuaReplHost, String)> {
     let (tx, rx) = bounded(1);
-    promise::spawn::spawn(async move {
-        let _ = tx.send_async(evaluate(host, expr).await).await;
-    })
-    .detach();
+    match super::reserve_overlay_main_thread(
+        promise::spawn::MainThreadServiceClass::Interactive,
+        super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES,
+        "debug expression evaluation",
+    ) {
+        Ok(reservation) => {
+            reservation
+                .spawn_local(async move {
+                    let _ = tx.send_async(evaluate(host, expr).await).await;
+                })
+                .detach();
+        }
+        Err(error) => {
+            let _ = tx.send((
+                host,
+                format!("debug expression was not evaluated: {error:#}"),
+            ));
+        }
+    }
     rx
 }
 

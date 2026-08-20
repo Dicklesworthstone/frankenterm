@@ -491,10 +491,21 @@ impl super::TermWindow {
             return;
         };
         let pane = MuxPane(pane.pane_id());
-        promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-            dispatch_new_tab_button(lua, window, pane, button, action)
-        }))
-        .detach();
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            8 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn_local(config::with_lua_config_on_main_thread(move |lua| {
+                        dispatch_new_tab_button(lua, window, pane, button, action)
+                    }))
+                    .detach();
+            }
+            rejected => log::error!(
+                "main-thread scheduler rejected new-tab mouse action before Lua dispatch: {rejected:?}"
+            ),
+        }
     }
 
     pub fn mouse_event_tab_bar(

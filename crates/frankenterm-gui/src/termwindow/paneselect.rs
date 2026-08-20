@@ -226,29 +226,53 @@ impl PaneSelector {
                 PaneSelectMode::MoveToNewWindow => {
                     if let Some(pos) = panes.iter().find(|p| p.index == pane_index) {
                         let pane_id = pos.pane.pane_id();
-                        promise::spawn::spawn(async move {
-                            if let Err(err) = mux.move_pane_to_new_tab(pane_id, None, None).await {
-                                log::error!("failed to move_pane_to_new_tab: {err:#}");
+                        match promise::spawn::try_reserve_main_thread(
+                            promise::spawn::MainThreadServiceClass::Topology,
+                            8 * 1024,
+                        ) {
+                            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                                reservation
+                                    .spawn_local(async move {
+                                        if let Err(err) =
+                                            mux.move_pane_to_new_tab(pane_id, None, None).await
+                                        {
+                                            log::error!("failed to move_pane_to_new_tab: {err:#}");
+                                        }
+                                    })
+                                    .detach();
                             }
-                        })
-                        .detach();
+                            rejected => log::error!(
+                                "main-thread scheduler rejected move-pane-to-new-window before mutation: {rejected:?}"
+                            ),
+                        }
                     }
                 }
                 PaneSelectMode::MoveToNewTab => {
                     if let Some(pos) = panes.iter().find(|p| p.index == pane_index) {
                         let pane_id = pos.pane.pane_id();
                         let window_id = term_window.mux_window_id;
-                        promise::spawn::spawn(async move {
-                            if let Err(err) = mux
-                                .move_pane_to_new_tab(pane_id, Some(window_id), None)
-                                .await
-                            {
-                                log::error!("failed to move_pane_to_new_tab: {err:#}");
-                            }
+                        match promise::spawn::try_reserve_main_thread(
+                            promise::spawn::MainThreadServiceClass::Topology,
+                            8 * 1024,
+                        ) {
+                            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                                reservation
+                                    .spawn_local(async move {
+                                        if let Err(err) = mux
+                                            .move_pane_to_new_tab(pane_id, Some(window_id), None)
+                                            .await
+                                        {
+                                            log::error!("failed to move_pane_to_new_tab: {err:#}");
+                                        }
 
-                            mux.focus_pane_and_containing_tab(pane_id).ok();
-                        })
-                        .detach();
+                                        mux.focus_pane_and_containing_tab(pane_id).ok();
+                                    })
+                                    .detach();
+                            }
+                            rejected => log::error!(
+                                "main-thread scheduler rejected move-pane-to-new-tab before mutation: {rejected:?}"
+                            ),
+                        }
                     }
                 }
             }

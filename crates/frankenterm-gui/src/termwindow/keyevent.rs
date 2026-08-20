@@ -290,11 +290,25 @@ impl super::TermWindow {
                 // schedule an invalidation so that the cursor or status
                 // area will be repainted at the right time
                 if let Some(window) = self.window.clone() {
-                    promise::spawn::spawn(async move {
-                        sleep(target.saturating_duration_since(Instant::now())).await;
-                        window.invalidate();
-                    })
-                    .detach();
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Render,
+                        4 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                                .spawn_local(async move {
+                                    sleep(target.saturating_duration_since(Instant::now())).await;
+                                    window.invalidate();
+                                })
+                                .detach();
+                        }
+                        rejected => {
+                            log::error!(
+                                "main-thread scheduler rejected leader-timeout repaint; invalidating immediately: {rejected:?}"
+                            );
+                            window.invalidate();
+                        }
+                    }
                 }
                 return true;
             }

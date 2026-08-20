@@ -71,7 +71,14 @@ pub fn show_line_prompt_overlay(
     let line =
         editor.read_line_with_optional_initial_value(&mut host, args.initial_value.as_deref())?;
 
-    promise::spawn::spawn_into_main_thread(async move {
+    let estimated_bytes = super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES
+        .saturating_add(line.as_ref().map_or(0, String::len));
+    super::reserve_overlay_main_thread(
+        promise::spawn::MainThreadServiceClass::Input,
+        estimated_bytes,
+        "prompt action",
+    )?
+    .spawn(async move {
         trampoline(name, window, pane, line);
         anyhow::Result::<()>::Ok(())
     })
@@ -81,11 +88,20 @@ pub fn show_line_prompt_overlay(
 }
 
 fn trampoline(name: String, window: GuiWin, pane: MuxPane, line: Option<String>) {
-    promise::spawn::spawn(async move {
-        config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane, line))
-            .await
-    })
-    .detach();
+    if let Ok(reservation) = super::reserve_overlay_main_thread(
+        promise::spawn::MainThreadServiceClass::Input,
+        super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES,
+        "prompt callback",
+    ) {
+        reservation
+            .spawn_local(async move {
+                config::with_lua_config_on_main_thread(move |lua| {
+                    do_event(lua, name, window, pane, line)
+                })
+                .await
+            })
+            .detach();
+    }
 }
 
 async fn do_event(

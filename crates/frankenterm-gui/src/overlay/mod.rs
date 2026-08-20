@@ -23,6 +23,37 @@ pub use debug::show_debug_overlay;
 pub use launcher::{LauncherArgs, LauncherFlags, launcher};
 pub use quickselect::QuickSelectOverlay;
 
+pub(crate) const OVERLAY_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
+
+pub(crate) fn reserve_overlay_main_thread(
+    service_class: promise::spawn::MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+) -> anyhow::Result<promise::spawn::MainThreadSpawnReservation> {
+    match promise::spawn::try_reserve_main_thread(service_class, estimated_bytes) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            metrics::counter!(
+                "gui.overlay.main_thread_admission",
+                "operation" => operation,
+                "outcome" => "admitted"
+            )
+            .increment(1);
+            Ok(reservation)
+        }
+        rejected => {
+            metrics::counter!(
+                "gui.overlay.main_thread_admission",
+                "operation" => operation,
+                "outcome" => "terminal_rejection"
+            )
+            .increment(1);
+            Err(anyhow::anyhow!(
+                "main-thread scheduler rejected overlay {operation} before task construction: {rejected:?}"
+            ))
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum OverlayCancellationTarget {
     Tab {

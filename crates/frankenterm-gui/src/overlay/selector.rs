@@ -214,24 +214,38 @@ impl SelectorState {
         term.render(&changes)
     }
 
-    fn trigger_event(&self, entry: Option<InputSelectorEntry>) {
+    fn trigger_event(&self, entry: Option<InputSelectorEntry>) -> anyhow::Result<()> {
         let name = self.event_name.clone();
         let window = self.window.clone();
         let pane = self.pane.clone();
 
-        promise::spawn::spawn_into_main_thread(async move {
+        let estimated_bytes = super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES.saturating_add(
+            entry.as_ref().map_or(0, |entry| {
+                entry
+                    .label
+                    .len()
+                    .saturating_add(entry.id.as_ref().map_or(0, String::len))
+            }),
+        );
+        super::reserve_overlay_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            estimated_bytes,
+            "selector action",
+        )?
+        .spawn(async move {
             trampoline(name, window, pane, entry);
             anyhow::Result::<()>::Ok(())
         })
         .detach();
+        Ok(())
     }
 
-    fn launch(&self, active_idx: usize) -> bool {
+    fn launch(&self, active_idx: usize) -> anyhow::Result<bool> {
         if let Some(entry) = self.filtered_entries.get(active_idx).cloned() {
-            self.trigger_event(Some(entry));
-            true
+            self.trigger_event(Some(entry))?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -265,7 +279,7 @@ impl SelectorState {
                         // by construction, we have pos as usize <= self.max_items
                         // for free
                         self.active_idx = self.top_row.saturating_add(pos);
-                        if self.launch(self.active_idx) {
+                        if self.launch(self.active_idx)? {
                             break;
                         }
                     }
@@ -321,7 +335,7 @@ impl SelectorState {
                     key: KeyCode::Escape,
                     ..
                 }) => {
-                    self.trigger_event(None);
+                    self.trigger_event(None)?;
                     break;
                 }
                 InputEvent::Key(KeyEvent {
@@ -372,14 +386,14 @@ impl SelectorState {
                         self.active_idx = active_idx;
 
                         if mouse_buttons == MouseButtons::LEFT {
-                            if self.launch(self.active_idx) {
+                            if self.launch(self.active_idx)? {
                                 break;
                             }
                         }
                     }
                     if mouse_buttons != MouseButtons::NONE {
                         // Treat any other mouse button as cancel
-                        self.trigger_event(None);
+                        self.trigger_event(None)?;
                         break;
                     }
                 }
@@ -387,7 +401,7 @@ impl SelectorState {
                     key: KeyCode::Enter,
                     ..
                 }) => {
-                    if self.launch(self.active_idx) {
+                    if self.launch(self.active_idx)? {
                         break;
                     }
                 }
@@ -401,11 +415,20 @@ impl SelectorState {
 }
 
 fn trampoline(name: String, window: GuiWin, pane: MuxPane, entry: Option<InputSelectorEntry>) {
-    promise::spawn::spawn(async move {
-        config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane, entry))
-            .await
-    })
-    .detach();
+    if let Ok(reservation) = super::reserve_overlay_main_thread(
+        promise::spawn::MainThreadServiceClass::Input,
+        super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES,
+        "selector callback",
+    ) {
+        reservation
+            .spawn_local(async move {
+                config::with_lua_config_on_main_thread(move |lua| {
+                    do_event(lua, name, window, pane, entry)
+                })
+                .await
+            })
+            .detach();
+    }
 }
 
 async fn do_event(

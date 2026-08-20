@@ -92,6 +92,27 @@ use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 
+fn schedule_existing_termwindow_future<F, OUTPUT>(
+    service_class: promise::spawn::MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+    future: F,
+) where
+    F: std::future::Future<Output = OUTPUT> + 'static,
+    OUTPUT: 'static,
+{
+    match promise::spawn::try_reserve_main_thread(service_class, estimated_bytes) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation.spawn_local(future).detach();
+        }
+        rejected => {
+            log::error!(
+                "main-thread scheduler rejected term-window operation {operation}; dropped its exact prepared future: {rejected:?}"
+            );
+        }
+    }
+}
+
 pub mod background;
 pub mod box_model;
 pub mod charselect;
@@ -1808,7 +1829,12 @@ impl TermWindow {
                         }
                     };
                 self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
-                promise::spawn::spawn(future).detach();
+                schedule_existing_termwindow_future(
+                    promise::spawn::MainThreadServiceClass::Input,
+                    8 * 1024,
+                    "close-window confirmation overlay",
+                    future,
+                );
 
                 // Don't close right now; let the close happen from
                 // the confirmation overlay
@@ -1941,7 +1967,29 @@ impl TermWindow {
                     ticket.0,
                     delay
                 );
-                promise::spawn::spawn(async move {
+                let reservation = match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Render,
+                    8 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                    }
+                    rejected => {
+                        let cancelled = self.render_wake_state.cancel_exact(ticket);
+                        debug_assert!(
+                            cancelled,
+                            "a just-planned render wake must retain its exact ticket until scheduler admission"
+                        );
+                        metrics::counter!("gui.render.wake", "action" => "scheduler_rejected")
+                            .increment(1);
+                        log::error!(
+                            "main-thread scheduler rejected exact render wake; cancelled ticket and invalidating immediately: {rejected:?}"
+                        );
+                        window.invalidate();
+                        return None;
+                    }
+                };
+                reservation.spawn_local(async move {
                     let _ = Abortable::new(
                         async move {
                             sleep(delay).await;
@@ -2722,6 +2770,14 @@ impl RenderWakeState {
 
     fn cancel(&mut self) -> bool {
         self.pending.take().is_some()
+    }
+
+    fn cancel_exact(&mut self, ticket: RenderWakeTicket) -> bool {
+        if self.pending.as_ref().map(|pending| pending.ticket) != Some(ticket) {
+            return false;
+        }
+        self.pending.take();
+        true
     }
 
     fn dispatch(&mut self, ticket: RenderWakeTicket) -> RenderWakeDispatch {
@@ -4605,27 +4661,49 @@ impl TermWindow {
                     );
                     return true;
                 }
-                promise::spawn::spawn_into_main_thread(async move {
-                    if !Self::mux_pane_output_event_callback(
-                        n,
-                        &window,
-                        mux_window_id,
-                        &dead,
-                        &mux,
-                        pane_removal_cleanup,
-                    ) {
+                match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Render,
+                    4 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                            .spawn(async move {
+                                if !Self::mux_pane_output_event_callback(
+                                    n,
+                                    &window,
+                                    mux_window_id,
+                                    &dead,
+                                    &mux,
+                                    pane_removal_cleanup,
+                                ) {
+                                    dead.store(true, Ordering::Release);
+                                    unsubscribe_requested.store(true, Ordering::Release);
+                                    let sub_id =
+                                        subscription_id.swap(usize::MAX, Ordering::AcqRel);
+                                    if sub_id != usize::MAX {
+                                        if let Some(mux) = mux.upgrade() {
+                                            let _ = mux.unsubscribe(sub_id);
+                                        }
+                                    }
+                                }
+                            })
+                            .detach();
+                        true
+                    }
+                    rejected => {
+                        metrics::counter!(
+                            "gui.mux_notification_admission",
+                            "outcome" => "terminal_rejection"
+                        )
+                        .increment(1);
+                        log::error!(
+                            "main-thread scheduler rejected mux notification; terminating the exact GUI subscription instead of silently dropping state: {rejected:?}"
+                        );
                         dead.store(true, Ordering::Release);
                         unsubscribe_requested.store(true, Ordering::Release);
-                        let sub_id = subscription_id.swap(usize::MAX, Ordering::AcqRel);
-                        if sub_id != usize::MAX {
-                            if let Some(mux) = mux.upgrade() {
-                                let _ = mux.unsubscribe(sub_id);
-                            }
-                        }
+                        false
                     }
-                })
-                .detach();
-                true
+                }
             })
             .context("allocating mux pane-update subscription")?;
         subscription_id.store(allocated_subscription_id, Ordering::Release);
@@ -4687,10 +4765,12 @@ impl TermWindow {
             Ok(())
         }
 
-        promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-            do_event(lua, name, window, pane)
-        }))
-        .detach();
+        schedule_existing_termwindow_future(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            8 * 1024,
+            "window Lua event",
+            config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane)),
+        );
     }
 
     /// Called as part of finishing up a callout to lua.
@@ -5139,10 +5219,14 @@ impl TermWindow {
             Ok(())
         }
 
-        promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-            do_event(lua, name, value, window, pane)
-        }))
-        .detach();
+        schedule_existing_termwindow_future(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            8 * 1024,
+            "user-variable Lua event",
+            config::with_lua_config_on_main_thread(move |lua| {
+                do_event(lua, name, value, window, pane)
+            }),
+        );
     }
 
     /// Called by window:set_right_status after the status has
@@ -5292,14 +5376,24 @@ impl TermWindow {
             if self.last_status_call <= now {
                 let interval = Duration::from_millis(self.config.status_update_interval);
                 let target = now + interval;
-                self.last_status_call = target;
-
                 let window = window.clone();
-                promise::spawn::spawn(async move {
-                    sleep(target.saturating_duration_since(Instant::now())).await;
-                    window.notify(TermWindowNotif::EmitStatusUpdate);
-                })
-                .detach();
+                match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Render,
+                    4 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        self.last_status_call = target;
+                        reservation
+                            .spawn_local(async move {
+                                sleep(target.saturating_duration_since(Instant::now())).await;
+                                window.notify(TermWindowNotif::EmitStatusUpdate);
+                            })
+                            .detach();
+                    }
+                    rejected => log::error!(
+                        "main-thread scheduler rejected status update timer; left it immediately eligible for retry: {rejected:?}"
+                    ),
+                }
             }
         }
     }
@@ -5324,15 +5418,29 @@ impl TermWindow {
 
         if let Some(window) = self.window.as_ref() {
             let window = window.clone();
-            promise::spawn::spawn(async move {
-                // ~one frame at 60 Hz. Imperceptible delay for OSC-driven UI.
-                sleep(Duration::from_millis(16)).await;
-                window.notify(TermWindowNotif::Apply(Box::new(|tw| {
-                    tw.pending_update_title = false;
-                    tw.update_title();
-                })));
-            })
-            .detach();
+            match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Render,
+                4 * 1024,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                    reservation
+                        .spawn_local(async move {
+                            // ~one frame at 60 Hz. Imperceptible delay for OSC-driven UI.
+                            sleep(Duration::from_millis(16)).await;
+                            window.notify(TermWindowNotif::Apply(Box::new(|tw| {
+                                tw.pending_update_title = false;
+                                tw.update_title();
+                            })));
+                        })
+                        .detach();
+                }
+                rejected => {
+                    self.pending_update_title = false;
+                    log::error!(
+                        "main-thread scheduler rejected title update; cleared coalescing state for retry: {rejected:?}"
+                    );
+                }
+            }
         } else {
             // Window already dropped; clear the flag so a future call can
             // re-arm once the window is recreated.
@@ -5559,7 +5667,12 @@ impl TermWindow {
             }
         };
         self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
-        promise::spawn::spawn(future).detach();
+        schedule_existing_termwindow_future(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            8 * 1024,
+            "input-selector overlay",
+            future,
+        );
     }
 
     fn show_prompt_input_line(&mut self, args: &PromptInputLine) {
@@ -5597,7 +5710,12 @@ impl TermWindow {
             }
         };
         self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
-        promise::spawn::spawn(future).detach();
+        schedule_existing_termwindow_future(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            8 * 1024,
+            "prompt overlay",
+            future,
+        );
     }
 
     fn tab_unify_identity(tab: &Tab) -> Option<TabIdentity> {
@@ -5806,11 +5924,16 @@ impl TermWindow {
 
         let (overlay, ticket, future) = match start_overlay(self, &tab, move |_tab_id, mut term| {
             if crate::overlay::confirm::run_confirmation(&message, &mut term)? {
-                promise::spawn::spawn_into_main_thread(async move {
-                    Self::apply_window_unify_plan(plan);
-                    anyhow::Result::<()>::Ok(())
-                })
-                .detach();
+                crate::overlay::reserve_overlay_main_thread(
+                    promise::spawn::MainThreadServiceClass::Input,
+                    crate::overlay::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES,
+                    "window unify action",
+                )?
+                .spawn(async move {
+                        Self::apply_window_unify_plan(plan);
+                        anyhow::Result::<()>::Ok(())
+                    })
+                    .detach();
             }
             Ok(())
         }) {
@@ -5821,7 +5944,12 @@ impl TermWindow {
             }
         };
         self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
-        promise::spawn::spawn(future).detach();
+        schedule_existing_termwindow_future(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            8 * 1024,
+            "quick-select overlay",
+            future,
+        );
     }
 
     fn show_confirmation(&mut self, args: &Confirmation) {
@@ -5855,7 +5983,12 @@ impl TermWindow {
             }
         };
         self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
-        promise::spawn::spawn(future).detach();
+        schedule_existing_termwindow_future(
+            promise::spawn::MainThreadServiceClass::Input,
+            8 * 1024,
+            "confirmation overlay",
+            future,
+        );
     }
 
     fn show_debug_overlay(&mut self) {
@@ -5884,7 +6017,12 @@ impl TermWindow {
             }
         };
         self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
-        promise::spawn::spawn(future).detach();
+        schedule_existing_termwindow_future(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            8 * 1024,
+            "debug overlay",
+            future,
+        );
     }
 
     fn show_tab_navigator(&mut self) {
@@ -5967,7 +6105,11 @@ impl TermWindow {
             .alphabet
             .unwrap_or_else(|| config.launcher_alphabet.clone());
 
-        promise::spawn::spawn(async move {
+        schedule_existing_termwindow_future(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            16 * 1024,
+            "prepare launcher overlay",
+            async move {
             let args = match LauncherArgs::new(
                 &title,
                 flags,
@@ -5995,6 +6137,20 @@ impl TermWindow {
                 };
                 if let Some(tab) = mux.get_tab(tab_id) {
                     let window = window.clone();
+                    let reservation = match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Interactive,
+                        8 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                        }
+                        rejected => {
+                            log::error!(
+                                "main-thread scheduler rejected launcher overlay before construction: {rejected:?}"
+                            );
+                            return;
+                        }
+                    };
                     let (overlay, ticket, future) =
                         match start_overlay(term_window, &tab, move |_tab_id, term| {
                             launcher(args, term, window, initial_choice_idx)
@@ -6007,11 +6163,11 @@ impl TermWindow {
                         };
 
                     term_window.assign_overlay_with_ticket(tab_id, overlay, ticket);
-                    promise::spawn::spawn(future).detach();
+                    reservation.spawn_local(future).detach();
                 }
             })));
-        })
-        .detach();
+        },
+        );
     }
 
     /// Returns the Prompt semantic zones
@@ -6569,7 +6725,12 @@ impl TermWindow {
                                 confirm_quit_program(term)
                             })?;
                         self.assign_overlay_with_ticket(tab.tab_id(), overlay, ticket);
-                        promise::spawn::spawn(future).detach();
+                        schedule_existing_termwindow_future(
+                            promise::spawn::MainThreadServiceClass::Input,
+                            8 * 1024,
+                            "quit confirmation overlay",
+                            future,
+                        );
                     }
                 }
             }
@@ -6840,31 +7001,46 @@ impl TermWindow {
                 let Some(switcher) = crate::frontend::WorkspaceSwitcher::new(&name) else {
                     return Ok(PerformAssignmentResult::Handled);
                 };
-                mux.set_active_workspace(&name);
-
                 if mux.iter_windows_in_workspace(&name).is_empty() {
                     let spawn = spawn.as_ref().map(|s| s.clone()).unwrap_or_default();
                     let size = self.terminal_size;
                     let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
                     let src_window_id = self.mux_window_id;
 
-                    promise::spawn::spawn(async move {
-                        if let Err(err) = crate::spawn::spawn_command_internal(
-                            spawn,
-                            SpawnWhere::NewWindow,
-                            size,
-                            Some(src_window_id),
-                            term_config,
-                        )
-                        .await
-                        {
-                            log::error!("Failed to spawn: {:#}", err);
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        16 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            mux.set_active_workspace(&name);
+                            reservation
+                                .spawn_local(async move {
+                                    if let Err(err) = crate::spawn::spawn_command_internal(
+                                        spawn,
+                                        SpawnWhere::NewWindow,
+                                        size,
+                                        Some(src_window_id),
+                                        term_config,
+                                    )
+                                    .await
+                                    {
+                                        log::error!("Failed to spawn: {:#}", err);
+                                    }
+                                    switcher.do_switch();
+                                    drop(activity);
+                                })
+                                .detach();
                         }
-                        switcher.do_switch();
-                        drop(activity);
-                    })
-                    .detach();
+                        rejected => {
+                            let message = format!(
+                                "main-thread scheduler rejected workspace `{name}` creation before activation: {rejected:?}"
+                            );
+                            log::error!("{message}");
+                            persistent_toast_notification("Workspace switch failed", &message);
+                        }
+                    }
                 } else {
+                    mux.set_active_workspace(&name);
                     switcher.do_switch();
                 }
             }
@@ -6879,31 +7055,47 @@ impl TermWindow {
                 let domain_name = domain.to_string();
                 let dpi = self.dimensions.dpi as u32;
 
-                promise::spawn::spawn(async move {
-                    let result = async {
-                        let mux = Mux::try_get()
-                            .ok_or_else(|| anyhow!("cannot attach domain without an active mux"))?;
-                        let domain = mux
-                            .get_domain_by_name(&domain_name)
-                            .ok_or_else(|| anyhow!("{} is not a valid domain name", domain_name))?;
-                        crate::spawn::attach_domain_to_window_or_spawn_recovery(
-                            &domain, window, None, None, dpi,
-                        )
-                        .await?;
+                match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    16 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                            .spawn_local(async move {
+                                let result = async {
+                                    let mux = Mux::try_get().ok_or_else(|| {
+                                        anyhow!("cannot attach domain without an active mux")
+                                    })?;
+                                    let domain = mux.get_domain_by_name(&domain_name).ok_or_else(
+                                        || anyhow!("{} is not a valid domain name", domain_name),
+                                    )?;
+                                    crate::spawn::attach_domain_to_window_or_spawn_recovery(
+                                        &domain, window, None, None, dpi,
+                                    )
+                                    .await?;
 
-                        Result::<(), anyhow::Error>::Ok(())
+                                    Result::<(), anyhow::Error>::Ok(())
+                                }
+                                .await;
+
+                                if let Err(err) = result {
+                                    let message = format!(
+                                        "failed to attach domain `{domain_name}` to window {window}: {err:#}"
+                                    );
+                                    log::error!("{message}");
+                                    persistent_toast_notification("Domain attach failed", &message);
+                                }
+                            })
+                            .detach();
                     }
-                    .await;
-
-                    if let Err(err) = result {
+                    rejected => {
                         let message = format!(
-                            "failed to attach domain `{domain_name}` to window {window}: {err:#}"
+                            "main-thread scheduler rejected domain `{domain_name}` attach before mutation: {rejected:?}"
                         );
                         log::error!("{message}");
                         persistent_toast_notification("Domain attach failed", &message);
                     }
-                })
-                .detach();
+                }
             }
             CopyMode(_) => {
                 // NOP here; handled by the overlay directly
@@ -7181,19 +7373,39 @@ impl TermWindow {
                 let mux_pane = active_pane.as_ref().map(|pane| MuxPane(pane.pane_id()));
                 let gui_window = GuiWin::try_new(self);
 
-                promise::spawn::spawn(async move {
-                    let commands = crate::termwindow::palette::build_commands(
-                        gui_window,
-                        mux_pane,
-                        filter_copy_mode,
-                    )
-                    .await;
-                    window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                        let modal = crate::termwindow::palette::CommandPalette::new(commands);
-                        term_window.set_modal(Rc::new(modal));
-                    })));
-                })
-                .detach();
+                match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Interactive,
+                    16 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                            .spawn_local(async move {
+                                let commands = crate::termwindow::palette::build_commands(
+                                    gui_window,
+                                    mux_pane,
+                                    filter_copy_mode,
+                                )
+                                .await;
+                                window.notify(TermWindowNotif::Apply(Box::new(
+                                    move |term_window| {
+                                        let modal =
+                                            crate::termwindow::palette::CommandPalette::new(
+                                                commands,
+                                            );
+                                        term_window.set_modal(Rc::new(modal));
+                                    },
+                                )));
+                            })
+                            .detach();
+                    }
+                    rejected => {
+                        let message = format!(
+                            "main-thread scheduler rejected command palette before construction: {rejected:?}"
+                        );
+                        log::error!("{message}");
+                        persistent_toast_notification("Command palette unavailable", &message);
+                    }
+                }
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
@@ -7244,10 +7456,14 @@ impl TermWindow {
                 Ok(())
             }
 
-            promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-                open_uri(lua, window, pane, link.uri().to_string())
-            }))
-            .detach();
+            schedule_existing_termwindow_future(
+                promise::spawn::MainThreadServiceClass::Input,
+                8 * 1024,
+                "open URI Lua event",
+                config::with_lua_config_on_main_thread(move |lua| {
+                    open_uri(lua, window, pane, link.uri().to_string())
+                }),
+            );
         }
     }
     fn close_current_pane(&mut self, confirm: bool) {
@@ -7284,7 +7500,12 @@ impl TermWindow {
                     }
                 };
             self.assign_overlay_for_pane_with_ticket(pane_id, overlay, ticket);
-            promise::spawn::spawn(future).detach();
+            schedule_existing_termwindow_future(
+                promise::spawn::MainThreadServiceClass::Input,
+                8 * 1024,
+                "close-pane confirmation overlay",
+                future,
+            );
         } else {
             mux.remove_pane(pane_id);
         }
@@ -7334,7 +7555,12 @@ impl TermWindow {
                 }
             };
             self.assign_overlay_with_ticket(tab_id, overlay, ticket);
-            promise::spawn::spawn(future).detach();
+            schedule_existing_termwindow_future(
+                promise::spawn::MainThreadServiceClass::Input,
+                8 * 1024,
+                "close-tab confirmation overlay",
+                future,
+            );
         } else {
             mux.remove_tab(tab_id);
         }
@@ -7372,7 +7598,12 @@ impl TermWindow {
                 }
             };
             self.assign_overlay_with_ticket(tab_id, overlay, ticket);
-            promise::spawn::spawn(future).detach();
+            schedule_existing_termwindow_future(
+                promise::spawn::MainThreadServiceClass::Input,
+                8 * 1024,
+                "close-window-tab confirmation overlay",
+                future,
+            );
         } else {
             mux.remove_tab(tab_id);
         }
@@ -9661,6 +9892,36 @@ mod tests {
         };
         assert_ne!(fresh, old);
         assert_eq!(delay, Duration::from_millis(8));
+    }
+
+    #[test]
+    fn stale_render_scheduler_rejection_cannot_cancel_newer_exact_wake() {
+        let now = Instant::now();
+        let mut wakes = RenderWakeState::default();
+        let old = match wakes.plan(
+            RenderWakeReason::Animation,
+            now + Duration::from_millis(20),
+            now,
+        ) {
+            RenderWakePlan::Schedule { ticket, .. } => ticket,
+            _ => panic!("initial animation must schedule"),
+        };
+        let stage = RenderFailureStage::Paint;
+        let current = match wakes.plan(
+            RenderWakeReason::Retry(stage),
+            now + Duration::from_millis(8),
+            now,
+        ) {
+            RenderWakePlan::Schedule { ticket, .. } => ticket,
+            _ => panic!("retry must supersede the animation"),
+        };
+
+        assert!(!wakes.cancel_exact(old));
+        assert_eq!(wakes.pending_ticket(), Some(current));
+        assert_eq!(wakes.dispatch(old), RenderWakeDispatch::Stale);
+        assert!(wakes.cancel_exact(current));
+        assert_eq!(wakes.pending_ticket(), None);
+        assert_eq!(wakes.dispatch(current), RenderWakeDispatch::Stale);
     }
 
     #[test]

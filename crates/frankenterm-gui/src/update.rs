@@ -145,13 +145,29 @@ fn schedule_set_banner_from_release_info(latest: &Release) {
     if latest.tag_name.as_str() <= current {
         return;
     }
-    promise::spawn::spawn_into_main_thread({
-        let latest = latest.clone();
-        async move {
-            set_banner_from_release_info(&latest);
+    match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Background,
+        4 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            let latest = latest.clone();
+            reservation
+                .spawn(async move {
+                    set_banner_from_release_info(&latest);
+                })
+                .detach();
         }
-    })
-    .detach();
+        rejected => {
+            metrics::counter!(
+                "gui.update_banner_admission",
+                "outcome" => "terminal_rejection"
+            )
+            .increment(1);
+            log::error!(
+                "main-thread scheduler rejected update banner before task construction: {rejected:?}"
+            );
+        }
+    }
 }
 
 fn release_browser_url(latest: &Release) -> String {

@@ -1181,6 +1181,17 @@ impl CopyRenderable {
     }
 
     fn schedule_update_search(&mut self) {
+        let reservation = match super::reserve_overlay_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            4 * 1024,
+            "copy-search debounce",
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                log::error!("{err:#}; retained the current search state for the next input");
+                return;
+            }
+        };
         self.mark_search_ui_dirty();
         // The debounce delays only the replacement query; obsolete search and
         // CPU-preparation work should stop as soon as the pattern changes.
@@ -1205,7 +1216,7 @@ impl CopyRenderable {
         let (abort, registration) = AbortHandle::new_pair();
         self.debounce_abort = Some(abort);
 
-        promise::spawn::spawn(async move {
+        reservation.spawn_local(async move {
             if Abortable::new(sleep(Duration::from_millis(350)), registration)
                 .await
                 .is_err()
@@ -1328,6 +1339,19 @@ impl CopyRenderable {
         pattern: Pattern,
         range: Range<StableRowIndex>,
     ) {
+        let reservation = match super::reserve_overlay_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            32 * 1024,
+            "copy-search chunk",
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                self.searching.take();
+                self.mark_search_ui_dirty();
+                log::error!("{err:#}; ended the exact copy-search run before task construction");
+                return;
+            }
+        };
         self.cancel_search_task();
         let instance_token = Arc::clone(&self.instance_token);
         let result_base = self.results.len();
@@ -1339,7 +1363,7 @@ impl CopyRenderable {
         let preparation_gate = Arc::clone(&self.search_preparation_gate);
         let (abort, registration) = AbortHandle::new_pair();
         self.search_abort = Some(abort);
-        promise::spawn::spawn(async move {
+        reservation.spawn_local(async move {
             let limit = Some(SEARCH_RESULT_REQUEST_LIMIT_PER_CHUNK);
             log::trace!("Searching for {pattern:?} in {range:?}");
             let preparation_range = range.clone();
@@ -1405,6 +1429,21 @@ impl CopyRenderable {
     }
 
     fn schedule_search_retry(&mut self, run: SearchRunIdentity, retry_attempt: u8) {
+        let reservation = match super::reserve_overlay_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            4 * 1024,
+            "copy-search retry",
+        ) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                self.cancel_search_task();
+                self.cancel_retry();
+                self.searching.take();
+                self.mark_search_ui_dirty();
+                log::error!("{err:#}; ended the exact copy-search run instead of losing a retry");
+                return;
+            }
+        };
         self.cancel_search_task();
         self.cancel_retry();
         let delay = search_retry_delay(retry_attempt);
@@ -1417,7 +1456,7 @@ impl CopyRenderable {
         let (abort, registration) = AbortHandle::new_pair();
         self.retry_abort = Some(abort);
         self.mark_search_ui_dirty();
-        promise::spawn::spawn(async move {
+        reservation.spawn_local(async move {
             if Abortable::new(sleep(delay), registration).await.is_err() {
                 return anyhow::Result::<()>::Ok(());
             }

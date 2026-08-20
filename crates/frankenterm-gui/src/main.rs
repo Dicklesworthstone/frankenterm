@@ -394,12 +394,22 @@ fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     let gui = crate::frontend::try_new()?;
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
 
-    promise::spawn::spawn(async {
-        if let Err(err) = async_run_ssh(opts).await {
-            terminate_with_error(err);
-        }
-    })
-    .detach();
+    let startup_reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        64 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!(
+            "main-thread scheduler rejected mandatory SSH GUI startup before task construction: {rejected:?}"
+        ),
+    };
+    startup_reservation
+        .spawn_local(async {
+            if let Err(err) = async_run_ssh(opts).await {
+                terminate_with_error(err);
+            }
+        })
+        .detach();
 
     maybe_show_configuration_error_window();
     run_gui_event_loop(gui)
@@ -451,12 +461,22 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
     let gui = crate::frontend::try_new()?;
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
 
-    promise::spawn::spawn(async {
-        if let Err(err) = async_run_serial(opts).await {
-            terminate_with_error(err);
-        }
-    })
-    .detach();
+    let startup_reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        64 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!(
+            "main-thread scheduler rejected mandatory serial GUI startup before task construction: {rejected:?}"
+        ),
+    };
+    startup_reservation
+        .spawn_local(async {
+            if let Err(err) = async_run_serial(opts).await {
+                terminate_with_error(err);
+            }
+        })
+        .detach();
 
     maybe_show_configuration_error_window();
     run_gui_event_loop(gui)
@@ -464,12 +484,30 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
 
 fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
     config::subscribe_to_config_reload(move || {
-        promise::spawn::spawn_into_main_thread(async move {
-            if let Err(err) = update_mux_domains(&config::configuration()) {
-                log::error!("Error updating mux domains: {:#}", err);
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn(async move {
+                        if let Err(err) = update_mux_domains(&config::configuration()) {
+                            log::error!("Error updating mux domains: {:#}", err);
+                        }
+                    })
+                    .detach();
             }
-        })
-        .detach();
+            rejected => {
+                metrics::counter!(
+                    "gui.domain_config_reload_admission",
+                    "outcome" => "terminal_rejection"
+                )
+                .increment(1);
+                log::error!(
+                    "main-thread scheduler rejected mux-domain config reload before task construction: {rejected:?}"
+                );
+            }
+        }
         true
     })
 }
@@ -1092,13 +1130,23 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
     let activity = Activity::new_for_mux(&mux);
 
-    promise::spawn::spawn(async move {
-        if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
-            terminate_with_error(err);
-        }
-        drop(activity);
-    })
-    .detach();
+    let startup_reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        64 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!(
+            "main-thread scheduler rejected mandatory terminal GUI startup before task construction: {rejected:?}"
+        ),
+    };
+    startup_reservation
+        .spawn_local(async move {
+            if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
+                terminate_with_error(err);
+            }
+            drop(activity);
+        })
+        .detach();
 
     maybe_show_configuration_error_window();
     run_gui_event_loop(gui)
@@ -1278,7 +1326,6 @@ mod tests {
     fn poll_guarded_startup(
         future: &mut GuardedStartupFuture,
     ) -> std::task::Poll<Result<(), futures::channel::oneshot::Canceled>> {
-        use std::future::Future as _;
         let waker = futures::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
         future.as_mut().poll(&mut context)

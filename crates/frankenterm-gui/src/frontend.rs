@@ -12,6 +12,9 @@ use frankenterm_toast_notification::*;
 use mux::client::ClientId;
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
+use promise::spawn::{
+    MainThreadReservationOutcome, MainThreadServiceClass, try_reserve_main_thread,
+};
 use promise::{Future, Promise};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
@@ -20,6 +23,34 @@ use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
 
 const MAX_RECONCILE_WAITERS: usize = 4_096;
+const FRONTEND_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
+
+fn schedule_frontend_main_thread<MAKE, FUT>(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+    make_future: MAKE,
+) where
+    MAKE: FnOnce() -> FUT,
+    FUT: std::future::Future<Output = ()> + 'static,
+{
+    match try_reserve_main_thread(service_class, estimated_bytes) {
+        MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation.spawn_local(make_future()).detach();
+        }
+        rejected => {
+            metrics::counter!(
+                "gui.main_thread_admission",
+                "operation" => operation,
+                "outcome" => "terminal_rejection"
+            )
+            .increment(1);
+            log::error!(
+                "GUI main-thread scheduler rejected {operation} before task construction: {rejected:?}"
+            );
+        }
+    }
+}
 
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
@@ -72,10 +103,14 @@ impl GuiFrontEnd {
                         let active = mux.active_workspace();
                         if active == old_workspace || active == new_workspace {
                             if let Some(switcher) = WorkspaceSwitcher::new(&new_workspace) {
-                                promise::spawn::spawn_into_main_thread(async move {
-                                    drop(switcher);
-                                })
-                                .detach();
+                                schedule_frontend_main_thread(
+                                    MainThreadServiceClass::Topology,
+                                    FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+                                    "workspace rename reconciliation",
+                                    || async move {
+                                        drop(switcher);
+                                    },
+                                );
                             }
                         }
                     }
@@ -84,40 +119,52 @@ impl GuiFrontEnd {
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::WindowCreated(_)
                 | MuxNotification::WindowRemoved(_) => {
-                    promise::spawn::spawn_into_main_thread(async move {
-                        if let Some(fe) = crate::frontend::try_front_end()
-                            && !fe.is_switching_workspace()
-                        {
-                            fe.reconcile_workspace();
-                        }
-                    })
-                    .detach();
+                    schedule_frontend_main_thread(
+                        MainThreadServiceClass::Topology,
+                        FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+                        "workspace state reconciliation",
+                        || async move {
+                            if let Some(fe) = crate::frontend::try_front_end()
+                                && !fe.is_switching_workspace()
+                            {
+                                fe.reconcile_workspace();
+                            }
+                        },
+                    );
                 }
                 MuxNotification::WindowTopologyChanged(change)
                     if !change.created_windows().is_empty()
                         || !change.removed_windows().is_empty() =>
                 {
-                    promise::spawn::spawn_into_main_thread(async move {
-                        if let Some(fe) = crate::frontend::try_front_end()
-                            && !fe.is_switching_workspace()
-                        {
-                            fe.reconcile_workspace();
-                        }
-                    })
-                    .detach();
+                    schedule_frontend_main_thread(
+                        MainThreadServiceClass::Topology,
+                        FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+                        "window topology reconciliation",
+                        || async move {
+                            if let Some(fe) = crate::frontend::try_front_end()
+                                && !fe.is_switching_workspace()
+                            {
+                                fe.reconcile_workspace();
+                            }
+                        },
+                    );
                 }
                 MuxNotification::PaneFocused(pane_id) => {
-                    promise::spawn::spawn_into_main_thread(async move {
-                        if let Some(mux) = Mux::try_get()
-                            && let Err(err) = mux.focus_pane_and_containing_tab(pane_id)
-                        {
-                            log::error!("error reconciling PaneFocused notification: {err:#}");
-                        }
-                        if let Some(fe) = crate::frontend::try_front_end() {
-                            fe.apply_osc22_cursor_shape_for_pane(pane_id);
-                        }
-                    })
-                    .detach();
+                    schedule_frontend_main_thread(
+                        MainThreadServiceClass::Input,
+                        FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+                        "focused pane reconciliation",
+                        || async move {
+                            if let Some(mux) = Mux::try_get()
+                                && let Err(err) = mux.focus_pane_and_containing_tab(pane_id)
+                            {
+                                log::error!("error reconciling PaneFocused notification: {err:#}");
+                            }
+                            if let Some(fe) = crate::frontend::try_front_end() {
+                                fe.apply_osc22_cursor_shape_for_pane(pane_id);
+                            }
+                        },
+                    );
                 }
                 MuxNotification::PaneRemoved(pane_id) => {
                     if let Some(fe) = crate::frontend::try_front_end() {
@@ -221,23 +268,27 @@ impl GuiFrontEnd {
                 MuxNotification::Empty => {
                     if config::configuration().quit_when_all_windows_are_closed {
                         let mux_owner = mux_owner.clone();
-                        promise::spawn::spawn_into_main_thread(async move {
-                            let Some(notifying_mux) = mux_owner.upgrade() else {
-                                return;
-                            };
-                            let is_current_owner = Mux::try_get()
-                                .is_some_and(|current| Arc::ptr_eq(&current, &notifying_mux));
-                            if is_current_owner
-                                && notifying_mux.is_empty()
-                                && mux::activity::Activity::count_for_mux(&notifying_mux) == 0
-                            {
-                                log::trace!("Exact mux is still empty; terminate gui");
-                                if let Some(conn) = Connection::get() {
-                                    conn.terminate_message_loop();
+                        schedule_frontend_main_thread(
+                            MainThreadServiceClass::Topology,
+                            FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+                            "empty mux termination",
+                            || async move {
+                                let Some(notifying_mux) = mux_owner.upgrade() else {
+                                    return;
+                                };
+                                let is_current_owner = Mux::try_get()
+                                    .is_some_and(|current| Arc::ptr_eq(&current, &notifying_mux));
+                                if is_current_owner
+                                    && notifying_mux.is_empty()
+                                    && mux::activity::Activity::count_for_mux(&notifying_mux) == 0
+                                {
+                                    log::trace!("Exact mux is still empty; terminate gui");
+                                    if let Some(conn) = Connection::get() {
+                                        conn.terminate_message_loop();
+                                    }
                                 }
-                            }
-                        })
-                        .detach();
+                            },
+                        );
                     }
                 }
                 MuxNotification::SaveToDownloads { name, data } => {
@@ -256,31 +307,38 @@ impl GuiFrontEnd {
                     selection,
                     clipboard,
                 } => {
-                    promise::spawn::spawn_into_main_thread(async move {
-                        log::trace!(
-                            "set clipboard in pane {} {:?} {:?}",
-                            pane_id,
-                            selection,
-                            clipboard
-                        );
-                        let Some(fe) = crate::frontend::try_front_end() else {
-                            return;
-                        };
-                        if let Some(window) = fe.known_windows.borrow().keys().next() {
-                            window.set_clipboard(
-                                match selection {
-                                    ClipboardSelection::Clipboard => Clipboard::Clipboard,
-                                    ClipboardSelection::PrimarySelection => {
-                                        Clipboard::PrimarySelection
-                                    }
-                                },
-                                clipboard.unwrap_or_else(String::new),
+                    let estimated_bytes = FRONTEND_MAIN_THREAD_ESTIMATED_BYTES.saturating_add(
+                        clipboard.as_ref().map_or(0, String::len),
+                    );
+                    schedule_frontend_main_thread(
+                        MainThreadServiceClass::Input,
+                        estimated_bytes,
+                        "clipboard assignment",
+                        || async move {
+                            log::trace!(
+                                "set clipboard in pane {} {:?} {:?}",
+                                pane_id,
+                                selection,
+                                clipboard
                             );
-                        } else {
-                            log::error!("Cannot assign clipboard as there are no windows");
-                        };
-                    })
-                    .detach();
+                            let Some(fe) = crate::frontend::try_front_end() else {
+                                return;
+                            };
+                            if let Some(window) = fe.known_windows.borrow().keys().next() {
+                                window.set_clipboard(
+                                    match selection {
+                                        ClipboardSelection::Clipboard => Clipboard::Clipboard,
+                                        ClipboardSelection::PrimarySelection => {
+                                            Clipboard::PrimarySelection
+                                        }
+                                    },
+                                    clipboard.unwrap_or_else(String::new),
+                                );
+                            } else {
+                                log::error!("Cannot assign clipboard as there are no windows");
+                            };
+                        },
+                    );
                 }
             }
             true
@@ -292,7 +350,7 @@ impl GuiFrontEnd {
         config::reload();
 
         // And build the initial menu bar — synchronously, BEFORE we hand
-        // control to AppKit's run loop. Deferring this via spawn_into_main_thread
+        // control to AppKit's run loop. Deferring this through the bounded scheduler
         // queues it for the next main-thread tick, but the implicit AE-open
         // event AppKit dispatches at launch arrives first; AppKit then walks
         // [NSApp mainMenu] in -[NSApplication _hasOpenMenuItem] / _doOpenUntitled
@@ -316,7 +374,11 @@ impl GuiFrontEnd {
                         return;
                     }
                 };
-                promise::spawn::spawn(async move {
+                schedule_frontend_main_thread(
+                    MainThreadServiceClass::Topology,
+                    FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+                    "open command script",
+                    || async move {
                     use config::keyassignment::SpawnTabDomain;
                     use wezterm_term::TerminalSize;
 
@@ -359,8 +421,8 @@ impl GuiFrontEnd {
                             log::error!("Failed to spawn {file_name}: {err:#?}");
                         }
                     };
-                })
-                .detach();
+                    },
+                );
             }
             ApplicationEvent::PerformKeyAssignment(action) => {
                 // We should only get here when there are no windows open
@@ -526,7 +588,21 @@ impl GuiFrontEnd {
         *self.known_windows.borrow_mut() = windows;
 
         // then spawn any new windows that are needed
-        promise::spawn::spawn(async move {
+        let reservation = match try_reserve_main_thread(
+            MainThreadServiceClass::Topology,
+            FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+        ) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                *self.switching_workspaces.borrow_mut() = false;
+                self.finish_workspace_reconcile_pass();
+                log::error!(
+                    "GUI main-thread scheduler rejected workspace reconciliation suffix; released the exact pass gate for retry: {rejected:?}"
+                );
+                return;
+            }
+        };
+        reservation.spawn_local(async move {
             while let Some(mux_window_id) = mux_windows.next() {
                 let Some(fe) = try_front_end() else {
                     return;
@@ -555,8 +631,7 @@ impl GuiFrontEnd {
                 *fe.switching_workspaces.borrow_mut() = false;
                 fe.finish_workspace_reconcile_pass();
             }
-        })
-        .detach();
+        }).detach();
     }
 
     fn finish_workspace_reconcile_pass(&self) {
@@ -709,10 +784,14 @@ fn terminal_toast_action(
 ) -> Option<ToastNotificationAction> {
     focus.then(|| {
         ToastNotificationAction::new("Focus", move || {
-            promise::spawn::spawn_into_main_thread(async move {
-                focus_terminal_toast_source(pane_id);
-            })
-            .detach();
+            schedule_frontend_main_thread(
+                MainThreadServiceClass::Interactive,
+                FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+                "terminal toast focus",
+                || async move {
+                    focus_terminal_toast_source(pane_id);
+                },
+            );
         })
     })
 }
@@ -867,10 +946,14 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
 
     let config_subscription = config::subscribe_to_config_reload({
         move || {
-            promise::spawn::spawn_into_main_thread(async {
-                crate::commands::CommandDef::recreate_menubar(&config::configuration());
-            })
-            .detach();
+            schedule_frontend_main_thread(
+                MainThreadServiceClass::Background,
+                FRONTEND_MAIN_THREAD_ESTIMATED_BYTES,
+                "menu rebuild after configuration reload",
+                || async {
+                    crate::commands::CommandDef::recreate_menubar(&config::configuration());
+                },
+            );
             true
         }
     });

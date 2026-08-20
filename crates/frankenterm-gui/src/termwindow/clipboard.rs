@@ -45,23 +45,36 @@ impl TermWindow {
             ClipboardPasteSource::Clipboard => Clipboard::Clipboard,
             ClipboardPasteSource::PrimarySelection => Clipboard::PrimarySelection,
         };
-        let future = window.get_clipboard(clipboard);
-        promise::spawn::spawn(async move {
-            if let Ok(clip) = future.await {
-                window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
-                    if let Some(pane) = myself
-                        .pane_state(pane_id)
-                        .overlay
-                        .as_ref()
-                        .map(|overlay| overlay.pane.clone())
-                        .or_else(|| Mux::try_get().and_then(|mux| mux.get_pane(pane_id)))
-                    {
-                        pane.send_paste(&clip).ok();
-                    }
-                })));
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            8 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                log::error!(
+                    "main-thread scheduler rejected clipboard paste before clipboard request: {rejected:?}"
+                );
+                return;
             }
-        })
-        .detach();
+        };
+        let future = window.get_clipboard(clipboard);
+        reservation
+            .spawn_local(async move {
+                if let Ok(clip) = future.await {
+                    window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                        if let Some(pane) = myself
+                            .pane_state(pane_id)
+                            .overlay
+                            .as_ref()
+                            .map(|overlay| overlay.pane.clone())
+                            .or_else(|| Mux::try_get().and_then(|mux| mux.get_pane(pane_id)))
+                        {
+                            pane.send_paste(&clip).ok();
+                        }
+                    })));
+                }
+            })
+            .detach();
         self.maybe_scroll_to_bottom_for_input(&pane);
     }
 }

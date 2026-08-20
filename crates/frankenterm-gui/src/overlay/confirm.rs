@@ -158,18 +158,28 @@ pub fn show_confirmation_overlay(
 
     if let Ok(confirm) = run_confirmation_impl(&args.message, &mut term) {
         if confirm {
-            promise::spawn::spawn_into_main_thread(async move {
-                trampoline(name, window, pane);
-                anyhow::Result::<()>::Ok(())
-            })
-            .detach();
-        } else if let Some(key_assignment) = args.cancel {
-            if let KeyAssignment::EmitEvent(id) = *key_assignment {
-                promise::spawn::spawn_into_main_thread(async move {
-                    trampoline(id, window, pane);
+            super::reserve_overlay_main_thread(
+                promise::spawn::MainThreadServiceClass::Input,
+                super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES,
+                "confirmation action",
+            )?
+            .spawn(async move {
+                    trampoline(name, window, pane);
                     anyhow::Result::<()>::Ok(())
                 })
                 .detach();
+        } else if let Some(key_assignment) = args.cancel {
+            if let KeyAssignment::EmitEvent(id) = *key_assignment {
+                super::reserve_overlay_main_thread(
+                    promise::spawn::MainThreadServiceClass::Input,
+                    super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES,
+                    "confirmation cancellation",
+                )?
+                .spawn(async move {
+                        trampoline(id, window, pane);
+                        anyhow::Result::<()>::Ok(())
+                    })
+                    .detach();
             }
         }
     }
@@ -177,10 +187,20 @@ pub fn show_confirmation_overlay(
 }
 
 fn trampoline(name: String, window: GuiWin, pane: MuxPane) {
-    promise::spawn::spawn(async move {
-        config::with_lua_config_on_main_thread(move |lua| do_event(lua, name, window, pane)).await
-    })
-    .detach();
+    if let Ok(reservation) = super::reserve_overlay_main_thread(
+        promise::spawn::MainThreadServiceClass::Input,
+        super::OVERLAY_MAIN_THREAD_ESTIMATED_BYTES,
+        "confirmation callback",
+    ) {
+        reservation
+            .spawn_local(async move {
+                config::with_lua_config_on_main_thread(move |lua| {
+                    do_event(lua, name, window, pane)
+                })
+                .await
+            })
+            .detach();
+    }
 }
 
 async fn do_event(
