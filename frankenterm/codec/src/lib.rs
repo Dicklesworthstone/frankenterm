@@ -21312,7 +21312,8 @@ mod test {
                 error
                     .downcast_ref::<PduEncodedBodyLimitExceeded>()
                     .is_some(),
-                "unexpected oversized-body error: {error:#}"
+                "unexpected oversized-body error: {:#}",
+                error
             );
         }
     }

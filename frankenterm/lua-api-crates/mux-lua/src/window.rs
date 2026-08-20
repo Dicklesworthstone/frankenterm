@@ -12,7 +12,6 @@ impl MuxWindow {
         mux.get_window(self.0)
             .ok_or_else(|| mlua::Error::external(format!("window id {} not found in mux", self.0)))
     }
-
 }
 
 impl UserData for MuxWindow {
@@ -66,7 +65,12 @@ impl UserData for MuxWindow {
             // MuxWindow is Copy: take the id by value so the deferred task does
             // not retain the Lua `UserDataRef` registry handle.
             let window = *this;
-            promise::spawn::spawn(async move { spawn.spawn(&window).await }).await
+            crate::run_on_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                "spawn tab",
+                || async move { spawn.spawn(&window).await },
+            )
+            .await?
         });
         methods.add_method("get_title", |_, this, _: ()| {
             let mux = get_mux()?;

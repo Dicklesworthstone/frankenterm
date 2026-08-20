@@ -11,9 +11,9 @@
 //!
 //! The correct shapes are `create_async_function` / `add_async_method` that
 //! either `.await` a `Send` future directly, or hand `!Send` work to the
-//! main-thread queue via `promise::spawn::spawn(..).await` (which uses
-//! `spawn_local`, lifting the `Send` bound, and yields to the event loop
-//! instead of blocking). Self-contained, non-dispatching work may use a private
+//! main-thread queue through an explicit service-class reservation followed by
+//! `spawn_local`, lifting the `Send` bound and yielding to the event loop
+//! instead of blocking. Self-contained, non-dispatching work may use a private
 //! executor such as `futures::executor::block_on`.
 //!
 //! This test walks every production `src/` `*.rs` file across the

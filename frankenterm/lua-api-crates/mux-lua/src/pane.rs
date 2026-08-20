@@ -80,7 +80,12 @@ impl UserData for MuxPane {
             let this = *this;
             async move {
                 let args = args.unwrap_or_default();
-                promise::spawn::spawn(async move { args.run(&this).await }).await
+                crate::run_on_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    "split pane",
+                    || async move { args.run(&this).await },
+                )
+                .await?
             }
         });
 
@@ -374,13 +379,17 @@ impl UserData for MuxPane {
                 // queue and await the `Send` `Task` handle (see `split`). Extract
                 // ids inside the spawned future so only `Send` values cross the
                 // `Task` boundary -- not `Arc<Tab>`.
-                let (tab_id, window) = promise::spawn::spawn(async move {
-                    let (tab, window) = mux
-                        .move_pane_to_new_tab(pane_id, Some(window_id), None)
-                        .await?;
-                    Ok::<_, anyhow::Error>((tab.tab_id(), window))
-                })
-                .await
+                let (tab_id, window) = crate::run_on_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    "move pane to new tab",
+                    || async move {
+                        let (tab, window) = mux
+                            .move_pane_to_new_tab(pane_id, Some(window_id), None)
+                            .await?;
+                        Ok::<_, anyhow::Error>((tab.tab_id(), window))
+                    },
+                )
+                .await?
                 .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
 
                 Ok((MuxTab(tab_id), MuxWindow(window)))
@@ -395,12 +404,16 @@ impl UserData for MuxPane {
                     let mux = get_mux()?;
                     // `move_pane_to_new_tab` is `!Send`; spawn onto the main-thread
                     // queue and await the `Send` `Task` handle (see `move_to_new_tab`).
-                    let (tab_id, window) = promise::spawn::spawn(async move {
-                        let (tab, window) =
-                            mux.move_pane_to_new_tab(pane_id, None, workspace).await?;
-                        Ok::<_, anyhow::Error>((tab.tab_id(), window))
-                    })
-                    .await
+                    let (tab_id, window) = crate::run_on_main_thread(
+                        promise::spawn::MainThreadServiceClass::Topology,
+                        "move pane to new window",
+                        || async move {
+                            let (tab, window) =
+                                mux.move_pane_to_new_tab(pane_id, None, workspace).await?;
+                            Ok::<_, anyhow::Error>((tab.tab_id(), window))
+                        },
+                    )
+                    .await?
                     .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
 
                     Ok((MuxTab(tab_id), MuxWindow(window)))

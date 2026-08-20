@@ -7,14 +7,38 @@ use config::lua::mlua::{self, Lua, UserData, UserDataMethods, Value as LuaValue}
 use config::lua::{get_or_create_module, get_or_create_sub_module};
 use luahelper::impl_lua_conversion_dynamic;
 use mlua::UserDataRef;
-use mux::Mux;
 use mux::domain::{DomainId, SplitSource};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use mux::window::{Window, WindowId};
+use mux::Mux;
 use portable_pty::CommandBuilder;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+pub(crate) async fn run_on_main_thread<MAKE, FUT, OUTPUT>(
+    service_class: promise::spawn::MainThreadServiceClass,
+    operation: &'static str,
+    make_future: MAKE,
+) -> mlua::Result<OUTPUT>
+where
+    MAKE: FnOnce() -> FUT,
+    FUT: std::future::Future<Output = OUTPUT> + 'static,
+    OUTPUT: 'static,
+{
+    let reservation = match promise::spawn::try_reserve_main_thread(service_class, 8 * 1024) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => {
+            return Err(mlua::Error::external(format!(
+                "main-thread scheduler rejected mux Lua operation {operation} before task construction: {rejected:?}"
+            )));
+        }
+    };
+    Ok(reservation
+        .spawn_local(make_future())
+        .into_task()
+        .await)
+}
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::TerminalSize;
 
@@ -129,7 +153,12 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         // no dispatch-guard trip, and only the `Send` `Task` is live across the
         // await, satisfying mlua.
         lua.create_async_function(|_, spawn: SpawnWindow| async move {
-            promise::spawn::spawn(spawn.spawn()).await
+            run_on_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                "spawn window",
+                || spawn.spawn(),
+            )
+            .await?
         })?,
     )?;
 

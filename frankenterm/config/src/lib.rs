@@ -387,16 +387,6 @@ where
     func(lua)
 }
 
-fn schedule_with_lua<F, RETF, RET>(func: F) -> promise::spawn::Task<anyhow::Result<RET>>
-where
-    F: 'static,
-    RET: 'static,
-    F: Fn(Option<Rc<Lua>>) -> RETF,
-    RETF: Future<Output = anyhow::Result<RET>>,
-{
-    promise::spawn::spawn(async move { with_lua_config_on_main_thread(func).await })
-}
-
 /// Spawn a future that will run with an optional Lua state from the most
 /// recently loaded lua configuration.
 /// The `func` argument is passed the lua state and must return a Future.
@@ -407,7 +397,21 @@ where
     F: Send + 'static,
     RET: Send + 'static,
 {
-    promise::spawn::spawn_into_main_thread(async move { schedule_with_lua(func).await }).await
+    let reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        4 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => {
+            anyhow::bail!(
+                "main-thread scheduler rejected Lua configuration operation before task construction: {rejected:?}"
+            )
+        }
+    };
+    reservation
+        .spawn(async move { with_lua_config_on_main_thread(func).await })
+        .into_task()
+        .await
 }
 
 #[cfg(feature = "lua")]

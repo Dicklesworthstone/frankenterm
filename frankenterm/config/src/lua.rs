@@ -570,7 +570,7 @@ fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<f64> {
 /// Internals:
 ///   1. Stash the Lua callback in the named registry under a unique key
 ///      (sync, while we still hold the `Lua` reference).
-///   2. `promise::spawn::spawn` a future that awaits
+///   2. Reserve bounded background scheduler capacity, then spawn a future that awaits
 ///      `promise::spawn::sleep(duration)` (asupersync-backed).
 ///   3. On wake, re-enter the main-thread Lua state via
 ///      `crate::with_lua_config_on_main_thread`, fetch the callback
@@ -591,16 +591,29 @@ fn lua_time_call_after(lua: &Lua, (seconds, func): (f64, mlua::Function)) -> mlu
     let counter = TIME_CALL_AFTER_COUNTER.fetch_add(1, Ordering::Relaxed);
     let key = format!("frankenterm-time-call-after-{ts_ns}-{counter}");
 
+    let reservation = match promise::spawn::try_reserve_main_thread_with_low_priority(
+        promise::spawn::MainThreadServiceClass::Background,
+        8 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => {
+            return Err(mlua::Error::external(format!(
+                "time.call_after: main-thread scheduler rejected timer before callback registration: {rejected:?}"
+            )));
+        }
+    };
+
     lua.set_named_registry_value(&key, func)?;
 
     let duration = Duration::from_secs_f64(seconds);
     let key_for_async = key.clone();
-    promise::spawn::spawn(async move {
-        promise::spawn::sleep(duration).await;
-        let _ = crate::with_lua_config_on_main_thread(move |lua_opt| {
-            let key = key_for_async.clone();
-            async move {
-                let Some(lua) = lua_opt else {
+    reservation
+        .spawn_local(async move {
+            promise::spawn::sleep(duration).await;
+            let _ = crate::with_lua_config_on_main_thread(move |lua_opt| {
+                let key = key_for_async.clone();
+                async move {
+                    let Some(lua) = lua_opt else {
                     // No live Lua state (config reload mid-flight or
                     // shutdown). The registry holding the callback is
                     // gone with it, so there's nothing to clean up.
@@ -632,12 +645,12 @@ fn lua_time_call_after(lua: &Lua, (seconds, func): (f64, mlua::Function)) -> mlu
                         // schedule and fire). Silently drop.
                     }
                 }
-                Ok(())
-            }
+                    Ok(())
+                }
+            })
+            .await;
         })
-        .await;
-    })
-    .detach();
+        .detach();
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 use super::*;
 use mlua::UserDataRef;
-use mux::DomainOperationGuard;
 use mux::domain::{DomainId, DomainState};
+use mux::DomainOperationGuard;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -54,18 +54,22 @@ impl UserData for MuxDomain {
                 let domain = this.resolve(&mux)?;
                 let window_id = window.map(|w| w.0);
                 let owner_client_id = mux.active_identity();
-                promise::spawn::spawn(async move {
-                    domain
-                        .attach(&mux, owner_client_id, window_id)
-                        .await
-                        .map_err(|err| {
-                            mlua::Error::external(format!(
-                                "failed to attach domain {}: {err:#}",
-                                domain.domain_name()
-                            ))
-                        })
-                })
-                .await
+                crate::run_on_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    "attach domain",
+                    || async move {
+                        domain
+                            .attach(&mux, owner_client_id, window_id)
+                            .await
+                            .map_err(|err| {
+                                mlua::Error::external(format!(
+                                    "failed to attach domain {}: {err:#}",
+                                    domain.domain_name()
+                                ))
+                            })
+                    },
+                )
+                .await?
             },
         );
 
@@ -103,7 +107,12 @@ impl UserData for MuxDomain {
         methods.add_async_method("label", |_, this, _: ()| async move {
             let mux = get_mux()?;
             let domain = this.resolve(&mux)?;
-            Ok(promise::spawn::spawn(async move { domain.domain_label().await }).await)
+            crate::run_on_main_thread(
+                promise::spawn::MainThreadServiceClass::Interactive,
+                "read domain label",
+                || async move { domain.domain_label().await },
+            )
+            .await
         });
 
         methods.add_method("has_any_panes", |_, this, _: ()| {
