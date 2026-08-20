@@ -2457,6 +2457,62 @@ impl RendererKeypressTraceStage {
     ];
 }
 
+/// Exact P0-P13 paste trace-v1 stage inventory.
+///
+/// Paste follows the same process and presentation boundaries as a keypress,
+/// but it is a distinct interaction path: a paste can contain an arbitrary
+/// byte sequence and must never be mislabeled as one key transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RendererPasteTraceStage {
+    #[serde(rename = "P0.native_paste_receipt")]
+    NativePasteReceipt,
+    #[serde(rename = "P1.gui_paste_mapping_complete")]
+    GuiPasteMappingComplete,
+    #[serde(rename = "P2.client_rpc_enqueue")]
+    ClientRpcEnqueue,
+    #[serde(rename = "P3.client_encode_socket_flush")]
+    ClientEncodeSocketFlush,
+    #[serde(rename = "P4.server_readable_decode")]
+    ServerReadableDecode,
+    #[serde(rename = "P5.server_dispatch_mux_wait")]
+    ServerDispatchMuxWait,
+    #[serde(rename = "P6.terminal_lock_pty_write_flush")]
+    TerminalLockPtyWriteFlush,
+    #[serde(rename = "P7.pty_echo_parser_apply")]
+    PtyEchoParserApply,
+    #[serde(rename = "P8.server_delta_compute")]
+    ServerDeltaCompute,
+    #[serde(rename = "P9.client_receive_decode_apply")]
+    ClientReceiveDecodeApply,
+    #[serde(rename = "P10.local_mux_gui_invalidation")]
+    LocalMuxGuiInvalidation,
+    #[serde(rename = "P11.paint_shape_atlas")]
+    PaintShapeAtlas,
+    #[serde(rename = "P12.gpu_submit_drawable_request")]
+    GpuSubmitDrawableRequest,
+    #[serde(rename = "P13.display_completion")]
+    DisplayCompletion,
+}
+
+impl RendererPasteTraceStage {
+    pub const ALL: [Self; 14] = [
+        Self::NativePasteReceipt,
+        Self::GuiPasteMappingComplete,
+        Self::ClientRpcEnqueue,
+        Self::ClientEncodeSocketFlush,
+        Self::ServerReadableDecode,
+        Self::ServerDispatchMuxWait,
+        Self::TerminalLockPtyWriteFlush,
+        Self::PtyEchoParserApply,
+        Self::ServerDeltaCompute,
+        Self::ClientReceiveDecodeApply,
+        Self::LocalMuxGuiInvalidation,
+        Self::PaintShapeAtlas,
+        Self::GpuSubmitDrawableRequest,
+        Self::DisplayCompletion,
+    ];
+}
+
 /// Exact R0-R25 resize/zoom production-path trace stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RendererResizeTraceStage {

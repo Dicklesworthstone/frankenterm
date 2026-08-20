@@ -11,7 +11,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::renderer_scenario_catalog::{RendererKeypressTraceStage, RendererResizeTraceStage};
+use crate::renderer_scenario_catalog::{
+    RendererKeypressTraceStage, RendererPasteTraceStage, RendererResizeTraceStage,
+};
 
 /// Exact wire schema accepted by this implementation.
 pub const INTERACTION_TRACE_V2_SCHEMA_VERSION: &str = "ft.interaction-trace.v2";
@@ -161,6 +163,7 @@ impl InteractionTraceIdAllocator {
 #[serde(rename_all = "snake_case")]
 pub enum InteractionTracePath {
     Keypress,
+    Paste,
     ResizeZoom,
 }
 
@@ -174,6 +177,7 @@ pub enum InteractionTracePath {
 )]
 pub enum InteractionTraceStage {
     Keypress(RendererKeypressTraceStage),
+    Paste(RendererPasteTraceStage),
     ResizeZoom(RendererResizeTraceStage),
 }
 
@@ -208,6 +212,7 @@ impl InteractionTraceStage {
     pub const fn path(self) -> InteractionTracePath {
         match self {
             Self::Keypress(_) => InteractionTracePath::Keypress,
+            Self::Paste(_) => InteractionTracePath::Paste,
             Self::ResizeZoom(_) => InteractionTracePath::ResizeZoom,
         }
     }
@@ -235,6 +240,22 @@ impl InteractionTraceStage {
                 RendererKeypressTraceStage::PaintShapeAtlas => 11,
                 RendererKeypressTraceStage::GpuSubmitDrawableRequest => 12,
                 RendererKeypressTraceStage::DisplayCompletion => 13,
+            },
+            Self::Paste(stage) => match stage {
+                RendererPasteTraceStage::NativePasteReceipt => 0,
+                RendererPasteTraceStage::GuiPasteMappingComplete => 1,
+                RendererPasteTraceStage::ClientRpcEnqueue => 2,
+                RendererPasteTraceStage::ClientEncodeSocketFlush => 3,
+                RendererPasteTraceStage::ServerReadableDecode => 4,
+                RendererPasteTraceStage::ServerDispatchMuxWait => 5,
+                RendererPasteTraceStage::TerminalLockPtyWriteFlush => 6,
+                RendererPasteTraceStage::PtyEchoParserApply => 7,
+                RendererPasteTraceStage::ServerDeltaCompute => 8,
+                RendererPasteTraceStage::ClientReceiveDecodeApply => 9,
+                RendererPasteTraceStage::LocalMuxGuiInvalidation => 10,
+                RendererPasteTraceStage::PaintShapeAtlas => 11,
+                RendererPasteTraceStage::GpuSubmitDrawableRequest => 12,
+                RendererPasteTraceStage::DisplayCompletion => 13,
             },
             Self::ResizeZoom(stage) => match stage {
                 RendererResizeTraceStage::NativeEventReceipt => 0,
@@ -272,6 +293,7 @@ impl InteractionTraceStage {
     pub const fn stage_count(path: InteractionTracePath) -> u8 {
         match path {
             InteractionTracePath::Keypress => RendererKeypressTraceStage::ALL.len() as u8,
+            InteractionTracePath::Paste => RendererPasteTraceStage::ALL.len() as u8,
             InteractionTracePath::ResizeZoom => RendererResizeTraceStage::ALL.len() as u8,
         }
     }
@@ -287,6 +309,9 @@ impl InteractionTraceStage {
             InteractionTracePath::Keypress => Some(Self::Keypress(
                 RendererKeypressTraceStage::ALL[ordinal as usize],
             )),
+            InteractionTracePath::Paste => {
+                Some(Self::Paste(RendererPasteTraceStage::ALL[ordinal as usize]))
+            }
             InteractionTracePath::ResizeZoom => Some(Self::ResizeZoom(
                 RendererResizeTraceStage::ALL[ordinal as usize],
             )),
@@ -307,6 +332,16 @@ impl InteractionTraceStage {
                     | RendererKeypressTraceStage::ServerDeltaCompute
                     | RendererKeypressTraceStage::ClientReceiveDecodeApply
                     | RendererKeypressTraceStage::LocalMuxGuiInvalidation
+            ) | Self::Paste(
+                RendererPasteTraceStage::ClientRpcEnqueue
+                    | RendererPasteTraceStage::ClientEncodeSocketFlush
+                    | RendererPasteTraceStage::ServerReadableDecode
+                    | RendererPasteTraceStage::ServerDispatchMuxWait
+                    | RendererPasteTraceStage::TerminalLockPtyWriteFlush
+                    | RendererPasteTraceStage::PtyEchoParserApply
+                    | RendererPasteTraceStage::ServerDeltaCompute
+                    | RendererPasteTraceStage::ClientReceiveDecodeApply
+                    | RendererPasteTraceStage::LocalMuxGuiInvalidation
             ) | Self::ResizeZoom(RendererResizeTraceStage::MuxResizeDispatch)
         )
     }
@@ -316,6 +351,7 @@ impl InteractionTraceStage {
         matches!(
             self,
             Self::Keypress(RendererKeypressTraceStage::DisplayCompletion)
+                | Self::Paste(RendererPasteTraceStage::DisplayCompletion)
                 | Self::ResizeZoom(RendererResizeTraceStage::DisplayCompletion)
         )
     }
@@ -1127,8 +1163,10 @@ where
 }
 
 fn validate_stage_outcome(event: &InteractionTraceEventV2) -> Result<(), TraceContractError> {
-    if matches!(event.stage, InteractionTraceStage::Keypress(_))
-        && event.stage_outcome == InteractionTraceStageOutcome::NotApplicable
+    if matches!(
+        event.stage,
+        InteractionTraceStage::Keypress(_) | InteractionTraceStage::Paste(_)
+    ) && event.stage_outcome == InteractionTraceStageOutcome::NotApplicable
     {
         return Err(TraceContractError::StageOutcomeInvalidForPath {
             stage: event.stage,
@@ -1262,10 +1300,17 @@ fn validate_generations(event: &InteractionTraceEventV2) -> Result<(), TraceCont
         InteractionTraceStage::Keypress(RendererKeypressTraceStage::PtyEchoParserApply) => {
             Some(("terminal_generation", event.generations.terminal_generation))
         }
+        InteractionTraceStage::Paste(RendererPasteTraceStage::PtyEchoParserApply) => {
+            Some(("terminal_generation", event.generations.terminal_generation))
+        }
         InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDeltaCompute) => {
             Some(("snapshot_generation", event.generations.snapshot_generation))
         }
+        InteractionTraceStage::Paste(RendererPasteTraceStage::ServerDeltaCompute) => {
+            Some(("snapshot_generation", event.generations.snapshot_generation))
+        }
         InteractionTraceStage::Keypress(RendererKeypressTraceStage::DisplayCompletion)
+        | InteractionTraceStage::Paste(RendererPasteTraceStage::DisplayCompletion)
         | InteractionTraceStage::ResizeZoom(RendererResizeTraceStage::DisplayCompletion) => {
             Some(("frame_generation", event.generations.frame_generation))
         }
@@ -1290,6 +1335,7 @@ fn validate_scheduler_queue(event: &InteractionTraceEventV2) -> Result<(), Trace
     if !matches!(
         event.stage,
         InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait)
+            | InteractionTraceStage::Paste(RendererPasteTraceStage::ServerDispatchMuxWait)
     ) {
         return Err(TraceContractError::SchedulerQueueEvidenceUnexpected { stage: event.stage });
     }
