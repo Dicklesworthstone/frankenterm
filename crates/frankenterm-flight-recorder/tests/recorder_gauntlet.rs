@@ -118,7 +118,9 @@ fn fields_for_with_completed_clock_id(
 fn opposite_path(path: InteractionTracePath) -> InteractionTracePath {
     match path {
         InteractionTracePath::Keypress => InteractionTracePath::ResizeZoom,
-        InteractionTracePath::ResizeZoom => InteractionTracePath::Keypress,
+        InteractionTracePath::Paste | InteractionTracePath::ResizeZoom => {
+            InteractionTracePath::Keypress
+        }
     }
 }
 

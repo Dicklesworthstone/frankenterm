@@ -42,7 +42,9 @@ use frankenterm_core_audit_types::interaction_trace_v2::{
     InteractionTraceTimestamp, InteractionTraceTopology, TraceContractError,
     validate_interaction_trace_structure,
 };
-use frankenterm_core_audit_types::renderer_scenario_catalog::RendererKeypressTraceStage;
+use frankenterm_core_audit_types::renderer_scenario_catalog::{
+    RendererKeypressTraceStage, RendererPasteTraceStage,
+};
 use thiserror::Error;
 
 const AUTHORITY_EXACT: u8 = 0;
@@ -357,8 +359,10 @@ impl EventFields {
         if self.topology.window_id == 0 || self.topology.tab_id == 0 || self.topology.pane_id == 0 {
             return Err(RecorderError::InvalidEvent("invalid topology identity"));
         }
-        if matches!(self.stage, InteractionTraceStage::Keypress(_))
-            && self.stage_outcome == InteractionTraceStageOutcome::NotApplicable
+        if matches!(
+            self.stage,
+            InteractionTraceStage::Keypress(_) | InteractionTraceStage::Paste(_)
+        ) && self.stage_outcome == InteractionTraceStageOutcome::NotApplicable
         {
             return Err(RecorderError::InvalidEvent(
                 "not-applicable is invalid on keypress path",
@@ -2379,12 +2383,20 @@ fn validate_generations(
     {
         return Err(RecorderError::InvalidEvent("zero state generation"));
     }
-    if (matches!(stage.ordinal(), 7) && stage.path() == InteractionTracePath::Keypress)
+    if (matches!(stage.ordinal(), 7)
+        && matches!(
+            stage.path(),
+            InteractionTracePath::Keypress | InteractionTracePath::Paste
+        ))
         && generations.terminal_generation.is_none()
     {
         return Err(RecorderError::InvalidEvent("terminal generation missing"));
     }
-    if ((stage.ordinal() == 8 && stage.path() == InteractionTracePath::Keypress)
+    if ((stage.ordinal() == 8
+        && matches!(
+            stage.path(),
+            InteractionTracePath::Keypress | InteractionTracePath::Paste
+        ))
         || (stage.ordinal() == 13 && stage.path() == InteractionTracePath::ResizeZoom))
         && generations.snapshot_generation.is_none()
     {
@@ -2403,6 +2415,7 @@ fn validate_scheduler_queue(fields: &EventFields) -> Result<(), RecorderError> {
     if !matches!(
         fields.stage,
         InteractionTraceStage::Keypress(RendererKeypressTraceStage::ServerDispatchMuxWait)
+            | InteractionTraceStage::Paste(RendererPasteTraceStage::ServerDispatchMuxWait)
     ) {
         return Err(RecorderError::InvalidEvent(
             "scheduler queue evidence is attached to the wrong stage",
@@ -2492,6 +2505,7 @@ fn encode_path(path: InteractionTracePath) -> u8 {
     match path {
         InteractionTracePath::Keypress => 0,
         InteractionTracePath::ResizeZoom => 1,
+        InteractionTracePath::Paste => 2,
     }
 }
 
@@ -2499,6 +2513,7 @@ fn decode_path(path: u8) -> Result<InteractionTracePath, RecorderError> {
     match path {
         0 => Ok(InteractionTracePath::Keypress),
         1 => Ok(InteractionTracePath::ResizeZoom),
+        2 => Ok(InteractionTracePath::Paste),
         _ => Err(RecorderError::InvalidRawEvent),
     }
 }

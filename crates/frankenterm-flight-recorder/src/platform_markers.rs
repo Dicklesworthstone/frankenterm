@@ -31,6 +31,8 @@ use crate::{EventFields, FlightRecorder, FrozenBatch, ProducerHandle, RecordOutc
 
 /// Static Linux `user_events` name for a keypress stage.
 pub const KEYPRESS_STAGE_MARKER_NAME: &str = "frankenterm_keypress_stage";
+/// Static Linux `user_events` name for a paste stage.
+pub const PASTE_STAGE_MARKER_NAME: &str = "frankenterm_paste_stage";
 /// Static Linux `user_events` name for a resize or zoom stage.
 pub const RESIZE_ZOOM_STAGE_MARKER_NAME: &str = "frankenterm_resize_zoom_stage";
 
@@ -38,6 +40,7 @@ pub const RESIZE_ZOOM_STAGE_MARKER_NAME: &str = "frankenterm_resize_zoom_stage";
 // span identity travel in the four fixed payload words.
 const KEYPRESS_STAGE_NAMESPACE: u32 = 1 << 8;
 const RESIZE_ZOOM_STAGE_NAMESPACE: u32 = 2 << 8;
+const PASTE_STAGE_NAMESPACE: u32 = 3 << 8;
 const MARKER_ADMISSION_SEALED: u64 = 1 << 63;
 const MARKER_IN_FLIGHT_MASK: u64 = MARKER_ADMISSION_SEALED - 1;
 
@@ -160,6 +163,7 @@ impl PlatformMarkerPayload {
     pub const fn static_name(self) -> &'static str {
         match self.stage.path() {
             InteractionTracePath::Keypress => KEYPRESS_STAGE_MARKER_NAME,
+            InteractionTracePath::Paste => PASTE_STAGE_MARKER_NAME,
             InteractionTracePath::ResizeZoom => RESIZE_ZOOM_STAGE_MARKER_NAME,
         }
     }
@@ -206,6 +210,7 @@ impl FlightRecorder {
 pub fn marker_stage_code(stage: InteractionTraceStage) -> u32 {
     let namespace = match stage.path() {
         InteractionTracePath::Keypress => KEYPRESS_STAGE_NAMESPACE,
+        InteractionTracePath::Paste => PASTE_STAGE_NAMESPACE,
         InteractionTracePath::ResizeZoom => RESIZE_ZOOM_STAGE_NAMESPACE,
     };
     namespace | u32::from(stage.ordinal())
