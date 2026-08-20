@@ -8028,7 +8028,7 @@ where
         | config::keyassignment::SpawnTabDomain::CurrentPaneDomain
         | config::keyassignment::SpawnTabDomain::DomainName(_) => None,
     };
-    let domain = mux
+    let domain = mux.mux()
         .resolve_spawn_tab_domain(None, &spawn.domain)
         .map_err(|_| MuxServerRejection::domain_not_found(domain_object_id))?;
     let frozen_domain = config::keyassignment::SpawnTabDomain::DomainId(domain.domain_id());
