@@ -445,17 +445,27 @@ impl XWindowInner {
                 self.paint_throttled = true;
                 let window_id = self.window_id;
                 let max_fps = self.config.max_fps;
-                promise::spawn::spawn(async move {
-                    promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps)).await;
-                    XConnection::with_window_inner(window_id, move |inner| {
-                        inner.paint_throttled = false;
-                        if inner.invalidated {
-                            inner.invalidate();
-                        }
-                        Ok(())
-                    });
-                })
-                .detach();
+                if let Ok(reservation) = crate::reserve_window_main_thread(
+                    promise::spawn::MainThreadServiceClass::Render,
+                    4 * 1024,
+                    "X11 repaint throttle",
+                ) {
+                    reservation
+                        .spawn_local(async move {
+                            promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps))
+                                .await;
+                            XConnection::with_window_inner(window_id, move |inner| {
+                                inner.paint_throttled = false;
+                                if inner.invalidated {
+                                    inner.invalidate();
+                                }
+                                Ok(())
+                            });
+                        })
+                        .detach();
+                } else {
+                    self.paint_throttled = false;
+                }
             }
         }
 
@@ -1657,17 +1667,26 @@ impl XWindowInner {
         // I don't really like this as a solution :-/
         // <https://github.com/wezterm/wezterm/issues/2198>
         let window = self.window_id;
-        promise::spawn::spawn(async move {
-            promise::spawn::sleep(std::time::Duration::from_secs(2)).await;
-            let Some(connection) = Connection::get() else {
-                log::debug!("skip DestroyWindow for {window:?}; X connection is unavailable");
-                return;
-            };
-            let conn = connection.x11();
-            log::trace!("close sending DestroyWindow for {:?}", window);
-            conn.send_request_no_reply_log(&xcb::x::DestroyWindow { window });
-        })
-        .detach();
+        if let Ok(reservation) = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+            "X11 delayed window destruction",
+        ) {
+            reservation
+                .spawn_local(async move {
+                    promise::spawn::sleep(std::time::Duration::from_secs(2)).await;
+                    let Some(connection) = Connection::get() else {
+                        log::debug!(
+                            "skip DestroyWindow for {window:?}; X connection is unavailable"
+                        );
+                        return;
+                    };
+                    let conn = connection.x11();
+                    log::trace!("close sending DestroyWindow for {:?}", window);
+                    conn.send_request_no_reply_log(&xcb::x::DestroyWindow { window });
+                })
+                .detach();
+        }
         // Ensure that we don't try to destroy the window twice,
         // otherwise the rust xcb bindings will generate a
         // fatal error!
@@ -2011,7 +2030,13 @@ impl HasWindowHandle for XWindow {
 impl WindowOps for XWindow {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
-        promise::spawn::spawn(async move {
+        let reservation = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            64 * 1024,
+            "X11 enable OpenGL",
+        )
+        .map_err(|rejected| anyhow::anyhow!("X11 OpenGL admission rejected: {rejected:?}"))?;
+        reservation.spawn_local(async move {
             let Some(connection) = Connection::get() else {
                 anyhow::bail!("X connection is unavailable");
             };
@@ -2023,8 +2048,7 @@ impl WindowOps for XWindow {
             } else {
                 anyhow::bail!("invalid window");
             }
-        })
-        .await
+        }).into_task().await
     }
 
     fn notify<T: Any + Send + Sync>(&self, t: T)
@@ -2188,6 +2212,25 @@ impl WindowOps for XWindow {
             return Future::err(anyhow!("new clipboard promise did not yield a future"));
         };
         let pending_promise = Arc::new(Mutex::new(Some(promise)));
+        let watcher_reservation = match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "X11 clipboard completion",
+        ) {
+            Ok(reservation) => reservation,
+            Err(rejected) => {
+                let pending = match pending_promise.lock() {
+                    Ok(mut guard) => guard.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                if let Some(mut promise) = pending {
+                    promise.err(anyhow!(
+                        "X11 clipboard completion admission rejected: {rejected:?}"
+                    ));
+                }
+                return future;
+            }
+        };
 
         let promise_for_request = Arc::clone(&pending_promise);
         let window_future = XConnection::with_window_inner(window_id, move |inner| {
@@ -2224,18 +2267,19 @@ impl WindowOps for XWindow {
             Ok(())
         });
         let promise_on_error = Arc::clone(&pending_promise);
-        promise::spawn::spawn(async move {
-            if let Err(err) = window_future.await {
-                let pending = match promise_on_error.lock() {
-                    Ok(mut guard) => guard.take(),
-                    Err(poisoned) => poisoned.into_inner().take(),
-                };
-                if let Some(mut promise) = pending {
-                    promise.err(err);
+        watcher_reservation
+            .spawn_local(async move {
+                if let Err(err) = window_future.await {
+                    let pending = match promise_on_error.lock() {
+                        Ok(mut guard) => guard.take(),
+                        Err(poisoned) => poisoned.into_inner().take(),
+                    };
+                    if let Some(mut promise) = pending {
+                        promise.err(err);
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
 
         future
     }

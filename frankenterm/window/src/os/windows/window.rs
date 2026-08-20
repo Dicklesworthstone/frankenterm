@@ -401,10 +401,17 @@ impl WindowInner {
 }
 
 fn schedule_apply_decoration(hwnd: HWND, decorations: WindowDecorations) {
-    promise::spawn::spawn(async move {
-        apply_decoration_immediate(hwnd, decorations);
-    })
-    .detach();
+    if let Ok(reservation) = crate::reserve_window_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        4 * 1024,
+        "windows apply decoration",
+    ) {
+        reservation
+            .spawn_local(async move {
+                apply_decoration_immediate(hwnd, decorations);
+            })
+            .detach();
+    }
 }
 
 fn apply_decoration_immediate(hwnd: HWND, decorations: WindowDecorations) {
@@ -652,8 +659,13 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
     // ShowWindow can call to the window proc and may attempt
     // to lock inner, so we avoid locking it ourselves here
     log::trace!("scheduling ShowWindowCommand {show:?}");
-    promise::spawn::spawn(async move {
-        unsafe {
+    if let Ok(reservation) = crate::reserve_window_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        4 * 1024,
+        "windows show window",
+    ) {
+        reservation
+            .spawn_local(async move { unsafe {
             log::trace!("applying ShowWindowCommand {show:?}");
             ShowWindow(
                 hwnd.0,
@@ -663,20 +675,25 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
                     ShowWindowCommand::Maximize => SW_MAXIMIZE,
                 },
             );
-        }
-    })
-    .detach();
+            } })
+            .detach();
+    }
 }
 
 impl WindowInner {
     fn close(&mut self) {
         let hwnd = self.hwnd;
-        promise::spawn::spawn(async move {
-            unsafe {
+        if let Ok(reservation) = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+            "windows close window",
+        ) {
+            reservation
+                .spawn_local(async move { unsafe {
                 DestroyWindow(hwnd.0);
-            }
-        })
-        .detach();
+                } })
+                .detach();
+        }
     }
 
     fn set_cursor(&mut self, cursor: Option<MouseCursor>) {
@@ -686,8 +703,13 @@ impl WindowInner {
     fn set_window_position(&self, coords: ScreenPoint) {
         let hwnd = self.hwnd.0;
         log::trace!("set_window_position wants {coords:?}");
-        promise::spawn::spawn(async move {
-            log::trace!("set_window_position apply {coords:?}");
+        if let Ok(reservation) = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+            "windows set position",
+        ) {
+            reservation.spawn_local(async move {
+                log::trace!("set_window_position apply {coords:?}");
             let mut rect = RECT {
                 left: 0,
                 bottom: 0,
@@ -710,8 +732,8 @@ impl WindowInner {
                     1,
                 );
             }
-        })
-        .detach();
+            }).detach();
+        }
     }
 
     fn set_title(&mut self, title: &str) {
@@ -744,7 +766,12 @@ impl WindowInner {
             let style = GetWindowLongW(hwnd, GWL_STYLE);
             let config = self.config.clone();
             if let Some(placement) = self.saved_placement.take() {
-                promise::spawn::spawn(async move {
+                if let Ok(reservation) = crate::reserve_window_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    4 * 1024,
+                    "windows leave fullscreen",
+                ) {
+                    reservation.spawn_local(async move {
                     let style = decorations_to_style(config.window_decorations);
                     SetWindowLongW(hwnd, GWL_STYLE, style as i32);
                     SetWindowPlacement(hwnd, &placement);
@@ -761,15 +788,20 @@ impl WindowInner {
                             | SWP_NOOWNERZORDER
                             | SWP_FRAMECHANGED,
                     );
-                })
-                .detach();
+                    }).detach();
+                }
             } else {
                 let mut placement = WINDOWPLACEMENT::default();
                 placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as _;
                 GetWindowPlacement(hwnd, &mut placement);
 
                 self.saved_placement.replace(placement);
-                promise::spawn::spawn(async move {
+                if let Ok(reservation) = crate::reserve_window_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    4 * 1024,
+                    "windows enter fullscreen",
+                ) {
+                    reservation.spawn_local(async move {
                     let mut mi = MONITORINFO::default();
                     mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
                     GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mut mi);
@@ -783,8 +815,8 @@ impl WindowInner {
                         mi.rcMonitor.bottom - mi.rcMonitor.top,
                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
                     );
-                })
-                .detach();
+                    }).detach();
+                }
             }
         }
     }
@@ -819,7 +851,13 @@ impl HasWindowHandle for Window {
 impl WindowOps for Window {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
-        promise::spawn::spawn(async move {
+        let reservation = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            64 * 1024,
+            "windows enable OpenGL",
+        )
+        .map_err(|rejected| anyhow::anyhow!("windows OpenGL admission rejected: {rejected:?}"))?;
+        reservation.spawn_local(async move {
             let Some(conn) = Connection::get() else {
                 bail!("Windows connection is unavailable");
             };
@@ -830,8 +868,7 @@ impl WindowOps for Window {
             } else {
                 anyhow::bail!("invalid window");
             }
-        })
-        .await
+        }).into_task().await
     }
 
     fn notify<T: Any + Send + Sync>(&self, t: T)
@@ -864,7 +901,12 @@ impl WindowOps for Window {
     fn focus(&self) {
         let window = self.0;
         let handle = window.0;
-        promise::spawn::spawn(async move {
+        if let Ok(reservation) = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            4 * 1024,
+            "windows focus",
+        ) {
+            reservation.spawn_local(async move {
             // In some situation, calling SetForegroundWindow could not bring up the window,
             // This is a little hack which can "steal" the foreground window permission
             // We only call this function in the window creation, so it should be fine.
@@ -906,8 +948,8 @@ impl WindowOps for Window {
 
                 SetForegroundWindow(handle);
             }
-        })
-        .detach();
+            }).detach();
+        }
     }
 
     fn maximize(&self) {
@@ -967,7 +1009,12 @@ impl WindowOps for Window {
         Connection::with_window_inner(self.0, move |inner| {
             let hwnd = inner.hwnd;
             let decorations = inner.config.window_decorations;
-            promise::spawn::spawn(async move {
+            if let Ok(reservation) = crate::reserve_window_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                4 * 1024,
+                "windows set inner size",
+            ) {
+                reservation.spawn_local(async move {
                 log::trace!("set_inner_size called with {width}x{height}");
                 let frame_dpi = unsafe { GetDpiForWindow(hwnd.0) };
                 let (width, height) = adjust_client_to_window_dimensions(
@@ -1001,8 +1048,8 @@ impl WindowOps for Window {
                                 because window_state is {window_state:?}"
                     );
                 }
-            })
-            .detach();
+                }).detach();
+            }
             Ok(())
         });
     }
@@ -1705,17 +1752,26 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     inner.paint_throttled = true;
     let window_id = inner.hwnd;
     let max_fps = inner.config.max_fps;
-    promise::spawn::spawn(async move {
-        promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps)).await;
-        Connection::with_window_inner(window_id, move |inner| {
-            inner.paint_throttled = false;
-            if inner.invalidated {
-                InvalidateRect(inner.hwnd.0, null(), 0);
-            }
-            Ok(())
-        });
-    })
-    .detach();
+    if let Ok(reservation) = crate::reserve_window_main_thread(
+        promise::spawn::MainThreadServiceClass::Render,
+        4 * 1024,
+        "windows repaint throttle",
+    ) {
+        reservation
+            .spawn_local(async move {
+                promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps)).await;
+                Connection::with_window_inner(window_id, move |inner| {
+                    inner.paint_throttled = false;
+                    if inner.invalidated {
+                        InvalidateRect(inner.hwnd.0, null(), 0);
+                    }
+                    Ok(())
+                });
+            })
+            .detach();
+    } else {
+        inner.paint_throttled = false;
+    }
 
     Some(0)
 }

@@ -157,20 +157,32 @@ impl Connection {
         R: Send + 'static,
     {
         let (mut prom, future) = new_window_op_promise();
-        promise::spawn::spawn_into_main_thread(async move {
-            let Some(connection) = Connection::get() else {
-                prom.err(anyhow!("Windows connection is unavailable"));
-                return;
-            };
+        match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "Windows window operation",
+        ) {
+            Ok(reservation) => reservation
+                .spawn(async move {
+                    let Some(connection) = Connection::get() else {
+                        prom.err(anyhow!("Windows connection is unavailable"));
+                        return;
+                    };
 
-            if let Some(handle) = connection.get_window(window) {
-                let mut inner = handle.borrow_mut();
-                prom.result(f(&mut inner));
-            } else {
-                fail_window_op_for_destroyed_window(&mut prom, "Windows", window.0);
+                    if let Some(handle) = connection.get_window(window) {
+                        let mut inner = handle.borrow_mut();
+                        prom.result(f(&mut inner));
+                    } else {
+                        fail_window_op_for_destroyed_window(&mut prom, "Windows", window.0);
+                    }
+                })
+                .detach(),
+            Err(rejected) => {
+                prom.err(anyhow!(
+                    "Windows window operation rejected by main-thread scheduler: {rejected:?}"
+                ));
             }
-        })
-        .detach();
+        }
 
         future
     }

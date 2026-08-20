@@ -144,20 +144,32 @@ impl WaylandConnection {
     {
         let (mut prom, future) = new_window_op_promise();
 
-        promise::spawn::spawn_into_main_thread(async move {
-            let Some(connection) = Connection::get() else {
-                fail_window_op_for_destroyed_window(&mut prom, "Wayland", window);
-                return;
-            };
+        match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "Wayland window operation",
+        ) {
+            Ok(reservation) => reservation
+                .spawn(async move {
+                    let Some(connection) = Connection::get() else {
+                        fail_window_op_for_destroyed_window(&mut prom, "Wayland", window);
+                        return;
+                    };
 
-            if let Some(handle) = connection.wayland().window_by_id(window) {
-                let mut inner = handle.borrow_mut();
-                prom.result(f(&mut inner));
-            } else {
-                fail_window_op_for_destroyed_window(&mut prom, "Wayland", window);
+                    if let Some(handle) = connection.wayland().window_by_id(window) {
+                        let mut inner = handle.borrow_mut();
+                        prom.result(f(&mut inner));
+                    } else {
+                        fail_window_op_for_destroyed_window(&mut prom, "Wayland", window);
+                    }
+                })
+                .detach(),
+            Err(rejected) => {
+                prom.err(anyhow::anyhow!(
+                    "Wayland window operation rejected by main-thread scheduler: {rejected:?}"
+                ));
             }
-        })
-        .detach();
+        }
 
         future
     }

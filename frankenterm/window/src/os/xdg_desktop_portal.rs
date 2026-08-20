@@ -99,20 +99,32 @@ pub fn get_appearance_if_cached() -> anyhow::Result<Option<Appearance>> {
 
 pub fn refresh_appearance_in_background() {
     let should_spawn = {
-        let mut state = lock_state("checking appearance refresh state");
-        if state.refresh_running || cached_appearance_for_state(&state).is_ok() {
-            false
-        } else {
-            state.refresh_running = true;
-            true
-        }
+        let state = lock_state("checking appearance refresh state");
+        !state.refresh_running && cached_appearance_for_state(&state).is_err()
     };
 
     if !should_spawn {
         return;
     }
 
-    promise::spawn::spawn(async move {
+    let background = match promise::spawn::try_reserve_background_task(8 * 1024) {
+        Ok(background) => background,
+        Err(err) => {
+            log::error!(
+                "background executor rejected portal appearance refresh before state mutation: {err:#}"
+            );
+            return;
+        }
+    };
+    {
+        let mut state = lock_state("claiming appearance refresh state");
+        if state.refresh_running || cached_appearance_for_state(&state).is_ok() {
+            return;
+        }
+        state.refresh_running = true;
+    }
+
+    background.spawn(async move {
         let refreshed = read_setting("org.freedesktop.appearance", "color-scheme")
             .await
             .and_then(value_to_appearance);
@@ -147,8 +159,7 @@ pub fn refresh_appearance_in_background() {
                 log::warn!("Unable to resolve appearance using xdg-desktop-portal: {err:#}");
             }
         }
-    })
-    .detach();
+    });
 }
 
 pub async fn read_setting(namespace: &str, key: &str) -> anyhow::Result<OwnedValue> {
@@ -245,20 +256,40 @@ async fn run_signal_loop(stream: &mut SettingChangedStream) -> Result<(), anyhow
 }
 
 pub fn subscribe() {
-    promise::spawn::spawn(async move {
-        let connection = zbus::Connection::session().await?;
-        let proxy = PortalSettingsProxy::new(&connection)
-            .await
-            .context("make proxy")?;
-        let mut stream = proxy.receive_SettingChanged().await?;
+    let background = match promise::spawn::try_reserve_background_task(16 * 1024) {
+        Ok(background) => background,
+        Err(err) => {
+            log::error!(
+                "background executor rejected portal subscription before construction: {err:#}"
+            );
+            return;
+        }
+    };
+    {
+        let mut state = lock_state("claiming portal subscription");
+        if state.subscribe_running {
+            return;
+        }
+        // This bit covers both connection setup and the live signal loop, so
+        // racing initialization cannot publish duplicate subscribers.
+        state.subscribe_running = true;
+    }
+    background.spawn(async move {
+        let result = async {
+            let connection = zbus::Connection::session().await?;
+            let proxy = PortalSettingsProxy::new(&connection)
+                .await
+                .context("make proxy")?;
+            let mut stream = proxy.receive_SettingChanged().await?;
 
-        lock_state("starting portal subscription").subscribe_running = true;
-        let res = run_signal_loop(&mut stream).await;
+            run_signal_loop(&mut stream).await
+        }
+        .await;
         lock_state("stopping portal subscription").subscribe_running = false;
-
-        res
-    })
-    .detach();
+        if let Err(err) = result {
+            log::error!("xdg-desktop-portal appearance subscription ended with error: {err:#}");
+        }
+    });
 }
 
 #[cfg(test)]

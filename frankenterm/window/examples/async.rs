@@ -1,7 +1,9 @@
 use ::window::*;
 use config::Dimension;
 use frankenterm_font::FontConfiguration;
-use promise::spawn::spawn;
+use promise::spawn::{
+    MainThreadReservationOutcome, MainThreadServiceClass, try_reserve_main_thread,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -140,11 +142,18 @@ async fn spawn_window() -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> anyhow::Result<()> {
     let conn = Connection::init()?;
-    spawn(async {
-        eprintln!("running this async block");
-        dbg!(spawn_window().await).ok();
-        eprintln!("end of async block");
-    })
-    .detach();
+    let reservation = match try_reserve_main_thread(MainThreadServiceClass::Topology, 8 * 1024) {
+        MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!(
+            "main-thread scheduler rejected example window startup before construction: {rejected:?}"
+        ),
+    };
+    reservation
+        .spawn_local(async {
+            eprintln!("running this async block");
+            dbg!(spawn_window().await).ok();
+            eprintln!("end of async block");
+        })
+        .detach();
     conn.run_message_loop()
 }

@@ -30,6 +30,39 @@ pub fn default_dpi() -> f64 {
     }
 }
 
+pub(crate) fn reserve_window_main_thread(
+    service_class: promise::spawn::MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+) -> Result<
+    promise::spawn::MainThreadSpawnReservation,
+    Box<promise::spawn::MainThreadReservationOutcome>,
+> {
+    match promise::spawn::try_reserve_main_thread(service_class, estimated_bytes) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            metrics::counter!(
+                "window.main_thread_admission",
+                "operation" => operation,
+                "outcome" => "admitted"
+            )
+            .increment(1);
+            Ok(reservation)
+        }
+        rejected => {
+            metrics::counter!(
+                "window.main_thread_admission",
+                "operation" => operation,
+                "outcome" => "terminal_rejection"
+            )
+            .increment(1);
+            log::error!(
+                "main-thread scheduler rejected window operation {operation} before task construction: {rejected:?}"
+            );
+            Err(Box::new(rejected))
+        }
+    }
+}
+
 mod egl;
 
 pub use bitmaps::{BitmapImage, Image};

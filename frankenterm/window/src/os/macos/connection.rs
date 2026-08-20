@@ -72,19 +72,31 @@ impl Connection {
         R: Send + 'static,
     {
         let (mut prom, future) = new_window_op_promise();
-        promise::spawn::spawn_into_main_thread(async move {
-            let Some(conn) = Connection::get() else {
-                fail_window_op_for_destroyed_window(&mut prom, "macOS", window_id);
-                return;
-            };
-            if let Some(handle) = conn.window_by_id(window_id) {
-                let mut inner = handle.borrow_mut();
-                prom.result(f(&mut inner));
-            } else {
-                fail_window_op_for_destroyed_window(&mut prom, "macOS", window_id);
+        match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "macOS window operation",
+        ) {
+            Ok(reservation) => reservation
+                .spawn(async move {
+                    let Some(conn) = Connection::get() else {
+                        fail_window_op_for_destroyed_window(&mut prom, "macOS", window_id);
+                        return;
+                    };
+                    if let Some(handle) = conn.window_by_id(window_id) {
+                        let mut inner = handle.borrow_mut();
+                        prom.result(f(&mut inner));
+                    } else {
+                        fail_window_op_for_destroyed_window(&mut prom, "macOS", window_id);
+                    }
+                })
+                .detach(),
+            Err(rejected) => {
+                prom.err(anyhow::anyhow!(
+                    "macOS window operation rejected by main-thread scheduler: {rejected:?}"
+                ));
             }
-        })
-        .detach();
+        }
 
         future
     }
@@ -143,10 +155,20 @@ impl ConnectionOps for Connection {
             } else {
                 // Bounce through the AppKit thread so stop applies to the
                 // active NSApplication run loop level.
-                promise::spawn::spawn_into_main_thread(async move {
-                    stop_app_message_loop();
-                })
-                .detach();
+                match crate::reserve_window_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    4 * 1024,
+                    "terminate macOS message loop",
+                ) {
+                    Ok(reservation) => reservation
+                        .spawn(async move {
+                            stop_app_message_loop();
+                        })
+                        .detach(),
+                    Err(rejected) => log::error!(
+                        "cannot terminate macOS message loop after scheduler rejection: {rejected:?}"
+                    ),
+                }
             }
         }
     }

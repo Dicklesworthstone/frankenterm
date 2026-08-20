@@ -789,7 +789,13 @@ pub fn window_level_to_nswindow_level(level: WindowLevel) -> NSWindowLevel {
 impl WindowOps for Window {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window_id = self.id;
-        promise::spawn::spawn(async move {
+        let reservation = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            64 * 1024,
+            "macOS enable OpenGL",
+        )
+        .map_err(|rejected| anyhow::anyhow!("macOS OpenGL admission rejected: {rejected:?}"))?;
+        reservation.spawn_local(async move {
             let conn =
                 Connection::get().ok_or_else(|| anyhow::anyhow!("Connection not available"))?;
             if let Some(handle) = conn.window_by_id(window_id) {
@@ -798,8 +804,7 @@ impl WindowOps for Window {
             } else {
                 bail!("invalid window");
             }
-        })
-        .await
+        }).into_task().await
     }
 
     fn notify<T: Any + Send + Sync>(&self, t: T)
@@ -3156,22 +3161,34 @@ impl WindowView {
 
                 let window_id = inner.window_id;
                 let max_fps = inner.config.max_fps;
-                promise::spawn::spawn(async move {
-                    promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps)).await;
-                    Connection::with_window_inner(window_id, move |inner| {
-                        if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                            let mut state = window_view.inner.borrow_mut();
-                            state.paint_throttled = false;
-                            if state.invalidated {
-                                unsafe {
-                                    let () = msg_send![*inner.view, setNeedsDisplay: YES];
+                if let Ok(reservation) = crate::reserve_window_main_thread(
+                    promise::spawn::MainThreadServiceClass::Render,
+                    4 * 1024,
+                    "macOS repaint throttle",
+                ) {
+                    reservation
+                        .spawn_local(async move {
+                            promise::spawn::sleep(config::frame_interval_for_max_fps(max_fps))
+                                .await;
+                            Connection::with_window_inner(window_id, move |inner| {
+                                if let Some(window_view) =
+                                    WindowView::get_this(unsafe { &**inner.view })
+                                {
+                                    let mut state = window_view.inner.borrow_mut();
+                                    state.paint_throttled = false;
+                                    if state.invalidated {
+                                        unsafe {
+                                            let () = msg_send![*inner.view, setNeedsDisplay: YES];
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                        Ok(())
-                    });
-                })
-                .detach();
+                                Ok(())
+                            });
+                        })
+                        .detach();
+                } else {
+                    inner.paint_throttled = false;
+                }
             }
         }
     }

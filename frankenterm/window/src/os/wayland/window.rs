@@ -589,7 +589,13 @@ impl WindowOps for WaylandWindow {
 
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
-        promise::spawn::spawn(async move {
+        let reservation = crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            64 * 1024,
+            "Wayland enable OpenGL",
+        )
+        .map_err(|rejected| anyhow::anyhow!("Wayland OpenGL admission rejected: {rejected:?}"))?;
+        reservation.spawn_local(async move {
             let Some(conn) = Connection::get() else {
                 bail!("cannot enable OpenGL: Wayland connection unavailable");
             };
@@ -599,8 +605,7 @@ impl WindowOps for WaylandWindow {
             } else {
                 anyhow::bail!("invalid window");
             }
-        })
-        .await
+        }).into_task().await
     }
 
     fn hide(&self) {
@@ -615,63 +620,75 @@ impl WindowOps for WaylandWindow {
 
     fn close(&self) {
         let window_id = self.0;
-        promise::spawn::spawn_into_main_thread(async move {
-            let Some(connection) = WaylandConnection::get() else {
-                log::debug!(
-                    "Dropping Wayland close for window {window_id}: connection unavailable"
-                );
-                return;
-            };
-            let connection = connection.wayland();
-            let Some(handle) = connection.window_by_id(window_id) else {
-                return;
-            };
-            let surface_id = handle
-                .borrow()
-                .window
-                .as_ref()
-                .map(|window| window.wl_surface().id());
+        match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+            "Wayland window close",
+        ) {
+            Ok(reservation) => reservation
+                .spawn(async move {
+                    let Some(connection) = WaylandConnection::get() else {
+                        log::debug!(
+                            "Dropping Wayland close for window {window_id}: connection unavailable"
+                        );
+                        return;
+                    };
+                    let connection = connection.wayland();
+                    let Some(handle) = connection.window_by_id(window_id) else {
+                        return;
+                    };
+                    let surface_id = handle
+                        .borrow()
+                        .window
+                        .as_ref()
+                        .map(|window| window.wl_surface().id());
 
-            {
-                let mut state = connection.wayland_state.borrow_mut();
-                let authority_cleanup =
-                    state.clear_destroyed_window_authorities(window_id, surface_id.as_ref());
-                if authority_cleanup.keyboard {
-                    if let (Some(text_input), Some(keyboard)) = (&state.text_input, &state.keyboard)
                     {
-                        if let Some(input) = text_input.get_text_input_for_keyboard(keyboard) {
-                            input.disable();
-                            input.commit();
+                        let mut state = connection.wayland_state.borrow_mut();
+                        let authority_cleanup = state
+                            .clear_destroyed_window_authorities(window_id, surface_id.as_ref());
+                        if authority_cleanup.keyboard {
+                            if let (Some(text_input), Some(keyboard)) =
+                                (&state.text_input, &state.keyboard)
+                            {
+                                if let Some(input) = text_input.get_text_input_for_keyboard(keyboard)
+                                {
+                                    input.disable();
+                                    input.commit();
+                                }
+                            }
+                        }
+                        if let Some(surface_id) = surface_id.as_ref() {
+                            if let Some(text_input) = &state.text_input {
+                                text_input.forget_surface_id(surface_id);
+                            }
+                            state.surface_to_pending.remove(surface_id);
                         }
                     }
-                }
-                if let Some(surface_id) = surface_id.as_ref() {
-                    if let Some(text_input) = &state.text_input {
-                        text_input.forget_surface_id(surface_id);
-                    }
-                    state.surface_to_pending.remove(surface_id);
-                }
-            }
 
-            // Publish destroyed input authority before dispatching Destroyed,
-            // but keep the registry entry alive during the callback so
-            // re-entrant window queries observe a coherent closing object.
-            handle.borrow_mut().close();
+                    // Publish destroyed input authority before dispatching Destroyed,
+                    // but keep the registry entry alive during the callback so
+                    // re-entrant window queries observe a coherent closing object.
+                    handle.borrow_mut().close();
 
-            let removed = connection
-                .wayland_state
-                .borrow_mut()
-                .windows
-                .get_mut()
-                .remove(&window_id);
-            debug_assert!(
-                removed
-                    .as_ref()
-                    .is_some_and(|removed| Rc::ptr_eq(removed, &handle)),
-                "closed Wayland window registry entry changed before removal"
-            );
-        })
-        .detach();
+                    let removed = connection
+                        .wayland_state
+                        .borrow_mut()
+                        .windows
+                        .get_mut()
+                        .remove(&window_id);
+                    debug_assert!(
+                        removed
+                            .as_ref()
+                            .is_some_and(|removed| Rc::ptr_eq(removed, &handle)),
+                        "closed Wayland window registry entry changed before removal"
+                    );
+                })
+                .detach(),
+            Err(rejected) => log::error!(
+                "Wayland close for window {window_id} was rejected by the main-thread scheduler: {rejected:?}"
+            ),
+        }
     }
 
     fn set_cursor(&self, cursor: Option<MouseCursor>) {
@@ -727,6 +744,23 @@ impl WindowOps for WaylandWindow {
             ));
         };
         let promise = Arc::new(Mutex::new(promise));
+        let watcher_reservation = match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+            "Wayland clipboard completion",
+        ) {
+            Ok(reservation) => reservation,
+            Err(rejected) => {
+                lock_or_recover(
+                    &promise,
+                    "recording Wayland clipboard scheduler admission failure",
+                )
+                .err(anyhow!(
+                    "Wayland clipboard completion admission rejected: {rejected:?}"
+                ));
+                return future;
+            }
+        };
         // Clone for the setup closure so the original `promise` stays owned here
         // and remains usable on the error path below (line `promise_on_error`).
         let promise_for_setup = Arc::clone(&promise);
@@ -766,16 +800,17 @@ impl WindowOps for WaylandWindow {
             Ok(())
         });
         let promise_on_error = Arc::clone(&promise);
-        promise::spawn::spawn(async move {
-            if let Err(err) = window_future.await {
-                let mut promise = lock_or_recover(
-                    &promise_on_error,
-                    "recording Wayland clipboard read setup failure",
-                );
-                promise.err(err);
-            }
-        })
-        .detach();
+        watcher_reservation
+            .spawn_local(async move {
+                if let Err(err) = window_future.await {
+                    let mut promise = lock_or_recover(
+                        &promise_on_error,
+                        "recording Wayland clipboard read setup failure",
+                    );
+                    promise.err(err);
+                }
+            })
+            .detach();
         future
     }
 
@@ -1008,14 +1043,27 @@ impl WaylandWindowInner {
             identity,
             _abort: abort,
         });
-        promise::spawn::spawn_into_main_thread(async move {
-            let _ = Abortable::new(
-                run_key_repeat(window_id, seed, task_identity, origin, initial_due, gap),
-                registration,
-            )
-            .await;
-        })
-        .detach();
+        match crate::reserve_window_main_thread(
+            promise::spawn::MainThreadServiceClass::Input,
+            4 * 1024,
+            "Wayland key repeat",
+        ) {
+            Ok(reservation) => reservation
+                .spawn(async move {
+                    let _ = Abortable::new(
+                        run_key_repeat(window_id, seed, task_identity, origin, initial_due, gap),
+                        registration,
+                    )
+                    .await;
+                })
+                .detach(),
+            Err(rejected) => {
+                held.timer.take();
+                log::error!(
+                    "Wayland key repeat for window {window_id} was rejected by the main-thread scheduler: {rejected:?}"
+                );
+            }
+        }
     }
 
     fn close(&mut self) {

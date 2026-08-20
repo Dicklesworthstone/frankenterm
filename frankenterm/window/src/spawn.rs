@@ -493,19 +493,6 @@ pub(crate) struct SpawnQueue {
     read: Mutex<FileDescriptor>,
 }
 
-fn schedule_with_pri(runnable: Runnable, high_pri: bool) {
-    SPAWN_QUEUE.spawn_impl(
-        wrap_main_thread_dispatch_scope(Box::new(move || {
-            // `Runnable::run()` returns a bool (whether the task was woken);
-            // discard it so the closure is `FnOnce() -> ()` as `SpawnFunc`
-            // requires. (The deadlock-guard wrap must not change the unit
-            // return contract of the scheduled func.)
-            runnable.run();
-        })),
-        high_pri,
-    );
-}
-
 fn schedule_admitted_with_pri(
     runnable: Runnable,
     admission: MainThreadAdmissionReceipt,
@@ -528,14 +515,6 @@ impl SpawnQueue {
 
     pub fn register_promise_schedulers(&self) {
         self.registration.call_once(|| {
-            promise::spawn::set_schedulers(
-                Box::new(|runnable| {
-                    schedule_with_pri(runnable, true);
-                }),
-                Box::new(|runnable| {
-                    schedule_with_pri(runnable, false);
-                }),
-            );
             let identity = self.core.identity;
             let limits = MainThreadAdmissionLimits::new(
                 self.core.task_capacity,
