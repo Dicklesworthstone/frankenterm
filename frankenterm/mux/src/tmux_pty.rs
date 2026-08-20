@@ -1,6 +1,6 @@
+use crate::DomainId;
 use crate::tmux::{RefTmuxRemotePane, TmuxCmdQueue, TmuxDomainState, TmuxEnqueueError};
 use crate::tmux_commands::{KillPane, Resize, SendKeys};
-use crate::DomainId;
 use filedescriptor::FileDescriptor;
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty};
@@ -257,6 +257,19 @@ impl ChildKiller for TmuxChildKiller {
             return Ok(());
         }
 
+        if let Some(owner) = self.owner.upgrade() {
+            match owner.claim_published_split_cleanup(self.pane_id, &self.child_state) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    self.child_state.mark_exited(ExitStatus::with_signal(
+                        "published tmux split cleanup transfer failed",
+                    ));
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, error));
+                }
+            }
+        }
+
         let enqueue_result = {
             let mut cmd_queue = self.cmd_queue.lock();
             cmd_queue.push_back(Box::new(KillPane {
@@ -384,10 +397,10 @@ impl MasterPty for TmuxPty {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Domain;
-    use crate::tmux::{TmuxDomain, TmuxPaneOutputState, TmuxRemotePane, CMD_QUEUE_MAX_DEPTH};
-    use crate::tmux_commands::ListCommands;
     use crate::Mux;
+    use crate::domain::Domain;
+    use crate::tmux::{CMD_QUEUE_MAX_DEPTH, TmuxDomain, TmuxPaneOutputState, TmuxRemotePane};
+    use crate::tmux_commands::ListCommands;
     use promise::spawn::ScopedExecutor;
     use std::sync::{Arc as StdArc, MutexGuard as StdMutexGuard};
     use termwiz::tmux_cc::Guarded;

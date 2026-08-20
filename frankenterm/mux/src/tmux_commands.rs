@@ -48,6 +48,10 @@ pub(crate) enum TmuxCommandClass {
 
 #[derive(Clone, Debug)]
 pub(crate) enum TmuxSplitFailureAuthority {
+    Baseline {
+        request_id: u64,
+        target_pane_id: TmuxPaneId,
+    },
     Pending {
         request_id: u64,
         target_pane_id: TmuxPaneId,
@@ -175,7 +179,7 @@ impl TmuxConditionalCommit {
 #[derive(Debug)]
 pub(crate) enum TmuxCommandPreparation {
     Ready {
-        command: Arc<[u8]>,
+        command: Vec<u8>,
         conditional_commit: Option<TmuxConditionalCommit>,
     },
     Suppressed,
@@ -222,7 +226,7 @@ pub(crate) trait TmuxCommand: Send + Debug {
     /// The default preserves the historical behavior of dropping an empty
     /// non-conditional command rather than reordering a lossless/control lane.
     fn prepare(
-        &self,
+        &mut self,
         domain_id: DomainId,
         _io_generation: u64,
         _lease: Option<TmuxConditionalCommitLease>,
@@ -232,7 +236,7 @@ pub(crate) trait TmuxCommand: Send + Debug {
             TmuxCommandPreparation::Discarded
         } else {
             TmuxCommandPreparation::Ready {
-                command: Arc::from(command.into_bytes()),
+                command: command.into_bytes(),
                 conditional_commit: None,
             }
         }
@@ -1121,9 +1125,10 @@ impl TmuxDomainState {
                 &target.registration(),
                 split_request,
                 &pane,
+                || remote.complete_structural_cut(cleanup_publication),
             )
             .context("commit atomic tmux split publication")?;
-        remote.commit(cleanup_publication);
+        remote.finish_committed_output();
 
         Ok(SplitCommitReceipt::from_exact_parts(
             pane,
@@ -2077,9 +2082,7 @@ pub(crate) fn parse_split_pane_identity(output: &str) -> SplitPaneIdentityParse 
         .filter(|line| !line.is_empty())
         .collect();
     let Some(identity) = identities.first() else {
-        return SplitPaneIdentityParse::Unresolved(
-            "split-window returned no pane id".to_string(),
-        );
+        return SplitPaneIdentityParse::Unresolved("split-window returned no pane id".to_string());
     };
     let pane_id = match parse_exact_split_pane_identity(identity) {
         Ok(pane_id) => pane_id,
@@ -2313,7 +2316,7 @@ impl TmuxCommand for ListAllPanes {
     }
 
     fn prepare(
-        &self,
+        &mut self,
         domain_id: DomainId,
         io_generation: u64,
         lease: Option<TmuxConditionalCommitLease>,
@@ -2340,7 +2343,7 @@ impl TmuxCommand for ListAllPanes {
                 command,
                 local_tab_id,
             } => TmuxCommandPreparation::Ready {
-                command: Arc::from(command.into_bytes()),
+                command: command.into_bytes(),
                 conditional_commit: conditional_lease.map(|lease| {
                     TmuxConditionalCommit::WindowLayout {
                         io_generation,
@@ -2622,7 +2625,7 @@ impl TmuxCommand for Resize {
     }
 
     fn prepare(
-        &self,
+        &mut self,
         domain_id: DomainId,
         io_generation: u64,
         lease: Option<TmuxConditionalCommitLease>,
@@ -2643,7 +2646,7 @@ impl TmuxCommand for Resize {
                 local_tab_id,
                 remote_window_id,
             } => TmuxCommandPreparation::Ready {
-                command: Arc::from(command.into_bytes()),
+                command: command.into_bytes(),
                 conditional_commit: Some(TmuxConditionalCommit::PaneSize {
                     io_generation,
                     lease,
@@ -2874,11 +2877,128 @@ impl TmuxCommand for ListCommands {
     }
 }
 
+pub(crate) const TMUX_SPLIT_TOKEN_OPTION: &str = "@frankenterm_split_token";
+
+/// Response-matched, window-scoped remote baseline taken before the split
+/// effect.  Its bytes are owned before admission so a later result never has
+/// to allocate command authority.
+#[derive(Debug)]
+pub(crate) struct SnapshotSplitPane {
+    pub request_id: u64,
+    pub target_pane_id: TmuxPaneId,
+    command: Option<Vec<u8>>,
+}
+
+impl SnapshotSplitPane {
+    pub(crate) fn new(
+        request_id: u64,
+        target_pane_id: TmuxPaneId,
+        window_id: TmuxWindowId,
+    ) -> Self {
+        Self {
+            request_id,
+            target_pane_id,
+            command: Some(
+                format!(
+                    "list-panes -t @{window_id} -F '#{{session_id}} #{{window_id}} #{{pane_id}} #{{{TMUX_SPLIT_TOKEN_OPTION}}}'\n"
+                )
+                .into_bytes(),
+            ),
+        }
+    }
+}
+
+impl TmuxCommand for SnapshotSplitPane {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::RequiredControl
+    }
+
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        String::from_utf8_lossy(self.command.as_deref().unwrap_or_default()).into_owned()
+    }
+
+    fn prepare(
+        &mut self,
+        _domain_id: DomainId,
+        _io_generation: u64,
+        _lease: Option<TmuxConditionalCommitLease>,
+    ) -> TmuxCommandPreparation {
+        match self.command.take() {
+            Some(command) => TmuxCommandPreparation::Ready {
+                command,
+                conditional_commit: None,
+            },
+            None => TmuxCommandPreparation::Discarded,
+        }
+    }
+
+    fn is_split_transaction(&self) -> bool {
+        true
+    }
+
+    fn split_failure_authority(&self) -> Option<TmuxSplitFailureAuthority> {
+        Some(TmuxSplitFailureAuthority::Baseline {
+            request_id: self.request_id,
+            target_pane_id: self.target_pane_id,
+        })
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        let mux = tmux_mux()?;
+        let domain = mux
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow!("Tmux domain lost"))?;
+        let tmux_domain = domain
+            .downcast_ref::<TmuxDomain>()
+            .ok_or_else(|| anyhow!("Tmux domain lost"))?;
+        if result.error {
+            let _ = tmux_domain.inner.fail_pending_split(
+                self.request_id,
+                anyhow!("scoped tmux split baseline failed: {result:#?}"),
+            );
+            anyhow::bail!("split baseline in domain={domain_id} failed: {result:#?}");
+        }
+        tmux_domain.inner.finish_split_baseline(
+            self.request_id,
+            self.target_pane_id,
+            &result.output,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SplitPane {
     pub pane_id: TmuxPaneId,
     pub direction: SplitDirection,
     pub request_id: u64,
+    command: Option<Vec<u8>>,
+}
+
+impl SplitPane {
+    pub(crate) fn new(
+        domain_id: DomainId,
+        pane_id: TmuxPaneId,
+        direction: SplitDirection,
+        request_id: u64,
+    ) -> Self {
+        let orientation = if direction == SplitDirection::Horizontal {
+            "-h"
+        } else {
+            "-v"
+        };
+        let token = format!("ft-{domain_id}-{request_id}");
+        Self {
+            pane_id,
+            direction,
+            request_id,
+            command: Some(
+                format!(
+                    "split-window -P -F '#{{pane_id}}' {orientation} -t %{pane_id} \\; set-option -p {TMUX_SPLIT_TOKEN_OPTION} {token}\n"
+                )
+                .into_bytes(),
+            ),
+        }
+    }
 }
 
 impl TmuxCommand for SplitPane {
@@ -2887,16 +3007,21 @@ impl TmuxCommand for SplitPane {
     }
 
     fn get_command(&self, _domain_id: DomainId) -> String {
-        if self.direction == SplitDirection::Horizontal {
-            format!(
-                "split-window -P -F '#{{pane_id}}' -h -t %{}\n",
-                self.pane_id
-            )
-        } else {
-            format!(
-                "split-window -P -F '#{{pane_id}}' -v -t %{}\n",
-                self.pane_id
-            )
+        String::from_utf8_lossy(self.command.as_deref().unwrap_or_default()).into_owned()
+    }
+
+    fn prepare(
+        &mut self,
+        _domain_id: DomainId,
+        _io_generation: u64,
+        _lease: Option<TmuxConditionalCommitLease>,
+    ) -> TmuxCommandPreparation {
+        match self.command.take() {
+            Some(command) => TmuxCommandPreparation::Ready {
+                command,
+                conditional_commit: None,
+            },
+            None => TmuxCommandPreparation::Discarded,
         }
     }
 
@@ -2912,21 +3037,6 @@ impl TmuxCommand for SplitPane {
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
-        if result.error {
-            let error = format!("split-window in domain={domain_id} failed: {result:#?}");
-            if let Some(mux) = Mux::try_get() {
-                if let Some(domain) = mux.get_domain(domain_id) {
-                    if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                        let _ = tmux_domain
-                            .inner
-                            .fail_pending_split(self.request_id, anyhow!(error.clone()));
-                    }
-                }
-            }
-            log::error!("{error}");
-            anyhow::bail!("{error}");
-        }
-
         let pane_id = parse_split_pane_identity(&result.output);
 
         let mux = tmux_mux()?;
@@ -2952,15 +3062,29 @@ impl TmuxCommand for SplitPane {
                     )?;
                     return Ok(());
                 }
-                anyhow::ensure!(
-                    tmux_domain.inner.resolve_pending_split(
-                        self.request_id,
-                        self.pane_id,
-                        pane_id
-                    )?,
-                    "missing pending tmux split request {}",
-                    self.request_id
-                );
+                if result.error {
+                    anyhow::ensure!(
+                        tmux_domain.inner.compensate_pending_split_identity(
+                            self.request_id,
+                            self.pane_id,
+                            pane_id,
+                            "split effect succeeded before its token-assignment command failed"
+                                .to_string(),
+                        )?,
+                        "missing pending tmux split request {}",
+                        self.request_id
+                    );
+                } else {
+                    anyhow::ensure!(
+                        tmux_domain.inner.resolve_pending_split(
+                            self.request_id,
+                            self.pane_id,
+                            pane_id
+                        )?,
+                        "missing pending tmux split request {}",
+                        self.request_id
+                    );
+                }
                 Ok(())
             }
             SplitPaneIdentityParse::RecoverableTrailingOutput {
@@ -2974,9 +3098,7 @@ impl TmuxCommand for SplitPane {
                     tmux_domain.inner.begin_split_reconciliation(
                         self.request_id,
                         self.pane_id,
-                        format!(
-                            "{diagnostic}; witness %{pane_id} collides with retained identity"
-                        ),
+                        format!("{diagnostic}; witness %{pane_id} collides with retained identity"),
                     )?;
                     return Ok(());
                 }
@@ -3014,6 +3136,26 @@ impl TmuxCommand for SplitPane {
 pub(crate) struct ReconcileSplitPane {
     pub request_id: u64,
     pub target_pane_id: TmuxPaneId,
+    command: Option<Vec<u8>>,
+}
+
+impl ReconcileSplitPane {
+    pub(crate) fn new(
+        request_id: u64,
+        target_pane_id: TmuxPaneId,
+        window_id: TmuxWindowId,
+    ) -> Self {
+        Self {
+            request_id,
+            target_pane_id,
+            command: Some(
+                format!(
+                    "list-panes -t @{window_id} -F '#{{session_id}} #{{window_id}} #{{pane_id}} #{{{TMUX_SPLIT_TOKEN_OPTION}}}'\n"
+                )
+                .into_bytes(),
+            ),
+        }
+    }
 }
 
 impl TmuxCommand for ReconcileSplitPane {
@@ -3022,7 +3164,22 @@ impl TmuxCommand for ReconcileSplitPane {
     }
 
     fn get_command(&self, _domain_id: DomainId) -> String {
-        "list-panes -a -F '#{pane_id}'\n".to_string()
+        String::from_utf8_lossy(self.command.as_deref().unwrap_or_default()).into_owned()
+    }
+
+    fn prepare(
+        &mut self,
+        _domain_id: DomainId,
+        _io_generation: u64,
+        _lease: Option<TmuxConditionalCommitLease>,
+    ) -> TmuxCommandPreparation {
+        match self.command.take() {
+            Some(command) => TmuxCommandPreparation::Ready {
+                command,
+                conditional_commit: None,
+            },
+            None => TmuxCommandPreparation::Discarded,
+        }
     }
 
     fn is_split_transaction(&self) -> bool {
@@ -3050,9 +3207,7 @@ impl TmuxCommand for ReconcileSplitPane {
                 "list-panes guarded error",
                 Vec::new(),
             );
-            anyhow::bail!(
-                "split reconciliation in domain={domain_id} failed: {result:#?}"
-            );
+            anyhow::bail!("split reconciliation in domain={domain_id} failed: {result:#?}");
         }
         tmux_domain.inner.finish_split_reconciliation(
             self.request_id,
@@ -3067,7 +3222,6 @@ impl TmuxCommand for ReconcileSplitPane {
 /// terminal queue/I/O teardown is allowed.
 #[derive(Debug)]
 pub(crate) struct CompensateSplitPane {
-    pub pane_id: TmuxPaneId,
     pub obligation: Arc<TmuxSplitCleanupObligation>,
 }
 
@@ -3077,7 +3231,27 @@ impl TmuxCommand for CompensateSplitPane {
     }
 
     fn get_command(&self, _domain_id: DomainId) -> String {
-        format!("kill-pane -t %{}\n", self.pane_id)
+        self.obligation
+            .pane_id()
+            .map_or_else(String::new, |pane_id| format!("kill-pane -t %{pane_id}\n"))
+    }
+
+    fn prepare(
+        &mut self,
+        _domain_id: DomainId,
+        _io_generation: u64,
+        _lease: Option<TmuxConditionalCommitLease>,
+    ) -> TmuxCommandPreparation {
+        match self.obligation.take_kill_command() {
+            Ok(command) => TmuxCommandPreparation::Ready {
+                command,
+                conditional_commit: None,
+            },
+            Err(error) => {
+                log::error!("cannot prepare tmux split compensation: {error:#}");
+                TmuxCommandPreparation::Discarded
+            }
+        }
     }
 
     fn is_split_transaction(&self) -> bool {
@@ -3095,8 +3269,8 @@ impl TmuxCommand for CompensateSplitPane {
             self.obligation
                 .finish_claimed(false, "tmux split compensation failed");
             anyhow::bail!(
-                "split compensation in domain={domain_id} failed for pane %{}: {result:#?}",
-                self.pane_id
+                "split compensation in domain={domain_id} failed for request {}: {result:#?}",
+                self.obligation.request_id()
             );
         }
         self.obligation
@@ -5245,27 +5419,19 @@ mod tests {
 
     #[test]
     fn split_pane_horizontal_get_command() {
-        let cmd = SplitPane {
-            pane_id: 5,
-            direction: SplitDirection::Horizontal,
-            request_id: 1,
-        };
+        let cmd = SplitPane::new(0, 5, SplitDirection::Horizontal, 1);
         assert_eq!(
             cmd.get_command(0),
-            "split-window -P -F '#{pane_id}' -h -t %5\n"
+            "split-window -P -F '#{pane_id}' -h -t %5 \\; set-option -p @frankenterm_split_token ft-0-1\n"
         );
     }
 
     #[test]
     fn split_pane_vertical_get_command() {
-        let cmd = SplitPane {
-            pane_id: 9,
-            direction: SplitDirection::Vertical,
-            request_id: 2,
-        };
+        let cmd = SplitPane::new(0, 9, SplitDirection::Vertical, 2);
         assert_eq!(
             cmd.get_command(0),
-            "split-window -P -F '#{pane_id}' -v -t %9\n"
+            "split-window -P -F '#{pane_id}' -v -t %9 \\; set-option -p @frankenterm_split_token ft-0-2\n"
         );
     }
 
