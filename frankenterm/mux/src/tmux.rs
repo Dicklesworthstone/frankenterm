@@ -4490,7 +4490,8 @@ impl Drop for SendScheduleLease {
                  stranding durably admitted commands",
                 self.owner.domain_id
             );
-            self.owner.transition_to_exit_and_schedule_detach();
+            self.owner
+                .fail_sender_operation("sender_runnable_cancelled");
         }
     }
 }
@@ -5119,6 +5120,14 @@ impl TmuxDomainState {
 
     fn install_io_operation(&self, kind: TmuxIoOperationKind, generation: u64) -> bool {
         let mut lifecycle = self.lifecycle.lock();
+        Self::install_io_operation_locked(&mut lifecycle, kind, generation)
+    }
+
+    fn install_io_operation_locked(
+        lifecycle: &mut TmuxLifecycle,
+        kind: TmuxIoOperationKind,
+        generation: u64,
+    ) -> bool {
         if lifecycle.terminal || lifecycle.io_operation.is_some() {
             return false;
         }
@@ -5248,12 +5257,27 @@ impl TmuxDomainState {
     }
 
     fn fail_io_supervisor(&self, reason: &'static str) {
+        self.fail_io_supervisor_with_authority(reason, None);
+    }
+
+    fn fail_sender_operation(&self, reason: &'static str) {
         let split_failure = self
             .cmd_queue
             .lock()
-            .in_flight
-            .as_ref()
-            .and_then(|in_flight| in_flight.command.split_failure_authority());
+            .split_failure_authority_for_sender();
+        self.fail_io_supervisor_with_authority(reason, split_failure);
+    }
+
+    fn fail_io_supervisor_with_authority(
+        &self,
+        reason: &'static str,
+        explicit_split_failure: Option<TmuxSplitFailureAuthority>,
+    ) {
+        let split_failure = explicit_split_failure.or_else(|| {
+            self.cmd_queue
+                .lock()
+                .split_failure_authority_for_sender()
+        });
         if !self.try_claim_failure_terminal(|_lifecycle, _state| true) {
             return;
         }
@@ -5663,6 +5687,16 @@ impl TmuxDomainState {
     fn transition_state(&self, expected: State, next: State) -> bool {
         debug_assert_ne!(next, State::Exit);
         let lifecycle = self.lifecycle.lock();
+        self.transition_state_with_lifecycle(&lifecycle, expected, next)
+    }
+
+    fn transition_state_with_lifecycle(
+        &self,
+        lifecycle: &TmuxLifecycle,
+        expected: State,
+        next: State,
+    ) -> bool {
+        debug_assert_ne!(next, State::Exit);
         if lifecycle.terminal {
             return false;
         }
