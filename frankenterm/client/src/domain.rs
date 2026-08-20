@@ -4153,6 +4153,8 @@ mod tests {
             });
             let (client, peer) =
                 Client::new_test_client_with_rpc_peer(Some(domain_id), config.clone());
+            peer.activate_reconnect_generation(&client)
+                .expect("test reconnect must own a fresh negotiating RPC generation");
             let inner = Arc::new(ClientInner::new(domain_id, client, None, None, false));
             let domain = Arc::new(ClientDomain {
                 label: config.label(),
@@ -4190,8 +4192,10 @@ mod tests {
             })
             .await;
             assert!(
-                matches!(first_poll, std::task::Poll::Pending),
-                "the reconnect must park with its exact guard around an in-flight bootstrap RPC"
+                matches!(&first_poll, std::task::Poll::Pending),
+                "the reconnect must park with its exact guard around an in-flight bootstrap RPC; \
+                 first poll returned {:?}",
+                first_poll
             );
             assert!(
                 !peer.is_empty(),
@@ -4241,7 +4245,7 @@ mod tests {
                         );
                         std::thread::yield_now();
                     }
-                    Err(error) => panic!("unexpected successor registration failure: {error}"),
+                    Err(error) => panic!("unexpected successor registration failure: {}", error),
                 }
             }
             assert!(
