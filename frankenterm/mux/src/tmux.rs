@@ -405,10 +405,6 @@ impl TmuxBacklog {
         }
     }
 
-    fn extend_pane_id_snapshot(&self, snapshot: &mut HashSet<TmuxPaneId>) {
-        snapshot.extend(self.entries.iter().map(|(pane_id, _)| *pane_id));
-    }
-
     pub(crate) fn clear(&mut self) {
         self.resync_all = false;
         self.clear_entries();
@@ -5547,6 +5543,7 @@ impl TmuxDomainState {
             })
     }
 
+    #[cfg(test)]
     fn install_io_operation(&self, kind: TmuxIoOperationKind, generation: u64) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         Self::install_io_operation_locked(&mut lifecycle, kind, generation)
@@ -7232,6 +7229,7 @@ impl TmuxDomainState {
     /// All queue handles, including PTY writers and child killers, share the
     /// closeable/capped `TmuxCmdQueue`; this wrapper preserves the existing
     /// call-site vocabulary while keeping enforcement inside the mailbox.
+    #[cfg(test)]
     fn push_command_capped(
         &self,
         queue: &mut TmuxCmdQueue,
@@ -8131,7 +8129,7 @@ impl TmuxDomainState {
                     self.transition_state_with_lifecycle(&lifecycle, State::Sending, State::Idle);
                 return Ok(());
             }
-            let (prepared_command, conditional_commit_lease, superseded) = {
+            let (mut prepared_command, conditional_commit_lease, superseded) = {
                 let lifecycle = self.lifecycle.lock();
                 let mut cmd_queue = self.cmd_queue.as_ref().lock();
                 let prepared_command = match cmd_queue.take_next_for_sender_preparation() {
@@ -8146,7 +8144,7 @@ impl TmuxDomainState {
                     }
                     None => None,
                 };
-                let Some(mut prepared_command) = prepared_command else {
+                let Some(prepared_command) = prepared_command else {
                     // Close the empty-check/Idle transition race under the
                     // mailbox lock. A later producer observes Idle and owns
                     // the next scheduling edge.
