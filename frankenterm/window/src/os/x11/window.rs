@@ -2036,19 +2036,24 @@ impl WindowOps for XWindow {
             "X11 enable OpenGL",
         )
         .map_err(|rejected| anyhow::anyhow!("X11 OpenGL admission rejected: {rejected:?}"))?;
-        reservation.spawn_local(async move {
-            let Some(connection) = Connection::get() else {
-                anyhow::bail!("X connection is unavailable");
-            };
+        reservation
+            .spawn_local(async move {
+                let Some(connection) = Connection::get() else {
+                    anyhow::bail!("X connection is unavailable");
+                };
 
-            if let Some(handle) = connection.x11().window_by_id(window) {
-                let mut inner =
-                    super::connection::lock_window_inner(&handle, "enabling OpenGL for X11 window");
-                inner.enable_opengl()
-            } else {
-                anyhow::bail!("invalid window");
-            }
-        }).into_task().await
+                if let Some(handle) = connection.x11().window_by_id(window) {
+                    let mut inner = super::connection::lock_window_inner(
+                        &handle,
+                        "enabling OpenGL for X11 window",
+                    );
+                    inner.enable_opengl()
+                } else {
+                    anyhow::bail!("invalid window");
+                }
+            })
+            .into_task()
+            .await
     }
 
     fn notify<T: Any + Send + Sync>(&self, t: T)

@@ -34,10 +34,7 @@ where
             )));
         }
     };
-    Ok(reservation
-        .spawn_local(make_future())
-        .into_task()
-        .await)
+    Ok(reservation.spawn_local(make_future()).into_task().await)
 }
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::TerminalSize;

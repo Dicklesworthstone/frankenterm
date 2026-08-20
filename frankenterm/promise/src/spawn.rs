@@ -980,9 +980,7 @@ struct BackgroundAdmissionState {
 pub enum BackgroundSpawnError {
     #[error("background task estimated size must be nonzero")]
     ZeroEstimatedBytes,
-    #[error(
-        "background task capacity exhausted: active={active}, capacity={capacity}"
-    )]
+    #[error("background task capacity exhausted: active={active}, capacity={capacity}")]
     TaskCapacityExhausted { active: usize, capacity: usize },
     #[error(
         "background estimated-byte capacity exhausted: active={active}, requested={requested}, capacity={capacity}"
@@ -1058,18 +1056,16 @@ fn start_background_executor() -> std::result::Result<Arc<Executor<'static>>, St
             .map_err(|err| err.to_string())?;
         std::thread::Builder::new()
             .name("promise-background-io".to_string())
-            .spawn(move || {
-                runtime.block_on(worker_executor.run(std::future::pending::<()>()))
-            })
+            .spawn(move || runtime.block_on(worker_executor.run(std::future::pending::<()>())))
     };
     #[cfg(not(feature = "async-asupersync"))]
     let worker = std::thread::Builder::new()
         .name("promise-background-io".to_string())
-        .spawn(move || {
-            async_io::block_on(worker_executor.run(std::future::pending::<()>()))
-        });
+        .spawn(move || async_io::block_on(worker_executor.run(std::future::pending::<()>())));
 
-    worker.map(|_worker| executor).map_err(|err| err.to_string())
+    worker
+        .map(|_worker| executor)
+        .map_err(|err| err.to_string())
 }
 
 /// Reserve bounded background I/O capacity before constructing a future.

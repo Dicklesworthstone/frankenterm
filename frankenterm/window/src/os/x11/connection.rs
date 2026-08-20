@@ -1077,11 +1077,7 @@ impl XConnection {
                             prom.result(f(&mut inner));
                         }
                     } else {
-                        fail_window_op_for_destroyed_window(
-                            &mut prom,
-                            "X11",
-                            window.resource_id(),
-                        );
+                        fail_window_op_for_destroyed_window(&mut prom, "X11", window.resource_id());
                     }
                 })
                 .detach(),

@@ -8068,12 +8068,7 @@ fn read_from_pane_pty(
     let _ = parser_done.recv();
 
     let exit_behavior = exit_behavior.unwrap_or_else(|| configuration().exit_behavior);
-    schedule_pane_reader_eof(
-        pane_for_lifecycle,
-        generation,
-        pane_id,
-        exit_behavior,
-    );
+    schedule_pane_reader_eof(pane_for_lifecycle, generation, pane_id, exit_behavior);
 
     dead.store(true, Ordering::Release);
 }
@@ -8875,12 +8870,10 @@ impl Mux {
             return None;
         }
         let mut clients = self.clients.write();
-        let info = clients
-            .get_mut(client.client_id.as_ref())
-            .filter(|info| {
-                Arc::ptr_eq(&info.client_id, &client.client_id)
-                    && Arc::ptr_eq(&info.registration_generation, &client.generation)
-            })?;
+        let info = clients.get_mut(client.client_id.as_ref()).filter(|info| {
+            Arc::ptr_eq(&info.client_id, &client.client_id)
+                && Arc::ptr_eq(&info.registration_generation, &client.generation)
+        })?;
         let prior = info.focused_pane_registration();
         let same_registration = prior
             .as_ref()
@@ -26216,10 +26209,8 @@ mod tests {
             .expect("the exact successor generation must admit new work");
         assert!(!stale_guard.same_registration(&replacement_guard));
 
-        assert!(mux.set_active_workspace_for_client_guarded(
-            &replacement_guard,
-            "replacement-workspace",
-        ));
+        assert!(mux
+            .set_active_workspace_for_client_guarded(&replacement_guard, "replacement-workspace",));
         let replacement_before = mux
             .clients
             .read()

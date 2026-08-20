@@ -595,17 +595,20 @@ impl WindowOps for WaylandWindow {
             "Wayland enable OpenGL",
         )
         .map_err(|rejected| anyhow::anyhow!("Wayland OpenGL admission rejected: {rejected:?}"))?;
-        reservation.spawn_local(async move {
-            let Some(conn) = Connection::get() else {
-                bail!("cannot enable OpenGL: Wayland connection unavailable");
-            };
-            if let Some(handle) = conn.wayland().window_by_id(window) {
-                let mut inner = handle.borrow_mut();
-                inner.enable_opengl()
-            } else {
-                anyhow::bail!("invalid window");
-            }
-        }).into_task().await
+        reservation
+            .spawn_local(async move {
+                let Some(conn) = Connection::get() else {
+                    bail!("cannot enable OpenGL: Wayland connection unavailable");
+                };
+                if let Some(handle) = conn.wayland().window_by_id(window) {
+                    let mut inner = handle.borrow_mut();
+                    inner.enable_opengl()
+                } else {
+                    anyhow::bail!("invalid window");
+                }
+            })
+            .into_task()
+            .await
     }
 
     fn hide(&self) {

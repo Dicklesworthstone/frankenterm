@@ -665,17 +665,19 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
         "windows show window",
     ) {
         reservation
-            .spawn_local(async move { unsafe {
-            log::trace!("applying ShowWindowCommand {show:?}");
-            ShowWindow(
-                hwnd.0,
-                match show {
-                    ShowWindowCommand::Normal => SW_NORMAL,
-                    ShowWindowCommand::Minimize => SW_MINIMIZE,
-                    ShowWindowCommand::Maximize => SW_MAXIMIZE,
-                },
-            );
-            } })
+            .spawn_local(async move {
+                unsafe {
+                    log::trace!("applying ShowWindowCommand {show:?}");
+                    ShowWindow(
+                        hwnd.0,
+                        match show {
+                            ShowWindowCommand::Normal => SW_NORMAL,
+                            ShowWindowCommand::Minimize => SW_MINIMIZE,
+                            ShowWindowCommand::Maximize => SW_MAXIMIZE,
+                        },
+                    );
+                }
+            })
             .detach();
     }
 }
@@ -689,9 +691,11 @@ impl WindowInner {
             "windows close window",
         ) {
             reservation
-                .spawn_local(async move { unsafe {
-                DestroyWindow(hwnd.0);
-                } })
+                .spawn_local(async move {
+                    unsafe {
+                        DestroyWindow(hwnd.0);
+                    }
+                })
                 .detach();
         }
     }
@@ -708,31 +712,33 @@ impl WindowInner {
             4 * 1024,
             "windows set position",
         ) {
-            reservation.spawn_local(async move {
-                log::trace!("set_window_position apply {coords:?}");
-            let mut rect = RECT {
-                left: 0,
-                bottom: 0,
-                right: 0,
-                top: 0,
-            };
-            unsafe {
-                GetWindowRect(hwnd, &mut rect);
+            reservation
+                .spawn_local(async move {
+                    log::trace!("set_window_position apply {coords:?}");
+                    let mut rect = RECT {
+                        left: 0,
+                        bottom: 0,
+                        right: 0,
+                        top: 0,
+                    };
+                    unsafe {
+                        GetWindowRect(hwnd, &mut rect);
 
-                let origin = client_to_screen(hwnd, Point::new(0, 0));
-                let delta_x = origin.x as i32 - rect.left;
-                let delta_y = origin.y as i32 - rect.top;
+                        let origin = client_to_screen(hwnd, Point::new(0, 0));
+                        let delta_x = origin.x as i32 - rect.left;
+                        let delta_y = origin.y as i32 - rect.top;
 
-                MoveWindow(
-                    hwnd,
-                    coords.x as i32 - delta_x,
-                    coords.y as i32 - delta_y,
-                    rect_width(&rect),
-                    rect_height(&rect),
-                    1,
-                );
-            }
-            }).detach();
+                        MoveWindow(
+                            hwnd,
+                            coords.x as i32 - delta_x,
+                            coords.y as i32 - delta_y,
+                            rect_width(&rect),
+                            rect_height(&rect),
+                            1,
+                        );
+                    }
+                })
+                .detach();
         }
     }
 
@@ -771,24 +777,26 @@ impl WindowInner {
                     4 * 1024,
                     "windows leave fullscreen",
                 ) {
-                    reservation.spawn_local(async move {
-                    let style = decorations_to_style(config.window_decorations);
-                    SetWindowLongW(hwnd, GWL_STYLE, style as i32);
-                    SetWindowPlacement(hwnd, &placement);
-                    SetWindowPos(
-                        hwnd,
-                        std::ptr::null_mut(),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE
-                            | SWP_NOSIZE
-                            | SWP_NOZORDER
-                            | SWP_NOOWNERZORDER
-                            | SWP_FRAMECHANGED,
-                    );
-                    }).detach();
+                    reservation
+                        .spawn_local(async move {
+                            let style = decorations_to_style(config.window_decorations);
+                            SetWindowLongW(hwnd, GWL_STYLE, style as i32);
+                            SetWindowPlacement(hwnd, &placement);
+                            SetWindowPos(
+                                hwnd,
+                                std::ptr::null_mut(),
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE
+                                    | SWP_NOSIZE
+                                    | SWP_NOZORDER
+                                    | SWP_NOOWNERZORDER
+                                    | SWP_FRAMECHANGED,
+                            );
+                        })
+                        .detach();
                 }
             } else {
                 let mut placement = WINDOWPLACEMENT::default();
@@ -801,21 +809,26 @@ impl WindowInner {
                     4 * 1024,
                     "windows enter fullscreen",
                 ) {
-                    reservation.spawn_local(async move {
-                    let mut mi = MONITORINFO::default();
-                    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-                    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mut mi);
-                    SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as i32));
-                    SetWindowPos(
-                        hwnd,
-                        HWND_TOP,
-                        mi.rcMonitor.left,
-                        mi.rcMonitor.top,
-                        mi.rcMonitor.right - mi.rcMonitor.left,
-                        mi.rcMonitor.bottom - mi.rcMonitor.top,
-                        SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
-                    );
-                    }).detach();
+                    reservation
+                        .spawn_local(async move {
+                            let mut mi = MONITORINFO::default();
+                            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                            GetMonitorInfoW(
+                                MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY),
+                                &mut mi,
+                            );
+                            SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as i32));
+                            SetWindowPos(
+                                hwnd,
+                                HWND_TOP,
+                                mi.rcMonitor.left,
+                                mi.rcMonitor.top,
+                                mi.rcMonitor.right - mi.rcMonitor.left,
+                                mi.rcMonitor.bottom - mi.rcMonitor.top,
+                                SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+                            );
+                        })
+                        .detach();
                 }
             }
         }
@@ -857,18 +870,21 @@ impl WindowOps for Window {
             "windows enable OpenGL",
         )
         .map_err(|rejected| anyhow::anyhow!("windows OpenGL admission rejected: {rejected:?}"))?;
-        reservation.spawn_local(async move {
-            let Some(conn) = Connection::get() else {
-                bail!("Windows connection is unavailable");
-            };
+        reservation
+            .spawn_local(async move {
+                let Some(conn) = Connection::get() else {
+                    bail!("Windows connection is unavailable");
+                };
 
-            if let Some(handle) = conn.get_window(window) {
-                let mut inner = handle.borrow_mut();
-                inner.enable_opengl()
-            } else {
-                anyhow::bail!("invalid window");
-            }
-        }).into_task().await
+                if let Some(handle) = conn.get_window(window) {
+                    let mut inner = handle.borrow_mut();
+                    inner.enable_opengl()
+                } else {
+                    anyhow::bail!("invalid window");
+                }
+            })
+            .into_task()
+            .await
     }
 
     fn notify<T: Any + Send + Sync>(&self, t: T)
@@ -906,49 +922,51 @@ impl WindowOps for Window {
             4 * 1024,
             "windows focus",
         ) {
-            reservation.spawn_local(async move {
-            // In some situation, calling SetForegroundWindow could not bring up the window,
-            // This is a little hack which can "steal" the foreground window permission
-            // We only call this function in the window creation, so it should be fine.
-            // See : https://stackoverflow.com/questions/10740346/setforegroundwindow-only-working-while-visual-studio-is-open
-            unsafe {
-                let alt_sc = MapVirtualKeyW(VK_MENU as u32, MAPVK_VK_TO_VSC);
+            reservation
+                .spawn_local(async move {
+                    // In some situation, calling SetForegroundWindow could not bring up the window,
+                    // This is a little hack which can "steal" the foreground window permission
+                    // We only call this function in the window creation, so it should be fine.
+                    // See : https://stackoverflow.com/questions/10740346/setforegroundwindow-only-working-while-visual-studio-is-open
+                    unsafe {
+                        let alt_sc = MapVirtualKeyW(VK_MENU as u32, MAPVK_VK_TO_VSC);
 
-                let mut inputs: [INPUT; 2] = [
-                    INPUT {
-                        type_: INPUT_KEYBOARD,
-                        u: Default::default(),
-                    },
-                    INPUT {
-                        type_: INPUT_KEYBOARD,
-                        u: Default::default(),
-                    },
-                ];
-                *inputs[0].u.ki_mut() = KEYBDINPUT {
-                    wVk: VK_LMENU as u16,
-                    wScan: alt_sc as u16,
-                    dwFlags: KEYEVENTF_EXTENDEDKEY,
-                    dwExtraInfo: 0,
-                    time: 0,
-                };
-                *inputs[1].u.ki_mut() = KEYBDINPUT {
-                    wVk: VK_LMENU as u16,
-                    wScan: alt_sc as u16,
-                    dwFlags: KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
-                    dwExtraInfo: 0,
-                    time: 0,
-                };
+                        let mut inputs: [INPUT; 2] = [
+                            INPUT {
+                                type_: INPUT_KEYBOARD,
+                                u: Default::default(),
+                            },
+                            INPUT {
+                                type_: INPUT_KEYBOARD,
+                                u: Default::default(),
+                            },
+                        ];
+                        *inputs[0].u.ki_mut() = KEYBDINPUT {
+                            wVk: VK_LMENU as u16,
+                            wScan: alt_sc as u16,
+                            dwFlags: KEYEVENTF_EXTENDEDKEY,
+                            dwExtraInfo: 0,
+                            time: 0,
+                        };
+                        *inputs[1].u.ki_mut() = KEYBDINPUT {
+                            wVk: VK_LMENU as u16,
+                            wScan: alt_sc as u16,
+                            dwFlags: KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
+                            dwExtraInfo: 0,
+                            time: 0,
+                        };
 
-                // Simulate a key press and release
-                SendInput(
-                    inputs.len() as u32,
-                    inputs.as_mut_ptr(),
-                    std::mem::size_of::<INPUT>() as i32,
-                );
+                        // Simulate a key press and release
+                        SendInput(
+                            inputs.len() as u32,
+                            inputs.as_mut_ptr(),
+                            std::mem::size_of::<INPUT>() as i32,
+                        );
 
-                SetForegroundWindow(handle);
-            }
-            }).detach();
+                        SetForegroundWindow(handle);
+                    }
+                })
+                .detach();
         }
     }
 
@@ -1014,41 +1032,45 @@ impl WindowOps for Window {
                 4 * 1024,
                 "windows set inner size",
             ) {
-                reservation.spawn_local(async move {
-                log::trace!("set_inner_size called with {width}x{height}");
-                let frame_dpi = unsafe { GetDpiForWindow(hwnd.0) };
-                let (width, height) = adjust_client_to_window_dimensions(
-                    decorations_to_style(decorations),
-                    width,
-                    height,
-                    frame_dpi,
-                );
-                let window_state = get_window_state(hwnd.0);
-                if window_state.can_resize() {
-                    log::trace!("set_inner_size now calling SetWindowPos with {width}x{height}");
-                    unsafe {
-                        SetWindowPos(
-                            hwnd.0,
-                            hwnd.0,
-                            0,
-                            0,
+                reservation
+                    .spawn_local(async move {
+                        log::trace!("set_inner_size called with {width}x{height}");
+                        let frame_dpi = unsafe { GetDpiForWindow(hwnd.0) };
+                        let (width, height) = adjust_client_to_window_dimensions(
+                            decorations_to_style(decorations),
                             width,
                             height,
-                            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
+                            frame_dpi,
                         );
-                        wm_paint(hwnd.0, 0, 0, 0);
-                        if let Some(inner) = rc_from_hwnd(hwnd.0) {
-                            let mut inner = inner.borrow_mut();
-                            inner.events.dispatch(WindowEvent::SetInnerSizeCompleted);
-                        }
-                    }
-                } else {
-                    log::trace!(
-                        "ignoring set_inner_size({width}, {height}) call \
+                        let window_state = get_window_state(hwnd.0);
+                        if window_state.can_resize() {
+                            log::trace!(
+                                "set_inner_size now calling SetWindowPos with {width}x{height}"
+                            );
+                            unsafe {
+                                SetWindowPos(
+                                    hwnd.0,
+                                    hwnd.0,
+                                    0,
+                                    0,
+                                    width,
+                                    height,
+                                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
+                                );
+                                wm_paint(hwnd.0, 0, 0, 0);
+                                if let Some(inner) = rc_from_hwnd(hwnd.0) {
+                                    let mut inner = inner.borrow_mut();
+                                    inner.events.dispatch(WindowEvent::SetInnerSizeCompleted);
+                                }
+                            }
+                        } else {
+                            log::trace!(
+                                "ignoring set_inner_size({width}, {height}) call \
                                 because window_state is {window_state:?}"
-                    );
-                }
-                }).detach();
+                            );
+                        }
+                    })
+                    .detach();
             }
             Ok(())
         });

@@ -25,8 +25,8 @@ use openssl::x509::X509;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use portable_pty::Child;
 use promise::spawn::{
-    MainThreadReservationOutcome, MainThreadServiceClass, MainThreadSpawnReservation,
-    try_reserve_main_thread,
+    try_reserve_main_thread, MainThreadReservationOutcome, MainThreadServiceClass,
+    MainThreadSpawnReservation,
 };
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque};
 use std::convert::TryFrom;

@@ -2,7 +2,7 @@ use ::window::*;
 use config::Dimension;
 use frankenterm_font::FontConfiguration;
 use promise::spawn::{
-    MainThreadReservationOutcome, MainThreadServiceClass, try_reserve_main_thread,
+    try_reserve_main_thread, MainThreadReservationOutcome, MainThreadServiceClass,
 };
 use std::cell::RefCell;
 use std::rc::Rc;

@@ -6711,11 +6711,8 @@ impl SessionHandler {
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
             }
             Pdu::SetFocusedPane(SetFocusedPane { pane_id }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -6939,11 +6936,8 @@ impl SessionHandler {
             }
 
             Pdu::WriteToPane(WriteToPane { pane_id, data }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -6975,11 +6969,8 @@ impl SessionHandler {
                 pane_id,
                 erase_mode,
             }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7001,11 +6992,8 @@ impl SessionHandler {
                 );
             }
             Pdu::KillPane(KillPane { pane_id }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7037,11 +7025,8 @@ impl SessionHandler {
                 data,
                 input_serial,
             }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7115,11 +7100,8 @@ impl SessionHandler {
                 pane_id,
                 zoomed,
             }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7168,11 +7150,8 @@ impl SessionHandler {
             }
 
             Pdu::ActivatePaneDirection(ActivatePaneDirection { pane_id, direction }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7199,11 +7178,8 @@ impl SessionHandler {
                 pane_id,
                 size,
             }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7491,11 +7467,8 @@ impl SessionHandler {
                 event,
                 input_serial,
             }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7539,11 +7512,8 @@ impl SessionHandler {
                 spawned.detach();
             }
             Pdu::SendKeyUp(SendKeyUp { pane_id, event }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7565,11 +7535,8 @@ impl SessionHandler {
                 );
             }
             Pdu::SendMouseEvent(SendMouseEvent { pane_id, event }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -7617,8 +7584,7 @@ impl SessionHandler {
                     &request_authority,
                     split.pane_id,
                     &send_response,
-                )
-                else {
+                ) else {
                     return;
                 };
                 let move_pane_authority = match split.move_pane_id {
@@ -7627,8 +7593,7 @@ impl SessionHandler {
                             &request_authority,
                             move_pane_id,
                             &send_response,
-                        )
-                        else {
+                        ) else {
                             return;
                         };
                         Some(authority)
@@ -7656,16 +7621,14 @@ impl SessionHandler {
                     &request_authority,
                     request.pane_id,
                     &send_response,
-                )
-                else {
+                ) else {
                     return;
                 };
                 schedule_main_thread_rpc(
                     MainThreadServiceClass::Topology,
                     MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
                     |send_response| async move {
-                        schedule_move_pane(pane_authority, request, send_response)
-                            .await;
+                        schedule_move_pane(pane_authority, request, send_response).await;
                     },
                     send_response,
                 );
@@ -7982,8 +7945,8 @@ impl SessionHandler {
                                     .mux()
                                     .set_window_title(window_id, &title)
                                     .map_err(|error| {
-                                    map_window_mutation_error(window_id, "set title", error)
-                                })?;
+                                        map_window_mutation_error(window_id, "set title", error)
+                                    })?;
 
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             },
@@ -8020,11 +7983,8 @@ impl SessionHandler {
                 );
             }
             Pdu::SetPalette(SetPalette { pane_id, palette }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -8051,11 +8011,8 @@ impl SessionHandler {
                 direction,
                 amount,
             }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -8082,11 +8039,8 @@ impl SessionHandler {
                 pane_id,
                 rect,
             }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -8108,11 +8062,8 @@ impl SessionHandler {
                 );
             }
             Pdu::MoveFloatingPane(MoveFloatingPane { pane_id, rect }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -8134,11 +8085,8 @@ impl SessionHandler {
                 );
             }
             Pdu::SetFloatingPaneZ(SetFloatingPaneZ { pane_id, z_order }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -8160,11 +8108,8 @@ impl SessionHandler {
                 );
             }
             Pdu::ToggleFloatingPane(ToggleFloatingPane { pane_id, visible }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -8186,11 +8131,8 @@ impl SessionHandler {
                 );
             }
             Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -8359,11 +8301,8 @@ impl SessionHandler {
                 min_height,
                 max_height,
             }) => {
-                let Some(pane_authority) = capture_pane_mutation_or_respond(
-                    &request_authority,
-                    pane_id,
-                    &send_response,
-                )
+                let Some(pane_authority) =
+                    capture_pane_mutation_or_respond(&request_authority, pane_id, &send_response)
                 else {
                     return;
                 };
@@ -8490,23 +8429,23 @@ async fn split_pane(
         move_pane_authority.request().ensure_effect_admitted()?;
         let (_, move_pane_operation) = move_pane_authority.into_parts();
         mux.split_pane_moved(
-                pane_operation,
-                move_pane_operation,
-                split.split_request,
-                split.domain,
-                client_id,
-            )
-            .await
+            pane_operation,
+            move_pane_operation,
+            split.split_request,
+            split.domain,
+            client_id,
+        )
+        .await
     } else {
         mux.split_pane_spawned(
-                pane_operation,
-                split.split_request,
-                split.command,
-                split.command_dir,
-                split.domain,
-                client_id,
-            )
-            .await
+            pane_operation,
+            split.split_request,
+            split.command,
+            split.command_dir,
+            split.domain,
+            client_id,
+        )
+        .await
     }?;
 
     debug_assert_eq!(target_pane_id, split.pane_id);
@@ -11991,29 +11930,29 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
 
         let collector_order = Arc::clone(&order);
-        let collector = match try_reserve_main_thread_with_low_priority(
-            MainThreadServiceClass::Topology,
-            1,
-        ) {
-            MainThreadReservationOutcome::Reserved(reservation) => reservation.spawn_local(async move {
-            let mut ledger = mux::tab::PaneSnapshotCensusLedger::new(
-                PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM,
-                PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM,
-            )
-            .expect("cooperative test ledger is valid");
-            ledger.begin_attempt();
-            ledger
-                .reserve_pane_callbacks(PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM)
-                .expect("exact cooperative quantum is admitted");
-            let mut cooperator = PaneSnapshotCooperator::new("test-pdu82");
+        let collector =
+            match try_reserve_main_thread_with_low_priority(MainThreadServiceClass::Topology, 1) {
+                MainThreadReservationOutcome::Reserved(reservation) => {
+                    reservation.spawn_local(async move {
+                        let mut ledger = mux::tab::PaneSnapshotCensusLedger::new(
+                            PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM,
+                            PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM,
+                        )
+                        .expect("cooperative test ledger is valid");
+                        ledger.begin_attempt();
+                        ledger
+                            .reserve_pane_callbacks(PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM)
+                            .expect("exact cooperative quantum is admitted");
+                        let mut cooperator = PaneSnapshotCooperator::new("test-pdu82");
 
-            collector_order.lock().unwrap().push("collector-before");
-            cooperator.after_tab(&ledger).await;
-            collector_order.lock().unwrap().push("collector-after");
-            assert_eq!(cooperator.yields(), 1);
-            }),
-            outcome => panic!("expected cooperative collector admission, got {outcome:?}"),
-        };
+                        collector_order.lock().unwrap().push("collector-before");
+                        cooperator.after_tab(&ledger).await;
+                        collector_order.lock().unwrap().push("collector-after");
+                        assert_eq!(cooperator.yields(), 1);
+                    })
+                }
+                outcome => panic!("expected cooperative collector admission, got {outcome:?}"),
+            };
         collector.detach();
 
         assert!(
@@ -12848,9 +12787,10 @@ mod tests {
         );
         mux.add_pane(&replacement)
             .expect("same-ID replacement is admitted after queued authority drops");
-        assert!(mux
-            .get_pane(pane_id)
-            .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)));
+        assert!(
+            mux.get_pane(pane_id)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement))
+        );
     }
 
     #[test]
@@ -13042,9 +12982,10 @@ mod tests {
             mux.add_pane(&replacement).unwrap_or_else(|error| {
                 panic!("{label}: exact pane guard must release after cancellation: {error:#}")
             });
-            assert!(mux
-                .get_pane(pane_id)
-                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)));
+            assert!(
+                mux.get_pane(pane_id)
+                    .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement))
+            );
         }
     }
 

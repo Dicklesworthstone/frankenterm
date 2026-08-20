@@ -1715,48 +1715,48 @@ impl RenderableInner {
         reservation
             .spawn_local(async move {
                 let response = request.await;
-            let cleared = registration.try_with_current(|_| {
-                let renderable = renderable.lock();
-                let inner = renderable.inner.borrow();
-                inner.poll_in_progress.store(false, Ordering::SeqCst);
-            });
-            if cleared.is_none() {
-                log::trace!(
-                    "discarding liveness poll completion for stale client pane registration {}",
-                    local_pane_id
-                );
-            }
-            let alive = match response {
-                Ok(response) if response.pane_id == remote_pane_id => response.is_alive,
-                Ok(response) => {
-                    return Err(anyhow::anyhow!(
-                        "liveness response pane mismatch: expected {remote_pane_id}, got {}",
-                        response.pane_id
-                    ));
+                let cleared = registration.try_with_current(|_| {
+                    let renderable = renderable.lock();
+                    let inner = renderable.inner.borrow();
+                    inner.poll_in_progress.store(false, Ordering::SeqCst);
+                });
+                if cleared.is_none() {
+                    log::trace!(
+                        "discarding liveness poll completion for stale client pane registration {}",
+                        local_pane_id
+                    );
                 }
-                // Preserve the established liveness policy: a transient
-                // transport failure cannot declare a reconnectable pane dead,
-                // while a non-reconnectable pane has no successor that could
-                // revive it. The generation commit below still prevents a G1
-                // result from mutating state after G2 publication.
-                Err(_) => client.client.is_reconnectable,
-            };
-            let updated = rpc
-                .commit_sync(RpcConsumerKind::Liveness, || {
-                    registration.try_with_current(|_| {
-                        let renderable = renderable.lock();
-                        let mut inner = renderable.inner.borrow_mut();
-                        inner.dead = !alive;
-                        inner.last_recv_time = Instant::now();
+                let alive = match response {
+                    Ok(response) if response.pane_id == remote_pane_id => response.is_alive,
+                    Ok(response) => {
+                        return Err(anyhow::anyhow!(
+                            "liveness response pane mismatch: expected {remote_pane_id}, got {}",
+                            response.pane_id
+                        ));
+                    }
+                    // Preserve the established liveness policy: a transient
+                    // transport failure cannot declare a reconnectable pane dead,
+                    // while a non-reconnectable pane has no successor that could
+                    // revive it. The generation commit below still prevents a G1
+                    // result from mutating state after G2 publication.
+                    Err(_) => client.client.is_reconnectable,
+                };
+                let updated = rpc
+                    .commit_sync(RpcConsumerKind::Liveness, || {
+                        registration.try_with_current(|_| {
+                            let renderable = renderable.lock();
+                            let mut inner = renderable.inner.borrow_mut();
+                            inner.dead = !alive;
+                            inner.last_recv_time = Instant::now();
+                        })
                     })
-                })
-                .map_err(anyhow::Error::new)?;
-            if updated.is_none() {
-                log::trace!(
-                    "discarding liveness state update for stale client pane registration {}",
-                    local_pane_id
-                );
-            }
+                    .map_err(anyhow::Error::new)?;
+                if updated.is_none() {
+                    log::trace!(
+                        "discarding liveness state update for stale client pane registration {}",
+                        local_pane_id
+                    );
+                }
                 Ok::<(), anyhow::Error>(())
             })
             .detach();

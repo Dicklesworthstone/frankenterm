@@ -795,16 +795,19 @@ impl WindowOps for Window {
             "macOS enable OpenGL",
         )
         .map_err(|rejected| anyhow::anyhow!("macOS OpenGL admission rejected: {rejected:?}"))?;
-        reservation.spawn_local(async move {
-            let conn =
-                Connection::get().ok_or_else(|| anyhow::anyhow!("Connection not available"))?;
-            if let Some(handle) = conn.window_by_id(window_id) {
-                let mut inner = handle.borrow_mut();
-                inner.enable_opengl()
-            } else {
-                bail!("invalid window");
-            }
-        }).into_task().await
+        reservation
+            .spawn_local(async move {
+                let conn =
+                    Connection::get().ok_or_else(|| anyhow::anyhow!("Connection not available"))?;
+                if let Some(handle) = conn.window_by_id(window_id) {
+                    let mut inner = handle.borrow_mut();
+                    inner.enable_opengl()
+                } else {
+                    bail!("invalid window");
+                }
+            })
+            .into_task()
+            .await
     }
 
     fn notify<T: Any + Send + Sync>(&self, t: T)

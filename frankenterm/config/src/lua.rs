@@ -614,37 +614,37 @@ fn lua_time_call_after(lua: &Lua, (seconds, func): (f64, mlua::Function)) -> mlu
                 let key = key_for_async.clone();
                 async move {
                     let Some(lua) = lua_opt else {
-                    // No live Lua state (config reload mid-flight or
-                    // shutdown). The registry holding the callback is
-                    // gone with it, so there's nothing to clean up.
-                    return Ok(());
-                };
-                let result: mlua::Result<Value> = lua.named_registry_value(&key);
-                // Unset before the call so re-entrant config reloads or
-                // panics inside the callback don't leave the slot
-                // permanently allocated.
-                let _ = lua.unset_named_registry_value(&key);
-                match result {
-                    Ok(Value::Function(func)) => {
-                        if let Err(err) = func.call_async::<()>(()).await {
+                        // No live Lua state (config reload mid-flight or
+                        // shutdown). The registry holding the callback is
+                        // gone with it, so there's nothing to clean up.
+                        return Ok(());
+                    };
+                    let result: mlua::Result<Value> = lua.named_registry_value(&key);
+                    // Unset before the call so re-entrant config reloads or
+                    // panics inside the callback don't leave the slot
+                    // permanently allocated.
+                    let _ = lua.unset_named_registry_value(&key);
+                    match result {
+                        Ok(Value::Function(func)) => {
+                            if let Err(err) = func.call_async::<()>(()).await {
+                                log::warn!(
+                                    target: "lua_config",
+                                    "time.call_after callback raised: {err}"
+                                );
+                            }
+                        }
+                        Ok(other) => {
                             log::warn!(
                                 target: "lua_config",
-                                "time.call_after callback raised: {err}"
+                                "time.call_after: registry slot {key} held non-function value {}",
+                                other.type_name()
                             );
                         }
+                        Err(_) => {
+                            // Registry slot vanished (config reload between
+                            // schedule and fire). Silently drop.
+                        }
                     }
-                    Ok(other) => {
-                        log::warn!(
-                            target: "lua_config",
-                            "time.call_after: registry slot {key} held non-function value {}",
-                            other.type_name()
-                        );
-                    }
-                    Err(_) => {
-                        // Registry slot vanished (config reload between
-                        // schedule and fire). Silently drop.
-                    }
-                }
                     Ok(())
                 }
             })
