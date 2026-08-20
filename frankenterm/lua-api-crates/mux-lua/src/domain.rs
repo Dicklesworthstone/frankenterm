@@ -1,13 +1,14 @@
 use super::*;
 use mlua::UserDataRef;
-use mux::domain::{Domain, DomainId, DomainState};
+use mux::DomainOperationGuard;
+use mux::domain::{DomainId, DomainState};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 pub struct MuxDomain(pub DomainId);
 
 impl MuxDomain {
-    pub fn resolve(&self, mux: &Arc<Mux>) -> mlua::Result<Arc<dyn Domain>> {
+    pub fn resolve(&self, mux: &Arc<Mux>) -> mlua::Result<DomainOperationGuard> {
         mux.get_domain(self.0)
             .ok_or_else(|| mlua::Error::external(format!("domain id {} not found in mux", self.0)))
     }
@@ -16,9 +17,11 @@ impl MuxDomain {
 impl UserData for MuxDomain {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, _: ()| {
-            Ok(format!("MuxDomain(domain_id:{}, pid:{})", this.0, unsafe {
-                libc::getpid()
-            }))
+            Ok(format!(
+                "MuxDomain(domain_id:{}, pid:{})",
+                this.0,
+                std::process::id()
+            ))
         });
         methods.add_method("domain_id", |_, this, _: ()| Ok(this.0));
 

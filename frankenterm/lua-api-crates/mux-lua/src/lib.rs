@@ -7,11 +7,11 @@ use config::lua::mlua::{self, Lua, UserData, UserDataMethods, Value as LuaValue}
 use config::lua::{get_or_create_module, get_or_create_sub_module};
 use luahelper::impl_lua_conversion_dynamic;
 use mlua::UserDataRef;
+use mux::Mux;
 use mux::domain::{DomainId, SplitSource};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use mux::window::{Window, WindowId};
-use mux::Mux;
 use portable_pty::CommandBuilder;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -150,7 +150,10 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         lua.create_function(|_, domain: LuaValue| {
             let mux = get_mux()?;
             match domain {
-                LuaValue::Nil => Ok(Some(MuxDomain(mux.default_domain().domain_id()))),
+                LuaValue::Nil => mux
+                    .default_domain()
+                    .map(|domain| Some(MuxDomain(domain.domain_id())))
+                    .map_err(mlua::Error::external),
                 LuaValue::String(s) => match s.to_str() {
                     Ok(name) => Ok(mux
                         .get_domain_by_name(&name)
@@ -189,7 +192,7 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         lua.create_function(|_, domain: UserDataRef<MuxDomain>| {
             let mux = get_mux()?;
             let domain = domain.resolve(&mux)?;
-            mux.set_default_domain(&domain)
+            mux.set_default_domain_guard(&domain)
                 .map_err(mlua::Error::external)?;
             Ok(())
         })?,

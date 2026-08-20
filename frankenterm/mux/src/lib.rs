@@ -1127,6 +1127,13 @@ impl LiveDomainRegistration {
 
 const DOMAIN_REGISTRATION_RETIRED: usize = 1usize << (usize::BITS - 1);
 const DOMAIN_REGISTRATION_OPERATION_MASK: usize = DOMAIN_REGISTRATION_RETIRED - 1;
+const DOMAIN_RETIREMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+#[cfg(test)]
+struct DomainOperationReleaseBarrier {
+    registration_disposed: std::sync::mpsc::SyncSender<()>,
+    permit_release: std::sync::mpsc::Receiver<()>,
+}
 
 /// Admission and cleanup state for one exact domain registration.
 ///
@@ -1137,6 +1144,8 @@ struct DomainRegistrationGeneration {
     domain_id: DomainId,
     operation_state: AtomicUsize,
     cleanup_claimed: AtomicBool,
+    #[cfg(test)]
+    operation_release_barrier: Mutex<Option<DomainOperationReleaseBarrier>>,
 }
 
 impl DomainRegistrationGeneration {
@@ -1145,6 +1154,8 @@ impl DomainRegistrationGeneration {
             domain_id,
             operation_state: AtomicUsize::new(0),
             cleanup_claimed: AtomicBool::new(false),
+            #[cfg(test)]
+            operation_release_barrier: Mutex::new(None),
         }
     }
 
@@ -1218,6 +1229,45 @@ impl DomainRegistrationGeneration {
         self.operation_state.load(Ordering::Acquire) & DOMAIN_REGISTRATION_RETIRED != 0
     }
 
+    fn cleanup_is_ready(&self) -> bool {
+        self.cleanup_claimed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn install_operation_release_barrier(
+        &self,
+        registration_disposed: std::sync::mpsc::SyncSender<()>,
+        permit_release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let prior = self
+            .operation_release_barrier
+            .lock()
+            .replace(DomainOperationReleaseBarrier {
+                registration_disposed,
+                permit_release,
+            });
+        assert!(
+            prior.is_none(),
+            "domain operation release barrier already installed"
+        );
+    }
+
+    #[cfg(test)]
+    fn wait_after_registration_disposal_before_release(&self) {
+        let barrier = self.operation_release_barrier.lock().take();
+        let Some(barrier) = barrier else {
+            return;
+        };
+        barrier
+            .registration_disposed
+            .send(())
+            .expect("domain operation drop barrier observer must remain live");
+        barrier
+            .permit_release
+            .recv_timeout(Duration::from_secs(5))
+            .expect("domain operation drop barrier was not released");
+    }
+
     #[cfg(test)]
     fn active_operations(&self) -> usize {
         self.operation_state.load(Ordering::Acquire) & DOMAIN_REGISTRATION_OPERATION_MASK
@@ -1232,6 +1282,49 @@ impl DomainRegistrationGeneration {
 #[derive(Default)]
 struct DomainRetirementTracker {
     generations: Mutex<HashMap<DomainId, Arc<DomainRegistrationGeneration>>>,
+}
+
+#[derive(Default)]
+struct PendingDomainRetirements {
+    registrations: VecDeque<PendingDomainRetirement>,
+    worker_running: bool,
+}
+
+struct PendingDomainRetirement {
+    registration: Arc<LiveDomainRegistration>,
+    disposition: DomainRetirementDisposition,
+}
+
+#[derive(Debug)]
+enum DomainRetirementDisposition {
+    Pending,
+    AwaitingPaneCleanup(Vec<Arc<AtomicBool>>),
+    Quarantined(&'static str),
+}
+
+#[derive(Debug)]
+enum DomainRetirementFinalization {
+    Complete,
+    AwaitingPaneCleanup(Vec<Arc<AtomicBool>>),
+    Retry(&'static str),
+    Quarantine(&'static str),
+}
+
+#[derive(Default)]
+struct DomainRetirementWakeup {
+    /// No code may retain this mutex while acquiring a mux authority/topology
+    /// lock or invoking a callback.
+    gate: Mutex<()>,
+    pending: AtomicBool,
+    ready: Condvar,
+}
+
+impl DomainRetirementWakeup {
+    fn notify(&self) {
+        let _gate = self.gate.lock();
+        self.pending.store(true, Ordering::Release);
+        self.ready.notify_one();
+    }
 }
 
 impl DomainRetirementTracker {
@@ -1275,20 +1368,21 @@ impl DomainRetirementTracker {
 /// callback rollback. Retirement may begin while it is live, but same-ID
 /// replacement and destructive teardown remain fenced until it is dropped.
 pub struct DomainOperationGuard {
-    owner: Arc<Mux>,
-    registration: Arc<LiveDomainRegistration>,
+    owner_identity: Arc<()>,
+    wakeup: Arc<DomainRetirementWakeup>,
+    /// `Drop` takes this Arc before it publishes generation quiescence. Keeping
+    /// it optional makes that order explicit instead of relying on Rust's field
+    /// destruction after the custom destructor returns.
+    registration: Option<Arc<LiveDomainRegistration>>,
 }
 
 impl std::fmt::Debug for DomainOperationGuard {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let registration = self.registration();
         formatter
             .debug_struct("DomainOperationGuard")
-            .field("domain_id", &self.registration.domain_id)
-            .field("domain_name", &self.registration.domain_name)
-            .field(
-                "generation",
-                &(Arc::as_ptr(&self.registration.generation) as usize),
-            )
+            .field("domain_id", &registration.domain_id)
+            .field("domain_name", &registration.domain_name)
             .finish_non_exhaustive()
     }
 }
@@ -1297,34 +1391,68 @@ impl std::ops::Deref for DomainOperationGuard {
     type Target = dyn Domain;
 
     fn deref(&self) -> &Self::Target {
-        self.registration.domain.as_ref()
+        self.registration().domain.as_ref()
     }
 }
 
 impl Drop for DomainOperationGuard {
     fn drop(&mut self) {
-        if self.registration.generation.release_operation() {
-            self.owner
-                .finalize_domain_retirement(Arc::clone(&self.registration));
+        let registration = self
+            .registration
+            .take()
+            .expect("domain operation guard registration is present until drop");
+        let generation = Arc::clone(&registration.generation);
+
+        // SAFETY: the worker samples `cleanup_is_ready` without the wakeup gate.
+        // Relinquish this guard's strong registration owner before publishing
+        // the last-operation edge, retaining only the content-free generation.
+        // The pending retirement queue keeps a retired registration alive until
+        // worker-owned, panic-contained disposal; no future field-drop ordering
+        // can move the external Domain destructor back onto this caller.
+        drop(registration);
+        #[cfg(test)]
+        generation.wait_after_registration_disposal_before_release();
+
+        if generation.release_operation() {
+            // The retirement record and its one bounded worker were both
+            // prepared before admission closed. Notification is allocation-free
+            // and uses a dedicated gate. The worker never retains this gate
+            // while taking domain, pane, tab, or window locks, so arbitrary
+            // caller lock ownership cannot form an AB/BA cycle with guard Drop.
+            self.wakeup.notify();
         }
     }
 }
 
 impl DomainOperationGuard {
+    fn registration(&self) -> &Arc<LiveDomainRegistration> {
+        self.registration
+            .as_ref()
+            .expect("live domain operation guard retains its exact registration")
+    }
+
     pub fn domain_id(&self) -> DomainId {
-        self.registration.domain_id
+        self.registration().domain_id
     }
 
     pub fn domain_name(&self) -> &str {
-        &self.registration.domain_name
+        &self.registration().domain_name
     }
 
-    fn domain_arc(&self) -> &Arc<dyn Domain> {
-        &self.registration.domain
+    /// Compare an externally retained domain object with this exact admitted
+    /// registration without allowing the guard's raw Arc to escape.
+    pub fn is_same_domain(&self, domain: &Arc<dyn Domain>) -> bool {
+        self.registration().matches_domain(domain)
     }
 
-    fn same_registration(&self, registration: &Arc<LiveDomainRegistration>) -> bool {
-        Arc::ptr_eq(&self.registration, registration)
+    /// Compare two admitted authorities without exposing either generation.
+    pub fn same_registration(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner_identity, &other.owner_identity)
+            && Arc::ptr_eq(self.registration(), other.registration())
+    }
+
+    pub(crate) fn domain_arc(&self) -> &Arc<dyn Domain> {
+        &self.registration().domain
     }
 }
 
@@ -2506,7 +2634,7 @@ mod pane_registration_handle {
             self.admitted_domain_id
         }
 
-        fn admitted_domain(&self) -> Option<&Weak<LiveDomainRegistration>> {
+        pub(crate) fn admitted_domain(&self) -> Option<&Weak<LiveDomainRegistration>> {
             self.admitted_domain.as_ref()
         }
 
@@ -2520,6 +2648,13 @@ mod pane_registration_handle {
                         self.pane_id()
                     )
                 })
+        }
+
+        /// Resolve content-free topology identifiers under this guard's exact
+        /// pane-generation authority without exposing a raw pane or tab Arc.
+        pub fn exact_location_ids(&self) -> anyhow::Result<(DomainId, WindowId, TabId)> {
+            self.exact_location()
+                .map(|(domain_id, window_id, tab)| (domain_id, window_id, tab.tab_id()))
         }
 
         pub fn capture_split_receipt(
@@ -2989,6 +3124,10 @@ mod pane_registration_handle {
         pub fn same_registration(&self, other: &Self) -> bool {
             Weak::ptr_eq(&self.pane, &other.pane)
                 && Arc::ptr_eq(&self.generation, &other.generation)
+        }
+
+        pub(super) fn cleanup_complete_marker(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.generation.cleanup_complete)
         }
 
         /// Compare one exact pane allocation without acquiring a retirement
@@ -5586,7 +5725,10 @@ impl PaneAuthorityIndex {
                         );
                         let exact_domain = exact_domains.get(&domain_id);
                         anyhow::ensure!(
-                            self.domain_directory_matches(domain_id, exact_domain)
+                            self.domain_directory_matches(
+                                domain_id,
+                                exact_domain.map(|registration| &registration.domain),
+                            )
                                 && !retired_domain_ids.contains(&domain_id),
                             "pane {} live relocation directory names a missing, replaced, or retired domain",
                             state.pane_id
@@ -6817,7 +6959,16 @@ pub struct Mux {
     domain_registrations: RwLock<HashMap<DomainId, Arc<LiveDomainRegistration>>>,
     domain_registrations_by_name: RwLock<HashMap<String, Arc<LiveDomainRegistration>>>,
     domain_registration: Mutex<()>,
+    domain_owner_identity: Arc<()>,
     domain_retirements: Arc<DomainRetirementTracker>,
+    pending_domain_retirements: Mutex<PendingDomainRetirements>,
+    domain_retirement_wakeup: Arc<DomainRetirementWakeup>,
+    #[cfg(test)]
+    fail_next_domain_retirement_worker_spawn: AtomicBool,
+    #[cfg(test)]
+    fail_next_domain_retirement_snapshot_reserve: AtomicBool,
+    #[cfg(test)]
+    domain_retirement_transient_failures: AtomicUsize,
     // Compatibility projection used by existing final-cut checks in Tab.
     // Unlike the former process-lifetime tombstone set, entries are removed
     // only after the exact generation and its indexed cleanup quiesce.
@@ -7751,7 +7902,16 @@ impl Mux {
             domain_registrations: RwLock::new(domain_registrations),
             domain_registrations_by_name: RwLock::new(domain_registrations_by_name),
             domain_registration: Mutex::new(()),
+            domain_owner_identity: Arc::new(()),
             domain_retirements: Arc::new(DomainRetirementTracker::default()),
+            pending_domain_retirements: Mutex::new(PendingDomainRetirements::default()),
+            domain_retirement_wakeup: Arc::new(DomainRetirementWakeup::default()),
+            #[cfg(test)]
+            fail_next_domain_retirement_worker_spawn: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_domain_retirement_snapshot_reserve: AtomicBool::new(false),
+            #[cfg(test)]
+            domain_retirement_transient_failures: AtomicUsize::new(0),
             retired_domain_ids: Mutex::new(HashSet::new()),
             subscribers: RwLock::new(HashMap::new()),
             pending_pane_output: Mutex::new(PendingPaneOutputNotifications::default()),
@@ -10500,16 +10660,24 @@ impl Mux {
         }
     }
 
-    pub fn default_domain(&self) -> Arc<dyn Domain> {
-        self.default_domain.read().as_ref().map(Arc::clone).unwrap()
+    pub fn default_domain(&self) -> anyhow::Result<DomainOperationGuard> {
+        self.resolve_default_domain()
     }
 
-    fn resolve_default_domain(&self) -> anyhow::Result<Arc<dyn Domain>> {
-        self.default_domain
+    fn resolve_default_domain(&self) -> anyhow::Result<DomainOperationGuard> {
+        let _registration = self.domain_registration.lock();
+        let registration = self
+            .default_domain_registration
             .read()
             .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| anyhow!("no default domain configured"))
+            .cloned()
+            .ok_or_else(|| anyhow!("no default domain configured"))?;
+        anyhow::ensure!(
+            self.domain_registration_is_current_locked(&registration),
+            "default domain {} is retired or no longer exact-current",
+            registration.domain_id
+        );
+        self.acquire_domain_operation_locked(registration)
     }
 
     pub fn set_default_domain(
@@ -10558,12 +10726,33 @@ impl Mux {
         Ok(())
     }
 
-    pub fn get_domain(&self, id: DomainId) -> Option<Arc<dyn Domain>> {
-        self.domains.read().get(&id).cloned()
+    pub fn set_default_domain_guard(
+        &self,
+        domain: &DomainOperationGuard,
+    ) -> Result<(), DomainRegistrationError> {
+        if !Arc::ptr_eq(&self.domain_owner_identity, &domain.owner_identity) {
+            return Err(DomainRegistrationError::DefaultNotRegistered {
+                domain_id: domain.domain_id(),
+                domain_name: domain.domain_name().to_string(),
+            });
+        }
+        self.set_default_domain(domain.domain_arc())
     }
 
-    pub fn get_domain_by_name(&self, name: &str) -> Option<Arc<dyn Domain>> {
-        self.domains_by_name.read().get(name).cloned()
+    pub fn get_domain(&self, id: DomainId) -> Option<DomainOperationGuard> {
+        let _registration = self.domain_registration.lock();
+        let registration = self.domain_registrations.read().get(&id).cloned()?;
+        self.acquire_domain_operation_locked(registration).ok()
+    }
+
+    pub fn get_domain_by_name(&self, name: &str) -> Option<DomainOperationGuard> {
+        let _registration = self.domain_registration.lock();
+        let registration = self
+            .domain_registrations_by_name
+            .read()
+            .get(name)
+            .cloned()?;
+        self.acquire_domain_operation_locked(registration).ok()
     }
 
     pub fn add_domain(&self, domain: &Arc<dyn Domain>) -> Result<(), DomainRegistrationError> {
@@ -14805,8 +14994,18 @@ impl Mux {
         Ok(window_ids)
     }
 
-    pub fn iter_domains(&self) -> Vec<Arc<dyn Domain>> {
-        self.domains.read().values().cloned().collect()
+    pub fn iter_domains(&self) -> Vec<DomainOperationGuard> {
+        let _registration = self.domain_registration.lock();
+        let registrations = self
+            .domain_registrations
+            .read()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        registrations
+            .into_iter()
+            .filter_map(|registration| self.acquire_domain_operation_locked(registration).ok())
+            .collect()
     }
 
     pub fn resolve_pane_id(&self, pane_id: PaneId) -> Option<(DomainId, WindowId, TabId)> {
@@ -15053,41 +15252,661 @@ impl Mux {
         ))
     }
 
-    pub fn domain_was_detached(&self, domain: DomainId) {
-        let Some(expected) = self.get_domain(domain) else {
+    pub fn domain_was_detached(self: &Arc<Self>, domain: DomainId) {
+        let expected = {
+            let _registration = self.domain_registration.lock();
+            let registration = self
+                .domain_registrations
+                .read()
+                .get(&domain)
+                .cloned();
+            registration
+                .filter(|registration| self.domain_registration_is_current_locked(registration))
+                .map(|registration| Arc::clone(&registration.domain))
+        };
+        let Some(expected) = expected else {
             return;
         };
         let _ = self.domain_was_detached_if_same(&expected);
     }
 
+    /// Retire the exact domain generation held by an admitted operation.
+    /// The supplied guard remains an in-flight lease until its caller drops it.
+    pub fn domain_was_detached_if_guard(
+        self: &Arc<Self>,
+        expected: &DomainOperationGuard,
+    ) -> bool {
+        if !Arc::ptr_eq(&self.domain_owner_identity, &expected.owner_identity) {
+            return false;
+        }
+        self.domain_was_detached_if_same(expected.domain_arc())
+    }
+
     /// Remove one exact domain instance and all of its topology.
     ///
-    /// Domain identifiers are retired before topology callbacks run, but the
-    /// exact detached domain remains discoverable until its panes have been
-    /// killed. `ClientPane::kill` relies on that detached registration to
-    /// suppress an unintended remote `KillPane` during transport teardown.
-    pub fn domain_was_detached_if_same(&self, expected: &Arc<dyn Domain>) -> bool {
+    /// Logical retirement closes operation admission immediately. Destructive
+    /// indexed cleanup begins only after every operation admitted against this
+    /// exact generation has dropped its non-cloneable guard.
+    pub fn domain_was_detached_if_same(
+        self: &Arc<Self>,
+        expected: &Arc<dyn Domain>,
+    ) -> bool {
         let domain = expected.domain_id();
-        let removed = {
+        let (cleanup_ready, worker_started) = {
             let _registration = self.domain_registration.lock();
-            let Some(registered) = self.domains.read().get(&domain).cloned() else {
+            let Some(registration) = self
+                .domain_registrations
+                .read()
+                .get(&domain)
+                .cloned()
+            else {
                 return false;
             };
-            if !Arc::ptr_eq(&registered, expected) {
+            if !registration.matches_domain(expected)
+                || !self
+                    .domain_registrations_by_name
+                    .read()
+                    .get(&registration.domain_name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &registration))
+                || !self
+                    .domains
+                    .read()
+                    .get(&domain)
+                    .is_some_and(|current| Arc::ptr_eq(current, expected))
+                || !self
+                    .domains_by_name
+                    .read()
+                    .get(&registration.domain_name)
+                    .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
                 return false;
             }
-            if !self.retired_domain_ids.lock().insert(domain) {
-                // Another exact teardown already owns this retired
-                // registration. Do not duplicate pane kills or callbacks.
+            if registration.generation.is_retired()
+                || self.domain_retirements.contains(domain)
+                || self.retired_domain_ids.lock().contains(&domain)
+            {
                 return false;
             }
-            registered
+
+            match self.domain_retirements.begin(&registration.generation) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::error!(
+                        "domain {domain} retirement tracker names another exact generation"
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    log::error!(
+                        "cannot reserve exact retirement tracker for domain {domain}: {error}"
+                    );
+                    return false;
+                }
+            }
+
+            let mut retired_ids = self.retired_domain_ids.lock();
+            if let Err(error) = retired_ids.try_reserve(1) {
+                self.domain_retirements.finish(&registration.generation);
+                log::error!(
+                    "cannot reserve bounded logical-retirement fence for domain {domain}: {error}"
+                );
+                return false;
+            }
+            let mut pending = self.pending_domain_retirements.lock();
+            if let Err(error) = pending.registrations.try_reserve(1) {
+                self.domain_retirements.finish(&registration.generation);
+                log::error!(
+                    "cannot reserve deferred cleanup queue for domain {domain}: {error}"
+                );
+                return false;
+            }
+            pending.registrations.push_back(PendingDomainRetirement {
+                registration: Arc::clone(&registration),
+                disposition: DomainRetirementDisposition::Pending,
+            });
+            let worker_started = if pending.worker_running {
+                false
+            } else {
+                pending.worker_running = true;
+                if let Err(error) = self.spawn_domain_retirement_worker() {
+                    pending.worker_running = false;
+                    pending.registrations.retain(|current| {
+                        !Arc::ptr_eq(&current.registration, &registration)
+                    });
+                    drop(pending);
+                    drop(retired_ids);
+                    self.domain_retirements.finish(&registration.generation);
+                    log::error!(
+                        "cannot start exact domain retirement worker for domain {domain}: {error}"
+                    );
+                    return false;
+                }
+                true
+            };
+            retired_ids.insert(domain);
+            let (began_retirement, cleanup_ready) = registration.generation.retire();
+            if !began_retirement {
+                pending.registrations.retain(|current| {
+                    !Arc::ptr_eq(&current.registration, &registration)
+                });
+                retired_ids.remove(&domain);
+                self.domain_retirements.finish(&registration.generation);
+                return false;
+            }
+
+            // Default selection is an admission projection, so it must stop
+            // naming the retired generation in the same serialized cut that
+            // closes admission. Destructive maps remain intact until cleanup
+            // quiesces, but a live minimum-ID fallback can be admitted now.
+            drop(pending);
+            drop(retired_ids);
+            let retiring_default = self
+                .default_domain_registration
+                .read()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &registration));
+            if retiring_default {
+                let replacement = self
+                    .domain_registrations
+                    .read()
+                    .values()
+                    .filter(|candidate| !candidate.generation.is_retired())
+                    .min_by_key(|candidate| candidate.domain_id)
+                    .cloned();
+                *self.default_domain.write() = replacement
+                    .as_ref()
+                    .map(|registration| Arc::clone(&registration.domain));
+                *self.default_domain_registration.write() = replacement;
+            }
+            (cleanup_ready, worker_started)
+        };
+
+        // A newly started worker cannot inspect the queue until the preflight
+        // locks above are released, so it observes an immediately-ready
+        // generation without a notification. Wake only an existing sleeper.
+        if cleanup_ready && !worker_started {
+            self.wake_domain_retirement_worker();
+        }
+        true
+    }
+
+    /// Start the one bounded cleanup worker for the current retirement wave.
+    ///
+    /// This is called at the explicit detach preflight boundary, before the
+    /// generation's retired bit or any public index changes. A spawn failure
+    /// therefore rejects retirement with zero logical mutation.
+    fn spawn_domain_retirement_worker(self: &Arc<Self>) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_domain_retirement_worker_spawn
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(std::io::Error::other(
+                "injected domain retirement worker spawn failure",
+            ));
+        }
+
+        let owner = Arc::downgrade(self);
+        thread::Builder::new()
+            .name("mux-domain-retirement".to_string())
+            .spawn(move || {
+                if let Some(owner) = owner.upgrade() {
+                    owner.run_domain_retirement_worker();
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Publish a coalesced readiness edge without exposing any mux authority
+    /// lock to arbitrary `DomainOperationGuard::drop` callers.
+    ///
+    /// The worker samples the wakeup's pending bit before sleeping and both
+    /// sides serialize the final sample/notification with its dedicated gate.
+    /// This prevents the check-to-wait lost-wakeup race while keeping Drop
+    /// allocation-free and callback-free.
+    fn wake_domain_retirement_worker(&self) {
+        self.domain_retirement_wakeup.notify();
+    }
+
+    /// Wait for exact generations to quiesce and finalize them one at a time.
+    /// The worker exits once no actionable record remains; quarantined records
+    /// stay as explicit same-ID fences. Guard Drop merely wakes this condition
+    /// variable after the last domain operation releases.
+    fn run_domain_retirement_worker(&self) {
+        loop {
+            if catch_recoverable(
+                RecoverablePanicSite::MuxPaneRetirement,
+                std::panic::AssertUnwindSafe(|| {
+                    self.run_domain_retirement_worker_until_stable()
+                }),
+            )
+            .is_ok()
+            {
+                return;
+            }
+
+            // SAFETY: this OS worker still owns `worker_running`; an
+            // unexpected unwind restarts the same bounded loop instead of
+            // abandoning actionable records behind a permanently true flag.
+            // If only absorbing quarantine records remain, explicitly release
+            // the flag so a later retirement wave can start a fresh worker.
+            log::error!("domain retirement worker recovered from an unexpected panic");
+            let mut pending = self.pending_domain_retirements.lock();
+            let actionable = pending.registrations.iter().any(|retirement| {
+                !matches!(
+                    &retirement.disposition,
+                    DomainRetirementDisposition::Quarantined(_)
+                )
+            });
+            if !actionable {
+                pending.worker_running = false;
+                return;
+            }
+        }
+    }
+
+    fn run_domain_retirement_worker_until_stable(&self) {
+        loop {
+            let (ready, awaiting_pane_cleanup) = {
+                let mut pending = self.pending_domain_retirements.lock();
+                let mut ready = None;
+                let mut has_actionable = false;
+                let mut awaiting_pane_cleanup = false;
+                for retirement in &pending.registrations {
+                    match &retirement.disposition {
+                        DomainRetirementDisposition::Pending => {
+                            has_actionable = true;
+                            if retirement.registration.generation.cleanup_is_ready() {
+                                ready = Some((Arc::clone(&retirement.registration), false));
+                                break;
+                            }
+                        }
+                        DomainRetirementDisposition::AwaitingPaneCleanup(markers) => {
+                            has_actionable = true;
+                            if markers
+                                .iter()
+                                .all(|marker| marker.load(Ordering::Acquire))
+                            {
+                                ready = Some((Arc::clone(&retirement.registration), true));
+                                break;
+                            }
+                            awaiting_pane_cleanup = true;
+                        }
+                        DomainRetirementDisposition::Quarantined(_) => {}
+                    }
+                }
+                if ready.is_none() && !has_actionable {
+                    // Quarantined records remain explicit same-ID fences, but
+                    // they are absorbing and do not keep a worker alive.
+                    for retirement in &pending.registrations {
+                        if let DomainRetirementDisposition::Quarantined(reason) =
+                            &retirement.disposition
+                        {
+                            log::trace!(
+                                "domain retirement worker retaining quarantined domain {} same-ID fence: {reason}",
+                                retirement.registration.domain_id
+                            );
+                        }
+                    }
+                    pending.worker_running = false;
+                    return;
+                }
+                (ready, awaiting_pane_cleanup)
+            };
+
+            let Some((registration, identity_only)) = ready else {
+                // The notifier takes this same dedicated gate. If readiness
+                // arrived after the queue scan, the atomic signal is observed
+                // here; otherwise notify happens only after Condvar::wait has
+                // atomically released the gate. Pane cleanup completes on a
+                // separate callback surface, so those records also receive a
+                // bounded poll rather than depending on an unrelated signal.
+                let mut gate = self.domain_retirement_wakeup.gate.lock();
+                if self.domain_retirement_wakeup.pending.swap(false, Ordering::AcqRel) {
+                    continue;
+                }
+                if awaiting_pane_cleanup {
+                    self.domain_retirement_wakeup
+                        .ready
+                        .wait_for(&mut gate, DOMAIN_RETIREMENT_RETRY_DELAY);
+                } else {
+                    self.domain_retirement_wakeup.ready.wait(&mut gate);
+                }
+                continue;
+            };
+
+            let outcome = catch_recoverable(
+                RecoverablePanicSite::MuxPaneRetirement,
+                std::panic::AssertUnwindSafe(|| {
+                    if identity_only {
+                        self.finalize_domain_retirement_identity(&registration)
+                    } else {
+                        self.finalize_domain_retirement(&registration)
+                    }
+                }),
+            )
+            .unwrap_or(DomainRetirementFinalization::Quarantine(
+                "panic during destructive domain retirement",
+            ));
+
+            match outcome {
+                DomainRetirementFinalization::Complete => {
+                    let domain_id = registration.domain_id;
+                    let generation = Arc::clone(&registration.generation);
+                    let mut pending = self.pending_domain_retirements.lock();
+                    let removed = pending
+                        .registrations
+                        .iter()
+                        .position(|current| {
+                            Arc::ptr_eq(&current.registration, &registration)
+                        })
+                        .and_then(|index| pending.registrations.remove(index));
+                    drop(pending);
+
+                    let missing_pending_record = removed.is_none();
+                    let disposal_panicked = catch_recoverable(
+                        RecoverablePanicSite::MuxPaneRetirement,
+                        std::panic::AssertUnwindSafe(|| {
+                            // The queue record and local work item are the last
+                            // ordinary owners after identity cleanup. Keep both
+                            // drops inside the canonical recovery boundary so
+                            // a hostile `Domain::drop` cannot unwind the sole
+                            // worker or strand `worker_running`.
+                            drop(removed);
+                            drop(registration);
+                        }),
+                    )
+                    .is_err();
+
+                    // The generation fence remains live until post-state
+                    // disposal has either completed or been quarantined.
+                    self.domain_retirements.finish(&generation);
+                    if missing_pending_record {
+                        log::error!(
+                            "completed domain {} retirement lost its pending queue record",
+                            domain_id
+                        );
+                    }
+                    if disposal_panicked {
+                        log::error!(
+                            "quarantined panic while disposing completed domain {domain_id} retirement state"
+                        );
+                    }
+                    continue;
+                }
+                DomainRetirementFinalization::AwaitingPaneCleanup(markers) => {
+                    let mut pending = self.pending_domain_retirements.lock();
+                    if let Some(current) = pending.registrations.iter_mut().find(|current| {
+                        Arc::ptr_eq(&current.registration, &registration)
+                    }) {
+                        current.disposition =
+                            DomainRetirementDisposition::AwaitingPaneCleanup(markers);
+                    } else {
+                        log::error!(
+                            "domain {} retirement lost its pending record before pane cleanup",
+                            registration.domain_id
+                        );
+                    }
+                }
+                DomainRetirementFinalization::Retry(reason) => {
+                    #[cfg(test)]
+                    self.domain_retirement_transient_failures
+                        .fetch_add(1, Ordering::AcqRel);
+                    log::warn!(
+                        "retrying deferred cleanup for retired domain {} after transient failure: {reason}",
+                        registration.domain_id
+                    );
+                    let mut gate = self.domain_retirement_wakeup.gate.lock();
+                    if !self.domain_retirement_wakeup.pending.swap(false, Ordering::AcqRel) {
+                        self.domain_retirement_wakeup
+                            .ready
+                            .wait_for(&mut gate, DOMAIN_RETIREMENT_RETRY_DELAY);
+                    }
+                }
+                DomainRetirementFinalization::Quarantine(reason) => {
+                    let mut pending = self.pending_domain_retirements.lock();
+                    if let Some(current) = pending.registrations.iter_mut().find(|current| {
+                        Arc::ptr_eq(&current.registration, &registration)
+                    }) {
+                        current.disposition =
+                            DomainRetirementDisposition::Quarantined(reason);
+                    }
+                    log::error!(
+                        "quarantined retired domain {} generation after terminal cleanup failure: {reason}",
+                        registration.domain_id
+                    );
+                }
+            }
+
+            let domain_id = registration.domain_id;
+            if catch_recoverable(
+                RecoverablePanicSite::MuxPaneRetirement,
+                std::panic::AssertUnwindSafe(|| drop(registration)),
+            )
+            .is_err()
+            {
+                log::error!(
+                    "quarantined panic while disposing domain {domain_id} worker work item"
+                );
+            }
+        }
+    }
+
+    /// Begin exact domain teardown after its admitted operation count reaches
+    /// zero. Transient snapshot failures retry before mutation; after pane
+    /// retirement commits, the pending record advances to a distinct cleanup
+    /// phase so destructive side effects are never replayed.
+    fn finalize_domain_retirement(
+        &self,
+        registration: &Arc<LiveDomainRegistration>,
+    ) -> DomainRetirementFinalization {
+        let domain = registration.domain_id;
+        let removed = Arc::clone(&registration.domain);
+
+        let (
+            domain_panes,
+            tabs,
+            dead_pane_registrations,
+            dead_pane_ids,
+            pane_cleanup_markers,
+            mut pending_structural_registrations,
+        ) = {
+            let _domain_registration = self.domain_registration.lock();
+            if !self
+                .domain_registrations
+                .read()
+                .get(&domain)
+                .is_some_and(|current| Arc::ptr_eq(current, registration))
+                || !registration.generation.is_retired()
+            {
+                return DomainRetirementFinalization::Quarantine(
+                    "exact retired generation is no longer current",
+                );
+            }
+            let _pane_registration = self.pane_registration.lock();
+            let authority = self.pane_authority.lock();
+            let panes = self.panes.read();
+            let live_domain_pane_count = panes
+                .values()
+                .filter(|current| current.domain_id == domain)
+                .count();
+            if let Some(indexed) = authority.registrations_by_domain.get(&domain) {
+                if indexed.pane_registrations.is_empty() {
+                    return DomainRetirementFinalization::Quarantine(
+                        "pane directory retains an empty domain bucket",
+                    );
+                }
+                if indexed.pane_registrations.len() != live_domain_pane_count {
+                    return DomainRetirementFinalization::Quarantine(
+                        "live pane and domain-directory cardinalities differ",
+                    );
+                }
+                let Some(expected) = indexed.domain.as_ref() else {
+                    return DomainRetirementFinalization::Quarantine(
+                        "live pane directory lacks its exact domain allocation",
+                    );
+                };
+                if !Weak::ptr_eq(expected, &Arc::downgrade(&removed)) {
+                    return DomainRetirementFinalization::Quarantine(
+                        "pane directory names another exact domain allocation",
+                    );
+                }
+                for (pane_id, current) in panes
+                    .iter()
+                    .filter(|(_, current)| current.domain_id == domain)
+                {
+                    if !indexed
+                        .pane_registrations
+                        .get(pane_id)
+                        .is_some_and(|expected| {
+                            expected.matches_live_registration(current)
+                        })
+                    {
+                        return DomainRetirementFinalization::Quarantine(
+                            "live domain pane is absent or changed in its authority directory",
+                        );
+                    }
+                }
+                #[cfg(test)]
+                if self
+                    .fail_next_domain_retirement_snapshot_reserve
+                    .swap(false, Ordering::AcqRel)
+                {
+                    return DomainRetirementFinalization::Retry(
+                        "injected indexed snapshot reservation failure",
+                    );
+                }
+
+                let pane_count = indexed.pane_registrations.len();
+                let mut domain_panes = Vec::new();
+                if let Err(error) = domain_panes.try_reserve_exact(pane_count) {
+                    log::error!(
+                        "cannot reserve indexed pane snapshot for retired domain {domain}: {error}"
+                    );
+                    return DomainRetirementFinalization::Retry(
+                        "reserve indexed pane snapshot",
+                    );
+                }
+                let mut tabs = Vec::new();
+                if let Err(error) = tabs.try_reserve_exact(pane_count) {
+                    log::error!(
+                        "cannot reserve indexed tab snapshot for retired domain {domain}: {error}"
+                    );
+                    return DomainRetirementFinalization::Retry(
+                        "reserve indexed tab snapshot",
+                    );
+                }
+                let mut tab_identities = HashSet::new();
+                if let Err(error) = tab_identities.try_reserve(pane_count) {
+                    log::error!(
+                        "cannot reserve indexed tab identity set for retired domain {domain}: {error}"
+                    );
+                    return DomainRetirementFinalization::Retry(
+                        "reserve indexed tab identity set",
+                    );
+                }
+                let mut dead_pane_registrations = Vec::new();
+                if let Err(error) = dead_pane_registrations.try_reserve_exact(pane_count) {
+                    log::error!(
+                        "cannot reserve exact pane registrations for retired domain {domain}: {error}"
+                    );
+                    return DomainRetirementFinalization::Retry(
+                        "reserve exact pane registrations",
+                    );
+                }
+                let mut dead_pane_ids = Vec::new();
+                if let Err(error) = dead_pane_ids.try_reserve_exact(pane_count) {
+                    log::error!(
+                        "cannot reserve pane IDs for retired domain {domain}: {error}"
+                    );
+                    return DomainRetirementFinalization::Retry(
+                        "reserve retired pane IDs",
+                    );
+                }
+                let mut pane_cleanup_markers = Vec::new();
+                if let Err(error) = pane_cleanup_markers.try_reserve_exact(pane_count) {
+                    log::error!(
+                        "cannot reserve pane cleanup markers for retired domain {domain}: {error}"
+                    );
+                    return DomainRetirementFinalization::Retry(
+                        "reserve pane cleanup markers",
+                    );
+                }
+                let mut pending_structural_registrations = Vec::new();
+                if let Err(error) = pending_structural_registrations.try_reserve_exact(pane_count) {
+                    log::error!(
+                        "cannot reserve structural pane receipts for retired domain {domain}: {error}"
+                    );
+                    return DomainRetirementFinalization::Retry(
+                        "reserve structural pane receipts",
+                    );
+                }
+                for (pane_id, expected_registration) in &indexed.pane_registrations {
+                    let Some(current) = panes.get(pane_id) else {
+                        return DomainRetirementFinalization::Quarantine(
+                            "indexed pane is absent from the live registry",
+                        );
+                    };
+                    if current.domain_id != domain
+                        || !expected_registration.matches_live_registration(current)
+                    {
+                        return DomainRetirementFinalization::Quarantine(
+                            "indexed pane changed exact registration",
+                        );
+                    }
+                    domain_panes.push(Arc::clone(&current.pane));
+                    dead_pane_registrations.push(expected_registration.clone());
+                    dead_pane_ids.push(*pane_id);
+                    pane_cleanup_markers.push(expected_registration.cleanup_complete_marker());
+                    if let Some(owner) = authority.structural_by_pane_id.get(pane_id) {
+                        if !owner.matches_pane(&current.pane) {
+                            return DomainRetirementFinalization::Quarantine(
+                                "pane structural owner changed exact allocation",
+                            );
+                        }
+                        let Some(tab) = owner.tab.upgrade() else {
+                            return DomainRetirementFinalization::Quarantine(
+                                "pane structural owner retains a dropped tab",
+                            );
+                        };
+                        if !owner.matches_tab(&tab) {
+                            return DomainRetirementFinalization::Quarantine(
+                                "pane structural tab changed exact generation",
+                            );
+                        }
+                        if tab_identities.insert(Arc::as_ptr(&tab) as usize) {
+                            tabs.push(tab);
+                        }
+                        pending_structural_registrations.push(expected_registration.clone());
+                    }
+                }
+                (
+                    domain_panes,
+                    tabs,
+                    dead_pane_registrations,
+                    dead_pane_ids,
+                    pane_cleanup_markers,
+                    pending_structural_registrations,
+                )
+            } else {
+                if live_domain_pane_count != 0 {
+                    return DomainRetirementFinalization::Quarantine(
+                        "live domain panes have no authority directory",
+                    );
+                }
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
         };
 
         // Tmux domains install mux notification subscriptions that should be
-        // removed eagerly when the domain is detached. Waiting for the next
-        // notification to lazily retain-drop stale callbacks can leak
-        // subscribers in long-idle sessions.
+        // removed eagerly once the exact indexed snapshot is validated.
         if let Some(tmux_domain) = removed.downcast_ref::<TmuxDomain>() {
             let sub_id = tmux_domain.inner.notification_sub_id.lock().take();
             if let Some(sub_id) = sub_id {
@@ -15095,48 +15914,58 @@ impl Mux {
             }
         }
 
-        let domain_panes = self
-            .iter_panes()
-            .into_iter()
-            .filter(|pane| pane.domain_id() == domain)
-            .collect::<Vec<_>>();
-        let dead_panes = domain_panes
-            .iter()
-            .map(|pane| pane.pane_id())
-            .collect::<HashSet<_>>();
-        let mut dead_pane_registrations = self.capture_pane_registrations(&domain_panes);
-
-        // Snapshot exact tab Arcs before structural work. Pane callbacks,
-        // resize/focus effects, and registration retirement must never run
-        // while the mux window registry is locked.
-        let mut tabs = self.tabs.read().values().cloned().collect::<Vec<_>>();
-        let window_tabs = self
-            .windows
-            .read()
-            .values()
-            .flat_map(|window| window.iter().cloned())
-            .collect::<Vec<_>>();
-        for tab in window_tabs {
-            if !tabs.iter().any(|candidate| Arc::ptr_eq(candidate, &tab)) {
-                tabs.push(tab);
-            }
-        }
+        // Exact tabs came from the per-domain structural-owner index. The
+        // callback-free live-pane census above is an integrity barrier only;
+        // teardown still avoids pane callbacks and a session-wide tab scan.
         for tab in tabs {
             let (_, registrations) = tab.remove_exact_panes_deferred(self, &domain_panes);
             for registration in registrations {
-                if !dead_pane_registrations
+                let Some(position) = pending_structural_registrations
                     .iter()
-                    .any(|current| current.same_registration(&registration))
-                {
-                    dead_pane_registrations.push(registration);
-                }
+                    .position(|current| current.same_registration(&registration))
+                else {
+                    return DomainRetirementFinalization::Quarantine(
+                        "tab removal returned an unindexed pane generation",
+                    );
+                };
+                pending_structural_registrations.swap_remove(position);
             }
         }
+        if !pending_structural_registrations.is_empty() {
+            return DomainRetirementFinalization::Quarantine(
+                "indexed structural pane did not leave its exact tab",
+            );
+        }
 
-        log::info!("domain detached panes: {:?}", dead_panes);
-        PaneRegistrationHandle::retire_batch_if_current(dead_pane_registrations);
+        log::info!("domain detached panes: {:?}", dead_pane_ids);
+        let expected_retirements = dead_pane_registrations.len();
+        let retired = PaneRegistrationHandle::retire_batch_if_current(dead_pane_registrations);
+        if retired != expected_retirements {
+            return DomainRetirementFinalization::Quarantine(
+                "exact pane retirement batch did not commit its complete set",
+            );
+        }
 
         self.prune_dead_windows();
+
+        if pane_cleanup_markers
+            .iter()
+            .any(|marker| !marker.load(Ordering::Acquire))
+        {
+            return DomainRetirementFinalization::AwaitingPaneCleanup(pane_cleanup_markers);
+        }
+
+        self.finalize_domain_retirement_identity(registration)
+    }
+
+    /// Release the domain's raw identity maps and same-ID fence only after all
+    /// exact pane generations have completed their deferred cleanup callbacks.
+    fn finalize_domain_retirement_identity(
+        &self,
+        registration: &Arc<LiveDomainRegistration>,
+    ) -> DomainRetirementFinalization {
+        let domain = registration.domain_id;
+        let removed = Arc::clone(&registration.domain);
 
         {
             let _registration = self.domain_registration.lock();
@@ -15144,12 +15973,15 @@ impl Mux {
             if !domains
                 .get(&domain)
                 .is_some_and(|current| Arc::ptr_eq(current, &removed))
+                || !self
+                    .domain_registrations
+                    .read()
+                    .get(&domain)
+                    .is_some_and(|current| Arc::ptr_eq(current, registration))
             {
-                log::error!(
-                    "retired domain {domain} changed identity during exact teardown; preserving \
-                     the unexpected registration"
+                return DomainRetirementFinalization::Quarantine(
+                    "domain identity changed during destructive teardown",
                 );
-                return false;
             }
             domains.remove(&domain);
             drop(domains);
@@ -15157,49 +15989,143 @@ impl Mux {
             self.domains_by_name
                 .write()
                 .retain(|_, current| !Arc::ptr_eq(current, &removed));
+            self.domain_registrations.write().remove(&domain);
+            self.domain_registrations_by_name
+                .write()
+                .retain(|_, current| !Arc::ptr_eq(current, &registration));
 
             let should_replace_default = self
-                .default_domain
+                .default_domain_registration
                 .read()
                 .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &removed));
+                .is_some_and(|current| Arc::ptr_eq(current, &registration));
             if should_replace_default {
-                let replacement = self.domains.read().values().next().cloned();
-                *self.default_domain.write() = replacement;
+                let replacement = self
+                    .domain_registrations
+                    .read()
+                    .values()
+                    .filter(|candidate| !candidate.generation.is_retired())
+                    .min_by_key(|candidate| candidate.domain_id)
+                    .cloned();
+                *self.default_domain.write() = replacement
+                    .as_ref()
+                    .map(|registration| Arc::clone(&registration.domain));
+                *self.default_domain_registration.write() = replacement;
             }
+            self.retired_domain_ids.lock().remove(&domain);
         }
-        true
+        DomainRetirementFinalization::Complete
     }
 
     pub fn set_banner(&self, banner: Option<String>) {
         *self.banner.write() = banner;
     }
 
-    pub fn resolve_spawn_tab_domain(
+    fn domain_registration_is_current_locked(
         &self,
+        registration: &Arc<LiveDomainRegistration>,
+    ) -> bool {
+        !registration.generation.is_retired()
+            && !self
+                .retired_domain_ids
+                .lock()
+                .contains(&registration.domain_id)
+            && self
+                .domain_registrations
+                .read()
+                .get(&registration.domain_id)
+                .is_some_and(|current| Arc::ptr_eq(current, registration))
+            && self
+                .domain_registrations_by_name
+                .read()
+                .get(&registration.domain_name)
+                .is_some_and(|current| Arc::ptr_eq(current, registration))
+            && self
+                .domains
+                .read()
+                .get(&registration.domain_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &registration.domain))
+            && self
+                .domains_by_name
+                .read()
+                .get(&registration.domain_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &registration.domain))
+    }
+
+    /// Final-cut validation for a previously admitted non-cloneable domain
+    /// operation. The caller holds `domain_registration` through publication.
+    pub(crate) fn domain_operation_guard_is_current_locked(
+        &self,
+        expected: &DomainOperationGuard,
+    ) -> bool {
+        Arc::ptr_eq(&self.domain_owner_identity, &expected.owner_identity)
+            && self.domain_registration_is_current_locked(expected.registration())
+    }
+
+    /// Acquire an exact domain operation while `domain_registration` excludes
+    /// logical retirement and index replacement.
+    fn acquire_domain_operation_locked(
+        &self,
+        registration: Arc<LiveDomainRegistration>,
+    ) -> anyhow::Result<DomainOperationGuard> {
+        anyhow::ensure!(
+            self.domain_registration_is_current_locked(&registration),
+            "domain {} ({}) retired or changed exact registration during operation admission",
+            registration.domain_id,
+            registration.domain_name,
+        );
+        anyhow::ensure!(
+            registration.generation.try_acquire(),
+            "domain {} ({}) rejected operation admission",
+            registration.domain_id,
+            registration.domain_name,
+        );
+        Ok(DomainOperationGuard {
+            owner_identity: Arc::clone(&self.domain_owner_identity),
+            wakeup: Arc::clone(&self.domain_retirement_wakeup),
+            registration: Some(registration),
+        })
+    }
+
+    /// Resolve one spawn selector and acquire its non-cloneable exact
+    /// generation lease in the same serialized registration cut.
+    pub fn resolve_spawn_tab_domain(
+        self: &Arc<Self>,
         source_pane_id: Option<PaneId>,
         domain: &config::keyassignment::SpawnTabDomain,
-    ) -> anyhow::Result<Arc<dyn Domain>> {
-        let domain = match domain {
-            SpawnTabDomain::DefaultDomain => self.resolve_default_domain()?,
-            SpawnTabDomain::CurrentPaneDomain => match source_pane_id {
-                Some(pane_id) => {
-                    let (pane_domain_id, _window_id, _tab_id) = self
-                        .resolve_pane_id(pane_id)
-                        .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
-                    self.get_domain(pane_domain_id).ok_or_else(|| {
-                        anyhow!("pane_id {pane_id} resolved to missing domain id {pane_domain_id}")
-                    })?
-                }
-                None => self.resolve_default_domain()?,
-            },
+    ) -> anyhow::Result<DomainOperationGuard> {
+        if matches!(domain, SpawnTabDomain::CurrentPaneDomain) {
+            if let Some(pane_id) = source_pane_id {
+                let pane = self
+                    .capture_pane_operation(pane_id)
+                    .ok_or_else(|| anyhow!("pane_id {pane_id} is not a current registration"))?;
+                return self.resolve_spawn_tab_domain_for_operation(&pane, domain);
+            }
+        }
+
+        let _domain_registration = self.domain_registration.lock();
+        let registration = match domain {
+            SpawnTabDomain::DefaultDomain | SpawnTabDomain::CurrentPaneDomain => self
+                .default_domain_registration
+                .read()
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("no default domain configured"))?,
             SpawnTabDomain::DomainId(domain_id) => self
-                .get_domain(*domain_id)
-                .ok_or_else(|| anyhow!("domain id {} is invalid", domain_id))?,
+                .domain_registrations
+                .read()
+                .get(domain_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("domain id {domain_id} is invalid"))?,
             SpawnTabDomain::DomainName(name) => {
-                self.get_domain_by_name(&name).ok_or_else(|| {
+                let registration = self
+                    .domain_registrations_by_name
+                    .read()
+                    .get(name)
+                    .cloned();
+                registration.ok_or_else(|| {
                     let names: Vec<String> = self
-                        .domains_by_name
+                        .domain_registrations_by_name
                         .read()
                         .keys()
                         .map(|name| format!("\"{name}\""))
@@ -15211,15 +16137,15 @@ impl Mux {
                 })?
             }
         };
-        Ok(domain)
+        self.acquire_domain_operation_locked(registration)
     }
 
     fn resolve_spawn_tab_domain_for_operation(
-        &self,
+        self: &Arc<Self>,
         target: &PaneOperationGuard,
         domain: &config::keyassignment::SpawnTabDomain,
-    ) -> anyhow::Result<Arc<dyn Domain>> {
-        if !std::ptr::eq(target.owner().as_ref(), self) {
+    ) -> anyhow::Result<DomainOperationGuard> {
+        if !std::ptr::eq(target.owner().as_ref(), self.as_ref()) {
             anyhow::bail!(
                 "pane operation guard {} belongs to another mux",
                 target.pane_id()
@@ -15229,25 +16155,30 @@ impl Mux {
             SpawnTabDomain::CurrentPaneDomain => {
                 let domain_id = target.admitted_domain_id();
                 let _registration = self.domain_registration.lock();
-                anyhow::ensure!(
-                    !self.retired_domain_ids.lock().contains(&domain_id),
-                    "exact pane registration {} resolved to retired domain id {domain_id}",
-                    target.pane_id()
-                );
-                let current = self.domains.read().get(&domain_id).cloned().ok_or_else(|| {
+                let captured = target
+                    .admitted_domain()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| {
                     anyhow!(
-                        "exact pane registration {} resolved to missing domain id {domain_id}",
+                        "exact pane registration {} captured no live domain registration for id {domain_id}",
                         target.pane_id()
                     )
                 })?;
                 anyhow::ensure!(
-                    target
-                        .admitted_domain()
-                        .is_some_and(|expected| Weak::ptr_eq(expected, &Arc::downgrade(&current))),
-                    "exact pane registration {} resolved to a replaced domain id {domain_id}",
+                    captured.domain_id == domain_id,
+                    "exact pane registration {} captured mismatched domain id {} instead of {domain_id}",
+                    target.pane_id(),
+                    captured.domain_id,
+                );
+                anyhow::ensure!(
+                    self.domain_registrations
+                        .read()
+                        .get(&domain_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &captured)),
+                    "exact pane registration {} captured a replaced domain generation {domain_id}",
                     target.pane_id()
                 );
-                Ok(current)
+                self.acquire_domain_operation_locked(captured)
             }
             _ => self.resolve_spawn_tab_domain(None, domain),
         }
@@ -15596,12 +16527,16 @@ impl Mux {
             anyhow::bail!("client registration is no longer current");
         }
         let (domain_id, _src_window, _src_tab) = target.exact_location()?;
-        let domain = self.get_domain(domain_id).ok_or_else(|| {
-            anyhow!(
-                "domain {domain_id} of exact pane registration {} not found",
-                target.pane_id()
+        let domain = self
+            .resolve_spawn_tab_domain_for_operation(
+                &target,
+                &SpawnTabDomain::CurrentPaneDomain,
             )
-        })?;
+            .context("resolve exact move domain")?;
+        anyhow::ensure!(
+            domain.domain_id() == domain_id,
+            "move domain generation changed numeric identity during admission"
+        );
 
         if let Some(receipt) = domain
             .move_pane_to_new_tab(self, &target, window_id, workspace_for_new_window.clone())
@@ -15673,6 +16608,10 @@ impl Mux {
 
         let committed = {
             let _domain_registration = self.domain_registration.lock();
+            anyhow::ensure!(
+                self.domain_registration_is_current_locked(domain.registration()),
+                "move domain {domain_id} retired before final mux commit"
+            );
             let _pane_registration = self.pane_registration.lock();
             let mut authority = self.pane_authority.lock();
             let mut tabs = self.tabs.write();
@@ -16153,6 +17092,117 @@ mod tests {
         crate::MUX_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+    }
+
+    fn wait_for_domain_retirement(mux: &Mux, domain_id: DomainId) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mux.domain_retirements.contains(domain_id) {
+            assert!(
+                Instant::now() < deadline,
+                "domain {domain_id} retirement did not reach terminal cleanup"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn wait_for_domain_retirement_with_executor(
+        mux: &Mux,
+        domain_id: DomainId,
+        executor: &promise::spawn::SimpleExecutor,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mux.domain_retirements.contains(domain_id) {
+            while executor
+                .try_tick()
+                .expect("domain retirement test executor must stay on its owner thread")
+            {}
+            assert!(
+                Instant::now() < deadline,
+                "domain {domain_id} retirement did not complete after its main-thread cleanup"
+            );
+            std::thread::yield_now();
+        }
+        while executor
+            .try_tick()
+            .expect("domain retirement test executor must drain on its owner thread")
+        {}
+    }
+
+    fn wait_for_domain_retirement_transient_failure(mux: &Mux, prior: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mux
+            .domain_retirement_transient_failures
+            .load(Ordering::Acquire)
+            == prior
+        {
+            assert!(
+                Instant::now() < deadline,
+                "domain retirement worker did not report the injected transient failure"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn wait_for_domain_retirement_quarantine(mux: &Mux, domain_id: DomainId) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pending = mux.pending_domain_retirements.lock();
+            let quarantined = pending.registrations.iter().any(|retirement| {
+                retirement.registration.domain_id == domain_id
+                    && matches!(
+                        &retirement.disposition,
+                        DomainRetirementDisposition::Quarantined(_)
+                    )
+            });
+            let worker_running = pending.worker_running;
+            drop(pending);
+            if quarantined && !worker_running {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "domain {domain_id} retirement did not enter terminal quarantine"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn wait_for_domain_pane_cleanup_barrier(mux: &Mux, domain_id: DomainId) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pending = mux.pending_domain_retirements.lock();
+            let awaiting = pending.registrations.iter().any(|retirement| {
+                retirement.registration.domain_id == domain_id
+                    && matches!(
+                        &retirement.disposition,
+                        DomainRetirementDisposition::AwaitingPaneCleanup(markers)
+                            if !markers.is_empty()
+                    )
+            });
+            drop(pending);
+            if awaiting {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "domain {domain_id} retirement did not reach its pane-cleanup barrier"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn wait_for_domain_retirement_worker_idle(mux: &Mux) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !mux.pending_domain_retirements.lock().worker_running {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "domain retirement worker did not release its running flag"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -16692,6 +17742,11 @@ mod tests {
         after_registration:
             Mutex<Option<Box<dyn FnOnce(&Arc<Mux>, &Arc<dyn Pane>) + Send + 'static>>>,
         supports_floating_spawn: bool,
+        panic_in_drop: bool,
+        drop_count: Option<Arc<AtomicUsize>>,
+        drop_on_retirement_worker: Option<Arc<AtomicBool>>,
+        drop_entered: Option<std::sync::mpsc::SyncSender<()>>,
+        drop_release: Option<StdMutex<std::sync::mpsc::Receiver<()>>>,
     }
 
     impl GuardedMutationTestDomain {
@@ -16701,6 +17756,11 @@ mod tests {
                 spawned_panes: Mutex::new(next_spawned_pane.into_iter().collect()),
                 after_registration: Mutex::new(None),
                 supports_floating_spawn: true,
+                panic_in_drop: false,
+                drop_count: None,
+                drop_on_retirement_worker: None,
+                drop_entered: None,
+                drop_release: None,
             }
         }
 
@@ -16710,6 +17770,11 @@ mod tests {
                 spawned_panes: Mutex::new(spawned_panes.into()),
                 after_registration: Mutex::new(None),
                 supports_floating_spawn: true,
+                panic_in_drop: false,
+                drop_count: None,
+                drop_on_retirement_worker: None,
+                drop_entered: None,
+                drop_release: None,
             }
         }
 
@@ -16719,6 +17784,11 @@ mod tests {
                 spawned_panes: Mutex::new(VecDeque::from([next_spawned_pane])),
                 after_registration: Mutex::new(None),
                 supports_floating_spawn: false,
+                panic_in_drop: false,
+                drop_count: None,
+                drop_on_retirement_worker: None,
+                drop_entered: None,
+                drop_release: None,
             }
         }
 
@@ -16731,6 +17801,11 @@ mod tests {
                 spawned_panes: Mutex::new(VecDeque::from([next_spawned_pane])),
                 after_registration: Mutex::new(Some(Box::new(after_registration))),
                 supports_floating_spawn: true,
+                panic_in_drop: false,
+                drop_count: None,
+                drop_on_retirement_worker: None,
+                drop_entered: None,
+                drop_release: None,
             }
         }
 
@@ -16740,6 +17815,72 @@ mod tests {
                 spawned_panes: Mutex::new(VecDeque::new()),
                 after_registration: Mutex::new(None),
                 supports_floating_spawn: true,
+                panic_in_drop: false,
+                drop_count: None,
+                drop_on_retirement_worker: None,
+                drop_entered: None,
+                drop_release: None,
+            }
+        }
+
+        fn panicking_in_drop(domain_id: DomainId, drop_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                domain_id,
+                spawned_panes: Mutex::new(VecDeque::new()),
+                after_registration: Mutex::new(None),
+                supports_floating_spawn: true,
+                panic_in_drop: true,
+                drop_count: Some(drop_count),
+                drop_on_retirement_worker: None,
+                drop_entered: None,
+                drop_release: None,
+            }
+        }
+
+        fn blocking_panicking_in_drop(
+            domain_id: DomainId,
+            drop_count: Arc<AtomicUsize>,
+            drop_on_retirement_worker: Arc<AtomicBool>,
+            drop_entered: std::sync::mpsc::SyncSender<()>,
+            drop_release: std::sync::mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                domain_id,
+                spawned_panes: Mutex::new(VecDeque::new()),
+                after_registration: Mutex::new(None),
+                supports_floating_spawn: true,
+                panic_in_drop: true,
+                drop_count: Some(drop_count),
+                drop_on_retirement_worker: Some(drop_on_retirement_worker),
+                drop_entered: Some(drop_entered),
+                drop_release: Some(StdMutex::new(drop_release)),
+            }
+        }
+    }
+
+    impl Drop for GuardedMutationTestDomain {
+        fn drop(&mut self) {
+            if let Some(drop_count) = &self.drop_count {
+                drop_count.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(drop_on_retirement_worker) = &self.drop_on_retirement_worker {
+                let current = std::thread::current();
+                drop_on_retirement_worker.store(
+                    current.name() == Some("mux-domain-retirement"),
+                    Ordering::SeqCst,
+                );
+            }
+            if let Some(drop_entered) = &self.drop_entered {
+                let _ = drop_entered.send(());
+            }
+            if let Some(drop_release) = &self.drop_release {
+                let _ = drop_release
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_secs(5));
+            }
+            if self.panic_in_drop {
+                panic!("intentional domain drop panic for worker recovery");
             }
         }
     }
@@ -16794,6 +17935,9 @@ mod tests {
             match self.domain_id {
                 1 => "guarded-mutation-test",
                 2 => "guarded-mutation-foreign-test",
+                3 => "guarded-mutation-third-test",
+                4 => "guarded-mutation-fourth-test",
+                5 => "guarded-mutation-fifth-test",
                 _ => "guarded-mutation-other-test",
             }
         }
@@ -19385,9 +20529,10 @@ mod tests {
             .generation;
 
         assert!(mux.retired_domain_ids.lock().insert(domain.domain_id()));
-        assert!(mux
-            .get_domain(domain.domain_id())
-            .is_some_and(|current| Arc::ptr_eq(&current, &domain)));
+        assert!(
+            mux.get_domain(domain.domain_id()).is_none(),
+            "public lookup must not mint callback authority past the retirement fence"
+        );
         assert_eq!(
             mux.resolve_pane_id(pane.pane_id()),
             None,
@@ -25162,8 +26307,14 @@ mod tests {
 
     #[test]
     fn resolve_spawn_tab_domain_reports_missing_default_domain() {
-        let mux = Mux::new(None);
+        let mux = Arc::new(Mux::new(None));
 
+        assert_eq!(
+            mux.default_domain()
+                .map(|domain| domain.domain_id())
+                .map_err(|error| error.to_string()),
+            Err("no default domain configured".to_string()),
+        );
         assert_eq!(
             mux.resolve_spawn_tab_domain(None, &SpawnTabDomain::DefaultDomain)
                 .map(|domain| domain.domain_id())
@@ -25176,6 +26327,642 @@ mod tests {
                 .map_err(|error| error.to_string()),
             Err("no default domain configured".to_string()),
         );
+    }
+
+    #[test]
+    fn domain_selectors_hold_exact_generation_and_close_all_admission_on_retirement() {
+        let global_guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+
+        for (case, selector) in [
+            (0, SpawnTabDomain::DefaultDomain),
+            (1, SpawnTabDomain::DomainId(1)),
+            (
+                2,
+                SpawnTabDomain::DomainName("guarded-mutation-test".to_string()),
+            ),
+            (3, SpawnTabDomain::CurrentPaneDomain),
+        ] {
+            let domain: Arc<dyn Domain> =
+                Arc::new(GuardedMutationTestDomain::for_domain(1));
+            let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+            let (source_pane_id, source_kills) = if case == 3 {
+                let (pane, kills) =
+                    KillCountingPane::new(260usize + case, test_size());
+                register_attached_test_pane(&global_guard, &mux, &pane);
+                (Some(pane.pane_id()), Some(kills))
+            } else {
+                (None, None)
+            };
+
+            let guard = mux
+                .resolve_spawn_tab_domain(source_pane_id, &selector)
+                .expect("selector must acquire its exact live generation");
+            let registration = mux
+                .domain_registrations
+                .read()
+                .get(&1)
+                .cloned()
+                .expect("exact domain registration");
+            assert_eq!(registration.generation.active_operations(), 1);
+            assert!(!format!("{guard:?}").contains("0x"));
+
+            assert!(mux.domain_was_detached_if_same(&domain));
+            assert!(registration.generation.is_retired());
+            assert_eq!(registration.generation.active_operations(), 1);
+            assert!(mux.get_domain(1).is_none());
+            assert!(mux.default_domain().is_err());
+            assert!(mux
+                .get_domain_by_name("guarded-mutation-test")
+                .is_none());
+            assert!(mux.iter_domains().is_empty());
+            for rejected in [
+                SpawnTabDomain::DefaultDomain,
+                SpawnTabDomain::DomainId(1),
+                SpawnTabDomain::DomainName("guarded-mutation-test".to_string()),
+                SpawnTabDomain::CurrentPaneDomain,
+            ] {
+                assert!(
+                    mux.resolve_spawn_tab_domain(source_pane_id, &rejected)
+                        .is_err(),
+                    "logical retirement must close every selector immediately"
+                );
+            }
+            assert!(mux.domains.read().get(&1).is_some_and(|current| {
+                Arc::ptr_eq(current, &domain)
+            }));
+            assert!(mux
+                .domain_registrations
+                .read()
+                .get(&1)
+                .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+            if let Some(kills) = source_kills.as_ref() {
+                assert_eq!(
+                    kills.load(Ordering::SeqCst),
+                    0,
+                    "destructive pane callbacks must wait for the domain guard"
+                );
+            }
+
+            let successor: Arc<dyn Domain> =
+                Arc::new(GuardedMutationTestDomain::for_domain(1));
+            assert!(matches!(
+                mux.add_domain(&successor),
+                Err(DomainRegistrationError::RetiredIdentifier { .. })
+            ));
+
+            drop(guard);
+            wait_for_domain_retirement_with_executor(&mux, 1, &executor);
+            assert!(!mux.retired_domain_ids.lock().contains(&1));
+            assert_eq!(mux.domain_retirements.len(), 0);
+            assert!(!mux.domains.read().contains_key(&1));
+            assert!(!mux.domain_registrations.read().contains_key(&1));
+            mux.add_domain(&successor)
+                .expect("same ID may be reused after exact cleanup quiesces");
+            assert!(mux
+                .get_domain(1)
+                .is_some_and(|current| current.is_same_domain(&successor)));
+        }
+    }
+
+    #[test]
+    fn domain_retirement_worker_spawn_failure_has_zero_logical_mutation() {
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let registration = mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("exact domain registration");
+        mux.fail_next_domain_retirement_worker_spawn
+            .store(true, Ordering::Release);
+
+        assert!(!mux.domain_was_detached_if_same(&domain));
+        assert!(!registration.generation.is_retired());
+        assert_eq!(registration.generation.active_operations(), 0);
+        assert!(!mux.retired_domain_ids.lock().contains(&1));
+        assert_eq!(mux.domain_retirements.len(), 0);
+        let pending = mux.pending_domain_retirements.lock();
+        assert!(pending.registrations.is_empty());
+        assert!(!pending.worker_running);
+        drop(pending);
+        assert!(mux
+            .get_domain(1)
+            .is_some_and(|current| current.is_same_domain(&domain)));
+        assert!(
+            mux.default_domain()
+                .is_ok_and(|current| current.is_same_domain(&domain)),
+            "worker-start failure must leave the default admission projection unchanged"
+        );
+        assert!(mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+    }
+
+    #[test]
+    fn same_id_domain_reuse_waits_for_exact_pane_cleanup_quiescence() {
+        let global_guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let (pane, kills) = KillCountingPane::new(267, test_size());
+        register_attached_test_pane(&global_guard, &mux, &pane);
+        let pane_registration = mux
+            .capture_pane_registration(&pane)
+            .expect("attached pane must retain an exact generation");
+        let pane_operation = pane_registration
+            .operation_guard(&mux)
+            .expect("admit pane operation before domain retirement");
+
+        assert!(mux.domain_was_detached_if_same(&domain));
+        wait_for_domain_pane_cleanup_barrier(&mux, 1);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        assert!(mux.domain_retirements.contains(1));
+        assert!(mux.retired_domain_ids.lock().contains(&1));
+        assert!(mux.domains.read().contains_key(&1));
+
+        let successor: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        assert!(matches!(
+            mux.add_domain(&successor),
+            Err(DomainRegistrationError::RetiredIdentifier { .. })
+        ));
+
+        drop(pane_operation);
+        wait_for_domain_retirement_with_executor(&mux, 1, &executor);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        mux.add_domain(&successor)
+            .expect("same domain ID may be reused only after pane cleanup quiesces");
+    }
+
+    #[test]
+    fn domain_guard_drops_registration_before_publishing_cleanup_readiness() {
+        let _global_guard = global_test_lock();
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let guard = mux
+            .get_domain(1)
+            .expect("admit exact domain operation before retirement");
+        let exact_registration = mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("exact domain registration");
+        let generation = Arc::clone(&exact_registration.generation);
+        assert_eq!(generation.active_operations(), 1);
+        assert!(mux.domain_was_detached_if_same(&domain));
+
+        let strong_count_before_drop = Arc::strong_count(&exact_registration);
+        let (registration_disposed_tx, registration_disposed_rx) =
+            std::sync::mpsc::sync_channel(0);
+        let (permit_release_tx, permit_release_rx) = std::sync::mpsc::sync_channel(0);
+        generation.install_operation_release_barrier(
+            registration_disposed_tx,
+            permit_release_rx,
+        );
+        let dropper = std::thread::spawn(move || drop(guard));
+        registration_disposed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("domain guard did not reach its post-registration-drop barrier");
+
+        assert_eq!(
+            Arc::strong_count(&exact_registration),
+            strong_count_before_drop - 1,
+            "the guard's strong registration owner must be gone before release"
+        );
+        assert_eq!(
+            generation.active_operations(),
+            1,
+            "the generation operation must remain active at the disposal barrier"
+        );
+        assert!(!generation.cleanup_is_ready());
+        let successor: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        assert!(matches!(
+            mux.add_domain(&successor),
+            Err(DomainRegistrationError::RetiredIdentifier { .. })
+        ));
+
+        drop(exact_registration);
+        drop(domain);
+        permit_release_tx
+            .send(())
+            .expect("release the blocked domain operation drop");
+        dropper
+            .join()
+            .expect("domain operation drop must finish without panicking");
+        wait_for_domain_retirement(&mux, 1);
+        wait_for_domain_retirement_worker_idle(&mux);
+        mux.add_domain(&successor)
+            .expect("same ID becomes admissible only after ordered cleanup");
+    }
+
+    #[test]
+    fn blocking_panicking_domain_drop_runs_on_retirement_worker_and_keeps_fence() {
+        let _global_guard = global_test_lock();
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let drop_on_retirement_worker = Arc::new(AtomicBool::new(false));
+        let (drop_entered_tx, drop_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (drop_release_tx, drop_release_rx) = std::sync::mpsc::sync_channel(0);
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::blocking_panicking_in_drop(
+                1,
+                Arc::clone(&drop_count),
+                Arc::clone(&drop_on_retirement_worker),
+                drop_entered_tx,
+                drop_release_rx,
+            ));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let guard = mux
+            .get_domain(1)
+            .expect("admit exact domain operation before retirement");
+
+        assert!(mux.domain_was_detached_if_same(&domain));
+        drop(domain);
+        drop(guard);
+        drop_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("final domain destructor did not enter its blocking barrier");
+
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        assert!(drop_on_retirement_worker.load(Ordering::SeqCst));
+        assert!(mux.domain_retirements.contains(1));
+        assert!(mux.pending_domain_retirements.lock().worker_running);
+        let successor: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        assert!(matches!(
+            mux.add_domain(&successor),
+            Err(DomainRegistrationError::RetiredIdentifier { .. })
+        ));
+
+        drop_release_tx
+            .send(())
+            .expect("release the worker-owned panicking domain destructor");
+        wait_for_domain_retirement(&mux, 1);
+        wait_for_domain_retirement_worker_idle(&mux);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        mux.add_domain(&successor)
+            .expect("recovered worker panic must release the exact same-ID fence");
+    }
+
+    #[test]
+    fn panicking_domain_drops_do_not_wedge_the_shared_retirement_worker() {
+        let _global_guard = global_test_lock();
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let first: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::panicking_in_drop(
+            1,
+            Arc::clone(&drop_count),
+        ));
+        let second: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::panicking_in_drop(
+            2,
+            Arc::clone(&drop_count),
+        ));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&first))));
+        mux.add_domain(&second)
+            .expect("register second panicking-drop domain");
+        let first_barrier = mux.get_domain(1).expect("admit first retirement barrier");
+        let second_barrier = mux.get_domain(2).expect("admit second retirement barrier");
+
+        assert!(mux.domain_was_detached_if_same(&first));
+        assert!(mux.domain_was_detached_if_same(&second));
+        drop(first);
+        drop(second);
+        drop(first_barrier);
+        drop(second_barrier);
+
+        wait_for_domain_retirement(&mux, 1);
+        wait_for_domain_retirement(&mux, 2);
+        wait_for_domain_retirement_worker_idle(&mux);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 2);
+        let pending = mux.pending_domain_retirements.lock();
+        assert!(pending.registrations.is_empty());
+        assert!(!pending.worker_running);
+        drop(pending);
+
+        for domain_id in [1, 2] {
+            let successor: Arc<dyn Domain> =
+                Arc::new(GuardedMutationTestDomain::for_domain(domain_id));
+            mux.add_domain(&successor)
+                .expect("post-panic worker cleanup must release the exact same-ID fence");
+        }
+    }
+
+    #[test]
+    fn missing_domain_authority_directory_quarantines_without_mutation() {
+        let global_guard = global_test_lock();
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let (pane, kills) = KillCountingPane::new(268, test_size());
+        register_attached_test_pane(&global_guard, &mux, &pane);
+        let exact_registration = mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("exact domain registration before planted corruption");
+        let barrier = mux
+            .get_domain(1)
+            .expect("hold retirement before planting missing authority");
+        assert!(mux.domain_was_detached_if_same(&domain));
+
+        {
+            let _pane_registration = mux.pane_registration.lock();
+            let removed = mux
+                .pane_authority
+                .lock()
+                .registrations_by_domain
+                .remove(&1);
+            assert!(removed.is_some());
+        }
+        drop(barrier);
+        wait_for_domain_retirement_quarantine(&mux, 1);
+
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        assert!(mux
+            .get_pane(268)
+            .is_some_and(|current| Arc::ptr_eq(&current, &pane)));
+        assert!(mux.domain_retirements.contains(1));
+        assert!(mux.retired_domain_ids.lock().contains(&1));
+        assert!(mux.get_domain(1).is_none());
+        assert!(mux
+            .domains
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
+        assert!(mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &exact_registration)));
+        let successor: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        assert!(matches!(
+            mux.add_domain(&successor),
+            Err(DomainRegistrationError::RetiredIdentifier { .. })
+        ));
+        let pending = mux.pending_domain_retirements.lock();
+        assert!(matches!(
+            &pending.registrations[0].disposition,
+            DomainRetirementDisposition::Quarantined(
+                "live domain panes have no authority directory"
+            )
+        ));
+    }
+
+    #[test]
+    fn omitted_domain_authority_pane_quarantines_without_mutation() {
+        let global_guard = global_test_lock();
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let (first, first_kills) = KillCountingPane::new(269, test_size());
+        let (second, second_kills) = KillCountingPane::new(270, test_size());
+        register_attached_test_pane(&global_guard, &mux, &first);
+        register_attached_test_pane(&global_guard, &mux, &second);
+        let exact_registration = mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("exact domain registration before planted corruption");
+        let omitted_pane_id = second.pane_id();
+        let barrier = mux
+            .get_domain(1)
+            .expect("hold retirement before planting omitted pane authority");
+        assert!(mux.domain_was_detached_if_same(&domain));
+
+        {
+            let _pane_registration = mux.pane_registration.lock();
+            let mut authority = mux.pane_authority.lock();
+            let removed = authority
+                .registrations_by_domain
+                .get_mut(&1)
+                .expect("domain authority bucket")
+                .pane_registrations
+                .remove(&omitted_pane_id);
+            assert!(removed.is_some());
+        }
+        drop(barrier);
+        wait_for_domain_retirement_quarantine(&mux, 1);
+
+        assert_eq!(first_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(second_kills.load(Ordering::SeqCst), 0);
+        assert!(mux
+            .get_pane(269)
+            .is_some_and(|current| Arc::ptr_eq(&current, &first)));
+        assert!(mux
+            .get_pane(270)
+            .is_some_and(|current| Arc::ptr_eq(&current, &second)));
+        assert!(mux.domain_retirements.contains(1));
+        assert!(mux.retired_domain_ids.lock().contains(&1));
+        assert!(mux.get_domain(1).is_none());
+        assert!(mux
+            .domains
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
+        assert!(mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &exact_registration)));
+        let successor: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        assert!(matches!(
+            mux.add_domain(&successor),
+            Err(DomainRegistrationError::RetiredIdentifier { .. })
+        ));
+        let pending = mux.pending_domain_retirements.lock();
+        assert!(matches!(
+            &pending.registrations[0].disposition,
+            DomainRetirementDisposition::Quarantined(
+                "live pane and domain-directory cardinalities differ"
+            )
+        ));
+    }
+
+    #[test]
+    fn transient_domain_snapshot_failure_stays_pending_then_retries_to_completion() {
+        let global_guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let (pane, kills) = KillCountingPane::new(264, test_size());
+        register_attached_test_pane(&global_guard, &mux, &pane);
+
+        let wake_gate = mux.domain_retirement_wakeup.gate.lock();
+        let prior_failures = mux
+            .domain_retirement_transient_failures
+            .load(Ordering::Acquire);
+        mux.fail_next_domain_retirement_snapshot_reserve
+            .store(true, Ordering::Release);
+        assert!(mux.domain_was_detached_if_same(&domain));
+        wait_for_domain_retirement_transient_failure(&mux, prior_failures);
+
+        assert!(mux.domain_retirements.contains(1));
+        assert!(mux.retired_domain_ids.lock().contains(&1));
+        assert!(mux.domains.read().contains_key(&1));
+        assert!(mux.domain_registrations.read().contains_key(&1));
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        let pending = mux.pending_domain_retirements.lock();
+        assert_eq!(pending.registrations.len(), 1);
+        assert!(matches!(
+            &pending.registrations[0].disposition,
+            DomainRetirementDisposition::Pending
+        ));
+        drop(pending);
+
+        drop(wake_gate);
+        mux.wake_domain_retirement_worker();
+        wait_for_domain_retirement_with_executor(&mux, 1, &executor);
+        assert!(!mux.retired_domain_ids.lock().contains(&1));
+        assert!(!mux.domain_registrations.read().contains_key(&1));
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn terminal_domain_cleanup_invariant_failure_is_explicitly_quarantined() {
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let barrier = mux
+            .get_domain(1)
+            .expect("hold cleanup while planting exact-index corruption");
+        assert!(mux.domain_was_detached_if_same(&domain));
+        assert!(mux.domains.write().remove(&1).is_some());
+
+        drop(barrier);
+        wait_for_domain_retirement_quarantine(&mux, 1);
+
+        assert!(mux.domain_retirements.contains(1));
+        assert!(mux.retired_domain_ids.lock().contains(&1));
+        assert!(mux.get_domain(1).is_none());
+        let pending = mux.pending_domain_retirements.lock();
+        assert_eq!(pending.registrations.len(), 1);
+        assert!(matches!(
+            &pending.registrations[0].disposition,
+            DomainRetirementDisposition::Quarantined(
+                "domain identity changed during destructive teardown"
+            )
+        ));
+        assert!(!pending.worker_running);
+    }
+
+    #[test]
+    fn dropping_last_domain_guard_under_domain_lock_only_notifies_worker() {
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let guard = mux
+            .get_domain(1)
+            .expect("admit exact domain operation before retirement");
+        let registration = mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("exact domain registration");
+        assert!(mux.domain_was_detached_if_same(&domain));
+
+        let domain_lock = mux.domain_registration.lock();
+        drop(guard);
+        assert_eq!(registration.generation.active_operations(), 0);
+        assert!(registration.generation.cleanup_is_ready());
+        assert!(mux.domains.read().contains_key(&1));
+        assert!(mux.domain_retirements.contains(1));
+        drop(domain_lock);
+
+        wait_for_domain_retirement(&mux, 1);
+    }
+
+    #[test]
+    fn default_domain_retirement_selects_minimum_live_domain_id() {
+        for insertion_order in [[3, 2], [2, 3]] {
+            let default: Arc<dyn Domain> =
+                Arc::new(GuardedMutationTestDomain::for_domain(5));
+            let mux = Arc::new(Mux::new(Some(Arc::clone(&default))));
+            for domain_id in insertion_order {
+                let candidate: Arc<dyn Domain> =
+                    Arc::new(GuardedMutationTestDomain::for_domain(domain_id));
+                mux.add_domain(&candidate)
+                    .expect("register deterministic fallback candidate");
+            }
+
+            let retirement_barrier = mux
+                .default_domain()
+                .expect("admit the exact default generation before retirement");
+            assert_eq!(retirement_barrier.domain_id(), 5);
+            assert!(mux.domain_was_detached_if_same(&default));
+            assert_eq!(
+                mux.default_domain()
+                    .expect("logical retirement must publish a live fallback")
+                    .domain_id(),
+                2
+            );
+            assert!(mux.domain_retirements.contains(5));
+            drop(retirement_barrier);
+            wait_for_domain_retirement(&mux, 5);
+            assert_eq!(
+                mux.default_domain()
+                    .expect("fallback remains live after cleanup")
+                    .domain_id(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn operation_started_after_logical_retirement_invokes_no_domain_callback() {
+        let global_guard = global_test_lock();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let (target, target_kills) = KillCountingPane::new(265, test_size());
+        let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &target);
+        let (spawned, spawned_kills) = KillCountingPane::new(266, test_size());
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(Some(spawned)));
+        mux.add_domain(&domain).expect("register test domain");
+        let retirement_barrier = mux
+            .get_domain(1)
+            .expect("hold one pre-retirement lease as a cleanup barrier");
+        let target = mux
+            .capture_floating_spawn_target(window_id)
+            .expect("capture exact destination before retirement");
+
+        assert!(mux.domain_was_detached_if_same(&domain));
+        let result = promise::spawn::block_on(mux.spawn_floating_pane(
+            target,
+            FloatingPaneRect {
+                left: 0,
+                top: 0,
+                width: 10,
+                height: 5,
+            },
+            None,
+            None,
+            SpawnTabDomain::DomainId(1),
+            Arc::new(TermConfig::new()),
+            None,
+        ));
+
+        assert!(result.is_err());
+        assert_eq!(spawned_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(target_kills.load(Ordering::SeqCst), 0);
+        assert!(mux
+            .get_tab(tab.tab_id())
+            .is_some_and(|current| Arc::ptr_eq(&current, &tab)));
+        assert_eq!(tab.iter_all_panes().len(), 1);
+
+        drop(retirement_barrier);
+        wait_for_domain_retirement_with_executor(&mux, 1, &executor);
     }
 
     #[test]
@@ -27894,7 +29681,7 @@ mod tests {
     fn detached_domain_is_removed_from_domain_maps() {
         let default_domain: Arc<dyn Domain> =
             Arc::new(domain::LocalDomain::new("default-test-domain").unwrap());
-        let mux = Mux::new(Some(Arc::clone(&default_domain)));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
 
         let detached_domain: Arc<dyn Domain> =
             Arc::new(domain::LocalDomain::new("detached-test-domain").unwrap());
@@ -27911,13 +29698,14 @@ mod tests {
         assert!(mux.get_domain(detached_id).is_none());
         assert!(mux.get_domain_by_name(&detached_name).is_none());
         assert!(mux.get_domain(default_domain.domain_id()).is_some());
+        wait_for_domain_retirement(&mux, detached_id);
     }
 
     #[test]
     fn detaching_default_domain_promotes_remaining_domain() {
         let default_domain: Arc<dyn Domain> =
             Arc::new(domain::LocalDomain::new("default-domain-to-detach").unwrap());
-        let mux = Mux::new(Some(Arc::clone(&default_domain)));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
 
         let replacement_domain: Arc<dyn Domain> =
             Arc::new(domain::LocalDomain::new("replacement-domain").unwrap());
@@ -27929,14 +29717,20 @@ mod tests {
 
         assert!(mux.get_domain(default_domain.domain_id()).is_none());
         assert!(mux.get_domain(replacement_id).is_some());
-        assert_eq!(mux.default_domain().domain_id(), replacement_id);
+        wait_for_domain_retirement(&mux, default_domain.domain_id());
+        assert_eq!(
+            mux.default_domain()
+                .expect("remaining domain must be the live default")
+                .domain_id(),
+            replacement_id
+        );
     }
 
     #[test]
     fn detaching_tmux_domain_eagerly_removes_notification_subscriber() {
         let default_domain: Arc<dyn Domain> =
             Arc::new(domain::LocalDomain::new("default-domain-tmux-detach-test").unwrap());
-        let mux = Mux::new(Some(default_domain));
+        let mux = Arc::new(Mux::new(Some(default_domain)));
 
         let tmux_domain =
             Arc::new(TmuxDomain::new(0).expect("start tmux test domain I/O supervisor"));
@@ -27953,6 +29747,7 @@ mod tests {
         mux.domain_was_detached(tmux_domain_id);
 
         assert!(mux.get_domain(tmux_domain_id).is_none());
+        wait_for_domain_retirement(&mux, tmux_domain_id);
         assert!(
             !mux.unsubscribe(sub_id),
             "tmux notification subscriber should be removed eagerly on detach"

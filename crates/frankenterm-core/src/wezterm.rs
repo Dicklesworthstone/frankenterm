@@ -3447,9 +3447,13 @@ impl WeztermClient {
             Some("RenameWorkspace") => MuxOperation::RenameWorkspace,
             Some("EraseScrollbackRequest") => MuxOperation::EraseScrollback,
             Some("SearchScrollbackRequest") => MuxOperation::SearchScrollback,
-            Some("SendKeyDown" | "SendKeyUp" | "SendKeyDownTracedV1" | "ReliableKeyEventV1") => {
-                MuxOperation::KeyInput
-            }
+            Some(
+                "SendKeyDown"
+                | "SendKeyUp"
+                | "SendKeyDownTracedV1"
+                | "ReliableKeyEventV1"
+                | "ReliableKeyEventTracedV1",
+            ) => MuxOperation::KeyInput,
             Some("SendMouseEvent") => MuxOperation::MouseInput,
             Some("GetImageCell") => MuxOperation::ReadImage,
             Some("GetPaneDirection") => MuxOperation::ReadPaneDirection,
@@ -7507,6 +7511,17 @@ mod tests {
                 spec.name,
             );
         }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn traced_reliable_key_rejections_retain_key_input_operation_identity() {
+        assert_eq!(
+            WeztermClient::mux_operation_from_request_ident(
+                <codec::ReliableKeyEventTracedV1 as codec::PduWireIdent>::IDENT,
+            ),
+            MuxOperation::KeyInput,
+        );
     }
 
     #[cfg(all(feature = "vendored", unix))]

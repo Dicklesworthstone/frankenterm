@@ -1,22 +1,26 @@
 use crate::activity::Activity;
-use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState};
+use crate::domain::{Domain, DomainId, DomainState, alloc_domain_id};
 use crate::localpane::LocalPane;
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    DetachClient, KillPane, ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand,
-    TmuxCommandClass, TmuxCommandPreparation, TmuxConditionalCommit, TmuxConditionalCommitIntent,
-    TmuxConditionalCommitLease, TmuxConditionalCommitTarget, TmuxPreparationPrerequisite,
+    CompensateSplitPane, DetachClient, ListAllPanes, ListAllWindows, ListCommands,
+    ReconcileSplitPane, SplitPane, TmuxCommand, TmuxCommandClass, TmuxCommandPreparation,
+    TmuxConditionalCommit, TmuxConditionalCommitIntent, TmuxConditionalCommitLease,
+    TmuxConditionalCommitTarget, TmuxPreparationPrerequisite, TmuxSplitFailureAuthority,
 };
 use crate::tmux_pty::TmuxChildState;
 use crate::window::WindowId;
-use crate::{Mux, MuxWindowBuilder, PaneOperationGuard, SplitCommitReceipt, TopologyRevision};
+use crate::{
+    DomainOperationGuard, Mux, MuxWindowBuilder, PaneOperationGuard, SplitCommitReceipt,
+    TopologyRevision,
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use config::configuration;
-use crossbeam::channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam::channel::{Receiver, Sender, TrySendError, bounded};
 use filedescriptor::FileDescriptor;
-use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
 use frankenterm_term::TerminalSize;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -26,7 +30,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fmt;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use termwiz::tmux_cc::*;
@@ -400,6 +404,10 @@ impl TmuxBacklog {
         }
     }
 
+    fn extend_pane_id_snapshot(&self, snapshot: &mut HashSet<TmuxPaneId>) {
+        snapshot.extend(self.entries.iter().map(|(pane_id, _)| *pane_id));
+    }
+
     pub(crate) fn clear(&mut self) {
         self.resync_all = false;
         self.clear_entries();
@@ -583,6 +591,11 @@ pub(crate) const NOTIFICATION_INTENT_MAX_REORDER_GAP: usize = 4_096;
 /// bounded tombstone prevents late output for a detached pane from being
 /// mistaken for pre-attach output for a future pane.
 pub(crate) const RETIRED_PANE_TOMBSTONE_LIMIT: usize = 65_536;
+
+/// Retain a bounded causal record when malformed control output makes an
+/// abandoned split identity ambiguous.  Ambiguity is never permission to kill
+/// a pane that may predate the request.
+const TMUX_SPLIT_QUARANTINE_LIMIT: usize = 1_024;
 
 /// Bound single-flight pane IDs retained by one domain output lane. This is
 /// deliberately independent of the much smaller unknown-pane backlog
@@ -856,11 +869,250 @@ impl TmuxRemoteSplitStateCell {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxSplitCleanupStatus {
+    Armed,
+    Claimed,
+    Completed,
+    Failed,
+}
+
+/// Exact, one-shot authority to compensate a remotely-created split pane.
+///
+/// The mutex is also the final publication fence: local topology publication
+/// retains an `Armed` guard through its structural cut, while terminalization
+/// and reservation drop must acquire the same guard before claiming the kill.
+#[derive(Debug)]
+pub(crate) struct TmuxSplitCleanupObligation {
+    owner: Weak<TmuxDomainState>,
+    request_id: u64,
+    pane_id: TmuxPaneId,
+    child_state: Arc<TmuxChildState>,
+    status: Mutex<TmuxSplitCleanupStatus>,
+}
+
+impl TmuxSplitCleanupObligation {
+    fn new(
+        owner: &Arc<TmuxDomainState>,
+        request_id: u64,
+        pane_id: TmuxPaneId,
+        child_state: Arc<TmuxChildState>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            owner: Arc::downgrade(owner),
+            request_id,
+            pane_id,
+            child_state,
+            status: Mutex::new(TmuxSplitCleanupStatus::Armed),
+        })
+    }
+
+    pub(crate) fn begin_publication(&self) -> anyhow::Result<TmuxSplitCleanupPublication<'_>> {
+        let status = self.status.lock();
+        anyhow::ensure!(
+            *status == TmuxSplitCleanupStatus::Armed,
+            "tmux split cleanup for pane {} changed to {:?} before local publication",
+            self.pane_id,
+            *status
+        );
+        Ok(TmuxSplitCleanupPublication {
+            obligation: self,
+            status,
+        })
+    }
+
+    fn claim(&self) -> bool {
+        let mut status = self.status.lock();
+        if *status != TmuxSplitCleanupStatus::Armed {
+            return false;
+        }
+        *status = TmuxSplitCleanupStatus::Claimed;
+        true
+    }
+
+    pub(crate) fn finish_claimed(&self, succeeded: bool, reason: &'static str) {
+        let next = if succeeded {
+            TmuxSplitCleanupStatus::Completed
+        } else {
+            TmuxSplitCleanupStatus::Failed
+        };
+        {
+            let mut status = self.status.lock();
+            if *status != TmuxSplitCleanupStatus::Claimed {
+                log::error!(
+                    "tmux split cleanup for pane {} completed from unexpected state {:?}",
+                    self.pane_id,
+                    *status
+                );
+                return;
+            }
+            *status = next;
+        }
+        self.child_state
+            .mark_exited(portable_pty::ExitStatus::with_signal(reason));
+        if let Some(owner) = self.owner.upgrade() {
+            owner.finish_split_cleanup_obligation(self, succeeded, reason);
+        }
+    }
+
+    fn status(&self) -> TmuxSplitCleanupStatus {
+        *self.status.lock()
+    }
+}
+
+pub(crate) struct TmuxSplitCleanupPublication<'a> {
+    obligation: &'a TmuxSplitCleanupObligation,
+    status: parking_lot::MutexGuard<'a, TmuxSplitCleanupStatus>,
+}
+
+impl TmuxSplitCleanupPublication<'_> {
+    fn complete(mut self) {
+        debug_assert_eq!(*self.status, TmuxSplitCleanupStatus::Armed);
+        *self.status = TmuxSplitCleanupStatus::Completed;
+        if let Some(owner) = self.obligation.owner.upgrade() {
+            owner.finish_split_cleanup_obligation(
+                self.obligation,
+                true,
+                "tmux split published locally",
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TmuxSplitQuarantine {
+    request_id: u64,
+    candidates: Vec<TmuxPaneId>,
+    reason: String,
+}
+
+#[cfg(test)]
+pub(crate) const TEST_SPLIT_OUTPUT_LANE_FULL: u8 = 1;
+#[cfg(test)]
+pub(crate) const TEST_SPLIT_OUTPUT_LANE_CLOSED: u8 = 2;
+#[cfg(test)]
+pub(crate) const TEST_SPLIT_OUTPUT_STATE_RACE: u8 = 3;
+
+/// One capacity unit reserved from the bounded pane-output lane before a
+/// pane becomes structurally visible. Dropping an unpublished reservation
+/// releases only its own unit; sending it after the local commit cannot report
+/// transaction failure.
+#[derive(Debug)]
+struct TmuxPaneOutputReservation {
+    ready: Sender<TmuxPaneId>,
+    active: Arc<AtomicUsize>,
+    pane_id: TmuxPaneId,
+    armed: bool,
+}
+
+impl TmuxPaneOutputReservation {
+    fn send(mut self) -> Result<(), TmuxPaneOutputGap> {
+        let result = match self.ready.try_send(self.pane_id) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(TmuxPaneOutputGap::DrainLaneCapacity),
+            Err(TrySendError::Disconnected(_)) => Err(TmuxPaneOutputGap::DrainLaneClosed),
+        };
+        if result.is_err() {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.armed = false;
+        result
+    }
+}
+
+impl Drop for TmuxPaneOutputReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 struct PendingTmuxSplit {
     promise: promise::Promise<TmuxRemoteSplitReservation>,
     target_remote_pane_id: TmuxPaneId,
     child_state: Arc<TmuxChildState>,
     state: Arc<TmuxRemoteSplitStateCell>,
+    identity_permit: Option<TmuxRetainedPaneIdentityPermit>,
+    baseline_remote_pane_ids: HashSet<TmuxPaneId>,
+    reconciling: bool,
+}
+
+impl PendingTmuxSplit {
+    #[cfg(test)]
+    fn new(
+        owner: &Arc<TmuxDomainState>,
+        promise: promise::Promise<TmuxRemoteSplitReservation>,
+        target_remote_pane_id: TmuxPaneId,
+    ) -> anyhow::Result<Self> {
+        let (identity_permit, baseline_remote_pane_ids) =
+            owner.reserve_remote_split_identity()?;
+        Ok(Self {
+            promise,
+            target_remote_pane_id,
+            child_state: Arc::new(TmuxChildState::new()),
+            state: Arc::new(TmuxRemoteSplitStateCell::new()),
+            identity_permit: Some(identity_permit),
+            baseline_remote_pane_ids,
+            reconciling: false,
+        })
+    }
+}
+
+/// One retained-identity slot reserved before `split-window` can become
+/// externally visible. The response consumes the permit into an exact remote
+/// pane tombstone; every earlier failure releases it without mutating tmux.
+#[derive(Debug)]
+struct TmuxRetainedPaneIdentityPermit {
+    owner: Weak<TmuxDomainState>,
+    armed: bool,
+}
+
+impl TmuxRetainedPaneIdentityPermit {
+    fn validate_locked(&self, owner: &Arc<TmuxDomainState>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.armed && Weak::ptr_eq(&self.owner, &Arc::downgrade(owner)),
+            "tmux retained-pane identity permit belongs to another domain generation"
+        );
+        anyhow::ensure!(
+            owner.remote_split_identity_permits.load(Ordering::Acquire) != 0,
+            "tmux retained-pane identity permit accounting underflow"
+        );
+        Ok(())
+    }
+
+    fn consume_locked(mut self, owner: &Arc<TmuxDomainState>) {
+        debug_assert!(self.validate_locked(owner).is_ok());
+        let prior = owner
+            .remote_split_identity_permits
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(prior, 0);
+        self.armed = false;
+    }
+}
+
+impl Drop for TmuxRetainedPaneIdentityPermit {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        if owner
+            .remote_split_identity_permits
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .is_err()
+        {
+            log::error!(
+                "tmux domain {} retained-pane identity permit accounting underflow",
+                owner.domain_id
+            );
+        }
+        self.armed = false;
+    }
 }
 
 /// Cancellation-owning authority for one remote pane created by tmux.
@@ -877,10 +1129,11 @@ pub(crate) struct TmuxRemoteSplitReservation {
     remote_pane_id: TmuxPaneId,
     child_state: Arc<TmuxChildState>,
     state: Arc<TmuxRemoteSplitStateCell>,
+    cleanup: Arc<TmuxSplitCleanupObligation>,
     published_gate: Option<RefTmuxRemotePane>,
     published_local_pane_id: Option<PaneId>,
     published_window_id: Option<TmuxWindowId>,
-    kill_owned_by_local_pane: bool,
+    output_reservation: Option<TmuxPaneOutputReservation>,
     armed: bool,
 }
 
@@ -893,7 +1146,8 @@ impl fmt::Debug for TmuxRemoteSplitReservation {
             .field("remote_pane_id", &self.remote_pane_id)
             .field("published_local_pane_id", &self.published_local_pane_id)
             .field("published_window_id", &self.published_window_id)
-            .field("kill_owned_by_local_pane", &self.kill_owned_by_local_pane)
+            .field("output_prepared", &self.output_reservation.is_some())
+            .field("cleanup_status", &*self.cleanup.status.lock())
             .field("armed", &self.armed)
             .finish_non_exhaustive()
     }
@@ -912,8 +1166,8 @@ impl TmuxRemoteSplitReservation {
         Arc::clone(&self.child_state)
     }
 
-    pub(crate) fn transfer_kill_to_local_pane(&mut self) {
-        self.kill_owned_by_local_pane = true;
+    pub(crate) fn cleanup_obligation(&self) -> Arc<TmuxSplitCleanupObligation> {
+        Arc::clone(&self.cleanup)
     }
 
     pub(crate) fn publish_local_mirror(
@@ -926,21 +1180,123 @@ impl TmuxRemoteSplitReservation {
         self.published_local_pane_id = Some(local_pane_id);
         self.published_window_id = Some(remote_window_id);
         let owner = Arc::clone(&self.owner);
-        let result = owner.publish_reserved_remote_split(self);
-        if result.is_err() {
-            owner.rollback_remote_split(self);
-        }
-        result
+        owner.publish_reserved_remote_split(self)
     }
 
-    pub(crate) fn commit(mut self) -> anyhow::Result<()> {
+    /// Reserve the bounded output-lane unit and freeze the pane's first drain
+    /// edge before any local mux topology becomes visible.
+    pub(crate) fn prepare_output_commit(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.armed, "tmux split reservation is no longer live");
+        anyhow::ensure!(
+            self.output_reservation.is_none(),
+            "tmux split output was prepared more than once"
+        );
         anyhow::ensure!(
             self.state.load()? == TmuxRemoteSplitState::Published,
-            "tmux remote split {} was not locally published before commit",
+            "tmux split pane {} lost published mirror authority before output preflight",
             self.remote_pane_id
         );
-        self.armed = false;
+        let remote_gate = self
+            .published_gate
+            .as_ref()
+            .cloned()
+            .context("published tmux split lacks its output gate")?;
+
+        #[cfg(test)]
+        for (stage, gap) in [
+            (
+                TEST_SPLIT_OUTPUT_LANE_FULL,
+                TmuxPaneOutputGap::DrainLaneCapacity,
+            ),
+            (
+                TEST_SPLIT_OUTPUT_LANE_CLOSED,
+                TmuxPaneOutputGap::DrainLaneClosed,
+            ),
+        ] {
+            if self
+                .owner
+                .test_split_output_failure
+                .compare_exchange(stage, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                anyhow::bail!(
+                    "tmux split pane {} output preflight failed: {}",
+                    self.remote_pane_id,
+                    gap.label()
+                );
+            }
+        }
+
+        let output_reservation = self
+            .owner
+            .output_lane
+            .get()
+            .ok_or(TmuxPaneOutputGap::DrainLaneClosed)
+            .and_then(|lane| lane.reserve(self.remote_pane_id))
+            .map_err(|gap| {
+                anyhow::anyhow!(
+                    "tmux split pane {} output preflight failed: {}",
+                    self.remote_pane_id,
+                    gap.label()
+                )
+            })?;
+        let mut remote = remote_gate.lock();
+        #[cfg(test)]
+        if self
+            .owner
+            .test_split_output_failure
+            .compare_exchange(
+                TEST_SPLIT_OUTPUT_STATE_RACE,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            remote.output_state = TmuxPaneOutputState::Ready;
+        }
+        anyhow::ensure!(
+            remote.output_state == TmuxPaneOutputState::Fresh
+                && !remote.output_ingress.drain_scheduled,
+            "tmux remote split {} output gate changed to {:?} before local commit",
+            self.remote_pane_id,
+            remote.output_state
+        );
+        remote.output_ingress.drain_scheduled = true;
+        remote.output_state = TmuxPaneOutputState::Ready;
+        drop(remote);
+        self.output_reservation = Some(output_reservation);
         Ok(())
+    }
+
+    /// Consume the already-reserved output edge after the local structural
+    /// commit. A vanishing worker at this point is an absorbing domain failure,
+    /// not a transaction error: the caller receives its committed receipt and
+    /// exact-domain teardown removes the complete published topology.
+    pub(crate) fn commit(mut self, publication: TmuxSplitCleanupPublication<'_>) {
+        publication.complete();
+        let output_reservation = self.output_reservation.take();
+        self.armed = false;
+        let Some(output_reservation) = output_reservation else {
+            log::error!(
+                "tmux remote split {} reached local commit without reserved output authority; \
+                 detaching the committed domain",
+                self.remote_pane_id
+            );
+            self.owner.transition_to_exit_and_schedule_detach();
+            return;
+        };
+        if let Err(gap) = output_reservation.send() {
+            log::error!(
+                "tmux remote split {} lost its reserved output lane after local commit ({}); \
+                 detaching the committed domain",
+                self.remote_pane_id,
+                gap.label()
+            );
+            self.owner.transition_to_exit_and_schedule_detach();
+        } else {
+            metrics::counter!("mux.tmux.output.drain_scheduled").increment(1);
+        }
     }
 }
 
@@ -957,6 +1313,7 @@ impl Drop for TmuxRemoteSplitReservation {
 struct TmuxPaneOutputLane {
     ready: Sender<TmuxPaneId>,
     active: Arc<AtomicUsize>,
+    connected: Arc<AtomicBool>,
     capacity: usize,
 }
 
@@ -969,6 +1326,8 @@ impl TmuxPaneOutputLane {
         let (ready_tx, ready_rx) = bounded(capacity.max(1));
         let active = Arc::new(AtomicUsize::new(0));
         let worker_active = Arc::clone(&active);
+        let connected = Arc::new(AtomicBool::new(true));
+        let worker_connected = Arc::clone(&connected);
         let panic_owner = owner.clone();
         std::thread::Builder::new()
             .name(format!("tmux-output-{domain_id}"))
@@ -979,6 +1338,7 @@ impl TmuxPaneOutputLane {
                         run_tmux_pane_output_lane(owner, ready_rx, &worker_active);
                     }),
                 );
+                worker_connected.store(false, Ordering::Release);
                 if outcome.is_err() {
                     if let Some(owner) = panic_owner.upgrade() {
                         log::error!(
@@ -995,11 +1355,15 @@ impl TmuxPaneOutputLane {
         Ok(Self {
             ready: ready_tx,
             active,
+            connected,
             capacity,
         })
     }
 
-    fn schedule(&self, pane_id: TmuxPaneId) -> Result<(), TmuxPaneOutputGap> {
+    fn reserve(&self, pane_id: TmuxPaneId) -> Result<TmuxPaneOutputReservation, TmuxPaneOutputGap> {
+        if !self.connected.load(Ordering::Acquire) {
+            return Err(TmuxPaneOutputGap::DrainLaneClosed);
+        }
         let mut active = self.active.load(Ordering::Acquire);
         loop {
             if active >= self.capacity {
@@ -1018,17 +1382,20 @@ impl TmuxPaneOutputLane {
                 Err(observed) => active = observed,
             }
         }
-        match self.ready.try_send(pane_id) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                self.active.fetch_sub(1, Ordering::AcqRel);
-                Err(TmuxPaneOutputGap::DrainLaneCapacity)
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.active.fetch_sub(1, Ordering::AcqRel);
-                Err(TmuxPaneOutputGap::DrainLaneClosed)
-            }
+        if !self.connected.load(Ordering::Acquire) {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            return Err(TmuxPaneOutputGap::DrainLaneClosed);
         }
+        Ok(TmuxPaneOutputReservation {
+            ready: self.ready.clone(),
+            active: Arc::clone(&self.active),
+            pane_id,
+            armed: true,
+        })
+    }
+
+    fn schedule(&self, pane_id: TmuxPaneId) -> Result<(), TmuxPaneOutputGap> {
+        self.reserve(pane_id)?.send()
     }
 }
 
@@ -1199,7 +1566,8 @@ impl TmuxMirrorIndex {
         debug_assert!(prior_local.is_none() && prior_remote.is_none());
     }
 
-    pub(crate) fn register_pane(
+    #[cfg(test)]
+    pub(crate) fn register_test_pane(
         &mut self,
         local_pane_id: PaneId,
         remote_pane_id: TmuxPaneId,
@@ -1762,6 +2130,7 @@ pub(crate) struct TmuxNotificationIntentTelemetrySnapshot {
 
 #[derive(Debug)]
 pub(crate) struct TmuxCmdQueue {
+    split_transaction_entries: VecDeque<Box<dyn TmuxCommand>>,
     durable_entries: VecDeque<Box<dyn TmuxCommand>>,
     intent_entries: VecDeque<Box<dyn TmuxCommand>>,
     retry_deferred_durable: VecDeque<DeferredTmuxCommand>,
@@ -1778,6 +2147,7 @@ pub(crate) struct TmuxCmdQueue {
     payload_bytes: usize,
     closed: bool,
     terminal_barrier: bool,
+    split_cleanup_barrier: bool,
     terminal_command_dispatched: bool,
     rejected_commands: u64,
     merged_commands: u64,
@@ -1794,6 +2164,8 @@ struct PreparingTmuxCommand {
     payload_bytes: usize,
     conditional_commit: Option<TmuxConditionalCommitLease>,
     superseded: bool,
+    split_transaction: bool,
+    split_failure_authority: Option<TmuxSplitFailureAuthority>,
 }
 
 #[derive(Debug)]
@@ -1812,6 +2184,7 @@ struct DeferredTmuxCommand {
 /// producer lock hold time.
 #[derive(Debug)]
 pub(crate) struct TmuxCmdQueueTeardown {
+    split_transaction_entries: VecDeque<Box<dyn TmuxCommand>>,
     durable_entries: VecDeque<Box<dyn TmuxCommand>>,
     intent_entries: VecDeque<Box<dyn TmuxCommand>>,
     retry_deferred_durable: VecDeque<DeferredTmuxCommand>,
@@ -1829,6 +2202,7 @@ impl Drop for TmuxCmdQueueTeardown {
     fn drop(&mut self) {
         // Explicitly release retained values before the collection allocations
         // themselves. This method runs outside the queue critical section.
+        self.split_transaction_entries.clear();
         self.durable_entries.clear();
         self.intent_entries.clear();
         self.retry_deferred_durable.clear();
@@ -2010,6 +2384,7 @@ impl std::error::Error for TmuxScheduleError {}
 impl TmuxCmdQueue {
     pub(crate) fn new() -> Self {
         Self {
+            split_transaction_entries: VecDeque::new(),
             durable_entries: VecDeque::new(),
             intent_entries: VecDeque::new(),
             retry_deferred_durable: VecDeque::new(),
@@ -2026,6 +2401,7 @@ impl TmuxCmdQueue {
             payload_bytes: 0,
             closed: false,
             terminal_barrier: false,
+            split_cleanup_barrier: false,
             terminal_command_dispatched: false,
             rejected_commands: 0,
             merged_commands: 0,
@@ -2219,7 +2595,7 @@ impl TmuxCmdQueue {
     /// share the same mutex, so stale PTY/writer handles cannot refill a queue
     /// after terminal cleanup.
     pub(crate) fn push_back(&mut self, cmd: Box<dyn TmuxCommand>) -> Result<(), TmuxEnqueueError> {
-        if self.closed || self.terminal_barrier {
+        if self.closed || self.terminal_barrier || self.split_cleanup_barrier {
             return Err(TmuxEnqueueError::Closed);
         }
 
@@ -2334,6 +2710,169 @@ impl TmuxCmdQueue {
         Ok(())
     }
 
+    /// Admit a response-matched split transaction on its dedicated priority
+    /// lane. This lane remains writable after ordinary producers are frozen,
+    /// but never after final queue closure.
+    fn push_split_transaction(
+        &mut self,
+        command: Box<dyn TmuxCommand>,
+    ) -> Result<(), TmuxEnqueueError> {
+        if self.closed {
+            return Err(TmuxEnqueueError::Closed);
+        }
+        if !command.is_split_transaction() {
+            return Err(TmuxEnqueueError::ClassMismatch);
+        }
+        let Some(failure_authority) = command.split_failure_authority() else {
+            return Err(TmuxEnqueueError::ClassMismatch);
+        };
+        if self.terminal_barrier
+            && matches!(failure_authority, TmuxSplitFailureAuthority::Pending { .. })
+        {
+            return Err(TmuxEnqueueError::Closed);
+        }
+        let class = command.mailbox_class();
+        if !matches!(
+            class,
+            TmuxCommandClass::RequiredControl | TmuxCommandClass::TerminalControl
+        ) {
+            return Err(TmuxEnqueueError::ClassMismatch);
+        }
+        self.split_transaction_entries
+            .try_reserve(1)
+            .map_err(|_| TmuxEnqueueError::Full)?;
+        self.split_transaction_entries.push_back(command);
+        self.retained_by_class[class.index()] =
+            self.retained_by_class[class.index()].saturating_add(1);
+        self.split_cleanup_barrier = true;
+        if let Some(preparing) = self.preparing.as_mut() {
+            if !preparing.split_transaction {
+                preparing.superseded = true;
+            }
+        }
+        metrics::counter!(
+            "mux.tmux.command_mailbox.admitted",
+            "class" => class.label(),
+            "disposition" => "split_transaction",
+        )
+        .increment(1);
+        Ok(())
+    }
+
+    fn release_split_cleanup_barrier(&mut self) {
+        if self.split_transaction_entries.is_empty()
+            && self
+                .in_flight
+                .as_ref()
+                .is_none_or(|in_flight| !in_flight.command.is_split_transaction())
+            && self
+                .preparing
+                .as_ref()
+                .is_none_or(|preparing| !preparing.split_transaction)
+        {
+            self.split_cleanup_barrier = false;
+        }
+    }
+
+    fn freeze_for_split_cleanup(&mut self) {
+        if !self.closed {
+            self.split_cleanup_barrier = true;
+            if let Some(preparing) = self.preparing.as_mut() {
+                if !preparing.split_transaction {
+                    preparing.superseded = true;
+                }
+            }
+        }
+    }
+
+    fn has_split_transaction_work(&self) -> bool {
+        !self.split_transaction_entries.is_empty()
+            || self
+                .in_flight
+                .as_ref()
+                .is_some_and(|in_flight| in_flight.command.is_split_transaction())
+            || self
+                .preparing
+                .as_ref()
+                .is_some_and(|preparing| preparing.split_transaction)
+    }
+
+    fn remove_queued_split_compensation(
+        &mut self,
+        obligation: &Arc<TmuxSplitCleanupObligation>,
+    ) -> bool {
+        let Some(index) = self.split_transaction_entries.iter().position(|command| {
+            matches!(
+                command.split_failure_authority(),
+                Some(TmuxSplitFailureAuthority::Compensation(current))
+                    if Arc::ptr_eq(&current, obligation)
+            )
+        }) else {
+            return false;
+        };
+        let Some(command) = self.split_transaction_entries.remove(index) else {
+            return false;
+        };
+        let class = command.mailbox_class();
+        self.retained_by_class[class.index()] =
+            self.retained_by_class[class.index()].saturating_sub(1);
+        drop(command);
+        true
+    }
+
+    fn remove_queued_split_reconciliation(&mut self, request_id: u64) -> bool {
+        let Some(index) = self.split_transaction_entries.iter().position(|command| {
+            matches!(
+                command.split_failure_authority(),
+                Some(TmuxSplitFailureAuthority::Reconciliation {
+                    request_id: current,
+                }) if current == request_id
+            )
+        }) else {
+            return false;
+        };
+        let Some(command) = self.split_transaction_entries.remove(index) else {
+            return false;
+        };
+        let class = command.mailbox_class();
+        self.retained_by_class[class.index()] =
+            self.retained_by_class[class.index()].saturating_sub(1);
+        drop(command);
+        true
+    }
+
+    fn remove_queued_pending_split(&mut self, request_id: u64) -> bool {
+        let Some(index) = self.split_transaction_entries.iter().position(|command| {
+            matches!(
+                command.split_failure_authority(),
+                Some(TmuxSplitFailureAuthority::Pending {
+                    request_id: current,
+                }) if current == request_id
+            )
+        }) else {
+            return false;
+        };
+        let Some(command) = self.split_transaction_entries.remove(index) else {
+            return false;
+        };
+        let class = command.mailbox_class();
+        self.retained_by_class[class.index()] =
+            self.retained_by_class[class.index()].saturating_sub(1);
+        drop(command);
+        true
+    }
+
+    fn split_failure_authority_for_sender(&self) -> Option<TmuxSplitFailureAuthority> {
+        self.in_flight
+            .as_ref()
+            .and_then(|in_flight| in_flight.command.split_failure_authority())
+            .or_else(|| {
+                self.preparing
+                    .as_ref()
+                    .and_then(|preparing| preparing.split_failure_authority.clone())
+            })
+    }
+
     /// Installs the one-way explicit-detach barrier at the front of the
     /// durable lane.
     ///
@@ -2346,7 +2885,7 @@ impl TmuxCmdQueue {
         &mut self,
         command: Box<dyn TmuxCommand>,
     ) -> Result<(), TmuxEnqueueError> {
-        if self.closed || self.terminal_barrier {
+        if self.closed || self.terminal_barrier || self.split_cleanup_barrier {
             return Err(TmuxEnqueueError::Closed);
         }
         if command.mailbox_class() != TmuxCommandClass::TerminalControl
@@ -2400,7 +2939,7 @@ impl TmuxCmdQueue {
         &mut self,
         commands: Vec<Box<dyn TmuxCommand>>,
     ) -> Result<(), TmuxEnqueueError> {
-        if self.closed || self.terminal_barrier {
+        if self.closed || self.terminal_barrier || self.split_cleanup_barrier {
             return Err(TmuxEnqueueError::Closed);
         }
         if commands.is_empty() {
@@ -2563,6 +3102,7 @@ impl TmuxCmdQueue {
         self.retry_deferred_intent_tail = None;
         self.payload_bytes = 0;
         TmuxCmdQueueTeardown {
+            split_transaction_entries: std::mem::take(&mut self.split_transaction_entries),
             durable_entries: std::mem::take(&mut self.durable_entries),
             intent_entries: std::mem::take(&mut self.intent_entries),
             retry_deferred_durable: std::mem::take(&mut self.retry_deferred_durable),
@@ -2590,7 +3130,8 @@ impl TmuxCmdQueue {
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.durable_entries.is_empty()
+        self.split_transaction_entries.is_empty()
+            && self.durable_entries.is_empty()
             && self.intent_entries.is_empty()
             && self.retry_deferred_durable.is_empty()
             && self.retry_deferred_intent_head.is_none()
@@ -2606,6 +3147,7 @@ impl TmuxCmdQueue {
         self.in_flight
             .as_ref()
             .map(|in_flight| in_flight.command.as_ref())
+            .or_else(|| self.split_transaction_entries.front().map(Box::as_ref))
             .or_else(|| {
                 if self.should_service_intent() {
                     self.intent_entries.front().map(Box::as_ref)
@@ -2635,6 +3177,23 @@ impl TmuxCmdQueue {
         allow_durable: bool,
     ) -> Option<Box<dyn TmuxCommand>> {
         debug_assert!(self.preparing.is_none());
+        if let Some(command) = self.split_transaction_entries.pop_front() {
+            self.preparing = Some(PreparingTmuxCommand {
+                class: command.mailbox_class(),
+                payload_bytes: command.mailbox_payload_bytes(),
+                conditional_commit: None,
+                superseded: false,
+                split_transaction: true,
+                split_failure_authority: command.split_failure_authority(),
+            });
+            metrics::counter!(
+                "mux.tmux.command_mailbox.serviced",
+                "class" => command.mailbox_class().label(),
+                "source" => "split_transaction",
+            )
+            .increment(1);
+            return Some(command);
+        }
         let service_intent = !allow_durable || self.should_service_intent();
         let command = if service_intent {
             let retry_intent_ready = self.retry_deferred_intent_is_ready();
@@ -2677,6 +3236,8 @@ impl TmuxCmdQueue {
             payload_bytes: command.mailbox_payload_bytes(),
             conditional_commit,
             superseded,
+            split_transaction: command.is_split_transaction(),
+            split_failure_authority: command.split_failure_authority(),
         });
         metrics::counter!(
             "mux.tmux.command_mailbox.serviced",
@@ -2830,11 +3391,23 @@ impl TmuxCmdQueue {
     ) -> Option<Result<Box<dyn TmuxCommand>, Box<dyn TmuxCommand>>> {
         debug_assert!(self.preparing.is_none());
 
-        if !self.terminal_barrier && self.should_force_retry_deferred_durable() {
+        if !self.split_transaction_entries.is_empty() {
+            return self.take_next_for_preparation_with_policy(true).map(Ok);
+        }
+
+        if self.split_cleanup_barrier {
+            return None;
+        }
+
+        if !self.terminal_barrier
+            && self.should_force_retry_deferred_durable()
+        {
             return self.take_retry_deferred_for_preparation();
         }
 
-        if !self.terminal_barrier && self.should_force_retry_deferred_intent() {
+        if !self.terminal_barrier
+            && self.should_force_retry_deferred_intent()
+        {
             return self.take_retry_deferred_intent_for_preparation();
         }
 
@@ -2913,6 +3486,8 @@ impl TmuxCmdQueue {
             payload_bytes: command.mailbox_payload_bytes(),
             conditional_commit: deferred.conditional_commit,
             superseded: false,
+            split_transaction: command.is_split_transaction(),
+            split_failure_authority: command.split_failure_authority(),
         });
         metrics::counter!(
             "mux.tmux.command_mailbox.serviced",
@@ -2964,9 +3539,11 @@ impl TmuxCmdQueue {
                     .as_ref()
                     .and_then(|preparing| preparing.conditional_commit.as_ref())
             );
-            debug_assert!(conditional_commit
-                .as_ref()
-                .is_none_or(|commit| commit.io_generation() == generation));
+            debug_assert!(
+                conditional_commit
+                    .as_ref()
+                    .is_none_or(|commit| commit.io_generation() == generation)
+            );
             if let Some(TmuxConditionalCommit::PaneSize { lease, .. }) = conditional_commit.as_ref()
             {
                 if let TmuxConditionalCommitIntent::PaneSize { pane_id, .. } = &lease.intent {
@@ -3029,6 +3606,12 @@ impl TmuxCmdQueue {
     }
 
     fn has_pending(&self) -> bool {
+        if !self.split_transaction_entries.is_empty() {
+            return true;
+        }
+        if self.split_cleanup_barrier {
+            return false;
+        }
         if self.terminal_barrier && self.terminal_command_dispatched {
             return false;
         }
@@ -3049,6 +3632,9 @@ impl TmuxCmdQueue {
     }
 
     fn should_service_intent(&self) -> bool {
+        if self.split_cleanup_barrier {
+            return false;
+        }
         if self.terminal_barrier && !self.terminal_command_dispatched {
             return false;
         }
@@ -3682,7 +4268,19 @@ fn run_tmux_io_supervisor(owner: Weak<TmuxDomainState>, control: Receiver<TmuxIo
                             if kind == TmuxIoOperationKind::Detach =>
                         {
                             metrics::histogram!("mux.tmux.io.clean_exit_seconds",)
-                                .record(response_started.elapsed().as_secs_f64());
+                            .record(response_started.elapsed().as_secs_f64());
+                            return;
+                        }
+                        Ok(TmuxIoControl::Terminal { .. })
+                            if kind == TmuxIoOperationKind::Command =>
+                        {
+                            if domain.io_operation_is_current(kind, generation) {
+                                domain.fail_tmux_io_operation(
+                                    kind,
+                                    generation,
+                                    "terminal_before_response",
+                                );
+                            }
                             return;
                         }
                         Ok(TmuxIoControl::Terminal { .. }) => return,
@@ -3784,8 +4382,11 @@ pub(crate) struct TmuxDomainState {
     pub(crate) notification_intent_telemetry: TmuxNotificationIntentTelemetry,
     pub(crate) pane_registry: Mutex<()>,
     pub(crate) retired_panes: Mutex<HashSet<TmuxPaneId>>,
-    pub(crate) remote_split_reservations:
-        Mutex<HashMap<TmuxPaneId, Arc<TmuxRemoteSplitStateCell>>>,
+    pub(crate) remote_split_reservations: Mutex<HashMap<TmuxPaneId, Arc<TmuxRemoteSplitStateCell>>>,
+    split_cleanup_obligations:
+        Mutex<HashMap<TmuxPaneId, Arc<TmuxSplitCleanupObligation>>>,
+    split_cleanup_quarantine: Mutex<VecDeque<TmuxSplitQuarantine>>,
+    remote_split_identity_permits: AtomicUsize,
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
@@ -3803,6 +4404,12 @@ pub(crate) struct TmuxDomainState {
     #[cfg(test)]
     test_send_runnables_scheduled: AtomicUsize,
     #[cfg(test)]
+    pub(crate) test_split_config_panic: AtomicU8,
+    #[cfg(test)]
+    pub(crate) test_split_output_failure: AtomicU8,
+    #[cfg(test)]
+    pub(crate) test_retire_split_domain_before_local_commit: AtomicBool,
+    #[cfg(test)]
     test_io_deadlines: Mutex<Option<TmuxIoDeadlines>>,
 }
 
@@ -3813,6 +4420,8 @@ pub struct TmuxDomain {
 #[derive(Debug, Default)]
 struct TmuxLifecycle {
     terminal: bool,
+    terminalizing: bool,
+    terminalizing_clean_exit: bool,
     clean_exit: bool,
     io_operation: Option<TmuxIoOperationLease>,
     active_operations: usize,
@@ -4176,28 +4785,104 @@ impl TmuxDomainState {
     }
 
     fn request_terminal(&self, requested_clean_exit: bool) {
-        let (first_transition, authoritative_clean_exit) = {
+        let (terminalizing, first_transition, authoritative_clean_exit, obligations) = {
             let mut lifecycle = self.lifecycle.lock();
             if lifecycle.terminal {
-                (false, lifecycle.clean_exit)
+                (false, false, lifecycle.clean_exit, Vec::new())
             } else {
-                let mut state = self.state.lock();
-                lifecycle.terminal = true;
-                lifecycle.clean_exit = requested_clean_exit;
-                lifecycle.io_operation = None;
-                lifecycle.detach_disposition = if requested_clean_exit {
-                    TerminalDetachDisposition::NotNeeded
+                let has_pending_splits = !self.pending_splits.lock().is_empty();
+                let obligations: Vec<_> = self
+                    .split_cleanup_obligations
+                    .lock()
+                    .values()
+                    .cloned()
+                    .collect();
+                let split_work = !obligations.is_empty()
+                    || has_pending_splits
+                    || self.cmd_queue.lock().has_split_transaction_work();
+                if split_work {
+                    let first_terminalizing = !lifecycle.terminalizing;
+                    lifecycle.terminalizing = true;
+                    lifecycle.terminalizing_clean_exit = false;
+                    self.cmd_queue.lock().freeze_for_split_cleanup();
+                    (
+                        true,
+                        first_terminalizing,
+                        lifecycle.terminalizing_clean_exit,
+                        obligations,
+                    )
                 } else {
-                    TerminalDetachDisposition::Pending
-                };
-                *state = State::Exit;
-                if requested_clean_exit {
-                    self.clean_exit_requested.store(true, Ordering::Release);
+                    let mut state = self.state.lock();
+                    lifecycle.terminalizing = false;
+                    lifecycle.terminal = true;
+                    lifecycle.clean_exit = requested_clean_exit;
+                    lifecycle.io_operation = None;
+                    lifecycle.detach_disposition = if requested_clean_exit {
+                        TerminalDetachDisposition::NotNeeded
+                    } else {
+                        TerminalDetachDisposition::Pending
+                    };
+                    *state = State::Exit;
+                    if requested_clean_exit {
+                        self.clean_exit_requested.store(true, Ordering::Release);
+                    }
+                    (false, true, requested_clean_exit, Vec::new())
                 }
-                (true, requested_clean_exit)
             }
         };
 
+        if terminalizing {
+            self.notification_intents.lock().close();
+            self.unsubscribe_notification();
+            for obligation in obligations {
+                if requested_clean_exit {
+                    if obligation.claim() {
+                        obligation.finish_claimed(
+                            false,
+                            "tmux exited before split compensation",
+                        );
+                    }
+                } else if let Err(error) = self.claim_remote_split_compensation(&obligation) {
+                    log::error!(
+                        "tmux domain {} could not start terminal split compensation for pane {}: {error:#}",
+                        self.domain_id,
+                        obligation.pane_id
+                    );
+                }
+            }
+            if requested_clean_exit {
+                let pending_request_ids: Vec<_> =
+                    self.pending_splits.lock().keys().copied().collect();
+                for request_id in pending_request_ids {
+                    self.fail_split_reconciliation(
+                        request_id,
+                        "tmux exited before split identity was reconciled",
+                        Vec::new(),
+                    );
+                }
+                {
+                    let mut lifecycle = self.lifecycle.lock();
+                    lifecycle.terminalizing = false;
+                    lifecycle.terminal = true;
+                    lifecycle.clean_exit = true;
+                    lifecycle.io_operation = None;
+                    lifecycle.detach_disposition = TerminalDetachDisposition::NotNeeded;
+                    *self.state.lock() = State::Exit;
+                    self.clean_exit_requested.store(true, Ordering::Release);
+                }
+                self.publish_terminal_transition(true, true);
+                return;
+            }
+            if first_transition {
+                log::debug!(
+                    "tmux domain {} entered bounded split-cleanup terminalization",
+                    self.domain_id
+                );
+            }
+            let _ = self.schedule_send_next_command();
+            self.maybe_finish_terminalizing();
+            return;
+        }
         self.publish_terminal_transition(first_transition, authoritative_clean_exit);
     }
 
@@ -4231,9 +4916,117 @@ impl TmuxDomainState {
         self.finish_terminal_cleanup_if_ready();
     }
 
+    fn record_split_quarantine(
+        &self,
+        request_id: u64,
+        candidates: Vec<TmuxPaneId>,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        let mut quarantine = self.split_cleanup_quarantine.lock();
+        if quarantine.len() == TMUX_SPLIT_QUARANTINE_LIMIT {
+            let _ = quarantine.pop_front();
+        }
+        quarantine.push_back(TmuxSplitQuarantine {
+            request_id,
+            candidates,
+            reason: reason.clone(),
+        });
+        metrics::counter!(
+            "mux.tmux.split_cleanup.quarantined",
+            "reason" => "ambiguous_or_failed",
+        )
+        .increment(1);
+        log::error!(
+            "tmux domain {} quarantined split request {}: {}",
+            self.domain_id,
+            request_id,
+            reason
+        );
+    }
+
+    fn finish_split_cleanup_obligation(
+        &self,
+        obligation: &TmuxSplitCleanupObligation,
+        succeeded: bool,
+        reason: &'static str,
+    ) {
+        {
+            let _lifecycle = self.lifecycle.lock();
+            let mut obligations = self.split_cleanup_obligations.lock();
+            let exact = obligations
+                .get(&obligation.pane_id)
+                .is_some_and(|current| std::ptr::eq(current.as_ref(), obligation));
+            if exact {
+                let _ = obligations.remove(&obligation.pane_id);
+            } else {
+                log::error!(
+                    "tmux split cleanup for pane {} lost its exact obligation map entry",
+                    obligation.pane_id
+                );
+            }
+        }
+        if !succeeded {
+            self.record_split_quarantine(
+                obligation.request_id,
+                vec![obligation.pane_id],
+                reason,
+            );
+        }
+        self.release_split_cleanup_barrier_if_idle();
+        if !self.lifecycle.lock().terminalizing {
+            let _ = self.schedule_send_next_command();
+        }
+        self.maybe_finish_terminalizing();
+    }
+
+    fn release_split_cleanup_barrier_if_idle(&self) {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.terminalizing
+            || !self.pending_splits.lock().is_empty()
+            || !self.split_cleanup_obligations.lock().is_empty()
+        {
+            return;
+        }
+        self.cmd_queue.lock().release_split_cleanup_barrier();
+    }
+
+    fn maybe_finish_terminalizing(&self) {
+        let transition = {
+            let mut lifecycle = self.lifecycle.lock();
+            if !lifecycle.terminalizing || lifecycle.terminal {
+                return;
+            }
+            if !self.pending_splits.lock().is_empty()
+                || !self.split_cleanup_obligations.lock().is_empty()
+                || self.cmd_queue.lock().has_split_transaction_work()
+                || lifecycle.io_operation.is_some()
+                || *self.state.lock() != State::Idle
+            {
+                return;
+            }
+            let clean_exit = lifecycle.terminalizing_clean_exit;
+            lifecycle.terminalizing = false;
+            lifecycle.terminal = true;
+            lifecycle.clean_exit = clean_exit;
+            lifecycle.io_operation = None;
+            lifecycle.detach_disposition = if clean_exit {
+                TerminalDetachDisposition::NotNeeded
+            } else {
+                TerminalDetachDisposition::Pending
+            };
+            *self.state.lock() = State::Exit;
+            if clean_exit {
+                self.clean_exit_requested.store(true, Ordering::Release);
+            }
+            clean_exit
+        };
+        self.publish_terminal_transition(true, transition);
+    }
+
     fn begin_active_operation(&self) -> Option<ActiveTmuxOperation<'_>> {
         let mut lifecycle = self.lifecycle.lock();
-        if lifecycle.terminal {
+        if lifecycle.terminal || lifecycle.terminalizing {
             return None;
         }
         let Some(next) = lifecycle.active_operations.checked_add(1) else {
@@ -4249,12 +5042,46 @@ impl TmuxDomainState {
 
     fn begin_owned_operation(self: &Arc<Self>) -> Option<OwnedActiveTmuxOperation> {
         let mut lifecycle = self.lifecycle.lock();
-        if lifecycle.terminal {
+        if lifecycle.terminal || lifecycle.terminalizing {
             return None;
         }
         let Some(next) = lifecycle.active_operations.checked_add(1) else {
             log::error!(
                 "tmux domain {} active-operation counter overflow; rejecting owned work",
+                self.domain_id
+            );
+            return None;
+        };
+        lifecycle.active_operations = next;
+        Some(OwnedActiveTmuxOperation {
+            owner: Arc::clone(self),
+        })
+    }
+
+    fn begin_protocol_operation(&self) -> Option<ActiveTmuxOperation<'_>> {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.terminal {
+            return None;
+        }
+        let Some(next) = lifecycle.active_operations.checked_add(1) else {
+            log::error!(
+                "tmux domain {} active-operation counter overflow; rejecting protocol work",
+                self.domain_id
+            );
+            return None;
+        };
+        lifecycle.active_operations = next;
+        Some(ActiveTmuxOperation { owner: self })
+    }
+
+    fn begin_owned_protocol_operation(self: &Arc<Self>) -> Option<OwnedActiveTmuxOperation> {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.terminal {
+            return None;
+        }
+        let Some(next) = lifecycle.active_operations.checked_add(1) else {
+            log::error!(
+                "tmux domain {} active-operation counter overflow; rejecting owned protocol work",
                 self.domain_id
             );
             return None;
@@ -4345,6 +5172,7 @@ impl TmuxDomainState {
             return false;
         }
         lifecycle.terminal = true;
+        lifecycle.terminalizing = false;
         lifecycle.clean_exit = false;
         lifecycle.io_operation = None;
         lifecycle.detach_disposition = TerminalDetachDisposition::Pending;
@@ -4358,6 +5186,18 @@ impl TmuxDomainState {
         generation: u64,
         reason: &'static str,
     ) {
+        let split_failure = self
+            .cmd_queue
+            .lock()
+            .in_flight
+            .as_ref()
+            .and_then(|in_flight| {
+                if in_flight.generation == generation {
+                    in_flight.command.split_failure_authority()
+                } else {
+                    None
+                }
+            });
         let claimed = self.try_claim_failure_terminal(|lifecycle, _state| {
             lifecycle.io_operation.is_some_and(|operation| {
                 operation.kind == kind && operation.generation == generation
@@ -4383,6 +5223,7 @@ impl TmuxDomainState {
             kind.label(),
             generation
         );
+        self.fail_split_transaction_authority(split_failure);
         self.invalidate_launcher_after_io_failure(reason);
         self.publish_terminal_transition(true, false);
     }
@@ -4407,6 +5248,12 @@ impl TmuxDomainState {
     }
 
     fn fail_io_supervisor(&self, reason: &'static str) {
+        let split_failure = self
+            .cmd_queue
+            .lock()
+            .in_flight
+            .as_ref()
+            .and_then(|in_flight| in_flight.command.split_failure_authority());
         if !self.try_claim_failure_terminal(|_lifecycle, _state| true) {
             return;
         }
@@ -4420,8 +5267,37 @@ impl TmuxDomainState {
             "tmux domain {} lost its I/O supervisor: {reason}",
             self.domain_id,
         );
+        self.fail_split_transaction_authority(split_failure);
         self.invalidate_launcher_after_io_failure(reason);
         self.publish_terminal_transition(true, false);
+    }
+
+    fn fail_split_transaction_authority(
+        &self,
+        authority: Option<TmuxSplitFailureAuthority>,
+    ) {
+        match authority {
+            Some(TmuxSplitFailureAuthority::Compensation(obligation)) => {
+                if obligation.status() == TmuxSplitCleanupStatus::Claimed {
+                    obligation.finish_claimed(false, "tmux split compensation timed out");
+                }
+            }
+            Some(TmuxSplitFailureAuthority::Pending { request_id }) => {
+                self.fail_split_reconciliation(
+                    request_id,
+                    "split command I/O ended before an exact response",
+                    Vec::new(),
+                );
+            }
+            Some(TmuxSplitFailureAuthority::Reconciliation { request_id }) => {
+                self.fail_split_reconciliation(
+                    request_id,
+                    "split reconciliation I/O ended before an exact response",
+                    Vec::new(),
+                );
+            }
+            None => {}
+        }
     }
 
     fn invalidate_launcher_after_io_failure(&self, reason: &str) {
@@ -4543,6 +5419,32 @@ impl TmuxDomainState {
         self.backlog.lock().clear();
         self.retired_panes.lock().clear();
         self.remote_split_reservations.lock().clear();
+        let abandoned_split_cleanup: Vec<_> = self
+            .split_cleanup_obligations
+            .lock()
+            .drain()
+            .map(|(_, obligation)| obligation)
+            .collect();
+        for obligation in abandoned_split_cleanup {
+            let prior = {
+                let mut status = obligation.status.lock();
+                let prior = *status;
+                *status = TmuxSplitCleanupStatus::Failed;
+                prior
+            };
+            self.record_split_quarantine(
+                obligation.request_id,
+                vec![obligation.pane_id],
+                format!(
+                    "terminal cleanup observed unresolved split obligation in state {prior:?}"
+                ),
+            );
+            obligation
+                .child_state
+                .mark_exited(portable_pty::ExitStatus::with_signal(
+                    "tmux split cleanup abandoned during terminal teardown",
+                ));
+        }
         self.gui_tabs.lock().clear();
         self.mirror_index.lock().clear();
         let pending_splits: Vec<_> = self.pending_splits.lock().drain().collect();
@@ -4648,7 +5550,7 @@ impl TmuxDomainState {
 
     fn finalize_terminal_cleanup(
         mux: &Arc<Mux>,
-        domain: &Arc<dyn Domain>,
+        domain: &DomainOperationGuard,
         expected_inner: &Arc<Self>,
     ) {
         let should_invalidate_launcher = {
@@ -4671,11 +5573,11 @@ impl TmuxDomainState {
         };
 
         expected_inner.finalize_launcher_tmux_binding(mux, should_invalidate_launcher);
-        let removed = mux.domain_was_detached_if_same(domain);
-        let exact_instance_absent = removed
+        let retirement_started = mux.domain_was_detached_if_guard(domain);
+        let exact_instance_absent = retirement_started
             || mux
                 .get_domain(expected_inner.domain_id)
-                .is_none_or(|current| !Arc::ptr_eq(&current, domain));
+                .is_none_or(|current| !current.same_registration(domain));
 
         let clean_exit = {
             let mut lifecycle = expected_inner.lifecycle.lock();
@@ -4686,7 +5588,7 @@ impl TmuxDomainState {
             lifecycle.finalized = exact_instance_absent;
             lifecycle.clean_exit
         };
-        if removed && clean_exit {
+        if retirement_started && clean_exit {
             expected_inner
                 .clean_detach_completed
                 .store(true, Ordering::Release);
@@ -4737,9 +5639,9 @@ impl TmuxDomainState {
     /// installed the required subscription.
     pub(crate) fn publish_notification_subscription(&self, sub_id: usize) -> anyhow::Result<bool> {
         let lifecycle = self.lifecycle.lock();
-        if lifecycle.terminal {
+        if lifecycle.terminal || lifecycle.terminalizing {
             anyhow::bail!(
-                "tmux domain {} became terminal before subscription publication",
+                "tmux domain {} became terminal or terminalizing before subscription publication",
                 self.domain_id
             );
         }
@@ -4772,17 +5674,140 @@ impl TmuxDomainState {
         false
     }
 
+    /// Reserve both retained-identity budget and backing map capacity before
+    /// `split-window` is admitted to tmux. Once the command is externally
+    /// visible, every successful response can therefore install an exact
+    /// cancellation-owned tombstone without allocation or cap failure.
+    fn reserve_remote_split_identity(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<(TmuxRetainedPaneIdentityPermit, HashSet<TmuxPaneId>)> {
+        let _registry = self.pane_registry.lock();
+        let retired_panes = self.retired_panes.lock();
+        let mut reservations = self.remote_split_reservations.lock();
+        let mut cleanup_obligations = self.split_cleanup_obligations.lock();
+        let permits = self.remote_split_identity_permits.load(Ordering::Acquire);
+        let retained_identities = retired_panes
+            .len()
+            .checked_add(reservations.len())
+            .and_then(|retained| retained.checked_add(permits))
+            .ok_or_else(|| anyhow::anyhow!("tmux retained pane identity count overflow"))?;
+        anyhow::ensure!(
+            retained_identities < RETIRED_PANE_TOMBSTONE_LIMIT,
+            "tmux retained-pane identity cap {RETIRED_PANE_TOMBSTONE_LIMIT} exceeded before split command admission"
+        );
+        let next_permits = permits
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("tmux remote split identity permit overflow"))?;
+        reservations.try_reserve(next_permits).map_err(|error| {
+            anyhow::anyhow!("reserve tmux split identity before command admission: {error}")
+        })?;
+        cleanup_obligations.try_reserve(next_permits).map_err(|error| {
+            anyhow::anyhow!("reserve tmux split cleanup authority before command admission: {error}")
+        })?;
+        let remote_panes = self.remote_panes.lock();
+        let backlog = self.backlog.lock();
+        let baseline_capacity = retired_panes
+            .len()
+            .checked_add(reservations.len())
+            .and_then(|count| count.checked_add(remote_panes.len()))
+            .and_then(|count| count.checked_add(backlog.entries.len()))
+            .ok_or_else(|| anyhow::anyhow!("tmux split baseline identity count overflow"))?;
+        let mut baseline_remote_pane_ids = HashSet::new();
+        baseline_remote_pane_ids
+            .try_reserve(baseline_capacity)
+            .map_err(|error| anyhow::anyhow!("reserve tmux split identity baseline: {error}"))?;
+        baseline_remote_pane_ids.extend(retired_panes.iter().copied());
+        baseline_remote_pane_ids.extend(reservations.keys().copied());
+        baseline_remote_pane_ids.extend(remote_panes.keys().copied());
+        backlog.extend_pane_id_snapshot(&mut baseline_remote_pane_ids);
+        drop(backlog);
+        drop(remote_panes);
+        let observed_permits = self
+            .remote_split_identity_permits
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert!(observed_permits <= permits);
+        Ok((
+            TmuxRetainedPaneIdentityPermit {
+                owner: Arc::downgrade(self),
+                armed: true,
+            },
+            baseline_remote_pane_ids,
+        ))
+    }
+
+    fn with_reserved_remote_split_identity<T>(
+        self: &Arc<Self>,
+        admit_command: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<(T, TmuxRetainedPaneIdentityPermit, HashSet<TmuxPaneId>)> {
+        let (identity_permit, baseline_remote_pane_ids) =
+            self.reserve_remote_split_identity()?;
+        let admitted = admit_command()?;
+        Ok((admitted, identity_permit, baseline_remote_pane_ids))
+    }
+
+    pub(crate) fn remote_split_identity_permit_count_locked(&self) -> usize {
+        self.remote_split_identity_permits.load(Ordering::Acquire)
+    }
+
     pub(crate) fn resolve_pending_split(
         self: &Arc<Self>,
         request_id: u64,
+        command_target_remote_pane_id: TmuxPaneId,
         pane_id: TmuxPaneId,
     ) -> anyhow::Result<bool> {
-        let Some(mut pending) = self.pending_splits.lock().remove(&request_id) else {
+        let Some((mut pending, reservation)) = self.take_pending_split_reservation(
+            request_id,
+            command_target_remote_pane_id,
+            pane_id,
+        )? else {
             return Ok(false);
         };
 
+        if self.lifecycle.lock().terminalizing {
+            let _ = pending.promise.err(anyhow::anyhow!(
+                "tmux split request {request_id} completed while domain {} was terminalizing",
+                self.domain_id
+            ));
+            drop(reservation);
+            return Ok(true);
+        }
+
+        let accepted = pending.promise.ok(reservation);
+        if !accepted {
+            log::debug!(
+                "tmux split request {request_id} completed after its local waiter was cancelled"
+            );
+        }
+        Ok(true)
+    }
+
+    fn take_pending_split_reservation(
+        self: &Arc<Self>,
+        request_id: u64,
+        command_target_remote_pane_id: TmuxPaneId,
+        pane_id: TmuxPaneId,
+    ) -> anyhow::Result<Option<(PendingTmuxSplit, TmuxRemoteSplitReservation)>> {
+        let lifecycle = self.lifecycle.lock();
+        anyhow::ensure!(
+            !lifecycle.terminal,
+            "tmux split request {request_id} completed after final terminal teardown"
+        );
+        let Some(mut pending) = self.pending_splits.lock().remove(&request_id) else {
+            return Ok(None);
+        };
+
         let reservation_result = (|| {
+            anyhow::ensure!(
+                pending.target_remote_pane_id == command_target_remote_pane_id,
+                "tmux split request {request_id} target changed from {} to {command_target_remote_pane_id}",
+                pending.target_remote_pane_id
+            );
             let _registry = self.pane_registry.lock();
+            let identity_permit = pending
+                .identity_permit
+                .take()
+                .context("tmux split response lost its retained-identity permit")?;
+            identity_permit.validate_locked(self)?;
             anyhow::ensure!(
                 !self.retired_panes.lock().contains(&pane_id),
                 "tmux split returned retired remote pane id {pane_id}"
@@ -4803,21 +5828,22 @@ impl TmuxDomainState {
                 !reservations.contains_key(&pane_id),
                 "tmux split returned already-reserved remote pane id {pane_id}"
             );
-            let retained_identities = self
-                .retired_panes
-                .lock()
-                .len()
-                .checked_add(reservations.len())
-                .ok_or_else(|| anyhow::anyhow!("tmux retained pane identity count overflow"))?;
+            let mut cleanup_obligations = self.split_cleanup_obligations.lock();
             anyhow::ensure!(
-                retained_identities < RETIRED_PANE_TOMBSTONE_LIMIT,
-                "tmux retained-pane identity cap {RETIRED_PANE_TOMBSTONE_LIMIT} exceeded"
+                !cleanup_obligations.contains_key(&pane_id),
+                "tmux split returned pane id {pane_id} with an existing cleanup obligation"
             );
-            reservations
-                .try_reserve(1)
-                .map_err(|error| anyhow::anyhow!("reserve tmux split identity: {error}"))?;
+            let cleanup = TmuxSplitCleanupObligation::new(
+                self,
+                request_id,
+                pane_id,
+                Arc::clone(&pending.child_state),
+            );
             let prior = reservations.insert(pane_id, Arc::clone(&pending.state));
+            let prior_cleanup = cleanup_obligations.insert(pane_id, Arc::clone(&cleanup));
             debug_assert!(prior.is_none());
+            debug_assert!(prior_cleanup.is_none());
+            identity_permit.consume_locked(self);
             Ok(TmuxRemoteSplitReservation {
                 owner: Arc::clone(self),
                 request_id,
@@ -4825,20 +5851,18 @@ impl TmuxDomainState {
                 remote_pane_id: pane_id,
                 child_state: Arc::clone(&pending.child_state),
                 state: Arc::clone(&pending.state),
+                cleanup,
                 published_gate: None,
                 published_local_pane_id: None,
                 published_window_id: None,
-                kill_owned_by_local_pane: false,
+                output_reservation: None,
                 armed: true,
             })
         })();
 
+        drop(lifecycle);
         match reservation_result {
-            Ok(reservation) => {
-                let accepted = pending.promise.ok(reservation);
-                debug_assert!(accepted, "pending tmux split promise resolved more than once");
-                Ok(true)
-            }
+            Ok(reservation) => Ok(Some((pending, reservation))),
             Err(error) => {
                 let message = format!(
                     "tmux split request {request_id} could not reserve remote pane {pane_id}: {error:#}"
@@ -4850,14 +5874,342 @@ impl TmuxDomainState {
         }
     }
 
+    pub(crate) fn compensate_pending_split_identity(
+        self: &Arc<Self>,
+        request_id: u64,
+        command_target_remote_pane_id: TmuxPaneId,
+        pane_id: TmuxPaneId,
+        reason: String,
+    ) -> anyhow::Result<bool> {
+        let Some((mut pending, reservation)) = self.take_pending_split_reservation(
+            request_id,
+            command_target_remote_pane_id,
+            pane_id,
+        )? else {
+            return Ok(false);
+        };
+        let _ = pending.promise.err(anyhow::anyhow!(reason));
+        drop(reservation);
+        Ok(true)
+    }
+
+    pub(crate) fn pending_split_identity_is_known(
+        &self,
+        request_id: u64,
+        pane_id: TmuxPaneId,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            self.pending_splits.lock().contains_key(&request_id),
+            "missing pending tmux split request {request_id}"
+        );
+        let _registry = self.pane_registry.lock();
+        Ok(self.retired_panes.lock().contains(&pane_id)
+            || self.remote_panes.lock().contains_key(&pane_id)
+            || self
+                .mirror_index
+                .lock()
+                .checked_local_pane_for_remote(pane_id)?
+                .is_some()
+            || self
+                .remote_split_reservations
+                .lock()
+                .contains_key(&pane_id))
+    }
+
+    pub(crate) fn begin_split_reconciliation(
+        &self,
+        request_id: u64,
+        command_target_remote_pane_id: TmuxPaneId,
+        diagnostic: String,
+    ) -> anyhow::Result<()> {
+        let admission = {
+            let mut lifecycle = self.lifecycle.lock();
+            anyhow::ensure!(
+                !lifecycle.terminal,
+                "tmux split request {request_id} cannot reconcile after terminal teardown"
+            );
+            let mut pending_splits = self.pending_splits.lock();
+            let pending = pending_splits
+                .get_mut(&request_id)
+                .with_context(|| format!("missing pending tmux split request {request_id}"))?;
+            anyhow::ensure!(
+                pending.target_remote_pane_id == command_target_remote_pane_id,
+                "tmux split request {request_id} target changed before reconciliation"
+            );
+            anyhow::ensure!(
+                !pending.reconciling,
+                "tmux split request {request_id} entered reconciliation twice"
+            );
+            pending.reconciling = true;
+            lifecycle.terminalizing = true;
+            lifecycle.terminalizing_clean_exit = false;
+            let mut queue = self.cmd_queue.lock();
+            queue.freeze_for_split_cleanup();
+            queue.push_split_transaction(Box::new(ReconcileSplitPane {
+                request_id,
+                target_pane_id: command_target_remote_pane_id,
+            }))
+        };
+        if let Err(error) = admission {
+            self.fail_split_reconciliation(
+                request_id,
+                "split reconciliation command admission failed",
+                Vec::new(),
+            );
+            return Err(anyhow::anyhow!(
+                "cannot admit split reconciliation for request {request_id}: {error}"
+            ));
+        }
+        self.notification_intents.lock().close();
+        self.unsubscribe_notification();
+        log::error!(
+            "tmux domain {} entered split identity reconciliation for request {}: {}",
+            self.domain_id,
+            request_id,
+            diagnostic
+        );
+        if let Err(error) = self.schedule_send_next_command() {
+            let removed = self
+                .cmd_queue
+                .lock()
+                .remove_queued_split_reconciliation(request_id);
+            debug_assert!(removed);
+            self.fail_split_reconciliation(
+                request_id,
+                "split reconciliation scheduling failed",
+                Vec::new(),
+            );
+            return Err(anyhow::anyhow!(
+                "cannot schedule split reconciliation for request {request_id}: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_split_reconciliation(
+        self: &Arc<Self>,
+        request_id: u64,
+        command_target_remote_pane_id: TmuxPaneId,
+        output: &str,
+    ) -> anyhow::Result<()> {
+        let baseline = {
+            let mut pending_splits = self.pending_splits.lock();
+            let pending = pending_splits
+                .get_mut(&request_id)
+                .with_context(|| format!("missing pending tmux split request {request_id}"))?;
+            anyhow::ensure!(
+                pending.reconciling
+                    && pending.target_remote_pane_id == command_target_remote_pane_id,
+                "tmux split request {request_id} lost exact reconciliation authority"
+            );
+            std::mem::take(&mut pending.baseline_remote_pane_ids)
+        };
+        let mut current = HashSet::new();
+        for line in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Some(digits) = line.strip_prefix('%') else {
+                self.fail_split_reconciliation(
+                    request_id,
+                    "list-panes reconciliation returned a non-pane identity",
+                    current.into_iter().collect(),
+                );
+                anyhow::bail!("split reconciliation returned invalid identity {line:?}");
+            };
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                self.fail_split_reconciliation(
+                    request_id,
+                    "list-panes reconciliation returned malformed pane identity",
+                    current.into_iter().collect(),
+                );
+                anyhow::bail!("split reconciliation returned invalid identity {line:?}");
+            }
+            let pane_id = match digits.parse::<TmuxPaneId>() {
+                Ok(pane_id) => pane_id,
+                Err(error) => {
+                    self.fail_split_reconciliation(
+                        request_id,
+                        "list-panes reconciliation pane identity overflowed",
+                        current.into_iter().collect(),
+                    );
+                    return Err(anyhow::anyhow!(
+                        "split reconciliation pane identity is outside the supported range: {error}"
+                    ));
+                }
+            };
+            current.insert(pane_id);
+        }
+        let mut candidates: Vec<_> = current.difference(&baseline).copied().collect();
+        candidates.sort_unstable();
+        if candidates.len() != 1 {
+            self.fail_split_reconciliation(
+                request_id,
+                "split reconciliation did not produce exactly one request-owned pane",
+                candidates.clone(),
+            );
+            anyhow::bail!(
+                "split reconciliation for request {request_id} found {} candidates",
+                candidates.len()
+            );
+        }
+        let pane_id = candidates[0];
+        match self.pending_split_identity_is_known(request_id, pane_id) {
+            Ok(false) => {}
+            Ok(true) => {
+                self.fail_split_reconciliation(
+                    request_id,
+                    "split reconciliation candidate collided with live local authority",
+                    candidates,
+                );
+                anyhow::bail!(
+                    "split reconciliation candidate %{pane_id} is not exclusively request-owned"
+                );
+            }
+            Err(error) => {
+                self.fail_split_reconciliation(
+                    request_id,
+                    "split reconciliation authority check failed",
+                    candidates,
+                );
+                return Err(error);
+            }
+        }
+        anyhow::ensure!(
+            self.compensate_pending_split_identity(
+                request_id,
+                command_target_remote_pane_id,
+                pane_id,
+                format!(
+                    "tmux split request {request_id} returned ambiguous output; exact set-difference candidate %{pane_id} is being compensated"
+                ),
+            )?,
+            "missing pending tmux split request {request_id}"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn fail_split_reconciliation(
+        &self,
+        request_id: u64,
+        reason: &'static str,
+        mut candidates: Vec<TmuxPaneId>,
+    ) {
+        candidates.sort_unstable();
+        candidates.dedup();
+        let pending = self.pending_splits.lock().remove(&request_id);
+        let Some(mut pending) = pending else {
+            return;
+        };
+        let _ = pending.promise.err(anyhow::anyhow!(
+            "tmux split request {request_id} quarantined: {reason}"
+        ));
+        self.record_split_quarantine(request_id, candidates, reason);
+        self.maybe_finish_terminalizing();
+    }
+
     pub(crate) fn fail_pending_split(&self, request_id: u64, err: anyhow::Error) -> bool {
         let pending = self.pending_splits.lock().remove(&request_id);
         if let Some(mut pending) = pending {
             pending.promise.err(err);
+            self.release_split_cleanup_barrier_if_idle();
+            self.maybe_finish_terminalizing();
             true
         } else {
             false
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_test_remote_split(
+        self: &Arc<Self>,
+        request_id: u64,
+        target_remote_pane_id: TmuxPaneId,
+        remote_pane_id: TmuxPaneId,
+    ) -> anyhow::Result<TmuxRemoteSplitReservation> {
+        let (identity_permit, _baseline_remote_pane_ids) =
+            self.reserve_remote_split_identity()?;
+        let state = Arc::new(TmuxRemoteSplitStateCell::new());
+        let _registry = self.pane_registry.lock();
+        identity_permit.validate_locked(self)?;
+        anyhow::ensure!(
+            !self.retired_panes.lock().contains(&remote_pane_id)
+                && !self.remote_panes.lock().contains_key(&remote_pane_id)
+                && self
+                    .mirror_index
+                    .lock()
+                    .checked_local_pane_for_remote(remote_pane_id)?
+                    .is_none(),
+            "test remote split identity {remote_pane_id} already exists"
+        );
+        let mut reservations = self.remote_split_reservations.lock();
+        anyhow::ensure!(
+            !reservations.contains_key(&remote_pane_id),
+            "test remote split identity {remote_pane_id} is already reserved"
+        );
+        let mut cleanup_obligations = self.split_cleanup_obligations.lock();
+        anyhow::ensure!(
+            !cleanup_obligations.contains_key(&remote_pane_id),
+            "test remote split identity {remote_pane_id} already has cleanup authority"
+        );
+        let child_state = Arc::new(TmuxChildState::new());
+        let cleanup = TmuxSplitCleanupObligation::new(
+            self,
+            request_id,
+            remote_pane_id,
+            Arc::clone(&child_state),
+        );
+        let prior_reservation = reservations.insert(remote_pane_id, Arc::clone(&state));
+        let prior_cleanup = cleanup_obligations.insert(remote_pane_id, Arc::clone(&cleanup));
+        debug_assert!(prior_reservation.is_none());
+        debug_assert!(prior_cleanup.is_none());
+        identity_permit.consume_locked(self);
+        Ok(TmuxRemoteSplitReservation {
+            owner: Arc::clone(self),
+            request_id,
+            target_remote_pane_id,
+            remote_pane_id,
+            child_state,
+            state,
+            cleanup,
+            published_gate: None,
+            published_local_pane_id: None,
+            published_window_id: None,
+            output_reservation: None,
+            armed: true,
+        })
+    }
+
+    fn claim_remote_split_compensation(
+        &self,
+        obligation: &Arc<TmuxSplitCleanupObligation>,
+    ) -> anyhow::Result<bool> {
+        if !obligation.claim() {
+            return Ok(false);
+        }
+        let enqueue = self.cmd_queue.lock().push_split_transaction(Box::new(
+            CompensateSplitPane {
+                pane_id: obligation.pane_id,
+                obligation: Arc::clone(obligation),
+            },
+        ));
+        if let Err(error) = enqueue {
+            obligation.finish_claimed(false, "tmux split compensation admission failed");
+            return Err(anyhow::anyhow!(
+                "tmux split compensation admission failed for remote pane {}: {error}",
+                obligation.pane_id
+            ));
+        }
+        if let Err(error) = self.schedule_send_next_command() {
+            let removed = self
+                .cmd_queue
+                .lock()
+                .remove_queued_split_compensation(obligation);
+            debug_assert!(removed);
+            obligation.finish_claimed(false, "tmux split compensation scheduling failed");
+            return Err(anyhow::anyhow!(
+                "tmux split compensation scheduling failed for remote pane {}: {error}",
+                obligation.pane_id
+            ));
+        }
+        Ok(true)
     }
 
     fn rollback_remote_split(&self, reservation: &TmuxRemoteSplitReservation) {
@@ -4909,9 +6261,8 @@ impl TmuxDomainState {
                         }
                         match reservation.published_window_id {
                             Some(window_id) => {
-                                let removed_membership = gui_tabs
-                                    .get_mut(&window_id)
-                                    .is_some_and(|tab| {
+                                let removed_membership =
+                                    gui_tabs.get_mut(&window_id).is_some_and(|tab| {
                                         tab.panes.remove(&reservation.remote_pane_id)
                                     });
                                 if !removed_membership {
@@ -4944,27 +6295,24 @@ impl TmuxDomainState {
                 }
             }
             drop(reservations);
-            self.backlog.lock().remove_many(&[reservation.remote_pane_id]);
+            self.backlog
+                .lock()
+                .remove_many(&[reservation.remote_pane_id]);
         }
 
-        if inconsistent {
-            self.transition_to_exit_and_schedule_detach();
-        }
-        if !reservation.kill_owned_by_local_pane && !self.is_terminal() {
-            if let Err(error) = self.enqueue_required(
-                Box::new(KillPane {
-                    pane_id: reservation.remote_pane_id,
-                    child_state: Arc::clone(&reservation.child_state),
-                }),
-                "abandoned tmux split compensation",
-            ) {
+        let compensation_failed =
+            if let Err(error) = self.claim_remote_split_compensation(&reservation.cleanup) {
                 log::error!(
                     "tmux split request {} could not compensate remote pane {}: {error:#}",
                     reservation.request_id,
                     reservation.remote_pane_id
                 );
-                self.transition_to_exit_and_schedule_detach();
-            }
+                true
+            } else {
+                false
+            };
+        if inconsistent || compensation_failed {
+            self.transition_to_exit_and_schedule_detach();
         }
     }
 
@@ -5002,7 +6350,10 @@ impl TmuxDomainState {
             self.domain_id
         );
         anyhow::ensure!(
-            !self.retired_panes.lock().contains(&reservation.remote_pane_id),
+            !self
+                .retired_panes
+                .lock()
+                .contains(&reservation.remote_pane_id),
             "reserved tmux split pane {} was retired before publication",
             reservation.remote_pane_id
         );
@@ -5031,8 +6382,7 @@ impl TmuxDomainState {
             .map_err(|error| anyhow::anyhow!("reserve tmux remote-pane mirror: {error}"))?;
 
         let mut mirror_index = self.mirror_index.lock();
-        mirror_index
-            .prepare_pane_registration(local_pane_id, reservation.remote_pane_id)?;
+        mirror_index.prepare_pane_registration(local_pane_id, reservation.remote_pane_id)?;
         let mut gui_tabs = self.gui_tabs.lock();
         let gui_tab = gui_tabs.get_mut(&remote_window_id).ok_or_else(|| {
             anyhow::anyhow!("tmux split window {remote_window_id} is no longer attached")
@@ -5092,7 +6442,6 @@ impl TmuxDomainState {
             .expect(
                 "exact reserved split state remains stable under the pane-registry transaction",
             );
-        remote.output_state = TmuxPaneOutputState::Ready;
         drop(remote);
         drop(gui_tabs);
         drop(mirror_index);
@@ -5100,8 +6449,7 @@ impl TmuxDomainState {
         drop(reservations);
         drop(_registry);
 
-        self.schedule_ready_pane_output(reservation.remote_pane_id, remote_gate)
-            .context("schedule committed tmux split output")
+        Ok(())
     }
 
     fn alloc_split_request_id(&self) -> anyhow::Result<u64> {
@@ -5199,7 +6547,16 @@ impl TmuxDomainState {
                 return None;
             }
 
-            let _active_operation = self.begin_active_operation()?;
+            if self.lifecycle.lock().terminalizing && !matches!(&event, Event::Guarded(_)) {
+                metrics::counter!(
+                    "mux.tmux.protocol_event.skipped",
+                    "reason" => "split_cleanup_terminalizing",
+                )
+                .increment(1);
+                continue;
+            }
+
+            let _active_operation = self.begin_protocol_operation()?;
             let state = *self.state.lock();
             log::debug!("tmux: {:?} in state {:?}", event, state);
             let event = match event {
@@ -5486,7 +6843,7 @@ impl TmuxDomainState {
                 barrier_lease.completed = true;
                 return;
             };
-            if !Arc::ptr_eq(&current_domain, &expected_domain) {
+            if !current_domain.same_registration(&expected_domain) {
                 expected_inner.transition_to_exit_and_schedule_detach();
                 barrier_lease.completed = true;
                 return;
@@ -5686,9 +7043,19 @@ impl TmuxDomainState {
         generation: u64,
         conditional_commit: Option<TmuxConditionalCommit>,
     ) -> bool {
-        let Some(_active_operation) = self.begin_active_operation() else {
+        let Some(_active_operation) = self.begin_protocol_operation() else {
             return false;
         };
+        let split_transaction = cmd.is_split_transaction();
+        let split_failure_authority = cmd.split_failure_authority();
+        if self.lifecycle.lock().terminalizing && !split_transaction {
+            metrics::counter!(
+                "mux.tmux.command_result.skipped",
+                "reason" => "split_cleanup_terminalizing",
+            )
+            .increment(1);
+            return true;
+        }
         let conditional_result_is_stale =
             conditional_commit
                 .as_ref()
@@ -5715,6 +7082,14 @@ impl TmuxDomainState {
             std::panic::AssertUnwindSafe(|| cmd.process_result(self.domain_id, response)),
         ) {
             Ok(Ok(())) if !response.error => {}
+            Ok(Ok(())) if split_transaction => {
+                log::error!(
+                    "tmux split transaction in domain {} received a guarded protocol error",
+                    self.domain_id
+                );
+                self.fail_split_transaction_authority(split_failure_authority.clone());
+                self.request_terminal(false);
+            }
             Ok(Ok(())) => {
                 log::error!(
                     "tmux command in domain {} accepted a guarded protocol error; detaching",
@@ -5723,10 +7098,23 @@ impl TmuxDomainState {
                 self.transition_to_exit_and_schedule_detach();
                 return false;
             }
+            Ok(Err(err)) if split_transaction => {
+                log::error!("Tmux split transaction result error: {err}");
+                self.fail_split_transaction_authority(split_failure_authority.clone());
+                self.request_terminal(false);
+            }
             Ok(Err(err)) => {
                 log::error!("Tmux processing command result error: {err}");
                 self.transition_to_exit_and_schedule_detach();
                 return false;
+            }
+            Err(_) if split_transaction => {
+                log::error!(
+                    "Tmux split transaction callback panicked in domain {}; quarantining before teardown",
+                    self.domain_id
+                );
+                self.fail_split_transaction_authority(split_failure_authority);
+                self.request_terminal(false);
             }
             Err(_) => {
                 log::error!(
@@ -5864,6 +7252,10 @@ impl TmuxDomainState {
                 }
                 return;
             }
+            self.maybe_finish_terminalizing();
+            if self.is_terminal() {
+                return;
+            }
             let _ = self.require_send_schedule("protocol response barrier drain");
             return;
         }
@@ -5875,6 +7267,7 @@ impl TmuxDomainState {
             return;
         }
         if self.transition_state(State::ProcessingResponse, State::Idle) {
+            self.maybe_finish_terminalizing();
             let _ = self.require_send_schedule("test command-result completion");
         }
     }
@@ -5892,7 +7285,7 @@ impl TmuxDomainState {
     }
 
     fn send_next_command_inner(self: &Arc<Self>) -> anyhow::Result<()> {
-        let Some(active_operation) = self.begin_owned_operation() else {
+        let Some(active_operation) = self.begin_owned_protocol_operation() else {
             return Ok(());
         };
         if !self.transition_state(State::Idle, State::Sending) {
@@ -6194,10 +7587,19 @@ impl TmuxDomainState {
         split_request: SplitRequest,
         request_id: u64,
     ) -> anyhow::Result<TmuxPaneId> {
+        let registered_domain = target.owner().get_domain(self.domain_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "tmux split target belongs to a mux without domain {}",
+                self.domain_id
+            )
+        })?;
+        let registered_tmux = registered_domain
+            .downcast_ref::<TmuxDomain>()
+            .context("tmux split target domain changed concrete type before command admission")?;
         anyhow::ensure!(
             target.admitted_domain_id() == self.domain_id
-                && target.owner().get_domain(self.domain_id).is_some(),
-            "tmux split target belongs to a mux without domain {}",
+                && std::ptr::eq(registered_tmux.inner.as_ref(), self),
+            "tmux split target domain {} changed exact identity before command admission",
             self.domain_id
         );
         let pane_id = target.pane_id();
@@ -6206,14 +7608,11 @@ impl TmuxDomainState {
         if let Some(id) = tmux_pane_id {
             let enqueued = {
                 let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                self.push_command_capped(
-                    &mut cmd_queue,
-                    Box::new(SplitPane {
-                        pane_id: id,
-                        direction: split_request.direction,
-                        request_id,
-                    }),
-                )
+                cmd_queue.push_split_transaction(Box::new(SplitPane {
+                    pane_id: id,
+                    direction: split_request.direction,
+                    request_id,
+                }))
             };
             enqueued.with_context(|| {
                 format!("cannot enqueue split for tmux domain {}", self.domain_id)
@@ -6254,6 +7653,9 @@ impl TmuxDomain {
             pane_registry: Mutex::new(()),
             retired_panes: Mutex::new(HashSet::new()),
             remote_split_reservations: Mutex::new(HashMap::default()),
+            split_cleanup_obligations: Mutex::new(HashMap::default()),
+            split_cleanup_quarantine: Mutex::new(VecDeque::new()),
+            remote_split_identity_permits: AtomicUsize::new(0),
             tmux_session: Mutex::new(None),
             support_commands: Mutex::new(HashMap::default()),
             attach_state: Mutex::new(AttachState::Init),
@@ -6270,6 +7672,12 @@ impl TmuxDomain {
             test_command_preparations: AtomicUsize::new(0),
             #[cfg(test)]
             test_send_runnables_scheduled: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_split_config_panic: AtomicU8::new(0),
+            #[cfg(test)]
+            test_split_output_failure: AtomicU8::new(0),
+            #[cfg(test)]
+            test_retire_split_domain_before_local_commit: AtomicBool::new(false),
             #[cfg(test)]
             test_io_deadlines: Mutex::new(None),
         });
@@ -6384,9 +7792,19 @@ impl Domain for TmuxDomain {
                 pending_splits
                     .try_reserve(1)
                     .map_err(|error| anyhow::anyhow!("reserve pending tmux split: {error}"))?;
-                let target_remote_pane_id = self
-                    .inner
-                    .split_tmux_pane(target, split_request, request_id)?;
+                // Retained-ID budget and the response-map slot must exist
+                // before `split-window` can create an externally visible
+                // remote pane. The helper's closure is never invoked when
+                // that pre-command reservation fails.
+                let (
+                    target_remote_pane_id,
+                    identity_permit,
+                    baseline_remote_pane_ids,
+                ) =
+                    self.inner.with_reserved_remote_split_identity(|| {
+                        self.inner
+                            .split_tmux_pane(target, split_request, request_id)
+                    })?;
                 anyhow::ensure!(
                     pending_splits
                         .insert(
@@ -6396,6 +7814,9 @@ impl Domain for TmuxDomain {
                                 target_remote_pane_id,
                                 child_state,
                                 state,
+                                identity_permit: Some(identity_permit),
+                                baseline_remote_pane_ids,
+                                reconciling: false,
                             },
                         )
                         .is_none(),
@@ -6415,9 +7836,7 @@ impl Domain for TmuxDomain {
                     self.inner.domain_id
                 )
             })?;
-            return self
-                .inner
-                .split_pane(mux, target, remote, split_request);
+            return self.inner.split_pane(mux, target, remote, split_request);
         }
 
         anyhow::bail!("Split_pane failed");
@@ -6501,6 +7920,11 @@ impl Domain for TmuxDomain {
             "cannot enqueue detach after tmux clean exit was requested"
         );
 
+        if self.inner.cmd_queue.lock().split_cleanup_barrier {
+            self.inner.transition_to_exit_and_schedule_detach();
+            return Ok(());
+        }
+
         let enqueue_result = {
             let mut queue = self.inner.cmd_queue.lock();
             if queue.has_domain_detach_pending() {
@@ -6541,7 +7965,7 @@ mod tests {
     use frankenterm_term::color::ColorPalette;
     use frankenterm_term::{KeyCode, KeyModifiers};
     use parking_lot::{MappedMutexGuard, MutexGuard};
-    use promise::spawn::{block_on, ScopedExecutor};
+    use promise::spawn::{ScopedExecutor, block_on};
     use rangeset::RangeSet;
     use std::ops::Range;
     use std::sync::atomic::AtomicUsize;
@@ -6609,6 +8033,7 @@ mod tests {
         let lane = TmuxPaneOutputLane {
             ready,
             active: Arc::clone(&active),
+            connected: Arc::new(AtomicBool::new(true)),
             capacity: 2,
         };
 
@@ -6621,6 +8046,7 @@ mod tests {
         let lane = TmuxPaneOutputLane {
             ready,
             active: Arc::clone(&active),
+            connected: Arc::new(AtomicBool::new(false)),
             capacity: 1,
         };
 
@@ -6632,6 +8058,7 @@ mod tests {
         let lane = TmuxPaneOutputLane {
             ready,
             active: Arc::clone(&active),
+            connected: Arc::new(AtomicBool::new(true)),
             capacity: usize::MAX,
         };
 
@@ -6656,9 +8083,11 @@ mod tests {
     #[test]
     fn tmux_initial_guard_commit_fences_a_late_deadline_claim() {
         let tmux_domain = new_tmux_domain(180);
-        assert!(tmux_domain
-            .inner
-            .transition_state(State::WaitForInitialGuard, State::Idle));
+        assert!(
+            tmux_domain
+                .inner
+                .transition_state(State::WaitForInitialGuard, State::Idle)
+        );
 
         tmux_domain.inner.fail_initial_guard("test_late_deadline");
 
@@ -6670,12 +8099,16 @@ mod tests {
     fn tmux_guarded_response_claim_fences_a_late_command_deadline() {
         let tmux_domain = new_tmux_domain(181);
         *tmux_domain.inner.state.lock() = State::WaitingForResponse;
-        assert!(tmux_domain
-            .inner
-            .install_io_operation(TmuxIoOperationKind::Command, 41));
-        assert!(tmux_domain
-            .inner
-            .claim_io_response(TmuxIoOperationKind::Command, 41));
+        assert!(
+            tmux_domain
+                .inner
+                .install_io_operation(TmuxIoOperationKind::Command, 41)
+        );
+        assert!(
+            tmux_domain
+                .inner
+                .claim_io_response(TmuxIoOperationKind::Command, 41)
+        );
 
         tmux_domain.inner.fail_tmux_io_operation(
             TmuxIoOperationKind::Command,
@@ -6693,12 +8126,16 @@ mod tests {
     fn tmux_detach_deadline_and_clean_exit_have_first_claim_authority() {
         let clean_winner = new_tmux_domain(182);
         *clean_winner.inner.state.lock() = State::WaitingForResponse;
-        assert!(clean_winner
-            .inner
-            .install_io_operation(TmuxIoOperationKind::Detach, 51));
-        assert!(clean_winner
-            .inner
-            .claim_io_response(TmuxIoOperationKind::Detach, 51));
+        assert!(
+            clean_winner
+                .inner
+                .install_io_operation(TmuxIoOperationKind::Detach, 51)
+        );
+        assert!(
+            clean_winner
+                .inner
+                .claim_io_response(TmuxIoOperationKind::Detach, 51)
+        );
         clean_winner.inner.transition_to_clean_exit();
         clean_winner.inner.fail_tmux_io_operation(
             TmuxIoOperationKind::Detach,
@@ -6714,9 +8151,11 @@ mod tests {
 
         let deadline_winner = new_tmux_domain(183);
         *deadline_winner.inner.state.lock() = State::WaitingForResponse;
-        assert!(deadline_winner
-            .inner
-            .install_io_operation(TmuxIoOperationKind::Detach, 52));
+        assert!(
+            deadline_winner
+                .inner
+                .install_io_operation(TmuxIoOperationKind::Detach, 52)
+        );
         deadline_winner.inner.fail_tmux_io_operation(
             TmuxIoOperationKind::Detach,
             52,
@@ -6727,10 +8166,12 @@ mod tests {
         assert!(lifecycle.terminal);
         assert!(!lifecycle.clean_exit);
         assert!(lifecycle.io_operation.is_none());
-        assert!(!deadline_winner
-            .inner
-            .clean_exit_requested
-            .load(Ordering::Acquire));
+        assert!(
+            !deadline_winner
+                .inner
+                .clean_exit_requested
+                .load(Ordering::Acquire)
+        );
     }
 
     fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
@@ -7685,11 +9126,13 @@ mod tests {
             .expect("test tmux domain should register");
         let inner = Arc::clone(&tmux_domain.inner);
         *inner.state.lock() = State::Idle;
-        assert!(inner
-            .cmd_queue
-            .lock()
-            .push_back(Box::new(ListCommands))
-            .is_ok());
+        assert!(
+            inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(ListCommands))
+                .is_ok()
+        );
 
         inner.send_next_command();
         if let Err(err) = write_entered.recv_timeout(Duration::from_secs(5)) {
@@ -7753,12 +9196,14 @@ mod tests {
         mux.add_domain(&domain)
             .expect("register missing-launcher tmux domain");
         *tmux_domain.inner.state.lock() = State::Idle;
-        assert!(tmux_domain
-            .inner
-            .cmd_queue
-            .lock()
-            .push_back(Box::new(ListCommands))
-            .is_ok());
+        assert!(
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(ListCommands))
+                .is_ok()
+        );
 
         tmux_domain.inner.send_next_command();
 
@@ -7777,12 +9222,14 @@ mod tests {
         let _guard = ScopedMux::shutdown();
         let tmux_domain = new_tmux_domain(91);
         *tmux_domain.inner.state.lock() = State::Idle;
-        assert!(tmux_domain
-            .inner
-            .cmd_queue
-            .lock()
-            .push_back(Box::new(ListCommands))
-            .is_ok());
+        assert!(
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(ListCommands))
+                .is_ok()
+        );
 
         tmux_domain.inner.send_next_command();
 
@@ -7811,12 +9258,14 @@ mod tests {
         mux.add_domain(&domain)
             .expect("register failing-writer tmux domain");
         *tmux_domain.inner.state.lock() = State::Idle;
-        assert!(tmux_domain
-            .inner
-            .cmd_queue
-            .lock()
-            .push_back(Box::new(ListCommands))
-            .is_ok());
+        assert!(
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(ListCommands))
+                .is_ok()
+        );
 
         tmux_domain.inner.send_next_command();
 
@@ -8025,7 +9474,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_split_promise_has_the_command_generation_response_deadline() {
+    fn tmux_split_reservation_promise_has_the_command_generation_response_deadline() {
         let default_domain: Arc<dyn Domain> =
             Arc::new(LocalDomain::new("tmux-split-timeout-default").expect("local domain"));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
@@ -8047,17 +9496,23 @@ mod tests {
         let split_future = split_promise
             .get_future()
             .expect("create split-timeout future");
-        assert!(tmux_domain
-            .inner
-            .pending_splits
-            .lock()
-            .insert(44, split_promise)
-            .is_none());
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    44,
+                    PendingTmuxSplit::new(&tmux_domain.inner, split_promise, 7)
+                        .expect("reserve split-timeout identity"),
+                )
+                .is_none()
+        );
         tmux_domain
             .inner
             .cmd_queue
             .lock()
-            .push_back(Box::new(SplitPane {
+            .push_split_transaction(Box::new(SplitPane {
                 pane_id: 7,
                 direction: SplitDirection::Horizontal,
                 request_id: 44,
@@ -8261,9 +9716,11 @@ mod tests {
             queue.retained_by_class[TmuxCommandClass::RequiredControl.index()] = 1;
         }
         *tmux_domain.inner.state.lock() = State::WaitingForResponse;
-        assert!(tmux_domain
-            .inner
-            .install_io_operation(TmuxIoOperationKind::Command, 1));
+        assert!(
+            tmux_domain
+                .inner
+                .install_io_operation(TmuxIoOperationKind::Command, 1)
+        );
 
         let completed = tmux_domain
             .inner
@@ -8361,12 +9818,14 @@ mod tests {
         mux.add_domain(&domain)
             .expect("test tmux domain should register");
 
-        assert!(tmux_domain
-            .inner
-            .cmd_queue
-            .lock()
-            .push_back(Box::new(ListCommands))
-            .is_ok());
+        assert!(
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(ListCommands))
+                .is_ok()
+        );
         tmux_domain
             .inner
             .support_commands
@@ -8421,10 +9880,12 @@ mod tests {
             mux.get_domain(tmux_domain.domain_id()).is_some(),
             "clean removal must wait for an already-admitted operation"
         );
-        assert!(tmux_domain
-            .inner
-            .clean_exit_requested
-            .load(Ordering::Acquire));
+        assert!(
+            tmux_domain
+                .inner
+                .clean_exit_requested
+                .load(Ordering::Acquire)
+        );
         drop(active_operation);
         assert!(
             mux.get_domain(tmux_domain.domain_id()).is_none(),
@@ -8435,12 +9896,14 @@ mod tests {
     #[test]
     fn tmux_terminal_transition_is_reentrant_from_active_callback() {
         let tmux_domain = new_tmux_domain(97);
-        assert!(tmux_domain
-            .inner
-            .with_active_lifecycle(|| {
-                tmux_domain.inner.transition_to_exit_and_schedule_detach();
-            })
-            .is_some());
+        assert!(
+            tmux_domain
+                .inner
+                .with_active_lifecycle(|| {
+                    tmux_domain.inner.transition_to_exit_and_schedule_detach();
+                })
+                .is_some()
+        );
 
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
         let lifecycle = tmux_domain.inner.lifecycle.lock();
@@ -8783,13 +10246,15 @@ mod tests {
     #[test]
     fn tmux_mirror_index_is_bidirectional_and_rejects_identity_aliases() {
         let mut index = TmuxMirrorIndex::default();
-        index.register_pane(11, 101).expect("register pane");
+        index
+            .register_test_pane(11, 101)
+            .expect("register pane");
         index.register_window(22, 202).expect("register window");
         assert_eq!(index.remote_pane_for_local(11), Some(101));
         assert_eq!(index.remote_window_for_local_tab(22), Some(202));
 
-        assert!(index.register_pane(11, 102).is_err());
-        assert!(index.register_pane(12, 101).is_err());
+        assert!(index.register_test_pane(11, 102).is_err());
+        assert!(index.register_test_pane(12, 101).is_err());
         assert!(index.register_window(22, 203).is_err());
         assert!(index.register_window(23, 202).is_err());
 
@@ -8978,12 +10443,14 @@ mod tests {
                 );
             }
             for sequence in 0..CMD_QUEUE_TERMINAL_RESERVED_SLOTS {
-                assert!(queue
-                    .push_back(Box::new(ClassedTestCommand {
-                        class: TmuxCommandClass::TerminalControl,
-                        sequence,
-                    }))
-                    .is_ok());
+                assert!(
+                    queue
+                        .push_back(Box::new(ClassedTestCommand {
+                            class: TmuxCommandClass::TerminalControl,
+                            sequence,
+                        }))
+                        .is_ok()
+                );
             }
             assert_eq!(
                 queue.push_back(Box::new(ClassedTestCommand {
@@ -9057,12 +10524,14 @@ mod tests {
     #[test]
     fn cmd_queue_payload_cap_rejects_byte_overflow_without_displacing_work() {
         let mut queue = TmuxCmdQueue::new();
-        assert!(queue
-            .push_back(Box::new(SendKeys {
-                pane: 7,
-                keys: b"kept".to_vec(),
-            }))
-            .is_ok());
+        assert!(
+            queue
+                .push_back(Box::new(SendKeys {
+                    pane: 7,
+                    keys: b"kept".to_vec(),
+                }))
+                .is_ok()
+        );
         queue.payload_bytes = CMD_QUEUE_MAX_PAYLOAD_BYTES - 1;
 
         assert_eq!(
@@ -9136,7 +10605,9 @@ mod tests {
             let command = queue
                 .take_next_for_preparation()
                 .expect("high-water intent enters preparation");
-            assert!(queue.restore_prepared_for_retry(command, TmuxPreparationPrerequisite::Attach,));
+            assert!(
+                queue.restore_prepared_for_retry(command, TmuxPreparationPrerequisite::Attach,)
+            );
         }
         queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
         queue.uncertain_remote_pane_sizes.extend(1..=128);
@@ -9753,10 +11224,12 @@ mod tests {
         );
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert_eq!(queue.retry_deferred_intents.len(), PARKED_TARGETS);
-        assert!(queue
-            .retry_deferred_intents
-            .values()
-            .all(|deferred| !deferred.retry_ready));
+        assert!(
+            queue
+                .retry_deferred_intents
+                .values()
+                .all(|deferred| !deferred.retry_ready)
+        );
         assert!(!queue.has_pending());
     }
 
@@ -9778,8 +11251,12 @@ mod tests {
             let command = queue
                 .take_next_for_preparation()
                 .expect("resize enters preparation");
-            assert!(queue
-                .restore_prepared_for_retry(command, TmuxPreparationPrerequisite::Pane(pane_id),));
+            assert!(
+                queue.restore_prepared_for_retry(
+                    command,
+                    TmuxPreparationPrerequisite::Pane(pane_id),
+                )
+            );
         }
         assert_eq!(
             queue.retry_deferred_intent_head,
@@ -9815,9 +11292,11 @@ mod tests {
             .expect("nonfront target lease remains current");
         assert_eq!(retried.as_resize().map(|(pane_id, _)| pane_id), Some(33));
         assert!(queue.ready_retry_deferred_intents.is_empty());
-        assert!(!queue
-            .retry_deferred_intents
-            .contains_key(&TmuxConditionalCommitTarget::PaneSize(33)));
+        assert!(
+            !queue
+                .retry_deferred_intents
+                .contains_key(&TmuxConditionalCommitTarget::PaneSize(33))
+        );
         assert_eq!(
             queue.retry_deferred_intent_head,
             Some(TmuxConditionalCommitTarget::PaneSize(31)),
@@ -9922,10 +11401,12 @@ mod tests {
             Some(TmuxConditionalCommitTarget::PaneSize(2)),
         );
         assert_eq!(queue.retry_deferred_intents.len(), 2);
-        assert!(queue
-            .retry_deferred_intents
-            .values()
-            .all(|deferred| !deferred.retry_ready));
+        assert!(
+            queue
+                .retry_deferred_intents
+                .values()
+                .all(|deferred| !deferred.retry_ready)
+        );
         assert!(!queue.conditional_commit_is_current(&initial_b_lease));
         let current_b = queue
             .retry_deferred_intents
@@ -9949,9 +11430,11 @@ mod tests {
                 },
             )),
         );
-        assert!(!queue
-            .queued_conditional_commits
-            .contains_key(&TmuxConditionalCommitTarget::PaneSize(2)));
+        assert!(
+            !queue
+                .queued_conditional_commits
+                .contains_key(&TmuxConditionalCommitTarget::PaneSize(2))
+        );
         assert!(!queue.has_pending());
     }
 
@@ -10007,19 +11490,21 @@ mod tests {
         mux.add_tab_no_panes(&tab)
             .expect("register conditional-commit test tab");
         let local_tab_id = tab.tab_id();
-        assert!(inner
-            .gui_tabs
-            .lock()
-            .insert(
-                remote_window_id,
-                TmuxTab {
-                    tab_id: local_tab_id,
-                    tmux_window_id: remote_window_id,
-                    layout_csum: layout_csum.to_string(),
-                    panes: HashSet::new(),
-                },
-            )
-            .is_none());
+        assert!(
+            inner
+                .gui_tabs
+                .lock()
+                .insert(
+                    remote_window_id,
+                    TmuxTab {
+                        tab_id: local_tab_id,
+                        tmux_window_id: remote_window_id,
+                        layout_csum: layout_csum.to_string(),
+                        panes: HashSet::new(),
+                    },
+                )
+                .is_none()
+        );
         local_tab_id
     }
 
@@ -10032,29 +11517,31 @@ mod tests {
         rows: u64,
     ) {
         let (_read, write) = filedescriptor::socketpair().expect("test pane socketpair");
-        assert!(inner
-            .remote_panes
-            .lock()
-            .insert(
-                remote_pane_id,
-                Arc::new(Mutex::new(TmuxRemotePane {
-                    local_pane_id,
-                    output_write: write,
-                    child_state: Arc::new(TmuxChildState::new()),
-                    session_id: 1,
-                    window_id: remote_window_id,
-                    pane_id: remote_pane_id,
-                    cursor_x: 0,
-                    cursor_y: 0,
-                    pane_width: cols,
-                    pane_height: rows,
-                    pane_left: 0,
-                    pane_top: 0,
-                    output_state: TmuxPaneOutputState::Ready,
-                    output_ingress: TmuxPaneOutputIngress::default(),
-                })),
-            )
-            .is_none());
+        assert!(
+            inner
+                .remote_panes
+                .lock()
+                .insert(
+                    remote_pane_id,
+                    Arc::new(Mutex::new(TmuxRemotePane {
+                        local_pane_id,
+                        output_write: write,
+                        child_state: Arc::new(TmuxChildState::new()),
+                        session_id: 1,
+                        window_id: remote_window_id,
+                        pane_id: remote_pane_id,
+                        cursor_x: 0,
+                        cursor_y: 0,
+                        pane_width: cols,
+                        pane_height: rows,
+                        pane_left: 0,
+                        pane_top: 0,
+                        output_state: TmuxPaneOutputState::Ready,
+                        output_ingress: TmuxPaneOutputIngress::default(),
+                    })),
+                )
+                .is_none()
+        );
     }
 
     fn install_conditional_layout_in_flight(
@@ -10097,9 +11584,11 @@ mod tests {
             Some(conditional_commit),
         ));
         *tmux_domain.inner.state.lock() = State::WaitingForResponse;
-        assert!(tmux_domain
-            .inner
-            .install_io_operation(TmuxIoOperationKind::Command, generation));
+        assert!(
+            tmux_domain
+                .inner
+                .install_io_operation(TmuxIoOperationKind::Command, generation)
+        );
         command_bytes
     }
 
@@ -10129,9 +11618,11 @@ mod tests {
         else {
             panic!("changed layout should prepare immutable list-panes bytes");
         };
-        assert!(command_bytes
-            .windows(b"list-panes".len())
-            .any(|window| window == b"list-panes"));
+        assert!(
+            command_bytes
+                .windows(b"list-panes".len())
+                .any(|window| window == b"list-panes")
+        );
         assert_eq!(
             tmux_domain
                 .inner
@@ -10144,9 +11635,11 @@ mod tests {
             "preparation must not publish the suppression checksum",
         );
 
-        assert!(!tmux_domain
-            .inner
-            .commit_conditional_success(18, conditional_commit.clone()));
+        assert!(
+            !tmux_domain
+                .inner
+                .commit_conditional_success(18, conditional_commit.clone())
+        );
         assert_eq!(
             tmux_domain
                 .inner
@@ -10158,9 +11651,11 @@ mod tests {
             "old0",
             "a mismatched I/O generation must leave the checksum retryable",
         );
-        assert!(tmux_domain
-            .inner
-            .commit_conditional_success(17, conditional_commit));
+        assert!(
+            tmux_domain
+                .inner
+                .commit_conditional_success(17, conditional_commit)
+        );
         let tab = tmux_domain.inner.gui_tabs.lock();
         let tab = tab.get(&71).expect("test tab");
         assert_eq!(tab.tab_id, local_tab_id);
@@ -10265,9 +11760,11 @@ mod tests {
         };
         queue.release_prepared();
         drop(queue);
-        assert!(tmux_domain
-            .inner
-            .commit_conditional_success(93, prune_commit));
+        assert!(
+            tmux_domain
+                .inner
+                .commit_conditional_success(93, prune_commit)
+        );
 
         let mut queue = tmux_domain.inner.cmd_queue.lock();
         let mandatory = queue
@@ -10328,9 +11825,11 @@ mod tests {
             .lock()
             .record_in_flight_response(&success)
             .expect("guarded success completes the exact in-flight response");
-        assert!(tmux_domain
-            .inner
-            .claim_io_response(TmuxIoOperationKind::Command, 86));
+        assert!(
+            tmux_domain
+                .inner
+                .claim_io_response(TmuxIoOperationKind::Command, 86)
+        );
         assert!(tmux_domain.inner.apply_command_result(
             command,
             &response,
@@ -10347,14 +11846,16 @@ mod tests {
                 .layout_csum,
             "new1",
         );
-        assert!(tmux_domain
-            .inner
-            .gui_tabs
-            .lock()
-            .get_mut(&83)
-            .expect("matching tab survives reconciliation")
-            .panes
-            .remove(&retained_pane_id));
+        assert!(
+            tmux_domain
+                .inner
+                .gui_tabs
+                .lock()
+                .get_mut(&83)
+                .expect("matching tab survives reconciliation")
+                .panes
+                .remove(&retained_pane_id)
+        );
         assert_eq!(
             tmux_domain
                 .inner
@@ -10566,9 +12067,11 @@ mod tests {
             .lock()
             .record_in_flight_response(&tmux_error)
             .expect("tmux error completes the owned response");
-        assert!(tmux_domain
-            .inner
-            .claim_io_response(TmuxIoOperationKind::Command, 85));
+        assert!(
+            tmux_domain
+                .inner
+                .claim_io_response(TmuxIoOperationKind::Command, 85)
+        );
 
         assert!(!tmux_domain.inner.apply_command_result(
             command,
@@ -10687,9 +12190,11 @@ mod tests {
         else {
             panic!("newer layout reconciliation should prepare");
         };
-        assert!(!tmux_domain
-            .inner
-            .commit_conditional_success(61, older_commit));
+        assert!(
+            !tmux_domain
+                .inner
+                .commit_conditional_success(61, older_commit)
+        );
         assert_eq!(
             tmux_domain
                 .inner
@@ -10823,9 +12328,11 @@ mod tests {
         {
             let queue = tmux_domain.inner.cmd_queue.lock();
             assert_eq!(queue.len(), 1, "retryable preparation must remain admitted");
-            assert!(queue
-                .front()
-                .is_some_and(|command| command.as_resize().is_some()));
+            assert!(
+                queue
+                    .front()
+                    .is_some_and(|command| command.as_resize().is_some())
+            );
             assert!(queue.preparing.is_none());
             assert!(queue.intent_entries.is_empty());
             assert_eq!(queue.retry_deferred_intents.len(), 1);
@@ -10963,10 +12470,12 @@ mod tests {
         // Keep the production ingress path from scheduling an asynchronous
         // sender so the retirement-to-retry boundary remains deterministic.
         *tmux_domain.inner.state.lock() = State::ProcessingResponse;
-        assert!(tmux_domain
-            .inner
-            .process_protocol_events(vec![Event::WindowClose { window: 90 }])
-            .is_none());
+        assert!(
+            tmux_domain
+                .inner
+                .process_protocol_events(vec![Event::WindowClose { window: 90 }])
+                .is_none()
+        );
         assert!(tmux_domain.inner.retired_panes.lock().contains(&900));
         {
             let queue = tmux_domain.inner.cmd_queue.lock();
@@ -11053,17 +12562,21 @@ mod tests {
             panic!("newer resize should prepare");
         };
 
-        assert!(!tmux_domain
-            .inner
-            .commit_conditional_success(51, older_commit));
+        assert!(
+            !tmux_domain
+                .inner
+                .commit_conditional_success(51, older_commit)
+        );
         {
             let panes = tmux_domain.inner.remote_panes.lock();
             let pane = panes.get(&84).expect("test pane").lock();
             assert_eq!((pane.pane_width, pane.pane_height), (80, 24));
         }
-        assert!(tmux_domain
-            .inner
-            .commit_conditional_success(52, newer_commit));
+        assert!(
+            tmux_domain
+                .inner
+                .commit_conditional_success(52, newer_commit)
+        );
         {
             let panes = tmux_domain.inner.remote_panes.lock();
             let pane = panes.get(&84).expect("test pane").lock();
@@ -11378,9 +12891,11 @@ mod tests {
 
         for _ in 0..CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS - 1 {
             let mut queue = inner.cmd_queue.lock();
-            assert!(inner
-                .push_command_capped(&mut queue, Box::new(ListCommands))
-                .is_ok());
+            assert!(
+                inner
+                    .push_command_capped(&mut queue, Box::new(ListCommands))
+                    .is_ok()
+            );
         }
         assert_eq!(
             inner.push_command_capped(&mut inner.cmd_queue.lock(), Box::new(ListCommands)),
@@ -11436,9 +12951,11 @@ mod tests {
 
         for _ in 0..CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS - 1 {
             let mut queue = inner.cmd_queue.lock();
-            assert!(inner
-                .push_command_capped(&mut queue, Box::new(ListCommands))
-                .is_ok());
+            assert!(
+                inner
+                    .push_command_capped(&mut queue, Box::new(ListCommands))
+                    .is_ok()
+            );
         }
         assert_eq!(
             inner.push_command_capped(&mut inner.cmd_queue.lock(), Box::new(ListCommands)),
@@ -11462,7 +12979,7 @@ mod tests {
     }
 
     #[test]
-    fn split_command_error_resolves_pending_split_with_error() {
+    fn tmux_split_reservation_command_error_resolves_pending_with_error() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
 
@@ -11473,12 +12990,18 @@ mod tests {
 
         let mut promise = promise::Promise::new();
         let future = promise.get_future().expect("split future");
-        assert!(tmux_domain
-            .inner
-            .pending_splits
-            .lock()
-            .insert(42, promise)
-            .is_none());
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    42,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 99)
+                        .expect("reserve command-error split identity"),
+                )
+                .is_none()
+        );
 
         let cmd = SplitPane {
             pane_id: 99,
@@ -11505,10 +13028,18 @@ mod tests {
             tmux_domain.inner.pending_splits.lock().is_empty(),
             "failed split should consume the pending promise instead of leaving it queued"
         );
+        assert_eq!(
+            tmux_domain
+                .inner
+                .remote_split_identity_permits
+                .load(Ordering::Acquire),
+            0,
+            "failed command must release its pre-command retained-ID permit"
+        );
     }
 
     #[test]
-    fn terminal_cleanup_fails_pending_split_instead_of_stranding_future() {
+    fn tmux_split_reservation_terminal_cleanup_fails_pending_future() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
 
@@ -11519,12 +13050,18 @@ mod tests {
 
         let mut promise = promise::Promise::new();
         let future = promise.get_future().expect("split future");
-        assert!(tmux_domain
-            .inner
-            .pending_splits
-            .lock()
-            .insert(43, promise)
-            .is_none());
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    43,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 99)
+                        .expect("reserve terminal-cleanup split identity"),
+                )
+                .is_none()
+        );
 
         tmux_domain.inner.transition_to_clean_exit();
 
@@ -11535,10 +13072,584 @@ mod tests {
             err
         );
         assert!(tmux_domain.inner.pending_splits.lock().is_empty());
+        assert_eq!(
+            tmux_domain
+                .inner
+                .remote_split_identity_permits
+                .load(Ordering::Acquire),
+            0,
+            "terminal cleanup must release pending retained-ID permits"
+        );
+    }
+
+    fn install_atomic_split_test_domain(
+        launcher_pane_id: PaneId,
+    ) -> (ScopedMux, Arc<TmuxDomain>, Arc<RecordingPane>) {
+        let default_domain: Arc<dyn Domain> = Arc::new(
+            LocalDomain::new(&format!("tmux-atomic-split-{launcher_pane_id}"))
+                .expect("atomic split local domain"),
+        );
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let guard = ScopedMux::install(Arc::clone(&mux));
+        let launcher = RecordingPane::new(launcher_pane_id, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();
+        mux.add_pane(&launcher_dyn)
+            .expect("register atomic split launcher pane");
+        let tmux_domain = Arc::new(new_tmux_domain(launcher_pane_id));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register atomic split tmux domain");
+        *tmux_domain.inner.state.lock() = State::Idle;
+        (guard, tmux_domain, launcher)
+    }
+
+    fn complete_atomic_split_command(
+        inner: &Arc<TmuxDomainState>,
+        output: &str,
+        error: bool,
+    ) {
+        let completed = inner
+            .process_protocol_events(vec![Event::Guarded(Guarded {
+                error,
+                timestamp: 0,
+                number: 0,
+                flags: 0,
+                output: output.to_string(),
+            })])
+            .expect("atomic split command must own its guarded response");
+        complete_protocol_response(inner, completed);
     }
 
     #[test]
-    fn split_command_results_resolve_exact_request_identity_out_of_order() {
+    fn tmux_atomic_publication_cancelled_waiter_retires_remote_identity_once() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(301);
+
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().expect("cancelled split future");
+        drop(future);
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    81,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 17)
+                        .expect("reserve cancelled-waiter split identity"),
+                )
+                .is_none()
+        );
+
+        assert!(
+            tmux_domain
+                .inner
+                .resolve_pending_split(81, 17, 18)
+                .expect("resolve cancelled split response")
+        );
+        assert!(tmux_domain.inner.pending_splits.lock().is_empty());
+        assert!(!tmux_domain.inner.remote_panes.lock().contains_key(&18));
+        assert_eq!(
+            tmux_domain
+                .inner
+                .remote_split_reservations
+                .lock()
+                .get(&18)
+                .expect("cancelled split tombstone")
+                .load()
+                .expect("valid cancelled split state"),
+            TmuxRemoteSplitState::Retired
+        );
+        tmux_domain.inner.send_next_command();
+        wait_until("cancelled split compensation write", || {
+            launcher.recorded_writes() == b"kill-pane -t %18\n"
+        });
+        complete_atomic_split_command(&tmux_domain.inner, "", false);
+        assert_eq!(launcher.recorded_writes(), b"kill-pane -t %18\n");
+        assert!(
+            !tmux_domain.inner.is_terminal(),
+            "guarded split compensation must preserve a healthy domain"
+        );
+    }
+
+    #[test]
+    fn tmux_atomic_publication_corrupted_reservation_writes_one_kill_then_terminalizes() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(302);
+
+        let reservation = tmux_domain
+            .inner
+            .reserve_test_remote_split(83, 31, 32)
+            .expect("reserve corrupted rollback split");
+        let child_state = reservation.child_state();
+        let replacement = Arc::new(TmuxRemoteSplitStateCell::new());
+        let displaced = tmux_domain
+            .inner
+            .remote_split_reservations
+            .lock()
+            .insert(32, replacement)
+            .expect("displace exact rollback reservation");
+        assert!(Arc::ptr_eq(&displaced, &reservation.state));
+
+        drop(reservation);
+
+        assert!(!tmux_domain.inner.is_terminal());
+        tmux_domain.inner.send_next_command();
+        wait_until("corrupt split compensation write", || {
+            launcher.recorded_writes() == b"kill-pane -t %32\n"
+        });
+        assert!(child_state.try_wait().is_none());
+        complete_atomic_split_command(&tmux_domain.inner, "", false);
+        assert!(tmux_domain.inner.is_terminal());
+        assert!(child_state.try_wait().is_some());
+        assert_eq!(launcher.recorded_writes(), b"kill-pane -t %32\n");
+    }
+
+    #[test]
+    fn tmux_atomic_publication_terminal_after_response_writes_one_kill_before_teardown() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(303);
+
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().expect("terminal-gap split future");
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    84,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 33)
+                        .expect("reserve terminal-gap split identity"),
+                )
+                .is_none()
+        );
+        assert!(
+            tmux_domain
+                .inner
+                .resolve_pending_split(84, 33, 34)
+                .expect("resolve terminal-gap split response")
+        );
+        let reservation = block_on(future).expect("receive terminal-gap remote reservation");
+        let child_state = reservation.child_state();
+
+        tmux_domain.inner.transition_to_exit_and_schedule_detach();
+        assert!(!tmux_domain.inner.is_terminal());
+        drop(reservation);
+
+        tmux_domain.inner.send_next_command();
+        wait_until("terminal-gap split compensation write", || {
+            launcher.recorded_writes() == b"kill-pane -t %34\n"
+        });
+        assert!(child_state.try_wait().is_none());
+        complete_atomic_split_command(&tmux_domain.inner, "", false);
+        assert!(tmux_domain.inner.is_terminal());
+        assert!(child_state.try_wait().is_some());
+        assert_eq!(launcher.recorded_writes(), b"kill-pane -t %34\n");
+    }
+
+    #[test]
+    fn tmux_atomic_publication_split_compensation_preempts_detach_barrier_once() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(304);
+        let reservation = tmux_domain
+            .inner
+            .reserve_test_remote_split(85, 35, 36)
+            .expect("reserve detach-race split");
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_domain_detach(Box::new(DetachClient))
+            .expect("install detach barrier before reservation rollback");
+
+        drop(reservation);
+        tmux_domain.inner.send_next_command();
+        wait_until("detach-race split compensation write", || {
+            launcher.recorded_writes() == b"kill-pane -t %36\n"
+        });
+        complete_atomic_split_command(&tmux_domain.inner, "", false);
+        assert_eq!(launcher.recorded_writes(), b"kill-pane -t %36\n");
+        assert!(
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .front()
+                .is_some_and(|command| command.awaits_clean_exit()),
+            "guarded compensation must leave the pre-existing detach as the next response owner"
+        );
+    }
+
+    #[test]
+    fn tmux_atomic_publication_trailing_noise_compensates_exact_witness_once() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(305);
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().expect("trailing-noise split future");
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    86,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 37)
+                        .expect("reserve trailing-noise split"),
+                )
+                .is_none()
+        );
+        SplitPane {
+            pane_id: 37,
+            direction: SplitDirection::Horizontal,
+            request_id: 86,
+        }
+        .process_result(
+            tmux_domain.domain_id(),
+            &Guarded {
+                error: false,
+                timestamp: 0,
+                number: 0,
+                flags: 0,
+                output: "%38\nwarning\n".to_string(),
+            },
+        )
+        .expect("valid split witness must enter exact compensation");
+        assert!(block_on(future).is_err());
+
+        tmux_domain.inner.send_next_command();
+        wait_until("trailing-noise split compensation write", || {
+            launcher.recorded_writes() == b"kill-pane -t %38\n"
+        });
+        complete_atomic_split_command(&tmux_domain.inner, "", false);
+        assert_eq!(launcher.recorded_writes(), b"kill-pane -t %38\n");
+        assert!(!tmux_domain.inner.is_terminal());
+    }
+
+    #[test]
+    fn tmux_atomic_publication_reconciliation_kills_exact_set_difference_once() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(306);
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().expect("reconciled split future");
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    87,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 39)
+                        .expect("reserve reconciled split"),
+                )
+                .is_none()
+        );
+        SplitPane {
+            pane_id: 39,
+            direction: SplitDirection::Vertical,
+            request_id: 87,
+        }
+        .process_result(
+            tmux_domain.domain_id(),
+            &Guarded {
+                error: false,
+                timestamp: 0,
+                number: 0,
+                flags: 0,
+                output: "unparseable split output".to_string(),
+            },
+        )
+        .expect("ambiguous split must enter reconciliation");
+
+        tmux_domain.inner.send_next_command();
+        wait_until("split reconciliation list-panes write", || {
+            launcher.recorded_writes() == b"list-panes -a -F '#{pane_id}'\n"
+        });
+        complete_atomic_split_command(&tmux_domain.inner, "%40\n", false);
+        assert!(block_on(future).is_err());
+        tmux_domain.inner.send_next_command();
+        wait_until("reconciled split compensation write", || {
+            launcher.recorded_writes()
+                == b"list-panes -a -F '#{pane_id}'\nkill-pane -t %40\n"
+        });
+        complete_atomic_split_command(&tmux_domain.inner, "", false);
+        assert!(tmux_domain.inner.is_terminal());
+        assert_eq!(
+            launcher.recorded_writes(),
+            b"list-panes -a -F '#{pane_id}'\nkill-pane -t %40\n"
+        );
+    }
+
+    #[test]
+    fn tmux_atomic_publication_concurrent_new_panes_are_quarantined_without_kill() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(307);
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().expect("ambiguous split future");
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    88,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 41)
+                        .expect("reserve ambiguous split"),
+                )
+                .is_none()
+        );
+        SplitPane {
+            pane_id: 41,
+            direction: SplitDirection::Horizontal,
+            request_id: 88,
+        }
+        .process_result(
+            tmux_domain.domain_id(),
+            &Guarded {
+                error: false,
+                timestamp: 0,
+                number: 0,
+                flags: 0,
+                output: "%42\n%43\n".to_string(),
+            },
+        )
+        .expect("multiple split identities must enter reconciliation");
+
+        tmux_domain.inner.send_next_command();
+        wait_until("ambiguous split reconciliation write", || {
+            launcher.recorded_writes() == b"list-panes -a -F '#{pane_id}'\n"
+        });
+        complete_atomic_split_command(&tmux_domain.inner, "%42\n%43\n", false);
+        assert!(block_on(future).is_err());
+        assert!(tmux_domain.inner.is_terminal());
+        assert_eq!(
+            launcher.recorded_writes(),
+            b"list-panes -a -F '#{pane_id}'\n",
+            "ambiguous reconciliation must never kill either candidate"
+        );
+        let quarantine = tmux_domain.inner.split_cleanup_quarantine.lock();
+        assert!(quarantine.iter().any(|entry| {
+            entry.request_id == 88 && entry.candidates == vec![42, 43]
+        }));
+    }
+
+    #[test]
+    fn tmux_atomic_publication_reconciliation_timeout_releases_permit_and_quarantines() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(308);
+        *tmux_domain.inner.test_io_deadlines.lock() = Some(TmuxIoDeadlines {
+            start: Duration::from_secs(1),
+            write: Duration::from_secs(1),
+            response: Duration::from_millis(25),
+        });
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().expect("timeout split future");
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    89,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 44)
+                        .expect("reserve timeout split"),
+                )
+                .is_none()
+        );
+        SplitPane {
+            pane_id: 44,
+            direction: SplitDirection::Vertical,
+            request_id: 89,
+        }
+        .process_result(
+            tmux_domain.domain_id(),
+            &Guarded {
+                error: false,
+                timestamp: 0,
+                number: 0,
+                flags: 0,
+                output: "missing identity".to_string(),
+            },
+        )
+        .expect("invalid split output must enter bounded reconciliation");
+        tmux_domain.inner.send_next_command();
+        wait_until("split reconciliation timeout", || {
+            tmux_domain.inner.is_terminal()
+        });
+
+        assert!(block_on(future).is_err());
+        assert_eq!(
+            launcher.recorded_writes(),
+            b"list-panes -a -F '#{pane_id}'\n"
+        );
+        assert!(tmux_domain.inner.pending_splits.lock().is_empty());
+        assert_eq!(
+            tmux_domain
+                .inner
+                .remote_split_identity_permits
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(tmux_domain.inner.split_cleanup_obligations.lock().is_empty());
+        assert!(
+            tmux_domain
+                .inner
+                .split_cleanup_quarantine
+                .lock()
+                .iter()
+                .any(|entry| entry.request_id == 89)
+        );
+    }
+
+    #[test]
+    fn tmux_atomic_publication_compensation_timeout_writes_once_and_quarantines() {
+        let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(309);
+        *tmux_domain.inner.test_io_deadlines.lock() = Some(TmuxIoDeadlines {
+            start: Duration::from_secs(1),
+            write: Duration::from_secs(1),
+            response: Duration::from_millis(25),
+        });
+        let reservation = tmux_domain
+            .inner
+            .reserve_test_remote_split(90, 45, 46)
+            .expect("reserve compensation-timeout split");
+        let cleanup = reservation.cleanup_obligation();
+        drop(reservation);
+        tmux_domain.inner.send_next_command();
+        wait_until("split compensation timeout", || {
+            tmux_domain.inner.is_terminal()
+        });
+
+        assert_eq!(launcher.recorded_writes(), b"kill-pane -t %46\n");
+        assert_eq!(cleanup.status(), TmuxSplitCleanupStatus::Failed);
+        assert!(tmux_domain.inner.split_cleanup_obligations.lock().is_empty());
+        assert!(
+            tmux_domain
+                .inner
+                .split_cleanup_quarantine
+                .lock()
+                .iter()
+                .any(|entry| entry.request_id == 90 && entry.candidates == vec![46])
+        );
+    }
+
+    #[test]
+    fn tmux_atomic_publication_retained_identity_cap_rejects_before_command_or_remote_mutation() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(0));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("test tmux domain should register");
+        {
+            let mut retired = tmux_domain.inner.retired_panes.lock();
+            retired
+                .try_reserve(RETIRED_PANE_TOMBSTONE_LIMIT)
+                .expect("reserve saturated retained-ID negative control");
+            retired.extend((0..RETIRED_PANE_TOMBSTONE_LIMIT).map(|id| {
+                TmuxPaneId::try_from(id).expect("retained-ID test range must fit tmux pane ids")
+            }));
+        }
+
+        let command_admitted = AtomicBool::new(false);
+        let error = tmux_domain
+            .inner
+            .with_reserved_remote_split_identity(|| {
+                command_admitted.store(true, Ordering::Release);
+                Ok(())
+            })
+            .expect_err("saturated retained-ID cap must reject pre-command admission");
+        assert!(format!("{error:#}").contains("before split command admission"));
+        assert!(
+            !command_admitted.load(Ordering::Acquire),
+            "retained-ID saturation must reject before invoking remote command admission"
+        );
+        assert_eq!(tmux_domain.inner.cmd_queue.lock().len(), 0);
+        assert!(tmux_domain.inner.pending_splits.lock().is_empty());
+        assert!(tmux_domain.inner.remote_panes.lock().is_empty());
+        assert!(
+            tmux_domain
+                .inner
+                .remote_split_reservations
+                .lock()
+                .is_empty()
+        );
+        assert_eq!(
+            tmux_domain
+                .inner
+                .remote_split_identity_permits
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(tmux_domain.inner.split_cleanup_obligations.lock().is_empty());
+    }
+
+    #[test]
+    fn tmux_atomic_publication_remote_id_collision_preserves_incumbent() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(0));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("test tmux domain should register");
+        let (_output_read, output_write) =
+            filedescriptor::socketpair().expect("collision test socketpair");
+        let incumbent = Arc::new(Mutex::new(TmuxRemotePane {
+            local_pane_id: 777,
+            output_write,
+            child_state: Arc::new(TmuxChildState::new()),
+            session_id: 1,
+            window_id: 2,
+            pane_id: 28,
+            cursor_x: 0,
+            cursor_y: 0,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+            output_state: TmuxPaneOutputState::Ready,
+            output_ingress: TmuxPaneOutputIngress::default(),
+        }));
+        tmux_domain
+            .inner
+            .mirror_index
+            .lock()
+            .register_test_pane(777, 28)
+            .expect("register incumbent split identity");
+        assert!(
+            tmux_domain
+                .inner
+                .remote_panes
+                .lock()
+                .insert(28, Arc::clone(&incumbent))
+                .is_none()
+        );
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().expect("colliding split future");
+        assert!(
+            tmux_domain
+                .inner
+                .pending_splits
+                .lock()
+                .insert(
+                    82,
+                    PendingTmuxSplit::new(&tmux_domain.inner, promise, 27)
+                        .expect("reserve collision split identity"),
+                )
+                .is_none()
+        );
+
+        let error = tmux_domain
+            .inner
+            .resolve_pending_split(82, 27, 28)
+            .expect_err("incumbent remote identity must reject split publication");
+        assert!(format!("{error:#}").contains("already-materialized remote pane id 28"));
+        assert_eq!(incumbent.lock().local_pane_id, 777);
+        assert!(
+            !tmux_domain
+                .inner
+                .remote_split_reservations
+                .lock()
+                .contains_key(&28)
+        );
+        assert!(block_on(future).is_err());
+        assert!(tmux_domain.inner.is_terminal());
+    }
+
+    #[test]
+    fn tmux_split_reservation_results_resolve_exact_request_identity_out_of_order() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
 
@@ -11553,8 +13664,24 @@ mod tests {
         let second_future = second_promise.get_future().expect("second split future");
         {
             let mut pending = tmux_domain.inner.pending_splits.lock();
-            assert!(pending.insert(100, first_promise).is_none());
-            assert!(pending.insert(200, second_promise).is_none());
+            assert!(
+                pending
+                    .insert(
+                        100,
+                        PendingTmuxSplit::new(&tmux_domain.inner, first_promise, 8)
+                            .expect("reserve first out-of-order split identity"),
+                    )
+                    .is_none()
+            );
+            assert!(
+                pending
+                    .insert(
+                        200,
+                        PendingTmuxSplit::new(&tmux_domain.inner, second_promise, 9)
+                            .expect("reserve second out-of-order split identity"),
+                    )
+                    .is_none()
+            );
         }
 
         let second = SplitPane {
@@ -11593,8 +13720,10 @@ mod tests {
             )
             .expect("first split result");
 
-        assert_eq!(block_on(first_future).expect("first pane id"), 11);
-        assert_eq!(block_on(second_future).expect("second pane id"), 22);
+        let first_reservation = block_on(first_future).expect("first split reservation");
+        let second_reservation = block_on(second_future).expect("second split reservation");
+        assert_eq!(first_reservation.remote_pane_id(), 11);
+        assert_eq!(second_reservation.remote_pane_id(), 22);
         assert!(tmux_domain.inner.pending_splits.lock().is_empty());
     }
 }
