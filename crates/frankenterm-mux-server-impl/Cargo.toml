@@ -53,6 +53,7 @@ zstd.workspace = true
 winapi = { workspace=true, features = [ "winuser" ]}
 
 [dev-dependencies]
+async-trait.workspace = true
 criterion = { workspace = true }
 proptest = "1.8.0"
 tempfile.workspace = true

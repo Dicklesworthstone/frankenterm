@@ -1,7 +1,6 @@
 use anyhow::{Context as _, anyhow};
 use config::{UnixDomain, create_user_owned_dirs};
 use fs2::FileExt;
-use promise::spawn::spawn_into_main_thread;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -54,18 +53,36 @@ impl LocalListener {
             match stream {
                 Ok(stream) => {
                     let dispatch_config = self.dispatch_config.clone();
-                    spawn_into_main_thread(async move {
-                        promise::spawn::spawn(async move {
-                            crate::dispatch::process_unix_auto_with_config(stream, dispatch_config)
-                                .await
-                                .map_err(|e| {
-                                    log::error!("{:#}", e);
-                                    e
+                    match promise::spawn::try_reserve_main_thread(
+                        promise::spawn::MainThreadServiceClass::Interactive,
+                        4 * 1024,
+                    ) {
+                        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            reservation
+                                .spawn_local(async move {
+                                    if let Err(error) =
+                                        crate::dispatch::process_unix_auto_with_config(
+                                            stream,
+                                            dispatch_config,
+                                        )
+                                        .await
+                                    {
+                                        log::error!("{error:#}");
+                                    }
                                 })
-                        })
-                        .detach();
-                    })
-                    .detach();
+                                .detach();
+                        }
+                        rejected => {
+                            metrics::counter!(
+                                "mux.server.local_accept_admission",
+                                "outcome" => "terminal_rejection"
+                            )
+                            .increment(1);
+                            log::error!(
+                                "main-thread scheduler rejected local connection before dispatch construction: {rejected:?}"
+                            );
+                        }
+                    }
                 }
                 Err(err) => match Self::accept_error_action(&err) {
                     AcceptErrorAction::ContinueAfter(backoff) => {

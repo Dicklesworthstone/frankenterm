@@ -9384,13 +9384,16 @@ mod tests {
         let (item_tx, _item_rx) = bounded(DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY);
         let (terminal, _terminal_rx) = DispatchTerminal::channel();
         let topology = TopologyStreamCoordinator::new(item_tx, terminal, stream_id);
+        let request = sampled_key_request();
+        let expected_pane_id = request.request.pane_id;
+        let expected_input_serial = request.request.input_serial;
 
         dispatch_client_request(
             &mut handler,
             &topology,
             DecodedPdu {
                 serial: 3,
-                pdu: Pdu::ReliableKeyEventTracedV1(sampled_key_request()),
+                pdu: Pdu::ReliableKeyEventTracedV1(request),
             },
         )
         .expect("valid sampled input should reach the session handler");
@@ -9399,17 +9402,19 @@ mod tests {
         assert_eq!(response.len(), 1);
         assert_eq!(response[0].serial, 3);
         match &response[0].pdu {
-            Pdu::ErrorResponse(error) => {
-                assert_eq!(error.code, codec::MuxErrorCode::PANE_NOT_FOUND);
+            Pdu::ReliableKeyEventV1Response(response) => {
+                assert_eq!(response.pane_id, expected_pane_id);
+                assert_eq!(response.input_serial, expected_input_serial);
                 assert_eq!(
-                    error.request_ident,
-                    <codec::ReliableKeyEventTracedV1 as codec::PduWireIdent>::IDENT
+                    response.outcome,
+                    codec::ReliableKeyEventOutcomeV1::Rejected(
+                        codec::ReliableKeyEventRejectionV1::PaneUnavailable,
+                    )
                 );
-                error
-                    .validate()
-                    .expect("missing pane error must be canonical");
             }
-            other => panic!("expected missing-pane response after trace admission, got {other:?}"),
+            other => {
+                panic!("expected typed missing-pane response after trace admission, got {other:?}")
+            }
         }
     }
 

@@ -291,13 +291,23 @@ fn run() -> anyhow::Result<()> {
 
     let activity = Activity::new_for_mux(&mux);
 
-    promise::spawn::spawn(async move {
-        if let Err(err) = async_run(cmd).await {
-            terminate_with_error(err);
-        }
-        drop(activity);
-    })
-    .detach();
+    let startup_reservation = match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        64 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+        rejected => anyhow::bail!(
+            "main-thread scheduler rejected mandatory mux-server startup before task construction: {rejected:?}"
+        ),
+    };
+    startup_reservation
+        .spawn_local(async move {
+            if let Err(err) = async_run(cmd).await {
+                terminate_with_error(err);
+            }
+            drop(activity);
+        })
+        .detach();
 
     while !shutdown_requested() {
         executor.tick()?;
@@ -326,12 +336,30 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
 
     update_mux_domains_for_server(&config)?;
     let _config_subscription = config::subscribe_to_config_reload(move || {
-        promise::spawn::spawn_into_main_thread(async move {
-            if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
-                log::error!("Error updating mux domains: {:#}", err);
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn(async move {
+                        if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
+                            log::error!("Error updating mux domains: {:#}", err);
+                        }
+                    })
+                    .detach();
             }
-        })
-        .detach();
+            rejected => {
+                metrics::counter!(
+                    "mux.server.domain_config_reload_admission",
+                    "outcome" => "terminal_rejection"
+                )
+                .increment(1);
+                log::error!(
+                    "main-thread scheduler rejected mux-domain config reload before task construction: {rejected:?}"
+                );
+            }
+        }
         true
     });
 

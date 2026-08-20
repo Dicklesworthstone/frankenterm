@@ -27,6 +27,7 @@ config.workspace = true
 frankenterm-alloc = { workspace = true, optional = true }
 libc.workspace = true
 log.workspace = true
+metrics.workspace = true
 mux.workspace = true
 mlua.workspace = true
 openssl.workspace = true

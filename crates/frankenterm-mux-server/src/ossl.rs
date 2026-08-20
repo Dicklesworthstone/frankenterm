@@ -4,7 +4,6 @@ use config::TlsDomainServer;
 use frankenterm_mux_server_impl::PKI;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslStream, SslVerifyMode};
 use openssl::x509::X509;
-use promise::spawn::spawn_into_main_thread;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
@@ -163,22 +162,38 @@ impl OpenSSLNetListener {
                             {
                                 continue;
                             }
-                            spawn_into_main_thread(async move {
-                                promise::spawn::spawn(async move {
-                                    log::debug!("Making new AsyncSslStream");
-                                    frankenterm_mux_server_impl::dispatch::process_with_config(
-                                        AsyncSslStream::new(stream),
-                                        dispatch_config,
+                            match promise::spawn::try_reserve_main_thread(
+                                promise::spawn::MainThreadServiceClass::Interactive,
+                                4 * 1024,
+                            ) {
+                                promise::spawn::MainThreadReservationOutcome::Reserved(
+                                    reservation,
+                                ) => {
+                                    reservation
+                                        .spawn_local(async move {
+                                            log::debug!("Making new AsyncSslStream");
+                                            if let Err(error) = frankenterm_mux_server_impl::dispatch::process_with_config(
+                                                AsyncSslStream::new(stream),
+                                                dispatch_config,
+                                            )
+                                            .await
+                                            {
+                                                log::error!("process: {error:?}");
+                                            }
+                                        })
+                                        .detach();
+                                }
+                                rejected => {
+                                    metrics::counter!(
+                                        "mux.server.tls_accept_admission",
+                                        "outcome" => "terminal_rejection"
                                     )
-                                    .await
-                                    .map_err(|e| {
-                                        log::error!("process: {:?}", e);
-                                        e
-                                    })
-                                })
-                                .detach();
-                            })
-                            .detach();
+                                    .increment(1);
+                                    log::error!(
+                                        "main-thread scheduler rejected authenticated TLS connection before dispatch construction: {rejected:?}"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             log::error!("failed TlsAcceptor: {}", e);

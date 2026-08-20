@@ -23,10 +23,10 @@ use codec::{
     ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventTracedV1,
     ReliableKeyEventV1, ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1,
     RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
-    SelectStackPane, SendKeyDown, SendKeyDownTracedV1, SendKeyUp, SendMouseEvent, SendPaste,
-    SetActiveWorkspace, SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
-    SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
-    TabTitleChanged, ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
+    SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace,
+    SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
+    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
+    ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
     UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_core_audit_types::interaction_flight_recorder_v1::{
@@ -50,16 +50,18 @@ use mux::client::ClientId;
 use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::{
-    CurrentPane, Mux, PaneRegistrationHandle, ReliableInputClaimOutcome, ReliableInputKeyKind,
+    ClientOperationGuard, CurrentPane, Mux, PaneOperationGuard, PaneRegistrationHandle,
+    ReliableInputClaimOutcome, ReliableInputKeyKind,
 };
 #[cfg(test)]
 use promise::spawn::block_on;
 use promise::spawn::{
     MainThreadAdmissionRejection, MainThreadEnqueueReceipt, MainThreadReservationOutcome,
-    MainThreadServiceClass, spawn_into_main_thread, try_reserve_main_thread,
+    MainThreadServiceClass, try_reserve_main_thread, try_reserve_main_thread_with_low_priority,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
@@ -76,6 +78,7 @@ use wezterm_term::StableRowIndex;
 use wezterm_term::terminal::Alert;
 
 const SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
+const MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES: usize = 4 * 1024;
 const RELIABLE_INPUT_RETRY_AFTER_NS: u64 = 1_000_000;
 const PRODUCTION_TRACE_SHARDS: u16 = 64;
 const PRODUCTION_TRACE_TOTAL_SLOTS: u32 = 16_384;
@@ -180,6 +183,87 @@ fn reject_send_key_down_scheduler_admission(
     };
     metrics::counter!("mux.server.input_scheduler_admission", "outcome" => label).increment(1);
     Err(rejection.into())
+}
+
+fn main_thread_rpc_estimated_bytes(dynamic_bytes: usize) -> usize {
+    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES.saturating_add(dynamic_bytes)
+}
+
+fn reject_main_thread_rpc_scheduler_admission(
+    outcome: MainThreadReservationOutcome,
+) -> anyhow::Result<Pdu> {
+    let (label, rejection) = match outcome {
+        MainThreadReservationOutcome::Reserved(_) => {
+            unreachable!("reserved main-thread RPC must be spawned instead of rejected")
+        }
+        MainThreadReservationOutcome::RetryableFull(_) => {
+            ("retryable_full", MuxServerRejection::quota_exceeded())
+        }
+        MainThreadReservationOutcome::RetiredGeneration(_) => {
+            ("retired_generation", MuxServerRejection::quota_exceeded())
+        }
+        MainThreadReservationOutcome::SchedulerUnavailable => (
+            "scheduler_unavailable",
+            MuxServerRejection::backend_failure(),
+        ),
+        MainThreadReservationOutcome::InvalidSize(_) => {
+            ("invalid_size", MuxServerRejection::invalid_request())
+        }
+        MainThreadReservationOutcome::AuthorityExhausted(_) => {
+            ("authority_exhausted", MuxServerRejection::backend_failure())
+        }
+        MainThreadReservationOutcome::Coalesced(_) => {
+            ("invalid_coalescing", MuxServerRejection::backend_failure())
+        }
+    };
+    metrics::counter!("mux.server.main_thread_rpc_admission", "outcome" => label).increment(1);
+    Err(rejection.into())
+}
+
+fn schedule_main_thread_rpc<SND, MAKE, FUT>(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    make_future: MAKE,
+    send_response: SND,
+) where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+    MAKE: FnOnce(SND) -> FUT,
+    FUT: Future<Output = ()> + 'static,
+{
+    match try_reserve_main_thread(service_class, estimated_bytes) {
+        MainThreadReservationOutcome::Reserved(reservation) => {
+            metrics::counter!("mux.server.main_thread_rpc_admission", "outcome" => "admitted")
+                .increment(1);
+            reservation.spawn_local(make_future(send_response)).detach();
+        }
+        rejected => send_response(reject_main_thread_rpc_scheduler_admission(rejected)),
+    }
+}
+
+/// Admit read-only topology census work against the correctness-critical
+/// reserve, but enqueue it on the low-priority lane. Its cooperative yields
+/// can then make real room for later input instead of immediately rejoining
+/// the same high-priority FIFO ahead of that input.
+fn schedule_main_thread_snapshot_rpc<SND, MAKE, FUT>(
+    estimated_bytes: usize,
+    make_future: MAKE,
+    send_response: SND,
+) where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+    MAKE: FnOnce(SND) -> FUT,
+    FUT: Future<Output = ()> + 'static,
+{
+    match try_reserve_main_thread_with_low_priority(
+        MainThreadServiceClass::Topology,
+        estimated_bytes,
+    ) {
+        MainThreadReservationOutcome::Reserved(reservation) => {
+            metrics::counter!("mux.server.main_thread_rpc_admission", "outcome" => "admitted")
+                .increment(1);
+            reservation.spawn_local(make_future(send_response)).detach();
+        }
+        rejected => send_response(reject_main_thread_rpc_scheduler_admission(rejected)),
+    }
 }
 
 fn reliable_input_scheduler_pressure(
@@ -1385,6 +1469,10 @@ impl SessionIncarnation {
             .fetch_or(SESSION_RETIRED, Ordering::AcqRel);
     }
 
+    fn is_retired(&self) -> bool {
+        self.operation_state.load(Ordering::Acquire) & SESSION_RETIRED != 0
+    }
+
     fn release_operation(&self) {
         let mut observed = self.operation_state.load(Ordering::Acquire);
         loop {
@@ -1552,6 +1640,7 @@ pub(crate) struct SessionAuthority {
 enum SessionAuthorityError {
     Retired,
     OwnerGone,
+    ClientRegistrationRetired,
     PaneNotFound { pane_id: PaneId },
 }
 
@@ -1560,6 +1649,9 @@ impl std::fmt::Display for SessionAuthorityError {
         match self {
             Self::Retired => formatter.write_str("mux server session is retired"),
             Self::OwnerGone => formatter.write_str("mux server session owner no longer exists"),
+            Self::ClientRegistrationRetired => {
+                formatter.write_str("client registration is no longer current")
+            }
             Self::PaneNotFound { pane_id } => write!(formatter, "pane {pane_id} not found"),
         }
     }
@@ -1603,6 +1695,29 @@ impl SessionAuthority {
         Ok(session.capture_current_pane(pane_id))
     }
 
+    fn capture_mutation(
+        &self,
+        client_id: Option<&Arc<ClientId>>,
+        request_serial: u64,
+    ) -> Result<SessionMutationGuard, SessionAuthorityError> {
+        let session = self.acquire()?;
+        let client = match client_id {
+            Some(client_id) => Some(
+                session
+                    .mux()
+                    .capture_client_operation(client_id)
+                    .ok_or(SessionAuthorityError::ClientRegistrationRetired)?,
+            ),
+            None => None,
+        };
+        Ok(SessionMutationGuard {
+            session,
+            client,
+            client_id: client_id.cloned(),
+            request_serial,
+        })
+    }
+
     fn retire(&self) {
         self.incarnation.retire();
     }
@@ -1628,6 +1743,114 @@ impl Deref for CurrentSession {
 
     fn deref(&self) -> &Self::Target {
         &self.mux
+    }
+}
+
+/// Request-scoped authority retained from decode admission through response.
+///
+/// The single non-cloneable client guard lives inside one shared request
+/// owner. `Rc` clones in the local executor share that exact guard rather than
+/// minting another client-generation lease. Retiring the connection or
+/// replacing an equal-valued client therefore cannot redirect deferred work
+/// to a successor mux/session registration.
+struct SessionMutationGuard {
+    session: CurrentSession,
+    client: Option<ClientOperationGuard>,
+    client_id: Option<Arc<ClientId>>,
+    request_serial: u64,
+}
+
+/// One deferred pane mutation admitted against an exact connection, client
+/// generation, mux, and pane generation in a single request-scoped owner.
+///
+/// The pane guard is deliberately non-cloneable. Scheduling moves this
+/// composite guard into exactly one runnable; retirement can then either win
+/// before the effect cut or allow that already-admitted old-generation action
+/// to finish, but it can never redirect the action through a reused pane ID or
+/// client value.
+struct SessionPaneMutationGuard {
+    request: Rc<SessionMutationGuard>,
+    pane: PaneOperationGuard,
+}
+
+impl SessionMutationGuard {
+    fn mux(&self) -> &Arc<Mux> {
+        self.session.mux()
+    }
+
+    fn client(&self) -> Option<&ClientOperationGuard> {
+        self.client.as_ref()
+    }
+
+    fn owner_client_id(&self) -> Option<Arc<ClientId>> {
+        self.client_id.clone()
+    }
+
+    fn request_serial(&self) -> u64 {
+        self.request_serial
+    }
+
+    fn may_deliver_response(&self) -> bool {
+        !self.session._operation.incarnation.is_retired()
+    }
+
+    fn ensure_effect_admitted(&self) -> Result<(), SessionAuthorityError> {
+        if self.may_deliver_response() {
+            Ok(())
+        } else {
+            Err(SessionAuthorityError::Retired)
+        }
+    }
+
+    fn capture_pane(
+        self: &Rc<Self>,
+        pane_id: PaneId,
+    ) -> Result<SessionPaneMutationGuard, SessionAuthorityError> {
+        let registration = self
+            .mux()
+            .capture_current_pane(pane_id)
+            .ok_or(SessionAuthorityError::PaneNotFound { pane_id })?;
+        let pane = registration
+            .operation_guard(self.mux())
+            .ok_or(SessionAuthorityError::PaneNotFound { pane_id })?;
+        Ok(SessionPaneMutationGuard {
+            request: Rc::clone(self),
+            pane,
+        })
+    }
+}
+
+impl SessionPaneMutationGuard {
+    fn pane_id(&self) -> PaneId {
+        self.pane.pane_id()
+    }
+
+    fn registration(&self) -> PaneRegistrationHandle {
+        self.pane.registration()
+    }
+
+    fn request(&self) -> &SessionMutationGuard {
+        self.request.as_ref()
+    }
+
+    fn into_parts(self) -> (Rc<SessionMutationGuard>, PaneOperationGuard) {
+        (self.request, self.pane)
+    }
+
+    fn try_with_pane<R>(
+        &self,
+        f: impl FnOnce(&CurrentPane<'_>) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        self.request.ensure_effect_admitted()?;
+        self.pane.with_current_pane(f)
+    }
+}
+
+impl Deref for SessionMutationGuard {
+    type Target = Mux;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
     }
 }
 
@@ -1811,7 +2034,10 @@ impl MuxRequestErrorContext {
         }
         if let Some(authority) = error.downcast_ref::<SessionAuthorityError>() {
             return match authority {
-                SessionAuthorityError::Retired => ErrorResponse::cancelled(self.request_ident),
+                SessionAuthorityError::Retired
+                | SessionAuthorityError::ClientRegistrationRetired => {
+                    ErrorResponse::cancelled(self.request_ident)
+                }
                 SessionAuthorityError::OwnerGone => {
                     ErrorResponse::backend_failure(self.request_ident)
                 }
@@ -5786,7 +6012,7 @@ fn process_reorder_window_tabs_request(
     mux: &Mux,
     request: &codec::ReorderWindowTabsV1,
     established: EstablishedOrderedWindowAuthority,
-    client_id: Option<&Arc<ClientId>>,
+    client: Option<&ClientOperationGuard>,
 ) -> anyhow::Result<codec::ReorderWindowTabsV1Response> {
     admit_reorder_transport(request, established)?;
     let mux_request = ordered_window_adapter::codec_reorder_request_to_mux(request)
@@ -5808,8 +6034,8 @@ fn process_reorder_window_tabs_request(
                         | mux::WindowReorderTerminalOutcome::Exhausted
                 )
             );
-            if counts_as_client_activity && let Some(client_id) = client_id {
-                let _ = mux.client_had_input_if_same(client_id);
+            if counts_as_client_activity && let Some(client) = client {
+                let _ = mux.client_had_input_guarded(client);
             }
             ordered_window_adapter::mux_reorder_result_to_codec(&result)
                 .context("converting mux reorder decision for PDU89")?
@@ -6159,21 +6385,43 @@ impl SessionHandler {
         registration: PaneRegistrationHandle,
         per_pane: Arc<Mutex<PerPane>>,
     ) {
-        spawn_into_main_thread(async move {
-            let pane_id = registration.pane_id();
-            let result = authority.try_run(|| {
-                registration
-                    .try_with_current(|pane| maybe_push_pane_changes(&pane, sender, per_pane))
-                    .ok_or_else(|| anyhow!("pane registration {} is no longer current", pane_id))?
-            });
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) | Err(err) => {
-                    log::error!("scheduled pane {pane_id} render push failed: {err:#}");
-                }
+        let pane_id = registration.pane_id();
+        match try_reserve_main_thread(
+            MainThreadServiceClass::Render,
+            MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+        ) {
+            MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn_local(async move {
+                        let result = authority.try_run(|| {
+                            registration
+                                .try_with_current(|pane| {
+                                    maybe_push_pane_changes(&pane, sender, per_pane)
+                                })
+                                .ok_or_else(|| {
+                                    anyhow!("pane registration {} is no longer current", pane_id)
+                                })?
+                        });
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) | Err(err) => {
+                                log::error!("scheduled pane {pane_id} render push failed: {err:#}");
+                            }
+                        }
+                    })
+                    .detach();
             }
-        })
-        .detach();
+            rejected => {
+                metrics::counter!(
+                    "mux.server.detached_render_admission",
+                    "outcome" => "rejected"
+                )
+                .increment(1);
+                log::error!(
+                    "pane {pane_id} render push was not admitted; cached pane state remains available for the next notification or explicit client poll: {rejected:?}"
+                );
+            }
+        }
     }
 
     pub fn process_one(&mut self, decoded: DecodedPdu) {
@@ -6191,8 +6439,24 @@ impl SessionHandler {
         let serial = decoded.serial;
         let authority = self.owner.authority();
         let response_authority = authority.clone();
+        // SetClientId is the client-generation transition itself. Requiring
+        // the handler's prior registration to remain current would prevent a
+        // stale connection slot from reclaiming its identity after an
+        // equal-valued replacement has departed. It still holds the exact
+        // session/mux lease; only ordinary requests acquire the pre-existing
+        // client-generation guard.
+        let admitted_client = if matches!(&decoded.pdu, Pdu::SetClientId(_)) {
+            None
+        } else {
+            self.client_id.as_ref()
+        };
+        let request_authority = authority
+            .capture_mutation(admitted_client, serial)
+            .map(Rc::new);
+        let response_request_authority = request_authority.as_ref().ok().map(Rc::clone);
         let request_error_context = MuxRequestErrorContext::from_request(&decoded.pdu);
         let send_response = move |result: anyhow::Result<Pdu>| {
+            let _request_authority = response_request_authority.as_ref();
             let pdu = match result {
                 Ok(pdu) => pdu,
                 Err(err) => {
@@ -6208,7 +6472,23 @@ impl SessionHandler {
                 }
             };
             log::trace!("{} processing time {:?}", serial, start.elapsed());
-            let _ = response_authority.try_run(|| sender.send_control(DecodedPdu { pdu, serial }));
+            if let Some(request_authority) = response_request_authority.as_ref() {
+                debug_assert_eq!(request_authority.request_serial(), serial);
+                if request_authority.may_deliver_response() {
+                    let _ = sender.send_control(DecodedPdu { pdu, serial });
+                }
+            } else {
+                let _ =
+                    response_authority.try_run(|| sender.send_control(DecodedPdu { pdu, serial }));
+            }
+        };
+
+        let request_authority = match request_authority {
+            Ok(request_authority) => request_authority,
+            Err(error) => {
+                send_response(Err(error.into()));
+                return;
+            }
         };
 
         let trace_validation = match (&decoded.pdu, input_trace_authority.as_ref()) {
@@ -6232,28 +6512,21 @@ impl SessionHandler {
             return;
         }
 
-        if let Some(client_id) = &self.client_id {
+        if let Some(client) = request_authority.client() {
             if decoded.pdu.is_user_input() && !matches!(&decoded.pdu, Pdu::ReorderWindowTabsV1(_)) {
                 // PDU88 is marked only inside its handler, after the exact
                 // stream/session/capability/domain checks. An unauthorized
                 // reorder must not mutate even client-activity bookkeeping.
-                match self.owner.authority().acquire() {
-                    Ok(mux) => {
-                        #[cfg(not(test))]
-                        {
-                            let _ = mux.client_had_input_if_same(client_id);
-                        }
-                        #[cfg(test)]
-                        if mux.client_had_input_if_same(client_id) {
-                            self.client_input_activity_updates = self
-                                .client_input_activity_updates
-                                .checked_add(1)
-                                .expect("test client-input activity counter overflow");
-                        }
-                    }
-                    Err(err) => {
-                        log::warn!("dropped client input activity marker: {err:#}");
-                    }
+                #[cfg(not(test))]
+                {
+                    let _ = request_authority.client_had_input_guarded(client);
+                }
+                #[cfg(test)]
+                if request_authority.client_had_input_guarded(client) {
+                    self.client_input_activity_updates = self
+                        .client_input_activity_updates
+                        .checked_add(1)
+                        .expect("test client-input activity counter overflow");
                 }
             }
         }
@@ -6278,6 +6551,23 @@ impl SessionHandler {
                 Ok(registration) => Some(registration),
                 Err(err) => {
                     send_response(Err(err.into()));
+                    None
+                }
+            }
+        }
+
+        fn capture_pane_mutation_or_respond<SND>(
+            request_authority: &Rc<SessionMutationGuard>,
+            pane_id: PaneId,
+            send_response: &SND,
+        ) -> Option<SessionPaneMutationGuard>
+        where
+            SND: Fn(anyhow::Result<Pdu>),
+        {
+            match request_authority.capture_pane(pane_id) {
+                Ok(authority) => Some(authority),
+                Err(error) => {
+                    send_response(Err(error.into()));
                     None
                 }
             }
@@ -6327,41 +6617,59 @@ impl SessionHandler {
                 window_id,
                 workspace,
             }) => {
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = session_mux(&authority)?;
-                            mux.mux()
-                                .set_window_workspace(window_id, &workspace)
-                                .map_err(|error| {
-                                    map_window_mutation_error(window_id, "set workspace", error)
-                                })?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                let request_authority = Rc::clone(&request_authority);
+                let estimated_bytes = main_thread_rpc_estimated_bytes(workspace.len());
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                request_authority.ensure_effect_admitted()?;
+                                request_authority
+                                    .mux()
+                                    .set_window_workspace(window_id, &workspace)
+                                    .map_err(|error| {
+                                        map_window_mutation_error(window_id, "set workspace", error)
+                                    })?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::SetActiveWorkspace(SetActiveWorkspace { workspace }) => {
-                let client_id = self.client_id.clone();
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let client_id = client_id.ok_or_else(|| {
-                                anyhow!("set active workspace before SetClientId")
-                            })?;
-                            let mux = session_mux(&authority)?;
-                            if !mux.set_active_workspace_for_client_if_same(&client_id, &workspace)
-                            {
-                                return Err(anyhow!("client registration is no longer current"));
-                            }
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                if request_authority.client().is_none() {
+                    send_response(Err(MuxServerRejection::invalid_request().into()));
+                    return;
+                }
+                let request_authority = Rc::clone(&request_authority);
+                let estimated_bytes = main_thread_rpc_estimated_bytes(workspace.len());
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                let client = request_authority
+                                    .client()
+                                    .ok_or_else(|| anyhow!("client registration is unavailable"))?;
+                                if !request_authority
+                                    .set_active_workspace_for_client_guarded(client, &workspace)
+                                {
+                                    return Err(anyhow!(
+                                        "client registration is no longer current"
+                                    ));
+                                }
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::SetClientId(SetClientId {
                 mut client_id,
@@ -6387,20 +6695,14 @@ impl SessionHandler {
                     }
 
                     let client_id = Arc::new(client_id);
-                    let mux = match session_mux(&authority) {
-                        Ok(mux) => mux,
-                        Err(err) => {
-                            send_response(Err(err));
-                            return;
-                        }
-                    };
+                    let mux = request_authority.mux();
                     let registration_is_current = self.client_id.as_ref().is_some_and(|current| {
                         current.as_ref() == client_id.as_ref()
                             && mux.client_registration_is_current(current)
                     });
                     if !registration_is_current {
                         if let Some(prior_client_id) = self.client_id.take() {
-                            unregister_owned_client(&mux, &prior_client_id);
+                            unregister_owned_client(mux, &prior_client_id);
                         }
                         mux.register_client(Arc::clone(&client_id));
                         self.client_id = Some(client_id);
@@ -6409,62 +6711,71 @@ impl SessionHandler {
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
             }
             Pdu::SetFocusedPane(SetFocusedPane { pane_id }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                let client_id = self.client_id.clone();
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            authority.try_run(|| {
-                                registration
-                                    .try_with_current(|current| {
-                                        current.focus_for_client_if_same(client_id.as_ref())?;
-                                        Ok(Pdu::UnitResponse(UnitResponse {}))
-                                    })
-                                    .ok_or_else(|| {
-                                        anyhow!("pane registration {pane_id} is no longer current")
-                                    })?
-                            })?
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|current| {
+                                    current.focus_for_client_guarded(
+                                        pane_authority.request().client(),
+                                    )?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::GetClientList(GetClientList) => {
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = session_mux(&authority)?;
-                            let clients = mux.iter_clients();
-                            Ok(Pdu::GetClientListResponse(GetClientListResponse {
-                                clients,
-                            }))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                let mux = session_mux(&authority)?;
+                                let clients = mux.iter_clients();
+                                Ok(Pdu::GetClientListResponse(GetClientListResponse {
+                                    clients,
+                                }))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::ListPanes(ListPanes {}) => {
                 let queued_at = Instant::now();
-                spawn_into_main_thread(async move {
-                    record_pane_snapshot_queue_delay("pdu4", queued_at);
-                    let started_at = Instant::now();
-                    let response = async {
-                        let mux = session_mux(&authority)?;
-                        Ok(Pdu::ListPanesResponse(
-                            collect_list_panes_snapshot(&mux).await?,
-                        ))
-                    }
-                    .await;
-                    record_pane_snapshot_collection_wall("pdu4", started_at, response.is_ok());
-                    send_response(response);
-                })
-                .detach();
+                schedule_main_thread_snapshot_rpc(
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        record_pane_snapshot_queue_delay("pdu4", queued_at);
+                        let started_at = Instant::now();
+                        let response = async {
+                            let mux = session_mux(&authority)?;
+                            Ok(Pdu::ListPanesResponse(
+                                collect_list_panes_snapshot(&mux).await?,
+                            ))
+                        }
+                        .await;
+                        record_pane_snapshot_collection_wall("pdu4", started_at, response.is_ok());
+                        send_response(response);
+                    },
+                    send_response,
+                );
             }
             Pdu::ListPanesCoherent(ListPanesCoherent {
                 supported,
@@ -6472,234 +6783,295 @@ impl SessionHandler {
             }) => {
                 let stream_id = self.topology_stream_id;
                 let queued_at = Instant::now();
-                spawn_into_main_thread(async move {
-                    record_pane_snapshot_queue_delay("pdu82", queued_at);
-                    let started_at = Instant::now();
-                    let response = async {
-                        let negotiated =
-                            supported.intersection(TopologyCapabilities::SERVER_SUPPORTED);
-                        let outcome = if negotiated
-                            .contains(TopologyCapabilities::FENCED_SNAPSHOT_V1)
-                            && negotiated.contains(required)
-                        {
-                            let mux = session_mux(&authority)?;
-                            collect_coherent_list_panes_snapshot(&mux).await?
-                        } else {
-                            ListPanesCoherentOutcome::Unsupported {
-                                supported: TopologyCapabilities::SERVER_SUPPORTED,
-                            }
-                        };
-                        Ok(Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
-                            negotiated,
-                            stream_id,
-                            outcome,
-                        }))
-                    }
-                    .await;
-                    record_pane_snapshot_collection_wall("pdu82", started_at, response.is_ok());
-                    send_response(response);
-                })
-                .detach();
+                schedule_main_thread_snapshot_rpc(
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        record_pane_snapshot_queue_delay("pdu82", queued_at);
+                        let started_at = Instant::now();
+                        let response = async {
+                            let negotiated =
+                                supported.intersection(TopologyCapabilities::SERVER_SUPPORTED);
+                            let outcome = if negotiated
+                                .contains(TopologyCapabilities::FENCED_SNAPSHOT_V1)
+                                && negotiated.contains(required)
+                            {
+                                let mux = session_mux(&authority)?;
+                                collect_coherent_list_panes_snapshot(&mux).await?
+                            } else {
+                                ListPanesCoherentOutcome::Unsupported {
+                                    supported: TopologyCapabilities::SERVER_SUPPORTED,
+                                }
+                            };
+                            Ok(Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                                negotiated,
+                                stream_id,
+                                outcome,
+                            }))
+                        }
+                        .await;
+                        record_pane_snapshot_collection_wall("pdu82", started_at, response.is_ok());
+                        send_response(response);
+                    },
+                    send_response,
+                );
             }
             Pdu::ListPanesOrderedV1(request) => {
                 let stream_id = self.topology_stream_id;
                 let queued_at = Instant::now();
-                spawn_into_main_thread(async move {
-                    record_pane_snapshot_queue_delay("pdu87", queued_at);
-                    let started_at = Instant::now();
-                    let response = async {
-                        let mux = session_mux(&authority)?;
-                        let response = process_list_panes_ordered_request(
-                            &mux,
-                            stream_id,
-                            TopologyCapabilities::SERVER_SUPPORTED,
-                            &request,
-                        )
-                        .await?;
-                        Ok(Pdu::ListPanesOrderedV1Response(response))
-                    }
-                    .await;
-                    record_pane_snapshot_collection_wall("pdu87", started_at, response.is_ok());
-                    send_response(response);
-                })
-                .detach();
+                schedule_main_thread_snapshot_rpc(
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        record_pane_snapshot_queue_delay("pdu87", queued_at);
+                        let started_at = Instant::now();
+                        let response = async {
+                            let mux = session_mux(&authority)?;
+                            let response = process_list_panes_ordered_request(
+                                &mux,
+                                stream_id,
+                                TopologyCapabilities::SERVER_SUPPORTED,
+                                &request,
+                            )
+                            .await?;
+                            Ok(Pdu::ListPanesOrderedV1Response(response))
+                        }
+                        .await;
+                        record_pane_snapshot_collection_wall("pdu87", started_at, response.is_ok());
+                        send_response(response);
+                    },
+                    send_response,
+                );
             }
             Pdu::ReorderWindowTabsV1(request) => {
-                let client_id = self.client_id.clone();
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let ordered_window_authority = ordered_window_authority.ok_or_else(|| {
-                                anyhow!(
-                                    "ordered-window stream has not been established by a dispatched PDU87"
-                                )
-                            })?;
-                            let mux = session_mux(&authority)?;
-                            let response = process_reorder_window_tabs_request(
-                                &mux,
-                                &request,
-                                ordered_window_authority,
-                                client_id.as_ref(),
-                            )?;
-                            Ok(Pdu::ReorderWindowTabsV1Response(response))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                let request_authority = Rc::clone(&request_authority);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                request_authority.ensure_effect_admitted()?;
+                                let ordered_window_authority =
+                                    ordered_window_authority.ok_or_else(|| {
+                                        anyhow!(
+                                            "ordered-window stream has not been established by a dispatched PDU87"
+                                        )
+                                    })?;
+                                let response = process_reorder_window_tabs_request(
+                                    request_authority.as_ref(),
+                                    &request,
+                                    ordered_window_authority,
+                                    request_authority.client(),
+                                )?;
+                                Ok(Pdu::ReorderWindowTabsV1Response(response))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::ListPanesTabStacks(ListPanesTabStacks {}) => {
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = session_mux(&authority)?;
-                            let mut tab_stack_entries = vec![];
-                            for window_id in mux.iter_windows() {
-                                let Some(window) = mux.get_window(window_id) else {
-                                    log::warn!(
-                                        "ListPanesTabStacks skipped stale window id {} from iter_windows",
-                                        window_id
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                let mux = session_mux(&authority)?;
+                                let mut tab_stack_entries = vec![];
+                                for window_id in mux.iter_windows() {
+                                    let Some(window) = mux.get_window(window_id) else {
+                                        log::warn!(
+                                            "ListPanesTabStacks skipped stale window id {} from iter_windows",
+                                            window_id
+                                        );
+                                        continue;
+                                    };
+                                    tab_stack_entries.extend(
+                                        window.tab_stack_entries().into_iter().map(|entry| {
+                                            ListPanesTabStackEntry {
+                                                window_id,
+                                                stack_id: entry.stack_id,
+                                                tab_id: entry.tab_id,
+                                                position: entry.position,
+                                                is_visible: entry.is_visible,
+                                            }
+                                        }),
                                     );
-                                    continue;
-                                };
-                                tab_stack_entries.extend(window.tab_stack_entries().into_iter().map(
-                                    |entry| ListPanesTabStackEntry {
-                                        window_id,
-                                        stack_id: entry.stack_id,
-                                        tab_id: entry.tab_id,
-                                        position: entry.position,
-                                        is_visible: entry.is_visible,
-                                    },
-                                ));
-                            }
-                            log::trace!("ListPanesTabStacks {tab_stack_entries:#?}");
-                            Ok(Pdu::ListPanesTabStacksResponse(
-                                ListPanesTabStacksResponse { tab_stack_entries },
-                            ))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                                }
+                                log::trace!("ListPanesTabStacks {tab_stack_entries:#?}");
+                                Ok(Pdu::ListPanesTabStacksResponse(
+                                    ListPanesTabStacksResponse { tab_stack_entries },
+                                ))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::RenameWorkspace(RenameWorkspace {
                 old_workspace,
                 new_workspace,
             }) => {
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = session_mux(&authority)?;
-                            mux.mux().rename_workspace(&old_workspace, &new_workspace)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                let request_authority = Rc::clone(&request_authority);
+                let estimated_bytes = main_thread_rpc_estimated_bytes(
+                    old_workspace.len().saturating_add(new_workspace.len()),
+                );
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                request_authority.ensure_effect_admitted()?;
+                                request_authority
+                                    .mux()
+                                    .rename_workspace(&old_workspace, &new_workspace)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::WriteToPane(WriteToPane { pane_id, data }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
                 let sender = self.to_write_tx.clone();
+                let registration = pane_authority.registration();
                 let per_pane = self.per_pane_for_registration(&registration);
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.write_all(&data)?;
-                                push_pane_changes_after_committed_input(
-                                    pane, sender, per_pane, "write",
-                                );
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                let estimated_bytes = main_thread_rpc_estimated_bytes(data.len());
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Input,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.write_all(&data)?;
+                                    push_pane_changes_after_committed_input(
+                                        pane, sender, per_pane, "write",
+                                    );
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::EraseScrollbackRequest(EraseScrollbackRequest {
                 pane_id,
                 erase_mode,
             }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.erase_scrollback(erase_mode);
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.erase_scrollback(erase_mode);
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::KillPane(KillPane { pane_id }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
+                let registration = pane_authority.registration();
                 self.remove_per_pane_if_same(&registration);
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let retired = authority.try_run(|| registration.retire_if_current())?;
-                            if !retired {
-                                return Err(anyhow!(
-                                    "pane registration {pane_id} is no longer current"
-                                ));
-                            }
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.request().ensure_effect_admitted()?;
+                                let retired = registration.retire_if_current();
+                                if !retired {
+                                    return Err(
+                                        SessionAuthorityError::PaneNotFound { pane_id }.into()
+                                    );
+                                }
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::SendPaste(SendPaste {
                 pane_id,
                 data,
                 input_serial,
             }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
                 let sender = self.to_write_tx.clone();
+                let registration = pane_authority.registration();
                 let per_pane = self.per_pane_for_registration(&registration);
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.send_paste(&data)?;
-                                push_input_dispatch_changes_after_committed_input(
-                                    pane,
-                                    sender,
-                                    per_pane,
-                                    input_serial,
-                                    "paste",
-                                );
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                let estimated_bytes = main_thread_rpc_estimated_bytes(data.len());
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Input,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.send_paste(&data)?;
+                                    push_input_dispatch_changes_after_committed_input(
+                                        pane,
+                                        sender,
+                                        per_pane,
+                                        input_serial,
+                                        "paste",
+                                    );
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::SearchScrollbackRequest(SearchScrollbackRequest {
@@ -6714,8 +7086,11 @@ impl SessionHandler {
                     return;
                 };
 
-                spawn_into_main_thread(async move {
-                    promise::spawn::spawn(async move {
+                let estimated_bytes = main_thread_rpc_estimated_bytes(pattern.len());
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Background,
+                    estimated_bytes,
+                    |send_response| async move {
                         let result = async {
                             let session = authority.acquire()?;
                             let results = registration
@@ -6730,10 +7105,9 @@ impl SessionHandler {
                         }
                         .await;
                         send_response(result);
-                    })
-                    .detach();
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
 
             Pdu::SetPaneZoomed(SetPaneZoomed {
@@ -6741,23 +7115,30 @@ impl SessionHandler {
                 pane_id,
                 zoomed,
             }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.set_zoomed_in_tab(containing_tab_id, zoomed)?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.set_zoomed_in_tab(containing_tab_id, zoomed)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::GetPaneDirection(GetPaneDirection { pane_id, direction }) => {
@@ -6766,40 +7147,51 @@ impl SessionHandler {
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                let pane_id = pane.pane_in_direction(direction)?;
-                                Ok(Pdu::GetPaneDirectionResponse(GetPaneDirectionResponse {
-                                    pane_id,
-                                }))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                with_current_pane(&authority, &registration, |pane| {
+                                    let pane_id = pane.pane_in_direction(direction)?;
+                                    Ok(Pdu::GetPaneDirectionResponse(GetPaneDirectionResponse {
+                                        pane_id,
+                                    }))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::ActivatePaneDirection(ActivatePaneDirection { pane_id, direction }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.activate_pane_direction(direction)?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.activate_pane_direction(direction)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::Resize(Resize {
@@ -6807,36 +7199,35 @@ impl SessionHandler {
                 pane_id,
                 size,
             }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.resize_in_tab(containing_tab_id, size)?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.resize_in_tab(containing_tab_id, size)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::ReliableKeyEventV1(request) => {
-                let trace_authority = admitted_input_trace;
-                let trace_producer = trace_authority
-                    .as_ref()
-                    .and_then(|admission| admission.trace_producer.as_ref().map(Rc::clone));
-                let sampled_trace = trace_producer.is_some();
-                let scheduler_enqueue = trace_authority
-                    .as_ref()
-                    .map(|admission| Rc::clone(&admission.scheduler_enqueue));
-                let registration = match authority.capture_current_pane(request.pane_id) {
-                    Ok(registration) => registration,
+                let pane_authority = match request_authority.capture_pane(request.pane_id) {
+                    Ok(authority) => authority,
                     Err(_) => {
                         send_response(Ok(reliable_key_response(
                             &request,
@@ -6847,6 +7238,16 @@ impl SessionHandler {
                         return;
                     }
                 };
+                let registration = pane_authority.registration();
+                let (request_authority, pane_operation) = pane_authority.into_parts();
+                let trace_authority = admitted_input_trace;
+                let trace_producer = trace_authority
+                    .as_ref()
+                    .and_then(|admission| admission.trace_producer.as_ref().map(Rc::clone));
+                let sampled_trace = trace_producer.is_some();
+                let scheduler_enqueue = trace_authority
+                    .as_ref()
+                    .map(|admission| Rc::clone(&admission.scheduler_enqueue));
                 let current_pane_registration =
                     ReliablePaneRegistrationIdentityV1::from_bytes(registration.wire_identity());
                 match request.pane_registration {
@@ -6876,46 +7277,30 @@ impl SessionHandler {
                     ReliableKeyEventKindV1::KeyDown => ReliableInputKeyKind::KeyDown,
                     ReliableKeyEventKindV1::KeyUp => ReliableInputKeyKind::KeyUp,
                 };
-                let (claim, pane_operation) = match authority.acquire() {
-                    Ok(session) => {
-                        let Some(pane_operation) = registration.operation_guard(session.mux())
-                        else {
-                            send_response(Ok(reliable_key_response(
-                                &request,
-                                ReliableKeyEventOutcomeV1::Rejected(
-                                    ReliableKeyEventRejectionV1::PaneUnavailable,
-                                ),
-                            )));
-                            return;
-                        };
-                        (
-                            session.claim_reliable_key_event(
-                                self.client_id.as_ref(),
-                                &registration,
-                                request.input_serial.get(),
-                                mux_kind,
-                                &request.event,
-                            ),
-                            Some(pane_operation),
-                        )
-                    }
-                    Err(_) => (ReliableInputClaimOutcome::ClientRegistrationRetired, None),
+                let Some(client) = request_authority.client() else {
+                    send_response(Ok(reliable_key_response(
+                        &request,
+                        ReliableKeyEventOutcomeV1::Retry(
+                            ReliableKeyEventRetryV1::ClientRegistrationTransition {
+                                retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
+                            },
+                        ),
+                    )));
+                    return;
                 };
+                let claim = request_authority.claim_reliable_key_event_guarded(
+                    client,
+                    &registration,
+                    request.input_serial.get(),
+                    mux_kind,
+                    &request.event,
+                );
                 let mut permit = match reliable_input_claim_outcome(claim) {
                     Ok(permit) => permit,
                     Err(outcome) => {
                         send_response(Ok(reliable_key_response(&request, outcome)));
                         return;
                     }
-                };
-                let Some(pane_operation) = pane_operation else {
-                    send_response(Ok(reliable_key_response(
-                        &request,
-                        ReliableKeyEventOutcomeV1::Rejected(
-                            ReliableKeyEventRejectionV1::OutcomeUnknown,
-                        ),
-                    )));
-                    return;
                 };
                 let reservation = match try_reserve_main_thread(
                     MainThreadServiceClass::Input,
@@ -6931,7 +7316,6 @@ impl SessionHandler {
                 };
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
-                let client_id = self.client_id.clone();
                 #[cfg(test)]
                 let force_begin_side_effect_failure =
                     self.reliable_input_test_fault == ReliableInputTestFault::BeginSideEffectFalse;
@@ -6948,11 +7332,9 @@ impl SessionHandler {
                 #[cfg(not(test))]
                 let cancel_after_enqueue = false;
                 let spawned = reservation.spawn_local(async move {
-                    let outcome = match authority.acquire() {
-                        Ok(session) => {
-                            if !client_id.as_ref().is_some_and(|client_id| {
-                                session.client_registration_is_current(client_id)
-                            }) {
+                    let outcome = match request_authority.ensure_effect_admitted() {
+                        Ok(()) => {
+                            if request_authority.client().is_none() {
                                 ReliableKeyEventOutcomeV1::Retry(
                                     ReliableKeyEventRetryV1::ClientRegistrationTransition {
                                         retry_after_ns: RELIABLE_INPUT_RETRY_AFTER_NS,
@@ -7109,12 +7491,16 @@ impl SessionHandler {
                 event,
                 input_serial,
             }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
                 let sender = self.to_write_tx.clone();
+                let registration = pane_authority.registration();
                 let per_pane = self.per_pane_for_registration(&registration);
                 debug_assert!(
                     admitted_input_trace.is_none(),
@@ -7133,7 +7519,7 @@ impl SessionHandler {
                 let spawned = reservation.spawn_local(async move {
                     catch(
                         move || {
-                            with_current_pane(&authority, &registration, |pane| {
+                            pane_authority.try_with_pane(|pane| {
                                 pane.key_down(event.key, event.modifiers)?;
                                 push_input_dispatch_changes_after_committed_input(
                                     pane,
@@ -7153,102 +7539,136 @@ impl SessionHandler {
                 spawned.detach();
             }
             Pdu::SendKeyUp(SendKeyUp { pane_id, event }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.key_up(event.key, event.modifiers)?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Input,
+                    SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.key_up(event.key, event.modifiers)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::SendMouseEvent(SendMouseEvent { pane_id, event }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
                 let sender = self.to_write_tx.clone();
+                let registration = pane_authority.registration();
                 let per_pane = self.per_pane_for_registration(&registration);
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.mouse_event(event)?;
-                                push_pane_changes_after_committed_input(
-                                    pane,
-                                    sender,
-                                    per_pane,
-                                    "mouse event",
-                                );
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Input,
+                    SEND_KEY_DOWN_MAIN_THREAD_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.mouse_event(event)?;
+                                    push_pane_changes_after_committed_input(
+                                        pane,
+                                        sender,
+                                        per_pane,
+                                        "mouse event",
+                                    );
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::SpawnV2(spawn) => {
-                let client_id = self.client_id.clone();
-                spawn_into_main_thread(async move {
-                    schedule_domain_spawn_v2(authority, spawn, send_response, client_id);
-                })
-                .detach();
+                let request_authority = Rc::clone(&request_authority);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        schedule_domain_spawn_v2(request_authority, spawn, send_response).await;
+                    },
+                    send_response,
+                );
             }
 
             Pdu::SplitPane(split) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, split.pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    split.pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                let move_registration = match split.move_pane_id {
+                let move_pane_authority = match split.move_pane_id {
                     Some(move_pane_id) => {
-                        let Some(registration) =
-                            capture_pane_or_respond(&authority, move_pane_id, &send_response)
+                        let Some(authority) = capture_pane_mutation_or_respond(
+                            &request_authority,
+                            move_pane_id,
+                            &send_response,
+                        )
                         else {
                             return;
                         };
-                        Some(registration)
+                        Some(authority)
                     }
                     None => None,
                 };
-                let client_id = self.client_id.clone();
-                spawn_into_main_thread(async move {
-                    schedule_split_pane(
-                        authority,
-                        registration,
-                        move_registration,
-                        split,
-                        send_response,
-                        client_id,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        schedule_split_pane(
+                            pane_authority,
+                            move_pane_authority,
+                            split,
+                            send_response,
+                        )
+                        .await;
+                    },
+                    send_response,
+                );
             }
 
             Pdu::MovePaneToNewTab(request) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, request.pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    request.pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                let client_id = self.client_id.clone();
-                spawn_into_main_thread(async move {
-                    schedule_move_pane(authority, registration, request, send_response, client_id);
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        schedule_move_pane(pane_authority, request, send_response)
+                            .await;
+                    },
+                    send_response,
+                );
             }
 
             Pdu::GetPaneRenderableDimensions(GetPaneRenderableDimensions { pane_id }) => {
@@ -7257,27 +7677,31 @@ impl SessionHandler {
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                let cursor_position = pane.get_cursor_position();
-                                let dimensions = pane.get_dimensions();
-                                Ok(Pdu::GetPaneRenderableDimensionsResponse(
-                                    GetPaneRenderableDimensionsResponse {
-                                        pane_id,
-                                        cursor_position,
-                                        dimensions,
-                                        tiered_scrollback_status: pane
-                                            .get_tiered_scrollback_status(),
-                                    },
-                                ))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                with_current_pane(&authority, &registration, |pane| {
+                                    let cursor_position = pane.get_cursor_position();
+                                    let dimensions = pane.get_dimensions();
+                                    Ok(Pdu::GetPaneRenderableDimensionsResponse(
+                                        GetPaneRenderableDimensionsResponse {
+                                            pane_id,
+                                            cursor_position,
+                                            dimensions,
+                                            tiered_scrollback_status: pane
+                                                .get_tiered_scrollback_status(),
+                                        },
+                                    ))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::GetPaneTieredScrollbackStatusesV1(request) => {
@@ -7287,56 +7711,71 @@ impl SessionHandler {
                     return;
                 }
                 let queued_at = Instant::now();
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let queue_delay = queued_at.elapsed();
-                            metrics::counter!("mux.server.tiered_scrollback_batch_requests")
-                                .increment(1);
-                            metrics::histogram!(
-                                "mux.server.tiered_scrollback_batch_queue_delay_ms"
-                            )
-                            .record(queue_delay.as_secs_f64() * 1_000.0);
-                            metrics::histogram!("mux.server.tiered_scrollback_batch_panes")
-                                .record(u32::try_from(request.pane_ids.len()).unwrap_or(u32::MAX));
-
-                            let snapshot_started_at = Instant::now();
-                            let session = authority.acquire()?;
-                            // Freeze registration identity for the complete request before
-                            // invoking any pane callback. A callback for an earlier pane can
-                            // therefore retire a later registration, but cannot change a pane
-                            // that existed at turn admission from `Closed` into `Missing`.
-                            // The intermediate collection is semantically required: fusing the
-                            // iterators would interleave registration capture with callbacks.
-                            #[allow(clippy::needless_collect)]
-                            let registrations = request
-                                .pane_ids
-                                .into_iter()
-                                .map(|pane_id| (pane_id, session.capture_current_pane(pane_id)))
-                                .collect::<Vec<_>>();
-                            let entries = registrations
-                                .into_iter()
-                                .map(
-                                    |(pane_id, registration)| PaneTieredScrollbackStatusEntryV1 {
-                                        pane_id,
-                                        outcome: sample_tiered_scrollback_status(
-                                            pane_id,
-                                            registration,
-                                        ),
-                                    },
+                let estimated_bytes = main_thread_rpc_estimated_bytes(
+                    request
+                        .pane_ids
+                        .len()
+                        .saturating_mul(std::mem::size_of::<PaneId>()),
+                );
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                let queue_delay = queued_at.elapsed();
+                                metrics::counter!("mux.server.tiered_scrollback_batch_requests")
+                                    .increment(1);
+                                metrics::histogram!(
+                                    "mux.server.tiered_scrollback_batch_queue_delay_ms"
                                 )
-                                .collect::<Vec<_>>();
-                            metrics::histogram!("mux.server.tiered_scrollback_batch_snapshot_ms")
+                                .record(queue_delay.as_secs_f64() * 1_000.0);
+                                metrics::histogram!("mux.server.tiered_scrollback_batch_panes")
+                                    .record(
+                                        u32::try_from(request.pane_ids.len()).unwrap_or(u32::MAX),
+                                    );
+
+                                let snapshot_started_at = Instant::now();
+                                let session = authority.acquire()?;
+                                // Freeze registration identity for the complete request before
+                                // invoking any pane callback. A callback for an earlier pane can
+                                // therefore retire a later registration, but cannot change a pane
+                                // that existed at turn admission from `Closed` into `Missing`.
+                                // The intermediate collection is semantically required: fusing the
+                                // iterators would interleave registration capture with callbacks.
+                                #[allow(clippy::needless_collect)]
+                                let registrations = request
+                                    .pane_ids
+                                    .into_iter()
+                                    .map(|pane_id| (pane_id, session.capture_current_pane(pane_id)))
+                                    .collect::<Vec<_>>();
+                                let entries = registrations
+                                    .into_iter()
+                                    .map(|(pane_id, registration)| {
+                                        PaneTieredScrollbackStatusEntryV1 {
+                                            pane_id,
+                                            outcome: sample_tiered_scrollback_status(
+                                                pane_id,
+                                                registration,
+                                            ),
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                metrics::histogram!(
+                                    "mux.server.tiered_scrollback_batch_snapshot_ms"
+                                )
                                 .record(snapshot_started_at.elapsed().as_secs_f64() * 1_000.0);
-                            record_tiered_scrollback_batch_outcomes(&entries);
-                            let response = GetPaneTieredScrollbackStatusesV1Response { entries };
-                            response.validate()?;
-                            Ok(Pdu::GetPaneTieredScrollbackStatusesV1Response(response))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                                record_tiered_scrollback_batch_outcomes(&entries);
+                                let response =
+                                    GetPaneTieredScrollbackStatusesV1Response { entries };
+                                response.validate()?;
+                                Ok(Pdu::GetPaneTieredScrollbackStatusesV1Response(response))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
@@ -7347,27 +7786,31 @@ impl SessionHandler {
                 };
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane_for_registration(&registration);
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let is_alive = authority
-                                .try_run(|| {
-                                    registration
-                                        .try_with_current(|current| {
-                                            maybe_push_pane_changes(&current, sender, per_pane)
-                                        })
-                                        .transpose()
-                                })??
-                                .is_some();
-                            Ok(Pdu::LivenessResponse(LivenessResponse {
-                                pane_id,
-                                is_alive,
-                            }))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Render,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                let is_alive = authority
+                                    .try_run(|| {
+                                        registration
+                                            .try_with_current(|current| {
+                                                maybe_push_pane_changes(&current, sender, per_pane)
+                                            })
+                                            .transpose()
+                                    })??
+                                    .is_some();
+                                Ok(Pdu::LivenessResponse(LivenessResponse {
+                                    pane_id,
+                                    is_alive,
+                                }))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::GetLines(GetLines { pane_id, lines }) => {
@@ -7376,33 +7819,43 @@ impl SessionHandler {
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                let mut lines_and_indices = vec![];
+                let estimated_bytes = main_thread_rpc_estimated_bytes(
+                    lines
+                        .len()
+                        .saturating_mul(std::mem::size_of::<std::ops::Range<StableRowIndex>>()),
+                );
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                with_current_pane(&authority, &registration, |pane| {
+                                    let mut lines_and_indices = vec![];
 
-                                for range in lines {
-                                    let (first_row, lines) = pane.get_lines(range);
-                                    for (idx, mut line) in lines.into_iter().enumerate() {
-                                        let Some(stable_row) = stable_row_offset(first_row, idx)
-                                        else {
-                                            break;
-                                        };
-                                        line.compress_for_scrollback();
-                                        lines_and_indices.push((stable_row, line));
+                                    for range in lines {
+                                        let (first_row, lines) = pane.get_lines(range);
+                                        for (idx, mut line) in lines.into_iter().enumerate() {
+                                            let Some(stable_row) =
+                                                stable_row_offset(first_row, idx)
+                                            else {
+                                                break;
+                                            };
+                                            line.compress_for_scrollback();
+                                            lines_and_indices.push((stable_row, line));
+                                        }
                                     }
-                                }
-                                Ok(Pdu::GetLinesResponse(GetLinesResponse {
-                                    pane_id,
-                                    lines: lines_and_indices.into(),
-                                }))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                                    Ok(Pdu::GetLinesResponse(GetLinesResponse {
+                                        pane_id,
+                                        lines: lines_and_indices.into(),
+                                    }))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::GetSemanticZones(GetSemanticZones { pane_id }) => {
@@ -7411,24 +7864,28 @@ impl SessionHandler {
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                let (zones, zone_texts, last_exit_code) =
-                                    pane.semantic_snapshot()?;
-                                Ok(Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse {
-                                    pane_id,
-                                    zones,
-                                    zone_texts,
-                                    last_exit_code,
-                                }))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                with_current_pane(&authority, &registration, |pane| {
+                                    let (zones, zone_texts, last_exit_code) =
+                                        pane.semantic_snapshot()?;
+                                    Ok(Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse {
+                                        pane_id,
+                                        zones,
+                                        zone_texts,
+                                        last_exit_code,
+                                    }))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::GetImageCell(GetImageCell {
@@ -7442,40 +7899,44 @@ impl SessionHandler {
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                let mut data = None;
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Render,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                with_current_pane(&authority, &registration, |pane| {
+                                    let mut data = None;
 
-                                let lines = match stable_row_range_from_len(line_idx, 1) {
-                                    Some(line_range) => pane.get_lines(line_range).1,
-                                    None => Vec::new(),
-                                };
-                                'found_data: for line in lines {
-                                    if let Some(cell) = line.get_cell(cell_idx) {
-                                        if let Some(images) = cell.attrs().images() {
-                                            for im in images {
-                                                if im.image_data().current_content_hash()
-                                                    == data_hash
-                                                {
-                                                    data.replace(im.image_data().clone());
-                                                    break 'found_data;
+                                    let lines = match stable_row_range_from_len(line_idx, 1) {
+                                        Some(line_range) => pane.get_lines(line_range).1,
+                                        None => Vec::new(),
+                                    };
+                                    'found_data: for line in lines {
+                                        if let Some(cell) = line.get_cell(cell_idx) {
+                                            if let Some(images) = cell.attrs().images() {
+                                                for im in images {
+                                                    if im.image_data().current_content_hash()
+                                                        == data_hash
+                                                    {
+                                                        data.replace(im.image_data().clone());
+                                                        break 'found_data;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                Ok(Pdu::GetImageCellResponse(GetImageCellResponse {
-                                    pane_id,
-                                    data,
-                                }))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                                    Ok(Pdu::GetImageCellResponse(GetImageCellResponse {
+                                        pane_id,
+                                        data,
+                                    }))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::GetCodecVersion(_) => {
@@ -7508,58 +7969,81 @@ impl SessionHandler {
                 );
             }
             Pdu::WindowTitleChanged(WindowTitleChanged { window_id, title }) => {
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = session_mux(&authority)?;
-                            mux.set_window_title(window_id, &title).map_err(|error| {
-                                map_window_mutation_error(window_id, "set title", error)
-                            })?;
+                let request_authority = Rc::clone(&request_authority);
+                let estimated_bytes = main_thread_rpc_estimated_bytes(title.len());
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                request_authority.ensure_effect_admitted()?;
+                                request_authority
+                                    .mux()
+                                    .set_window_title(window_id, &title)
+                                    .map_err(|error| {
+                                    map_window_mutation_error(window_id, "set title", error)
+                                })?;
 
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::TabTitleChanged(TabTitleChanged { tab_id, title }) => {
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = session_mux(&authority)?;
-                            if mux.get_tab(tab_id).is_none() {
-                                let id = u64::try_from(tab_id)
-                                    .map_err(|_| MuxServerRejection::invalid_request())?;
-                                return Err(MuxServerRejection::tab_not_found(id).into());
-                            }
-                            mux.set_tab_title(tab_id, &title);
+                let request_authority = Rc::clone(&request_authority);
+                let estimated_bytes = main_thread_rpc_estimated_bytes(title.len());
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    estimated_bytes,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                request_authority.ensure_effect_admitted()?;
+                                let mux = request_authority.mux();
+                                if mux.get_tab(tab_id).is_none() {
+                                    let id = u64::try_from(tab_id)
+                                        .map_err(|_| MuxServerRejection::invalid_request())?;
+                                    return Err(MuxServerRejection::tab_not_found(id).into());
+                                }
+                                mux.set_tab_title(tab_id, &title);
 
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
             Pdu::SetPalette(SetPalette { pane_id, palette }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.set_client_palette(Arc::unwrap_or_clone(palette));
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Render,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.set_client_palette(Arc::unwrap_or_clone(palette));
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::AdjustPaneSize(AdjustPaneSize {
@@ -7567,23 +8051,30 @@ impl SessionHandler {
                 direction,
                 amount,
             }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            with_current_pane(&authority, &registration, |pane| {
-                                pane.adjust_pane_size(direction, amount)?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
-                            })
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
+                        catch(
+                            move || {
+                                pane_authority.try_with_pane(|pane| {
+                                    pane.adjust_pane_size(direction, amount)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
+                            },
+                            send_response,
+                        );
+                    },
+                    send_response,
+                );
             }
 
             Pdu::CreateFloatingPane(CreateFloatingPane {
@@ -7591,125 +8082,148 @@ impl SessionHandler {
                 pane_id,
                 rect,
             }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                with_current_pane(&authority, &registration, |pane| {
+                                pane_authority.try_with_pane(|pane| {
                                     pane.create_floating_pane(tab_id, rect)?;
                                     Ok(Pdu::UnitResponse(UnitResponse {}))
                                 })
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::MoveFloatingPane(MoveFloatingPane { pane_id, rect }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                with_current_pane(&authority, &registration, |pane| {
+                                pane_authority.try_with_pane(|pane| {
                                     pane.move_floating_pane(rect)?;
                                     Ok(Pdu::UnitResponse(UnitResponse {}))
                                 })
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::SetFloatingPaneZ(SetFloatingPaneZ { pane_id, z_order }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                with_current_pane(&authority, &registration, |pane| {
+                                pane_authority.try_with_pane(|pane| {
                                     pane.set_floating_pane_z_order(z_order)?;
                                     Ok(Pdu::UnitResponse(UnitResponse {}))
                                 })
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::ToggleFloatingPane(ToggleFloatingPane { pane_id, visible }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                with_current_pane(&authority, &registration, |pane| {
+                                pane_authority.try_with_pane(|pane| {
                                     pane.set_floating_pane_visible(visible)?;
                                     Ok(Pdu::UnitResponse(UnitResponse {}))
                                 })
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                with_current_pane(&authority, &registration, |pane| {
+                                pane_authority.try_with_pane(|pane| {
                                     pane.remove_floating_pane()?;
                                     Ok(Pdu::UnitResponse(UnitResponse {}))
                                 })
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::SwapToLayout(SwapToLayout {
                 tab_id,
                 layout_index,
             }) => {
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                let request_authority = Rc::clone(&request_authority);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                let mux = session_mux(&authority)?;
+                                request_authority.ensure_effect_admitted()?;
+                                let mux = request_authority.mux();
                                 let tab = mux.get_tab(tab_id).ok_or_else(|| {
                                     u64::try_from(tab_id).map_or_else(
                                         |_| MuxServerRejection::invalid_request(),
@@ -7721,20 +8235,26 @@ impl SessionHandler {
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::SetLayoutCycle(SetLayoutCycle {
                 tab_id,
                 layout_names,
             }) => {
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                let request_authority = Rc::clone(&request_authority);
+                let dynamic_bytes = layout_names
+                    .iter()
+                    .fold(0usize, |sum, name| sum.saturating_add(name.len()));
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    main_thread_rpc_estimated_bytes(dynamic_bytes),
+                    |send_response| async move {
                         catch(
                             move || {
-                                let mux = session_mux(&authority)?;
+                                request_authority.ensure_effect_admitted()?;
+                                let mux = request_authority.mux();
                                 let tab = mux.get_tab(tab_id).ok_or_else(|| {
                                     u64::try_from(tab_id).map_or_else(
                                         |_| MuxServerRejection::invalid_request(),
@@ -7765,21 +8285,24 @@ impl SessionHandler {
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::CycleStack(CycleStack {
                 tab_id,
                 slot_index,
                 forward,
             }) => {
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                let request_authority = Rc::clone(&request_authority);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                let mux = session_mux(&authority)?;
+                                request_authority.ensure_effect_admitted()?;
+                                let mux = request_authority.mux();
                                 let tab = mux.get_tab(tab_id).ok_or_else(|| {
                                     u64::try_from(tab_id).map_or_else(
                                         |_| MuxServerRejection::invalid_request(),
@@ -7795,21 +8318,24 @@ impl SessionHandler {
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::SelectStackPane(SelectStackPane {
                 tab_id,
                 slot_index,
                 pane_index,
             }) => {
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                let request_authority = Rc::clone(&request_authority);
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Interactive,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                let mux = session_mux(&authority)?;
+                                request_authority.ensure_effect_admitted()?;
+                                let mux = request_authority.mux();
                                 let tab = mux.get_tab(tab_id).ok_or_else(|| {
                                     u64::try_from(tab_id).map_or_else(
                                         |_| MuxServerRejection::invalid_request(),
@@ -7822,9 +8348,9 @@ impl SessionHandler {
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
                 pane_id,
@@ -7833,17 +8359,21 @@ impl SessionHandler {
                 min_height,
                 max_height,
             }) => {
-                let Some(registration) =
-                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                let Some(pane_authority) = capture_pane_mutation_or_respond(
+                    &request_authority,
+                    pane_id,
+                    &send_response,
+                )
                 else {
                     return;
                 };
-                spawn_into_main_thread({
-                    let send_response = send_response.clone();
-                    async move {
+                schedule_main_thread_rpc(
+                    MainThreadServiceClass::Topology,
+                    MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+                    |send_response| async move {
                         catch(
                             move || {
-                                with_current_pane(&authority, &registration, |pane| {
+                                pane_authority.try_with_pane(|pane| {
                                     pane.update_pane_constraints(
                                         min_width, max_width, min_height, max_height,
                                     )?;
@@ -7852,9 +8382,9 @@ impl SessionHandler {
                             },
                             send_response,
                         );
-                    }
-                })
-                .detach();
+                    },
+                    send_response,
+                );
             }
             Pdu::RenderApplicationResult(_) | Pdu::RenderApplicationResultV1(_) => {
                 send_response(Err(MuxServerRejection::invalid_request().into()));
@@ -7921,64 +8451,55 @@ impl SessionHandler {
 // function below because the compiler thinks that all of its locals then need to be Send.
 // We need to shimmy through this helper to break that aspect of the compiler flow
 // analysis and allow things to compile.
-fn schedule_domain_spawn_v2<SND>(
-    authority: SessionAuthority,
+async fn schedule_domain_spawn_v2<SND>(
+    request_authority: Rc<SessionMutationGuard>,
     spawn: SpawnV2,
     send_response: SND,
-    client_id: Option<Arc<ClientId>>,
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move {
-        send_response(domain_spawn_v2(authority, spawn, client_id).await);
-    })
-    .detach();
+    send_response(domain_spawn_v2(request_authority, spawn).await);
 }
 
-fn schedule_split_pane<SND>(
-    authority: SessionAuthority,
-    registration: PaneRegistrationHandle,
-    move_registration: Option<PaneRegistrationHandle>,
+async fn schedule_split_pane<SND>(
+    pane_authority: SessionPaneMutationGuard,
+    move_pane_authority: Option<SessionPaneMutationGuard>,
     split: SplitPane,
     send_response: SND,
-    client_id: Option<Arc<ClientId>>,
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move {
-        send_response(
-            split_pane(authority, registration, move_registration, split, client_id).await,
-        );
-    })
-    .detach();
+    send_response(split_pane(pane_authority, move_pane_authority, split).await);
 }
 
 async fn split_pane(
-    authority: SessionAuthority,
-    registration: PaneRegistrationHandle,
-    move_registration: Option<PaneRegistrationHandle>,
+    pane_authority: SessionPaneMutationGuard,
+    move_pane_authority: Option<SessionPaneMutationGuard>,
     split: SplitPane,
-    client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
-    let session = authority.acquire()?;
+    pane_authority.request().ensure_effect_admitted()?;
+    let target_pane_id = pane_authority.pane_id();
+    let (request_authority, pane_operation) = pane_authority.into_parts();
+    let mux = request_authority.mux();
+    let client_id = request_authority.owner_client_id();
 
     let receipt = if let Some(move_pane_id) = split.move_pane_id {
-        let move_registration = move_registration.as_ref().ok_or_else(|| {
+        let move_pane_authority = move_pane_authority.ok_or_else(|| {
             anyhow!("move pane registration {move_pane_id} was not admitted for split")
         })?;
-        registration
-            .split_moved_if_current(
-                session.mux(),
-                move_registration,
+        move_pane_authority.request().ensure_effect_admitted()?;
+        let (_, move_pane_operation) = move_pane_authority.into_parts();
+        mux.split_pane_moved(
+                pane_operation,
+                move_pane_operation,
                 split.split_request,
                 split.domain,
                 client_id,
             )
             .await
     } else {
-        registration
-            .split_spawned_if_current(
-                session.mux(),
+        mux.split_pane_spawned(
+                pane_operation,
                 split.split_request,
                 split.command,
                 split.command_dir,
@@ -7986,13 +8507,9 @@ async fn split_pane(
                 client_id,
             )
             .await
-    }
-    .ok_or_else(|| {
-        anyhow!(
-            "pane registration {} is no longer current",
-            registration.pane_id()
-        )
-    })??;
+    }?;
+
+    debug_assert_eq!(target_pane_id, split.pane_id);
 
     Ok::<Pdu, anyhow::Error>(Pdu::SpawnResponse(SpawnResponse {
         pane_id: receipt.pane_id(),
@@ -8003,23 +8520,22 @@ async fn split_pane(
 }
 
 async fn domain_spawn_v2(
-    authority: SessionAuthority,
+    request_authority: Rc<SessionMutationGuard>,
     spawn: SpawnV2,
-    client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
-    domain_spawn_v2_with_resolution_hook(authority, spawn, client_id, |_, _| {}).await
+    domain_spawn_v2_with_resolution_hook(request_authority, spawn, |_, _| {}).await
 }
 
 async fn domain_spawn_v2_with_resolution_hook<HOOK>(
-    authority: SessionAuthority,
+    request_authority: Rc<SessionMutationGuard>,
     spawn: SpawnV2,
-    client_id: Option<Arc<ClientId>>,
     on_resolved: HOOK,
 ) -> anyhow::Result<Pdu>
 where
     HOOK: FnOnce(&Arc<Mux>, &mux::DomainOperationGuard),
 {
-    let mux = session_mux(&authority)?;
+    request_authority.ensure_effect_admitted()?;
+    let mux = request_authority.mux();
     let domain_object_id = match &spawn.domain {
         config::keyassignment::SpawnTabDomain::DomainId(domain_id) => {
             u64::try_from(*domain_id).ok()
@@ -8028,14 +8544,13 @@ where
         | config::keyassignment::SpawnTabDomain::CurrentPaneDomain
         | config::keyassignment::SpawnTabDomain::DomainName(_) => None,
     };
-    let domain = mux.mux()
+    let domain = mux
         .resolve_spawn_tab_domain(None, &spawn.domain)
         .map_err(|_| MuxServerRejection::domain_not_found(domain_object_id))?;
     let frozen_domain = config::keyassignment::SpawnTabDomain::DomainId(domain.domain_id());
-    on_resolved(mux.mux(), &domain);
+    on_resolved(mux, &domain);
 
     let spawn_result = mux
-        .mux()
         .spawn_tab_or_window(
             spawn.window_id,
             frozen_domain,
@@ -8045,7 +8560,7 @@ where
             None, // optional current pane_id
             spawn.workspace,
             None, // optional gui window position
-            client_id,
+            request_authority.owner_client_id(),
         )
         .await;
     drop(domain);
@@ -8059,42 +8574,31 @@ where
     }))
 }
 
-fn schedule_move_pane<SND>(
-    authority: SessionAuthority,
-    registration: PaneRegistrationHandle,
+async fn schedule_move_pane<SND>(
+    pane_authority: SessionPaneMutationGuard,
     request: MovePaneToNewTab,
     send_response: SND,
-    client_id: Option<Arc<ClientId>>,
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move {
-        send_response(move_pane(authority, registration, request, client_id).await);
-    })
-    .detach();
+    send_response(move_pane(pane_authority, request).await);
 }
 
 async fn move_pane(
-    authority: SessionAuthority,
-    registration: PaneRegistrationHandle,
+    pane_authority: SessionPaneMutationGuard,
     request: MovePaneToNewTab,
-    client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
-    let session = authority.acquire()?;
-    let receipt = registration
-        .move_to_new_tab_if_current(
-            session.mux(),
+    pane_authority.request().ensure_effect_admitted()?;
+    let (request_authority, pane_operation) = pane_authority.into_parts();
+    let mux = request_authority.mux();
+    let receipt = mux
+        .move_pane_to_new_tab_guarded(
+            pane_operation,
             request.window_id,
             request.workspace_for_new_window,
-            client_id,
+            request_authority.owner_client_id(),
         )
-        .await
-        .ok_or_else(|| {
-            anyhow!(
-                "pane registration {} is no longer current",
-                registration.pane_id()
-            )
-        })??;
+        .await?;
 
     Ok::<Pdu, anyhow::Error>(Pdu::MovePaneToNewTabResponse(MovePaneToNewTabResponse {
         tab_id: receipt.tab_id(),
@@ -8184,7 +8688,6 @@ mod tests {
         pane_registration: ReliablePaneRegistrationIdentityV1,
         mux: Arc<Mux>,
         _mux_guard: ScopedMux,
-        recorder: Arc<FlightRecorder>,
         authority: Arc<DispatchTraceAuthority>,
         producer: Rc<SessionTraceProducer>,
         handler: SessionHandler,
@@ -8221,7 +8724,7 @@ mod tests {
             let pane_for_tab: Arc<dyn Pane> = pane.clone();
             let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
             tab.assign_pane(&pane_for_tab);
-            let (mux, mux_guard) = install_tab_with_window(&tab, &[]);
+            let (mux, mux_guard) = install_tab_with_window(&tab);
             let registration = mux
                 .capture_pane_registration(&pane_for_tab)
                 .expect("sampled harness pane retains exact wire authority");
@@ -8249,13 +8752,17 @@ mod tests {
                 take_response(&captured).pdu,
                 Pdu::UnitResponse(UnitResponse {})
             );
+            // Pane/tab publication may enqueue lifecycle maintenance. Tests
+            // below make exact assertions about the reliable-input runnable,
+            // so establish a quiescent scheduler baseline after fixture setup
+            // instead of accidentally ticking an unrelated setup callback.
+            drain_simple_executor(&executor);
             Self {
                 executor,
                 pane,
                 pane_registration,
                 mux,
                 _mux_guard: mux_guard,
-                recorder,
                 authority,
                 producer,
                 handler,
@@ -8446,7 +8953,7 @@ mod tests {
         let pane_for_tab: Arc<dyn Pane> = pane.clone();
         let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
         tab.assign_pane(&pane_for_tab);
-        let (mux, _mux_guard) = install_tab_with_window(&tab, &[]);
+        let (mux, _mux_guard) = install_tab_with_window(&tab);
         let (_, window_id, tab_id) = mux
             .resolve_pane_id(pane.pane_id())
             .expect("attached test pane must have one exact topology owner");
@@ -8475,6 +8982,7 @@ mod tests {
             take_response(&captured).pdu,
             Pdu::UnitResponse(UnitResponse {})
         );
+        drain_simple_executor(&executor);
         let registration = mux
             .capture_pane_registration(&pane_for_tab)
             .expect("sampled trace pane must retain an exact registration");
@@ -8794,6 +9302,68 @@ mod tests {
     }
 
     #[test]
+    fn main_thread_rpc_saturation_rejects_before_future_construction() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let executor = SimpleExecutor::try_with_limits(
+            MainThreadAdmissionLimits::new(1, 8 * 1024, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let blocker = match try_spawn_with_admission(
+            MainThreadServiceClass::Topology,
+            4 * 1024,
+            std::future::pending::<()>(),
+        ) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned,
+            outcome => panic!("expected scheduler blocker admission, got {outcome:?}"),
+        };
+        let future_constructed = Arc::new(AtomicBool::new(false));
+        let future_ran = Arc::new(AtomicBool::new(false));
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let constructed_for_factory = Arc::clone(&future_constructed);
+        let ran_for_future = Arc::clone(&future_ran);
+        let responses_for_sender = Arc::clone(&responses);
+        let send_response: Box<dyn Fn(anyhow::Result<Pdu>)> = Box::new(move |response| {
+            responses_for_sender.lock().unwrap().push(response);
+        });
+
+        schedule_main_thread_rpc(
+            MainThreadServiceClass::Interactive,
+            MAIN_THREAD_RPC_BASE_ESTIMATED_BYTES,
+            move |send_response: Box<dyn Fn(anyhow::Result<Pdu>)>| {
+                constructed_for_factory.store(true, Ordering::Release);
+                async move {
+                    ran_for_future.store(true, Ordering::Release);
+                    send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
+                }
+            },
+            send_response,
+        );
+
+        assert!(
+            !future_constructed.load(Ordering::Acquire),
+            "a rejected request must retain producer state instead of constructing a task"
+        );
+        assert!(!future_ran.load(Ordering::Acquire));
+        let error = responses
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("scheduler rejection produces one response")
+            .expect_err("saturated scheduler rejects the request");
+        let rejection = error
+            .downcast_ref::<MuxServerRejection>()
+            .expect("scheduler rejection remains typed");
+        assert_eq!(rejection.code, MuxErrorCode::QUOTA_EXCEEDED);
+        assert_eq!(rejection.effect, MuxErrorEffect::NOT_APPLIED);
+        assert_eq!(rejection.retry, MuxErrorRetry::SAFE_AFTER_BACKOFF);
+
+        drop(blocker);
+        while executor.try_tick().unwrap() {}
+    }
+
+    #[test]
     fn sampled_duplicate_pending_retry_records_no_k4_k5_pair() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
@@ -8838,7 +9408,7 @@ mod tests {
     }
 
     #[test]
-    fn sampled_retired_client_runnable_records_no_k4_k5_pair() {
+    fn sampled_admitted_client_generation_finishes_without_retargeting_replacement() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -8860,21 +9430,35 @@ mod tests {
             .as_ref()
             .expect("sampled harness registered its client");
         let replacement = Arc::new(retired.as_ref().clone());
-        harness.mux.register_client(replacement);
+        harness.mux.register_client(Arc::clone(&replacement));
+        assert!(harness.mux.client_registration_is_current(&replacement));
+        assert!(!harness.mux.client_registration_is_current(retired));
 
         harness.executor.tick().expect("run retired-client task");
-        let response = take_response(&harness.captured);
+        let response = {
+            let mut responses = harness
+                .captured
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let index = responses
+                .iter()
+                .position(|response| response.serial == 2)
+                .expect("retired-client retry must retain the request serial");
+            responses.remove(index)
+        };
         assert!(matches!(
             response.pdu,
             Pdu::ReliableKeyEventV1Response(ReliableKeyEventV1Response {
-                outcome: ReliableKeyEventOutcomeV1::Retry(
-                    ReliableKeyEventRetryV1::ClientRegistrationTransition { .. }
-                ),
+                outcome: ReliableKeyEventOutcomeV1::Applied,
                 ..
             })
         ));
-        assert_eq!(harness.pane.key_down_count(), 0);
-        assert!(freeze_trace_events(&recorder).is_empty());
+        assert_eq!(harness.pane.key_down_count(), 1);
+        assert_eq!(freeze_trace_events(&recorder).len(), 2);
+        assert!(
+            harness.mux.client_registration_is_current(&replacement),
+            "the admitted old-generation effect must not mutate or retire its equal-valued successor"
+        );
     }
 
     #[test]
@@ -8907,7 +9491,7 @@ mod tests {
             })
         ));
         assert_eq!(harness.pane.key_down_count(), 0);
-        assert!(freeze_trace_events(&recorder).is_empty());
+        assert_eq!(freeze_trace_events(&recorder), Vec::new());
     }
 
     #[test]
@@ -8935,7 +9519,7 @@ mod tests {
         assert_eq!(harness.executor.queue_snapshot().depth, 0);
         assert_eq!(harness.pane.key_down_count(), 0);
         assert!(harness.captured.lock().unwrap().is_empty());
-        assert!(freeze_trace_events(&recorder).is_empty());
+        assert_eq!(freeze_trace_events(&recorder), Vec::new());
     }
 
     #[test]
@@ -8978,7 +9562,7 @@ mod tests {
         tick_until_response(&harness.executor, &harness.captured, 2);
         drain_simple_executor(&harness.executor);
         assert_eq!(harness.pane.key_down_count(), 1);
-        assert!(freeze_trace_events(&recorder).is_empty());
+        assert_eq!(freeze_trace_events(&recorder), Vec::new());
     }
 
     #[test]
@@ -9029,7 +9613,7 @@ mod tests {
             })
         ));
         assert_eq!(harness.pane.key_down_count(), 1);
-        assert!(freeze_trace_events(&recorder).is_empty());
+        assert_eq!(freeze_trace_events(&recorder), Vec::new());
     }
 
     #[test]
@@ -9037,7 +9621,7 @@ mod tests {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let cases: [(&str, Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>); 2] = [
+        let cases: [(&str, KeyDownProbe); 2] = [
             (
                 "error",
                 Arc::new(|| Err(anyhow!("injected sampled key callback failure"))),
@@ -9182,7 +9766,7 @@ mod tests {
                     })
                 )
         }));
-        assert!(freeze_trace_events(&recorder).is_empty());
+        assert_eq!(freeze_trace_events(&recorder), Vec::new());
     }
 
     #[test]
@@ -9266,7 +9850,7 @@ mod tests {
         let pane_for_tab: Arc<dyn Pane> = pane.clone();
         let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
         tab.assign_pane(&pane_for_tab);
-        let (mux, _mux_guard) = install_tab_with_window(&tab, &[]);
+        let (mux, _mux_guard) = install_tab_with_window(&tab);
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new_for_mux(sender, mux);
 
@@ -9472,7 +10056,7 @@ mod tests {
         let pane_for_tab: Arc<dyn Pane> = pane.clone();
         let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
         tab.assign_pane(&pane_for_tab);
-        let (mux, _mux_guard) = install_tab_with_window(&tab, &[]);
+        let (mux, _mux_guard) = install_tab_with_window(&tab);
 
         let stream_id = topology_stream(11);
         let recorder = trace_recorder(1);
@@ -9602,6 +10186,8 @@ mod tests {
         }
     }
 
+    type KeyDownProbe = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
+
     #[derive(Clone)]
     struct FakePaneState {
         cursor_position: StableCursorPosition,
@@ -9620,7 +10206,7 @@ mod tests {
         changed_lines: Mutex<RangeSet<StableRowIndex>>,
         changed_since_seqnos: Mutex<Vec<SequenceNo>>,
         key_down_count: AtomicUsize,
-        key_down_probe: Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
+        key_down_probe: Option<KeyDownProbe>,
         paste_count: AtomicUsize,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         tiered_scrollback_status_probe: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -9698,10 +10284,7 @@ mod tests {
             pane
         }
 
-        fn new_with_key_down_probe(
-            pane_id: PaneId,
-            key_down_probe: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
-        ) -> Self {
+        fn new_with_key_down_probe(pane_id: PaneId, key_down_probe: KeyDownProbe) -> Self {
             let mut pane = Self::new_with_id(pane_id, None);
             pane.key_down_probe = Some(key_down_probe);
             pane
@@ -10013,9 +10596,12 @@ mod tests {
             .expect("register routing domain B");
 
         let response = block_on(domain_spawn_v2_with_resolution_hook(
-            SessionAuthority::new(&mux),
+            Rc::new(
+                SessionAuthority::new(&mux)
+                    .capture_mutation(None, 1)
+                    .expect("capture exact routing request authority"),
+            ),
             routing_spawn_request(config::keyassignment::SpawnTabDomain::DefaultDomain),
-            None,
             |mux, resolved| {
                 assert_eq!(resolved.domain_id(), 0);
                 let replacement = mux.get_domain(1).expect("routing domain B remains live");
@@ -10059,11 +10645,14 @@ mod tests {
         let domain_b_for_barrier = Arc::clone(&domain_b);
 
         let result = block_on(domain_spawn_v2_with_resolution_hook(
-            SessionAuthority::new(&mux),
+            Rc::new(
+                SessionAuthority::new(&mux)
+                    .capture_mutation(None, 2)
+                    .expect("capture exact routing request authority"),
+            ),
             routing_spawn_request(config::keyassignment::SpawnTabDomain::DomainName(
                 "shared-routing-name".to_string(),
             )),
-            None,
             move |mux, resolved| {
                 assert_eq!(resolved.domain_id(), 0);
                 assert!(
@@ -11402,7 +11991,11 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
 
         let collector_order = Arc::clone(&order);
-        spawn_into_main_thread(async move {
+        let collector = match try_reserve_main_thread_with_low_priority(
+            MainThreadServiceClass::Topology,
+            1,
+        ) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation.spawn_local(async move {
             let mut ledger = mux::tab::PaneSnapshotCensusLedger::new(
                 PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM,
                 PANE_SNAPSHOT_COOPERATIVE_WORK_QUANTUM,
@@ -11418,8 +12011,10 @@ mod tests {
             cooperator.after_tab(&ledger).await;
             collector_order.lock().unwrap().push("collector-after");
             assert_eq!(cooperator.yields(), 1);
-        })
-        .detach();
+            }),
+            outcome => panic!("expected cooperative collector admission, got {outcome:?}"),
+        };
+        collector.detach();
 
         assert!(
             executor
@@ -11586,18 +12181,18 @@ mod tests {
             .expect("snapshot-stage reorder request must satisfy mux authority")
     }
 
-    fn install_tab_with_window(
-        tab: &Arc<mux::tab::Tab>,
-        extra_panes: &[Arc<dyn Pane>],
-    ) -> (Arc<Mux>, ScopedMux) {
-        let mux = Arc::new(Mux::new(None));
+    fn install_tab_with_window(tab: &Arc<mux::tab::Tab>) -> (Arc<Mux>, ScopedMux) {
+        let domain: Arc<dyn Domain> = Arc::new(SpawnRoutingTestDomain::new(
+            DomainId::default(),
+            "installed-tab-test-domain",
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let mux = Arc::new(Mux::new(Some(domain)));
         let guard = ScopedMux::install(&mux);
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
         mux.add_tab_and_active_pane(tab).unwrap();
-        for pane in extra_panes {
-            mux.add_pane(pane).unwrap();
-        }
         mux.add_tab_to_window(tab, window_id).unwrap();
         drop(window);
         (mux, guard)
@@ -12212,7 +12807,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_kill_rejects_same_id_replacement() {
+    fn deferred_kill_fences_same_id_replacement_until_effect_finishes() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -12235,8 +12830,10 @@ mod tests {
         });
         assert!(original_registration.retire_if_current());
         let replacement: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
-        mux.add_pane(&replacement)
-            .expect("register replacement pane");
+        assert!(
+            mux.add_pane(&replacement).is_err(),
+            "the queued request's admitted pane guard must fence same-ID reuse"
+        );
         tick_until_response(&executor, &captured, 1);
 
         let response = take_response(&captured);
@@ -12249,11 +12846,206 @@ mod tests {
                 id: u64::try_from(pane_id).expect("test pane id fits protocol object id"),
             })
         );
-        assert!(
-            mux.get_pane(pane_id)
-                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)),
-            "stale queued kill must preserve the same-ID replacement"
-        );
+        mux.add_pane(&replacement)
+            .expect("same-ID replacement is admitted after queued authority drops");
+        assert!(mux
+            .get_pane(pane_id)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)));
+    }
+
+    #[test]
+    fn every_deferred_pane_mutation_holds_exact_generation_until_runnable_finishes() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        type MutationRequest = fn(PaneId) -> Pdu;
+        let cases: &[(&str, MutationRequest)] = &[
+            ("focus", |pane_id| {
+                Pdu::SetFocusedPane(SetFocusedPane { pane_id })
+            }),
+            ("write", |pane_id| {
+                Pdu::WriteToPane(WriteToPane {
+                    pane_id,
+                    data: b"generation-fenced-write".to_vec(),
+                })
+            }),
+            ("erase-scrollback", |pane_id| {
+                Pdu::EraseScrollbackRequest(EraseScrollbackRequest {
+                    pane_id,
+                    erase_mode: config::keyassignment::ScrollbackEraseMode::ScrollbackOnly,
+                })
+            }),
+            ("paste", |pane_id| {
+                Pdu::SendPaste(SendPaste {
+                    pane_id,
+                    data: "generation-fenced-paste".to_string(),
+                    input_serial: InputSerial::empty(),
+                })
+            }),
+            ("zoom", |pane_id| {
+                Pdu::SetPaneZoomed(SetPaneZoomed {
+                    containing_tab_id: 91_001,
+                    pane_id,
+                    zoomed: true,
+                })
+            }),
+            ("activate-direction", |pane_id| {
+                Pdu::ActivatePaneDirection(ActivatePaneDirection {
+                    pane_id,
+                    direction: PaneDirection::Next,
+                })
+            }),
+            ("resize", |pane_id| {
+                Pdu::Resize(Resize {
+                    containing_tab_id: 91_002,
+                    pane_id,
+                    size: TerminalSize::default(),
+                })
+            }),
+            ("key-down", |pane_id| {
+                Pdu::SendKeyDown(SendKeyDown {
+                    pane_id,
+                    event: termwiz::input::KeyEvent {
+                        key: KeyCode::Char('d'),
+                        modifiers: KeyModifiers::CTRL,
+                    },
+                    input_serial: InputSerial::empty(),
+                })
+            }),
+            ("key-up", |pane_id| {
+                Pdu::SendKeyUp(SendKeyUp {
+                    pane_id,
+                    event: termwiz::input::KeyEvent {
+                        key: KeyCode::Char('u'),
+                        modifiers: KeyModifiers::ALT,
+                    },
+                })
+            }),
+            ("mouse", |pane_id| {
+                Pdu::SendMouseEvent(SendMouseEvent {
+                    pane_id,
+                    event: MouseEvent {
+                        kind: wezterm_term::input::MouseEventKind::Move,
+                        x: 1,
+                        y: 2,
+                        x_pixel_offset: 0,
+                        y_pixel_offset: 0,
+                        button: wezterm_term::input::MouseButton::None,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                })
+            }),
+            ("split", |pane_id| {
+                Pdu::SplitPane(SplitPane {
+                    pane_id,
+                    split_request: mux::tab::SplitRequest::default(),
+                    command: None,
+                    command_dir: None,
+                    domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+                    move_pane_id: None,
+                })
+            }),
+            ("move-to-new-tab", |pane_id| {
+                Pdu::MovePaneToNewTab(MovePaneToNewTab {
+                    pane_id,
+                    window_id: None,
+                    workspace_for_new_window: None,
+                })
+            }),
+            ("palette", |pane_id| {
+                Pdu::SetPalette(SetPalette {
+                    pane_id,
+                    palette: Arc::new(ColorPalette::default()),
+                })
+            }),
+            ("adjust-size", |pane_id| {
+                Pdu::AdjustPaneSize(AdjustPaneSize {
+                    pane_id,
+                    direction: PaneDirection::Right,
+                    amount: 1,
+                })
+            }),
+            ("move-floating", |pane_id| {
+                Pdu::MoveFloatingPane(MoveFloatingPane {
+                    pane_id,
+                    rect: mux::tab::FloatingPaneRect {
+                        left: 1,
+                        top: 2,
+                        width: 20,
+                        height: 10,
+                    },
+                })
+            }),
+            ("set-floating-z", |pane_id| {
+                Pdu::SetFloatingPaneZ(SetFloatingPaneZ {
+                    pane_id,
+                    z_order: 7,
+                })
+            }),
+            ("toggle-floating", |pane_id| {
+                Pdu::ToggleFloatingPane(ToggleFloatingPane {
+                    pane_id,
+                    visible: false,
+                })
+            }),
+            ("remove-floating", |pane_id| {
+                Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id })
+            }),
+            ("constraints", |pane_id| {
+                Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                    pane_id,
+                    min_width: Some(10),
+                    max_width: Some(100),
+                    min_height: Some(4),
+                    max_height: Some(40),
+                })
+            }),
+        ];
+
+        for (case_index, (label, request)) in cases.iter().enumerate() {
+            let pane_id = 71_000 + case_index;
+            let mux = Arc::new(Mux::new(None));
+            let original: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+            mux.add_pane(&original)
+                .unwrap_or_else(|error| panic!("{label}: register original pane: {error:#}"));
+            let registration = mux
+                .capture_current_pane(pane_id)
+                .unwrap_or_else(|| panic!("{label}: capture original registration"));
+            let (sender, captured) = capturing_sender();
+            let mut handler =
+                SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+
+            handler.process_one(DecodedPdu {
+                serial: 10_000 + u64::try_from(case_index).expect("case index fits serial"),
+                pdu: request(pane_id),
+            });
+            assert!(
+                registration.retire_if_current(),
+                "{label}: retire the exact generation after request admission"
+            );
+            let replacement: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+            assert!(
+                mux.add_pane(&replacement).is_err(),
+                "{label}: queued runnable must retain an exact pane-operation guard"
+            );
+
+            drop(handler);
+            drain_simple_executor(&executor);
+            assert!(
+                captured
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty(),
+                "{label}: retired session must suppress the cancelled response"
+            );
+            mux.add_pane(&replacement).unwrap_or_else(|error| {
+                panic!("{label}: exact pane guard must release after cancellation: {error:#}")
+            });
+            assert!(mux
+                .get_pane(pane_id)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)));
+        }
     }
 
     #[test]
@@ -12281,11 +13073,13 @@ mod tests {
         drop(handler);
         let drained = Arc::new(AtomicUsize::new(0));
         let drained_task = Arc::clone(&drained);
-        spawn_into_main_thread(async move {
+        match try_spawn_with_admission(MainThreadServiceClass::Topology, 1, async move {
             drained_task.store(1, Ordering::Release);
             Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+        }) {
+            MainThreadSpawnOutcome::Spawned(spawned) => spawned.detach(),
+            outcome => panic!("expected drain sentinel admission, got {outcome:?}"),
+        }
         for _ in 0..16 {
             if drained.load(Ordering::Acquire) == 1 {
                 break;
@@ -12320,6 +13114,9 @@ mod tests {
         let first_pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_005, None));
         let second_pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_006, None));
         tab.assign_pane(&first_pane);
+        let (mux, _mux_guard) = install_tab_with_window(&tab);
+        mux.add_pane(&second_pane)
+            .expect("register second pane before bound split");
         tab.split_and_insert(
             0,
             mux::tab::SplitRequest {
@@ -12330,7 +13127,6 @@ mod tests {
         )
         .expect("insert second pane");
         tab.set_active_pane(&first_pane);
-        let (mux, _mux_guard) = install_tab_with_window(&tab, &[Arc::clone(&second_pane)]);
         let client = test_client_id("stale-focus", 41_008);
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
@@ -12362,16 +13158,9 @@ mod tests {
         let error = expect_error_response(
             &response.pdu,
             SetFocusedPane::IDENT,
-            MuxErrorCode::PANE_NOT_FOUND,
+            MuxErrorCode::CANCELLED,
         );
-        assert_eq!(
-            error.object,
-            Some(MuxErrorObject {
-                kind: MuxErrorObjectKind::PANE,
-                id: u64::try_from(second_pane.pane_id())
-                    .expect("test pane id fits protocol object id"),
-            })
-        );
+        assert_eq!(error.object, None);
         assert_eq!(
             tab.get_active_pane().map(|pane| pane.pane_id()),
             Some(first_pane.pane_id()),
@@ -12382,6 +13171,82 @@ mod tests {
             mux.client_registration_is_current(&replacement_client),
             "stale handler cleanup must preserve the equal-valued replacement client"
         );
+        assert!(mux.unregister_client_if_same(&replacement_client));
+    }
+
+    #[test]
+    fn admitted_key_down_holds_exact_client_generation_through_replacement_and_response() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane = Arc::new(FakePane::new_with_id(7_009, None));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("register exact-generation key pane");
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+        let client = test_client_id("admitted-key-generation", 41_010);
+
+        handler.process_one(DecodedPdu {
+            serial: 306,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client.clone(),
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        let stale_client = Arc::clone(handler.client_id.as_ref().expect("registered client"));
+        let stale_client_weak = Arc::downgrade(&stale_client);
+
+        handler.process_one(DecodedPdu {
+            serial: 307,
+            pdu: Pdu::SendKeyDown(SendKeyDown {
+                pane_id: pane.pane_id(),
+                event: termwiz::input::KeyEvent {
+                    key: KeyCode::Char('g'),
+                    modifiers: KeyModifiers::CTRL,
+                },
+                input_serial: InputSerial::now(),
+            }),
+        });
+        assert_eq!(pane.key_down_count(), 0, "key task must still be queued");
+
+        let replacement_client = Arc::new(client);
+        mux.register_client(Arc::clone(&replacement_client));
+        assert!(!mux.client_registration_is_current(&stale_client));
+        assert!(mux.client_registration_is_current(&replacement_client));
+
+        tick_until_response(&executor, &captured, 1);
+        let response = {
+            let mut responses = captured.lock().unwrap_or_else(|error| error.into_inner());
+            let index = responses
+                .iter()
+                .position(|response| response.serial == 307)
+                .expect("admitted key response must preserve its request serial");
+            responses.remove(index)
+        };
+        assert_eq!(response.serial, 307);
+        assert_eq!(response.pdu, Pdu::UnitResponse(UnitResponse {}));
+        assert_eq!(
+            pane.key_down_count(),
+            1,
+            "work admitted under the old exact generation may finish on its original session"
+        );
+        assert!(mux.client_registration_is_current(&replacement_client));
+
+        drop(stale_client);
+        drop(handler);
+        assert!(
+            stale_client_weak.upgrade().is_none(),
+            "the completed request must release its exact retired client generation"
+        );
+        assert!(mux.client_registration_is_current(&replacement_client));
         assert!(mux.unregister_client_if_same(&replacement_client));
     }
 
@@ -12712,12 +13577,17 @@ mod tests {
         let pane2: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(2, None));
         let pane3: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(3, None));
         tab.assign_pane(&pane1);
+        let (mux, _guard) = install_tab_with_window(&tab);
+        mux.add_pane(&pane2)
+            .expect("register second stack pane before bound split");
         let first_request = mux::tab::SplitRequest {
             direction: mux::tab::SplitDirection::Horizontal,
             ..Default::default()
         };
         tab.split_and_insert(0, first_request, Arc::clone(&pane2))
             .unwrap();
+        mux.add_pane(&pane3)
+            .expect("register third stack pane before bound split");
         let second_request = mux::tab::SplitRequest {
             direction: mux::tab::SplitDirection::Horizontal,
             ..Default::default()
@@ -12739,10 +13609,6 @@ mod tests {
             .iter()
             .position(|pane_id| *pane_id == pane2.pane_id())
             .expect("the requested pane must remain addressable in the stack");
-        let (_mux, _guard) = install_tab_with_window(
-            &tab,
-            &[Arc::clone(&pane1), Arc::clone(&pane2), Arc::clone(&pane3)],
-        );
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
 
@@ -12779,7 +13645,7 @@ mod tests {
         let tab = Arc::new(mux::tab::Tab::new(&size));
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7, None));
         tab.assign_pane(&pane);
-        let (_mux, _guard) = install_tab_with_window(&tab, &[]);
+        let (_mux, _guard) = install_tab_with_window(&tab);
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
 
@@ -12815,7 +13681,7 @@ mod tests {
         let tab = Arc::new(mux::tab::Tab::new(&size));
         let tiled: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(1, None));
         tab.assign_pane(&tiled);
-        let (mux, _guard) = install_tab_with_window(&tab, &[]);
+        let (mux, _guard) = install_tab_with_window(&tab);
         let floating: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(2, None));
         mux.add_pane(&floating).unwrap();
         let (sender, captured) = capturing_sender();
@@ -14270,7 +15136,7 @@ mod tests {
         second.assign_pane(&second_pane);
         let first_id = first.tab_id();
         let second_id = second.tab_id();
-        let (mux, _guard) = install_tab_with_window(&first, &[]);
+        let (mux, _guard) = install_tab_with_window(&first);
         let window_id = mux.iter_windows()[0];
         mux.add_tab_and_active_pane(&second).unwrap();
         mux.add_tab_to_window(&second, window_id).unwrap();
@@ -14532,7 +15398,7 @@ mod tests {
         let tab = Arc::new(mux::tab::Tab::new(&size));
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(1, None));
         tab.assign_pane(&pane);
-        let (_mux, _guard) = install_tab_with_window(&tab, &[]);
+        let (_mux, _guard) = install_tab_with_window(&tab);
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
 
@@ -15251,6 +16117,13 @@ mod tests {
                     }
                     ReconnectOp::Ping { slot } => {
                         if let Some(handler) = slots[slot].handler.as_mut() {
+                            let generation_is_current = slot_owner[slot]
+                                .as_ref()
+                                .is_some_and(|(owner, client)| {
+                                    latest_owner_by_client
+                                        .get(client)
+                                        .is_some_and(|latest| latest == owner)
+                                });
                             handler.process_one(DecodedPdu {
                                 serial,
                                 pdu: Pdu::Ping(Ping {}),
@@ -15263,11 +16136,25 @@ mod tests {
                                 .expect("captured response lock");
                             let response = captured.last().expect("Ping should respond");
                             prop_assert_eq!(response.serial, serial);
-                            prop_assert!(
-                                matches!(response.pdu, Pdu::Pong(Pong {})),
-                                "ping response at step {idx} should be Pong, got {:?}",
-                                response.pdu
-                            );
+                            if generation_is_current {
+                                prop_assert!(
+                                    matches!(response.pdu, Pdu::Pong(Pong {})),
+                                    "current-generation ping at step {idx} should be Pong, got {:?}",
+                                    response.pdu
+                                );
+                            } else {
+                                prop_assert!(
+                                    matches!(
+                                        response.pdu,
+                                        Pdu::ErrorResponse(ErrorResponse {
+                                            code: MuxErrorCode::CANCELLED,
+                                            ..
+                                        })
+                                    ),
+                                    "retired-generation ping at step {idx} should be cancelled, got {:?}",
+                                    response.pdu
+                                );
+                            }
                         }
                     }
                 }
@@ -15481,7 +16368,7 @@ mod tests {
             let tab = Arc::new(mux::tab::Tab::new(&size));
             let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
             tab.assign_pane(&pane);
-            let (mux, _mux_guard) = install_tab_with_window(&tab, &[]);
+            let (mux, _mux_guard) = install_tab_with_window(&tab);
             let client = reconnect_client(client_variant);
 
             let mut stale_handlers = Vec::new();
@@ -15544,14 +16431,26 @@ mod tests {
             let first_registration = mux
                 .capture_current_pane(pane_id)
                 .expect("capture pane registration before reuse");
+            let removed = tab
+                .remove_pane(pane_id)
+                .expect("live pane must release its exact structural tab owner before retirement");
+            prop_assert!(
+                Arc::ptr_eq(&removed, &pane),
+                "structural retirement must remove the original pane allocation"
+            );
             prop_assert!(
                 first_registration.retire_if_current(),
-                "the original pane registration should retire before reuse"
+                "the structurally detached original registration should retire before reuse"
             );
             let replacement: Arc<dyn Pane> =
                 Arc::new(FakePane::new_with_id(pane_id, None));
             mux.add_pane(&replacement)
                 .expect("same-ID replacement should register");
+            tab.assign_pane(&replacement);
+            prop_assert!(
+                tab.contains_pane(pane_id),
+                "same-ID replacement must reacquire exact structural tab authority"
+            );
             current_handler.process_one(DecodedPdu {
                 serial: 10_002,
                 pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id }),
