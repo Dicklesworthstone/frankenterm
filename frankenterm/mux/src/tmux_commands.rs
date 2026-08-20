@@ -50,7 +50,6 @@ pub(crate) enum TmuxCommandClass {
 pub(crate) enum TmuxSplitFailureAuthority {
     Baseline {
         request_id: u64,
-        target_pane_id: TmuxPaneId,
     },
     Pending {
         request_id: u64,
@@ -2939,7 +2938,6 @@ impl TmuxCommand for SnapshotSplitPane {
     fn split_failure_authority(&self) -> Option<TmuxSplitFailureAuthority> {
         Some(TmuxSplitFailureAuthority::Baseline {
             request_id: self.request_id,
-            target_pane_id: self.target_pane_id,
         })
     }
 
@@ -2969,7 +2967,6 @@ impl TmuxCommand for SnapshotSplitPane {
 #[derive(Debug)]
 pub(crate) struct SplitPane {
     pub pane_id: TmuxPaneId,
-    pub direction: SplitDirection,
     pub request_id: u64,
     command: Option<Vec<u8>>,
 }
@@ -2989,7 +2986,6 @@ impl SplitPane {
         let token = format!("ft-{domain_id}-{request_id}");
         Self {
             pane_id,
-            direction,
             request_id,
             command: Some(
                 format!(
@@ -4765,36 +4761,26 @@ mod tests {
             None
         );
         assert!(
-            !tmux_domain
+            tmux_domain
                 .inner
                 .gui_tabs
                 .lock()
                 .get(&14)
-                .expect("retired-domain remote window survives")
-                .panes
-                .contains(&142)
+                .is_none_or(|window| !window.panes.contains(&142)),
+            "retired-domain cleanup must not retain the rejected split pane"
         );
-        assert_eq!(
-            tmux_domain
+        assert!(
+            !tmux_domain
                 .inner
                 .remote_split_reservations
                 .lock()
-                .get(&142)
-                .expect("retired-domain split tombstone")
-                .load()
-                .expect("valid retired-domain split state"),
-            crate::tmux::TmuxRemoteSplitState::Retired
+                .contains_key(&142),
+            "retired domain generation must release its remote reservation directory"
         );
-        let queue = tmux_domain.inner.cmd_queue.lock();
-        assert_eq!(queue.len(), 1);
-        assert_eq!(
-            queue
-                .front()
-                .expect("retired-domain split compensation")
-                .get_command(tmux_domain.domain_id()),
-            "kill-pane -t %142\n"
+        assert!(
+            tmux_domain.inner.cmd_queue.lock().len() == 0,
+            "retired domain teardown must not retain orphaned command authority"
         );
-        drop(queue);
         drop(domain_fence);
     }
 

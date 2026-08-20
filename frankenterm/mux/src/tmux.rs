@@ -6459,6 +6459,7 @@ impl TmuxDomainState {
             request_id,
             command_target_remote_pane_id,
             pane_id,
+            false,
         )?
         else {
             return Ok(false);
@@ -6487,6 +6488,7 @@ impl TmuxDomainState {
         request_id: u64,
         command_target_remote_pane_id: TmuxPaneId,
         pane_id: TmuxPaneId,
+        expected_reconciling: bool,
     ) -> anyhow::Result<Option<(PendingTmuxSplit, TmuxRemoteSplitReservation)>> {
         let lifecycle = self.lifecycle.lock();
         anyhow::ensure!(
@@ -6504,7 +6506,7 @@ impl TmuxDomainState {
                 pending.target_remote_pane_id
             );
             anyhow::ensure!(
-                pending.baseline_complete && !pending.reconciling,
+                pending.baseline_complete && pending.reconciling == expected_reconciling,
                 "tmux split request {request_id} produced an identity outside its split phase"
             );
             let _registry = self.pane_registry.lock();
@@ -6568,6 +6570,9 @@ impl TmuxDomainState {
                     "tmux split request {request_id} could not reserve remote pane {pane_id}: {error:#}"
                 );
                 let _ = pending.promise.err(anyhow::anyhow!(message.clone()));
+                pending.cleanup.fail_without_remote_identity(
+                    "tmux split response collided with retained local identity",
+                );
                 self.record_split_quarantine(request_id, vec![pane_id], message.clone());
                 self.transition_to_exit_and_schedule_detach();
                 Err(anyhow::anyhow!(message))
@@ -6582,10 +6587,44 @@ impl TmuxDomainState {
         pane_id: TmuxPaneId,
         reason: String,
     ) -> anyhow::Result<bool> {
+        self.compensate_split_identity(
+            request_id,
+            command_target_remote_pane_id,
+            pane_id,
+            reason,
+            false,
+        )
+    }
+
+    fn compensate_reconciled_split_identity(
+        self: &Arc<Self>,
+        request_id: u64,
+        command_target_remote_pane_id: TmuxPaneId,
+        pane_id: TmuxPaneId,
+        reason: String,
+    ) -> anyhow::Result<bool> {
+        self.compensate_split_identity(
+            request_id,
+            command_target_remote_pane_id,
+            pane_id,
+            reason,
+            true,
+        )
+    }
+
+    fn compensate_split_identity(
+        self: &Arc<Self>,
+        request_id: u64,
+        command_target_remote_pane_id: TmuxPaneId,
+        pane_id: TmuxPaneId,
+        reason: String,
+        expected_reconciling: bool,
+    ) -> anyhow::Result<bool> {
         let Some((mut pending, reservation)) = self.take_pending_split_reservation(
             request_id,
             command_target_remote_pane_id,
             pane_id,
+            expected_reconciling,
         )?
         else {
             return Ok(false);
@@ -6788,7 +6827,7 @@ impl TmuxDomainState {
             }
         }
         anyhow::ensure!(
-            self.compensate_pending_split_identity(
+            self.compensate_reconciled_split_identity(
                 request_id,
                 command_target_remote_pane_id,
                 pane_id,
@@ -11659,7 +11698,7 @@ mod tests {
             }))
             .expect("ready intent");
 
-        let retryable = queue
+        let mut retryable = queue
             .take_next_for_preparation()
             .expect("durable head enters preparation first");
         assert!(matches!(
@@ -11706,7 +11745,7 @@ mod tests {
             }))
             .expect("later durable command");
 
-        let head = queue
+        let mut head = queue
             .take_next_for_sender_preparation()
             .expect("required head selection")
             .expect("required head is not stale");
@@ -12426,8 +12465,8 @@ mod tests {
         generation: u64,
         remote_window_id: TmuxWindowId,
         layout_csum: &str,
-    ) -> Arc<[u8]> {
-        let (command, lease) = {
+    ) -> Vec<u8> {
+        let (mut command, lease) = {
             let mut queue = tmux_domain.inner.cmd_queue.lock();
             queue
                 .push_back(Box::new(ListAllPanes {
@@ -12479,7 +12518,7 @@ mod tests {
             .expect("register conditional-commit test domain");
         let local_tab_id = install_conditional_test_tab(&mux, &tmux_domain.inner, 71, "old0");
 
-        let (command, lease) = take_conditional_command(
+        let (mut command, lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(ListAllPanes {
                 window_id: 71,
@@ -12564,7 +12603,7 @@ mod tests {
             }))
             .expect("same-checksum pruning refresh admission");
 
-        let mandatory = queue
+        let mut mandatory = queue
             .take_next_for_sender_preparation()
             .expect("mandatory snapshot selection")
             .expect("mandatory snapshot is never stale");
@@ -12579,7 +12618,7 @@ mod tests {
         ));
         queue.release_prepared();
 
-        let prune = queue
+        let mut prune = queue
             .take_next_for_sender_preparation()
             .expect("pruning refresh selection")
             .expect("pruning refresh lease is current");
@@ -12620,7 +12659,7 @@ mod tests {
             }))
             .expect("later mandatory non-pruning snapshot admission");
 
-        let prune = queue
+        let mut prune = queue
             .take_next_for_sender_preparation()
             .expect("pruning refresh selection")
             .expect("mandatory snapshot must not stale pruning authority");
@@ -12644,7 +12683,7 @@ mod tests {
         );
 
         let mut queue = tmux_domain.inner.cmd_queue.lock();
-        let mandatory = queue
+        let mut mandatory = queue
             .take_next_for_sender_preparation()
             .expect("mandatory snapshot selection")
             .expect("mandatory snapshot is never stale");
@@ -12752,7 +12791,7 @@ mod tests {
             .expect("register retry-boundary test domain");
         install_conditional_test_tab(&mux, &tmux_domain.inner, 72, "old0");
 
-        let (command, lease) = take_conditional_command(
+        let (mut command, lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(ListAllPanes {
                 window_id: 72,
@@ -12775,7 +12814,7 @@ mod tests {
             "abandoning prepared bytes and authority must not publish the checksum",
         );
 
-        let (retry, retry_lease) = take_conditional_command(
+        let (mut retry, retry_lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(ListAllPanes {
                 window_id: 72,
@@ -12976,7 +13015,7 @@ mod tests {
             .expect("register stale-error boundary domain");
         install_conditional_test_tab(&mux, &tmux_domain.inner, 91, "old0");
 
-        let (older, older_lease) = take_conditional_command(
+        let (mut older, older_lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(ListAllPanes {
                 window_id: 91,
@@ -13036,7 +13075,7 @@ mod tests {
             .expect("register layout-overlap test domain");
         install_conditional_test_tab(&mux, &tmux_domain.inner, 75, "old0");
 
-        let (older, older_lease) = take_conditional_command(
+        let (mut older, older_lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(ListAllPanes {
                 window_id: 75,
@@ -13052,7 +13091,7 @@ mod tests {
             panic!("older layout reconciliation should prepare");
         };
 
-        let (newer, newer_lease) = take_conditional_command(
+        let (mut newer, newer_lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(ListAllPanes {
                 window_id: 75,
@@ -13127,7 +13166,7 @@ mod tests {
             .panes
             .insert(retained_pane_id);
 
-        let (older, older_lease) = take_conditional_command(
+        let (mut older, older_lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(ListAllPanes {
                 window_id: 76,
@@ -13399,7 +13438,7 @@ mod tests {
             .lock()
             .insert("resize-window".to_string(), String::new());
 
-        let (older, older_lease) = take_conditional_command(
+        let (mut older, older_lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(Resize {
                 pane_id: 84,
@@ -13419,7 +13458,7 @@ mod tests {
             panic!("older resize should prepare");
         };
 
-        let (newer, newer_lease) = take_conditional_command(
+        let (mut newer, newer_lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(Resize {
                 pane_id: 84,
@@ -13460,7 +13499,7 @@ mod tests {
             assert_eq!((pane.pane_width, pane.pane_height), (140, 50));
         }
 
-        let (replacement_fenced, replacement_lease) = take_conditional_command(
+        let (mut replacement_fenced, replacement_lease) = take_conditional_command(
             &mut tmux_domain.inner.cmd_queue.lock(),
             Box::new(Resize {
                 pane_id: 84,
@@ -13536,7 +13575,7 @@ mod tests {
             }) as Box<dyn TmuxCommand>
         };
 
-        let (resize_b, resize_b_lease) = {
+        let (mut resize_b, resize_b_lease) = {
             let mut queue = tmux_domain.inner.cmd_queue.lock();
             queue
                 .push_back(resize(40, 120))
@@ -13595,7 +13634,7 @@ mod tests {
             assert_eq!((pane.pane_width, pane.pane_height), (80, 24));
         }
 
-        let (resize_a, resize_a_lease) = {
+        let (mut resize_a, resize_a_lease) = {
             let mut queue = tmux_domain.inner.cmd_queue.lock();
             let command = queue
                 .take_next_for_preparation()
@@ -14129,11 +14168,8 @@ mod tests {
             .reserve_test_remote_split(85, 35, 36)
             .expect("reserve detach-race split");
         tmux_domain
-            .inner
-            .cmd_queue
-            .lock()
-            .push_domain_detach(Box::new(DetachClient))
-            .expect("install detach barrier before reservation rollback");
+            .detach()
+            .expect("public detach must transfer through split cleanup terminalization");
 
         drop(reservation);
         tmux_domain.inner.send_next_command();
@@ -14143,14 +14179,10 @@ mod tests {
         complete_atomic_split_command(&tmux_domain.inner, "", false);
         assert_eq!(launcher.recorded_writes(), b"kill-pane -t %36\n");
         assert!(
-            tmux_domain
-                .inner
-                .cmd_queue
-                .lock()
-                .front()
-                .is_some_and(|command| command.awaits_clean_exit()),
-            "guarded compensation must leave the pre-existing detach as the next response owner"
+            tmux_domain.inner.is_terminal(),
+            "public detach must finish only after its split compensation response"
         );
+        assert!(tmux_domain.inner.cmd_queue.lock().is_empty());
     }
 
     #[test]
@@ -14255,7 +14287,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_atomic_publication_reconciliation_kills_exact_set_difference_once() {
+    fn tmux_atomic_publication_reconciliation_kills_exact_request_token_once() {
         let (_guard, tmux_domain, launcher) = install_atomic_split_test_domain(306);
         let mut promise = promise::Promise::new();
         let future = promise.get_future().expect("reconciled split future");
@@ -14291,19 +14323,40 @@ mod tests {
 
         tmux_domain.inner.send_next_command();
         wait_until("split reconciliation list-panes write", || {
-            launcher.recorded_writes() == b"list-panes -a -F '#{pane_id}'\n"
+            launcher.recorded_writes()
+                == b"list-panes -t @1 -F '#{session_id} #{window_id} #{pane_id} #{@frankenterm_split_token}'\n"
         });
-        complete_atomic_split_command(&tmux_domain.inner, "%40\n", false);
+        complete_atomic_split_command(
+            &tmux_domain.inner,
+            &format!("$1 @1 %40 ft-{}-87\n", tmux_domain.domain_id()),
+            false,
+        );
         assert!(block_on(future).is_err());
+        assert!(
+            tmux_domain.inner.split_cleanup_quarantine.lock().is_empty(),
+            "exact request-token reconciliation unexpectedly quarantined: {:?}",
+            *tmux_domain.inner.split_cleanup_quarantine.lock()
+        );
+        assert!(
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .front()
+                .is_some_and(|command| command.get_command(tmux_domain.domain_id())
+                    == "kill-pane -t %40\n"),
+            "exact request-token reconciliation did not queue its preallocated compensation"
+        );
         tmux_domain.inner.send_next_command();
         wait_until("reconciled split compensation write", || {
-            launcher.recorded_writes() == b"list-panes -a -F '#{pane_id}'\nkill-pane -t %40\n"
+            launcher.recorded_writes()
+                == b"list-panes -t @1 -F '#{session_id} #{window_id} #{pane_id} #{@frankenterm_split_token}'\nkill-pane -t %40\n"
         });
         complete_atomic_split_command(&tmux_domain.inner, "", false);
         assert!(tmux_domain.inner.is_terminal());
         assert_eq!(
             launcher.recorded_writes(),
-            b"list-panes -a -F '#{pane_id}'\nkill-pane -t %40\n"
+            b"list-panes -t @1 -F '#{session_id} #{window_id} #{pane_id} #{@frankenterm_split_token}'\nkill-pane -t %40\n"
         );
     }
 
@@ -14344,14 +14397,15 @@ mod tests {
 
         tmux_domain.inner.send_next_command();
         wait_until("ambiguous split reconciliation write", || {
-            launcher.recorded_writes() == b"list-panes -a -F '#{pane_id}'\n"
+            launcher.recorded_writes()
+                == b"list-panes -t @1 -F '#{session_id} #{window_id} #{pane_id} #{@frankenterm_split_token}'\n"
         });
-        complete_atomic_split_command(&tmux_domain.inner, "%42\n%43\n", false);
+        complete_atomic_split_command(&tmux_domain.inner, "$1 @1 %42\n$1 @1 %43\n", false);
         assert!(block_on(future).is_err());
         assert!(tmux_domain.inner.is_terminal());
         assert_eq!(
             launcher.recorded_writes(),
-            b"list-panes -a -F '#{pane_id}'\n",
+            b"list-panes -t @1 -F '#{session_id} #{window_id} #{pane_id} #{@frankenterm_split_token}'\n",
             "ambiguous reconciliation must never kill either candidate"
         );
         let quarantine = tmux_domain.inner.split_cleanup_quarantine.lock();
@@ -14409,7 +14463,7 @@ mod tests {
         assert!(block_on(future).is_err());
         assert_eq!(
             launcher.recorded_writes(),
-            b"list-panes -a -F '#{pane_id}'\n"
+            b"list-panes -t @1 -F '#{session_id} #{window_id} #{pane_id} #{@frankenterm_split_token}'\n"
         );
         assert!(tmux_domain.inner.pending_splits.lock().is_empty());
         assert_eq!(
@@ -14492,19 +14546,14 @@ mod tests {
             }));
         }
 
-        let command_admitted = AtomicBool::new(false);
-        let error = tmux_domain
-            .inner
-            .with_reserved_remote_split_identity(|| {
-                command_admitted.store(true, Ordering::Release);
-                Ok(())
-            })
-            .expect_err("saturated retained-ID cap must reject pre-command admission");
+        let error = match tmux_domain.inner.reserve_remote_split_identity(
+            1,
+            Arc::new(TmuxChildState::new()),
+        ) {
+            Ok(_) => panic!("saturated retained-ID cap must reject pre-command admission"),
+            Err(error) => error,
+        };
         assert!(format!("{error:#}").contains("before split command admission"));
-        assert!(
-            !command_admitted.load(Ordering::Acquire),
-            "retained-ID saturation must reject before invoking remote command admission"
-        );
         assert_eq!(tmux_domain.inner.cmd_queue.lock().len(), 0);
         assert!(tmux_domain.inner.pending_splits.lock().is_empty());
         assert!(tmux_domain.inner.remote_panes.lock().is_empty());
