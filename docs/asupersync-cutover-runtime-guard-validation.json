@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-05-12T19:08:00Z",
+  "checked_at": "2026-08-20T23:34:01Z",
   "checks": [
     {
       "name": "contract_identity",
@@ -29,9 +29,9 @@
     },
     {
       "counts": {
-        "async_io::": 6,
-        "smol::": 35,
-        "tokio::": 143
+        "async_io::": 9,
+        "smol::": 32,
+        "tokio::": 138
       },
       "files": {
         "async_io::": [
@@ -74,8 +74,6 @@
           "crates/frankenterm-core/tests/replay_labruntime.rs",
           "crates/frankenterm-core/tests/reports_labruntime.rs",
           "crates/frankenterm-core/tests/restore_layout_labruntime.rs",
-          "crates/frankenterm-core/tests/restore_process_labruntime.rs",
-          "crates/frankenterm-core/tests/restore_scrollback_labruntime.rs",
           "crates/frankenterm-core/tests/retry_labruntime.rs",
           "crates/frankenterm-core/tests/runtime_async_surface_guard.rs",
           "crates/frankenterm-core/tests/runtime_labruntime.rs",
@@ -131,9 +129,9 @@
       ]
     },
     "forbidden_token_counts": {
-      "async_io::": 6,
-      "smol::": 35,
-      "tokio::": 143
+      "async_io::": 9,
+      "smol::": 32,
+      "tokio::": 138
     }
   }
 }
