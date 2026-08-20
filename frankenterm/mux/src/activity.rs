@@ -210,10 +210,29 @@ impl ActivityPruneState {
             claim,
             completed: false,
         };
-        promise::spawn::spawn_into_main_thread(async move {
-            dispatch.execute();
-        })
-        .detach();
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn(async move {
+                        dispatch.execute();
+                    })
+                    .detach();
+            }
+            rejected => {
+                metrics::counter!(
+                    "mux.activity_prune_admission",
+                    "outcome" => "dispatch_drop_recovery"
+                )
+                .increment(1);
+                log::error!(
+                    "main-thread scheduler rejected activity prune; invoking bounded dispatch recovery: {rejected:?}"
+                );
+                drop(dispatch);
+            }
+        }
     }
 
     /// Drive all synchronously-created scheduling work iteratively.

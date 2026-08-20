@@ -57,15 +57,16 @@ compile_error!(
     "mux requires one async runtime feature: \"async-asupersync\" (preferred) or \"async-smol\""
 );
 
-use crate::client::{ClientId, ClientInfo};
+use crate::client::{
+    ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
+};
 use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{FloatingPaneRect, SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{
     FrozenWindowOrder, PrepareWindowOrderError, PreparedWindowPaneCount, PreparedWindowState,
-    Window, WindowId, WindowOrderRevision, WindowOrderSnapshotError,
-    MAX_TABS_PER_ORDERED_WINDOW,
+    Window, WindowId, WindowOrderRevision, WindowOrderSnapshotError, MAX_TABS_PER_ORDERED_WINDOW,
 };
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
@@ -78,11 +79,11 @@ use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, Te
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use log::error;
 use metrics::histogram;
+#[cfg(test)]
+use parking_lot::MappedRwLockWriteGuard;
 use parking_lot::{
     Condvar, MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
-#[cfg(test)]
-use parking_lot::MappedRwLockWriteGuard;
 use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,39 @@ pub mod window;
 use crate::activity::{Activity, ActivityPruneState};
 
 pub const DEFAULT_WORKSPACE: &str = "default";
+const MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES: usize = 4 * 1024;
+
+fn schedule_mux_main_thread<MAKE, FUT>(
+    service_class: promise::spawn::MainThreadServiceClass,
+    operation: &'static str,
+    make_future: MAKE,
+) -> bool
+where
+    MAKE: FnOnce() -> FUT,
+    FUT: std::future::Future<Output = ()> + Send + 'static,
+{
+    match promise::spawn::try_reserve_main_thread(
+        service_class,
+        MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation.spawn(make_future()).detach();
+            true
+        }
+        rejected => {
+            metrics::counter!(
+                "mux.main_thread_admission",
+                "operation" => operation,
+                "outcome" => "terminal_rejection"
+            )
+            .increment(1);
+            log::error!(
+                "mux main-thread scheduler rejected {operation} before task construction: {rejected:?}"
+            );
+            false
+        }
+    }
+}
 
 /// Unpredictable identity for one live mux-session incarnation.
 ///
@@ -2489,6 +2523,41 @@ mod pane_registration_handle {
             Ok(())
         }
 
+        /// Focus this exact pane while attributing the operation only to one
+        /// admitted client generation. The pane focus may complete for work
+        /// admitted before client retirement, but stale client metadata is
+        /// never written into an equal-valued successor.
+        pub fn focus_for_client_guarded(
+            &self,
+            client: Option<&ClientOperationGuard>,
+        ) -> anyhow::Result<()> {
+            if let Some(client) = client {
+                anyhow::ensure!(
+                    self.owner.client_operation_is_current(client),
+                    "client registration is no longer current"
+                );
+            }
+            self.focus_pane_and_containing_tab()?;
+            if let Some(client) = client {
+                if self
+                    .owner
+                    .replace_client_focus_metadata_for_guard_if_current(
+                        client,
+                        self.pane_id,
+                        self.registration,
+                    )
+                    .is_none()
+                {
+                    metrics::counter!("mux.focus.client_attribution_lost").increment(1);
+                    log::warn!(
+                        "client generation retired after pane {} focus committed; skipping stale client attribution",
+                        self.pane_id,
+                    );
+                }
+            }
+            Ok(())
+        }
+
         pub(super) fn record_focus_for_client(&self, client_id: &Arc<ClientId>) -> bool {
             self.owner.record_focus_for_client_registration_if_same(
                 client_id,
@@ -2590,6 +2659,12 @@ mod pane_registration_handle {
         admitted_domain_id: DomainId,
         admitted_domain: Option<Weak<LiveDomainRegistration>>,
         _operation: PaneRegistrationOperationLease,
+        // Keep the exact domain generation admitted for this pane operation
+        // alive until after the pane-generation lease is released.  A weak
+        // witness is sufficient for final-cut identity comparison, but it
+        // cannot fence destructive domain retirement while the pane operation
+        // is in flight.
+        _domain_operation: Option<DomainOperationGuard>,
     }
 
     impl std::fmt::Debug for PaneOperationGuard {
@@ -2637,6 +2712,24 @@ mod pane_registration_handle {
         /// scoped to this non-cloneable guard.
         pub fn with_pane<R>(&self, f: impl FnOnce(&dyn Pane) -> R) -> R {
             f(self.pane.as_ref())
+        }
+
+        /// Borrow the restricted exact-pane mutation surface under this
+        /// already-admitted operation lease.
+        ///
+        /// Retirement may remove the numeric registry slot after admission,
+        /// but it cannot redirect this guard to a successor. Callers that
+        /// schedule deferred work should acquire the guard before enqueue and
+        /// use this method at the effect cut instead of resolving the pane ID
+        /// or registration again.
+        pub fn with_current_pane<R>(&self, f: impl FnOnce(&CurrentPane<'_>) -> R) -> R {
+            let registration = self.registration();
+            f(&CurrentPane {
+                owner: self.owner.as_ref(),
+                pane: &self.pane,
+                registration: &registration,
+                pane_id: self.generation.pane_id,
+            })
         }
 
         pub fn registration(&self) -> PaneRegistrationHandle {
@@ -3194,7 +3287,7 @@ mod pane_registration_handle {
             if !Arc::ptr_eq(&retirement, &owner.pane_retirements) {
                 return None;
             }
-            let (admitted_domain_id, admitted_domain) = {
+            let (admitted_domain_id, admitted_domain, domain_operation) = {
                 let _domain_registration = owner.domain_registration.lock();
                 let _registration = owner.pane_registration.lock();
                 let domain_id = owner
@@ -3214,8 +3307,13 @@ mod pane_registration_handle {
                     .read()
                     .get(&domain_id)
                     .filter(|registration| !registration.generation.is_retired())
-                    .map(Arc::downgrade);
-                (domain_id, exact_domain)
+                    .cloned();
+                let exact_domain_witness = exact_domain.as_ref().map(Arc::downgrade);
+                let domain_operation = exact_domain
+                    .map(|registration| owner.acquire_domain_operation_locked(registration))
+                    .transpose()
+                    .ok()?;
+                (domain_id, exact_domain_witness, domain_operation)
             };
             Some(PaneOperationGuard {
                 owner,
@@ -3225,6 +3323,7 @@ mod pane_registration_handle {
                 admitted_domain_id,
                 admitted_domain,
                 _operation: operation,
+                _domain_operation: domain_operation,
             })
         }
 
@@ -3453,9 +3552,9 @@ mod pane_registration_handle {
 
             let batch_result = (|| -> anyhow::Result<_> {
                 let mut owners = HashMap::<usize, OwnerBatch>::new();
-                owners.try_reserve(registrations.len()).map_err(|error| {
-                    anyhow!("reserve pane retirement owner directory: {error}")
-                })?;
+                owners
+                    .try_reserve(registrations.len())
+                    .map_err(|error| anyhow!("reserve pane retirement owner directory: {error}"))?;
                 for registration in registrations {
                     let Some(operation) = registration.generation.try_acquire() else {
                         continue;
@@ -3469,16 +3568,17 @@ mod pane_registration_handle {
                     let owner_identity = Arc::as_ptr(&owner) as usize;
                     let batch = match owners.entry(owner_identity) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                            OwnerBatch {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(OwnerBatch {
                                 owner,
                                 candidates: Vec::new(),
-                            },
-                        ),
+                            })
+                        }
                     };
-                    batch.candidates.try_reserve(1).map_err(|error| {
-                        anyhow!("reserve pane retirement candidate: {error}")
-                    })?;
+                    batch
+                        .candidates
+                        .try_reserve(1)
+                        .map_err(|error| anyhow!("reserve pane retirement candidate: {error}"))?;
                     batch.candidates.push(PaneBatchRetirementCandidate {
                         pane,
                         generation: registration.generation,
@@ -3490,9 +3590,7 @@ mod pane_registration_handle {
             let owners = match batch_result {
                 Ok(owners) => owners,
                 Err(error) => {
-                    log::error!(
-                        "refusing pane retirement batch before mutation: {error:#}"
-                    );
+                    log::error!("refusing pane retirement batch before mutation: {error:#}");
                     return 0;
                 }
             };
@@ -4328,10 +4426,13 @@ impl PaneOutputBatch {
         drop(mux);
 
         let dispatch = PaneLifecycleTicketDispatch::new(self.owner.clone(), ticket);
-        promise::spawn::spawn_into_main_thread(async move {
-            dispatch.execute(true);
-        })
-        .detach();
+        schedule_mux_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            "pane lifecycle notification",
+            move || async move {
+                dispatch.execute(true);
+            },
+        );
     }
 }
 
@@ -4401,10 +4502,13 @@ impl PaneRetirementCompletion {
         drop(mux);
 
         let dispatch = PaneRetirementDispatch::new(owner, self);
-        promise::spawn::spawn_into_main_thread(async move {
-            dispatch.execute(true);
-        })
-        .detach();
+        schedule_mux_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            "pane retirement",
+            move || async move {
+                dispatch.execute(true);
+            },
+        );
     }
 
     fn complete(self, mux: Option<&Mux>) {
@@ -4532,10 +4636,7 @@ impl PreparedTabPaneRetirement<'_> {
                 .remove(&candidate.pane_id)
                 .expect("prepared tab pane remains registered");
             debug_assert!(Arc::ptr_eq(&registered.pane, &candidate.pane));
-            debug_assert!(Arc::ptr_eq(
-                &registered.generation,
-                &candidate.generation
-            ));
+            debug_assert!(Arc::ptr_eq(&registered.generation, &candidate.generation));
             let inserted = retiring.insert(candidate.pane_id);
             debug_assert!(inserted);
             if candidate.output_current {
@@ -4548,23 +4649,20 @@ impl PreparedTabPaneRetirement<'_> {
             }
             removed_live.push(registered);
 
-            let first_revision = first_revision
-                .expect("live tab pane retirement retains topology authority");
-            lifecycle_notifications
-                .push(PreparedPaneLifecycleBatchNotification {
-                    notification: PaneLifecycleNotification::Removed(candidate.pane_id),
-                    topology: MuxTopologyStamp::Revision(TopologyRevision::new(
-                        first_revision
-                            .get()
-                            .checked_add(candidate.revision_offset)
-                            .expect("reserved tab pane retirement revisions cannot overflow"),
-                    )),
-                    reader_start_gate: None,
-                    cleanup_complete: Some(Arc::clone(
-                        &candidate.generation.cleanup_complete,
-                    )),
-                    removal_follow_up: PaneRemovalFollowUp::None,
-                });
+            let first_revision =
+                first_revision.expect("live tab pane retirement retains topology authority");
+            lifecycle_notifications.push(PreparedPaneLifecycleBatchNotification {
+                notification: PaneLifecycleNotification::Removed(candidate.pane_id),
+                topology: MuxTopologyStamp::Revision(TopologyRevision::new(
+                    first_revision
+                        .get()
+                        .checked_add(candidate.revision_offset)
+                        .expect("reserved tab pane retirement revisions cannot overflow"),
+                )),
+                reader_start_gate: None,
+                cleanup_complete: Some(Arc::clone(&candidate.generation.cleanup_complete)),
+                removal_follow_up: PaneRemovalFollowUp::None,
+            });
         }
 
         let tickets = lifecycle_enqueue
@@ -4572,14 +4670,12 @@ impl PreparedTabPaneRetirement<'_> {
             .unwrap_or_default();
         debug_assert_eq!(tickets.len(), live.len());
         for (candidate, ticket) in live.into_iter().zip(tickets) {
-            removed_panes_by_group[candidate.group_index].push(
-                RemovedPaneRegistration {
-                    pane_id: candidate.pane_id,
-                    pane: candidate.pane,
-                    generation: candidate.generation,
-                    lifecycle_notification: ticket,
-                },
-            );
+            removed_panes_by_group[candidate.group_index].push(RemovedPaneRegistration {
+                pane_id: candidate.pane_id,
+                pane: candidate.pane,
+                generation: candidate.generation,
+                lifecycle_notification: ticket,
+            });
         }
 
         CommittedTabPaneRetirement {
@@ -4666,6 +4762,11 @@ struct PaneAuthorityIndex {
     structural_by_pane_id: HashMap<PaneId, PaneStructuralOwnerRegistration>,
     pane_ids_by_tab: HashMap<TabId, TabStructuralOwnerRegistrations>,
     registrations_by_domain: HashMap<DomainId, DomainPaneRegistrations>,
+    /// Independent cardinality authority for each per-domain registration
+    /// bucket. Keeping this separate from the bucket lets hot-path retirement
+    /// detect an omitted entry or bucket in O(1), without scanning every live
+    /// pane in the mux or trusting a corrupted directory's own length.
+    live_registration_counts_by_domain: HashMap<DomainId, usize>,
     next_structural_generation: u64,
 }
 
@@ -4812,6 +4913,8 @@ struct PreparedLivePaneRegistrationInsert {
     domain_id: DomainId,
     new_domain_registrations: Option<DomainPaneRegistrations>,
     bind_existing_domain: Option<Weak<dyn Domain>>,
+    prior_domain_count: usize,
+    next_domain_count: usize,
 }
 
 struct PreparedLivePaneRegistrationRemoval {
@@ -4901,13 +5004,9 @@ impl PreparedStructuralRelocation<'_> {
         for replacement in &tab_replacements {
             for pane_id in &replacement.current_pane_ids {
                 let removed = authority.structural_by_pane_id.remove(pane_id);
-                debug_assert!(removed.is_some_and(|owner| {
-                    owner.matches_tab(&replacement.tab)
-                }));
+                debug_assert!(removed.is_some_and(|owner| { owner.matches_tab(&replacement.tab) }));
             }
-            authority
-                .pane_ids_by_tab
-                .remove(&replacement.tab.tab_id());
+            authority.pane_ids_by_tab.remove(&replacement.tab.tab_id());
         }
         for replacement in tab_replacements {
             if let Some(members) = replacement.replacement_members {
@@ -4956,11 +5055,41 @@ struct PreparedDomainAuthorityTabReplacement {
 pub(crate) struct PreparedDomainFloatingAuthorityReconcile {
     domain_id: DomainId,
     final_domain_registrations: Option<DomainPaneRegistrations>,
+    final_domain_registration_count: usize,
     tab_replacements: Vec<PreparedDomainAuthorityTabReplacement>,
     next_structural_generation: u64,
 }
 
 impl PaneAuthorityIndex {
+    /// Validate the independent per-domain live-registration count against
+    /// the exact directory in O(1). Production writers maintain both values in
+    /// one authority cut; the duplicate scalar is deliberate corruption
+    /// detection for cleanup paths that must never scan the global pane map.
+    fn validated_domain_registration_count(&self, domain_id: DomainId) -> anyhow::Result<usize> {
+        let directory_count = self
+            .registrations_by_domain
+            .get(&domain_id)
+            .map_or(0, |registrations| registrations.pane_registrations.len());
+        let recorded_count = self
+            .live_registration_counts_by_domain
+            .get(&domain_id)
+            .copied()
+            .unwrap_or(0);
+        anyhow::ensure!(
+            directory_count == recorded_count,
+            "domain {domain_id} live-registration count {recorded_count} differs from directory cardinality {directory_count}"
+        );
+        anyhow::ensure!(
+            recorded_count != 0
+                || (!self.registrations_by_domain.contains_key(&domain_id)
+                    && !self
+                        .live_registration_counts_by_domain
+                        .contains_key(&domain_id)),
+            "domain {domain_id} retains an empty live-registration authority bucket"
+        );
+        Ok(recorded_count)
+    }
+
     fn prepare_live_registration_insert(
         &mut self,
         pane_id: PaneId,
@@ -4968,11 +5097,24 @@ impl PaneAuthorityIndex {
         domain_id: DomainId,
         expected_domain: Option<&Arc<dyn Domain>>,
     ) -> anyhow::Result<PreparedLivePaneRegistrationInsert> {
+        let prior_domain_count = self.validated_domain_registration_count(domain_id)?;
+        let next_domain_count = prior_domain_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("domain {domain_id} live-registration count exhausted"))?;
+        if prior_domain_count == 0 {
+            self.live_registration_counts_by_domain
+                .try_reserve(1)
+                .map_err(|error| {
+                    anyhow!("reserve domain {domain_id} live-registration count: {error}")
+                })?;
+        }
         anyhow::ensure!(
-            self.registrations_by_domain.iter().all(|(other_domain_id, registrations)| {
-                *other_domain_id == domain_id
-                    || !registrations.pane_registrations.contains_key(&pane_id)
-            }),
+            self.registrations_by_domain
+                .iter()
+                .all(|(other_domain_id, registrations)| {
+                    *other_domain_id == domain_id
+                        || !registrations.pane_registrations.contains_key(&pane_id)
+                }),
             "pane {pane_id} is stranded in another domain-registration directory"
         );
         if let Some(owner) = self.structural_by_pane_id.get(&pane_id) {
@@ -5000,8 +5142,9 @@ impl PaneAuthorityIndex {
         }
 
         let mut bind_existing_domain = None;
-        let new_domain_registrations =
-            if let Some(registrations) = self.registrations_by_domain.get_mut(&domain_id) {
+        let new_domain_registrations = if let Some(registrations) =
+            self.registrations_by_domain.get_mut(&domain_id)
+        {
             match (&registrations.domain, expected_domain) {
                 (Some(current), Some(expected)) => anyhow::ensure!(
                     Weak::ptr_eq(current, &Arc::downgrade(expected)),
@@ -5022,12 +5165,14 @@ impl PaneAuthorityIndex {
             registrations
                 .pane_registrations
                 .try_reserve(1)
-                .map_err(|error| anyhow!("reserve domain {domain_id} pane registration: {error}"))?;
+                .map_err(|error| {
+                    anyhow!("reserve domain {domain_id} pane registration: {error}")
+                })?;
             None
         } else {
-            self.registrations_by_domain.try_reserve(1).map_err(|error| {
-                anyhow!("reserve domain-registration directory entry: {error}")
-            })?;
+            self.registrations_by_domain
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve domain-registration directory entry: {error}"))?;
             let mut pane_registrations = HashMap::new();
             pane_registrations.try_reserve(1).map_err(|error| {
                 anyhow!("reserve first domain {domain_id} pane registration: {error}")
@@ -5041,6 +5186,8 @@ impl PaneAuthorityIndex {
             domain_id,
             new_domain_registrations,
             bind_existing_domain,
+            prior_domain_count,
+            next_domain_count,
         })
     }
 
@@ -5054,7 +5201,9 @@ impl PaneAuthorityIndex {
     ) {
         debug_assert_eq!(prepared.domain_id, domain_id);
         if let Some(registrations) = prepared.new_domain_registrations.take() {
-            let prior = self.registrations_by_domain.insert(domain_id, registrations);
+            let prior = self
+                .registrations_by_domain
+                .insert(domain_id, registrations);
             debug_assert!(prior.is_none());
         }
         let registrations = self
@@ -5069,6 +5218,15 @@ impl PaneAuthorityIndex {
             .pane_registrations
             .insert(pane_id, registration.clone());
         debug_assert!(replaced.is_none());
+        debug_assert_eq!(
+            self.live_registration_counts_by_domain
+                .get(&domain_id)
+                .copied()
+                .unwrap_or(0),
+            prepared.prior_domain_count,
+        );
+        self.live_registration_counts_by_domain
+            .insert(domain_id, prepared.next_domain_count);
 
         if let Some(owner) = self.structural_by_pane_id.get_mut(&pane_id) {
             debug_assert!(owner.matches_pane(pane));
@@ -5086,6 +5244,11 @@ impl PaneAuthorityIndex {
         expected_domain: Option<&Arc<dyn Domain>>,
         registration: &PaneRegistrationHandle,
     ) -> anyhow::Result<PreparedLivePaneRegistrationRemoval> {
+        let prior_domain_count = self.validated_domain_registration_count(domain_id)?;
+        anyhow::ensure!(
+            prior_domain_count != 0,
+            "domain {domain_id} live-registration count would underflow"
+        );
         anyhow::ensure!(
             registration.pane_id() == pane_id && registration.is_same_pane(pane),
             "pane {pane_id} removal registration names another exact allocation"
@@ -5106,19 +5269,22 @@ impl PaneAuthorityIndex {
             "pane {pane_id} lacks its exact domain-registration generation"
         );
         anyhow::ensure!(
-            self.registrations_by_domain.iter().all(|(other_domain_id, registrations)| {
-                *other_domain_id == domain_id
-                    || !registrations.pane_registrations.contains_key(&pane_id)
-            }),
+            self.registrations_by_domain
+                .iter()
+                .all(|(other_domain_id, registrations)| {
+                    *other_domain_id == domain_id
+                        || !registrations.pane_registrations.contains_key(&pane_id)
+                }),
             "pane {pane_id} is duplicated across domain-registration directories"
         );
         if let Some(owner) = self.structural_by_pane_id.get(&pane_id) {
             anyhow::ensure!(
                 owner.matches_pane(pane)
                     && owner.domain_id == Some(domain_id)
-                    && owner.registration.as_ref().is_some_and(|current| {
-                        current.same_registration(registration)
-                    }),
+                    && owner
+                        .registration
+                        .as_ref()
+                        .is_some_and(|current| { current.same_registration(registration) }),
                 "pane {pane_id} structural-owner live metadata disagrees with removal authority"
             );
             let tab = owner
@@ -5128,18 +5294,17 @@ impl PaneAuthorityIndex {
             let tab_id = tab.tab_id();
             anyhow::ensure!(
                 owner.matches_tab(&tab)
-                    && self
-                        .pane_ids_by_tab
-                        .get(&tab_id)
-                        .is_some_and(|members| {
-                            members.matches_tab(&tab) && members.pane_ids.contains(&pane_id)
-                        }),
+                    && self.pane_ids_by_tab.get(&tab_id).is_some_and(|members| {
+                        members.matches_tab(&tab) && members.pane_ids.contains(&pane_id)
+                    }),
                 "pane {pane_id} structural-owner reverse directory is inconsistent"
             );
             anyhow::ensure!(
-                self.pane_ids_by_tab.iter().all(|(candidate_tab_id, members)| {
-                    *candidate_tab_id == tab_id || !members.pane_ids.contains(&pane_id)
-                }),
+                self.pane_ids_by_tab
+                    .iter()
+                    .all(|(candidate_tab_id, members)| {
+                        *candidate_tab_id == tab_id || !members.pane_ids.contains(&pane_id)
+                    }),
                 "pane {pane_id} appears in more than one structural reverse directory"
             );
         } else {
@@ -5158,10 +5323,15 @@ impl PaneAuthorityIndex {
         })
     }
 
-    fn commit_live_registration_removal(
-        &mut self,
-        prepared: PreparedLivePaneRegistrationRemoval,
-    ) {
+    fn commit_live_registration_removal(&mut self, prepared: PreparedLivePaneRegistrationRemoval) {
+        let prior_domain_count = self
+            .live_registration_counts_by_domain
+            .get(&prepared.domain_id)
+            .copied()
+            .expect("prepared domain-registration count remains present");
+        let next_domain_count = prior_domain_count
+            .checked_sub(1)
+            .expect("prepared domain-registration count remains nonzero");
         let registrations = self
             .registrations_by_domain
             .get_mut(&prepared.domain_id)
@@ -5171,15 +5341,23 @@ impl PaneAuthorityIndex {
             .remove(&prepared.pane_id)
             .expect("prepared exact domain registration remains present");
         debug_assert!(removed.same_registration(&prepared.registration));
+        if next_domain_count == 0 {
+            self.live_registration_counts_by_domain
+                .remove(&prepared.domain_id);
+        } else {
+            self.live_registration_counts_by_domain
+                .insert(prepared.domain_id, next_domain_count);
+        }
         if registrations.pane_registrations.is_empty() {
             self.registrations_by_domain.remove(&prepared.domain_id);
         }
         if let Some(owner) = self.structural_by_pane_id.get_mut(&prepared.pane_id) {
             debug_assert!(owner.matches_pane(&prepared.pane));
             debug_assert_eq!(owner.domain_id, Some(prepared.domain_id));
-            debug_assert!(owner.registration.as_ref().is_some_and(|current| {
-                current.same_registration(&prepared.registration)
-            }));
+            debug_assert!(owner
+                .registration
+                .as_ref()
+                .is_some_and(|current| { current.same_registration(&prepared.registration) }));
             owner.registration = None;
             owner.domain_id = None;
         }
@@ -5215,9 +5393,7 @@ impl PaneAuthorityIndex {
         anyhow::ensure!(
             self.registrations_by_domain
                 .values()
-                .filter(|registrations| {
-                    registrations.pane_registrations.contains_key(&pane_id)
-                })
+                .filter(|registrations| { registrations.pane_registrations.contains_key(&pane_id) })
                 .count()
                 == 1,
             "pane {pane_id} appears in more than one domain-registration directory"
@@ -5276,18 +5452,18 @@ impl PaneAuthorityIndex {
     /// carried through a transaction.
     #[cfg(test)]
     fn validate_complete_structural_bijection(&self) -> anyhow::Result<()> {
-        let reverse_members = self.pane_ids_by_tab.values().try_fold(
-            0usize,
-            |count, members| {
-                anyhow::ensure!(
-                    !members.pane_ids.is_empty(),
-                    "structural reverse index retains an empty tab bucket"
-                );
-                count
-                    .checked_add(members.pane_ids.len())
-                    .ok_or_else(|| anyhow!("structural reverse-member count overflow"))
-            },
-        )?;
+        let reverse_members =
+            self.pane_ids_by_tab
+                .values()
+                .try_fold(0usize, |count, members| {
+                    anyhow::ensure!(
+                        !members.pane_ids.is_empty(),
+                        "structural reverse index retains an empty tab bucket"
+                    );
+                    count
+                        .checked_add(members.pane_ids.len())
+                        .ok_or_else(|| anyhow!("structural reverse-member count overflow"))
+                })?;
         anyhow::ensure!(
             reverse_members == self.structural_by_pane_id.len(),
             "structural forward/reverse cardinality differs: {} forward, {reverse_members} reverse",
@@ -5321,6 +5497,34 @@ impl PaneAuthorityIndex {
                 );
             }
         }
+        anyhow::ensure!(
+            self.live_registration_counts_by_domain.len() == self.registrations_by_domain.len(),
+            "domain registration directory/count bucket cardinalities differ"
+        );
+        for (domain_id, registrations) in &self.registrations_by_domain {
+            anyhow::ensure!(
+                !registrations.pane_registrations.is_empty(),
+                "domain {domain_id} retains an empty registration directory"
+            );
+            anyhow::ensure!(
+                self.live_registration_counts_by_domain
+                    .get(domain_id)
+                    .copied()
+                    == Some(registrations.pane_registrations.len()),
+                "domain {domain_id} registration directory/count authority differs"
+            );
+        }
+        for (domain_id, count) in &self.live_registration_counts_by_domain {
+            anyhow::ensure!(*count != 0, "domain {domain_id} retains a zero live count");
+            anyhow::ensure!(
+                self.registrations_by_domain
+                    .get(domain_id)
+                    .is_some_and(|registrations| {
+                        registrations.pane_registrations.len() == *count
+                    }),
+                "domain {domain_id} live count lacks an exact directory"
+            );
+        }
         Ok(())
     }
 
@@ -5349,8 +5553,7 @@ impl PaneAuthorityIndex {
             let registration_matches = match (&existing.registration, &registration) {
                 (None, None) => true,
                 (Some(current), Some((expected, domain_id))) => {
-                    current.same_registration(expected)
-                        && existing.domain_id == Some(*domain_id)
+                    current.same_registration(expected) && existing.domain_id == Some(*domain_id)
                 }
                 _ => false,
             };
@@ -5511,9 +5714,10 @@ impl PaneAuthorityIndex {
         lane: Option<PaneStructuralLane>,
         registration: Option<&PaneRegistrationHandle>,
     ) -> anyhow::Result<()> {
-        let owner = self.structural_by_pane_id.get(&pane_id).ok_or_else(|| {
-            anyhow!("pane {pane_id} lacks structural-owner authority")
-        })?;
+        let owner = self
+            .structural_by_pane_id
+            .get(&pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} lacks structural-owner authority"))?;
         anyhow::ensure!(
             owner.matches_pane(pane) && owner.matches_tab(tab),
             "pane {pane_id} structural-owner authority names another exact allocation"
@@ -5668,8 +5872,7 @@ impl PaneAuthorityIndex {
             let tab_id = replacement.tab.tab_id();
             let tab_identity = Arc::as_ptr(&replacement.tab) as usize;
             anyhow::ensure!(
-                affected_tab_ids.insert(tab_id)
-                    && affected_tab_identities.insert(tab_identity),
+                affected_tab_ids.insert(tab_id) && affected_tab_identities.insert(tab_identity),
                 "tab {tab_id} appears more than once in one structural relocation"
             );
             let mux_owner_generation = replacement
@@ -5686,8 +5889,7 @@ impl PaneAuthorityIndex {
                 "tab {tab_id} retains an empty or missing reverse structural directory"
             );
             anyhow::ensure!(
-                indexed.map_or(0, |members| members.pane_ids.len())
-                    == replacement.current.len(),
+                indexed.map_or(0, |members| members.pane_ids.len()) == replacement.current.len(),
                 "tab {tab_id} structural index cardinality {} differs from relocation topology {}",
                 indexed.map_or(0, |members| members.pane_ids.len()),
                 replacement.current.len()
@@ -5713,17 +5915,14 @@ impl PaneAuthorityIndex {
                     owner.matches_pane(&state.pane)
                         && owner.matches_tab(&replacement.tab)
                         && owner.lane == state.lane
-                        && indexed.is_some_and(|members| {
-                            members.pane_ids.contains(&state.pane_id)
-                        }),
+                        && indexed
+                            .is_some_and(|members| { members.pane_ids.contains(&state.pane_id) }),
                     "pane {} structural authority disagrees with relocation tab {tab_id}",
                     state.pane_id
                 );
                 self.validate_structural_reverse_exact(state.pane_id, &replacement.tab)?;
-                let (registration, domain_id) = match (
-                    owner.registration.as_ref(),
-                    owner.domain_id,
-                ) {
+                let (registration, domain_id) = match (owner.registration.as_ref(), owner.domain_id)
+                {
                     (Some(registration), Some(domain_id)) => {
                         anyhow::ensure!(
                             registration.pane_id() == state.pane_id
@@ -5789,12 +5988,10 @@ impl PaneAuthorityIndex {
                     );
                     let witness = operation.registration();
                     let exact_witness = match &registration {
-                        Some(current) => {
-                            domain_id.is_some_and(|domain_id| {
-                                operation.admitted_domain_id() == domain_id
-                                    && current.same_registration(&witness)
-                            })
-                        }
+                        Some(current) => domain_id.is_some_and(|domain_id| {
+                            operation.admitted_domain_id() == domain_id
+                                && current.same_registration(&witness)
+                        }),
                         None => witness.guards_detached_topology(mux, &state.pane),
                     };
                     anyhow::ensure!(
@@ -5869,9 +6066,7 @@ impl PaneAuthorityIndex {
                 let mut pane_ids = HashSet::new();
                 pane_ids
                     .try_reserve(desired.len())
-                    .map_err(|error| {
-                        anyhow!("reserve tab {tab_id} relocated members: {error}")
-                    })?;
+                    .map_err(|error| anyhow!("reserve tab {tab_id} relocated members: {error}"))?;
                 Some(TabStructuralOwnerRegistrations {
                     tab: Arc::downgrade(&tab),
                     mux_owner_generation,
@@ -5999,6 +6194,7 @@ impl PaneAuthorityIndex {
     ) -> anyhow::Result<PreparedDomainFloatingAuthorityReconcile> {
         #[cfg(test)]
         self.validate_complete_structural_bijection()?;
+        self.validated_domain_registration_count(domain_id)?;
         let existing_domain = self.registrations_by_domain.get(&domain_id);
         anyhow::ensure!(
             existing_domain.is_none_or(|registrations| {
@@ -6027,12 +6223,14 @@ impl PaneAuthorityIndex {
                 "one exact pane allocation appears more than once in final domain {domain_id}"
             );
             anyhow::ensure!(
-                self.registrations_by_domain.iter().all(|(other_domain_id, registrations)| {
-                    *other_domain_id == domain_id
-                        || !registrations
-                            .pane_registrations
-                            .contains_key(&state.pane_id)
-                }),
+                self.registrations_by_domain
+                    .iter()
+                    .all(|(other_domain_id, registrations)| {
+                        *other_domain_id == domain_id
+                            || !registrations
+                                .pane_registrations
+                                .contains_key(&state.pane_id)
+                    }),
                 "pane {} is indexed by another domain",
                 state.pane_id
             );
@@ -6044,8 +6242,13 @@ impl PaneAuthorityIndex {
                 state.pane_id
             );
         }
-        let needs_domain_directory_slot = !final_domain_registrations.is_empty()
+        let final_domain_registration_count = final_domain_registrations.len();
+        let needs_domain_directory_slot = final_domain_registration_count != 0
             && !self.registrations_by_domain.contains_key(&domain_id);
+        let needs_domain_count_slot = final_domain_registration_count != 0
+            && !self
+                .live_registration_counts_by_domain
+                .contains_key(&domain_id);
 
         let mut affected_tabs = HashMap::<TabId, usize>::new();
         affected_tabs
@@ -6128,8 +6331,7 @@ impl PaneAuthorityIndex {
                 "tab {tab_id} retains an empty or missing reverse structural directory"
             );
             anyhow::ensure!(
-                indexed.map_or(0, |members| members.pane_ids.len())
-                    == replacement.current.len(),
+                indexed.map_or(0, |members| members.pane_ids.len()) == replacement.current.len(),
                 "tab {tab_id} structural index cardinality differs from topology"
             );
             let mut current_pane_ids = Vec::new();
@@ -6157,25 +6359,22 @@ impl PaneAuthorityIndex {
                     owner.matches_pane(&state.pane)
                         && owner.matches_tab(&replacement.tab)
                         && owner.lane == state.lane
-                        && indexed.is_some_and(|members| {
-                            members.pane_ids.contains(&state.pane_id)
-                        }),
+                        && indexed
+                            .is_some_and(|members| { members.pane_ids.contains(&state.pane_id) }),
                     "pane {} structural authority disagrees with tab {tab_id}",
                     state.pane_id
                 );
                 self.validate_structural_reverse_exact(state.pane_id, &replacement.tab)?;
-                let (registration, registered_domain_id) = match (
-                    owner.registration.as_ref(),
-                    owner.domain_id,
-                ) {
-                    (Some(registration), Some(registered_domain_id)) => {
-                        (registration, registered_domain_id)
-                    }
-                    _ => anyhow::bail!(
-                        "pane {} structural owner lacks complete live metadata",
-                        state.pane_id
-                    ),
-                };
+                let (registration, registered_domain_id) =
+                    match (owner.registration.as_ref(), owner.domain_id) {
+                        (Some(registration), Some(registered_domain_id)) => {
+                            (registration, registered_domain_id)
+                        }
+                        _ => anyhow::bail!(
+                            "pane {} structural owner lacks complete live metadata",
+                            state.pane_id
+                        ),
+                    };
                 anyhow::ensure!(
                     self.contains_live_registration(
                         state.pane_id,
@@ -6249,11 +6448,9 @@ impl PaneAuthorityIndex {
                 None
             } else {
                 let mut pane_ids = HashSet::new();
-                pane_ids
-                    .try_reserve(desired.len())
-                    .map_err(|error| {
-                        anyhow!("reserve tab {tab_id} desired structural members: {error}")
-                    })?;
+                pane_ids.try_reserve(desired.len()).map_err(|error| {
+                    anyhow!("reserve tab {tab_id} desired structural members: {error}")
+                })?;
                 Some(TabStructuralOwnerRegistrations {
                     tab: Arc::downgrade(&tab),
                     mux_owner_generation,
@@ -6292,11 +6489,9 @@ impl PaneAuthorityIndex {
                 );
                 if state.domain_id == domain_id {
                     anyhow::ensure!(
-                        final_domain_registrations
-                            .get(&state.pane_id)
-                            .is_some_and(|registration| {
-                                registration.same_registration(&state.registration)
-                            }),
+                        final_domain_registrations.get(&state.pane_id).is_some_and(
+                            |registration| { registration.same_registration(&state.registration) }
+                        ),
                         "pane {} desired owner is absent from final domain authority",
                         state.pane_id
                     );
@@ -6331,8 +6526,7 @@ impl PaneAuthorityIndex {
                         state.pane_id
                     );
                     anyhow::ensure!(
-                        owner.matches_pane(&state.pane)
-                            || state.domain_id == domain_id,
+                        owner.matches_pane(&state.pane) || state.domain_id == domain_id,
                         "foreign pane {} desired identity changed",
                         state.pane_id
                     );
@@ -6353,9 +6547,9 @@ impl PaneAuthorityIndex {
                 let generation = match unchanged_generation {
                     Some(generation) => generation,
                     None => {
-                        next_generation = next_generation.checked_add(1).ok_or_else(|| {
-                            anyhow!("pane structural-owner generation exhausted")
-                        })?;
+                        next_generation = next_generation
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("pane structural-owner generation exhausted"))?;
                         next_generation
                     }
                 };
@@ -6391,9 +6585,14 @@ impl PaneAuthorityIndex {
         );
 
         if needs_domain_directory_slot {
-            self.registrations_by_domain.try_reserve(1).map_err(|error| {
-                anyhow!("reserve final domain-registration directory: {error}")
-            })?;
+            self.registrations_by_domain
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve final domain-registration directory: {error}"))?;
+        }
+        if needs_domain_count_slot {
+            self.live_registration_counts_by_domain
+                .try_reserve(1)
+                .map_err(|error| anyhow!("reserve final domain-registration count: {error}"))?;
         }
         if structural_growth != 0 {
             self.structural_by_pane_id
@@ -6406,15 +6605,15 @@ impl PaneAuthorityIndex {
                 .map_err(|error| anyhow!("reserve reconciled tab-directory growth: {error}"))?;
         }
 
-        let final_domain_registrations = (!final_domain_registrations.is_empty()).then(|| {
-            DomainPaneRegistrations {
+        let final_domain_registrations =
+            (!final_domain_registrations.is_empty()).then(|| DomainPaneRegistrations {
                 domain: Some(Arc::downgrade(expected_domain)),
                 pane_registrations: final_domain_registrations,
-            }
-        });
+            });
         Ok(PreparedDomainFloatingAuthorityReconcile {
             domain_id,
             final_domain_registrations,
+            final_domain_registration_count,
             tab_replacements: prepared_tabs,
             next_structural_generation: next_generation,
         })
@@ -6427,8 +6626,12 @@ impl PaneAuthorityIndex {
         if let Some(registrations) = prepared.final_domain_registrations {
             self.registrations_by_domain
                 .insert(prepared.domain_id, registrations);
+            self.live_registration_counts_by_domain
+                .insert(prepared.domain_id, prepared.final_domain_registration_count);
         } else {
             self.registrations_by_domain.remove(&prepared.domain_id);
+            self.live_registration_counts_by_domain
+                .remove(&prepared.domain_id);
         }
         for replacement in &prepared.tab_replacements {
             for pane_id in &replacement.current_pane_ids {
@@ -6442,7 +6645,8 @@ impl PaneAuthorityIndex {
                     .insert(replacement.tab.tab_id(), members);
             }
             for owner in replacement.replacement {
-                self.structural_by_pane_id.insert(owner.pane_id, owner.owner);
+                self.structural_by_pane_id
+                    .insert(owner.pane_id, owner.owner);
             }
         }
         self.next_structural_generation = prepared.next_structural_generation;
@@ -6456,9 +6660,9 @@ impl PaneAuthorityIndex {
     ) -> anyhow::Result<PreparedTabStructuralReplacement> {
         #[cfg(test)]
         self.validate_complete_structural_bijection()?;
-        let mux_owner_generation = tab.active_mux_owner_generation().ok_or_else(|| {
-            anyhow!("tab {} lacks active mux-owner generation", tab.tab_id())
-        })?;
+        let mux_owner_generation = tab
+            .active_mux_owner_generation()
+            .ok_or_else(|| anyhow!("tab {} lacks active mux-owner generation", tab.tab_id()))?;
         let indexed = self.pane_ids_by_tab.get(&tab.tab_id());
         anyhow::ensure!(
             indexed.is_none_or(|members| members.matches_tab(&tab)),
@@ -6505,7 +6709,9 @@ impl PaneAuthorityIndex {
             let owner = self
                 .structural_by_pane_id
                 .get(&state.pane_id)
-                .ok_or_else(|| anyhow!("pane {} lacks structural-owner authority", state.pane_id))?;
+                .ok_or_else(|| {
+                    anyhow!("pane {} lacks structural-owner authority", state.pane_id)
+                })?;
             anyhow::ensure!(
                 owner.matches_pane(&state.pane)
                     && owner.matches_tab(&tab)
@@ -6522,8 +6728,9 @@ impl PaneAuthorityIndex {
             );
             self.validate_structural_reverse_exact(state.pane_id, &tab)?;
             match (&owner.registration, owner.domain_id) {
-                (Some(registration), Some(domain_id)) => self
-                    .validate_live_registration_exact(state.pane_id, domain_id, registration)?,
+                (Some(registration), Some(domain_id)) => {
+                    self.validate_live_registration_exact(state.pane_id, domain_id, registration)?
+                }
                 (None, None) => {}
                 _ => anyhow::bail!(
                     "pane {} structural owner has partial live-registration metadata",
@@ -6602,16 +6809,16 @@ impl PaneAuthorityIndex {
                     if same_exact_owner && owner.lane == state.lane {
                         owner.generation
                     } else {
-                        next_generation = next_generation.checked_add(1).ok_or_else(|| {
-                            anyhow!("pane structural-owner generation exhausted")
-                        })?;
+                        next_generation = next_generation
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("pane structural-owner generation exhausted"))?;
                         next_generation
                     }
                 }
                 None => {
-                    next_generation = next_generation.checked_add(1).ok_or_else(|| {
-                        anyhow!("pane structural-owner generation exhausted")
-                    })?;
+                    next_generation = next_generation
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("pane structural-owner generation exhausted"))?;
                     next_generation
                 }
             };
@@ -6651,10 +6858,7 @@ impl PaneAuthorityIndex {
         })
     }
 
-    fn commit_tab_structural_replacement(
-        &mut self,
-        prepared: PreparedTabStructuralReplacement,
-    ) {
+    fn commit_tab_structural_replacement(&mut self, prepared: PreparedTabStructuralReplacement) {
         for pane_id in &prepared.current_pane_ids {
             let removed = self.structural_by_pane_id.remove(pane_id);
             debug_assert!(removed.is_some_and(|owner| owner.matches_tab(&prepared.tab)));
@@ -6704,7 +6908,10 @@ impl PaneAuthorityIndex {
             .map_err(|error| anyhow!("reserve tab structural retirement identities: {error}"))?;
         for pane_id in &indexed.pane_ids {
             let owner = self.structural_by_pane_id.get(pane_id).ok_or_else(|| {
-                anyhow!("tab {} indexes missing structural pane {pane_id}", tab.tab_id())
+                anyhow!(
+                    "tab {} indexes missing structural pane {pane_id}",
+                    tab.tab_id()
+                )
             })?;
             anyhow::ensure!(
                 owner.matches_tab(tab),
@@ -6759,9 +6966,9 @@ impl PaneAuthorityIndex {
         debug_assert!(removed_members.is_some());
         for (pane_id, pane) in candidates {
             let removed = self.structural_by_pane_id.remove(pane_id);
-            debug_assert!(removed.is_some_and(|owner| {
-                owner.matches_tab(tab) && owner.matches_pane(pane)
-            }));
+            debug_assert!(
+                removed.is_some_and(|owner| { owner.matches_tab(tab) && owner.matches_pane(pane) })
+            );
         }
     }
 }
@@ -6800,8 +7007,22 @@ impl TabParentRegistration {
         tab.active_mux_owner_generation() == Some(self.mux_owner_generation)
             && self
                 .tab
+                .upgrade()
+                .is_some_and(|registered| Arc::ptr_eq(&registered, tab))
+    }
+
+    /// Match the exact allocation retained by a historical parent entry even
+    /// after its mux-owner generation has retired.  This is intentionally
+    /// narrower than [`Self::is_same_tab`]: only stale-parent recovery may use
+    /// it, after revalidating that the allocation is absent from `Mux::tabs`.
+    fn is_same_tab_allocation(&self, tab: &Arc<Tab>) -> bool {
+        self.tab
             .upgrade()
             .is_some_and(|registered| Arc::ptr_eq(&registered, tab))
+    }
+
+    fn matches_allocation(&self, tab: &Arc<Tab>, window_id: WindowId) -> bool {
+        self.window_id == window_id && self.is_same_tab_allocation(tab)
     }
 }
 
@@ -6993,6 +7214,8 @@ pub struct Mux {
     fail_next_domain_retirement_snapshot_reserve: AtomicBool,
     #[cfg(test)]
     domain_retirement_transient_failures: AtomicUsize,
+    #[cfg(test)]
+    domain_retirement_pane_registry_probes: AtomicUsize,
     // Compatibility projection used by existing final-cut checks in Tab.
     // Unlike the former process-lifetime tombstone set, entries are removed
     // only after the exact generation and its indexed cleanup quiesce.
@@ -7027,6 +7250,44 @@ pub struct Mux {
 /// ordinary client but receives a typed reliable-input refusal rather than
 /// growing mux memory without limit.
 pub const MAX_RELIABLE_INPUT_CLIENTS: usize = 4_096;
+
+/// Opaque authority for one operation admitted against one exact client
+/// registration.
+///
+/// The guard is intentionally non-cloneable and exposes no raw `Arc<ClientId>`
+/// outside this crate. Replacing or unregistering an equal-valued client closes
+/// new admission atomically, while work that already owns this guard cannot be
+/// redirected to the successor registration.
+pub struct ClientOperationGuard {
+    owner: Weak<Mux>,
+    client_id: Arc<ClientId>,
+    generation: Arc<ClientRegistrationGeneration>,
+    _operation: ClientRegistrationOperationLease,
+}
+
+impl std::fmt::Debug for ClientOperationGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientOperationGuard")
+            .field("client_numeric_id", &self.client_id.id)
+            .field("client_pid", &self.client_id.pid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientOperationGuard {
+    fn client_id(&self) -> &Arc<ClientId> {
+        &self.client_id
+    }
+
+    /// Compare two admitted client authorities without exposing either raw
+    /// registration allocation or generation.
+    pub fn same_registration(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.owner, &other.owner)
+            && Arc::ptr_eq(&self.client_id, &other.client_id)
+            && Arc::ptr_eq(&self.generation, &other.generation)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReliableInputKeyKind {
@@ -7378,14 +7639,37 @@ fn notify_synchronized_output_event(
     }
 
     let owner = Arc::downgrade(&mux);
-    promise::spawn::spawn_into_main_thread(async move {
-        let _operation = operation;
-        let Some(mux) = owner.upgrade() else {
-            return;
-        };
-        mux.notify(notification);
-    })
-    .detach();
+    match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation
+                .spawn(async move {
+                    let _operation = operation;
+                    let Some(mux) = owner.upgrade() else {
+                        return;
+                    };
+                    mux.notify(notification);
+                })
+                .detach();
+        }
+        rejected => {
+            metrics::counter!(
+                "mux.main_thread_admission",
+                "operation" => "synchronized output notification",
+                "outcome" => "inline_fallback"
+            )
+            .increment(1);
+            log::error!(
+                "mux main-thread scheduler rejected synchronized output notification; preserving delivery inline: {rejected:?}"
+            );
+            let _operation = operation;
+            if let Some(mux) = owner.upgrade() {
+                mux.notify(notification);
+            }
+        }
+    }
 }
 
 /// This function applies parsed actions to the pane and notifies any
@@ -7691,6 +7975,42 @@ fn finish_pane_reader_eof(
     }
 }
 
+fn schedule_pane_reader_eof(
+    pane: Weak<dyn Pane>,
+    generation: Arc<PaneRegistrationGeneration>,
+    pane_id: PaneId,
+    exit_behavior: ExitBehavior,
+) {
+    if promise::spawn::is_scheduler_configured() {
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn(async move {
+                        finish_pane_reader_eof(&pane, &generation, pane_id, exit_behavior);
+                    })
+                    .detach();
+            }
+            rejected => {
+                metrics::counter!(
+                    "mux.main_thread_admission",
+                    "operation" => "pane reader EOF",
+                    "outcome" => "inline_fallback"
+                )
+                .increment(1);
+                log::error!(
+                    "mux main-thread scheduler rejected pane reader EOF finalization; preserving cleanup inline: {rejected:?}"
+                );
+                finish_pane_reader_eof(&pane, &generation, pane_id, exit_behavior);
+            }
+        }
+    } else {
+        finish_pane_reader_eof(&pane, &generation, pane_id, exit_behavior);
+    }
+}
+
 /// This function is run in a separate thread; its purpose is to perform
 /// blocking reads from the pty (non-blocking reads are not portable to
 /// all platforms and pty/tty types), parse the escape sequences and
@@ -7748,14 +8068,12 @@ fn read_from_pane_pty(
     let _ = parser_done.recv();
 
     let exit_behavior = exit_behavior.unwrap_or_else(|| configuration().exit_behavior);
-    if promise::spawn::is_scheduler_configured() {
-        promise::spawn::spawn_into_main_thread(async move {
-            finish_pane_reader_eof(&pane_for_lifecycle, &generation, pane_id, exit_behavior);
-        })
-        .detach();
-    } else {
-        finish_pane_reader_eof(&pane_for_lifecycle, &generation, pane_id, exit_behavior);
-    }
+    schedule_pane_reader_eof(
+        pane_for_lifecycle,
+        generation,
+        pane_id,
+        exit_behavior,
+    );
 
     dead.store(true, Ordering::Release);
 }
@@ -7939,6 +8257,8 @@ impl Mux {
             fail_next_domain_retirement_snapshot_reserve: AtomicBool::new(false),
             #[cfg(test)]
             domain_retirement_transient_failures: AtomicUsize::new(0),
+            #[cfg(test)]
+            domain_retirement_pane_registry_probes: AtomicUsize::new(0),
             retired_domain_ids: Mutex::new(HashSet::new()),
             subscribers: RwLock::new(HashMap::new()),
             pending_pane_output: Mutex::new(PendingPaneOutputNotifications::default()),
@@ -8004,9 +8324,9 @@ impl Mux {
             anyhow::bail!("injected {operation} pane-count allocation failure");
         }
         let mut seen_windows = HashSet::new();
-        seen_windows
-            .try_reserve(deltas.len())
-            .map_err(|error| anyhow!("reserve {operation} pane-count window identities: {error}"))?;
+        seen_windows.try_reserve(deltas.len()).map_err(|error| {
+            anyhow!("reserve {operation} pane-count window identities: {error}")
+        })?;
         let mut prepared_windows = Vec::new();
         prepared_windows
             .try_reserve_exact(deltas.len())
@@ -8081,9 +8401,11 @@ impl Mux {
                 *additions != 0 && !workspace_counts.contains_key(workspace)
             })
             .count();
-        workspace_counts.try_reserve(missing_entries).map_err(|error| {
-            anyhow!("reserve {operation} workspace pane-count entries: {error}")
-        })?;
+        workspace_counts
+            .try_reserve(missing_entries)
+            .map_err(|error| {
+                anyhow!("reserve {operation} workspace pane-count entries: {error}")
+            })?;
         let mut prepared_workspaces = Vec::new();
         prepared_workspaces
             .try_reserve_exact(workspace_deltas.len())
@@ -8170,10 +8492,16 @@ impl Mux {
                 .find(|delta| delta.window_id == parent.window_id)
             {
                 delta.removals = delta.removals.checked_add(removals).ok_or_else(|| {
-                    anyhow!("{operation} window {} pane removals overflow", parent.window_id)
+                    anyhow!(
+                        "{operation} window {} pane removals overflow",
+                        parent.window_id
+                    )
                 })?;
                 delta.additions = delta.additions.checked_add(additions).ok_or_else(|| {
-                    anyhow!("{operation} window {} pane additions overflow", parent.window_id)
+                    anyhow!(
+                        "{operation} window {} pane additions overflow",
+                        parent.window_id
+                    )
                 })?;
             } else {
                 deltas.push(WindowPaneCountDelta::new(
@@ -8183,12 +8511,7 @@ impl Mux {
                 ));
             }
         }
-        self.prepare_pane_count_mutation_locked(
-            windows,
-            workspace_counts,
-            &deltas,
-            operation,
-        )
+        self.prepare_pane_count_mutation_locked(windows, workspace_counts, &deltas, operation)
     }
 
     /// Exact O(1) tab structural cardinality from the private reverse index.
@@ -8232,15 +8555,14 @@ impl Mux {
         );
         census.tab_ids.clear();
         census.exact_identities.clear();
-        census.tab_ids.try_reserve(window.len()).map_err(|error| {
-            anyhow!("reserve window {window_id} tab identity census: {error}")
-        })?;
+        census
+            .tab_ids
+            .try_reserve(window.len())
+            .map_err(|error| anyhow!("reserve window {window_id} tab identity census: {error}"))?;
         census
             .exact_identities
             .try_reserve(window.len())
-            .map_err(|error| {
-                anyhow!("reserve window {window_id} exact tab census: {error}")
-            })?;
+            .map_err(|error| anyhow!("reserve window {window_id} exact tab census: {error}"))?;
         let mut pane_count = 0usize;
         for tab in window.iter() {
             let identity = Arc::as_ptr(tab) as usize;
@@ -8341,9 +8663,7 @@ impl Mux {
             ) {
                 Ok(pane_count) => pane_count,
                 Err(error) => {
-                    log::error!(
-                        "refusing pane-count recompute before cache mutation: {error:#}"
-                    );
+                    log::error!("refusing pane-count recompute before cache mutation: {error:#}");
                     return;
                 }
             };
@@ -8538,6 +8858,37 @@ impl Mux {
         self.replace_client_focus_metadata_if_same(client_id, pane_id, Some(target))
     }
 
+    fn replace_client_focus_metadata_for_guard_if_current(
+        &self,
+        client: &ClientOperationGuard,
+        pane_id: PaneId,
+        target: &PaneRegistrationHandle,
+    ) -> Option<(Option<PaneRegistrationHandle>, bool)> {
+        let _registration = self.pane_registration.lock();
+        let remains_current = self.panes.read().get(&pane_id).is_some_and(|registered| {
+            target.same_registration(&PaneRegistrationHandle::new(
+                &registered.pane,
+                &registered.generation,
+            ))
+        });
+        if !remains_current {
+            return None;
+        }
+        let mut clients = self.clients.write();
+        let info = clients
+            .get_mut(client.client_id.as_ref())
+            .filter(|info| {
+                Arc::ptr_eq(&info.client_id, &client.client_id)
+                    && Arc::ptr_eq(&info.registration_generation, &client.generation)
+            })?;
+        let prior = info.focused_pane_registration();
+        let same_registration = prior
+            .as_ref()
+            .is_some_and(|prior| prior.same_registration(target));
+        info.replace_focused_pane(pane_id, Some(target.clone()));
+        Some((prior, same_registration))
+    }
+
     /// Replace only the process-local client focus projection.
     ///
     /// No pane callback or mux notification is emitted here. Callers that
@@ -8643,6 +8994,13 @@ impl Mux {
             {
                 return;
             }
+            if let Some(prior) = clients.get(client_id.as_ref()) {
+                // Close admission while the value-keyed slot is still owned by
+                // the old registration. A concurrent reader either acquired
+                // its exact old-generation lease before this cut or observes
+                // only the successor after publication.
+                prior.registration_generation.retire();
+            }
             clients.insert(
                 (*client_id).clone(),
                 ClientInfo::new(Arc::clone(&client_id)),
@@ -8666,6 +9024,109 @@ impl Mux {
             .read()
             .get(client_id.as_ref())
             .is_some_and(|info| Arc::ptr_eq(&info.client_id, client_id))
+    }
+
+    /// Admit one operation against the exact live client registration.
+    ///
+    /// The read guard serializes generation acquisition with replacement and
+    /// unregister, which both retire the old generation under the write guard.
+    pub fn capture_client_operation(
+        self: &Arc<Self>,
+        client_id: &Arc<ClientId>,
+    ) -> Option<ClientOperationGuard> {
+        let clients = self.clients.read();
+        let info = clients
+            .get(client_id.as_ref())
+            .filter(|info| Arc::ptr_eq(&info.client_id, client_id))?;
+        let operation = info.registration_generation.try_acquire()?;
+        Some(ClientOperationGuard {
+            owner: Arc::downgrade(self),
+            client_id: Arc::clone(client_id),
+            generation: Arc::clone(&info.registration_generation),
+            _operation: operation,
+        })
+    }
+
+    fn client_operation_is_current(&self, client: &ClientOperationGuard) -> bool {
+        if !client
+            .owner
+            .upgrade()
+            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), self))
+        {
+            return false;
+        }
+        self.clients
+            .read()
+            .get(client.client_id.as_ref())
+            .is_some_and(|info| {
+                Arc::ptr_eq(&info.client_id, &client.client_id)
+                    && Arc::ptr_eq(&info.registration_generation, &client.generation)
+            })
+    }
+
+    /// Record activity only for the exact registration represented by a held
+    /// operation guard. A successor with an equal value can never receive the
+    /// old connection's activity timestamp.
+    pub fn client_had_input_guarded(&self, client: &ClientOperationGuard) -> bool {
+        let updated = {
+            let mut clients = self.clients.write();
+            clients
+                .get_mut(client.client_id.as_ref())
+                .filter(|info| {
+                    Arc::ptr_eq(&info.client_id, &client.client_id)
+                        && Arc::ptr_eq(&info.registration_generation, &client.generation)
+                })
+                .is_some_and(|info| {
+                    info.update_last_input();
+                    true
+                })
+        };
+        if updated {
+            if let Some(agent) = &self.agent {
+                agent.update_target();
+            }
+        }
+        updated
+    }
+
+    /// Assign active workspace only to the exact guarded client generation.
+    pub fn set_active_workspace_for_client_guarded(
+        &self,
+        client: &ClientOperationGuard,
+        workspace: &str,
+    ) -> bool {
+        let mut clients = self.clients.write();
+        clients
+            .get_mut(client.client_id.as_ref())
+            .filter(|info| {
+                Arc::ptr_eq(&info.client_id, &client.client_id)
+                    && Arc::ptr_eq(&info.registration_generation, &client.generation)
+            })
+            .is_some_and(|info| {
+                info.active_workspace.replace(workspace.to_string());
+                true
+            })
+    }
+
+    /// Claim reliable input only through an exact client-generation lease.
+    pub fn claim_reliable_key_event_guarded(
+        &self,
+        client: &ClientOperationGuard,
+        registration: &PaneRegistrationHandle,
+        input_serial: u64,
+        kind: ReliableInputKeyKind,
+        event: &KeyEvent,
+    ) -> ReliableInputClaimOutcome {
+        if !self.client_operation_is_current(client) {
+            return ReliableInputClaimOutcome::ClientRegistrationRetired;
+        }
+        self.claim_reliable_key_event(
+            Some(client.client_id()),
+            registration,
+            input_serial,
+            kind,
+            event,
+        )
     }
 
     /// Claim the sole pending reliable key transition for an exact registered
@@ -8929,27 +9390,24 @@ impl Mux {
             affected_window_ids.sort_unstable();
 
             let mut workspace_counts = self.num_panes_by_workspace.write();
-            let cached_old_count = workspace_counts
-                .get(old_workspace)
-                .copied()
-                .unwrap_or(0);
+            let cached_old_count = workspace_counts.get(old_workspace).copied().unwrap_or(0);
             anyhow::ensure!(
                 cached_old_count == exact_old_count,
                 "workspace {old_workspace} pane-count cache {cached_old_count} differs from exact structural count {exact_old_count}"
             );
-            let cached_new_count = workspace_counts
-                .get(new_workspace)
-                .copied()
-                .unwrap_or(0);
+            let cached_new_count = workspace_counts.get(new_workspace).copied().unwrap_or(0);
             anyhow::ensure!(
                 cached_new_count == exact_new_count,
                 "workspace {new_workspace} pane-count cache {cached_new_count} differs from exact structural count {exact_new_count}"
             );
-            let final_new_count = exact_new_count.checked_add(exact_old_count).ok_or_else(|| {
-                anyhow!(
+            let final_new_count =
+                exact_new_count
+                    .checked_add(exact_old_count)
+                    .ok_or_else(|| {
+                        anyhow!(
                     "workspace {new_workspace} pane count overflows while renaming {old_workspace}"
                 )
-            })?;
+                    })?;
             if final_new_count != 0 && !workspace_counts.contains_key(new_workspace) {
                 workspace_counts.try_reserve(1).map_err(|error| {
                     anyhow!("reserve renamed workspace pane-count entry: {error}")
@@ -8957,9 +9415,7 @@ impl Mux {
             }
             let prepared_count_key = (final_new_count != 0
                 && !workspace_counts.contains_key(new_workspace))
-            .then(|| {
-                Self::prepare_owned_text(new_workspace, "renamed pane-count key")
-            })
+            .then(|| Self::prepare_owned_text(new_workspace, "renamed pane-count key"))
             .transpose()?;
 
             let mut prepared_windows = Vec::new();
@@ -9013,8 +9469,7 @@ impl Mux {
                 *count = final_new_count;
             } else {
                 let prior = workspace_counts.insert(
-                    prepared_count_key
-                        .expect("absent nonzero destination count key was prepared"),
+                    prepared_count_key.expect("absent nonzero destination count key was prepared"),
                     final_new_count,
                 );
                 debug_assert!(prior.is_none());
@@ -9081,9 +9536,14 @@ impl Mux {
     pub fn unregister_client_if_same(&self, client_id: &Arc<ClientId>) -> bool {
         let removed = {
             let mut clients = self.clients.write();
-            let owns_registration = clients
-                .get(client_id.as_ref())
-                .is_some_and(|info| Arc::ptr_eq(&info.client_id, client_id));
+            let owns_registration = clients.get(client_id.as_ref()).is_some_and(|info| {
+                if Arc::ptr_eq(&info.client_id, client_id) {
+                    info.registration_generation.retire();
+                    true
+                } else {
+                    false
+                }
+            });
             if owns_registration {
                 clients.remove(client_id.as_ref());
                 true
@@ -9440,6 +9900,7 @@ impl Mux {
             attached_tabs,
             created_windows,
             removed_windows,
+            false,
             trailing_revision_count,
             commit_trailing,
         )
@@ -9463,6 +9924,7 @@ impl Mux {
         attached_tabs: Vec<(TabId, WindowId)>,
         mut created_windows: Vec<WindowId>,
         mut removed_windows: Vec<WindowId>,
+        allow_retired_prior_tab_allocations: bool,
         trailing_revision_count: usize,
         commit_trailing: impl FnOnce(Option<TopologyRevision>) -> R,
     ) -> anyhow::Result<R> {
@@ -9520,9 +9982,7 @@ impl Mux {
         );
         if parentage_changed {
             for (window_id, state) in &prepared {
-                if state.membership_changed()
-                    || removed_windows.binary_search(window_id).is_ok()
-                {
+                if state.membership_changed() || removed_windows.binary_search(window_id).is_ok() {
                     anyhow::ensure!(
                         prepared_pane_counts
                             .window_ids()
@@ -9654,9 +10114,13 @@ impl Mux {
                 .map_err(|error| anyhow!("reserve tab-parent index transaction: {error}"))?;
             for (window_id, tab) in &prior_tabs {
                 anyhow::ensure!(
-                    tab_parents
-                        .get(&tab.tab_id())
-                        .is_some_and(|parent| parent.matches(tab, *window_id)),
+                    tab_parents.get(&tab.tab_id()).is_some_and(|parent| {
+                        if allow_retired_prior_tab_allocations {
+                            parent.matches_allocation(tab, *window_id)
+                        } else {
+                            parent.matches(tab, *window_id)
+                        }
+                    }),
                     "tab {} parent index does not match exact membership in window {window_id}",
                     tab.tab_id()
                 );
@@ -9676,9 +10140,7 @@ impl Mux {
                             tab.tab_id()
                         );
                     }
-                    if !prior_tab_memberships
-                        .contains(&(*window_id, Arc::as_ptr(tab) as usize))
-                    {
+                    if !prior_tab_memberships.contains(&(*window_id, Arc::as_ptr(tab) as usize)) {
                         new_parent_entries.push((
                             tab.tab_id(),
                             TabParentRegistration::prepare(tab, *window_id)?,
@@ -9736,7 +10198,13 @@ impl Mux {
             for (window_id, tab) in &prior_tabs {
                 if !final_tab_memberships.contains(&(*window_id, Arc::as_ptr(tab) as usize)) {
                     let removed = tab_parents.remove(&tab.tab_id());
-                    debug_assert!(removed.is_some_and(|parent| parent.matches(tab, *window_id)));
+                    debug_assert!(removed.is_some_and(|parent| {
+                        if allow_retired_prior_tab_allocations {
+                            parent.matches_allocation(tab, *window_id)
+                        } else {
+                            parent.matches(tab, *window_id)
+                        }
+                    }));
                 }
             }
             for (tab_id, parent) in new_parent_entries {
@@ -9806,10 +10274,13 @@ impl Mux {
             pending.scheduled = true;
             WindowNotificationDispatch::new(Arc::downgrade(&owner))
         };
-        promise::spawn::spawn_into_main_thread(async move {
-            dispatch.execute();
-        })
-        .detach();
+        schedule_mux_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            "window notification drain",
+            move || async move {
+                dispatch.execute();
+            },
+        );
     }
 
     fn run_scheduled_window_notification_drain(&self) {
@@ -9908,12 +10379,35 @@ impl Mux {
             }
         }
         if promise::spawn::is_scheduler_configured() {
-            promise::spawn::spawn_into_main_thread(async {
-                if let Some(mux) = Mux::try_get() {
-                    mux.notify(notification);
+            match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                    reservation
+                        .spawn(async move {
+                            if let Some(mux) = Mux::try_get() {
+                                mux.notify(notification);
+                            }
+                        })
+                        .detach();
+                    return;
                 }
-            })
-            .detach();
+                rejected => {
+                    metrics::counter!(
+                        "mux.main_thread_admission",
+                        "operation" => "cross-thread notification",
+                        "outcome" => "inline_fallback"
+                    )
+                    .increment(1);
+                    log::error!(
+                        "mux main-thread scheduler rejected cross-thread notification; preserving delivery inline: {rejected:?}"
+                    );
+                }
+            }
+        }
+        if let Some(mux) = Mux::try_get() {
+            mux.notify(notification);
         }
     }
 
@@ -10617,10 +11111,13 @@ impl Mux {
             .filter(|mux| std::ptr::eq::<Mux>(mux.as_ref(), self));
         if let Some(exact_mux) = exact_mux {
             let dispatch = PaneOutputDrainDispatch::new(Arc::downgrade(&exact_mux));
-            promise::spawn::spawn_into_main_thread(async move {
-                dispatch.execute();
-            })
-            .detach();
+            schedule_mux_main_thread(
+                promise::spawn::MainThreadServiceClass::Render,
+                "pane output notification drain",
+                move || async move {
+                    dispatch.execute();
+                },
+            );
         } else {
             // Standalone/headless embedders may intentionally construct a mux
             // without configuring the GUI scheduler or without installing it
@@ -10704,11 +11201,7 @@ impl Mux {
         let domain_id = domain.domain_id();
         let domain_name = domain.domain_name().to_string();
         let _registration = self.domain_registration.lock();
-        let exact_registration = self
-            .domain_registrations
-            .read()
-            .get(&domain_id)
-            .cloned();
+        let exact_registration = self.domain_registrations.read().get(&domain_id).cloned();
         let exact = exact_registration.as_ref().is_some_and(|registered| {
             registered.matches_domain(domain)
                 && registered.domain_name == domain_name
@@ -10845,14 +11338,10 @@ impl Mux {
                             && retired_ids.contains(&registration.domain_id)
                             && domains
                                 .get(&registration.domain_id)
-                                .is_some_and(|current| {
-                                    Arc::ptr_eq(current, &registration.domain)
-                                })
+                                .is_some_and(|current| Arc::ptr_eq(current, &registration.domain))
                             && domains_by_name
                                 .get(&registration.domain_name)
-                                .is_some_and(|current| {
-                                    Arc::ptr_eq(current, &registration.domain)
-                                })
+                                .is_some_and(|current| Arc::ptr_eq(current, &registration.domain))
                             && registrations_by_name
                                 .get(&registration.domain_name)
                                 .is_some_and(|current| Arc::ptr_eq(current, registration))
@@ -10933,11 +11422,8 @@ impl Mux {
         let registration_name_key = registration_name.clone();
         let domain_arc = Arc::clone(domain);
         let domain_weak = Arc::downgrade(domain);
-        let live_registration = LiveDomainRegistration::new(
-            domain_id,
-            registration_name,
-            Arc::clone(&domain_arc),
-        );
+        let live_registration =
+            LiveDomainRegistration::new(domain_id, registration_name, Arc::clone(&domain_arc));
         // SAFETY: every staged owner of external `Domain` state is declared
         // before these guards. Rust's reverse local-drop order therefore
         // releases every registry guard before an early return can dispose of
@@ -10959,6 +11445,11 @@ impl Mux {
         let mut domains_by_name = self.domains_by_name.write();
         let mut registrations = self.domain_registrations.write();
         let mut registrations_by_name = self.domain_registrations_by_name.write();
+        authority
+            .validated_domain_registration_count(domain_id)
+            .map_err(|error| DomainRegistrationError::RegistryInconsistent {
+                detail: error.to_string(),
+            })?;
         if let Some(existing) = domains.get(&domain_id) {
             if Arc::ptr_eq(existing, domain) {
                 let exact_name = domains_by_name
@@ -10992,30 +11483,32 @@ impl Mux {
                     &registrations,
                     &registrations_by_name,
                 )
-                .map_err(|detail| DomainRegistrationError::RegistryInconsistent {
-                    detail: detail.to_string(),
+                .map_err(|detail| {
+                    DomainRegistrationError::RegistryInconsistent {
+                        detail: detail.to_string(),
+                    }
                 })?;
-                let bind_domain_directory =
-                    if let Some(registrations) = authority.registrations_by_domain.get(&domain_id) {
-                        match registrations.domain.as_ref() {
-                            Some(current) if Weak::ptr_eq(current, &domain_weak) => false,
-                            None => true,
-                            Some(_) => {
-                                return Err(DomainRegistrationError::RegistryInconsistent {
+                let bind_domain_directory = if let Some(registrations) =
+                    authority.registrations_by_domain.get(&domain_id)
+                {
+                    match registrations.domain.as_ref() {
+                        Some(current) if Weak::ptr_eq(current, &domain_weak) => false,
+                        None => true,
+                        Some(_) => {
+                            return Err(DomainRegistrationError::RegistryInconsistent {
                                     detail: format!(
                                         "domain {domain_id} pane directory names another exact allocation"
                                     ),
                                 });
-                            }
                         }
-                    } else {
-                        false
-                    };
+                    }
+                } else {
+                    false
+                };
                 let outcome = self.prepare_domain_add_outcome_locked(
                     mode,
                     Arc::clone(
-                        exact_registration
-                            .expect("validated exact registration remains present"),
+                        exact_registration.expect("validated exact registration remains present"),
                     ),
                 )?;
                 if bind_domain_directory {
@@ -11033,9 +11526,7 @@ impl Mux {
                     Arc::ptr_eq(registered, existing).then(|| name.clone())
                 })
                 .ok_or_else(|| DomainRegistrationError::RegistryInconsistent {
-                    detail: format!(
-                        "identifier {domain_id} has no exact name-index registration"
-                    ),
+                    detail: format!("identifier {domain_id} has no exact name-index registration"),
                 })?;
             return Err(DomainRegistrationError::IdentifierInUse {
                 domain_id,
@@ -11047,9 +11538,7 @@ impl Mux {
             if !Arc::ptr_eq(existing, domain) {
                 let registered_id = domains
                     .iter()
-                    .find_map(|(id, registered)| {
-                        Arc::ptr_eq(registered, existing).then_some(*id)
-                    })
+                    .find_map(|(id, registered)| Arc::ptr_eq(registered, existing).then_some(*id))
                     .ok_or_else(|| DomainRegistrationError::RegistryInconsistent {
                         detail: format!(
                             "name {} has no exact identifier-index registration",
@@ -11113,11 +11602,11 @@ impl Mux {
                 detail: detail.to_string(),
             })?;
 
-        domains.try_reserve(1).map_err(|error| {
-            DomainRegistrationError::RegistryInconsistent {
+        domains
+            .try_reserve(1)
+            .map_err(|error| DomainRegistrationError::RegistryInconsistent {
                 detail: format!("reserve domain identifier entry: {error}"),
-            }
-        })?;
+            })?;
         domains_by_name.try_reserve(1).map_err(|error| {
             DomainRegistrationError::RegistryInconsistent {
                 detail: format!("reserve domain name entry: {error}"),
@@ -11138,10 +11627,8 @@ impl Mux {
         // generation before binding authority or publishing any index entry.
         // The guard is retained across the commit and returned without a raw
         // Arc projection or numeric-ID relookup.
-        let outcome = self.prepare_domain_add_outcome_locked(
-            mode,
-            Arc::clone(&live_registration),
-        )?;
+        let outcome =
+            self.prepare_domain_add_outcome_locked(mode, Arc::clone(&live_registration))?;
 
         if bind_domain_directory {
             authority
@@ -11152,10 +11639,7 @@ impl Mux {
         }
         domains_by_name.insert(domain_name_key, Arc::clone(&domain_arc));
         domains.insert(domain_id, Arc::clone(&domain_arc));
-        registrations_by_name.insert(
-            registration_name_key,
-            Arc::clone(&live_registration),
-        );
+        registrations_by_name.insert(registration_name_key, Arc::clone(&live_registration));
         registrations.insert(domain_id, Arc::clone(&live_registration));
 
         if install_default {
@@ -11742,7 +12226,11 @@ impl Mux {
                 if !preparation_claim.is_authoritative_locked() {
                     return Err(PanePreparationCancelled { pane_id }.into());
                 }
-                if self.retired_domain_ids.lock().contains(&preparation_claim.domain_id) {
+                if self
+                    .retired_domain_ids
+                    .lock()
+                    .contains(&preparation_claim.domain_id)
+                {
                     anyhow::bail!(
                         "pane {pane_id} belongs to retired domain {}",
                         preparation_claim.domain_id
@@ -11843,6 +12331,11 @@ impl Mux {
             let mut tabs = self.tabs.write();
             match tabs.get(&tab.tab_id()) {
                 Some(existing) if Arc::ptr_eq(existing, tab) => {
+                    anyhow::ensure!(
+                        tab.has_active_mux_owner(self),
+                        "tab {} is registered without active mux-owner authority",
+                        tab.tab_id()
+                    );
                     anyhow::ensure!(
                         tab.is_structurally_empty_for_mux(self),
                         "tab {} is registered as pane-free but has structural topology",
@@ -11962,7 +12455,8 @@ impl Mux {
                             ),
                             "active pane {pane_id} lacks exact domain-registration authority"
                         );
-                        let expected_domain = self.domains.read().get(&registered_domain_id).cloned();
+                        let expected_domain =
+                            self.domains.read().get(&registered_domain_id).cloned();
                         anyhow::ensure!(
                             authority.domain_directory_matches(
                                 registered_domain_id,
@@ -12011,10 +12505,7 @@ impl Mux {
                             .prepare_mux_owner_binding_with_exact_single_tiled_pane(self, &pane)?;
                         let tab_mux_owner_generation = tab_binding.commit();
                         tabs.insert(tab_id, Arc::clone(tab));
-                        authority.commit_structural_bind(
-                            structural,
-                            tab_mux_owner_generation,
-                        );
+                        authority.commit_structural_bind(structural, tab_mux_owner_generation);
                         prepared_counts.commit(&mut windows, &mut workspace_counts);
                         Ok(None)
                     }
@@ -12037,15 +12528,13 @@ impl Mux {
                             .take()
                             .expect("a prepared pane retains its registration reservation")
                             .commit()?;
-                        let registration =
-                            PaneRegistrationHandle::new(&pane, &claim.generation);
+                        let registration = PaneRegistrationHandle::new(&pane, &claim.generation);
                         anyhow::ensure!(
                             !self.retired_domain_ids.lock().contains(&claim.domain_id),
                             "active pane {pane_id} belongs to retired domain {}",
                             claim.domain_id
                         );
-                        let expected_domain =
-                            self.domains.read().get(&claim.domain_id).cloned();
+                        let expected_domain = self.domains.read().get(&claim.domain_id).cloned();
                         let mut authority = self.pane_authority.lock();
                         let prepared_authority = authority.prepare_live_registration_insert(
                             pane_id,
@@ -12107,20 +12596,17 @@ impl Mux {
                             "active-pane tab and pane registration",
                         )?;
                         let tab_binding = if tab_needs_insert {
-                            Some(
-                                tab.prepare_mux_owner_binding_with_exact_single_tiled_pane(
-                                    self, &pane,
-                                )?,
-                            )
+                            Some(tab.prepare_mux_owner_binding_with_exact_single_tiled_pane(
+                                self, &pane,
+                            )?)
                         } else {
                             None
                         };
                         let existing_tab_generation = if tab_needs_insert {
                             0
                         } else {
-                            tab.active_mux_owner_generation().ok_or_else(|| {
-                                anyhow!("tab {tab_id} lost mux-owner authority")
-                            })?
+                            tab.active_mux_owner_generation()
+                                .ok_or_else(|| anyhow!("tab {tab_id} lost mux-owner authority"))?
                         };
                         anyhow::ensure!(
                             !panes.contains_key(&pane_id),
@@ -12154,8 +12640,7 @@ impl Mux {
                             registration,
                             prepared_authority,
                         );
-                        authority
-                            .commit_structural_bind(structural, tab_mux_owner_generation);
+                        authority.commit_structural_bind(structural, tab_mux_owner_generation);
                         prepared_counts.commit(&mut windows, &mut workspace_counts);
                         let lifecycle_notification = lifecycle_enqueue.enqueue(
                             PaneLifecycleNotification::Added(pane_id),
@@ -12198,9 +12683,8 @@ impl Mux {
             let _registration = self.pane_registration.lock();
             let candidate_domain_id = self.panes.read().get(&pane_id).and_then(|registered| {
                 (expected.is_none_or(|expected| Arc::ptr_eq(&registered.pane, expected))
-                    && expected_generation.is_none_or(|generation| {
-                        Arc::ptr_eq(&registered.generation, generation)
-                    }))
+                    && expected_generation
+                        .is_none_or(|generation| Arc::ptr_eq(&registered.generation, generation)))
                 .then_some(registered.domain_id)
             });
             let expected_domain = candidate_domain_id
@@ -12220,9 +12704,8 @@ impl Mux {
 
             let registration_matches = panes.get(&pane_id).is_some_and(|registered| {
                 expected.is_none_or(|expected| Arc::ptr_eq(&registered.pane, expected))
-                    && expected_generation.is_none_or(|generation| {
-                        Arc::ptr_eq(&registered.generation, generation)
-                    })
+                    && expected_generation
+                        .is_none_or(|generation| Arc::ptr_eq(&registered.generation, generation))
             });
             let preparation_matches = expected_generation.is_none()
                 && preparations.get(&pane_id).is_some_and(|preparing| {
@@ -12246,9 +12729,7 @@ impl Mux {
                     .map_err(|error| anyhow!("reserve pane {pane_id} retirement fence: {error}"))?;
             }
 
-            let Some(registered) = registration_matches
-                .then(|| panes.get(&pane_id))
-                .flatten()
+            let Some(registered) = registration_matches.then(|| panes.get(&pane_id)).flatten()
             else {
                 if preparation_matches {
                     preparations
@@ -12257,13 +12738,7 @@ impl Mux {
                         .cancelled = true;
                 }
                 let cleanup_only_fence_owned = retiring.insert(pane_id);
-                return Ok((
-                    None,
-                    None,
-                    true,
-                    cleanup_only_fence_owned,
-                    None,
-                ));
+                return Ok((None, None, true, cleanup_only_fence_owned, None));
             };
 
             anyhow::ensure!(
@@ -12324,13 +12799,7 @@ impl Mux {
                 generation,
                 lifecycle_notification,
             };
-            Ok((
-                Some(removed),
-                Some(removed_live),
-                true,
-                false,
-                output_batch,
-            ))
+            Ok((Some(removed), Some(removed_live), true, false, output_batch))
         })();
         let (removed, removed_live, needs_cleanup, cleanup_only_fence_owned, output_batch) =
             match transaction {
@@ -12393,14 +12862,11 @@ impl Mux {
             let mut seen_current_ids = HashSet::<PaneId>::new();
             let mut prepared = Vec::<PreparedCandidate>::new();
             let mut lifecycle_ids = Vec::<PaneId>::new();
-            let mut lifecycle_notifications =
-                Vec::<PreparedPaneLifecycleBatchNotification>::new();
+            let mut lifecycle_notifications = Vec::<PreparedPaneLifecycleBatchNotification>::new();
             let mut committed = Vec::<PaneBatchRetirementCandidate>::new();
             let mut removed_live = Vec::<LivePaneRegistration>::new();
-            let mut removed = Vec::<(
-                RemovedPaneRegistration,
-                PaneRegistrationOperationLease,
-            )>::new();
+            let mut removed =
+                Vec::<(RemovedPaneRegistration, PaneRegistrationOperationLease)>::new();
             let mut output_batches = Vec::<Arc<PaneOutputBatch>>::new();
             let mut removed_ids = HashSet::<PaneId>::new();
             for allocation in [
@@ -12486,16 +12952,13 @@ impl Mux {
                     !preparations.contains_key(&pane_id),
                     "live pane {pane_id} also owns an in-flight preparation"
                 );
-                let registered = panes.get(&pane_id).ok_or_else(|| {
-                    anyhow!("pane {pane_id} retired before batch commit")
-                })?;
+                let registered = panes
+                    .get(&pane_id)
+                    .ok_or_else(|| anyhow!("pane {pane_id} retired before batch commit"))?;
                 anyhow::ensure!(
                     registered.domain_id == current.domain_id
                         && Arc::ptr_eq(&registered.pane, &current.candidate.pane)
-                        && Arc::ptr_eq(
-                            &registered.generation,
-                            &current.candidate.generation
-                        ),
+                        && Arc::ptr_eq(&registered.generation, &current.candidate.generation),
                     "pane {pane_id} changed exact generation before batch commit"
                 );
                 let registration = PaneRegistrationHandle::new(
@@ -12768,19 +13231,17 @@ impl Mux {
                 }
             };
             let result = tab.with_pane_snapshot_for_retirement(self, |pane_snapshot| {
-                let pane_candidates = match authority
-                    .prepare_tab_structural_removal(&tab, &pane_snapshot)
-                {
-                    Ok(candidates) => candidates,
-                    Err(error) => {
-                        log::error!(
-                            "refusing tab retirement before structural-index commit: {error:#}"
-                        );
-                        return None;
-                    }
-                };
-                let prepared_retirement = match self
-                    .prepare_tab_pane_candidates_for_removal_locked(
+                let pane_candidates =
+                    match authority.prepare_tab_structural_removal(&tab, &pane_snapshot) {
+                        Ok(candidates) => candidates,
+                        Err(error) => {
+                            log::error!(
+                                "refusing tab retirement before structural-index commit: {error:#}"
+                            );
+                            return None;
+                        }
+                    };
+                let prepared_retirement = match self.prepare_tab_pane_candidates_for_removal_locked(
                     &authority,
                     std::slice::from_ref(&pane_candidates),
                 ) {
@@ -12818,6 +13279,7 @@ impl Mux {
                         Vec::new(),
                         Vec::new(),
                         removed_windows,
+                        false,
                         revision_count,
                         commit,
                     )
@@ -12864,14 +13326,14 @@ impl Mux {
         authority: &PaneAuthorityIndex,
         pane_candidate_batches: &[Vec<(PaneId, Arc<dyn Pane>)>],
     ) -> anyhow::Result<PreparedTabPaneRetirement<'a>> {
-        let candidate_count = pane_candidate_batches.iter().try_fold(
-            0usize,
-            |count, candidates| {
-                count
-                    .checked_add(candidates.len())
-                    .ok_or_else(|| anyhow!("tab pane retirement candidate count overflow"))
-            },
-        )?;
+        let candidate_count =
+            pane_candidate_batches
+                .iter()
+                .try_fold(0usize, |count, candidates| {
+                    count
+                        .checked_add(candidates.len())
+                        .ok_or_else(|| anyhow!("tab pane retirement candidate count overflow"))
+                })?;
 
         let mut live = Vec::new();
         let mut preparation_cancellations = Vec::new();
@@ -12885,9 +13347,8 @@ impl Mux {
             lifecycle_notifications.try_reserve_exact(candidate_count),
             removed_live.try_reserve_exact(candidate_count),
         ] {
-            allocation.map_err(|error| {
-                anyhow!("reserve exact tab pane retirement storage: {error}")
-            })?;
+            allocation
+                .map_err(|error| anyhow!("reserve exact tab pane retirement storage: {error}"))?;
         }
 
         let mut removed_ids = HashSet::new();
@@ -12930,9 +13391,12 @@ impl Mux {
                     seen_ids.insert(*pane_id),
                     "pane {pane_id} appears more than once in one tab retirement transaction"
                 );
-                let owner = authority.structural_by_pane_id.get(pane_id).ok_or_else(|| {
-                    anyhow!("pane {pane_id} lacks prepared structural retirement authority")
-                })?;
+                let owner = authority
+                    .structural_by_pane_id
+                    .get(pane_id)
+                    .ok_or_else(|| {
+                        anyhow!("pane {pane_id} lacks prepared structural retirement authority")
+                    })?;
                 anyhow::ensure!(
                     owner.matches_pane(expected),
                     "pane {pane_id} structural retirement names another exact allocation"
@@ -13018,9 +13482,7 @@ impl Mux {
         anyhow::ensure!(
             seen_ids.iter().all(|pane_id| {
                 !retiring.contains(pane_id)
-                    && !self
-                        .pane_retirements
-                        .has_in_flight_retirement(*pane_id)
+                    && !self.pane_retirements.has_in_flight_retirement(*pane_id)
             }),
             "a tab pane already owns a retirement fence"
         );
@@ -13088,10 +13550,7 @@ impl Mux {
     ) -> anyhow::Result<Option<WindowId>> {
         let mut parent = None;
         for (window_id, window) in windows {
-            if !window
-                .iter()
-                .any(|candidate| Arc::ptr_eq(candidate, tab))
-            {
+            if !window.iter().any(|candidate| Arc::ptr_eq(candidate, tab)) {
                 continue;
             }
             anyhow::ensure!(
@@ -13120,8 +13579,10 @@ impl Mux {
         Vec<WindowPaneCountDelta>,
     )> {
         #[cfg(test)]
-        self.validate_tab_parent_index_matches_windows_locked(windows)
-            .with_context(|| format!("validate tab-parent index before {operation}"))?;
+        if !allow_same_id_successor {
+            self.validate_tab_parent_index_matches_windows_locked(windows)
+                .with_context(|| format!("validate tab-parent index before {operation}"))?;
+        }
 
         let parents = self.tab_parents.read();
         let mut removals_by_window: HashMap<WindowId, (HashSet<usize>, usize)> = HashMap::new();
@@ -13137,7 +13598,12 @@ impl Mux {
                 );
                 continue;
             };
-            if !parent.is_same_tab(tab) {
+            let exact_parent = if allow_same_id_successor {
+                parent.is_same_tab_allocation(tab)
+            } else {
+                parent.is_same_tab(tab)
+            };
+            if !exact_parent {
                 anyhow::ensure!(
                     allow_same_id_successor,
                     "{operation}: tab {} parent index names a different exact generation",
@@ -13196,11 +13662,7 @@ impl Mux {
                 .with_context(|| format!("prepare {operation} in window {window_id}"))?
             {
                 prepared.push((window_id, state));
-                pane_count_deltas.push(WindowPaneCountDelta::new(
-                    window_id,
-                    pane_count,
-                    0,
-                ));
+                pane_count_deltas.push(WindowPaneCountDelta::new(window_id, pane_count, 0));
             } else {
                 anyhow::bail!(
                     "{operation}: indexed exact tab membership is absent from window {window_id}"
@@ -13274,9 +13736,7 @@ impl Mux {
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    log::error!(
-                        "refusing witnessed tab retirement count preparation: {error:#}"
-                    );
+                    log::error!("refusing witnessed tab retirement count preparation: {error:#}");
                     return None;
                 }
             };
@@ -13336,6 +13796,7 @@ impl Mux {
                             Vec::new(),
                             Vec::new(),
                             removed_windows,
+                            false,
                             revision_count,
                             commit,
                         )
@@ -13496,6 +13957,7 @@ impl Mux {
                         Vec::new(),
                         Vec::new(),
                         removed_windows,
+                        false,
                         0,
                         |_| (),
                     )
@@ -13565,14 +14027,15 @@ impl Mux {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let (mut prepared_windows, mut pane_count_deltas) = match self.prepare_exact_tab_detach_locked(
-                &authority,
-                &windows,
-                &retired_tabs,
-                None,
-                false,
-                "window retirement",
-            ) {
+            let (mut prepared_windows, mut pane_count_deltas) = match self
+                .prepare_exact_tab_detach_locked(
+                    &authority,
+                    &windows,
+                    &retired_tabs,
+                    None,
+                    false,
+                    "window retirement",
+                ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     log::error!(
@@ -13683,9 +14146,7 @@ impl Mux {
                     let commit_terminal = |first_revision| {
                         for tab in &retired_tabs {
                             let removed = tabs.remove(&tab.tab_id());
-                            debug_assert!(
-                                removed.is_some_and(|removed| Arc::ptr_eq(&removed, tab))
-                            );
+                            debug_assert!(removed.is_some_and(|removed| Arc::ptr_eq(&removed, tab)));
                         }
                         for (tab, pane_candidates) in
                             retired_tabs.iter().zip(&pane_candidate_batches)
@@ -13718,6 +14179,7 @@ impl Mux {
                             Vec::new(),
                             Vec::new(),
                             removed_windows,
+                            false,
                             revision_count,
                             commit_terminal,
                         )
@@ -14182,14 +14644,31 @@ impl Mux {
                 }
             };
             if !prepared.is_empty() {
-                if let Err(error) = self.commit_prepared_window_states_locked(
-                    &mut windows,
-                    prepared,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    pane_count_deltas,
-                ) {
+                let mut tab_parents = self.tab_parents.write();
+                let mut workspace_counts = self.num_panes_by_workspace.write();
+                let commit_result = self
+                    .prepare_pane_count_mutation_locked(
+                        &windows,
+                        &mut workspace_counts,
+                        &pane_count_deltas,
+                        "stale-parent prune",
+                    )
+                    .and_then(|prepared_counts| {
+                        self.commit_prepared_window_states_with_prepared_authorities_locked(
+                            &mut windows,
+                            &mut tab_parents,
+                            &mut workspace_counts,
+                            prepared_counts,
+                            prepared,
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            true,
+                            0,
+                            |_| (),
+                        )
+                    });
+                if let Err(error) = commit_result {
                     log::error!("refusing stale-parent prune window commit: {error:#}");
                 }
             }
@@ -14296,6 +14775,7 @@ impl Mux {
     ) -> Result<bool, WindowMutationError> {
         self.bind_window_notification_owner();
         let changed = {
+            let registered_tabs = self.tabs.read();
             let mut windows = self.windows.write();
             let window = windows
                 .get(&window_id)
@@ -14306,21 +14786,47 @@ impl Mux {
             if window.get_workspace() == workspace {
                 return Ok(false);
             }
+            let tab_parents = self.tab_parents.read();
+            for tab in window.iter() {
+                if !registered_tabs
+                    .get(&tab.tab_id())
+                    .is_some_and(|registered| Arc::ptr_eq(registered, tab))
+                {
+                    return Err(WindowMutationError::invariant(
+                        window_id,
+                        anyhow!(
+                            "window {window_id} tab {} is not the exact live mux tab generation",
+                            tab.tab_id()
+                        ),
+                    ));
+                }
+                if !tab_parents
+                    .get(&tab.tab_id())
+                    .is_some_and(|parent| parent.matches(tab, window_id))
+                {
+                    return Err(WindowMutationError::invariant(
+                        window_id,
+                        anyhow!(
+                            "window {window_id} tab {} lacks its exact indexed parent",
+                            tab.tab_id()
+                        ),
+                    ));
+                }
+            }
 
             let window_pane_count = window.structural_pane_count();
-            let old_workspace = Self::prepare_owned_text(
-                window.get_workspace(),
-                "prior window state",
-            )
-            .map_err(|source| {
-                WindowMutationError::allocation(window_id, "prior workspace state", source)
-            })?;
-            let workspace_state = Self::prepare_owned_text(workspace, "window state")
-                .map_err(|source| {
+            let old_workspace =
+                Self::prepare_owned_text(window.get_workspace(), "prior window state").map_err(
+                    |source| {
+                        WindowMutationError::allocation(window_id, "prior workspace state", source)
+                    },
+                )?;
+            let workspace_state =
+                Self::prepare_owned_text(workspace, "window state").map_err(|source| {
                     WindowMutationError::allocation(window_id, "workspace state", source)
                 })?;
-            let workspace_event = Self::prepare_owned_text(workspace, "window event")
-                .map_err(|source| {
+            let workspace_event =
+                Self::prepare_owned_text(workspace, "window event").map_err(|source| {
                     WindowMutationError::allocation(window_id, "workspace event", source)
                 })?;
 
@@ -14335,9 +14841,7 @@ impl Mux {
                     .ok_or_else(|| {
                         WindowMutationError::invariant(
                             window_id,
-                            anyhow!(
-                                "workspace {old_workspace} lacks its nonzero pane-count entry"
-                            ),
+                            anyhow!("workspace {old_workspace} lacks its nonzero pane-count entry"),
                         )
                     })?;
                 if old_count < window_pane_count {
@@ -14369,17 +14873,17 @@ impl Mux {
                             error,
                         )
                     })?;
-                    workspace_count_key = Some(Self::prepare_owned_text(
-                        workspace,
-                        "window pane-count key",
-                    )
-                    .map_err(|source| {
-                        WindowMutationError::allocation(
-                            window_id,
-                            "destination workspace pane-count key",
-                            source,
-                        )
-                    })?);
+                    workspace_count_key = Some(
+                        Self::prepare_owned_text(workspace, "window pane-count key").map_err(
+                            |source| {
+                                WindowMutationError::allocation(
+                                    window_id,
+                                    "destination workspace pane-count key",
+                                    source,
+                                )
+                            },
+                        )?,
+                    );
                 }
                 Some((old_count, next_old_count, new_count, next_new_count))
             };
@@ -14392,18 +14896,12 @@ impl Mux {
                     anyhow!("window workspace transaction requires the exact notification owner"),
                 ));
             }
-            pending
-                .queue
-                .try_reserve(1)
-                .map_err(|source| {
-                    WindowMutationError::allocation(window_id, "workspace delivery", source)
-                })?;
+            pending.queue.try_reserve(1).map_err(|source| {
+                WindowMutationError::allocation(window_id, "workspace delivery", source)
+            })?;
             let revision = topology
                 .reserve_revision()
-                .map_err(|source| WindowMutationError::RevisionExhausted {
-                    window_id,
-                    source,
-                })?;
+                .map_err(|source| WindowMutationError::RevisionExhausted { window_id, source })?;
 
             let window = windows
                 .get_mut(&window_id)
@@ -14470,12 +14968,12 @@ impl Mux {
                 return Ok(false);
             }
 
-            let title_state = Self::prepare_owned_text(title, "window title state")
-                .map_err(|source| {
+            let title_state =
+                Self::prepare_owned_text(title, "window title state").map_err(|source| {
                     WindowMutationError::allocation(window_id, "title state", source)
                 })?;
-            let title_event = Self::prepare_owned_text(title, "window title event")
-                .map_err(|source| {
+            let title_event =
+                Self::prepare_owned_text(title, "window title event").map_err(|source| {
                     WindowMutationError::allocation(window_id, "title event", source)
                 })?;
             let mut topology = self.topology.lock();
@@ -14486,18 +14984,12 @@ impl Mux {
                     anyhow!("window title transaction requires the exact notification owner"),
                 ));
             }
-            pending
-                .queue
-                .try_reserve(1)
-                .map_err(|source| {
-                    WindowMutationError::allocation(window_id, "title delivery", source)
-                })?;
+            pending.queue.try_reserve(1).map_err(|source| {
+                WindowMutationError::allocation(window_id, "title delivery", source)
+            })?;
             let revision = topology
                 .reserve_revision()
-                .map_err(|source| WindowMutationError::RevisionExhausted {
-                    window_id,
-                    source,
-                })?;
+                .map_err(|source| WindowMutationError::RevisionExhausted { window_id, source })?;
 
             let window = windows
                 .get_mut(&window_id)
@@ -14905,11 +15397,7 @@ impl Mux {
                 attached_tabs,
                 created_windows,
                 Vec::new(),
-                vec![WindowPaneCountDelta::new(
-                    window_id,
-                    0,
-                    tab_pane_count,
-                )],
+                vec![WindowPaneCountDelta::new(window_id, 0, tab_pane_count)],
             )?;
         }
         self.flush_window_notifications();
@@ -15264,9 +15752,7 @@ impl Mux {
         self.pane_authority_lookup_probes
             .fetch_add(1, Ordering::Relaxed);
         self.indexed_pane_location(pane_id, None, None)
-            .map(|(domain_id, window_id, tab, _lane)| {
-                (domain_id, window_id, tab.tab_id())
-            })
+            .map(|(domain_id, window_id, tab, _lane)| (domain_id, window_id, tab.tab_id()))
     }
 
     fn indexed_pane_location(
@@ -15282,9 +15768,7 @@ impl Mux {
         let authority = self.pane_authority.lock();
         let entry = authority.structural_by_pane_id.get(&pane_id).cloned()?;
         let registration = entry.registration.as_ref()?;
-        if expected_registration.is_some_and(|expected| {
-            !expected.same_registration(registration)
-        }) {
+        if expected_registration.is_some_and(|expected| !expected.same_registration(registration)) {
             return None;
         }
         let _operation = registration.cached_location_lease_for_owner(self)?;
@@ -15377,11 +15861,7 @@ impl Mux {
         let _domain_registration = self.domain_registration.lock();
         let _pane_registration = self.pane_registration.lock();
 
-        if self
-            .retired_domain_ids
-            .lock()
-            .contains(&admitted_domain_id)
-        {
+        if self.retired_domain_ids.lock().contains(&admitted_domain_id) {
             return None;
         }
         let current_domain = self
@@ -15391,8 +15871,7 @@ impl Mux {
             .cloned();
         let domain_is_current = match (operation.admitted_domain(), current_domain.as_ref()) {
             (Some(expected), Some(current)) => {
-                Weak::ptr_eq(expected, &Arc::downgrade(current))
-                    && !current.generation.is_retired()
+                Weak::ptr_eq(expected, &Arc::downgrade(current)) && !current.generation.is_retired()
             }
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
@@ -15455,7 +15934,9 @@ impl Mux {
                     .get(&admitted_domain_id)
                     .is_none_or(|registrations| {
                         registrations.matches_domain(
-                            current_domain.as_ref().map(|registration| &registration.domain),
+                            current_domain
+                                .as_ref()
+                                .map(|registration| &registration.domain),
                         )
                     });
                 if entry.registration.is_some()
@@ -15495,22 +15976,13 @@ impl Mux {
             return None;
         }
 
-        Some((
-            admitted_domain_id,
-            window_id,
-            tab,
-            entry.lane,
-        ))
+        Some((admitted_domain_id, window_id, tab, entry.lane))
     }
 
     pub fn domain_was_detached(self: &Arc<Self>, domain: DomainId) {
         let expected = {
             let _registration = self.domain_registration.lock();
-            let registration = self
-                .domain_registrations
-                .read()
-                .get(&domain)
-                .cloned();
+            let registration = self.domain_registrations.read().get(&domain).cloned();
             registration
                 .filter(|registration| self.domain_registration_is_current_locked(registration))
                 .map(|registration| Arc::clone(&registration.domain))
@@ -15523,10 +15995,7 @@ impl Mux {
 
     /// Retire the exact domain generation held by an admitted operation.
     /// The supplied guard remains an in-flight lease until its caller drops it.
-    pub fn domain_was_detached_if_guard(
-        self: &Arc<Self>,
-        expected: &DomainOperationGuard,
-    ) -> bool {
+    pub fn domain_was_detached_if_guard(self: &Arc<Self>, expected: &DomainOperationGuard) -> bool {
         if !Arc::ptr_eq(&self.domain_owner_identity, &expected.owner_identity) {
             return false;
         }
@@ -15538,19 +16007,11 @@ impl Mux {
     /// Logical retirement closes operation admission immediately. Destructive
     /// indexed cleanup begins only after every operation admitted against this
     /// exact generation has dropped its non-cloneable guard.
-    pub fn domain_was_detached_if_same(
-        self: &Arc<Self>,
-        expected: &Arc<dyn Domain>,
-    ) -> bool {
+    pub fn domain_was_detached_if_same(self: &Arc<Self>, expected: &Arc<dyn Domain>) -> bool {
         let domain = expected.domain_id();
         let (cleanup_ready, worker_started, replaced_default_registration) = {
             let _registration = self.domain_registration.lock();
-            let Some(registration) = self
-                .domain_registrations
-                .read()
-                .get(&domain)
-                .cloned()
-            else {
+            let Some(registration) = self.domain_registrations.read().get(&domain).cloned() else {
                 return false;
             };
             if !registration.matches_domain(expected)
@@ -15606,9 +16067,7 @@ impl Mux {
             let mut pending = self.pending_domain_retirements.lock();
             if let Err(error) = pending.registrations.try_reserve(1) {
                 self.domain_retirements.finish(&registration.generation);
-                log::error!(
-                    "cannot reserve deferred cleanup queue for domain {domain}: {error}"
-                );
+                log::error!("cannot reserve deferred cleanup queue for domain {domain}: {error}");
                 return false;
             }
             pending.registrations.push_back(PendingDomainRetirement {
@@ -15621,9 +16080,9 @@ impl Mux {
                 pending.worker_running = true;
                 if let Err(error) = self.spawn_domain_retirement_worker() {
                     pending.worker_running = false;
-                    pending.registrations.retain(|current| {
-                        !Arc::ptr_eq(&current.registration, &registration)
-                    });
+                    pending
+                        .registrations
+                        .retain(|current| !Arc::ptr_eq(&current.registration, &registration));
                     drop(pending);
                     drop(retired_ids);
                     self.domain_retirements.finish(&registration.generation);
@@ -15637,9 +16096,9 @@ impl Mux {
             retired_ids.insert(domain);
             let (began_retirement, cleanup_ready) = registration.generation.retire();
             if !began_retirement {
-                pending.registrations.retain(|current| {
-                    !Arc::ptr_eq(&current.registration, &registration)
-                });
+                pending
+                    .registrations
+                    .retain(|current| !Arc::ptr_eq(&current.registration, &registration));
                 retired_ids.remove(&domain);
                 self.domain_retirements.finish(&registration.generation);
                 return false;
@@ -15671,11 +16130,7 @@ impl Mux {
             } else {
                 None
             };
-            (
-                cleanup_ready,
-                worker_started,
-                replaced_default_registration,
-            )
+            (cleanup_ready, worker_started, replaced_default_registration)
         };
 
         // A registration owns external Domain state. Dispose the displaced
@@ -15738,9 +16193,7 @@ impl Mux {
         loop {
             if catch_recoverable(
                 RecoverablePanicSite::MuxPaneRetirement,
-                std::panic::AssertUnwindSafe(|| {
-                    self.run_domain_retirement_worker_until_stable()
-                }),
+                std::panic::AssertUnwindSafe(|| self.run_domain_retirement_worker_until_stable()),
             )
             .is_ok()
             {
@@ -15785,10 +16238,7 @@ impl Mux {
                         }
                         DomainRetirementDisposition::AwaitingPaneCleanup(markers) => {
                             has_actionable = true;
-                            if markers
-                                .iter()
-                                .all(|marker| marker.load(Ordering::Acquire))
-                            {
+                            if markers.iter().all(|marker| marker.load(Ordering::Acquire)) {
                                 ready = Some((Arc::clone(&retirement.registration), true));
                                 break;
                             }
@@ -15824,7 +16274,11 @@ impl Mux {
                 // separate callback surface, so those records also receive a
                 // bounded poll rather than depending on an unrelated signal.
                 let mut gate = self.domain_retirement_wakeup.gate.lock();
-                if self.domain_retirement_wakeup.pending.swap(false, Ordering::AcqRel) {
+                if self
+                    .domain_retirement_wakeup
+                    .pending
+                    .swap(false, Ordering::AcqRel)
+                {
                     continue;
                 }
                 if awaiting_pane_cleanup {
@@ -15859,9 +16313,7 @@ impl Mux {
                     let removed = pending
                         .registrations
                         .iter()
-                        .position(|current| {
-                            Arc::ptr_eq(&current.registration, &registration)
-                        })
+                        .position(|current| Arc::ptr_eq(&current.registration, &registration))
                         .and_then(|index| pending.registrations.remove(index));
                     drop(pending);
 
@@ -15898,9 +16350,11 @@ impl Mux {
                 }
                 DomainRetirementFinalization::AwaitingPaneCleanup(markers) => {
                     let mut pending = self.pending_domain_retirements.lock();
-                    if let Some(current) = pending.registrations.iter_mut().find(|current| {
-                        Arc::ptr_eq(&current.registration, &registration)
-                    }) {
+                    if let Some(current) = pending
+                        .registrations
+                        .iter_mut()
+                        .find(|current| Arc::ptr_eq(&current.registration, &registration))
+                    {
                         current.disposition =
                             DomainRetirementDisposition::AwaitingPaneCleanup(markers);
                     } else {
@@ -15919,7 +16373,11 @@ impl Mux {
                         registration.domain_id
                     );
                     let mut gate = self.domain_retirement_wakeup.gate.lock();
-                    if !self.domain_retirement_wakeup.pending.swap(false, Ordering::AcqRel) {
+                    if !self
+                        .domain_retirement_wakeup
+                        .pending
+                        .swap(false, Ordering::AcqRel)
+                    {
                         self.domain_retirement_wakeup
                             .ready
                             .wait_for(&mut gate, DOMAIN_RETIREMENT_RETRY_DELAY);
@@ -15927,11 +16385,12 @@ impl Mux {
                 }
                 DomainRetirementFinalization::Quarantine(reason) => {
                     let mut pending = self.pending_domain_retirements.lock();
-                    if let Some(current) = pending.registrations.iter_mut().find(|current| {
-                        Arc::ptr_eq(&current.registration, &registration)
-                    }) {
-                        current.disposition =
-                            DomainRetirementDisposition::Quarantined(reason);
+                    if let Some(current) = pending
+                        .registrations
+                        .iter_mut()
+                        .find(|current| Arc::ptr_eq(&current.registration, &registration))
+                    {
+                        current.disposition = DomainRetirementDisposition::Quarantined(reason);
                     }
                     log::error!(
                         "quarantined retired domain {} generation after terminal cleanup failure: {reason}",
@@ -15988,17 +16447,22 @@ impl Mux {
             let _pane_registration = self.pane_registration.lock();
             let authority = self.pane_authority.lock();
             let panes = self.panes.read();
-            let live_domain_pane_count = panes
-                .values()
-                .filter(|current| current.domain_id == domain)
-                .count();
+            let live_domain_pane_count = authority
+                .live_registration_counts_by_domain
+                .get(&domain)
+                .copied()
+                .unwrap_or(0);
             if let Some(indexed) = authority.registrations_by_domain.get(&domain) {
                 if indexed.pane_registrations.is_empty() {
                     return DomainRetirementFinalization::Quarantine(
                         "pane directory retains an empty domain bucket",
                     );
                 }
-                if indexed.pane_registrations.len() != live_domain_pane_count {
+                if !authority
+                    .live_registration_counts_by_domain
+                    .contains_key(&domain)
+                    || indexed.pane_registrations.len() != live_domain_pane_count
+                {
                     return DomainRetirementFinalization::Quarantine(
                         "live pane and domain-directory cardinalities differ",
                     );
@@ -16012,22 +16476,6 @@ impl Mux {
                     return DomainRetirementFinalization::Quarantine(
                         "pane directory names another exact domain allocation",
                     );
-                }
-                for (pane_id, current) in panes
-                    .iter()
-                    .filter(|(_, current)| current.domain_id == domain)
-                {
-                    if !indexed
-                        .pane_registrations
-                        .get(pane_id)
-                        .is_some_and(|expected| {
-                            expected.matches_live_registration(current)
-                        })
-                    {
-                        return DomainRetirementFinalization::Quarantine(
-                            "live domain pane is absent or changed in its authority directory",
-                        );
-                    }
                 }
                 #[cfg(test)]
                 if self
@@ -16045,65 +16493,52 @@ impl Mux {
                     log::error!(
                         "cannot reserve indexed pane snapshot for retired domain {domain}: {error}"
                     );
-                    return DomainRetirementFinalization::Retry(
-                        "reserve indexed pane snapshot",
-                    );
+                    return DomainRetirementFinalization::Retry("reserve indexed pane snapshot");
                 }
                 let mut tabs = Vec::new();
                 if let Err(error) = tabs.try_reserve_exact(pane_count) {
                     log::error!(
                         "cannot reserve indexed tab snapshot for retired domain {domain}: {error}"
                     );
-                    return DomainRetirementFinalization::Retry(
-                        "reserve indexed tab snapshot",
-                    );
+                    return DomainRetirementFinalization::Retry("reserve indexed tab snapshot");
                 }
                 let mut tab_identities = HashSet::new();
                 if let Err(error) = tab_identities.try_reserve(pane_count) {
                     log::error!(
                         "cannot reserve indexed tab identity set for retired domain {domain}: {error}"
                     );
-                    return DomainRetirementFinalization::Retry(
-                        "reserve indexed tab identity set",
-                    );
+                    return DomainRetirementFinalization::Retry("reserve indexed tab identity set");
                 }
                 let mut dead_pane_registrations = Vec::new();
                 if let Err(error) = dead_pane_registrations.try_reserve_exact(pane_count) {
                     log::error!(
                         "cannot reserve exact pane registrations for retired domain {domain}: {error}"
                     );
-                    return DomainRetirementFinalization::Retry(
-                        "reserve exact pane registrations",
-                    );
+                    return DomainRetirementFinalization::Retry("reserve exact pane registrations");
                 }
                 let mut dead_pane_ids = Vec::new();
                 if let Err(error) = dead_pane_ids.try_reserve_exact(pane_count) {
-                    log::error!(
-                        "cannot reserve pane IDs for retired domain {domain}: {error}"
-                    );
-                    return DomainRetirementFinalization::Retry(
-                        "reserve retired pane IDs",
-                    );
+                    log::error!("cannot reserve pane IDs for retired domain {domain}: {error}");
+                    return DomainRetirementFinalization::Retry("reserve retired pane IDs");
                 }
                 let mut pane_cleanup_markers = Vec::new();
                 if let Err(error) = pane_cleanup_markers.try_reserve_exact(pane_count) {
                     log::error!(
                         "cannot reserve pane cleanup markers for retired domain {domain}: {error}"
                     );
-                    return DomainRetirementFinalization::Retry(
-                        "reserve pane cleanup markers",
-                    );
+                    return DomainRetirementFinalization::Retry("reserve pane cleanup markers");
                 }
                 let mut pending_structural_registrations = Vec::new();
                 if let Err(error) = pending_structural_registrations.try_reserve_exact(pane_count) {
                     log::error!(
                         "cannot reserve structural pane receipts for retired domain {domain}: {error}"
                     );
-                    return DomainRetirementFinalization::Retry(
-                        "reserve structural pane receipts",
-                    );
+                    return DomainRetirementFinalization::Retry("reserve structural pane receipts");
                 }
                 for (pane_id, expected_registration) in &indexed.pane_registrations {
+                    #[cfg(test)]
+                    self.domain_retirement_pane_registry_probes
+                        .fetch_add(1, Ordering::Relaxed);
                     let Some(current) = panes.get(pane_id) else {
                         return DomainRetirementFinalization::Quarantine(
                             "indexed pane is absent from the live registry",
@@ -16151,7 +16586,11 @@ impl Mux {
                     pending_structural_registrations,
                 )
             } else {
-                if live_domain_pane_count != 0 {
+                if live_domain_pane_count != 0
+                    || authority
+                        .live_registration_counts_by_domain
+                        .contains_key(&domain)
+                {
                     return DomainRetirementFinalization::Quarantine(
                         "live domain panes have no authority directory",
                     );
@@ -16375,14 +16814,17 @@ impl Mux {
         published: std::sync::mpsc::SyncSender<()>,
         permit_return: std::sync::mpsc::Receiver<()>,
     ) {
-        let prior = self
-            .domain_add_publication_barrier
-            .lock()
-            .replace(DomainAddPublicationBarrier {
-                published,
-                permit_return,
-            });
-        assert!(prior.is_none(), "domain add publication barrier already installed");
+        let prior =
+            self.domain_add_publication_barrier
+                .lock()
+                .replace(DomainAddPublicationBarrier {
+                    published,
+                    permit_return,
+                });
+        assert!(
+            prior.is_none(),
+            "domain add publication barrier already installed"
+        );
     }
 
     #[cfg(test)]
@@ -16450,11 +16892,7 @@ impl Mux {
                 .cloned()
                 .ok_or_else(|| anyhow!("domain id {domain_id} is invalid"))?,
             SpawnTabDomain::DomainName(name) => {
-                let registration = self
-                    .domain_registrations_by_name
-                    .read()
-                    .get(name)
-                    .cloned();
+                let registration = self.domain_registrations_by_name.read().get(name).cloned();
                 registration.ok_or_else(|| {
                     let names: Vec<String> = self
                         .domain_registrations_by_name
@@ -16860,10 +17298,7 @@ impl Mux {
         }
         let (domain_id, _src_window, _src_tab) = target.exact_location()?;
         let domain = self
-            .resolve_spawn_tab_domain_for_operation(
-                &target,
-                &SpawnTabDomain::CurrentPaneDomain,
-            )
+            .resolve_spawn_tab_domain_for_operation(&target, &SpawnTabDomain::CurrentPaneDomain)
             .context("resolve exact move domain")?;
         anyhow::ensure!(
             domain.domain_id() == domain_id,
@@ -16894,24 +17329,16 @@ impl Mux {
                 .ok_or_else(|| anyhow!("window {window_id} has no tabs"))?;
             (window_id, active_tab.get_size())
         } else {
-            let workspace = workspace_for_new_window
-                .unwrap_or_else(|| self.active_workspace());
-            let window = Window::new_for_owner(
-                Some(workspace),
-                None,
-                Arc::downgrade(self),
-            );
+            let workspace = workspace_for_new_window.unwrap_or_else(|| self.active_workspace());
+            let window = Window::new_for_owner(Some(workspace), None, Arc::downgrade(self));
             let window_id = window.window_id();
             let size = source_tab.get_size();
             unpublished_window = Some(window);
             (window_id, size)
         };
 
-        let mut prepared = source_tab.prepare_guarded_move_to_new_tab(
-            self,
-            &target,
-            destination_size,
-        )?;
+        let mut prepared =
+            source_tab.prepare_guarded_move_to_new_tab(self, &target, destination_size)?;
         if unpublished_window.is_some() {
             anyhow::ensure!(
                 prepared.source_size_at_preparation() == destination_size,
@@ -16925,7 +17352,11 @@ impl Mux {
         let mut authority_replacements = prepared.take_authority_replacements()?;
         let mut pane_count_deltas = Vec::new();
         pane_count_deltas
-            .try_reserve_exact(if source_window_id == destination_window_id { 1 } else { 2 })
+            .try_reserve_exact(if source_window_id == destination_window_id {
+                1
+            } else {
+                2
+            })
             .map_err(|error| anyhow!("reserve move-to-new-tab pane-count deltas: {error}"))?;
         if source_window_id == destination_window_id {
             pane_count_deltas.push(WindowPaneCountDelta::identity(source_window_id));
@@ -16969,22 +17400,19 @@ impl Mux {
             let mut windows = self.windows.write();
             {
                 let parents = self.tab_parents.read();
-                let source_parent = parents.get(&source_tab.tab_id()).ok_or_else(|| {
-                    anyhow!("move source tab lost its indexed window parent")
-                })?;
+                let source_parent = parents
+                    .get(&source_tab.tab_id())
+                    .ok_or_else(|| anyhow!("move source tab lost its indexed window parent"))?;
                 anyhow::ensure!(
                     source_parent.matches(&source_tab, source_window_id)
                         && windows.get(&source_window_id).is_some_and(|window| {
-                            window
-                                .iter()
-                                .any(|tab| Arc::ptr_eq(tab, &source_tab))
+                            window.iter().any(|tab| Arc::ptr_eq(tab, &source_tab))
                         }),
                     "move source tab changed exact window parent before commit"
                 );
             }
             anyhow::ensure!(
-                unpublished_window.is_some()
-                    || windows.contains_key(&destination_window_id),
+                unpublished_window.is_some() || windows.contains_key(&destination_window_id),
                 "move destination window {destination_window_id} left the mux before commit"
             );
             if unpublished_window.is_some() {
@@ -17016,14 +17444,15 @@ impl Mux {
                         .expect("unpublished destination retained its prepared state"),
                 ));
                 if source_tab_retires {
-                    let (source_states, detach_count_deltas) = self.prepare_exact_tab_detach_locked(
-                        &authority,
-                        &windows,
-                        std::slice::from_ref(&source_tab),
-                        None,
-                        false,
-                        "guarded move-to-new-tab source retirement",
-                    )?;
+                    let (source_states, detach_count_deltas) = self
+                        .prepare_exact_tab_detach_locked(
+                            &authority,
+                            &windows,
+                            std::slice::from_ref(&source_tab),
+                            None,
+                            false,
+                            "guarded move-to-new-tab source retirement",
+                        )?;
                     anyhow::ensure!(
                         detach_count_deltas.iter().any(|delta| {
                             delta.window_id == source_window_id && delta.removals == 1
@@ -17063,9 +17492,9 @@ impl Mux {
                                 "exact move source tab left window {source_window_id} before insertion"
                             )
                         })?;
-                    let destination_index = source_index.checked_add(1).ok_or_else(|| {
-                        anyhow!("move destination tab index overflow")
-                    })?;
+                    let destination_index = source_index
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("move destination tab index overflow"))?;
                     window.prepare_insert(destination_index, &destination_tab)?
                 };
                 prepared_windows.push((source_window_id, state));
@@ -17078,14 +17507,15 @@ impl Mux {
                     destination.prepare_insert(destination.len(), &destination_tab)?,
                 ));
                 if source_tab_retires {
-                    let (source_states, detach_count_deltas) = self.prepare_exact_tab_detach_locked(
-                        &authority,
-                        &windows,
-                        std::slice::from_ref(&source_tab),
-                        None,
-                        false,
-                        "guarded cross-window move source retirement",
-                    )?;
+                    let (source_states, detach_count_deltas) = self
+                        .prepare_exact_tab_detach_locked(
+                            &authority,
+                            &windows,
+                            std::slice::from_ref(&source_tab),
+                            None,
+                            false,
+                            "guarded cross-window move source retirement",
+                        )?;
                     anyhow::ensure!(
                         detach_count_deltas.iter().any(|delta| {
                             delta.window_id == source_window_id && delta.removals == 1
@@ -17128,15 +17558,13 @@ impl Mux {
             };
             let commit_result = (|| -> anyhow::Result<_> {
                 let mut tab_parents = self.tab_parents.write();
-                let source_parent = tab_parents.get(&source_tab.tab_id()).ok_or_else(|| {
-                    anyhow!("move source tab lost its indexed window parent")
-                })?;
+                let source_parent = tab_parents
+                    .get(&source_tab.tab_id())
+                    .ok_or_else(|| anyhow!("move source tab lost its indexed window parent"))?;
                 anyhow::ensure!(
                     source_parent.matches(&source_tab, source_window_id)
                         && windows.get(&source_window_id).is_some_and(|window| {
-                            window
-                                .iter()
-                                .any(|tab| Arc::ptr_eq(tab, &source_tab))
+                            window.iter().any(|tab| Arc::ptr_eq(tab, &source_tab))
                         }),
                     "move source tab changed exact window parent before final commit"
                 );
@@ -17148,11 +17576,7 @@ impl Mux {
                     "guarded move to new tab",
                 )?;
 
-                let tab_locks = prepared.lock_for_commit(
-                    self,
-                    &source_tab,
-                    &destination_tab,
-                )?;
+                let tab_locks = prepared.lock_for_commit(self, &source_tab, &destination_tab)?;
                 {
                     let panes = self.panes.read();
                     for replacement in &mut authority_replacements {
@@ -17193,6 +17617,7 @@ impl Mux {
                     attached_tabs,
                     created_windows,
                     removed_windows,
+                    false,
                     trailing_revision_count,
                     |first_revision| {
                         // Remove the source's exact authority while its tab
@@ -17432,6 +17857,7 @@ mod tests {
         domains_by_name: (usize, usize),
         registrations: (usize, usize),
         registrations_by_name: (usize, usize),
+        domain_registration_counts: (usize, usize, Vec<(DomainId, usize)>),
         topology_revision: TopologyRevision,
         topology_exhausted: bool,
         pane_authority_generation: u64,
@@ -17454,6 +17880,20 @@ mod tests {
             let registrations = mux.domain_registrations_by_name.read();
             (registrations.len(), registrations.capacity())
         };
+        let domain_registration_counts = {
+            let authority = mux.pane_authority.lock();
+            let mut counts = authority
+                .live_registration_counts_by_domain
+                .iter()
+                .map(|(domain_id, count)| (*domain_id, *count))
+                .collect::<Vec<_>>();
+            counts.sort_unstable_by_key(|(domain_id, _)| *domain_id);
+            (
+                authority.live_registration_counts_by_domain.len(),
+                authority.live_registration_counts_by_domain.capacity(),
+                counts,
+            )
+        };
         let (topology_revision, topology_exhausted) = {
             let topology = mux.topology.lock();
             (topology.revision, topology.exhausted)
@@ -17464,6 +17904,7 @@ mod tests {
             domains_by_name,
             registrations,
             registrations_by_name,
+            domain_registration_counts,
             topology_revision,
             topology_exhausted,
             pane_authority_generation,
@@ -17478,7 +17919,7 @@ mod tests {
                 "domain {} retirement did not reach terminal cleanup",
                 domain_id
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -17492,13 +17933,14 @@ mod tests {
             while executor
                 .try_tick()
                 .expect("domain retirement test executor must stay on its owner thread")
-            {}
+            {
+            }
             assert!(
                 Instant::now() < deadline,
                 "domain {} retirement did not complete after its main-thread cleanup",
                 domain_id
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
         while executor
             .try_tick()
@@ -17517,7 +17959,7 @@ mod tests {
                 Instant::now() < deadline,
                 "domain retirement worker did not report the injected transient failure"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -17542,32 +17984,7 @@ mod tests {
                 "domain {} retirement did not enter terminal quarantine",
                 domain_id
             );
-            std::thread::yield_now();
-        }
-    }
-
-    fn wait_for_domain_pane_cleanup_barrier(mux: &Mux, domain_id: DomainId) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let pending = mux.pending_domain_retirements.lock();
-            let awaiting = pending.registrations.iter().any(|retirement| {
-                retirement.registration.domain_id == domain_id
-                    && matches!(
-                        &retirement.disposition,
-                        DomainRetirementDisposition::AwaitingPaneCleanup(markers)
-                            if !markers.is_empty()
-                    )
-            });
-            drop(pending);
-            if awaiting {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "domain {} retirement did not reach its pane-cleanup barrier",
-                domain_id
-            );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -17581,7 +17998,7 @@ mod tests {
                 Instant::now() < deadline,
                 "domain retirement worker did not release its running flag"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -18622,10 +19039,18 @@ mod tests {
         );
     }
 
+    fn register_guarded_mutation_test_domain(mux: &Arc<Mux>) -> Arc<dyn Domain> {
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain)
+            .expect("register exact guarded-mutation test domain");
+        domain
+    }
+
     #[test]
     fn pane_count_preparation_allocation_failure_is_zero_mutation() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
+        let _domain = register_guarded_mutation_test_domain(&mux);
         let (root, _root_kills) = KillCountingPane::new(62_101, test_size());
         let (tab, window_id) = register_attached_test_pane(&global_guard, &mux, &root);
         let (inserted, _inserted_kills) = KillCountingPane::new(62_102, test_size());
@@ -18645,10 +19070,14 @@ mod tests {
             .split_and_insert(0, SplitRequest::default(), Arc::clone(&inserted))
             .expect_err("injected count allocation failure must reject the split");
 
-        assert!(format!("{error:#}").contains("injected bound split insertion pane-count allocation failure"));
+        assert!(format!("{error:#}")
+            .contains("injected bound split insertion pane-count allocation failure"));
         assert_eq!(tab.iter_all_panes().len(), 1);
         assert!(Arc::ptr_eq(&tab.iter_all_panes()[0], &root));
-        assert_eq!(mux.topology_snapshot_authority().unwrap().1, before_topology);
+        assert_eq!(
+            mux.topology_snapshot_authority().unwrap().1,
+            before_topology
+        );
         assert_eq!(*mux.num_panes_by_workspace.read(), before_workspace_counts);
         assert_eq!(
             mux.get_window(window_id)
@@ -18667,6 +19096,7 @@ mod tests {
     fn structural_pane_count_authority_tracks_every_writer_family_without_recount() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
+        let _domain = register_guarded_mutation_test_domain(&mux);
         mux.pane_count_recomputes.store(0, Ordering::Relaxed);
         let (root, _root_kills) = KillCountingPane::new(62_201, test_size());
         let (tab, first_window_id) = register_attached_test_pane(&global_guard, &mux, &root);
@@ -18788,12 +19218,11 @@ mod tests {
     fn pane_count_mutation_probes_only_affected_windows() {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
+        let _domain = register_guarded_mutation_test_domain(&mux);
         let (root, _root_kills) = KillCountingPane::new(62_301, test_size());
         let (tab, _window_id) = register_attached_test_pane(&global_guard, &mux, &root);
         let unrelated_windows = (0..128)
-            .map(|index| {
-                mux.new_empty_window(Some(format!("unrelated-{index}")), None)
-            })
+            .map(|index| mux.new_empty_window(Some(format!("unrelated-{index}")), None))
             .collect::<Vec<_>>();
         let (inserted, _inserted_kills) = KillCountingPane::new(62_302, test_size());
         mux.add_pane(&inserted)
@@ -19934,6 +20363,7 @@ mod tests {
 
         let origin = Arc::new(Mux::new(None));
         let replacement_mux = Arc::new(Mux::new(None));
+        let _origin_domain = register_guarded_mutation_test_domain(&origin);
         let (origin_pane, origin_kills) = KillCountingPane::new(162, test_size());
         let (replacement_pane, replacement_kills) = KillCountingPane::new(162, test_size());
         let (origin_tab, origin_window_id) =
@@ -21095,8 +21525,7 @@ mod tests {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
         let (pane, kills) = KillCountingPane::new(173, test_size());
-        let (source_tab, window_id) =
-            register_attached_test_pane(&global_guard, &mux, &pane);
+        let (source_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
         let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
         mux.add_domain(&domain).expect("register test domain");
         let guard = mux
@@ -21136,9 +21565,15 @@ mod tests {
             .window_order_snapshot(window_id)
             .expect("snapshot replacement window")
             .expect("same window survives exact replacement");
-        assert_eq!(after.ordered_tab_ids().collect::<Vec<_>>(), [receipt.tab_id()]);
+        assert_eq!(
+            after.ordered_tab_ids().collect::<Vec<_>>(),
+            [receipt.tab_id()]
+        );
         assert_eq!(after.active_tab_id(), Some(receipt.tab_id()));
-        assert_eq!(after.order_revision().get(), before.order_revision().get() + 1);
+        assert_eq!(
+            after.order_revision().get(),
+            before.order_revision().get() + 1
+        );
         assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
         assert_eq!(
             mux.num_panes_by_workspace
@@ -21157,15 +21592,14 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let (pane, kills) = KillCountingPane::new(174, test_size());
         let (companion, companion_kills) = KillCountingPane::new(175, test_size());
-        let (source_tab, window_id) =
-            register_attached_test_pane(&global_guard, &mux, &pane);
+        let (source_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain).expect("register test domain");
         mux.add_pane(&companion)
             .expect("register same-tab companion pane");
         source_tab
             .split_and_insert(0, SplitRequest::default(), Arc::clone(&companion))
             .expect("attach exact companion pane to source tab");
-        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
-        mux.add_domain(&domain).expect("register test domain");
         let guard = mux
             .capture_pane_operation(pane.pane_id())
             .expect("admit exact nonempty-source move");
@@ -21217,8 +21651,7 @@ mod tests {
         let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
         let (pane, kills) = KillCountingPane::new(176, test_size());
-        let (source_tab, window_id) =
-            register_attached_test_pane(&global_guard, &mux, &pane);
+        let (source_tab, window_id) = register_attached_test_pane(&global_guard, &mux, &pane);
         let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
         mux.add_domain(&domain).expect("register test domain");
         let guard = mux
@@ -21269,7 +21702,10 @@ mod tests {
             window_after.ordered_tab_ids().collect::<Vec<_>>(),
             window_before.ordered_tab_ids().collect::<Vec<_>>()
         );
-        assert_eq!(window_after.order_revision(), window_before.order_revision());
+        assert_eq!(
+            window_after.order_revision(),
+            window_before.order_revision()
+        );
         assert_eq!(mux.tabs.read().len(), tab_count_before);
         assert_eq!(mux.windows.read().len(), window_count_before);
         assert_eq!(*mux.num_panes_by_workspace.read(), workspace_counts_before);
@@ -21282,10 +21718,7 @@ mod tests {
                 .generation,
             structural_generation_before
         );
-        assert_eq!(
-            mux.topology.lock().revision,
-            TopologyRevision(u64::MAX - 1)
-        );
+        assert_eq!(mux.topology.lock().revision, TopologyRevision(u64::MAX - 1));
         assert_eq!(mux.pane_count_recomputes.load(Ordering::Relaxed), 0);
         mux.assert_tab_parent_index_matches_windows();
         assert_structural_pane_count_authority(&mux);
@@ -21864,10 +22297,10 @@ mod tests {
         );
 
         let (origin_successor, successor_kills) = KillCountingPane::new(139, test_size());
-        tab.assign_pane(&origin_successor);
         origin
             .add_pane(&origin_successor)
             .expect("origin may publish a later same-ID registration");
+        tab.assign_pane(&origin_successor);
 
         assert!(!tab.kill_pane_registration(&delayed));
         assert_eq!(successor_kills.load(Ordering::SeqCst), 0);
@@ -22078,6 +22511,7 @@ mod tests {
 
         let origin = Arc::new(Mux::new(None));
         let replacement = Arc::new(Mux::new(None));
+        let _domain = register_guarded_mutation_test_domain(&origin);
         let tab = Arc::new(Tab::new(&test_size()));
         let (first, _) = KillCountingPane::new(196, test_size());
         let (second, _) = KillCountingPane::new(197, test_size());
@@ -22085,9 +22519,9 @@ mod tests {
         origin
             .add_tab_and_active_pane(&tab)
             .expect("origin tab and first pane registration");
+        origin.add_pane(&second).expect("second pane registration");
         tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&second))
             .expect("two-pane rotation fixture");
-        origin.add_pane(&second).expect("second pane registration");
 
         let origin_resizes = Arc::new(AtomicUsize::new(0));
         let origin_resizes_for_subscriber = Arc::clone(&origin_resizes);
@@ -22555,7 +22989,16 @@ mod tests {
         assert!(mux.get_tab(tab.tab_id()).is_none());
         assert!(
             mux.get_window(window_id).is_none(),
-            "stale-parent pruning must detach the stale tab and retire its emptied window",
+            "stale-parent pruning must detach the stale tab and retire its emptied window; \
+             remaining_tabs={:?}, parent={:?}, provisional={}, window_len={:?}",
+            mux.get_window(window_id)
+                .map(|window| { window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>() }),
+            mux.tab_parents
+                .read()
+                .get(&tab.tab_id())
+                .map(|parent| parent.window_id),
+            mux.provisional_windows.lock().contains(&window_id),
+            mux.get_window(window_id).map(|window| window.len()),
         );
 
         Mux::shutdown();
@@ -22755,11 +23198,9 @@ mod tests {
             .expect("replacement subscription");
 
         Mux::set_mux(&replacement);
-        assert!(
-            origin
-                .set_window_title(window_id, "origin window")
-                .expect("set origin window title")
-        );
+        assert!(origin
+            .set_window_title(window_id, "origin window")
+            .expect("set origin window title"));
         assert!(origin.set_tab_title(tab_id, "origin tab"));
         assert_eq!(origin_notifications.load(Ordering::SeqCst), 2);
         assert_eq!(replacement_notifications.load(Ordering::SeqCst), 0);
@@ -23087,6 +23528,47 @@ mod tests {
 
         executor.run_until(Duration::from_secs(30), || removed_rx.try_recv().is_ok());
         assert!(mux.get_pane(122).is_none());
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn pane_reader_eof_scheduler_rejection_finalizes_exact_generation_inline() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(1, 4 * 1024, 0, 0)
+                .expect("test scheduler limits"),
+        )
+        .expect("test scheduler identity");
+        let occupying = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("test must occupy the scheduler: {:?}", outcome),
+        };
+
+        let mux = Arc::new(Mux::new(None));
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let (pane, _) =
+            KillCountingPane::new_with_reader(222, test_size(), Some(Box::new(reader)), false);
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::PaneRemoved(222)) {
+                let _ = removed_tx.send(());
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        mux.add_pane(&pane).expect("register EOF test pane");
+        removed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("scheduler rejection must finalize EOF inline");
+        assert!(mux.get_pane(222).is_none());
+        assert_eq!(executor.queue_snapshot().depth, 0);
+
+        drop(occupying);
         Mux::shutdown();
     }
 
@@ -23873,46 +24355,18 @@ mod tests {
     }
 
     #[test]
-    fn tab_removal_during_active_pane_preparation_fences_topology_publication() {
+    fn pane_free_tab_registration_rejects_nonempty_topology_before_preparation() {
         let mux = Arc::new(Mux::new(None));
         let tab = Arc::new(Tab::new(&test_size()));
         let tab_id = tab.tab_id();
         let (pane, kills, reader_entered, release_reader) = pane_with_blocked_reader(88);
         tab.assign_pane(&pane);
-        mux.add_tab_no_panes(&tab)
-            .expect("test tab should be provisionally registered");
-        let mux_for_add = Arc::clone(&mux);
-        let tab_for_add = Arc::clone(&tab);
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let add_thread = std::thread::spawn(move || {
-            let result = mux_for_add.add_tab_and_active_pane(&tab_for_add);
-            result_tx
-                .send(result)
-                .expect("test should still be waiting for registration result");
-        });
-
-        reader_entered
-            .recv_timeout(Duration::from_secs(30))
-            .expect("pane preparation should reach its blocking reader callback");
-        let removed_tab = mux
-            .remove_tab(tab_id)
-            .expect("exact provisionally registered tab should be removed");
-        assert!(Arc::ptr_eq(&removed_tab, &tab));
-        release_reader
-            .send(())
-            .expect("blocked reader callback should still be waiting");
-
-        let err = result_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("cancelled tab registration should finish")
-            .expect_err("a cancelled active pane must prevent tab publication");
-        assert_eq!(
-            err.downcast_ref::<PanePreparationCancelled>(),
-            Some(&PanePreparationCancelled { pane_id: 88 })
-        );
-        add_thread
-            .join()
-            .expect("registration thread should not panic");
+        let error = mux
+            .add_tab_no_panes(&tab)
+            .expect_err("pane-free registration must reject a populated tab");
+        assert!(error.to_string().contains("not structurally empty"));
+        assert!(reader_entered.try_recv().is_err());
+        drop(release_reader);
         assert!(mux.get_pane(88).is_none());
         assert!(mux.get_tab(tab_id).is_none());
         assert_eq!(kills.load(Ordering::SeqCst), 0);
@@ -24120,14 +24574,8 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let (failed_registration, _) = KillCountingPane::new(91, test_size());
         let (replacement, _) = KillCountingPane::new(91, test_size());
-        mux.panes.write().insert(
-            91,
-            LivePaneRegistration {
-                pane: Arc::clone(&replacement),
-                generation: PaneRegistrationGeneration::new(91, &mux.pane_retirements, Weak::new()),
-                domain_id: replacement.domain_id(),
-            },
-        );
+        mux.add_pane(&replacement)
+            .expect("replacement must enter through authoritative registration");
 
         assert!(!mux.remove_pane_registration_if_same(91, &failed_registration));
         let registered = mux
@@ -24615,10 +25063,9 @@ mod tests {
         );
         mux.pane_count_recomputes.store(0, Ordering::Relaxed);
 
-        assert!(
-            mux.set_window_workspace(window_id, "workspace-b")
-                .expect("move populated window to workspace B")
-        );
+        assert!(mux
+            .set_window_workspace(window_id, "workspace-b")
+            .expect("move populated window to workspace B"));
 
         assert_eq!(
             mux.get_window(window_id)
@@ -24686,12 +25133,10 @@ mod tests {
             .send(())
             .expect("release recount publication before workspace transfer");
         recount.join().expect("exact recount must finish");
-        assert!(
-            setter_result_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("workspace transfer must return")
-                .expect("workspace transfer after recount must commit")
-        );
+        assert!(setter_result_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("workspace transfer must return")
+            .expect("workspace transfer after recount must commit"));
         setter.join().expect("workspace setter thread must finish");
 
         assert_eq!(
@@ -24730,10 +25175,9 @@ mod tests {
         })
         .expect("subscribe to workspace no-op events");
 
-        assert!(
-            !mux.set_window_workspace(window_id, DEFAULT_WORKSPACE)
-                .expect("same workspace is a successful no-op")
-        );
+        assert!(!mux
+            .set_window_workspace(window_id, DEFAULT_WORKSPACE)
+            .expect("same workspace is a successful no-op"));
 
         assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
         assert_eq!(
@@ -24859,11 +25303,8 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let original_builder = mux.new_empty_window(Some("original".to_string()), None);
         let window_id = *original_builder;
-        let replacement = Window::new_for_owner(
-            Some("replacement".to_string()),
-            None,
-            Arc::downgrade(&mux),
-        );
+        let replacement =
+            Window::new_for_owner(Some("replacement".to_string()), None, Arc::downgrade(&mux));
         let replacement_id = replacement.window_id();
         assert_ne!(replacement_id, window_id);
         let original = mux
@@ -24969,19 +25410,15 @@ mod tests {
                     assert!(mux_for_subscriber.tabs.try_write().is_some());
                     assert!(mux_for_subscriber.try_window_exclusive_access(window_id));
                     assert!(mux_for_subscriber.tab_parents.try_write().is_some());
-                    assert!(
-                        mux_for_subscriber
-                            .num_panes_by_workspace
-                            .try_write()
-                            .is_some()
-                    );
+                    assert!(mux_for_subscriber
+                        .num_panes_by_workspace
+                        .try_write()
+                        .is_some());
                     assert!(mux_for_subscriber.topology.try_lock().is_some());
-                    assert!(
-                        mux_for_subscriber
-                            .pending_window_notifications
-                            .try_lock()
-                            .is_some()
-                    );
+                    assert!(mux_for_subscriber
+                        .pending_window_notifications
+                        .try_lock()
+                        .is_some());
                     assert_eq!(
                         mux_for_subscriber
                             .num_panes_by_workspace
@@ -24991,11 +25428,9 @@ mod tests {
                         Some(1)
                     );
                     events_for_subscriber.lock().push("workspace");
-                    assert!(
-                        mux_for_subscriber
-                            .set_window_title(window_id, "reentrant-title")
-                            .expect("reentrant title transaction after workspace locks")
-                    );
+                    assert!(mux_for_subscriber
+                        .set_window_title(window_id, "reentrant-title")
+                        .expect("reentrant title transaction after workspace locks"));
                 }
                 MuxNotification::WindowTitleChanged {
                     window_id: id,
@@ -25009,10 +25444,9 @@ mod tests {
         })
         .expect("subscribe to exact workspace transaction");
 
-        assert!(
-            mux.set_window_workspace(window_id, "workspace-b")
-                .expect("workspace callback transaction")
-        );
+        assert!(mux
+            .set_window_workspace(window_id, "workspace-b")
+            .expect("workspace callback transaction"));
 
         assert_eq!(events.lock().as_slice(), &["workspace", "title"]);
         assert_eq!(
@@ -25145,10 +25579,7 @@ mod tests {
             .expect("prepare second old-workspace window");
         let client = Arc::new(ClientId::new());
         mux.register_client(Arc::clone(&client));
-        assert!(mux.set_active_workspace_for_client_if_same(
-            &client,
-            "old-workspace"
-        ));
+        assert!(mux.set_active_workspace_for_client_if_same(&client, "old-workspace"));
 
         let counts_before = mux.num_panes_by_workspace.read().clone();
         let client_workspace_before = mux.active_workspace_for_client(&client);
@@ -25746,6 +26177,85 @@ mod tests {
     }
 
     #[test]
+    fn client_operation_guard_fences_equal_valued_replacement_generation() {
+        let mux = Arc::new(Mux::new(None));
+        let stale_client = Arc::new(ClientId::new());
+        let replacement_client = Arc::new(stale_client.as_ref().clone());
+
+        mux.register_client(Arc::clone(&stale_client));
+        let stale_generation = Arc::clone(
+            &mux.clients
+                .read()
+                .get(stale_client.as_ref())
+                .expect("stale client registration")
+                .registration_generation,
+        );
+        let stale_guard = mux
+            .capture_client_operation(&stale_client)
+            .expect("the live client generation must admit one operation");
+        assert_eq!(stale_generation.active_operations(), 1);
+        assert!(!stale_generation.is_retired());
+
+        mux.register_client(Arc::clone(&replacement_client));
+
+        assert!(
+            stale_generation.is_retired(),
+            "replacement must close old-generation admission in the publication cut",
+        );
+        assert_eq!(
+            stale_generation.active_operations(),
+            1,
+            "already-admitted work must retain its counted old-generation lease",
+        );
+        assert!(
+            mux.capture_client_operation(&stale_client).is_none(),
+            "an equal-valued stale Arc must not acquire the successor generation",
+        );
+        let replacement_guard = mux
+            .capture_client_operation(&replacement_client)
+            .expect("the exact successor generation must admit new work");
+        assert!(!stale_guard.same_registration(&replacement_guard));
+
+        assert!(mux.set_active_workspace_for_client_guarded(
+            &replacement_guard,
+            "replacement-workspace",
+        ));
+        let replacement_before = mux
+            .clients
+            .read()
+            .get(replacement_client.as_ref())
+            .cloned()
+            .expect("replacement registration before stale mutation attempts");
+
+        assert!(
+            !mux.client_had_input_guarded(&stale_guard),
+            "old-generation activity must not update an equal-valued successor",
+        );
+        assert!(
+            !mux.set_active_workspace_for_client_guarded(&stale_guard, "stale-workspace"),
+            "old-generation workspace mutation must not update the successor",
+        );
+        let replacement_after = mux
+            .clients
+            .read()
+            .get(replacement_client.as_ref())
+            .cloned()
+            .expect("replacement registration after stale mutation attempts");
+        assert_eq!(replacement_after, replacement_before);
+        assert!(Arc::ptr_eq(
+            &replacement_after.client_id,
+            &replacement_client,
+        ));
+
+        drop(stale_guard);
+        assert_eq!(
+            stale_generation.active_operations(),
+            0,
+            "dropping the sole old-generation guard must release exactly one lease",
+        );
+    }
+
+    #[test]
     fn register_client_is_idempotent_for_the_exact_registration() {
         let mux = Arc::new(Mux::new(None));
         let client = Arc::new(ClientId::new());
@@ -26052,6 +26562,7 @@ mod tests {
 
         let origin = Arc::new(Mux::new(None));
         let replacement = Arc::new(Mux::new(None));
+        let _domain = register_guarded_mutation_test_domain(&origin);
         let client = Arc::new(ClientId::new());
         let (prior, prior_focus) = KillCountingPane::new_with_focus_counter(783, test_size());
         let (target, target_focus) = KillCountingPane::new_with_focus_counter(784, test_size());
@@ -26066,9 +26577,9 @@ mod tests {
         origin
             .add_tab_to_window(&tab, window_id)
             .expect("origin tab attachment");
+        origin.add_pane(&target).expect("target registration");
         tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&target))
             .expect("target split");
-        origin.add_pane(&target).expect("target registration");
         tab.set_active_pane_for_mux(&prior, &origin);
         origin.register_client(Arc::clone(&client));
         assert!(origin.record_focus_for_client(&client, 783));
@@ -26731,8 +27242,7 @@ mod tests {
     fn atomic_domain_add_returns_the_exact_published_registration_guard() {
         let _global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
 
         let guard = mux
             .add_domain_and_acquire(&domain)
@@ -26760,8 +27270,7 @@ mod tests {
         assert_eq!(registration.generation.active_operations(), 1);
 
         assert!(mux.domain_was_detached_if_guard(&guard));
-        let successor: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
             Err(DomainRegistrationError::RetiredIdentifier { .. })
@@ -26778,8 +27287,7 @@ mod tests {
     #[test]
     fn atomic_domain_add_rejects_cross_index_foreign_registration_without_mutation() {
         let _global_guard = global_test_lock();
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let domain_name = domain.domain_name().to_string();
         let correct_registration = mux
@@ -26788,11 +27296,8 @@ mod tests {
             .as_ref()
             .cloned()
             .expect("initial default registration");
-        let foreign_registration = LiveDomainRegistration::new(
-            2,
-            domain_name.clone(),
-            Arc::clone(&domain),
-        );
+        let foreign_registration =
+            LiveDomainRegistration::new(2, domain_name.clone(), Arc::clone(&domain));
 
         let replaced_by_id = mux
             .domain_registrations
@@ -26860,9 +27365,10 @@ mod tests {
     fn atomic_existing_domain_add_rejects_stale_default_generation_without_mutation() {
         let _global_guard = global_test_lock();
         let drop_count = Arc::new(AtomicUsize::new(0));
-        let domain: Arc<dyn Domain> = Arc::new(
-            GuardedMutationTestDomain::counting_in_drop(1, Arc::clone(&drop_count)),
-        );
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::counting_in_drop(
+            1,
+            Arc::clone(&drop_count),
+        ));
         let domain_identity = Arc::downgrade(&domain);
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let domain_name = domain.domain_name().to_string();
@@ -26872,11 +27378,8 @@ mod tests {
             .as_ref()
             .cloned()
             .expect("initial exact default registration");
-        let fresh_registration = LiveDomainRegistration::new(
-            1,
-            domain_name.clone(),
-            Arc::clone(&domain),
-        );
+        let fresh_registration =
+            LiveDomainRegistration::new(1, domain_name.clone(), Arc::clone(&domain));
 
         let replaced_by_id = mux
             .domain_registrations
@@ -26888,29 +27391,10 @@ mod tests {
             .write()
             .insert(domain_name.clone(), Arc::clone(&fresh_registration))
             .expect("replace the planted registration name projection");
-        assert!(Arc::ptr_eq(
-            &replaced_by_id,
-            &stale_default_registration
-        ));
-        assert!(Arc::ptr_eq(
-            &replaced_by_name,
-            &stale_default_registration
-        ));
+        assert!(Arc::ptr_eq(&replaced_by_id, &stale_default_registration));
+        assert!(Arc::ptr_eq(&replaced_by_name, &stale_default_registration));
         drop(replaced_by_name);
         drop(replaced_by_id);
-        assert!(mux
-            .pane_authority
-            .lock()
-            .registrations_by_domain
-            .insert(
-                1,
-                DomainPaneRegistrations {
-                    domain: None,
-                    pane_registrations: HashMap::new(),
-                },
-            )
-            .is_none());
-
         let before = domain_registry_mutation_snapshot(&mux);
         let domain_owners_before = Arc::strong_count(&domain);
         let stale_registration_owners_before = Arc::strong_count(&stale_default_registration);
@@ -26969,13 +27453,6 @@ mod tests {
             .read()
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &stale_default_registration)));
-        assert!(mux
-            .pane_authority
-            .lock()
-            .registrations_by_domain
-            .get(&1)
-            .is_some_and(|registrations| registrations.domain.is_none()));
-
         drop(fresh_registration);
         drop(stale_default_registration);
         drop(domain);
@@ -26988,9 +27465,10 @@ mod tests {
     fn atomic_existing_domain_add_rejects_missing_default_registration_without_mutation() {
         let _global_guard = global_test_lock();
         let drop_count = Arc::new(AtomicUsize::new(0));
-        let domain: Arc<dyn Domain> = Arc::new(
-            GuardedMutationTestDomain::counting_in_drop(1, Arc::clone(&drop_count)),
-        );
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::counting_in_drop(
+            1,
+            Arc::clone(&drop_count),
+        ));
         let domain_identity = Arc::downgrade(&domain);
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let domain_name = domain.domain_name().to_string();
@@ -27005,24 +27483,8 @@ mod tests {
             .write()
             .take()
             .expect("erase the sole default registration authority");
-        assert!(Arc::ptr_eq(
-            &removed_default_registration,
-            &registration
-        ));
+        assert!(Arc::ptr_eq(&removed_default_registration, &registration));
         drop(removed_default_registration);
-        assert!(mux
-            .pane_authority
-            .lock()
-            .registrations_by_domain
-            .insert(
-                1,
-                DomainPaneRegistrations {
-                    domain: None,
-                    pane_registrations: HashMap::new(),
-                },
-            )
-            .is_none());
-
         let before = domain_registry_mutation_snapshot(&mux);
         let domain_owners_before = Arc::strong_count(&domain);
         let registration_owners_before = Arc::strong_count(&registration);
@@ -27038,10 +27500,7 @@ mod tests {
         );
         assert_eq!(domain_registry_mutation_snapshot(&mux), before);
         assert_eq!(Arc::strong_count(&domain), domain_owners_before);
-        assert_eq!(
-            Arc::strong_count(&registration),
-            registration_owners_before
-        );
+        assert_eq!(Arc::strong_count(&registration), registration_owners_before);
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
         assert_eq!(registration.generation.active_operations(), 0);
         assert!(
@@ -27072,13 +27531,6 @@ mod tests {
             .get(&domain_name)
             .is_some_and(|current| Arc::ptr_eq(current, &registration)));
         assert!(mux.default_domain_registration.read().is_none());
-        assert!(mux
-            .pane_authority
-            .lock()
-            .registrations_by_domain
-            .get(&1)
-            .is_some_and(|registrations| registrations.domain.is_none()));
-
         drop(registration);
         drop(domain);
         drop(mux);
@@ -27091,12 +27543,14 @@ mod tests {
         let _global_guard = global_test_lock();
         let live_drop_count = Arc::new(AtomicUsize::new(0));
         let requested_drop_count = Arc::new(AtomicUsize::new(0));
-        let live: Arc<dyn Domain> = Arc::new(
-            GuardedMutationTestDomain::counting_in_drop(2, Arc::clone(&live_drop_count)),
-        );
-        let requested: Arc<dyn Domain> = Arc::new(
-            GuardedMutationTestDomain::counting_in_drop(1, Arc::clone(&requested_drop_count)),
-        );
+        let live: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::counting_in_drop(
+            2,
+            Arc::clone(&live_drop_count),
+        ));
+        let requested: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::counting_in_drop(
+            1,
+            Arc::clone(&requested_drop_count),
+        ));
         let live_identity = Arc::downgrade(&live);
         let requested_identity = Arc::downgrade(&requested);
         let mux = Arc::new(Mux::new(Some(Arc::clone(&live))));
@@ -27118,19 +27572,6 @@ mod tests {
             &live_registration
         ));
         drop(removed_default_registration);
-        assert!(mux
-            .pane_authority
-            .lock()
-            .registrations_by_domain
-            .insert(
-                1,
-                DomainPaneRegistrations {
-                    domain: None,
-                    pane_registrations: HashMap::new(),
-                },
-            )
-            .is_none());
-
         let before = domain_registry_mutation_snapshot(&mux);
         let live_owners_before = Arc::strong_count(&live);
         let requested_owners_before = Arc::strong_count(&requested);
@@ -27190,13 +27631,6 @@ mod tests {
             .read()
             .contains_key(&requested_name));
         assert!(mux.default_domain_registration.read().is_none());
-        assert!(mux
-            .pane_authority
-            .lock()
-            .registrations_by_domain
-            .get(&1)
-            .is_some_and(|registrations| registrations.domain.is_none()));
-
         drop(requested);
         assert_eq!(requested_drop_count.load(Ordering::SeqCst), 1);
         assert!(requested_identity.upgrade().is_none());
@@ -27212,19 +27646,15 @@ mod tests {
     fn atomic_domain_add_serializes_racing_retirement_and_same_id_successor() {
         let _global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
-        let successor: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let (published_tx, published_rx) = std::sync::mpsc::sync_channel(0);
         let (permit_return_tx, permit_return_rx) = std::sync::mpsc::sync_channel(0);
         mux.install_domain_add_publication_barrier(published_tx, permit_return_rx);
 
         let mux_for_add = Arc::clone(&mux);
         let domain_for_add = Arc::clone(&domain);
-        let add = std::thread::spawn(move || {
-            mux_for_add.add_domain_and_acquire(&domain_for_add)
-        });
+        let add = std::thread::spawn(move || mux_for_add.add_domain_and_acquire(&domain_for_add));
         published_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("atomic add did not reach its post-publication cut");
@@ -27237,8 +27667,7 @@ mod tests {
         assert_eq!(registration.generation.active_operations(), 1);
         assert!(!add.is_finished());
 
-        let (retirement_started_tx, retirement_started_rx) =
-            std::sync::mpsc::sync_channel(0);
+        let (retirement_started_tx, retirement_started_rx) = std::sync::mpsc::sync_channel(0);
         let mux_for_retirement = Arc::clone(&mux);
         let domain_for_retirement = Arc::clone(&domain);
         let retirement = std::thread::spawn(move || {
@@ -27257,9 +27686,8 @@ mod tests {
 
         let mux_for_successor = Arc::clone(&mux);
         let successor_for_race = Arc::clone(&successor);
-        let successor_add = std::thread::spawn(move || {
-            mux_for_successor.add_domain(&successor_for_race)
-        });
+        let successor_add =
+            std::thread::spawn(move || mux_for_successor.add_domain(&successor_for_race));
 
         permit_return_tx
             .send(())
@@ -27270,11 +27698,9 @@ mod tests {
             .expect("atomic add must return its pre-retirement authority");
         assert!(guard.is_same_domain(&domain));
         assert!(Arc::ptr_eq(guard.registration(), &registration));
-        assert!(
-            retirement
-                .join()
-                .expect("racing retirement thread must not panic")
-        );
+        assert!(retirement
+            .join()
+            .expect("racing retirement thread must not panic"));
         assert!(matches!(
             successor_add
                 .join()
@@ -27296,8 +27722,7 @@ mod tests {
     fn atomic_domain_add_operation_failure_has_zero_publication() {
         let _global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         mux.fail_next_domain_registration_operation_acquire
             .store(true, Ordering::Release);
 
@@ -27313,7 +27738,11 @@ mod tests {
         assert!(mux.default_domain_registration.read().is_none());
         assert!(mux.retired_domain_ids.lock().is_empty());
         assert_eq!(mux.domain_retirements.len(), 0);
-        assert!(mux.pending_domain_retirements.lock().registrations.is_empty());
+        assert!(mux
+            .pending_domain_retirements
+            .lock()
+            .registrations
+            .is_empty());
         assert!(mux.pane_authority.lock().registrations_by_domain.is_empty());
 
         let guard = mux
@@ -27358,8 +27787,7 @@ mod tests {
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
         assert!(drop_on_retirement_worker.load(Ordering::SeqCst));
         assert!(mux.domain_retirements.contains(1));
-        let successor: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
             Err(DomainRegistrationError::RetiredIdentifier { .. })
@@ -27388,12 +27816,10 @@ mod tests {
             ),
             (3, SpawnTabDomain::CurrentPaneDomain),
         ] {
-            let domain: Arc<dyn Domain> =
-                Arc::new(GuardedMutationTestDomain::for_domain(1));
+            let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
             let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
             let (source_pane_id, source_kills) = if case == 3 {
-                let (pane, kills) =
-                    KillCountingPane::new(260usize + case, test_size());
+                let (pane, kills) = KillCountingPane::new(260usize + case, test_size());
                 register_attached_test_pane(&global_guard, &mux, &pane);
                 (Some(pane.pane_id()), Some(kills))
             } else {
@@ -27417,9 +27843,7 @@ mod tests {
             assert_eq!(registration.generation.active_operations(), 1);
             assert!(mux.get_domain(1).is_none());
             assert!(mux.default_domain().is_err());
-            assert!(mux
-                .get_domain_by_name("guarded-mutation-test")
-                .is_none());
+            assert!(mux.get_domain_by_name("guarded-mutation-test").is_none());
             assert!(mux.iter_domains().is_empty());
             for rejected in [
                 SpawnTabDomain::DefaultDomain,
@@ -27433,9 +27857,11 @@ mod tests {
                     "logical retirement must close every selector immediately"
                 );
             }
-            assert!(mux.domains.read().get(&1).is_some_and(|current| {
-                Arc::ptr_eq(current, &domain)
-            }));
+            assert!(mux
+                .domains
+                .read()
+                .get(&1)
+                .is_some_and(|current| { Arc::ptr_eq(current, &domain) }));
             assert!(mux
                 .domain_registrations
                 .read()
@@ -27449,8 +27875,7 @@ mod tests {
                 );
             }
 
-            let successor: Arc<dyn Domain> =
-                Arc::new(GuardedMutationTestDomain::for_domain(1));
+            let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
             assert!(matches!(
                 mux.add_domain(&successor),
                 Err(DomainRegistrationError::RetiredIdentifier { .. })
@@ -27472,8 +27897,7 @@ mod tests {
 
     #[test]
     fn domain_retirement_worker_spawn_failure_has_zero_logical_mutation() {
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let registration = mux
             .domain_registrations
@@ -27512,8 +27936,7 @@ mod tests {
     fn same_id_domain_reuse_waits_for_exact_pane_cleanup_quiescence() {
         let global_guard = global_test_lock();
         let executor = promise::spawn::SimpleExecutor::new();
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let (pane, kills) = KillCountingPane::new(267, test_size());
         register_attached_test_pane(&global_guard, &mux, &pane);
@@ -27525,14 +27948,22 @@ mod tests {
             .expect("admit pane operation before domain retirement");
 
         assert!(mux.domain_was_detached_if_same(&domain));
-        wait_for_domain_pane_cleanup_barrier(&mux, 1);
         assert_eq!(kills.load(Ordering::SeqCst), 0);
         assert!(mux.domain_retirements.contains(1));
         assert!(mux.retired_domain_ids.lock().contains(&1));
         assert!(mux.domains.read().contains_key(&1));
+        let pending = mux.pending_domain_retirements.lock();
+        assert!(pending.worker_running);
+        assert!(pending.registrations.iter().any(|retirement| {
+            retirement.registration.domain_id == 1
+                && matches!(
+                    &retirement.disposition,
+                    DomainRetirementDisposition::Pending
+                )
+        }));
+        drop(pending);
 
-        let successor: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
             Err(DomainRegistrationError::RetiredIdentifier { .. })
@@ -27548,8 +27979,7 @@ mod tests {
     #[test]
     fn domain_guard_drops_registration_before_publishing_cleanup_readiness() {
         let _global_guard = global_test_lock();
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let guard = mux
             .get_domain(1)
@@ -27565,13 +27995,9 @@ mod tests {
         assert!(mux.domain_was_detached_if_same(&domain));
 
         let strong_count_before_drop = Arc::strong_count(&exact_registration);
-        let (registration_disposed_tx, registration_disposed_rx) =
-            std::sync::mpsc::sync_channel(0);
+        let (registration_disposed_tx, registration_disposed_rx) = std::sync::mpsc::sync_channel(0);
         let (permit_release_tx, permit_release_rx) = std::sync::mpsc::sync_channel(0);
-        generation.install_operation_release_barrier(
-            registration_disposed_tx,
-            permit_release_rx,
-        );
+        generation.install_operation_release_barrier(registration_disposed_tx, permit_release_rx);
         let dropper = std::thread::spawn(move || drop(guard));
         registration_disposed_rx
             .recv_timeout(Duration::from_secs(5))
@@ -27588,8 +28014,7 @@ mod tests {
             "the generation operation must remain active at the disposal barrier"
         );
         assert!(!generation.cleanup_is_ready());
-        let successor: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
             Err(DomainRegistrationError::RetiredIdentifier { .. })
@@ -27640,8 +28065,7 @@ mod tests {
         assert!(drop_on_retirement_worker.load(Ordering::SeqCst));
         assert!(mux.domain_retirements.contains(1));
         assert!(mux.pending_domain_retirements.lock().worker_running);
-        let successor: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
             Err(DomainRegistrationError::RetiredIdentifier { .. })
@@ -27700,10 +28124,81 @@ mod tests {
     }
 
     #[test]
+    fn domain_retirement_probes_only_exact_indexed_domain_panes() {
+        let _global_guard = global_test_lock();
+        let retiring_domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let unrelated_domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(2));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&retiring_domain))));
+        mux.add_domain(&unrelated_domain)
+            .expect("register unrelated domain before pane population");
+
+        let (retiring_pane, _) = KillCountingPane::new_with_domain(271, test_size(), 1);
+        mux.add_pane(&retiring_pane)
+            .expect("register the sole retiring-domain pane");
+        for pane_id in 1_000..1_016 {
+            let (pane, _) = KillCountingPane::new_with_domain(pane_id, test_size(), 2);
+            mux.add_pane(&pane)
+                .expect("register unrelated-domain pane without affecting cleanup work");
+        }
+
+        let guard = mux
+            .get_domain(1)
+            .expect("admit exact retiring-domain barrier");
+        assert!(mux.domain_was_detached_if_same(&retiring_domain));
+        drop(guard);
+        wait_for_domain_retirement(&mux, 1);
+        wait_for_domain_retirement_worker_idle(&mux);
+
+        assert_eq!(
+            mux.domain_retirement_pane_registry_probes
+                .load(Ordering::Relaxed),
+            1,
+            "retirement must probe only the exact per-domain directory, independent of 16 unrelated panes",
+        );
+        assert!(mux.get_pane(271).is_none());
+        assert!(mux.get_pane(1_015).is_some());
+    }
+
+    #[test]
+    fn domain_retirement_does_not_strand_on_a_dropped_simple_executor() {
+        let _global_guard = global_test_lock();
+        let stale_executor = promise::spawn::SimpleExecutor::new();
+        let stale_identity = stale_executor.scheduler_identity();
+        drop(stale_executor);
+
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let (pane, kills) = KillCountingPane::new_with_domain(272, test_size(), 1);
+        mux.add_pane(&pane)
+            .expect("register pane before exact-domain retirement");
+        let guard = mux
+            .get_domain(1)
+            .expect("admit exact retiring-domain barrier");
+
+        assert!(mux.domain_was_detached_if_same(&domain));
+        drop(guard);
+        wait_for_domain_retirement(&mux, 1);
+        wait_for_domain_retirement_worker_idle(&mux);
+
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert!(mux.get_pane(272).is_none());
+        assert!(mux.get_domain(1).is_none());
+        assert!(promise::spawn::is_scheduler_configured());
+        assert!(matches!(
+            promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                MUX_MAIN_THREAD_TASK_ESTIMATED_BYTES,
+            ),
+            promise::spawn::MainThreadReservationOutcome::RetiredGeneration(rejection)
+                if (rejection.queue_id, rejection.scheduler_generation)
+                    == (stale_identity.queue_id, stale_identity.scheduler_generation)
+        ));
+    }
+
+    #[test]
     fn missing_domain_authority_directory_quarantines_without_mutation() {
         let global_guard = global_test_lock();
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let (pane, kills) = KillCountingPane::new(268, test_size());
         register_attached_test_pane(&global_guard, &mux, &pane);
@@ -27720,11 +28215,7 @@ mod tests {
 
         {
             let _pane_registration = mux.pane_registration.lock();
-            let removed = mux
-                .pane_authority
-                .lock()
-                .registrations_by_domain
-                .remove(&1);
+            let removed = mux.pane_authority.lock().registrations_by_domain.remove(&1);
             assert!(removed.is_some());
         }
         drop(barrier);
@@ -27747,8 +28238,7 @@ mod tests {
             .read()
             .get(&1)
             .is_some_and(|current| Arc::ptr_eq(current, &exact_registration)));
-        let successor: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
             Err(DomainRegistrationError::RetiredIdentifier { .. })
@@ -27765,8 +28255,7 @@ mod tests {
     #[test]
     fn omitted_domain_authority_pane_quarantines_without_mutation() {
         let global_guard = global_test_lock();
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let (first, first_kills) = KillCountingPane::new(269, test_size());
         let (second, second_kills) = KillCountingPane::new(270, test_size());
@@ -27819,8 +28308,7 @@ mod tests {
             .read()
             .get(&1)
             .is_some_and(|current| Arc::ptr_eq(current, &exact_registration)));
-        let successor: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         assert!(matches!(
             mux.add_domain(&successor),
             Err(DomainRegistrationError::RetiredIdentifier { .. })
@@ -27838,8 +28326,7 @@ mod tests {
     fn transient_domain_snapshot_failure_stays_pending_then_retries_to_completion() {
         let global_guard = global_test_lock();
         let executor = promise::spawn::SimpleExecutor::new();
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let (pane, kills) = KillCountingPane::new(264, test_size());
         register_attached_test_pane(&global_guard, &mux, &pane);
@@ -27876,8 +28363,7 @@ mod tests {
 
     #[test]
     fn terminal_domain_cleanup_invariant_failure_is_explicitly_quarantined() {
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let barrier = mux
             .get_domain(1)
@@ -27904,8 +28390,7 @@ mod tests {
 
     #[test]
     fn dropping_last_domain_guard_under_domain_lock_only_notifies_worker() {
-        let domain: Arc<dyn Domain> =
-            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(1));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
         let guard = mux
             .get_domain(1)
@@ -27932,8 +28417,7 @@ mod tests {
     #[test]
     fn default_domain_retirement_selects_minimum_live_domain_id() {
         for insertion_order in [[3, 2], [2, 3]] {
-            let default: Arc<dyn Domain> =
-                Arc::new(GuardedMutationTestDomain::for_domain(5));
+            let default: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::for_domain(5));
             let mux = Arc::new(Mux::new(Some(Arc::clone(&default))));
             for domain_id in insertion_order {
                 let candidate: Arc<dyn Domain> =
@@ -28130,6 +28614,51 @@ mod tests {
     }
 
     #[test]
+    fn window_topology_scheduler_rejection_delivers_exact_notification_inline() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+        let executor = promise::spawn::SimpleExecutor::try_with_limits(
+            promise::spawn::MainThreadAdmissionLimits::new(1, 4 * 1024, 0, 0)
+                .expect("test scheduler limits"),
+        )
+        .expect("test scheduler identity");
+        let occupying = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("test must occupy the scheduler: {:?}", outcome),
+        };
+
+        let mux = Arc::new(Mux::new(None));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_subscriber = Arc::clone(&seen);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::WindowCreated(window_id) = notification {
+                seen_for_subscriber.lock().push(window_id);
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        let mux_for_thread = Arc::clone(&mux);
+        let window_id = std::thread::spawn(move || {
+            let window_builder = mux_for_thread.new_empty_window(None, None);
+            let window_id = *window_builder;
+            drop(window_builder);
+            window_id
+        })
+        .join()
+        .expect("window builder thread should not panic");
+
+        assert_eq!(&*seen.lock(), &[window_id]);
+        assert_eq!(executor.queue_snapshot().depth, 0);
+
+        drop(occupying);
+        Mux::shutdown();
+    }
+
+    #[test]
     fn new_empty_window_without_global_mux_uses_instance_workspace() {
         let _guard = global_test_lock();
         Mux::shutdown();
@@ -28144,10 +28673,9 @@ mod tests {
                 .get_workspace(),
             DEFAULT_WORKSPACE
         );
-        assert!(
-            mux.set_window_workspace(window_id, "workspace-without-global-mux")
-                .expect("set exact mux window workspace")
-        );
+        assert!(mux
+            .set_window_workspace(window_id, "workspace-without-global-mux")
+            .expect("set exact mux window workspace"));
         assert_eq!(
             mux.get_window(window_id)
                 .expect("workspace-mutated window remains registered")
@@ -30357,7 +30885,12 @@ mod tests {
         let error = mux
             .add_tab_and_active_pane(&duplicate_tab)
             .expect_err("one exact pane allocation cannot acquire a second tab owner");
-        assert!(format!("{error:#}").contains("structurally owned"));
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("already has structural-owner authority"),
+            "unexpected duplicate-owner rejection: {}",
+            rendered
+        );
         assert!(mux.get_tab(duplicate_tab.tab_id()).is_none());
         assert!(!duplicate_tab.has_active_mux_owner(&mux));
 

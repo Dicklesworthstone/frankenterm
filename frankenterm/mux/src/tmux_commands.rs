@@ -1,21 +1,21 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{PaneId, alloc_pane_id};
+use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{
-    AttachState, NOTIFICATION_INTENT_DRAIN_QUANTUM, TmuxBacklogDrain, TmuxBacklogLimits,
-    TmuxDomain, TmuxDomainState, TmuxEnqueueError, TmuxNotificationIntent,
-    TmuxNotificationIntentRunDisposition, TmuxPaneOutputIngress, TmuxPaneOutputLimits,
-    TmuxPaneOutputState, TmuxRemotePane, TmuxSplitCleanupObligation, TmuxTab,
-    TmuxTopologyBarrierEvent,
+    AttachState, TmuxBacklogDrain, TmuxBacklogLimits, TmuxDomain, TmuxDomainState,
+    TmuxEnqueueError, TmuxNotificationIntent, TmuxNotificationIntentRunDisposition,
+    TmuxPaneOutputIngress, TmuxPaneOutputLimits, TmuxPaneOutputState, TmuxRemotePane,
+    TmuxSplitCleanupObligation, TmuxTab, TmuxTopologyBarrierEvent,
+    NOTIFICATION_INTENT_DRAIN_QUANTUM,
 };
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{
     Mux, MuxNotification, MuxNotificationEnvelope, MuxTopologyStamp, Pane, PaneOperationGuard,
     SplitCommitReceipt,
 };
-use anyhow::{Context, anyhow};
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use anyhow::{anyhow, Context};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
@@ -1790,15 +1790,34 @@ impl TmuxDomainState {
             owner: Arc::clone(self),
             completed: false,
         };
-        promise::spawn::spawn_into_main_thread(async move {
-            let mut lease = lease;
-            let disposition = owner.run_notification_intent_runnable();
-            lease.completed = true;
-            if disposition == TmuxNotificationIntentRunDisposition::Reschedule {
-                owner.spawn_claimed_notification_intent_runnable();
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn(async move {
+                        let mut lease = lease;
+                        let disposition = owner.run_notification_intent_runnable();
+                        lease.completed = true;
+                        if disposition == TmuxNotificationIntentRunDisposition::Reschedule {
+                            owner.spawn_claimed_notification_intent_runnable();
+                        }
+                    })
+                    .detach();
             }
-        })
-        .detach();
+            rejected => {
+                metrics::counter!(
+                    "mux.tmux.notification_intent.scheduler_admission",
+                    "outcome" => "terminal_rejection"
+                )
+                .increment(1);
+                log::error!(
+                    "main-thread scheduler rejected tmux notification intent; lease drop will detach instead of losing final selection: {rejected:?}"
+                );
+                drop(lease);
+            }
+        }
     }
 
     fn run_notification_intent_runnable(self: &Arc<Self>) -> TmuxNotificationIntentRunDisposition {
@@ -3452,11 +3471,11 @@ impl TmuxCommand for AttachDone {
 mod tests {
     use super::*;
     use crate::domain::Domain;
-    use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd};
+    use filedescriptor::{poll, pollfd, AsRawSocketDescriptor, FileDescriptor, POLLIN};
     use promise::spawn::ScopedExecutor;
     use std::io::{Read as _, Write as _};
-    use std::sync::MutexGuard as StdMutexGuard;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::MutexGuard as StdMutexGuard;
     use std::time::{Duration, Instant};
 
     struct ScopedMux {
@@ -3671,13 +3690,11 @@ mod tests {
         );
         assert_eq!(tab.iter_all_panes().len(), 1);
         assert!(Arc::ptr_eq(&tab.iter_all_panes()[0], &target_pane));
-        assert!(
-            !tmux_domain
-                .inner
-                .remote_panes
-                .lock()
-                .contains_key(&failed_remote_pane_id)
-        );
+        assert!(!tmux_domain
+            .inner
+            .remote_panes
+            .lock()
+            .contains_key(&failed_remote_pane_id));
         assert_eq!(
             tmux_domain
                 .inner
@@ -3687,16 +3704,14 @@ mod tests {
                 .expect("coherent callback-panic reverse index"),
             None
         );
-        assert!(
-            !tmux_domain
-                .inner
-                .gui_tabs
-                .lock()
-                .get(&remote_window_id)
-                .expect("callback-panic target window survives")
-                .panes
-                .contains(&failed_remote_pane_id)
-        );
+        assert!(!tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get(&remote_window_id)
+            .expect("callback-panic target window survives")
+            .panes
+            .contains(&failed_remote_pane_id));
         assert_eq!(
             tmux_domain
                 .inner
@@ -3739,13 +3754,11 @@ mod tests {
             .expect("tmux domain must continue after isolated callback panic");
         assert_eq!(tab.iter_all_panes().len(), 2);
         assert!(mux.get_pane(receipt.pane_id()).is_some());
-        assert!(
-            tmux_domain
-                .inner
-                .remote_panes
-                .lock()
-                .contains_key(&succeeding_remote_pane_id)
-        );
+        assert!(tmux_domain
+            .inner
+            .remote_panes
+            .lock()
+            .contains_key(&succeeding_remote_pane_id));
         assert!(
             !tmux_domain.inner.is_terminal(),
             "successful follow-up publication proves domain progress"
@@ -3812,13 +3825,11 @@ mod tests {
                 .structural_pane_count(),
             before_window_count
         );
-        assert!(
-            !tmux_domain
-                .inner
-                .remote_panes
-                .lock()
-                .contains_key(&failed_remote_pane_id)
-        );
+        assert!(!tmux_domain
+            .inner
+            .remote_panes
+            .lock()
+            .contains_key(&failed_remote_pane_id));
         assert_eq!(
             tmux_domain
                 .inner
@@ -3828,16 +3839,14 @@ mod tests {
                 .expect("coherent output-preflight reverse index"),
             None
         );
-        assert!(
-            !tmux_domain
-                .inner
-                .gui_tabs
-                .lock()
-                .get(&remote_window_id)
-                .expect("output-preflight remote window survives")
-                .panes
-                .contains(&failed_remote_pane_id)
-        );
+        assert!(!tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get(&remote_window_id)
+            .expect("output-preflight remote window survives")
+            .panes
+            .contains(&failed_remote_pane_id));
         assert_eq!(
             tmux_domain
                 .inner
@@ -3880,13 +3889,11 @@ mod tests {
             .expect("tmux domain must progress after output preflight rejection");
         assert_eq!(tab.iter_all_panes().len(), 2);
         assert!(mux.get_pane(receipt.pane_id()).is_some());
-        assert!(
-            tmux_domain
-                .inner
-                .remote_panes
-                .lock()
-                .contains_key(&succeeding_remote_pane_id)
-        );
+        assert!(tmux_domain
+            .inner
+            .remote_panes
+            .lock()
+            .contains_key(&succeeding_remote_pane_id));
         assert!(!tmux_domain.inner.is_terminal());
         assert_eq!(
             tmux_domain.inner.cmd_queue.lock().len(),
@@ -4350,10 +4357,9 @@ mod tests {
                 },
             )
             .expect_err("capture/live-output race must fail closed");
-        assert!(
-            err.to_string()
-                .contains("capture-time stream authority is ambiguous")
-        );
+        assert!(err
+            .to_string()
+            .contains("capture-time stream authority is ambiguous"));
         {
             let pane = pane_gate.lock();
             assert!(pane.output_ingress.capture_raced());
@@ -4516,30 +4522,26 @@ mod tests {
                 .expect("coherent reverse index"),
             None
         );
-        assert!(
-            tmux_domain
-                .inner
-                .gui_tabs
-                .lock()
-                .get(&2)
-                .is_none_or(|tab| !tab.panes.contains(&41))
-        );
+        assert!(tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get(&2)
+            .is_none_or(|tab| !tab.panes.contains(&41)));
         let remote = remote_gate.lock();
         assert_eq!(remote.output_state, TmuxPaneOutputState::Retired);
         assert!(remote.child_state.try_wait().is_some());
         assert!(remote.output_ingress.is_empty());
         drop(remote);
         assert!(tmux_domain.inner.is_terminal());
-        assert!(
-            tmux_domain
-                .inner
-                .cmd_queue
-                .lock()
-                .front()
-                .is_none_or(|command| {
-                    command.get_command(tmux_domain.domain_id()) != "kill-pane -t %41\n"
-                })
-        );
+        assert!(tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .front()
+            .is_none_or(|command| {
+                command.get_command(tmux_domain.domain_id()) != "kill-pane -t %41\n"
+            }));
     }
 
     #[test]
@@ -4585,14 +4587,12 @@ mod tests {
                 .expect("coherent retired-domain root reverse index"),
             None
         );
-        assert!(
-            tmux_domain
-                .inner
-                .gui_tabs
-                .lock()
-                .get(&13)
-                .is_none_or(|tab| !tab.panes.contains(&131))
-        );
+        assert!(tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get(&13)
+            .is_none_or(|tab| !tab.panes.contains(&131)));
         let remote = remote_gate.lock();
         assert_eq!(remote.output_state, TmuxPaneOutputState::Retired);
         assert!(remote.child_state.try_wait().is_some());
@@ -4669,16 +4669,14 @@ mod tests {
                 .expect("coherent split reverse index"),
             None
         );
-        assert!(
-            !tmux_domain
-                .inner
-                .gui_tabs
-                .lock()
-                .get(&3)
-                .expect("target tmux window survives")
-                .panes
-                .contains(&52)
-        );
+        assert!(!tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get(&3)
+            .expect("target tmux window survives")
+            .panes
+            .contains(&52));
         assert_eq!(
             tmux_domain
                 .inner
@@ -4735,12 +4733,10 @@ mod tests {
             .split_pane(&mux, &target, reservation, SplitRequest::default())
             .expect_err("retired split domain generation must reject local publication");
         assert!(format!("{error:#}").contains("domain retired or changed identity"));
-        assert!(
-            !tmux_domain
-                .inner
-                .test_retire_split_domain_before_local_commit
-                .load(Ordering::Acquire)
-        );
+        assert!(!tmux_domain
+            .inner
+            .test_retire_split_domain_before_local_commit
+            .load(Ordering::Acquire));
         assert_eq!(tab.iter_all_panes().len(), 1);
         assert!(Arc::ptr_eq(&tab.iter_all_panes()[0], &target_pane));
         assert_eq!(*mux.num_panes_by_workspace.read(), before_workspace_counts);
@@ -4848,16 +4844,14 @@ mod tests {
                 .copied(),
             Some(2)
         );
-        assert!(
-            tmux_domain
-                .inner
-                .gui_tabs
-                .lock()
-                .get(&4)
-                .expect("successful remote tmux window")
-                .panes
-                .contains(&62)
-        );
+        assert!(tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get(&4)
+            .expect("successful remote tmux window")
+            .panes
+            .contains(&62));
         assert_eq!(
             tmux_domain
                 .inner
@@ -4880,7 +4874,19 @@ mod tests {
                 .output_state,
             TmuxPaneOutputState::Ready
         );
-        assert_eq!(tmux_domain.inner.cmd_queue.lock().len(), 0);
+        let queue = tmux_domain.inner.cmd_queue.lock();
+        assert!(
+            !queue.has_split_transaction_work(),
+            "successful split must release every reserved split command slot: {:#?}",
+            *queue,
+        );
+        assert_eq!(
+            tmux_domain
+                .inner
+                .remote_split_identity_permit_count_locked(),
+            0,
+            "successful split must release its retained-identity permit"
+        );
     }
 
     #[test]
@@ -5067,14 +5073,12 @@ mod tests {
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
 
         for _ in 0..10_000 {
-            assert!(
-                tmux_domain
-                    .inner
-                    .ingest_mux_notification(MuxNotificationEnvelope {
-                        notification: MuxNotification::PaneOutput(77),
-                        topology: MuxTopologyStamp::NonTopology,
-                    })
-            );
+            assert!(tmux_domain
+                .inner
+                .ingest_mux_notification(MuxNotificationEnvelope {
+                    notification: MuxNotification::PaneOutput(77),
+                    topology: MuxTopologyStamp::NonTopology,
+                }));
         }
 
         let telemetry = tmux_domain.inner.notification_intent_telemetry.snapshot();
@@ -5657,8 +5661,8 @@ mod tests {
     }
 
     #[test]
-    fn tmux_atomic_publication_initial_sync_releases_gui_window_for_subscription_fanout()
-    -> anyhow::Result<()> {
+    fn tmux_atomic_publication_initial_sync_releases_gui_window_for_subscription_fanout(
+    ) -> anyhow::Result<()> {
         let (_mux_guard, tmux_domain) = install_tmux_domain();
         let mux = tmux_mux()?;
         *tmux_domain.inner.tmux_session.lock() = Some(17);

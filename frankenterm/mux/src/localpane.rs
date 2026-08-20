@@ -42,6 +42,37 @@ use url::Url;
 use crossbeam::queue::ArrayQueue;
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
+const LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES: usize = 4 * 1024;
+
+fn schedule_local_pane_main_thread<MAKE, FUT>(
+    service_class: promise::spawn::MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+    make_future: MAKE,
+) -> bool
+where
+    MAKE: FnOnce() -> FUT,
+    FUT: std::future::Future<Output = ()> + Send + 'static,
+{
+    match promise::spawn::try_reserve_main_thread(service_class, estimated_bytes) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation.spawn(make_future()).detach();
+            true
+        }
+        rejected => {
+            metrics::counter!(
+                "mux.local_pane.main_thread_admission",
+                "operation" => operation,
+                "outcome" => "terminal_rejection"
+            )
+            .increment(1);
+            log::error!(
+                "main-thread scheduler rejected local-pane {operation} before task construction: {rejected:?}"
+            );
+            false
+        }
+    }
+}
 
 /// ft-87qfi: capacity (in action batches) of the lock-free SPSC staging ring
 /// used on the pane->render hot path when `disruptor-pane-io` is enabled. Each
@@ -226,10 +257,14 @@ impl ChildExitPruneState {
             target_intent,
             finished: false,
         };
-        promise::spawn::spawn_into_main_thread(async move {
-            dispatch.execute();
-        })
-        .detach();
+        schedule_local_pane_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+            "child-exit prune",
+            move || async move {
+                dispatch.execute();
+            },
+        );
     }
 
     fn finish_dispatch(
@@ -1670,17 +1705,47 @@ struct LocalPaneDCSHandler {
 }
 
 pub(crate) fn emit_output_for_pane(registration: PaneRegistrationHandle, message: &str) {
+    let estimated_bytes = LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES.saturating_add(message.len());
+    let reservation = if promise::spawn::is_scheduler_configured() {
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Render,
+            estimated_bytes,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                Some(reservation)
+            }
+            rejected => {
+                metrics::counter!(
+                    "mux.local_pane.main_thread_admission",
+                    "operation" => "emit pane output",
+                    "outcome" => "inline_fallback"
+                )
+                .increment(1);
+                log::error!(
+                    "main-thread scheduler rejected local-pane output; preserving output inline: {rejected:?}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![Action::CSI(CSI::Sgr(Sgr::Reset))];
     parser.parse(message.as_bytes(), |action| actions.push(action));
 
-    if promise::spawn::is_scheduler_configured() {
-        promise::spawn::spawn_into_main_thread(async move {
-            let _ = registration.try_with_current_output(|pane| {
-                pane.perform_actions(actions);
-            });
-        })
-        .detach();
+    if let Some(reservation) = reservation {
+        reservation
+            .spawn(async move {
+                let _ = registration.try_with_current_output(|pane| {
+                    pane.perform_actions(actions);
+                });
+            })
+            .detach();
+    } else {
+        let _ = registration.try_with_current_output(|pane| {
+            pane.perform_actions(actions);
+        });
     }
 }
 
@@ -1810,9 +1875,6 @@ struct LocalPaneNotifHandler {
 
 impl AlertHandler for LocalPaneNotifHandler {
     fn alert(&mut self, alert: Alert) {
-        if !promise::spawn::is_scheduler_configured() {
-            return;
-        }
         let Some(registration) = self.mux_registration.load() else {
             log::trace!(
                 "dropping alert for unregistered local pane {}",
@@ -1820,12 +1882,40 @@ impl AlertHandler for LocalPaneNotifHandler {
             );
             return;
         };
-        promise::spawn::spawn_into_main_thread(async move {
+        if !promise::spawn::is_scheduler_configured() {
             let _ = registration.try_with_current(|pane| {
                 pane.dispatch_alert(alert);
             });
-        })
-        .detach();
+            return;
+        }
+        match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            LOCAL_PANE_MAIN_THREAD_ESTIMATED_BYTES,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                reservation
+                    .spawn(async move {
+                        let _ = registration.try_with_current(|pane| {
+                            pane.dispatch_alert(alert);
+                        });
+                    })
+                    .detach();
+            }
+            rejected => {
+                metrics::counter!(
+                    "mux.local_pane.main_thread_admission",
+                    "operation" => "pane alert",
+                    "outcome" => "inline_fallback"
+                )
+                .increment(1);
+                log::error!(
+                    "main-thread scheduler rejected local-pane alert; preserving alert inline: {rejected:?}"
+                );
+                let _ = registration.try_with_current(|pane| {
+                    pane.dispatch_alert(alert);
+                });
+            }
+        }
     }
 }
 

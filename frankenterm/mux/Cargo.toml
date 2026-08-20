@@ -85,6 +85,7 @@ winapi = { workspace=true, features = [
 [dev-dependencies]
 criterion = "0.8.2"
 k9.workspace = true
+promise = { workspace = true, features = ["test-support"] }
 proptest = "1.8.0"
 serde_json.workspace = true
 

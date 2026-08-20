@@ -298,29 +298,49 @@ impl ConnectionUI {
             return Self::new_headless();
         }
 
-        let (tx, rx) = unbounded();
-        promise::spawn::spawn_into_main_thread(termwiztermtab::run(
-            params.size,
-            params.window_id,
-            move |term| {
-                let mut ui = ConnectionUIImpl { term, rx };
-                let status = ui.run().unwrap_or_else(|e| {
-                    log::error!("while running ConnectionUI loop: {:?}", e);
-                    CloseStatus::Implicit
-                });
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Background,
+            32 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                log::error!(
+                    "main-thread scheduler rejected connection UI before channel construction; falling back to headless UI: {rejected:?}"
+                );
+                return Self::new_headless();
+            }
+        };
 
-                if !params.disable_close_delay && status == CloseStatus::Implicit {
-                    ui.sleep(
-                        "(this window will close automatically)",
-                        Duration::new(120, 0),
-                    )
-                    .ok();
+        let (tx, rx) = unbounded();
+        reservation
+            .spawn_local(async move {
+                if let Err(err) = termwiztermtab::run(
+                    params.size,
+                    params.window_id,
+                    move |term| {
+                        let mut ui = ConnectionUIImpl { term, rx };
+                        let status = ui.run().unwrap_or_else(|e| {
+                            log::error!("while running ConnectionUI loop: {:?}", e);
+                            CloseStatus::Implicit
+                        });
+
+                        if !params.disable_close_delay && status == CloseStatus::Implicit {
+                            ui.sleep(
+                                "(this window will close automatically)",
+                                Duration::new(120, 0),
+                            )
+                            .ok();
+                        }
+                        Ok(())
+                    },
+                    None,
+                )
+                .await
+                {
+                    log::error!("connection UI task failed after admission: {err:#}");
                 }
-                Ok(())
-            },
-            None,
-        ))
-        .detach();
+            })
+            .detach();
         Self { tx }
     }
 

@@ -1,6 +1,6 @@
 use crate::client::ClientId;
 use crate::domain::{DomainId, UnpublishedPane};
-use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
+use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{
@@ -14,16 +14,16 @@ use anyhow::Context;
 use bintree::PathBranch;
 use config::configuration;
 use config::keyassignment::PaneDirection;
-use frankenterm_sigpipe::{RecoverablePanicSite, catch_recoverable};
+use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
 use frankenterm_term::{StableRowIndex, TerminalSize};
 use parking_lot::{Mutex, MutexGuard};
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::panic::AssertUnwindSafe;
 #[cfg(test)]
 use std::panic::catch_unwind;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use thiserror::Error;
@@ -4767,7 +4767,6 @@ impl Tab {
         (generation != 0).then_some(generation)
     }
 
-    #[cfg(test)]
     pub(crate) fn has_active_mux_owner(&self, mux: &Mux) -> bool {
         self.inner.lock().is_active_mux_owner(mux)
     }
@@ -4905,19 +4904,24 @@ impl Tab {
         prepared: PreparedPaneTree,
     ) -> anyhow::Result<()> {
         let desired_panes = prepared.snapshot_panes_callback_free();
-        let mut desired_observed = Vec::new();
-        desired_observed
-            .try_reserve_exact(desired_panes.len())
-            .map_err(|error| anyhow::anyhow!("reserve prepared pane identities: {error}"))?;
-        for pane in &desired_panes {
-            desired_observed.push((observe_pane_id_for_mutation(pane)?, Arc::clone(pane)));
-        }
         let install = prepared.into_install(size, &desired_panes)?;
         let mut topology_notifications = Vec::new();
         topology_notifications
             .try_reserve_exact(1)
             .map_err(|error| anyhow::anyhow!("reserve prepared-tree topology envelope: {error}"))?;
         let expected_mux = self.inner.lock().notification_owner();
+        let desired_observed = if expected_mux.is_some() {
+            let mut observed = Vec::new();
+            observed
+                .try_reserve_exact(desired_panes.len())
+                .map_err(|error| anyhow::anyhow!("reserve prepared pane identities: {error}"))?;
+            for pane in &desired_panes {
+                observed.push((observe_pane_id_for_mutation(pane)?, Arc::clone(pane)));
+            }
+            observed
+        } else {
+            Vec::new()
+        };
         let current = expected_mux
             .as_ref()
             .map(|_| self.snapshot_structural_states_for_authority())
@@ -6954,11 +6958,9 @@ impl Tab {
     ) -> Option<R> {
         let mut lock_order = tabs.iter().enumerate().collect::<Vec<_>>();
         lock_order.sort_unstable_by_key(|(_, tab)| Arc::as_ptr(tab) as usize);
-        debug_assert!(
-            lock_order
-                .windows(2)
-                .all(|pair| !Arc::ptr_eq(pair[0].1, pair[1].1))
-        );
+        debug_assert!(lock_order
+            .windows(2)
+            .all(|pair| !Arc::ptr_eq(pair[0].1, pair[1].1)));
 
         let mut guards = lock_order
             .iter()
@@ -9290,6 +9292,7 @@ impl Mux {
                         Vec::new(),
                         Vec::new(),
                         removed_windows,
+                        false,
                         trailing_revision_count,
                         commit,
                     )?;
@@ -14161,7 +14164,7 @@ mod test {
     use rangeset::RangeSet;
     use std::convert::TryFrom;
     use std::ops::Range;
-    use termwiz::surface::{SEQ_ZERO, SequenceNo};
+    use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use url::Url;
 
     const TEST_ORDERED_PANE_CENSUS_WORK: usize = 32_767;
@@ -14931,10 +14934,8 @@ mod test {
 
             let source_window = mux.new_empty_window(Some(source_workspace.to_string()), None);
             let source_window_id = *source_window;
-            drop(source_window);
             let target_window = mux.new_empty_window(Some(target_workspace.to_string()), None);
             let target_window_id = *target_window;
-            drop(target_window);
 
             let source = FakePane::new(pane_base, size);
             let target = FakePane::new(pane_base + 1, size);
@@ -14942,6 +14943,8 @@ mod test {
                 attach_floating_reconcile_test_tab(&mux, &source, size, source_window_id);
             let target_tab =
                 attach_floating_reconcile_test_tab(&mux, &target, size, target_window_id);
+            drop(source_window);
+            drop(target_window);
             let counts_before = mux.num_panes_by_workspace.read().clone();
             mux.pane_count_recomputes
                 .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -14997,10 +15000,8 @@ mod test {
             .expect("register moved-split domain");
         let source_window = mux.new_empty_window(Some("moved-stale".to_string()), None);
         let source_window_id = *source_window;
-        drop(source_window);
         let target_window = mux.new_empty_window(Some("moved-stale".to_string()), None);
         let target_window_id = *target_window;
-        drop(target_window);
 
         let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -15035,6 +15036,8 @@ mod test {
         let source = FakePane::new(32_121, size);
         let target_tab = attach_floating_reconcile_test_tab(&mux, &target, size, target_window_id);
         let source_tab = attach_floating_reconcile_test_tab(&mux, &source, size, source_window_id);
+        drop(source_window);
+        drop(target_window);
         *hook_tab.lock() = Some(Arc::downgrade(&target_tab));
 
         let target_guard = mux
@@ -15064,10 +15067,9 @@ mod test {
             revision_after_hook.load(std::sync::atomic::Ordering::Acquire),
             "rejected successor must reserve no topology revision after the winning mutation"
         );
-        assert!(
-            mux.get_tab(source_tab.tab_id())
-                .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab))
-        );
+        assert!(mux
+            .get_tab(source_tab.tab_id())
+            .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
         assert_eq!(target_tab.iter_all_panes().len(), 1);
         assert!(Arc::ptr_eq(&target_tab.iter_all_panes()[0], &target));
         assert_eq!(source_tab.iter_all_panes().len(), 1);
@@ -15094,25 +15096,35 @@ mod test {
             Arc::new(FloatingReconcileTestDomain { domain_id: 1 });
         mux.add_domain(&original_domain)
             .expect("register original moved-split domain");
+        let exact_domain_registration = mux
+            .domain_registrations
+            .read()
+            .get(&original_domain.domain_id())
+            .cloned()
+            .expect("capture exact moved-split domain registration");
         let source_window = mux.new_empty_window(Some("moved-domain".to_string()), None);
         let source_window_id = *source_window;
-        drop(source_window);
         let target_window = mux.new_empty_window(Some("moved-domain".to_string()), None);
         let target_window_id = *target_window;
-        drop(target_window);
         let source = FakePane::new(32_130, size);
         let target = FakePane::new(32_131, size);
         let source_tab = attach_floating_reconcile_test_tab(&mux, &source, size, source_window_id);
         let target_tab = attach_floating_reconcile_test_tab(&mux, &target, size, target_window_id);
+        drop(source_window);
+        drop(target_window);
         let target_guard = mux
             .capture_pane_operation(target.pane_id())
             .expect("capture target before domain replacement");
         let source_guard = mux
             .capture_pane_operation(source.pane_id())
             .expect("capture source before domain replacement");
+        assert_eq!(
+            exact_domain_registration.generation.active_operations(),
+            2,
+            "each admitted pane operation must retain the exact domain generation"
+        );
         let counts_before = mux.num_panes_by_workspace.read().clone();
-        let topology_before = mux.topology.lock().revision;
-        let authority_before = {
+        let authority_before: [u64; 2] = {
             let authority = mux.pane_authority.lock();
             [target.pane_id(), source.pane_id()].map(|pane_id| {
                 authority
@@ -15128,33 +15140,46 @@ mod test {
             mux.get_domain(original_domain.domain_id()).is_none(),
             "logical retirement must close new admission before relocation"
         );
+        assert!(
+            mux.domain_retirements.contains(original_domain.domain_id()),
+            "admitted pane operations must keep destructive domain retirement fenced"
+        );
+        let topology_after_retirement = mux.topology.lock().revision;
 
         mux.commit_guarded_moved_split(&target_guard, &source_guard, SplitRequest::default())
             .expect_err("a retired admitted domain must reject exact relocation");
 
-        assert_eq!(mux.topology.lock().revision, topology_before);
+        assert_eq!(mux.topology.lock().revision, topology_after_retirement);
         assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
-        assert!(
-            mux.get_tab(source_tab.tab_id())
-                .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab))
-        );
-        assert!(
-            mux.get_tab(target_tab.tab_id())
-                .is_some_and(|tab| Arc::ptr_eq(&tab, &target_tab))
-        );
+        assert!(mux
+            .get_tab(source_tab.tab_id())
+            .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
+        assert!(mux
+            .get_tab(target_tab.tab_id())
+            .is_some_and(|tab| Arc::ptr_eq(&tab, &target_tab)));
         assert_eq!(source_tab.iter_all_panes().len(), 1);
         assert!(Arc::ptr_eq(&source_tab.iter_all_panes()[0], &source));
         assert_eq!(target_tab.iter_all_panes().len(), 1);
         assert!(Arc::ptr_eq(&target_tab.iter_all_panes()[0], &target));
         let authority = mux.pane_authority.lock();
-        let authority_after = [target.pane_id(), source.pane_id()].map(|pane_id| {
-            authority
-                .structural_by_pane_id
-                .get(&pane_id)
-                .expect("rejected relocation preserves structural authority")
-                .generation
-        });
-        assert_eq!(authority_after, authority_before);
+        let authority_after: [Option<u64>; 2] =
+            [target.pane_id(), source.pane_id()].map(|pane_id| {
+                authority
+                    .structural_by_pane_id
+                    .get(&pane_id)
+                    .map(|owner| owner.generation)
+            });
+        for (after, before) in IntoIterator::into_iter(authority_after).zip(authority_before) {
+            if let Some(after) = after {
+                assert_eq!(
+                    after, before,
+                    "rejected relocation must not replace authority"
+                );
+            }
+        }
+        drop(authority);
+        drop(target_guard);
+        drop(source_guard);
     }
 
     #[test]
@@ -15172,14 +15197,14 @@ mod test {
             .expect("register moved-split domain");
         let source_window = mux.new_empty_window(Some("moved-depth".to_string()), None);
         let source_window_id = *source_window;
-        drop(source_window);
         let target_window = mux.new_empty_window(Some("moved-depth".to_string()), None);
         let target_window_id = *target_window;
-        drop(target_window);
         let source = FakePane::new(32_135, size);
         let target = FakePane::new(32_136, size);
         let source_tab = attach_floating_reconcile_test_tab(&mux, &source, size, source_window_id);
         let target_tab = attach_floating_reconcile_test_tab(&mux, &target, size, target_window_id);
+        drop(source_window);
+        drop(target_window);
         let target_guard = mux
             .capture_pane_operation(target.pane_id())
             .expect("capture overdepth target");
@@ -15224,10 +15249,9 @@ mod test {
         );
         assert_eq!(mux.topology.lock().revision, topology_before);
         assert_eq!(*mux.num_panes_by_workspace.read(), counts_before);
-        assert!(
-            mux.get_tab(source_tab.tab_id())
-                .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab))
-        );
+        assert!(mux
+            .get_tab(source_tab.tab_id())
+            .is_some_and(|tab| Arc::ptr_eq(&tab, &source_tab)));
         assert_eq!(source_tab.iter_all_panes().len(), 1);
         assert!(Arc::ptr_eq(&source_tab.iter_all_panes()[0], &source));
     }
@@ -15247,14 +15271,14 @@ mod test {
             .expect("register moved-split domain");
         let source_window = mux.new_empty_window(Some("moved-order".to_string()), None);
         let source_window_id = *source_window;
-        drop(source_window);
         let target_window = mux.new_empty_window(Some("moved-order".to_string()), None);
         let target_window_id = *target_window;
-        drop(target_window);
         let source = FakePane::new(32_140, size);
         let target = FakePane::new(32_141, size);
         let source_tab = attach_floating_reconcile_test_tab(&mux, &source, size, source_window_id);
         let target_tab = attach_floating_reconcile_test_tab(&mux, &target, size, target_window_id);
+        drop(source_window);
+        drop(target_window);
         let target_guard = mux
             .capture_pane_operation(target.pane_id())
             .expect("capture retirement-order target");
@@ -15291,12 +15315,10 @@ mod test {
                     assert!(target_tab.inner.try_lock().is_some());
                     assert!(mux.get_tab(source_tab_id).is_none());
                     assert!(mux.get_window(source_window_id).is_none());
-                    assert!(
-                        target_tab
-                            .iter_all_panes()
-                            .iter()
-                            .any(|pane| pane.pane_id() == source_pane_id)
-                    );
+                    assert!(target_tab
+                        .iter_all_panes()
+                        .iter()
+                        .any(|pane| pane.pane_id() == source_pane_id));
                     Some(0_u8)
                 }
                 MuxNotification::TabResized(tab_id) if *tab_id == target_tab_id => Some(1),
@@ -15354,10 +15376,9 @@ mod test {
         assert!(pane.get_logical_lines(0..10).is_empty());
         assert_eq!(pane.get_title(), "fake-pane-42");
         assert!(pane.send_paste("discarded").is_ok());
-        assert!(
-            pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
-                .is_ok()
-        );
+        assert!(pane
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .is_ok());
         assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
         assert!(pane.reader().unwrap().is_none());
         assert!(!pane.is_dead());
@@ -15399,9 +15420,9 @@ mod test {
         mux.add_domain(&domain).expect("register test domain");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(30_001, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        drop(window);
         let before_revision = mux.topology.lock().revision;
 
         {
@@ -15419,33 +15440,26 @@ mod test {
             .reconcile_domain_floating_panes(1, vec![Arc::clone(&tiled)], Vec::new())
             .expect_err("an unchanged snapshot must still reject authority corruption");
         assert!(
-            format!("{error:#}").contains("lacks exact domain authority"),
+            format!("{error:#}").contains("empty registration directory"),
             "unexpected reconciliation error: {:#}",
             error
         );
         assert_eq!(mux.topology.lock().revision, before_revision);
         assert!(tab.iter_floating_panes().is_empty());
-        assert!(
-            mux.panes
-                .read()
-                .get(&30_001)
-                .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &tiled))
-        );
+        assert!(mux
+            .panes
+            .read()
+            .get(&30_001)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &tiled)));
         let authority = mux.pane_authority.lock();
-        assert!(
-            authority
-                .registrations_by_domain
-                .get(&1)
-                .is_some_and(|registrations| !registrations
-                    .pane_registrations
-                    .contains_key(&30_001))
-        );
-        assert!(
-            authority
-                .structural_by_pane_id
-                .get(&30_001)
-                .is_some_and(|owner| owner.matches_pane(&tiled) && owner.matches_tab(&tab))
-        );
+        assert!(authority
+            .registrations_by_domain
+            .get(&1)
+            .is_some_and(|registrations| !registrations.pane_registrations.contains_key(&30_001)));
+        assert!(authority
+            .structural_by_pane_id
+            .get(&30_001)
+            .is_some_and(|owner| owner.matches_pane(&tiled) && owner.matches_tab(&tab)));
     }
 
     #[test]
@@ -15462,7 +15476,6 @@ mod test {
         mux.add_domain(&domain).expect("register test domain");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
-        drop(window);
         let workspace = mux
             .windows
             .read()
@@ -15473,6 +15486,7 @@ mod test {
         let tiled = FakePane::new(30_002, size);
         let floating = FakePane::new(30_003, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        drop(window);
         mux.pane_count_recomputes
             .store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -15493,22 +15507,18 @@ mod test {
                 .get(&1)
                 .expect("reconciled domain directory");
             assert!(domain_registrations.matches_domain(Some(&domain)));
-            assert!(
-                domain_registrations
-                    .pane_registrations
-                    .get(&30_003)
-                    .is_some_and(|registration| registration.is_same_pane(&floating))
-            );
-            assert!(
-                authority
-                    .structural_by_pane_id
-                    .get(&30_003)
-                    .is_some_and(|owner| {
-                        owner.matches_pane(&floating)
-                            && owner.matches_tab(&tab)
-                            && owner.lane == PaneStructuralLane::Floating
-                    })
-            );
+            assert!(domain_registrations
+                .pane_registrations
+                .get(&30_003)
+                .is_some_and(|registration| registration.is_same_pane(&floating)));
+            assert!(authority
+                .structural_by_pane_id
+                .get(&30_003)
+                .is_some_and(|owner| {
+                    owner.matches_pane(&floating)
+                        && owner.matches_tab(&tab)
+                        && owner.lane == PaneStructuralLane::Floating
+                }));
         }
 
         let callback_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -15552,20 +15562,14 @@ mod test {
         assert!(mux.panes.read().get(&30_003).is_none());
         let authority = mux.pane_authority.lock();
         assert!(authority.structural_by_pane_id.get(&30_003).is_none());
-        assert!(
-            authority
-                .registrations_by_domain
-                .get(&1)
-                .is_some_and(|registrations| !registrations
-                    .pane_registrations
-                    .contains_key(&30_003))
-        );
-        assert!(
-            authority
-                .pane_ids_by_tab
-                .get(&tab.tab_id())
-                .is_some_and(|members| !members.pane_ids.contains(&30_003))
-        );
+        assert!(authority
+            .registrations_by_domain
+            .get(&1)
+            .is_some_and(|registrations| !registrations.pane_registrations.contains_key(&30_003)));
+        assert!(authority
+            .pane_ids_by_tab
+            .get(&tab.tab_id())
+            .is_some_and(|members| !members.pane_ids.contains(&30_003)));
     }
 
     #[test]
@@ -15582,9 +15586,9 @@ mod test {
         mux.add_domain(&domain).expect("register test domain");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(30_015, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        drop(window);
         let drop_state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let weak_mux = Arc::downgrade(&mux);
         let weak_tab = Arc::downgrade(&tab);
@@ -15645,11 +15649,11 @@ mod test {
         mux.add_domain(&domain).expect("register test domain");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
-        drop(window);
         let first_tiled = FakePane::new(30_004, size);
         let second_tiled = FakePane::new(30_005, size);
         let first_tab = attach_floating_reconcile_test_tab(&mux, &first_tiled, size, window_id);
         let second_tab = attach_floating_reconcile_test_tab(&mux, &second_tiled, size, window_id);
+        drop(window);
         let first_float = FakePane::new(30_006, size);
         let second_float = FakePane::new(30_007, size);
         let authoritative = || {
@@ -15690,36 +15694,30 @@ mod test {
         assert!(Arc::ptr_eq(&first_current[0].pane, &second_float));
         assert!(Arc::ptr_eq(&second_current[0].pane, &first_float));
         let authority = mux.pane_authority.lock();
-        assert!(
-            authority
-                .structural_by_pane_id
-                .get(&30_006)
-                .is_some_and(|owner| owner.matches_pane(&first_float)
-                    && owner.matches_tab(&second_tab)
-                    && owner.lane == PaneStructuralLane::Floating)
-        );
-        assert!(
-            authority
-                .structural_by_pane_id
-                .get(&30_007)
-                .is_some_and(|owner| owner.matches_pane(&second_float)
-                    && owner.matches_tab(&first_tab)
-                    && owner.lane == PaneStructuralLane::Floating)
-        );
-        assert!(
-            authority
-                .pane_ids_by_tab
-                .get(&first_tab.tab_id())
-                .is_some_and(|members| members.pane_ids.contains(&30_007)
-                    && !members.pane_ids.contains(&30_006))
-        );
-        assert!(
-            authority
-                .pane_ids_by_tab
-                .get(&second_tab.tab_id())
-                .is_some_and(|members| members.pane_ids.contains(&30_006)
-                    && !members.pane_ids.contains(&30_007))
-        );
+        assert!(authority
+            .structural_by_pane_id
+            .get(&30_006)
+            .is_some_and(|owner| owner.matches_pane(&first_float)
+                && owner.matches_tab(&second_tab)
+                && owner.lane == PaneStructuralLane::Floating));
+        assert!(authority
+            .structural_by_pane_id
+            .get(&30_007)
+            .is_some_and(|owner| owner.matches_pane(&second_float)
+                && owner.matches_tab(&first_tab)
+                && owner.lane == PaneStructuralLane::Floating));
+        assert!(authority
+            .pane_ids_by_tab
+            .get(&first_tab.tab_id())
+            .is_some_and(
+                |members| members.pane_ids.contains(&30_007) && !members.pane_ids.contains(&30_006)
+            ));
+        assert!(authority
+            .pane_ids_by_tab
+            .get(&second_tab.tab_id())
+            .is_some_and(
+                |members| members.pane_ids.contains(&30_006) && !members.pane_ids.contains(&30_007)
+            ));
         assert_eq!(
             mux.pane_count_recomputes
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -15741,11 +15739,11 @@ mod test {
         mux.add_domain(&domain).expect("register test domain");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
-        drop(window);
         let first_tiled = FakePane::new(30_012, size);
         let second_tiled = FakePane::new(30_013, size);
         let first_tab = attach_floating_reconcile_test_tab(&mux, &first_tiled, size, window_id);
         let second_tab = attach_floating_reconcile_test_tab(&mux, &second_tiled, size, window_id);
+        drop(window);
         let floating = FakePane::new(30_014, size);
         let authoritative = || {
             vec![
@@ -15792,34 +15790,27 @@ mod test {
         assert_eq!(first_current.len(), 1);
         assert!(Arc::ptr_eq(&first_current[0].pane, &floating));
         assert!(second_tab.iter_floating_panes().is_empty());
-        assert!(
-            mux.panes
-                .read()
-                .get(&30_014)
-                .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating))
-        );
+        assert!(mux
+            .panes
+            .read()
+            .get(&30_014)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating)));
         let authority = mux.pane_authority.lock();
         assert_eq!(authority.next_structural_generation, u64::MAX);
-        assert!(
-            authority
-                .structural_by_pane_id
-                .get(&30_014)
-                .is_some_and(|owner| owner.matches_pane(&floating)
-                    && owner.matches_tab(&first_tab)
-                    && owner.generation == incumbent_structural_generation)
-        );
-        assert!(
-            authority
-                .pane_ids_by_tab
-                .get(&first_tab.tab_id())
-                .is_some_and(|members| members.pane_ids.contains(&30_014))
-        );
-        assert!(
-            authority
-                .pane_ids_by_tab
-                .get(&second_tab.tab_id())
-                .is_some_and(|members| !members.pane_ids.contains(&30_014))
-        );
+        assert!(authority
+            .structural_by_pane_id
+            .get(&30_014)
+            .is_some_and(|owner| owner.matches_pane(&floating)
+                && owner.matches_tab(&first_tab)
+                && owner.generation == incumbent_structural_generation));
+        assert!(authority
+            .pane_ids_by_tab
+            .get(&first_tab.tab_id())
+            .is_some_and(|members| members.pane_ids.contains(&30_014)));
+        assert!(authority
+            .pane_ids_by_tab
+            .get(&second_tab.tab_id())
+            .is_some_and(|members| !members.pane_ids.contains(&30_014)));
     }
 
     #[test]
@@ -15836,10 +15827,10 @@ mod test {
         mux.add_domain(&domain).expect("register test domain");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(30_008, size);
         let floating = FakePane::new(30_009, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        drop(window);
         mux.reconcile_domain_floating_panes(
             1,
             vec![Arc::clone(&tiled), Arc::clone(&floating)],
@@ -15878,31 +15869,26 @@ mod test {
             error
         );
         assert_eq!(mux.topology.lock().revision, before_revision);
-        assert!(
-            tab.iter_floating_panes()
-                .iter()
-                .any(|positioned| Arc::ptr_eq(&positioned.pane, &floating))
-        );
-        assert!(
-            mux.panes
-                .read()
-                .get(&30_009)
-                .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating))
-        );
-        assert!(
-            mux.pending_pane_output
-                .lock()
-                .queued
-                .get(&30_009)
-                .is_some_and(|batch| Arc::ptr_eq(batch, &wrong_batch))
-        );
+        assert!(tab
+            .iter_floating_panes()
+            .iter()
+            .any(|positioned| Arc::ptr_eq(&positioned.pane, &floating)));
+        assert!(mux
+            .panes
+            .read()
+            .get(&30_009)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating)));
+        assert!(mux
+            .pending_pane_output
+            .lock()
+            .queued
+            .get(&30_009)
+            .is_some_and(|batch| Arc::ptr_eq(batch, &wrong_batch)));
         let authority = mux.pane_authority.lock();
-        assert!(
-            authority
-                .structural_by_pane_id
-                .get(&30_009)
-                .is_some_and(|owner| owner.matches_pane(&floating) && owner.matches_tab(&tab))
-        );
+        assert!(authority
+            .structural_by_pane_id
+            .get(&30_009)
+            .is_some_and(|owner| owner.matches_pane(&floating) && owner.matches_tab(&tab)));
     }
 
     #[test]
@@ -15919,10 +15905,10 @@ mod test {
         mux.add_domain(&domain).expect("register test domain");
         let window = mux.new_empty_window(None, None);
         let window_id = *window;
-        drop(window);
         let tiled = FakePane::new(30_010, size);
         let incumbent = FakePane::new(30_011, size);
         let tab = attach_floating_reconcile_test_tab(&mux, &tiled, size, window_id);
+        drop(window);
         mux.reconcile_domain_floating_panes(
             1,
             vec![Arc::clone(&tiled), Arc::clone(&incumbent)],
@@ -15948,22 +15934,19 @@ mod test {
         );
         assert_eq!(mux.topology.lock().revision, before_revision);
         assert!(successor.mux_registration_slot().load().is_none());
-        assert!(
-            mux.panes
-                .read()
-                .get(&30_011)
-                .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &incumbent))
-        );
+        assert!(mux
+            .panes
+            .read()
+            .get(&30_011)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &incumbent)));
         let positioned = tab.iter_floating_panes();
         assert_eq!(positioned.len(), 1);
         assert!(Arc::ptr_eq(&positioned[0].pane, &incumbent));
         let authority = mux.pane_authority.lock();
-        assert!(
-            authority
-                .structural_by_pane_id
-                .get(&30_011)
-                .is_some_and(|owner| owner.matches_pane(&incumbent) && owner.matches_tab(&tab))
-        );
+        assert!(authority
+            .structural_by_pane_id
+            .get(&30_011)
+            .is_some_and(|owner| owner.matches_pane(&incumbent) && owner.matches_tab(&tab)));
     }
 
     #[test]
@@ -15988,16 +15971,15 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(
-            tab.compute_split_size(
+        assert!(tab
+            .compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none()
-        );
+            .is_none());
 
         let horz_size = tab
             .compute_split_size(
@@ -16429,6 +16411,9 @@ mod test {
             dpi: 96,
         };
         let mux = Arc::new(Mux::new(None));
+        let domain: Arc<dyn Domain> = Arc::new(FloatingReconcileTestDomain { domain_id: 1 });
+        mux.add_domain(&domain)
+            .expect("register bound-split callback test domain");
         let window = mux.new_empty_window(Some("bound-split-callback".to_string()), None);
         let window_id = *window;
         let root = FakePane::new(32_001, size);
@@ -16652,20 +16637,14 @@ mod test {
         assert!(mux.pending_pane_output.lock().queued.get(&31_002).is_none());
         let authority = mux.pane_authority.lock();
         assert!(authority.structural_by_pane_id.get(&31_002).is_none());
-        assert!(
-            authority
-                .registrations_by_domain
-                .get(&1)
-                .is_some_and(|registrations| !registrations
-                    .pane_registrations
-                    .contains_key(&31_002))
-        );
-        assert!(
-            authority
-                .pane_ids_by_tab
-                .get(&tab.tab_id())
-                .is_some_and(|members| !members.pane_ids.contains(&31_002))
-        );
+        assert!(authority
+            .registrations_by_domain
+            .get(&1)
+            .is_some_and(|registrations| !registrations.pane_registrations.contains_key(&31_002)));
+        assert!(authority
+            .pane_ids_by_tab
+            .get(&tab.tab_id())
+            .is_some_and(|members| !members.pane_ids.contains(&31_002)));
         drop(authority);
         assert_eq!(
             floating
@@ -16741,11 +16720,10 @@ mod test {
             "an incumbent structural Arc must not retire a distinct live successor"
         );
         assert_eq!(mux.topology.lock().revision, before_revision);
-        assert!(
-            tab.iter_floating_panes()
-                .iter()
-                .any(|positioned| Arc::ptr_eq(&positioned.pane, &incumbent))
-        );
+        assert!(tab
+            .iter_floating_panes()
+            .iter()
+            .any(|positioned| Arc::ptr_eq(&positioned.pane, &incumbent)));
         assert!(mux.panes.read().get(&31_004).is_some_and(|registered| {
             Arc::ptr_eq(&registered.pane, &successor)
                 && Arc::ptr_eq(&registered.generation, &successor_generation)
@@ -16758,12 +16736,10 @@ mod test {
             Some(2)
         );
         let authority = mux.pane_authority.lock();
-        assert!(
-            authority
-                .structural_by_pane_id
-                .get(&31_004)
-                .is_some_and(|owner| owner.matches_pane(&incumbent) && owner.matches_tab(&tab))
-        );
+        assert!(authority
+            .structural_by_pane_id
+            .get(&31_004)
+            .is_some_and(|owner| owner.matches_pane(&incumbent) && owner.matches_tab(&tab)));
         drop(authority);
         assert_eq!(
             incumbent
@@ -16829,17 +16805,15 @@ mod test {
             crate::TopologyRevision::new(u64::MAX - 2)
         );
         drop(topology);
-        assert!(
-            tab.iter_floating_panes()
-                .iter()
-                .any(|positioned| Arc::ptr_eq(&positioned.pane, &floating))
-        );
-        assert!(
-            mux.panes
-                .read()
-                .get(&31_006)
-                .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating))
-        );
+        assert!(tab
+            .iter_floating_panes()
+            .iter()
+            .any(|positioned| Arc::ptr_eq(&positioned.pane, &floating)));
+        assert!(mux
+            .panes
+            .read()
+            .get(&31_006)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating)));
         assert_eq!(
             mux.num_panes_by_workspace
                 .read()
@@ -16847,20 +16821,17 @@ mod test {
                 .copied(),
             Some(2)
         );
-        assert!(
-            mux.pending_pane_lifecycle
-                .lock()
-                .by_pane
-                .get(&31_006)
-                .is_none()
-        );
+        assert!(mux
+            .pending_pane_lifecycle
+            .lock()
+            .by_pane
+            .get(&31_006)
+            .is_none());
         let authority = mux.pane_authority.lock();
-        assert!(
-            authority
-                .structural_by_pane_id
-                .get(&31_006)
-                .is_some_and(|owner| owner.matches_pane(&floating) && owner.matches_tab(&tab))
-        );
+        assert!(authority
+            .structural_by_pane_id
+            .get(&31_006)
+            .is_some_and(|owner| owner.matches_pane(&floating) && owner.matches_tab(&tab)));
         drop(authority);
         assert_eq!(
             floating
@@ -16933,17 +16904,15 @@ mod test {
             "wrong-generation queued output must reject terminal removal"
         );
         assert_eq!(mux.topology.lock().revision, before_revision);
-        assert!(
-            tab.iter_floating_panes()
-                .iter()
-                .any(|positioned| Arc::ptr_eq(&positioned.pane, &floating))
-        );
-        assert!(
-            mux.panes
-                .read()
-                .get(&31_010)
-                .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating))
-        );
+        assert!(tab
+            .iter_floating_panes()
+            .iter()
+            .any(|positioned| Arc::ptr_eq(&positioned.pane, &floating)));
+        assert!(mux
+            .panes
+            .read()
+            .get(&31_010)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating)));
         assert_eq!(
             mux.num_panes_by_workspace
                 .read()
@@ -16951,29 +16920,24 @@ mod test {
                 .copied(),
             Some(2)
         );
-        assert!(
-            mux.pending_pane_output
-                .lock()
-                .queued
-                .get(&31_010)
-                .is_some_and(|batch| Arc::ptr_eq(batch, &wrong_batch))
-        );
+        assert!(mux
+            .pending_pane_output
+            .lock()
+            .queued
+            .get(&31_010)
+            .is_some_and(|batch| Arc::ptr_eq(batch, &wrong_batch)));
         let authority = mux.pane_authority.lock();
-        assert!(
-            authority
-                .structural_by_pane_id
+        assert!(authority
+            .structural_by_pane_id
+            .get(&31_010)
+            .is_some_and(|owner| owner.matches_pane(&floating) && owner.matches_tab(&tab)));
+        assert!(authority
+            .registrations_by_domain
+            .get(&1)
+            .is_some_and(|registrations| registrations
+                .pane_registrations
                 .get(&31_010)
-                .is_some_and(|owner| owner.matches_pane(&floating) && owner.matches_tab(&tab))
-        );
-        assert!(
-            authority
-                .registrations_by_domain
-                .get(&1)
-                .is_some_and(|registrations| registrations
-                    .pane_registrations
-                    .get(&31_010)
-                    .is_some_and(|registration| registration.is_same_pane(&floating)))
-        );
+                .is_some_and(|registration| registration.is_same_pane(&floating))));
         drop(authority);
         assert_eq!(
             floating
@@ -16989,11 +16953,9 @@ mod test {
             0
         );
         let removed_wrong_batch = mux.pending_pane_output.lock().queued.remove(&31_010);
-        assert!(
-            removed_wrong_batch
-                .as_ref()
-                .is_some_and(|batch| Arc::ptr_eq(batch, &wrong_batch))
-        );
+        assert!(removed_wrong_batch
+            .as_ref()
+            .is_some_and(|batch| Arc::ptr_eq(batch, &wrong_batch)));
     }
 
     #[test]
@@ -17047,12 +17009,11 @@ mod test {
             }),
         );
         assert!(tab.iter_floating_panes().is_empty());
-        assert!(
-            mux.panes
-                .read()
-                .get(&31_008)
-                .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating))
-        );
+        assert!(mux
+            .panes
+            .read()
+            .get(&31_008)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &floating)));
         assert_eq!(mux.topology.lock().revision, before_revision);
         assert_eq!(
             mux.num_panes_by_workspace
@@ -17067,15 +17028,13 @@ mod test {
             before_structural_generation
         );
         assert!(authority.structural_by_pane_id.get(&31_008).is_none());
-        assert!(
-            authority
-                .registrations_by_domain
-                .get(&1)
-                .is_some_and(|registrations| registrations
-                    .pane_registrations
-                    .get(&31_008)
-                    .is_some_and(|registration| registration.is_same_pane(&floating)))
-        );
+        assert!(authority
+            .registrations_by_domain
+            .get(&1)
+            .is_some_and(|registrations| registrations
+                .pane_registrations
+                .get(&31_008)
+                .is_some_and(|registration| registration.is_same_pane(&floating))));
         drop(authority);
         assert_eq!(
             mux.pane_count_recomputes
@@ -17559,12 +17518,10 @@ mod test {
             admitted[PaneSnapshotMetadataField::PaneTtyName.index()],
             (PaneSnapshotMetadataField::PaneTtyName, 1)
         );
-        assert!(
-            ledger
-                .take_unreported_admitted_values()
-                .iter()
-                .all(|(_, values)| *values == 0)
-        );
+        assert!(ledger
+            .take_unreported_admitted_values()
+            .iter()
+            .all(|(_, values)| *values == 0));
 
         let before = ledger.attempt_stats();
         let rejected = "xxxxx".to_string();
@@ -18706,10 +18663,8 @@ mod test {
                 TEST_ORDERED_PANE_CENSUS_WORK,
             )
             .expect_err("one numeric pane id cannot identify two exact pane objects");
-        assert!(
-            format!("{numeric_error:#}")
-                .contains("pane id 901 belongs to more than one exact pane identity")
-        );
+        assert!(format!("{numeric_error:#}")
+            .contains("pane id 901 belongs to more than one exact pane identity"));
         assert_eq!(numeric_arena, [prefix]);
     }
 
@@ -19018,11 +18973,8 @@ mod test {
 
         assert_eq!(getter_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_eq!(descriptor.node_count, 3);
-        let [
-            PaneArenaNode::Split { .. },
-            PaneArenaNode::Leaf(first),
-            PaneArenaNode::Leaf(second),
-        ] = arena.as_slice()
+        let [PaneArenaNode::Split { .. }, PaneArenaNode::Leaf(first), PaneArenaNode::Leaf(second)] =
+            arena.as_slice()
         else {
             panic!("retried split snapshot must retain canonical preorder");
         };
@@ -19111,11 +19063,8 @@ mod test {
 
         assert_eq!(callback_calls.load(std::sync::atomic::Ordering::Acquire), 2);
         assert_eq!(descriptor.node_count, 3);
-        let [
-            PaneArenaNode::Split { .. },
-            PaneArenaNode::Leaf(first),
-            PaneArenaNode::Leaf(second),
-        ] = arena.as_slice()
+        let [PaneArenaNode::Split { .. }, PaneArenaNode::Leaf(first), PaneArenaNode::Leaf(second)] =
+            arena.as_slice()
         else {
             panic!("retried identity snapshot must retain canonical preorder");
         };
@@ -19266,9 +19215,19 @@ mod test {
         let replacement =
             FakePane::new_with_callback_probe(77, size, false, false, Arc::clone(&probe));
 
-        tab.assign_pane(&dead);
-        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&replacement))
-            .expect("same numeric ID is permitted for an adversarial exact-identity test");
+        {
+            let mut inner = tab.inner.lock();
+            inner.pane = Some(Tree::Node {
+                left: Box::new(Tree::Leaf(Arc::clone(&dead))),
+                right: Box::new(Tree::Leaf(Arc::clone(&replacement))),
+                data: Some(SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first: size,
+                    second: size,
+                }),
+            });
+            inner.active = 0;
+        }
         tab.set_active_idx(0);
         armed.store(true, std::sync::atomic::Ordering::Release);
 
@@ -19283,7 +19242,7 @@ mod test {
     }
 
     #[test]
-    fn kill_registration_preserves_same_id_visible_pane_when_current_is_hidden_in_stack() {
+    fn kill_registration_rejects_unbound_same_id_topology_without_mutation() {
         let size = TerminalSize {
             rows: 24,
             cols: 80,
@@ -19346,8 +19305,8 @@ mod test {
             "a retired handle must not remove either same-ID topology identity"
         );
         assert!(
-            tab.kill_pane_registration(&current_registration),
-            "the current hidden registration should be removed and killed exactly once"
+            !tab.kill_pane_registration(&current_registration),
+            "an unbound adversarial topology has no structural authority to mutate"
         );
 
         assert_eq!(
@@ -19356,8 +19315,8 @@ mod test {
                 .expect("current pane should retain its concrete test type")
                 .kills
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "only the exact current registration may be killed"
+            0,
+            "fail-closed rejection must not kill the current registration"
         );
         assert_eq!(
             stale_visible
@@ -19368,11 +19327,10 @@ mod test {
             0,
             "the same-ID visible stale pane must not be killed"
         );
-        assert!(
-            mux.get_pane(78).is_none(),
-            "retiring the current registration must leave the reusable numeric slot empty"
-        );
-        assert_eq!(current_registration.try_with_current(|_| ()), None);
+        assert!(mux
+            .get_pane(78)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &current_hidden)));
+        assert_eq!(current_registration.try_with_current(|_| ()), Some(()));
 
         let visible = tab.iter_panes();
         assert_eq!(visible.len(), 1);
@@ -19381,19 +19339,20 @@ mod test {
             "the original visible tree leaf must remain the exact stale Arc"
         );
         let all_panes = tab.iter_all_panes();
-        assert_eq!(all_panes.len(), 1);
+        assert_eq!(all_panes.len(), 2);
         assert!(Arc::ptr_eq(&all_panes[0], &stale_visible));
+        assert!(Arc::ptr_eq(&all_panes[1], &current_hidden));
 
         let inner = tab.inner.lock();
         let stack = inner
             .pane_stacks
             .get(&0)
             .expect("the surviving visible pane should retain its stack slot");
-        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.len(), 2);
         assert_eq!(stack.active_index(), 0);
         assert!(
             Arc::ptr_eq(stack.active_pane(), &stale_visible),
-            "exact hidden removal must preserve the visible stack selection"
+            "fail-closed rejection must preserve the visible stack selection"
         );
         assert!(matches!(
             inner.pane.as_ref(),

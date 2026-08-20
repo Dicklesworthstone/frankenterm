@@ -912,17 +912,55 @@ impl WrappedSshChild {
 
         let (tx, rx) = bounded(1);
         if promise::spawn::is_scheduler_configured() {
-            let mux_owner = Weak::clone(&self.mux_owner);
-            promise::spawn::spawn_into_main_thread(async move {
-                if let Ok(status) = child.async_wait().await {
-                    tx.send(status).await.ok();
-                    if let Some(mux) = mux_owner.upgrade() {
-                        mux.prune_dead_windows();
-                    }
+            match promise::spawn::try_reserve_background_task(8 * 1024) {
+                Ok(background) => {
+                    let mux_owner = Weak::clone(&self.mux_owner);
+                    background.spawn(async move {
+                        match child.async_wait().await {
+                            Ok(status) => {
+                                tx.send(status).await.ok();
+                                if let Some(mux) = mux_owner.upgrade() {
+                                    match promise::spawn::try_reserve_main_thread(
+                                        promise::spawn::MainThreadServiceClass::Topology,
+                                        4 * 1024,
+                                    ) {
+                                        promise::spawn::MainThreadReservationOutcome::Reserved(
+                                            reservation,
+                                        ) => {
+                                            reservation
+                                                .spawn(async move {
+                                                    mux.prune_dead_windows();
+                                                })
+                                                .detach();
+                                        }
+                                        rejected => {
+                                            metrics::counter!(
+                                                "mux.ssh_child_prune_admission",
+                                                "outcome" => "inline_fallback"
+                                            )
+                                            .increment(1);
+                                            log::error!(
+                                                "main-thread scheduler rejected SSH child prune; preserving cleanup inline: {rejected:?}"
+                                            );
+                                            mux.prune_dead_windows();
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                log::error!("SSH child wait failed on background executor: {err:#}");
+                            }
+                        }
+                    });
+                    self.status.replace(rx);
                 }
-            })
-            .detach();
-            self.status.replace(rx);
+                Err(err) => {
+                    log::error!(
+                        "background executor rejected SSH child wait; retaining synchronous child authority: {err:#}"
+                    );
+                    self.child.replace(child);
+                }
+            }
         } else {
             self.child.replace(child);
         }

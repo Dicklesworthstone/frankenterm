@@ -613,10 +613,29 @@ impl TermWizRunCleanup {
         };
         let dispatch = TermWizCleanupDispatch::new(registration);
         if promise::spawn::is_scheduler_configured() {
-            promise::spawn::spawn_into_main_thread(async move {
-                dispatch.execute();
-            })
-            .detach();
+            match promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                4 * 1024,
+            ) {
+                promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                    reservation
+                        .spawn(async move {
+                            dispatch.execute();
+                        })
+                        .detach();
+                }
+                rejected => {
+                    metrics::counter!(
+                        "mux.termwiz.cleanup_admission",
+                        "outcome" => "inline_drop_fallback"
+                    )
+                    .increment(1);
+                    log::error!(
+                        "main-thread scheduler rejected TermWiz cleanup; preserving exact cleanup through dispatch drop: {rejected:?}"
+                    );
+                    drop(dispatch);
+                }
+            }
         } else {
             dispatch.execute();
         }
@@ -733,18 +752,31 @@ pub fn run<T: Send + 'static, F: Send + 'static + FnOnce(TermWizTerminal) -> any
             Ok(cleanup)
         }
 
-        let mut cleanup = promise::spawn::spawn_into_main_thread(async move {
-            register_tab(
-                origin_mux,
-                input_tx,
-                render_rx,
-                size,
-                window_id,
-                term_config,
-            )
-            .await
-        })
-        .await?;
+        let reservation = match promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            8 * 1024,
+        ) {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                anyhow::bail!(
+                    "main-thread scheduler rejected TermWiz tab registration before topology construction: {rejected:?}"
+                )
+            }
+        };
+        let mut cleanup = reservation
+            .spawn(async move {
+                register_tab(
+                    origin_mux,
+                    input_tx,
+                    render_rx,
+                    size,
+                    window_id,
+                    term_config,
+                )
+                .await
+            })
+            .into_task()
+            .await?;
 
         let result = promise::spawn::spawn_into_new_thread(move || f(tw_term)).await;
 

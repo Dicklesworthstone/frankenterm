@@ -2,11 +2,13 @@ use crate::{PaneId, PaneRegistrationHandle};
 use chrono::serde::ts_milliseconds;
 use chrono::{DateTime, Utc};
 use serde::*;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 static CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
+const CLIENT_REGISTRATION_RETIRED: usize = 1usize << (usize::BITS - 1);
+const CLIENT_REGISTRATION_OPERATION_MASK: usize = CLIENT_REGISTRATION_RETIRED - 1;
 lazy_static::lazy_static! {
     static ref EPOCH: u64 = SystemTime::now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -69,6 +71,14 @@ pub struct ClientInfo {
     /// against whichever pane later occupies that reusable slot.
     #[serde(skip, default)]
     focused_pane_registration: Option<PaneRegistrationHandle>,
+    /// Exact process-local lifetime authority for this client registration.
+    ///
+    /// It is deliberately absent from the wire representation. Equal-valued
+    /// `ClientId`s may be registered by successive connections, but deferred
+    /// work must retain the generation that admitted it rather than rechecking
+    /// whichever allocation currently occupies the value-keyed map slot.
+    #[serde(skip, default)]
+    pub(crate) registration_generation: Arc<ClientRegistrationGeneration>,
 }
 
 impl ClientInfo {
@@ -80,6 +90,7 @@ impl ClientInfo {
             last_input: Utc::now(),
             focused_pane_id: None,
             focused_pane_registration: None,
+            registration_generation: Arc::new(ClientRegistrationGeneration::default()),
         }
     }
 
@@ -97,6 +108,7 @@ impl ClientInfo {
             last_input,
             focused_pane_id,
             focused_pane_registration: None,
+            registration_generation: Arc::new(ClientRegistrationGeneration::default()),
         }
     }
 
@@ -126,7 +138,82 @@ impl ClientInfo {
         let mut snapshot = self.clone();
         snapshot.client_id = Arc::new(self.client_id.as_ref().clone());
         snapshot.focused_pane_registration = None;
+        snapshot.registration_generation = Arc::new(ClientRegistrationGeneration::default());
         snapshot
+    }
+}
+
+/// Admission state for one exact process-local client registration.
+///
+/// Retirement sets the high bit and therefore closes acquisition in the same
+/// `clients` write cut that removes or replaces the registration. Operations
+/// admitted before that cut retain a counted lease and may finish only with
+/// the exact `ClientOperationGuard` that owns it.
+#[derive(Debug, Default)]
+pub(crate) struct ClientRegistrationGeneration {
+    operation_state: AtomicUsize,
+}
+
+impl ClientRegistrationGeneration {
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<ClientRegistrationOperationLease> {
+        let mut state = self.operation_state.load(Ordering::Acquire);
+        loop {
+            if state & CLIENT_REGISTRATION_RETIRED != 0 {
+                return None;
+            }
+            let active = state & CLIENT_REGISTRATION_OPERATION_MASK;
+            let next = active.checked_add(1)?;
+            if next > CLIENT_REGISTRATION_OPERATION_MASK {
+                return None;
+            }
+            match self.operation_state.compare_exchange_weak(
+                state,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ClientRegistrationOperationLease {
+                        generation: Arc::clone(self),
+                    });
+                }
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    pub(crate) fn retire(&self) {
+        self.operation_state
+            .fetch_or(CLIENT_REGISTRATION_RETIRED, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_retired(&self) -> bool {
+        self.operation_state.load(Ordering::Acquire) & CLIENT_REGISTRATION_RETIRED != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_operations(&self) -> usize {
+        self.operation_state.load(Ordering::Acquire) & CLIENT_REGISTRATION_OPERATION_MASK
+    }
+}
+
+/// Counted, non-cloneable admission lease for one client generation.
+#[derive(Debug)]
+pub(crate) struct ClientRegistrationOperationLease {
+    generation: Arc<ClientRegistrationGeneration>,
+}
+
+impl Drop for ClientRegistrationOperationLease {
+    fn drop(&mut self) {
+        let previous = self
+            .generation
+            .operation_state
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous & CLIENT_REGISTRATION_OPERATION_MASK > 0,
+            "client registration operation count must not underflow"
+        );
     }
 }
 

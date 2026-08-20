@@ -351,10 +351,7 @@ impl Window {
         })
     }
 
-    pub(crate) fn commit_structural_pane_count(
-        &mut self,
-        prepared: PreparedWindowPaneCount,
-    ) {
+    pub(crate) fn commit_structural_pane_count(&mut self, prepared: PreparedWindowPaneCount) {
         assert_eq!(
             prepared.window_id, self.id,
             "prepared pane count changed windows"
@@ -2821,11 +2818,9 @@ mod tests {
             vec![Arc::as_ptr(&first), Arc::as_ptr(&new), Arc::as_ptr(&third)],
         );
         assert_eq!(window.get_active_idx(), 1);
-        assert!(
-            window
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &new))
-        );
+        assert!(window
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &new)));
         assert_eq!(window.last_active, Some(new_id));
         assert_eq!(window.tab_stack_for_tab(old_id), None);
         assert_eq!(window.tab_stack_for_tab(new_id), Some(stack_id));
@@ -2876,11 +2871,9 @@ mod tests {
             .expect("present inactive exact tab must produce a replacement");
         window.commit_prepared_state(prepared);
 
-        assert!(
-            window
-                .get_active()
-                .is_some_and(|tab| Arc::ptr_eq(tab, &active))
-        );
+        assert!(window
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
         assert_eq!(window.get_active_idx(), 2);
         assert_eq!(window.last_active, Some(new.tab_id()));
         assert_eq!(
@@ -2939,23 +2932,19 @@ mod tests {
         let stacks = window.tab_stacks.clone();
         let revision = window.order_revision();
 
-        assert!(
-            window
-                .prepare_replace_exact(&absent, &replacement)
-                .expect("absent old tab is not malformed")
-                .is_none()
-        );
+        assert!(window
+            .prepare_replace_exact(&absent, &replacement)
+            .expect("absent old tab is not malformed")
+            .is_none());
         assert_unchanged(&window, &pointers, active, last_active, &stacks, revision);
 
         let existing_error = match window.prepare_replace_exact(&old, &existing_new) {
             Err(error) => error,
             Ok(_) => panic!("an already-present replacement must be rejected"),
         };
-        assert!(
-            existing_error
-                .to_string()
-                .contains("already contains replacement")
-        );
+        assert!(existing_error
+            .to_string()
+            .contains("already contains replacement"));
         assert_unchanged(&window, &pointers, active, last_active, &stacks, revision);
 
         window.last_active = Some(replacement.tab_id());
