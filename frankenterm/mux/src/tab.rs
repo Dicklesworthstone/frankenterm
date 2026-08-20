@@ -7924,6 +7924,7 @@ impl Tab {
         expected_window_id: Option<WindowId>,
         split: Option<(&PaneRegistrationHandle, SplitRequest)>,
         pane: &Arc<dyn Pane>,
+        on_structural_cut: impl FnOnce(),
     ) -> anyhow::Result<(PaneRegistrationHandle, usize)> {
         anyhow::ensure!(
             expected_domain.domain_id() == expected_domain_id,
@@ -8236,6 +8237,12 @@ impl Tab {
             (registration, lifecycle_ticket, retired_inner)
         };
 
+        // This is the callback-free publication cut.  The registry,
+        // structural owner, pane counts, and lifecycle ticket are committed,
+        // while retired pane drops and every subscriber/Pane callback remain
+        // deferred below.  Transaction owners may retire an external cleanup
+        // obligation here without carrying its mutex across re-entrant code.
+        on_structural_cut();
         drop(retired_inner);
         callbacks.execute(Some(mux));
         mux.complete_pane_lifecycle_notification(lifecycle_ticket);
@@ -8258,6 +8265,7 @@ impl Tab {
             None,
             None,
             pane,
+            || {},
         )
         .map(|(registration, _)| registration)
     }
@@ -8272,6 +8280,7 @@ impl Tab {
         target: &PaneRegistrationHandle,
         request: SplitRequest,
         pane: &Arc<dyn Pane>,
+        on_structural_cut: impl FnOnce(),
     ) -> anyhow::Result<PaneRegistrationHandle> {
         self.commit_unregistered_tiled_pane(
             mux,
@@ -8280,6 +8289,7 @@ impl Tab {
             Some(expected_window_id),
             Some((target, request)),
             pane,
+            on_structural_cut,
         )
         .map(|(registration, _)| registration)
     }
@@ -8301,6 +8311,7 @@ impl Tab {
             None,
             Some((target, request)),
             pane,
+            || {},
         )
     }
 

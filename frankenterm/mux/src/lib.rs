@@ -1095,6 +1095,21 @@ pub enum DomainRegistrationError {
         domain_id: DomainId,
         domain_name: String,
     },
+    #[error(
+        "domain identifier {domain_id} could not acquire operation authority before publication"
+    )]
+    OperationAdmissionFailed { domain_id: DomainId },
+}
+
+#[derive(Clone, Copy)]
+enum DomainAddMode {
+    RegisterOnly,
+    RegisterAndAcquire,
+}
+
+enum DomainAddOutcome {
+    Registered,
+    Acquired(DomainOperationGuard),
 }
 
 /// One exact registration of a domain in every mux-owned domain index.
@@ -1133,6 +1148,12 @@ const DOMAIN_RETIREMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
 struct DomainOperationReleaseBarrier {
     registration_disposed: std::sync::mpsc::SyncSender<()>,
     permit_release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct DomainAddPublicationBarrier {
+    published: std::sync::mpsc::SyncSender<()>,
+    permit_return: std::sync::mpsc::Receiver<()>,
 }
 
 /// Admission and cleanup state for one exact domain registration.
@@ -6952,7 +6973,6 @@ pub struct Mux {
     window_order_receipts: Mutex<WindowOrderReceiptLedger>,
     activity_count: Arc<AtomicUsize>,
     activity_prune_state: Arc<ActivityPruneState>,
-    default_domain: RwLock<Option<Arc<dyn Domain>>>,
     default_domain_registration: RwLock<Option<Arc<LiveDomainRegistration>>>,
     domains: RwLock<HashMap<DomainId, Arc<dyn Domain>>>,
     domains_by_name: RwLock<HashMap<String, Arc<dyn Domain>>>,
@@ -6963,6 +6983,10 @@ pub struct Mux {
     domain_retirements: Arc<DomainRetirementTracker>,
     pending_domain_retirements: Mutex<PendingDomainRetirements>,
     domain_retirement_wakeup: Arc<DomainRetirementWakeup>,
+    #[cfg(test)]
+    domain_add_publication_barrier: Mutex<Option<DomainAddPublicationBarrier>>,
+    #[cfg(test)]
+    fail_next_domain_registration_operation_acquire: AtomicBool,
     #[cfg(test)]
     fail_next_domain_retirement_worker_spawn: AtomicBool,
     #[cfg(test)]
@@ -7895,7 +7919,6 @@ impl Mux {
             window_order_receipts: Mutex::new(WindowOrderReceiptLedger::new()),
             activity_count: Arc::new(AtomicUsize::new(0)),
             activity_prune_state: Arc::new(ActivityPruneState::default()),
-            default_domain: RwLock::new(default_domain),
             default_domain_registration: RwLock::new(default_domain_registration),
             domains_by_name: RwLock::new(domains_by_name),
             domains: RwLock::new(domains),
@@ -7906,6 +7929,10 @@ impl Mux {
             domain_retirements: Arc::new(DomainRetirementTracker::default()),
             pending_domain_retirements: Mutex::new(PendingDomainRetirements::default()),
             domain_retirement_wakeup: Arc::new(DomainRetirementWakeup::default()),
+            #[cfg(test)]
+            domain_add_publication_barrier: Mutex::new(None),
+            #[cfg(test)]
+            fail_next_domain_registration_operation_acquire: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_domain_retirement_worker_spawn: AtomicBool::new(false),
             #[cfg(test)]
@@ -10666,17 +10693,7 @@ impl Mux {
 
     fn resolve_default_domain(&self) -> anyhow::Result<DomainOperationGuard> {
         let _registration = self.domain_registration.lock();
-        let registration = self
-            .default_domain_registration
-            .read()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow!("no default domain configured"))?;
-        anyhow::ensure!(
-            self.domain_registration_is_current_locked(&registration),
-            "default domain {} is retired or no longer exact-current",
-            registration.domain_id
-        );
+        let registration = self.validated_default_domain_registration_locked()?;
         self.acquire_domain_operation_locked(registration)
     }
 
@@ -10721,8 +10738,13 @@ impl Mux {
                 domain_name,
             });
         }
-        *self.default_domain.write() = Some(Arc::clone(domain));
-        *self.default_domain_registration.write() = exact_registration;
+        let mut default_registration = self.default_domain_registration.write();
+        let replaced = std::mem::replace(&mut *default_registration, exact_registration);
+        drop(default_registration);
+        drop(_registration);
+        // A planted inconsistent registry could leave this as the last owner.
+        // Never run an external domain destructor under the serializer.
+        drop(replaced);
         Ok(())
     }
 
@@ -10756,12 +10778,170 @@ impl Mux {
     }
 
     pub fn add_domain(&self, domain: &Arc<dyn Domain>) -> Result<(), DomainRegistrationError> {
+        match self.add_domain_with_mode(domain, DomainAddMode::RegisterOnly)? {
+            DomainAddOutcome::Registered => Ok(()),
+            DomainAddOutcome::Acquired(_) => {
+                unreachable!("register-only domain transaction returned an operation guard")
+            }
+        }
+    }
+
+    /// Publish a domain and acquire its exact non-cloneable operation authority
+    /// in one serialized registration cut.
+    ///
+    /// The returned guard is built from the same registration Arc inserted into
+    /// every live index; it is never obtained by releasing the serializer and
+    /// looking the numeric identifier up again. Retirement can therefore close
+    /// admission immediately after this method returns without substituting a
+    /// same-ID generation or revoking the operation already admitted here.
+    pub fn add_domain_and_acquire(
+        &self,
+        domain: &Arc<dyn Domain>,
+    ) -> Result<DomainOperationGuard, DomainRegistrationError> {
+        match self.add_domain_with_mode(domain, DomainAddMode::RegisterAndAcquire)? {
+            DomainAddOutcome::Acquired(guard) => Ok(guard),
+            DomainAddOutcome::Registered => {
+                unreachable!("atomic domain admission completed without an operation guard")
+            }
+        }
+    }
+
+    /// Validate the sole default-domain authority against the already-held
+    /// exact registry indexes. This helper performs no allocation and invokes
+    /// no `Domain` callback; callers retain `domain_registration` plus the
+    /// supplied index/default guards through their admission or publication
+    /// cut. `Ok(true)` means that no live registration exists and a newly
+    /// published registration may become the default. Exact retired records
+    /// may remain indexed while their deferred cleanup owns the same-ID fence.
+    fn validate_default_domain_registration_locked(
+        &self,
+        default_registration: Option<&Arc<LiveDomainRegistration>>,
+        domains: &HashMap<DomainId, Arc<dyn Domain>>,
+        domains_by_name: &HashMap<String, Arc<dyn Domain>>,
+        registrations: &HashMap<DomainId, Arc<LiveDomainRegistration>>,
+        registrations_by_name: &HashMap<String, Arc<LiveDomainRegistration>>,
+    ) -> Result<bool, &'static str> {
+        match default_registration {
+            None => {
+                if domains.is_empty()
+                    && domains_by_name.is_empty()
+                    && registrations.is_empty()
+                    && registrations_by_name.is_empty()
+                {
+                    return Ok(true);
+                }
+
+                // Logical retirement removes the default authority before
+                // deferred teardown removes its exact index records. Accept
+                // that state only when every retained projection is a complete
+                // retired generation protected by its same-ID fence.
+                let retired_ids = self.retired_domain_ids.lock();
+                let exact_retired_only = domains.len() == registrations.len()
+                    && domains_by_name.len() == registrations_by_name.len()
+                    && registrations.len() == registrations_by_name.len()
+                    && registrations.values().all(|registration| {
+                        registration.domain_id == registration.generation.domain_id
+                            && registration.generation.is_retired()
+                            && retired_ids.contains(&registration.domain_id)
+                            && domains
+                                .get(&registration.domain_id)
+                                .is_some_and(|current| {
+                                    Arc::ptr_eq(current, &registration.domain)
+                                })
+                            && domains_by_name
+                                .get(&registration.domain_name)
+                                .is_some_and(|current| {
+                                    Arc::ptr_eq(current, &registration.domain)
+                                })
+                            && registrations_by_name
+                                .get(&registration.domain_name)
+                                .is_some_and(|current| Arc::ptr_eq(current, registration))
+                    });
+                exact_retired_only.then_some(true).ok_or(
+                    "default domain registration is absent while live or inconsistent registry indexes remain",
+                )
+            }
+            Some(registration) => {
+                let exact_default = registration.domain_id == registration.generation.domain_id
+                    && !registration.generation.is_retired()
+                    && !self
+                        .retired_domain_ids
+                        .lock()
+                        .contains(&registration.domain_id)
+                    && domains
+                        .get(&registration.domain_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &registration.domain))
+                    && domains_by_name
+                        .get(&registration.domain_name)
+                        .is_some_and(|current| Arc::ptr_eq(current, &registration.domain))
+                    && registrations
+                        .get(&registration.domain_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, registration))
+                    && registrations_by_name
+                        .get(&registration.domain_name)
+                        .is_some_and(|current| Arc::ptr_eq(current, registration));
+                exact_default
+                    .then_some(false)
+                    .ok_or("default domain registration does not name one exact live registration")
+            }
+        }
+    }
+
+    /// Clone the validated default registration while `domain_registration`
+    /// excludes a concurrent retirement or replacement. All index guards are
+    /// released before operation admission and before any cloned owner drops.
+    fn validated_default_domain_registration_locked(
+        &self,
+    ) -> anyhow::Result<Arc<LiveDomainRegistration>> {
+        let domains = self.domains.read();
+        let domains_by_name = self.domains_by_name.read();
+        let registrations = self.domain_registrations.read();
+        let registrations_by_name = self.domain_registrations_by_name.read();
+        let default_registration = self.default_domain_registration.read();
+        self.validate_default_domain_registration_locked(
+            default_registration.as_ref(),
+            &domains,
+            &domains_by_name,
+            &registrations,
+            &registrations_by_name,
+        )
+        .map_err(|detail| anyhow!("domain registry indexes are inconsistent: {detail}"))?;
+        let registration = default_registration.as_ref().cloned();
+        drop(default_registration);
+        drop(registrations_by_name);
+        drop(registrations);
+        drop(domains_by_name);
+        drop(domains);
+        registration.ok_or_else(|| anyhow!("no default domain configured"))
+    }
+
+    fn add_domain_with_mode(
+        &self,
+        domain: &Arc<dyn Domain>,
+        mode: DomainAddMode,
+    ) -> Result<DomainAddOutcome, DomainRegistrationError> {
         // Domain implementations are external callbacks. Resolve requested
         // metadata before taking registry locks so a reentrant or blocking
         // implementation cannot freeze every domain reader/writer.
         let domain_id = domain.domain_id();
-        let domain_name = domain.domain_name().to_string();
+        let registration_name = domain.domain_name().to_string();
+        // Stage both owned index keys and the exact registration before the
+        // serialized cut. Once publication starts below, every remaining
+        // operation is allocation-free and infallible under the established
+        // index-capacity preflight.
+        let domain_name_key = registration_name.clone();
+        let registration_name_key = registration_name.clone();
         let domain_arc = Arc::clone(domain);
+        let domain_weak = Arc::downgrade(domain);
+        let live_registration = LiveDomainRegistration::new(
+            domain_id,
+            registration_name,
+            Arc::clone(&domain_arc),
+        );
+        // SAFETY: every staged owner of external `Domain` state is declared
+        // before these guards. Rust's reverse local-drop order therefore
+        // releases every registry guard before an early return can dispose of
+        // `live_registration` or `domain_arc` and run a domain destructor.
         let _registration = self.domain_registration.lock();
         let _pane_registration = self.pane_registration.lock();
 
@@ -10770,7 +10950,7 @@ impl Mux {
         {
             return Err(DomainRegistrationError::RetiredIdentifier {
                 domain_id,
-                domain_name,
+                domain_name: domain_name_key,
             });
         }
 
@@ -10782,13 +10962,16 @@ impl Mux {
         if let Some(existing) = domains.get(&domain_id) {
             if Arc::ptr_eq(existing, domain) {
                 let exact_name = domains_by_name
-                    .get(&domain_name)
+                    .get(&live_registration.domain_name)
                     .is_some_and(|registered| Arc::ptr_eq(registered, domain));
                 let exact_registration = registrations.get(&domain_id);
-                let exact_registration_name = registrations_by_name.get(&domain_name);
+                let exact_registration_name =
+                    registrations_by_name.get(&live_registration.domain_name);
                 let exact_generation = exact_registration.is_some_and(|registered| {
-                    registered.matches_domain(domain)
-                        && registered.domain_name == domain_name
+                    registered.domain_id == domain_id
+                        && registered.generation.domain_id == domain_id
+                        && registered.matches_domain(domain)
+                        && registered.domain_name == live_registration.domain_name
                         && exact_registration_name
                             .is_some_and(|by_name| Arc::ptr_eq(by_name, registered))
                         && !registered.generation.is_retired()
@@ -10796,43 +10979,71 @@ impl Mux {
                 if !exact_name || !exact_generation {
                     return Err(DomainRegistrationError::RegistryInconsistent {
                         detail: format!(
-                            "identifier {domain_id} exact registration is missing live shared record/name {domain_name}"
+                            "identifier {domain_id} exact registration is missing live shared record/name {}",
+                            live_registration.domain_name
                         ),
                     });
                 }
-                if let Some(registrations) = authority.registrations_by_domain.get_mut(&domain_id)
-                {
-                    match registrations.domain.as_ref() {
-                        Some(current) if Weak::ptr_eq(current, &Arc::downgrade(domain)) => {}
-                        None => registrations.domain = Some(Arc::downgrade(domain)),
-                        Some(_) => {
-                            return Err(DomainRegistrationError::RegistryInconsistent {
-                                detail: format!(
-                                    "domain {domain_id} pane directory names another exact allocation"
-                                ),
-                            });
+                let default_registration = self.default_domain_registration.read();
+                self.validate_default_domain_registration_locked(
+                    default_registration.as_ref(),
+                    &domains,
+                    &domains_by_name,
+                    &registrations,
+                    &registrations_by_name,
+                )
+                .map_err(|detail| DomainRegistrationError::RegistryInconsistent {
+                    detail: detail.to_string(),
+                })?;
+                let bind_domain_directory =
+                    if let Some(registrations) = authority.registrations_by_domain.get(&domain_id) {
+                        match registrations.domain.as_ref() {
+                            Some(current) if Weak::ptr_eq(current, &domain_weak) => false,
+                            None => true,
+                            Some(_) => {
+                                return Err(DomainRegistrationError::RegistryInconsistent {
+                                    detail: format!(
+                                        "domain {domain_id} pane directory names another exact allocation"
+                                    ),
+                                });
+                            }
                         }
-                    }
+                    } else {
+                        false
+                    };
+                let outcome = self.prepare_domain_add_outcome_locked(
+                    mode,
+                    Arc::clone(
+                        exact_registration
+                            .expect("validated exact registration remains present"),
+                    ),
+                )?;
+                if bind_domain_directory {
+                    authority
+                        .registrations_by_domain
+                        .get_mut(&domain_id)
+                        .expect("validated domain pane directory remains present")
+                        .domain = Some(domain_weak);
                 }
-                return Ok(());
+                return Ok(outcome);
             }
-                let registered_name = domains_by_name
-                    .iter()
-                    .find_map(|(name, registered)| {
-                        Arc::ptr_eq(registered, existing).then(|| name.clone())
-                    })
-                    .ok_or_else(|| DomainRegistrationError::RegistryInconsistent {
-                        detail: format!(
-                            "identifier {domain_id} has no exact name-index registration"
-                        ),
-                    })?;
-                return Err(DomainRegistrationError::IdentifierInUse {
-                    domain_id,
-                    registered_name,
-                    requested_name: domain_name,
-                });
+            let registered_name = domains_by_name
+                .iter()
+                .find_map(|(name, registered)| {
+                    Arc::ptr_eq(registered, existing).then(|| name.clone())
+                })
+                .ok_or_else(|| DomainRegistrationError::RegistryInconsistent {
+                    detail: format!(
+                        "identifier {domain_id} has no exact name-index registration"
+                    ),
+                })?;
+            return Err(DomainRegistrationError::IdentifierInUse {
+                domain_id,
+                registered_name,
+                requested_name: domain_name_key,
+            });
         }
-        if let Some(existing) = domains_by_name.get(&domain_name) {
+        if let Some(existing) = domains_by_name.get(&live_registration.domain_name) {
             if !Arc::ptr_eq(existing, domain) {
                 let registered_id = domains
                     .iter()
@@ -10841,25 +11052,38 @@ impl Mux {
                     })
                     .ok_or_else(|| DomainRegistrationError::RegistryInconsistent {
                         detail: format!(
-                            "name {domain_name} has no exact identifier-index registration"
+                            "name {} has no exact identifier-index registration",
+                            live_registration.domain_name
                         ),
                     })?;
                 return Err(DomainRegistrationError::NameInUse {
-                    domain_name,
+                    domain_name: domain_name_key,
                     registered_id,
                     requested_id: domain_id,
                 });
             }
             return Err(DomainRegistrationError::RegistryInconsistent {
                 detail: format!(
-                    "name {domain_name} exact registration has no identifier {domain_id}"
+                    "name {} exact registration has no identifier {domain_id}",
+                    live_registration.domain_name
+                ),
+            });
+        }
+
+        if registrations.contains_key(&domain_id)
+            || registrations_by_name.contains_key(&live_registration.domain_name)
+        {
+            return Err(DomainRegistrationError::RegistryInconsistent {
+                detail: format!(
+                    "domain {domain_id} ({}) has an orphaned exact registration index",
+                    live_registration.domain_name
                 ),
             });
         }
 
         let bind_domain_directory = match authority.registrations_by_domain.get(&domain_id) {
             Some(registrations) => match registrations.domain.as_ref() {
-                Some(current) if Weak::ptr_eq(current, &Arc::downgrade(domain)) => false,
+                Some(current) if Weak::ptr_eq(current, &domain_weak) => false,
                 None => true,
                 Some(_) => {
                     return Err(DomainRegistrationError::RegistryInconsistent {
@@ -10871,6 +11095,24 @@ impl Mux {
             },
             None => false,
         };
+
+        // Default identity is part of the same registry transaction. Hold its
+        // sole exact-registration authority through publication. An absent
+        // default is installable only when no live registration exists;
+        // otherwise corruption fails before capacity growth or mutation.
+        let mut default_registration = self.default_domain_registration.write();
+        let install_default = self
+            .validate_default_domain_registration_locked(
+                default_registration.as_ref(),
+                &domains,
+                &domains_by_name,
+                &registrations,
+                &registrations_by_name,
+            )
+            .map_err(|detail| DomainRegistrationError::RegistryInconsistent {
+                detail: detail.to_string(),
+            })?;
+
         domains.try_reserve(1).map_err(|error| {
             DomainRegistrationError::RegistryInconsistent {
                 detail: format!("reserve domain identifier entry: {error}"),
@@ -10892,38 +11134,47 @@ impl Mux {
             }
         })?;
 
-        let live_registration = LiveDomainRegistration::new(
-            domain_id,
-            domain_name.clone(),
-            Arc::clone(&domain_arc),
-        );
+        // This is the final fallible step. Acquire against the staged exact
+        // generation before binding authority or publishing any index entry.
+        // The guard is retained across the commit and returned without a raw
+        // Arc projection or numeric-ID relookup.
+        let outcome = self.prepare_domain_add_outcome_locked(
+            mode,
+            Arc::clone(&live_registration),
+        )?;
 
         if bind_domain_directory {
             authority
                 .registrations_by_domain
                 .get_mut(&domain_id)
                 .expect("validated domain pane directory remains present")
-                .domain = Some(Arc::downgrade(domain));
+                .domain = Some(domain_weak);
         }
-        domains_by_name.insert(domain_name, Arc::clone(&domain_arc));
+        domains_by_name.insert(domain_name_key, Arc::clone(&domain_arc));
         domains.insert(domain_id, Arc::clone(&domain_arc));
         registrations_by_name.insert(
-            live_registration.domain_name.clone(),
+            registration_name_key,
             Arc::clone(&live_registration),
         );
         registrations.insert(domain_id, Arc::clone(&live_registration));
+
+        if install_default {
+            debug_assert!(default_registration.is_none());
+            *default_registration = Some(Arc::clone(&live_registration));
+        }
+        drop(default_registration);
         drop(registrations_by_name);
         drop(registrations);
         drop(domains_by_name);
         drop(domains);
         drop(authority);
 
-        let mut default_domain = self.default_domain.write();
-        if default_domain.is_none() {
-            *default_domain = Some(domain_arc);
-            *self.default_domain_registration.write() = Some(live_registration);
+        #[cfg(test)]
+        if matches!(mode, DomainAddMode::RegisterAndAcquire) {
+            self.wait_at_domain_add_publication_barrier();
         }
-        Ok(())
+
+        Ok(outcome)
     }
 
     pub fn set_mux(mux: &Arc<Mux>) {
@@ -15292,7 +15543,7 @@ impl Mux {
         expected: &Arc<dyn Domain>,
     ) -> bool {
         let domain = expected.domain_id();
-        let (cleanup_ready, worker_started) = {
+        let (cleanup_ready, worker_started, replaced_default_registration) = {
             let _registration = self.domain_registration.lock();
             let Some(registration) = self
                 .domain_registrations
@@ -15413,13 +15664,24 @@ impl Mux {
                     .filter(|candidate| !candidate.generation.is_retired())
                     .min_by_key(|candidate| candidate.domain_id)
                     .cloned();
-                *self.default_domain.write() = replacement
-                    .as_ref()
-                    .map(|registration| Arc::clone(&registration.domain));
-                *self.default_domain_registration.write() = replacement;
-            }
-            (cleanup_ready, worker_started)
+                let mut default_registration = self.default_domain_registration.write();
+                let replaced = std::mem::replace(&mut *default_registration, replacement);
+                drop(default_registration);
+                replaced
+            } else {
+                None
+            };
+            (
+                cleanup_ready,
+                worker_started,
+                replaced_default_registration,
+            )
         };
+
+        // A registration owns external Domain state. Dispose the displaced
+        // default only after the serializer and retirement preflight locks are
+        // gone, even if a planted inconsistent registry made it the last owner.
+        drop(replaced_default_registration);
 
         // A newly started worker cannot inspect the queue until the preflight
         // locks above are released, so it observes an immediately-ready
@@ -15967,7 +16229,7 @@ impl Mux {
         let domain = registration.domain_id;
         let removed = Arc::clone(&registration.domain);
 
-        {
+        let replaced_default_registration = {
             let _registration = self.domain_registration.lock();
             let mut domains = self.domains.write();
             if !domains
@@ -15999,7 +16261,7 @@ impl Mux {
                 .read()
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &registration));
-            if should_replace_default {
+            let replaced_default_registration = if should_replace_default {
                 let replacement = self
                     .domain_registrations
                     .read()
@@ -16007,13 +16269,18 @@ impl Mux {
                     .filter(|candidate| !candidate.generation.is_retired())
                     .min_by_key(|candidate| candidate.domain_id)
                     .cloned();
-                *self.default_domain.write() = replacement
-                    .as_ref()
-                    .map(|registration| Arc::clone(&registration.domain));
-                *self.default_domain_registration.write() = replacement;
-            }
+                let mut default_registration = self.default_domain_registration.write();
+                let replaced = std::mem::replace(&mut *default_registration, replacement);
+                drop(default_registration);
+                replaced
+            } else {
+                None
+            };
             self.retired_domain_ids.lock().remove(&domain);
-        }
+            replaced_default_registration
+        };
+        // Never dispose an external Domain owner under domain_registration.
+        drop(replaced_default_registration);
         DomainRetirementFinalization::Complete
     }
 
@@ -16062,6 +16329,78 @@ impl Mux {
             && self.domain_registration_is_current_locked(expected.registration())
     }
 
+    fn prepare_domain_add_outcome_locked(
+        &self,
+        mode: DomainAddMode,
+        registration: Arc<LiveDomainRegistration>,
+    ) -> Result<DomainAddOutcome, DomainRegistrationError> {
+        match mode {
+            DomainAddMode::RegisterOnly => Ok(DomainAddOutcome::Registered),
+            DomainAddMode::RegisterAndAcquire => {
+                #[cfg(test)]
+                if self
+                    .fail_next_domain_registration_operation_acquire
+                    .swap(false, Ordering::AcqRel)
+                {
+                    return Err(DomainRegistrationError::OperationAdmissionFailed {
+                        domain_id: registration.domain_id,
+                    });
+                }
+                if !registration.generation.try_acquire() {
+                    return Err(DomainRegistrationError::OperationAdmissionFailed {
+                        domain_id: registration.domain_id,
+                    });
+                }
+                Ok(DomainAddOutcome::Acquired(
+                    self.domain_operation_guard_from_acquired_registration(registration),
+                ))
+            }
+        }
+    }
+
+    fn domain_operation_guard_from_acquired_registration(
+        &self,
+        registration: Arc<LiveDomainRegistration>,
+    ) -> DomainOperationGuard {
+        DomainOperationGuard {
+            owner_identity: Arc::clone(&self.domain_owner_identity),
+            wakeup: Arc::clone(&self.domain_retirement_wakeup),
+            registration: Some(registration),
+        }
+    }
+
+    #[cfg(test)]
+    fn install_domain_add_publication_barrier(
+        &self,
+        published: std::sync::mpsc::SyncSender<()>,
+        permit_return: std::sync::mpsc::Receiver<()>,
+    ) {
+        let prior = self
+            .domain_add_publication_barrier
+            .lock()
+            .replace(DomainAddPublicationBarrier {
+                published,
+                permit_return,
+            });
+        assert!(prior.is_none(), "domain add publication barrier already installed");
+    }
+
+    #[cfg(test)]
+    fn wait_at_domain_add_publication_barrier(&self) {
+        let barrier = self.domain_add_publication_barrier.lock().take();
+        let Some(barrier) = barrier else {
+            return;
+        };
+        barrier
+            .published
+            .send(())
+            .expect("atomic domain publication observer must remain live");
+        barrier
+            .permit_return
+            .recv_timeout(Duration::from_secs(5))
+            .expect("atomic domain publication barrier was not released");
+    }
+
     /// Acquire an exact domain operation while `domain_registration` excludes
     /// logical retirement and index replacement.
     fn acquire_domain_operation_locked(
@@ -16080,11 +16419,7 @@ impl Mux {
             registration.domain_id,
             registration.domain_name,
         );
-        Ok(DomainOperationGuard {
-            owner_identity: Arc::clone(&self.domain_owner_identity),
-            wakeup: Arc::clone(&self.domain_retirement_wakeup),
-            registration: Some(registration),
-        })
+        Ok(self.domain_operation_guard_from_acquired_registration(registration))
     }
 
     /// Resolve one spawn selector and acquire its non-cloneable exact
@@ -16105,12 +16440,9 @@ impl Mux {
 
         let _domain_registration = self.domain_registration.lock();
         let registration = match domain {
-            SpawnTabDomain::DefaultDomain | SpawnTabDomain::CurrentPaneDomain => self
-                .default_domain_registration
-                .read()
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| anyhow!("no default domain configured"))?,
+            SpawnTabDomain::DefaultDomain | SpawnTabDomain::CurrentPaneDomain => {
+                self.validated_default_domain_registration_locked()?
+            }
             SpawnTabDomain::DomainId(domain_id) => self
                 .domain_registrations
                 .read()
@@ -17094,6 +17426,50 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct DomainRegistryMutationSnapshot {
+        domains: (usize, usize),
+        domains_by_name: (usize, usize),
+        registrations: (usize, usize),
+        registrations_by_name: (usize, usize),
+        topology_revision: TopologyRevision,
+        topology_exhausted: bool,
+        pane_authority_generation: u64,
+    }
+
+    fn domain_registry_mutation_snapshot(mux: &Mux) -> DomainRegistryMutationSnapshot {
+        let domains = {
+            let domains = mux.domains.read();
+            (domains.len(), domains.capacity())
+        };
+        let domains_by_name = {
+            let domains = mux.domains_by_name.read();
+            (domains.len(), domains.capacity())
+        };
+        let registrations = {
+            let registrations = mux.domain_registrations.read();
+            (registrations.len(), registrations.capacity())
+        };
+        let registrations_by_name = {
+            let registrations = mux.domain_registrations_by_name.read();
+            (registrations.len(), registrations.capacity())
+        };
+        let (topology_revision, topology_exhausted) = {
+            let topology = mux.topology.lock();
+            (topology.revision, topology.exhausted)
+        };
+        let pane_authority_generation = mux.pane_authority.lock().next_structural_generation;
+        DomainRegistryMutationSnapshot {
+            domains,
+            domains_by_name,
+            registrations,
+            registrations_by_name,
+            topology_revision,
+            topology_exhausted,
+            pane_authority_generation,
+        }
+    }
+
     fn wait_for_domain_retirement(mux: &Mux, domain_id: DomainId) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while mux.domain_retirements.contains(domain_id) {
@@ -17830,6 +18206,20 @@ mod tests {
                 after_registration: Mutex::new(None),
                 supports_floating_spawn: true,
                 panic_in_drop: true,
+                drop_count: Some(drop_count),
+                drop_on_retirement_worker: None,
+                drop_entered: None,
+                drop_release: None,
+            }
+        }
+
+        fn counting_in_drop(domain_id: DomainId, drop_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                domain_id,
+                spawned_panes: Mutex::new(VecDeque::new()),
+                after_registration: Mutex::new(None),
+                supports_floating_spawn: true,
+                panic_in_drop: false,
                 drop_count: Some(drop_count),
                 drop_on_retirement_worker: None,
                 drop_entered: None,
@@ -26327,6 +26717,814 @@ mod tests {
                 .map_err(|error| error.to_string()),
             Err("no default domain configured".to_string()),
         );
+    }
+
+    #[test]
+    fn atomic_domain_add_returns_the_exact_published_registration_guard() {
+        let _global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+
+        let guard = mux
+            .add_domain_and_acquire(&domain)
+            .expect("publish and admit one exact domain generation");
+        let peer = mux
+            .get_domain(1)
+            .expect("the published registration remains independently admissible");
+        let registration = mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("atomic add published the exact registration index");
+
+        assert!(guard.is_same_domain(&domain));
+        assert!(guard.same_registration(&peer));
+        assert!(Arc::ptr_eq(guard.registration(), &registration));
+        assert!(mux
+            .default_domain_registration
+            .read()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+        assert_eq!(registration.generation.active_operations(), 2);
+        drop(peer);
+        assert_eq!(registration.generation.active_operations(), 1);
+
+        assert!(mux.domain_was_detached_if_guard(&guard));
+        let successor: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        assert!(matches!(
+            mux.add_domain(&successor),
+            Err(DomainRegistrationError::RetiredIdentifier { .. })
+        ));
+
+        drop(registration);
+        drop(domain);
+        drop(guard);
+        wait_for_domain_retirement(&mux, 1);
+        mux.add_domain(&successor)
+            .expect("same ID becomes admissible after exact guard quiescence");
+    }
+
+    #[test]
+    fn atomic_domain_add_rejects_cross_index_foreign_registration_without_mutation() {
+        let _global_guard = global_test_lock();
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let domain_name = domain.domain_name().to_string();
+        let correct_registration = mux
+            .default_domain_registration
+            .read()
+            .as_ref()
+            .cloned()
+            .expect("initial default registration");
+        let foreign_registration = LiveDomainRegistration::new(
+            2,
+            domain_name.clone(),
+            Arc::clone(&domain),
+        );
+
+        let replaced_by_id = mux
+            .domain_registrations
+            .write()
+            .insert(1, Arc::clone(&foreign_registration))
+            .expect("replace the planted ID projection");
+        let replaced_by_name = mux
+            .domain_registrations_by_name
+            .write()
+            .insert(domain_name.clone(), Arc::clone(&foreign_registration))
+            .expect("replace the planted name projection");
+        assert!(Arc::ptr_eq(&replaced_by_id, &correct_registration));
+        assert!(Arc::ptr_eq(&replaced_by_name, &correct_registration));
+        drop(replaced_by_name);
+        drop(replaced_by_id);
+
+        let before = domain_registry_mutation_snapshot(&mux);
+        mux.fail_next_domain_registration_operation_acquire
+            .store(true, Ordering::Release);
+        let error = mux
+            .add_domain_and_acquire(&domain)
+            .expect_err("a foreign-ID exact-registration record must fail closed");
+
+        assert!(matches!(
+            error,
+            DomainRegistrationError::RegistryInconsistent { .. }
+        ));
+        assert_eq!(domain_registry_mutation_snapshot(&mux), before);
+        assert_eq!(foreign_registration.generation.active_operations(), 0);
+        assert!(
+            mux.fail_next_domain_registration_operation_acquire
+                .load(Ordering::Acquire),
+            "foreign registration must be rejected before operation admission"
+        );
+        mux.fail_next_domain_registration_operation_acquire
+            .store(false, Ordering::Release);
+        assert!(mux
+            .domains
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
+        assert!(mux
+            .domains_by_name
+            .read()
+            .get(&domain_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
+        assert!(mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &foreign_registration)));
+        assert!(mux
+            .domain_registrations_by_name
+            .read()
+            .get(&domain_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &foreign_registration)));
+        assert!(mux
+            .default_domain_registration
+            .read()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &correct_registration)));
+    }
+
+    #[test]
+    fn atomic_existing_domain_add_rejects_stale_default_generation_without_mutation() {
+        let _global_guard = global_test_lock();
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let domain: Arc<dyn Domain> = Arc::new(
+            GuardedMutationTestDomain::counting_in_drop(1, Arc::clone(&drop_count)),
+        );
+        let domain_identity = Arc::downgrade(&domain);
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let domain_name = domain.domain_name().to_string();
+        let stale_default_registration = mux
+            .default_domain_registration
+            .read()
+            .as_ref()
+            .cloned()
+            .expect("initial exact default registration");
+        let fresh_registration = LiveDomainRegistration::new(
+            1,
+            domain_name.clone(),
+            Arc::clone(&domain),
+        );
+
+        let replaced_by_id = mux
+            .domain_registrations
+            .write()
+            .insert(1, Arc::clone(&fresh_registration))
+            .expect("replace the planted registration ID projection");
+        let replaced_by_name = mux
+            .domain_registrations_by_name
+            .write()
+            .insert(domain_name.clone(), Arc::clone(&fresh_registration))
+            .expect("replace the planted registration name projection");
+        assert!(Arc::ptr_eq(
+            &replaced_by_id,
+            &stale_default_registration
+        ));
+        assert!(Arc::ptr_eq(
+            &replaced_by_name,
+            &stale_default_registration
+        ));
+        drop(replaced_by_name);
+        drop(replaced_by_id);
+        assert!(mux
+            .pane_authority
+            .lock()
+            .registrations_by_domain
+            .insert(
+                1,
+                DomainPaneRegistrations {
+                    domain: None,
+                    pane_registrations: HashMap::new(),
+                },
+            )
+            .is_none());
+
+        let before = domain_registry_mutation_snapshot(&mux);
+        let domain_owners_before = Arc::strong_count(&domain);
+        let stale_registration_owners_before = Arc::strong_count(&stale_default_registration);
+        let fresh_registration_owners_before = Arc::strong_count(&fresh_registration);
+        mux.fail_next_domain_registration_operation_acquire
+            .store(true, Ordering::Release);
+        let error = mux
+            .add_domain_and_acquire(&domain)
+            .expect_err("a stale default generation must fail before existing-domain admission");
+
+        assert_eq!(
+            error.to_string(),
+            "domain registry indexes are inconsistent: default domain registration does not name one exact live registration"
+        );
+        assert_eq!(domain_registry_mutation_snapshot(&mux), before);
+        assert_eq!(Arc::strong_count(&domain), domain_owners_before);
+        assert_eq!(
+            Arc::strong_count(&stale_default_registration),
+            stale_registration_owners_before
+        );
+        assert_eq!(
+            Arc::strong_count(&fresh_registration),
+            fresh_registration_owners_before
+        );
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fresh_registration.generation.active_operations(), 0);
+        assert!(
+            mux.fail_next_domain_registration_operation_acquire
+                .load(Ordering::Acquire),
+            "default parity must fail before operation admission consumes its fault"
+        );
+        mux.fail_next_domain_registration_operation_acquire
+            .store(false, Ordering::Release);
+        assert!(mux
+            .domains
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
+        assert!(mux
+            .domains_by_name
+            .read()
+            .get(&domain_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
+        assert!(mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &fresh_registration)));
+        assert!(mux
+            .domain_registrations_by_name
+            .read()
+            .get(&domain_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &fresh_registration)));
+        assert!(mux
+            .default_domain_registration
+            .read()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &stale_default_registration)));
+        assert!(mux
+            .pane_authority
+            .lock()
+            .registrations_by_domain
+            .get(&1)
+            .is_some_and(|registrations| registrations.domain.is_none()));
+
+        drop(fresh_registration);
+        drop(stale_default_registration);
+        drop(domain);
+        drop(mux);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        assert!(domain_identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn atomic_existing_domain_add_rejects_missing_default_registration_without_mutation() {
+        let _global_guard = global_test_lock();
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let domain: Arc<dyn Domain> = Arc::new(
+            GuardedMutationTestDomain::counting_in_drop(1, Arc::clone(&drop_count)),
+        );
+        let domain_identity = Arc::downgrade(&domain);
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&domain))));
+        let domain_name = domain.domain_name().to_string();
+        let registration = mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("initial exact registration");
+        let removed_default_registration = mux
+            .default_domain_registration
+            .write()
+            .take()
+            .expect("erase the sole default registration authority");
+        assert!(Arc::ptr_eq(
+            &removed_default_registration,
+            &registration
+        ));
+        drop(removed_default_registration);
+        assert!(mux
+            .pane_authority
+            .lock()
+            .registrations_by_domain
+            .insert(
+                1,
+                DomainPaneRegistrations {
+                    domain: None,
+                    pane_registrations: HashMap::new(),
+                },
+            )
+            .is_none());
+
+        let before = domain_registry_mutation_snapshot(&mux);
+        let domain_owners_before = Arc::strong_count(&domain);
+        let registration_owners_before = Arc::strong_count(&registration);
+        mux.fail_next_domain_registration_operation_acquire
+            .store(true, Ordering::Release);
+        let error = mux
+            .add_domain_and_acquire(&domain)
+            .expect_err("live indexes without a default must fail existing-domain admission");
+
+        assert_eq!(
+            error.to_string(),
+            "domain registry indexes are inconsistent: default domain registration is absent while live or inconsistent registry indexes remain"
+        );
+        assert_eq!(domain_registry_mutation_snapshot(&mux), before);
+        assert_eq!(Arc::strong_count(&domain), domain_owners_before);
+        assert_eq!(
+            Arc::strong_count(&registration),
+            registration_owners_before
+        );
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+        assert_eq!(registration.generation.active_operations(), 0);
+        assert!(
+            mux.fail_next_domain_registration_operation_acquire
+                .load(Ordering::Acquire),
+            "a missing live default must fail before operation admission"
+        );
+        mux.fail_next_domain_registration_operation_acquire
+            .store(false, Ordering::Release);
+        assert!(mux
+            .domains
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
+        assert!(mux
+            .domains_by_name
+            .read()
+            .get(&domain_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &domain)));
+        assert!(mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+        assert!(mux
+            .domain_registrations_by_name
+            .read()
+            .get(&domain_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &registration)));
+        assert!(mux.default_domain_registration.read().is_none());
+        assert!(mux
+            .pane_authority
+            .lock()
+            .registrations_by_domain
+            .get(&1)
+            .is_some_and(|registrations| registrations.domain.is_none()));
+
+        drop(registration);
+        drop(domain);
+        drop(mux);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        assert!(domain_identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn atomic_new_domain_add_rejects_empty_defaults_with_live_indexes_without_mutation() {
+        let _global_guard = global_test_lock();
+        let live_drop_count = Arc::new(AtomicUsize::new(0));
+        let requested_drop_count = Arc::new(AtomicUsize::new(0));
+        let live: Arc<dyn Domain> = Arc::new(
+            GuardedMutationTestDomain::counting_in_drop(2, Arc::clone(&live_drop_count)),
+        );
+        let requested: Arc<dyn Domain> = Arc::new(
+            GuardedMutationTestDomain::counting_in_drop(1, Arc::clone(&requested_drop_count)),
+        );
+        let live_identity = Arc::downgrade(&live);
+        let requested_identity = Arc::downgrade(&requested);
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&live))));
+        let live_name = live.domain_name().to_string();
+        let requested_name = requested.domain_name().to_string();
+        let live_registration = mux
+            .domain_registrations
+            .read()
+            .get(&2)
+            .cloned()
+            .expect("initial exact live registration");
+        let removed_default = mux
+            .default_domain
+            .write()
+            .take()
+            .expect("erase the raw live default projection");
+        let removed_default_registration = mux
+            .default_domain_registration
+            .write()
+            .take()
+            .expect("erase the live default registration projection");
+        assert!(Arc::ptr_eq(&removed_default, &live));
+        assert!(Arc::ptr_eq(
+            &removed_default_registration,
+            &live_registration
+        ));
+        drop(removed_default_registration);
+        drop(removed_default);
+        assert!(mux
+            .pane_authority
+            .lock()
+            .registrations_by_domain
+            .insert(
+                1,
+                DomainPaneRegistrations {
+                    domain: None,
+                    pane_registrations: HashMap::new(),
+                },
+            )
+            .is_none());
+
+        let before = domain_registry_mutation_snapshot(&mux);
+        let live_owners_before = Arc::strong_count(&live);
+        let requested_owners_before = Arc::strong_count(&requested);
+        let registration_owners_before = Arc::strong_count(&live_registration);
+        mux.fail_next_domain_registration_operation_acquire
+            .store(true, Ordering::Release);
+        let error = mux
+            .add_domain_and_acquire(&requested)
+            .expect_err("a new identity cannot install over an absent live default pair");
+
+        assert_eq!(
+            error.to_string(),
+            "domain registry indexes are inconsistent: default domain projections are absent while live registry indexes remain"
+        );
+        assert_eq!(domain_registry_mutation_snapshot(&mux), before);
+        assert_eq!(Arc::strong_count(&live), live_owners_before);
+        assert_eq!(Arc::strong_count(&requested), requested_owners_before);
+        assert_eq!(
+            Arc::strong_count(&live_registration),
+            registration_owners_before
+        );
+        assert_eq!(live_drop_count.load(Ordering::SeqCst), 0);
+        assert_eq!(requested_drop_count.load(Ordering::SeqCst), 0);
+        assert_eq!(live_registration.generation.active_operations(), 0);
+        assert!(
+            mux.fail_next_domain_registration_operation_acquire
+                .load(Ordering::Acquire),
+            "non-initial empty defaults must fail before reserve or operation admission"
+        );
+        mux.fail_next_domain_registration_operation_acquire
+            .store(false, Ordering::Release);
+        assert!(mux
+            .domains
+            .read()
+            .get(&2)
+            .is_some_and(|current| Arc::ptr_eq(current, &live)));
+        assert!(mux
+            .domains_by_name
+            .read()
+            .get(&live_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &live)));
+        assert!(mux
+            .domain_registrations
+            .read()
+            .get(&2)
+            .is_some_and(|current| Arc::ptr_eq(current, &live_registration)));
+        assert!(mux
+            .domain_registrations_by_name
+            .read()
+            .get(&live_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &live_registration)));
+        assert!(!mux.domains.read().contains_key(&1));
+        assert!(!mux.domains_by_name.read().contains_key(&requested_name));
+        assert!(!mux.domain_registrations.read().contains_key(&1));
+        assert!(!mux
+            .domain_registrations_by_name
+            .read()
+            .contains_key(&requested_name));
+        assert!(mux.default_domain.read().is_none());
+        assert!(mux.default_domain_registration.read().is_none());
+        assert!(mux
+            .pane_authority
+            .lock()
+            .registrations_by_domain
+            .get(&1)
+            .is_some_and(|registrations| registrations.domain.is_none()));
+
+        drop(requested);
+        assert_eq!(requested_drop_count.load(Ordering::SeqCst), 1);
+        assert!(requested_identity.upgrade().is_none());
+        assert_eq!(live_drop_count.load(Ordering::SeqCst), 0);
+        drop(live_registration);
+        drop(live);
+        drop(mux);
+        assert_eq!(live_drop_count.load(Ordering::SeqCst), 1);
+        assert!(live_identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn atomic_domain_add_rejects_partial_default_projection_without_publication() {
+        let _global_guard = global_test_lock();
+
+        for raw_default_present in [true, false] {
+            let drop_count = Arc::new(AtomicUsize::new(0));
+            let stale: Arc<dyn Domain> = Arc::new(
+                GuardedMutationTestDomain::counting_in_drop(2, Arc::clone(&drop_count)),
+            );
+            let stale_identity = Arc::downgrade(&stale);
+            let mux = Arc::new(Mux::new(Some(Arc::clone(&stale))));
+            if raw_default_present {
+                let removed = mux.default_domain_registration.write().take();
+                drop(removed);
+            } else {
+                let removed = mux.default_domain.write().take();
+                drop(removed);
+            }
+            drop(stale);
+
+            let requested: Arc<dyn Domain> =
+                Arc::new(GuardedMutationTestDomain::for_domain(1));
+            let before = domain_registry_mutation_snapshot(&mux);
+            mux.fail_next_domain_registration_operation_acquire
+                .store(true, Ordering::Release);
+            let error = mux
+                .add_domain_and_acquire(&requested)
+                .expect_err("partial default projections must fail before publication");
+
+            assert!(matches!(
+                error,
+                DomainRegistrationError::RegistryInconsistent { .. }
+            ));
+            assert_eq!(domain_registry_mutation_snapshot(&mux), before);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+            assert!(
+                mux.fail_next_domain_registration_operation_acquire
+                    .load(Ordering::Acquire),
+                "partial defaults must be rejected before operation admission"
+            );
+            mux.fail_next_domain_registration_operation_acquire
+                .store(false, Ordering::Release);
+            assert_eq!(mux.default_domain.read().is_some(), raw_default_present);
+            assert_eq!(
+                mux.default_domain_registration.read().is_some(),
+                !raw_default_present
+            );
+            let retained_identity = if raw_default_present {
+                mux.default_domain
+                    .read()
+                    .as_ref()
+                    .map(Arc::downgrade)
+            } else {
+                mux.default_domain_registration
+                    .read()
+                    .as_ref()
+                    .map(|registration| Arc::downgrade(&registration.domain))
+            }
+            .expect("the planted partial owner remains untouched");
+            assert!(Weak::ptr_eq(&retained_identity, &stale_identity));
+
+            drop(requested);
+            drop(mux);
+            assert_eq!(
+                drop_count.load(Ordering::SeqCst),
+                1,
+                "the untouched stale owner drops only after the mux serializer is gone"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_domain_add_rejects_mismatched_default_projection_without_publication() {
+        let _global_guard = global_test_lock();
+        let raw_drop_count = Arc::new(AtomicUsize::new(0));
+        let registration_drop_count = Arc::new(AtomicUsize::new(0));
+        let raw_default: Arc<dyn Domain> = Arc::new(
+            GuardedMutationTestDomain::counting_in_drop(2, Arc::clone(&raw_drop_count)),
+        );
+        let registration_default: Arc<dyn Domain> = Arc::new(
+            GuardedMutationTestDomain::counting_in_drop(
+                3,
+                Arc::clone(&registration_drop_count),
+            ),
+        );
+        let raw_identity = Arc::downgrade(&raw_default);
+        let registration_identity = Arc::downgrade(&registration_default);
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&raw_default))));
+        mux.add_domain(&registration_default)
+            .expect("seed the second exact-current domain registration");
+        let registration_default_record = mux
+            .domain_registrations
+            .read()
+            .get(&3)
+            .cloned()
+            .expect("second exact-current registration");
+        let replaced = mux
+            .default_domain_registration
+            .write()
+            .replace(Arc::clone(&registration_default_record))
+            .expect("replace the raw default's exact registration projection");
+        drop(replaced);
+        drop(registration_default_record);
+        drop(raw_default);
+        drop(registration_default);
+
+        let requested: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let before = domain_registry_mutation_snapshot(&mux);
+        mux.fail_next_domain_registration_operation_acquire
+            .store(true, Ordering::Release);
+        let error = mux
+            .add_domain_and_acquire(&requested)
+            .expect_err("mismatched default projections must fail before publication");
+
+        assert!(matches!(
+            error,
+            DomainRegistrationError::RegistryInconsistent { .. }
+        ));
+        assert_eq!(domain_registry_mutation_snapshot(&mux), before);
+        assert_eq!(raw_drop_count.load(Ordering::SeqCst), 0);
+        assert_eq!(registration_drop_count.load(Ordering::SeqCst), 0);
+        assert!(
+            mux.fail_next_domain_registration_operation_acquire
+                .load(Ordering::Acquire),
+            "mismatched defaults must be rejected before operation admission"
+        );
+        mux.fail_next_domain_registration_operation_acquire
+            .store(false, Ordering::Release);
+        let retained_raw_identity = mux
+            .default_domain
+            .read()
+            .as_ref()
+            .map(Arc::downgrade)
+            .expect("raw default remains present");
+        let retained_registration_identity = mux
+            .default_domain_registration
+            .read()
+            .as_ref()
+            .map(|registration| Arc::downgrade(&registration.domain))
+            .expect("default registration remains present");
+        assert!(Weak::ptr_eq(&retained_raw_identity, &raw_identity));
+        assert!(Weak::ptr_eq(
+            &retained_registration_identity,
+            &registration_identity
+        ));
+
+        drop(requested);
+        drop(mux);
+        assert_eq!(raw_drop_count.load(Ordering::SeqCst), 1);
+        assert_eq!(registration_drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn atomic_domain_add_serializes_racing_retirement_and_same_id_successor() {
+        let _global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let successor: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(0);
+        let (permit_return_tx, permit_return_rx) = std::sync::mpsc::sync_channel(0);
+        mux.install_domain_add_publication_barrier(published_tx, permit_return_rx);
+
+        let mux_for_add = Arc::clone(&mux);
+        let domain_for_add = Arc::clone(&domain);
+        let add = std::thread::spawn(move || {
+            mux_for_add.add_domain_and_acquire(&domain_for_add)
+        });
+        published_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("atomic add did not reach its post-publication cut");
+        let registration = mux
+            .domain_registrations
+            .read()
+            .get(&1)
+            .cloned()
+            .expect("exact registration is visible at the publication cut");
+        assert_eq!(registration.generation.active_operations(), 1);
+        assert!(!add.is_finished());
+
+        let (retirement_started_tx, retirement_started_rx) =
+            std::sync::mpsc::sync_channel(0);
+        let mux_for_retirement = Arc::clone(&mux);
+        let domain_for_retirement = Arc::clone(&domain);
+        let retirement = std::thread::spawn(move || {
+            retirement_started_tx
+                .send(())
+                .expect("retirement observer remains live");
+            mux_for_retirement.domain_was_detached_if_same(&domain_for_retirement)
+        });
+        retirement_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retirement contender did not start");
+        assert!(
+            !retirement.is_finished(),
+            "retirement cannot pass the retained atomic publication serializer"
+        );
+
+        let mux_for_successor = Arc::clone(&mux);
+        let successor_for_race = Arc::clone(&successor);
+        let successor_add = std::thread::spawn(move || {
+            mux_for_successor.add_domain(&successor_for_race)
+        });
+
+        permit_return_tx
+            .send(())
+            .expect("release the atomic publication cut");
+        let guard = add
+            .join()
+            .expect("atomic add thread must not panic")
+            .expect("atomic add must return its pre-retirement authority");
+        assert!(guard.is_same_domain(&domain));
+        assert!(Arc::ptr_eq(guard.registration(), &registration));
+        assert!(
+            retirement
+                .join()
+                .expect("racing retirement thread must not panic")
+        );
+        assert!(matches!(
+            successor_add
+                .join()
+                .expect("same-ID contender thread must not panic"),
+            Err(DomainRegistrationError::IdentifierInUse { .. })
+                | Err(DomainRegistrationError::RetiredIdentifier { .. })
+        ));
+        assert!(mux.get_domain(1).is_none());
+
+        drop(registration);
+        drop(domain);
+        drop(guard);
+        wait_for_domain_retirement(&mux, 1);
+        mux.add_domain(&successor)
+            .expect("racing retirement cleanup releases the exact same-ID fence");
+    }
+
+    #[test]
+    fn atomic_domain_add_operation_failure_has_zero_publication() {
+        let _global_guard = global_test_lock();
+        let mux = Arc::new(Mux::new(None));
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        mux.fail_next_domain_registration_operation_acquire
+            .store(true, Ordering::Release);
+
+        assert!(matches!(
+            mux.add_domain_and_acquire(&domain),
+            Err(DomainRegistrationError::OperationAdmissionFailed { domain_id: 1 })
+        ));
+        assert_eq!(Arc::strong_count(&domain), 1);
+        assert!(mux.domains.read().is_empty());
+        assert!(mux.domains_by_name.read().is_empty());
+        assert!(mux.domain_registrations.read().is_empty());
+        assert!(mux.domain_registrations_by_name.read().is_empty());
+        assert!(mux.default_domain_registration.read().is_none());
+        assert!(mux.retired_domain_ids.lock().is_empty());
+        assert_eq!(mux.domain_retirements.len(), 0);
+        assert!(mux.pending_domain_retirements.lock().registrations.is_empty());
+        assert!(mux.pane_authority.lock().registrations_by_domain.is_empty());
+
+        let guard = mux
+            .add_domain_and_acquire(&domain)
+            .expect("the injected failure is one-shot and leaves a clean retry cut");
+        assert!(guard.is_same_domain(&domain));
+        drop(guard);
+    }
+
+    #[test]
+    fn atomic_domain_add_defers_panicking_destructor_to_retirement_worker() {
+        let _global_guard = global_test_lock();
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let drop_on_retirement_worker = Arc::new(AtomicBool::new(false));
+        let (drop_entered_tx, drop_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (drop_release_tx, drop_release_rx) = std::sync::mpsc::sync_channel(0);
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::blocking_panicking_in_drop(
+                1,
+                Arc::clone(&drop_count),
+                Arc::clone(&drop_on_retirement_worker),
+                drop_entered_tx,
+                drop_release_rx,
+            ));
+        let mux = Arc::new(Mux::new(None));
+        let guard = mux
+            .add_domain_and_acquire(&domain)
+            .expect("atomic add returns a destructor-retaining operation guard");
+
+        assert!(mux.domain_was_detached_if_guard(&guard));
+        drop(domain);
+        assert_eq!(
+            drop_count.load(Ordering::SeqCst),
+            0,
+            "dropping the creator Arc while the guard is live cannot run Domain::drop"
+        );
+        drop(guard);
+        drop_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker-owned domain destructor did not enter its blocking barrier");
+
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        assert!(drop_on_retirement_worker.load(Ordering::SeqCst));
+        assert!(mux.domain_retirements.contains(1));
+        let successor: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::for_domain(1));
+        assert!(matches!(
+            mux.add_domain(&successor),
+            Err(DomainRegistrationError::RetiredIdentifier { .. })
+        ));
+
+        drop_release_tx
+            .send(())
+            .expect("release the worker-owned panicking domain destructor");
+        wait_for_domain_retirement(&mux, 1);
+        wait_for_domain_retirement_worker_idle(&mux);
+        mux.add_domain(&successor)
+            .expect("panic quarantine releases the same-ID fence after disposal");
     }
 
     #[test]
