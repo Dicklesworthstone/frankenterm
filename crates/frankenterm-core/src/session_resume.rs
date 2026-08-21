@@ -7,6 +7,7 @@
 //! Feature-gated behind `session-resume`.
 
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};

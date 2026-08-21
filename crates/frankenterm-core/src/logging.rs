@@ -106,6 +106,7 @@ pub enum LogError {
 fn ensure_parent_dir(path: &std::path::Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
+            #[cfg(unix)]
             let existed = parent.exists();
             std::fs::create_dir_all(parent)?;
             #[cfg(unix)]
@@ -154,6 +155,7 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
     // Handle optional file output
     let file_writer = if let Some(path) = &config.file {
         ensure_parent_dir(path)?;
+        #[cfg(unix)]
         let existed = path.exists();
         let file = std::fs::OpenOptions::new()
             .create(true)

@@ -27159,10 +27159,12 @@ const WATCH_EVENTS_CLAIM_STATUS: &str = "claimed";
 const WATCH_EVENTS_CLAIM_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const WATCH_EVENTS_CLAIM_COMPLETION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
+#[cfg(any(unix, test))]
 const WATCH_EVENTS_CLAIM_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const WATCH_EVENTS_BATCH_LIMIT_MAX: usize = 1_000;
 const WATCH_EVENTS_BATCH_LIMIT_ERROR: &str = "Invalid --limit: must be in 1..=1000";
 const WATCH_EVENTS_POLL_INTERVAL_MS_MIN: u64 = 10;
+#[cfg(any(unix, test))]
 const WATCH_EVENTS_IPC_CANCELLATION_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(500);
 #[cfg(test)]
@@ -27903,6 +27905,7 @@ fn watch_claim_output_metrics() -> WatchClaimOutputMetrics {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum WatchClaimOutputFailureKind {
     ContextCancelled,
     WriteZero,
@@ -27975,6 +27978,7 @@ struct WatchClaimOutputSuccess {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum WatchClaimOutputAttempt {
     Flushed(WatchClaimOutputSuccess),
     FlushedRestoreLost {
@@ -35785,6 +35789,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     fancy_regex::Regex::new(&regex_pattern).is_ok_and(|re| re.is_match(value).unwrap_or(false))
 }
 
+#[cfg(any(unix, test))]
 fn is_structured_uservar_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.starts_with("ft-")
@@ -35796,6 +35801,7 @@ fn is_structured_uservar_name(name: &str) -> bool {
         || lower == "wa_event"
 }
 
+#[cfg(any(unix, test))]
 fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(), String> {
     // Use the canonical IPC message size limit from frankenterm-core.
     // Previously duplicated here as 131_072 — now reads from the single source.
@@ -54562,6 +54568,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = (pane_id, weight, ttl_secs, clear, json);
                     eprintln!("Error: IPC is not supported on this platform");
                     std::process::exit(1);
                 }
@@ -59922,6 +59929,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
 
             #[cfg(not(unix))]
             {
+                let _ = (name, value);
                 eprintln!("Error: IPC event forwarding is only supported on Unix platforms.");
                 eprintln!("Context: pane_id={pane}");
                 std::process::exit(1);

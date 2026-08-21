@@ -14,9 +14,7 @@
 //! - [`ResumeContext`]: Reconstructs tx state from a persisted ledger for restart recovery.
 //! - [`IdempotencyPolicy`]: Configuration for key generation, dedup windows, and resume behavior.
 
-use cap_fs_ext::{
-    DirExt, FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt, OpenOptionsSyncExt,
-};
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
 #[cfg(any(unix, windows))]
 use cap_std::fs::OpenOptionsExt as CapOpenOptionsExt;
 use cap_std::fs::{Dir, File as CapFile, OpenOptions as CapOpenOptions};

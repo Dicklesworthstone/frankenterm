@@ -10,7 +10,9 @@
 
 use crate::robot_types::{SubmitGuaranteeLevel, SubmitReceipt, SubmitReceiptState};
 use crate::verified_submit::SubmitIdempotencyBinding;
-use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
+#[cfg(unix)]
+use cap_fs_ext::MetadataExt as CapMetadataExt;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{
     Dir as CapDir, File as CapFile, Metadata as CapMetadata, OpenOptions as CapOpenOptions,
 };

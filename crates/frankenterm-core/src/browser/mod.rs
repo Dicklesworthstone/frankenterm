@@ -1557,11 +1557,11 @@ fn open_child_directory_path_nofollow(
     Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
 }
 
-fn set_private_directory_permissions(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
+fn set_private_directory_permissions(_directory: &cap_std::fs::Dir) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        directory
+        _directory
             .try_clone()?
             .into_std_file()
             .set_permissions(std::fs::Permissions::from_mode(0o700))?;
@@ -1569,11 +1569,11 @@ fn set_private_directory_permissions(directory: &cap_std::fs::Dir) -> std::io::R
     Ok(())
 }
 
-fn verify_private_directory_permissions(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
+fn verify_private_directory_permissions(_directory: &cap_std::fs::Dir) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = directory
+        let mode = _directory
             .try_clone()?
             .into_std_file()
             .metadata()?

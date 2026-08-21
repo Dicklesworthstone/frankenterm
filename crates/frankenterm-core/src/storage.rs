@@ -1993,6 +1993,7 @@ fn env_value_is_truthy(value: &str) -> bool {
 fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
+            #[cfg(unix)]
             let existed = parent.exists();
             std::fs::create_dir_all(parent)
                 .map_err(|e| StorageError::Database(format!("Failed to create directory: {e}")))?;
@@ -2868,10 +2869,7 @@ impl StorageBackendProvider for RusqliteStorageBackendProvider {
             StorageHandle::checkpoint_storage_open(cx, "after FTS startup repair")?;
         }
 
-        #[cfg(unix)]
-        {
-            ensure_db_permissions(Path::new(&request.db_path), !request.db_existed)?;
-        }
+        ensure_db_permissions(Path::new(&request.db_path), !request.db_existed)?;
 
         if let Some(cx) = request.cx.as_ref() {
             StorageHandle::checkpoint_storage_open(cx, "after permission setup")?;

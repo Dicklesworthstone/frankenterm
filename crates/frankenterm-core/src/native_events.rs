@@ -174,6 +174,7 @@ struct NativeListenerAnomalyCounters {
     malformed_event_drops: AtomicU64,
     connections_with_drops: AtomicU64,
     post_accept_io_failures: AtomicU64,
+    #[cfg(unix)]
     rejected_peers: AtomicU64,
 }
 
@@ -497,13 +498,6 @@ mod socket_transport {
 
         pub type LineReader<T> = asupersync::io::Lines<BufReader<T>>;
 
-        pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
-            let cx = crate::cx::Cx::current().ok_or_else(|| {
-                super::super::native_context_io_error("listener_bind_context_unavailable")
-            })?;
-            bind_with_cx(&cx, path).await
-        }
-
         pub async fn bind_with_cx<P: AsRef<Path>>(
             cx: &crate::cx::Cx,
             path: P,
@@ -513,13 +507,6 @@ mod socket_transport {
             let inner = frankenterm_uds::UnixListener::bind(path)?;
             inner.set_nonblocking(true)?;
             Ok(UnixListener { inner })
-        }
-
-        pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-            let cx = crate::cx::Cx::current().ok_or_else(|| {
-                super::super::native_context_io_error("connect_context_unavailable")
-            })?;
-            connect_with_cx(&cx, path).await
         }
 
         pub async fn connect_with_cx<P: AsRef<Path>>(
@@ -540,13 +527,6 @@ mod socket_transport {
         }
 
         impl UnixListener {
-            pub async fn accept(&self) -> io::Result<(UnixStream, ())> {
-                let cx = crate::cx::Cx::current().ok_or_else(|| {
-                    super::super::native_context_io_error("accept_context_unavailable")
-                })?;
-                self.accept_with_cx(&cx).await
-            }
-
             pub async fn accept_with_cx(&self, cx: &crate::cx::Cx) -> io::Result<(UnixStream, ())> {
                 loop {
                     cx.checkpoint()

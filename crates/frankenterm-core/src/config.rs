@@ -6359,6 +6359,7 @@ fn path_to_string(path: &Path) -> String {
 }
 
 fn ensure_dir(path: &Path) -> crate::Result<()> {
+    #[cfg(unix)]
     let existed = path.exists();
     std::fs::create_dir_all(path).map_err(|e| {
         crate::Error::Config(crate::error::ConfigError::ValidationError(format!(
