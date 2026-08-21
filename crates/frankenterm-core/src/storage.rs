@@ -5627,17 +5627,15 @@ impl StorageHandle {
                 turn.deleted_segments,
             );
 
-            if !turn.over_limit_after
-                || turn.deleted_segments == 0
-                || turn.used_bytes_after >= turn.used_bytes_before
-            {
-                // A committed batch that releases no live pages cannot make
-                // progress toward this page-based cap. Stop rather than
-                // destroying more history in a tight loop; later SQLite page
-                // reuse or a subsequent maintenance pass may change the
-                // physical-page economics.
+            if !turn.over_limit_after || turn.deleted_segments == 0 {
                 return DurableMutationProgress::Complete(*current);
             }
+            // SQLite live-page reclamation is quantized: deleting a small
+            // batch can leave the live-page count unchanged even though a
+            // later bounded batch releases the page. Continue through the
+            // FIFO while each turn removes rows; the finite segment set and
+            // complete-sample dominance guard provide the stop authority when
+            // the configured cap is unattainable.
             // Re-enter through the FIFO tail. The checkpoint at the next
             // iteration makes cancellation observable between committed
             // batches and lets latency-sensitive writes run first.
@@ -35833,8 +35831,10 @@ fn enforce_size_limit_evicts_oldest_segments_under_cap() {
             "cap=0 must not delete anything"
         );
 
-        // Enforce a 1 MiB cap: must evict the oldest segments and shrink size.
-        let outcome = storage.enforce_size_limit(1).await.unwrap();
+        // Enforce a 2 MiB cap: this stays above the empty schema's live-page
+        // floor while remaining below the segment-heavy fixture, so the
+        // oldest-first pass must converge with some recent history intact.
+        let outcome = storage.enforce_size_limit(2).await.unwrap();
         assert!(
             outcome.deleted_segments > 0,
             "expected size eviction, got {outcome:?}"

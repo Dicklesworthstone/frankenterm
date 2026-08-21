@@ -7777,10 +7777,14 @@ mod tests {
     fn snapshot_authority_registry_unifies_hard_links_and_propagates_latches() {
         let (_tmp, db_path) = setup_test_db();
         let path = Path::new(db_path.as_str());
+        let source_name = path
+            .file_name()
+            .expect("temporary database must have a file name")
+            .to_string_lossy();
         let hard_link = path
             .parent()
             .expect("database parent")
-            .join("snapshot-authority-hard-link.db");
+            .join(format!("{source_name}.snapshot-authority-hard-link.db"));
         std::fs::hard_link(path, &hard_link).expect("create database hard-link alias");
 
         let primary = SnapshotEngine::new(db_path, SnapshotConfig::default());
