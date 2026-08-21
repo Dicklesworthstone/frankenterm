@@ -163,7 +163,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     echo "missing CARGO_TARGET_DIR" >&2
     exit 64
   fi
-  mkdir -p "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release"
+  mkdir -p "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive"
   printf '%s\n' \
     '#!/bin/bash' \
     'if [[ "${1:-}" == "--version" ]]; then' \
@@ -174,7 +174,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  echo "stub help"' \
     '  exit 0' \
     'fi' \
-    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui"
+    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
   printf '%s\n' \
     '#!/bin/bash' \
     'if [[ "${1:-}" == "--version" ]]; then' \
@@ -185,7 +185,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  echo "stub help"' \
     '  exit 0' \
     'fi' \
-    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/ft"
+    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
   printf '%s\n' \
     '#!/bin/bash' \
     'if [[ "${1:-}" == "--version" ]]; then' \
@@ -196,8 +196,8 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  echo "stub help"' \
     '  exit 0' \
     'fi' \
-    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
-  chmod +x "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/ft" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
+    'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  chmod +x "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/ft" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
   exit 0
 fi
 
@@ -225,14 +225,9 @@ fi
 if [[ "\${1:-}" == "exec" ]]; then
   shift
   printf '%s\n' "\$*" >> "${marker_file}"
-  if [[ "\$*" == *"pkg-config --exists x11"* ]]; then
-    echo "FT_GUI_REMOTE_PREREQ_MISSING:x11" >&2
+  if [[ "\$*" == *"cargo build"* ]]; then
     echo "Package x11 was not found in the pkg-config search path." >&2
     exit 42
-  fi
-  if [[ "\$*" == *"cargo build"* ]]; then
-    echo "cargo build should not run after failed x11 preflight" >&2
-    exit 99
   fi
   printf 'unexpected exec: %s\n' "\$*" >&2
   exit 64
@@ -263,17 +258,9 @@ fi
 if [[ "\${1:-}" == "exec" ]]; then
   shift
   printf '%s\n' "\$*" >> "${marker_file}"
-  if [[ "\$*" == *"pkg-config --exists ${missing_pkg}"* ]]; then
-    echo "FT_GUI_REMOTE_PREREQ_MISSING:${missing_pkg}" >&2
+  if [[ "\$*" == *"cargo build"* ]]; then
     echo "Package ${missing_pkg} was not found in the pkg-config search path." >&2
     exit 43
-  fi
-  if [[ "\$*" == *"pkg-config --exists x11"* ]]; then
-    exit 0
-  fi
-  if [[ "\$*" == *"cargo build"* ]]; then
-    echo "cargo build should not run after failed GUI link-package preflight" >&2
-    exit 99
   fi
   printf 'unexpected exec: %s\n' "\$*" >&2
   exit 64
@@ -517,20 +504,20 @@ scenario_e2e_missing_x11_refuses_cargo() {
     record_result "e2e_missing_x11_refuses_cargo" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
     return
   fi
-  if ! grep -q 'pkg-config --exists x11' "${marker_file}"; then
-    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_preflight_exec" "X11_PREFLIGHT_MISSING" "script never ran the remote x11 preflight"
+  if ! grep -q 'cargo build' "${marker_file}"; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_authoritative_build" "CARGO_BUILD_MISSING" "script never ran the authoritative remote Cargo build"
     return
   fi
-  if grep -q 'cargo build' "${marker_file}"; then
-    record_result "e2e_missing_x11_refuses_cargo" "false" "cargo_ran_after_failed_preflight" "CARGO_RAN_AFTER_X11_FAILURE" "cargo build still ran after failed x11 preflight"
+  if ! grep -q 'Package x11 was not found' "${stderr_file}"; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_x11_diagnostic" "X11_DIAGNOSTIC_MISSING" "authoritative Cargo failure omitted the x11 diagnostic"
     return
   fi
-  if ! grep -q 'Remote worker is missing X11 development metadata required for frankenterm-gui.' "${stdout_file}"; then
+  if ! grep -q 'Strict-remote frankenterm-gui build failed.' "${stdout_file}"; then
     record_result "e2e_missing_x11_refuses_cargo" "false" "missing_x11_message" "X11_MESSAGE_MISSING" "missing explicit x11 prerequisite message"
     return
   fi
-  if ! grep -q '\[SKIP\] 2. verify GUI binary exists (build step failed (remote worker missing pkg-config x11 / x11.pc); GUI binary unavailable)' "${stdout_file}"; then
-    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_dependency_skip" "DEPENDENCY_SKIP_MISSING" "dependent GUI binary check did not skip after x11 preflight failure"
+  if ! grep -q '\[SKIP\] 2. verify GUI binary exists (build step failed (strict-remote GUI cargo build returned non-zero); GUI binary unavailable)' "${stdout_file}"; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_dependency_skip" "DEPENDENCY_SKIP_MISSING" "dependent GUI binary check did not skip after the Cargo failure"
     return
   fi
   if ! grep -q 'Summary: pass=0 fail=1 skip=6 total=7' "${stdout_file}"; then
@@ -569,20 +556,20 @@ scenario_e2e_missing_gui_link_pkg_refuses_cargo() {
     record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
     return
   fi
-  if ! grep -q 'pkg-config --exists xcb-image' "${marker_file}"; then
-    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_preflight_exec" "GUI_LINK_PKG_PREFLIGHT_MISSING" "script never ran the remote xcb-image preflight"
+  if ! grep -q 'cargo build' "${marker_file}"; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_authoritative_build" "CARGO_BUILD_MISSING" "script never ran the authoritative remote Cargo build"
     return
   fi
-  if grep -q 'cargo build' "${marker_file}"; then
-    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "cargo_ran_after_failed_preflight" "CARGO_RAN_AFTER_GUI_LINK_PKG_FAILURE" "cargo build still ran after failed GUI link-package preflight"
+  if ! grep -q 'Package xcb-image was not found' "${stderr_file}"; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_gui_pkg_diagnostic" "GUI_LINK_PKG_DIAGNOSTIC_MISSING" "authoritative Cargo failure omitted the xcb-image diagnostic"
     return
   fi
-  if ! grep -q 'Remote worker is missing xcb-image development metadata required for frankenterm-gui.' "${stdout_file}"; then
+  if ! grep -q 'Strict-remote frankenterm-gui build failed.' "${stdout_file}"; then
     record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_gui_pkg_message" "GUI_LINK_PKG_MESSAGE_MISSING" "missing explicit xcb-image prerequisite message"
     return
   fi
-  if ! grep -q '\[SKIP\] 2. verify GUI binary exists (build step failed (remote worker missing pkg-config xcb-image / xcb-image.pc); GUI binary unavailable)' "${stdout_file}"; then
-    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_dependency_skip" "DEPENDENCY_SKIP_MISSING" "dependent GUI binary check did not skip after xcb-image preflight failure"
+  if ! grep -q '\[SKIP\] 2. verify GUI binary exists (build step failed (strict-remote GUI cargo build returned non-zero); GUI binary unavailable)' "${stdout_file}"; then
+    record_result "e2e_missing_gui_link_pkg_refuses_cargo" "false" "missing_dependency_skip" "DEPENDENCY_SKIP_MISSING" "dependent GUI binary check did not skip after the Cargo failure"
     return
   fi
   record_result "e2e_missing_gui_link_pkg_refuses_cargo" "true"
@@ -599,9 +586,9 @@ scenario_bundle_skip_build_creates_structure() {
   local app_bundle="${output_dir}/FrankenTerm.app"
 
   mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/ft"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
   write_codesign_mock "${mock_bin}" "${codesign_log}"
 
   emit_log "running" "bundle_skip_build_creates_structure" "skip_build_bundle" "none" "none" "${stdout_file}" "scripts/create-macos-bundle.sh --skip-build"
@@ -642,9 +629,9 @@ scenario_bundle_refuses_overwrite() {
   local rc
 
   mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/ft"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
   write_codesign_mock "${mock_bin}" "${codesign_log}"
 
   if ! env PATH="${mock_bin}:${PATH}" CARGO_TARGET_DIR="${target_dir}" "${ROOT_DIR}/scripts/create-macos-bundle.sh" --skip-build --output "${output_dir}" "${BROWSER_BUNDLE_ARGS[@]}" >"${stdout_first}" 2>"${stderr_first}"; then
@@ -683,9 +670,9 @@ scenario_bundle_refuses_failed_codesign_verification() {
   local rc
 
   mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-gui"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/frankenterm-mux-server"
-  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release/ft"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
   write_codesign_verification_failure_mock "${mock_bin}"
 
   emit_log "running" "bundle_refuses_failed_codesign_verification" "codesign_verify" "none" "none" "${stdout_file}" "strict deep codesign verification failure"
@@ -770,15 +757,15 @@ scenario_bundle_missing_x11_refuses_exec() {
     record_result "bundle_missing_x11_refuses_exec" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
     return
   fi
-  if ! grep -q 'pkg-config --exists x11' "${marker_file}"; then
-    record_result "bundle_missing_x11_refuses_exec" "false" "missing_preflight_exec" "X11_PREFLIGHT_MISSING" "bundle script never ran the remote x11 preflight"
+  if ! grep -q 'cargo build' "${marker_file}"; then
+    record_result "bundle_missing_x11_refuses_exec" "false" "missing_authoritative_build" "CARGO_BUILD_MISSING" "bundle script never ran the authoritative remote Cargo build"
     return
   fi
-  if grep -q 'cargo build' "${marker_file}"; then
-    record_result "bundle_missing_x11_refuses_exec" "false" "cargo_ran_after_failed_preflight" "CARGO_RAN_AFTER_X11_FAILURE" "bundle cargo build still ran after failed x11 preflight"
+  if ! grep -q 'Package x11 was not found' "${stderr_file}"; then
+    record_result "bundle_missing_x11_refuses_exec" "false" "missing_x11_diagnostic" "X11_DIAGNOSTIC_MISSING" "authoritative Cargo failure omitted the x11 diagnostic"
     return
   fi
-  if ! grep -q 'Error: remote worker is missing X11 development metadata required for frankenterm-gui' "${stdout_file}"; then
+  if ! grep -q 'Error: strict-remote GUI/mux/CLI bundle build failed.' "${stdout_file}"; then
     record_result "bundle_missing_x11_refuses_exec" "false" "missing_x11_message" "X11_MESSAGE_MISSING" "bundle script missing explicit x11 prerequisite message"
     return
   fi
@@ -813,15 +800,15 @@ scenario_bundle_missing_gui_link_pkg_refuses_exec() {
     record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
     return
   fi
-  if ! grep -q 'pkg-config --exists xkbcommon-x11' "${marker_file}"; then
-    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "missing_preflight_exec" "GUI_LINK_PKG_PREFLIGHT_MISSING" "bundle script never ran the remote xkbcommon-x11 preflight"
+  if ! grep -q 'cargo build' "${marker_file}"; then
+    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "missing_authoritative_build" "CARGO_BUILD_MISSING" "bundle script never ran the authoritative remote Cargo build"
     return
   fi
-  if grep -q 'cargo build' "${marker_file}"; then
-    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "cargo_ran_after_failed_preflight" "CARGO_RAN_AFTER_GUI_LINK_PKG_FAILURE" "bundle cargo build still ran after failed GUI link-package preflight"
+  if ! grep -q 'Package xkbcommon-x11 was not found' "${stderr_file}"; then
+    record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "missing_gui_pkg_diagnostic" "GUI_LINK_PKG_DIAGNOSTIC_MISSING" "authoritative Cargo failure omitted the xkbcommon-x11 diagnostic"
     return
   fi
-  if ! grep -q 'Error: remote worker is missing xkbcommon-x11 development metadata required for frankenterm-gui' "${stdout_file}"; then
+  if ! grep -q 'Error: strict-remote GUI/mux/CLI bundle build failed.' "${stdout_file}"; then
     record_result "bundle_missing_gui_link_pkg_refuses_exec" "false" "missing_gui_pkg_message" "GUI_LINK_PKG_MESSAGE_MISSING" "bundle script missing explicit xkbcommon-x11 prerequisite message"
     return
   fi
