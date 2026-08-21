@@ -484,7 +484,6 @@ mod socket_transport {
     #[cfg(windows)]
     mod windows {
         use std::io;
-        use std::path::Path;
         use std::time::Duration;
 
         #[cfg(test)]
@@ -497,34 +496,6 @@ mod socket_transport {
         }
 
         pub type LineReader<T> = asupersync::io::Lines<BufReader<T>>;
-
-        pub async fn bind_with_cx<P: AsRef<Path>>(
-            cx: &crate::cx::Cx,
-            path: P,
-        ) -> io::Result<UnixListener> {
-            cx.checkpoint()
-                .map_err(|_| super::super::native_context_io_error("listener_bind"))?;
-            let inner = frankenterm_uds::UnixListener::bind(path)?;
-            inner.set_nonblocking(true)?;
-            Ok(UnixListener { inner })
-        }
-
-        pub async fn connect_with_cx<P: AsRef<Path>>(
-            cx: &crate::cx::Cx,
-            path: P,
-        ) -> io::Result<UnixStream> {
-            cx.checkpoint()
-                .map_err(|_| super::super::native_context_io_error("connect"))?;
-            let stream_result = UnixStream::connect(path);
-            cx.checkpoint()
-                .map_err(|_| super::super::native_context_io_error("connect"))?;
-            let stream = stream_result?;
-            let nonblocking_result = stream.set_nonblocking(true);
-            cx.checkpoint()
-                .map_err(|_| super::super::native_context_io_error("connect"))?;
-            nonblocking_result?;
-            Ok(stream)
-        }
 
         impl UnixListener {
             pub async fn accept_with_cx(&self, cx: &crate::cx::Cx) -> io::Result<(UnixStream, ())> {
