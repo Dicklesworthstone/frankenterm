@@ -190,6 +190,7 @@ impl SpawnQueueCore {
         }
     }
 
+    #[cfg(test)]
     fn queue_legacy(&self, func: SpawnFunc, high_priority: bool) {
         let item = LegacySpawnFunc {
             func,
@@ -566,10 +567,6 @@ impl SpawnQueue {
         receipt
     }
 
-    fn queue_func(&self, func: SpawnFunc, high_priority: bool) {
-        self.core.queue_legacy(func, high_priority);
-    }
-
     fn request_wakeup(&self) {
         if self.wake.request_signal() {
             self.signal_platform_wakeup();
@@ -600,11 +597,6 @@ impl SpawnQueue {
             registration: Once::new(),
             event_handle,
         })
-    }
-
-    fn spawn_impl(&self, f: SpawnFunc, high_pri: bool) {
-        self.queue_func(f, high_pri);
-        self.request_wakeup();
     }
 
     fn signal_platform_wakeup(&self) {
@@ -646,11 +638,6 @@ impl SpawnQueue {
             write: Mutex::new(pipe.write),
             read: Mutex::new(pipe.read),
         })
-    }
-
-    fn spawn_impl(&self, f: SpawnFunc, high_pri: bool) {
-        self.queue_func(f, high_pri);
-        self.request_wakeup();
     }
 
     fn signal_platform_wakeup(&self) {
@@ -752,11 +739,6 @@ impl SpawnQueue {
         unsafe {
             CFRunLoopWakeUp(CFRunLoopGetMain());
         }
-    }
-
-    fn spawn_impl(&self, f: SpawnFunc, high_pri: bool) {
-        self.queue_func(f, high_pri);
-        self.request_wakeup();
     }
 
     fn run_impl(&self) -> bool {
