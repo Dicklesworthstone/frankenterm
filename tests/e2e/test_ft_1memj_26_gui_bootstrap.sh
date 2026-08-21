@@ -585,7 +585,7 @@ scenario_bundle_skip_build_creates_structure() {
   local codesign_log="${scenario_dir}/codesign.log"
   local app_bundle="${output_dir}/FrankenTerm.app"
 
-  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
+  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release-interactive" "${output_dir}"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
@@ -628,7 +628,7 @@ scenario_bundle_refuses_overwrite() {
   local app_bundle="${output_dir}/FrankenTerm.app"
   local rc
 
-  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
+  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release-interactive" "${output_dir}"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
@@ -669,7 +669,7 @@ scenario_bundle_refuses_failed_codesign_verification() {
   local stderr_file="${scenario_dir}/stderr.log"
   local rc
 
-  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release" "${output_dir}"
+  mkdir -p "${scenario_dir}" "${target_dir}/${BUNDLE_TARGET}/release-interactive" "${output_dir}"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
   write_stub_binary "${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
