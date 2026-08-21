@@ -589,7 +589,24 @@ pub fn panic_is_broken_pipe(info: &std::panic::PanicHookInfo<'_>) -> bool {
 
 fn is_std_stdio_location(file: &str) -> bool {
     const STDIO_SOURCE: &str = "library/std/src/io/stdio.rs";
-    file == STDIO_SOURCE
+    if file == STDIO_SOURCE {
+        return true;
+    }
+
+    // Distributed rustc builds may retain the compiler's remapped source
+    // prefix in release artifacts: `/rustc/<commit>/library/std/...`. Keep
+    // this narrow by requiring the exact namespace, one 40-digit hexadecimal
+    // compiler commit, and the exact stdio suffix. A caller-controlled path
+    // that merely ends in `library/std/...` remains insufficient authority.
+    let Some(remapped) = file.strip_prefix("/rustc/") else {
+        return false;
+    };
+    let Some((commit, source)) = remapped.split_once('/') else {
+        return false;
+    };
+    commit.len() == 40
+        && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && source == STDIO_SOURCE
 }
 
 fn payload_is_std_broken_pipe_print(payload: &dyn std::any::Any) -> bool {
@@ -1102,8 +1119,14 @@ mod tests {
     #[test]
     fn recognizes_only_rust_standard_stdio_source_locations() {
         assert!(is_std_stdio_location("library/std/src/io/stdio.rs"));
+        assert!(is_std_stdio_location(
+            "/rustc/12c36e2539c54397c51d6ea4401defd8768a4f5b/library/std/src/io/stdio.rs"
+        ));
         assert!(!is_std_stdio_location(
             "/rustc/toolchain/library/std/src/io/stdio.rs"
+        ));
+        assert!(!is_std_stdio_location(
+            "/rustc/12c36e2539c54397c51d6ea4401defd8768a4f5g/library/std/src/io/stdio.rs"
         ));
         assert!(!is_std_stdio_location(
             r"C:\rustc\toolchain\library/std/src/io/stdio.rs"
