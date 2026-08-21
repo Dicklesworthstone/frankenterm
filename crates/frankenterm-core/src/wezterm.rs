@@ -2570,18 +2570,18 @@ impl WeztermClient {
     /// vendored+unix+asupersync. The legacy CLI cannot carry pane input over
     /// bounded stdin, so this path fails closed before subprocess construction.
     #[cfg(not(all(feature = "vendored", unix)))]
-    async fn send_text_impl_with_cx(
+    fn send_text_impl_with_cx(
         &self,
         _cx: &crate::cx::Cx,
         _pane_id: u64,
         _text: &str,
         _no_paste: bool,
         _no_newline: bool,
-    ) -> Result<()> {
+    ) -> impl Future<Output = Result<()>> {
         frankenterm_core_replay_types::simulation_guard::SimulationGuard::assert_not_simulating(
             "wezterm::WeztermClient::send_text_impl_with_cx",
         );
-        Self::reject_cli_pane_input_fallback()
+        std::future::ready(Self::reject_cli_pane_input_fallback())
     }
 
     fn reject_cli_pane_input_fallback() -> Result<()> {
