@@ -47680,19 +47680,22 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             .await
                                         };
                                         #[cfg(not(unix))]
-                                        let delivery_result = deliver_claimed_watch_event(
-                                            &cx,
-                                            &storage,
-                                            redacted.id,
-                                            record,
-                                            move |line| async move {
-                                                let mut lock = stdout.lock();
-                                                write_watch_claim_line_synchronously(
-                                                    &mut lock, &line,
-                                                )
-                                            },
-                                        )
-                                        .await;
+                                        let delivery_result = {
+                                            let stdout_ref = &stdout;
+                                            deliver_claimed_watch_event(
+                                                &cx,
+                                                &storage,
+                                                redacted.id,
+                                                record,
+                                                move |line| async move {
+                                                    let mut lock = stdout_ref.lock();
+                                                    write_watch_claim_line_synchronously(
+                                                        &mut lock, &line,
+                                                    )
+                                                },
+                                            )
+                                            .await
+                                        };
                                         let delivery = match delivery_result {
                                             Ok(delivery) => delivery,
                                             Err(error)
