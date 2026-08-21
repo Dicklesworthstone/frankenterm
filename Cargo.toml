@@ -669,6 +669,6 @@ debug = 1
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.
 k9 = { git = "https://github.com/aaronabramov/k9", rev = "db63bcd7f6766051f3767b48b5e05cf1f8fffc7c" }
 # FastMCP and FastAPI request rich_rust from crates.io. Patch that source to the
-# reviewed 0.2.2 revision that carries the repaired `time` bound; patching the
+# reviewed 0.2.3 revision that carries the repaired `time` bound; patching the
 # FastMCP Git source itself cannot affect a crates.io dependency.
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "b0b298fca7ea29d20cac4014dd6665b234685037" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "60ca9a06697b79378b6569b678405d3121194114" }

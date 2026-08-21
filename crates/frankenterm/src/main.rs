@@ -47685,7 +47685,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                                             &storage,
                                             redacted.id,
                                             record,
-                                            |line| async {
+                                            move |line| async move {
                                                 let mut lock = stdout.lock();
                                                 write_watch_claim_line_synchronously(
                                                     &mut lock, &line,

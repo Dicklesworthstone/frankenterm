@@ -48,6 +48,7 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.0...v0.
 - Correctly terminates Unix subprocess groups on cancellation by separating the negative process-group identifier from `kill` option parsing, with an exact live process-group regression.
 - Makes timeout arbitration return an already-ready result before installing an elapsed timer, and preserves completion signalling after blocking work observes cancellation.
 - Continues bounded FIFO size eviction across SQLite's quantized page-release boundary while reporting an unattainable cap honestly when only the schema floor remains.
+- Restores clean-host release reproducibility by pinning `rich_rust` to its reachable 0.2.3 revision, and fixes Windows watch-claim delivery to own its asynchronous line payload.
 
 ---
 
