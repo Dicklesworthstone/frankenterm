@@ -12,6 +12,14 @@ BUNDLE_TARGET="aarch64-apple-darwin"
 BROWSER_RUNTIME_ROOT="${ARTIFACT_DIR}/browser-runtime-component"
 BROWSER_RUNTIME_MANIFEST="${ARTIFACT_DIR}/browser-runtime-component.json"
 BROWSER_BUNDLE_ARGS=()
+WORKSPACE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${ROOT_DIR}/Cargo.toml" | head -1)"
+SOURCE_REVISION="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
+TEST_ATOMIC_BUILD_ID="$(bash "${ROOT_DIR}/scripts/atomic-component-manifest.sh" derive-build-id \
+  --source-revision "${SOURCE_REVISION}" \
+  --version "${WORKSPACE_VERSION}" \
+  --target "${BUNDLE_TARGET}" \
+  --profile release-interactive \
+  --feature-contract workspace-default-members-default-features-v1)"
 
 mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
 
@@ -175,6 +183,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  exit 0' \
     'fi' \
     'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
+  printf '%s\n' '# FT_ATOMIC_COMPONENT_IDENTITY_V1:${TEST_ATOMIC_BUILD_ID}:frankenterm-gui:${BUNDLE_TARGET}:release-interactive:${WORKSPACE_VERSION};' >> "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui"
   printf '%s\n' \
     '#!/bin/bash' \
     'if [[ "${1:-}" == "--version" ]]; then' \
@@ -186,6 +195,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  exit 0' \
     'fi' \
     'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
+  printf '%s\n' '# FT_ATOMIC_COMPONENT_IDENTITY_V1:${TEST_ATOMIC_BUILD_ID}:ft:${BUNDLE_TARGET}:release-interactive:${WORKSPACE_VERSION};' >> "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/ft"
   printf '%s\n' \
     '#!/bin/bash' \
     'if [[ "${1:-}" == "--version" ]]; then' \
@@ -197,6 +207,7 @@ if [[ "\${1:-}" == "exec" ]]; then
     '  exit 0' \
     'fi' \
     'exit 0' > "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
+  printf '%s\n' '# FT_ATOMIC_COMPONENT_IDENTITY_V1:${TEST_ATOMIC_BUILD_ID}:frankenterm-mux-server:${BUNDLE_TARGET}:release-interactive:${WORKSPACE_VERSION};' >> "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
   chmod +x "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-gui" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/ft" "\${PWD}/\${target_dir}/${BUNDLE_TARGET}/release-interactive/frankenterm-mux-server"
   exit 0
 fi
@@ -296,6 +307,8 @@ EOF
 
 write_stub_binary() {
   local path="$1"
+  local component
+  component="$(basename "${path}")"
   cat > "${path}" <<'EOF'
 #!/bin/bash
 if [[ "${1:-}" == "--version" ]]; then
@@ -308,6 +321,7 @@ if [[ "${1:-}" == "--help" ]]; then
 fi
 exit 0
 EOF
+  printf '%s\n' "# FT_ATOMIC_COMPONENT_IDENTITY_V1:${TEST_ATOMIC_BUILD_ID}:${component}:${BUNDLE_TARGET}:release-interactive:${WORKSPACE_VERSION};" >> "${path}"
   chmod +x "${path}"
 }
 
