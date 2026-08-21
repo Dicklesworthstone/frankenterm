@@ -43,6 +43,7 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.0...v0.
 - Restores the full native release process after `v0.15.0` was published without binary assets.
 - Ships verified CLI archives for Linux x86_64, Linux arm64, macOS arm64, and Windows x86_64, plus the complete macOS `FrankenTerm.app` bundle.
 - Restores formatter-clean source, per-asset SHA-256 sidecars, aggregate `SHA256SUMS`, local macOS GUI installation, LaunchServices registration, and Dock refresh.
+- Seals every macOS bundle executable with the exact `release-interactive` profile identity instead of Cargo's generic inherited `release` label, so mixed-profile bundles fail closed before publication.
 - Preserves quiet exit `141` for real closed-pipe writes from release binaries built with compiler-remapped standard-library source paths, while continuing to reject caller-forged EPIPE panic payloads.
 
 ---

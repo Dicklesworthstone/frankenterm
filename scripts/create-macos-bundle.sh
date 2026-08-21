@@ -286,6 +286,7 @@ run_rch_bundle_build() {
         run_rch --no-self-healing exec -- env \
             CARGO_TARGET_DIR="$CARGO_TARGET_DIR_REL" \
             FT_ATOMIC_BUILD_IDENTITY="$FT_ATOMIC_BUILD_IDENTITY" \
+            FT_ATOMIC_BUILD_PROFILE="$BUILD_PROFILE" \
             cargo build --locked --profile "$BUILD_PROFILE" --target "$TARGET_TRIPLE" \
             --bin frankenterm-gui \
             --bin frankenterm-mux-server \
