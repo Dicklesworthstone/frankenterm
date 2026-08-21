@@ -354,7 +354,7 @@ impl UnixStream {
         self.register_interest(cx, Interest::WRITABLE)
     }
 
-    #[cfg(feature = "async-asupersync")]
+    #[cfg(all(feature = "async-asupersync", unix))]
     fn register_interest_for_read_write(&self, cx: &Context<'_>) -> std::io::Result<()> {
         self.register_interest(cx, Interest::READABLE | Interest::WRITABLE)
     }
