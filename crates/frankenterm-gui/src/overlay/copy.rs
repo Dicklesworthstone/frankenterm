@@ -1738,7 +1738,7 @@ impl CopyRenderable {
 
                     let start = SelectionCoordinate::x_y(
                         if cursor_is_above_start {
-                            usize::max_value()
+                            usize::MAX
                         } else {
                             0
                         },
@@ -1748,7 +1748,7 @@ impl CopyRenderable {
                         if cursor_is_above_start {
                             0
                         } else {
-                            usize::max_value()
+                            usize::MAX
                         },
                         self.cursor.y,
                     );
@@ -2072,7 +2072,7 @@ impl CopyRenderable {
 
     fn move_to_bottom(&mut self) {
         // This will get fixed up by clamp_cursor_to_scrollback
-        self.cursor.y = isize::max_value();
+        self.cursor.y = isize::MAX;
         self.select_to_cursor_pos();
     }
 
@@ -2151,7 +2151,7 @@ impl CopyRenderable {
             if let Some(previous_row) =
                 previous_row_within_scrollback(self.cursor.y, scrollback_top)
             {
-                self.cursor.x = usize::max_value();
+                self.cursor.x = usize::MAX;
                 previous_row
             } else {
                 self.cursor.y
@@ -2167,7 +2167,7 @@ impl CopyRenderable {
         let (top, lines) = self.delegate.get_lines(line_range);
         if let Some(line) = lines.get(0) {
             self.cursor.y = top;
-            if self.cursor.x == usize::max_value() {
+            if self.cursor.x == usize::MAX {
                 self.cursor.x = line.len().saturating_sub(1);
             }
             let s = line.columns_as_str(0..self.cursor.x.saturating_add(1));
@@ -2206,7 +2206,7 @@ impl CopyRenderable {
                 if let Some(previous_row) =
                     previous_row_within_scrollback(self.cursor.y, scrollback_top)
                 {
-                    self.cursor.x = usize::max_value();
+                    self.cursor.x = usize::MAX;
                     self.cursor.y = previous_row;
                     return self.move_backward_one_word();
                 }
