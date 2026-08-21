@@ -287,7 +287,13 @@ import sys
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     payload = json.load(handle)
 
-for worker in payload.get("data", []):
+data = payload.get("data", [])
+workers = data.get("results", []) if isinstance(data, dict) else data
+if not isinstance(workers, list):
+    raise SystemExit("rch worker probe returned an invalid data shape")
+for worker in workers:
+    if not isinstance(worker, dict):
+        raise SystemExit("rch worker probe returned an invalid worker record")
     status = str(worker.get("status", "")).strip().lower()
     if status and not status.endswith("_failed") and status not in {
         "connection_failed",

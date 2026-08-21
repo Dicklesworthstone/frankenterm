@@ -112,7 +112,7 @@ if [[ "\${1:-}" == "--no-self-healing" ]]; then
   shift
 fi
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
-  printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"connection_failed","error":"RCH-E100"}]}'
+  printf '%s\n' '{"api_version":"1.0","data":{"results":[{"id":"mock-worker","host":"127.0.0.1","status":"connection_failed","error":"RCH-E100"}],"summary":{"healthy":0}}}'
   exit 0
 fi
 
@@ -138,7 +138,7 @@ if [[ "\${1:-}" == "--no-self-healing" ]]; then
   shift
 fi
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
-  printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
+  printf '%s\n' '{"api_version":"1.0","data":{"results":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}],"summary":{"healthy":1}}}'
   exit 0
 fi
 
@@ -218,7 +218,7 @@ if [[ "\${1:-}" == "--no-self-healing" ]]; then
   shift
 fi
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
-  printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
+  printf '%s\n' '{"api_version":"1.0","data":{"results":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}],"summary":{"healthy":1}}}'
   exit 0
 fi
 
@@ -256,7 +256,7 @@ if [[ "\${1:-}" == "--no-self-healing" ]]; then
   shift
 fi
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
-  printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
+  printf '%s\n' '{"api_version":"1.0","data":{"results":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}],"summary":{"healthy":1}}}'
   exit 0
 fi
 
@@ -481,7 +481,7 @@ scenario_e2e_probe_failure_refuses_exec() {
     record_result "e2e_probe_failure_refuses_exec" "false" "unexpected_summary" "SUMMARY_MISMATCH" "probe-failure summary did not collapse to a single root-cause failure"
     return
   fi
-  if ! jq -e '.data[0].status == "connection_failed"' "${probe_log}" >/dev/null; then
+  if ! jq -e '.data.results[0].status == "connection_failed"' "${probe_log}" >/dev/null; then
     record_result "e2e_probe_failure_refuses_exec" "false" "probe_artifact_missing" "PROBE_LOG_INVALID" "probe artifact missing connection_failed status"
     return
   fi
