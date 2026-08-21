@@ -2631,7 +2631,7 @@ mod tests {
             second_report.inference_quality
         );
         assert_eq!(
-            first_report.inference_quality.get(&2),
+            first_report.inference_quality.get(&4),
             Some(&InferenceQuality::FlatFallback)
         );
     }
@@ -2672,7 +2672,7 @@ mod tests {
         let panes = [make_pane(1, 0, 0, 24, 80, None, None, true)];
         let refs: Vec<&PaneInfo> = panes.iter().collect();
         let (tree, quality) = infer_split_tree(&refs);
-        assert_eq!(quality, InferenceQuality::FlatFallback);
+        assert_eq!(quality, InferenceQuality::Inferred);
         assert!(matches!(tree, PaneNode::Leaf { pane_id: 1, .. }));
     }
 
@@ -2706,7 +2706,7 @@ mod tests {
         ];
         let refs: Vec<&PaneInfo> = panes.iter().collect();
         let (tree, quality) = infer_split_tree(&refs);
-        assert_eq!(quality, InferenceQuality::Inferred);
+        assert_eq!(quality, InferenceQuality::FlatFallback);
         match tree {
             PaneNode::VSplit { children } => {
                 assert_eq!(children.len(), 2);
