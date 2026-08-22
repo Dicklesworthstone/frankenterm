@@ -174,10 +174,14 @@ jobs:
               --no-default-features \
               --features browser,distributed,vendored,mcp,metrics,native-wezterm,semantic-search,subprocess-bridge,sync,ftui,tui-dashboard,tui-widgets,web,redis-session,asupersync-runtime
           else
-            # `ft watch` and core task/storage paths contain audited recovery
-            # boundaries, so every shipped CLI must share the unwind contract.
+            # A usable remote-domain release is an atomic client/server process
+            # family.  In particular, a breaking codec-floor bump cannot be
+            # deployed safely if the Linux archive contains only the client:
+            # long-lived remote mux servers would be stranded on the old
+            # dialect.  Build both artifacts from the frozen source identity.
             cargo build --locked --profile release-interactive --target ${{ matrix.target }} \
-              -p frankenterm --bin ft
+              -p frankenterm --bin ft \
+              -p frankenterm-mux-server --bin frankenterm-mux-server
           fi
 
           if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
@@ -220,6 +224,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           BINARY="target/${{ matrix.target }}/release-interactive/${{ matrix.artifact }}"
+          MUX_SERVER_BINARY="target/${{ matrix.target }}/release-interactive/frankenterm-mux-server"
           echo "=== ft --version ==="
           "$BINARY" --version
           echo "=== ft version --full ==="
@@ -246,6 +251,8 @@ jobs:
           # malformed-output regressions while letting the doctor's
           # environmental checks correctly flag missing backends.
           echo "$DOCTOR_OUTPUT" | python3 -c "import json,sys; json.loads(sys.stdin.read())"
+          echo "=== frankenterm-mux-server --version ==="
+          "$MUX_SERVER_BINARY" --version
           echo "=== All smoke tests passed ==="
 
       - name: Smoke test binary (Windows)
@@ -287,8 +294,13 @@ jobs:
           STAGING="target/atomic-release-staging/${{ matrix.asset }}"
           mkdir "$STAGING"
           cp "target/${{ matrix.target }}/release-interactive/${{ matrix.artifact }}" "$STAGING/ft"
+          cp "target/${{ matrix.target }}/release-interactive/frankenterm-mux-server" \
+            "$STAGING/frankenterm-mux-server"
           cp scripts/atomic-component-manifest.sh "$STAGING/verify-components.sh"
-          chmod 0755 "$STAGING/ft" "$STAGING/verify-components.sh"
+          chmod 0755 \
+            "$STAGING/ft" \
+            "$STAGING/frankenterm-mux-server" \
+            "$STAGING/verify-components.sh"
 
           extract_numeric_rust_const() {
             local source_file="$1"
@@ -316,6 +328,7 @@ jobs:
             --profile "$FT_ATOMIC_BUILD_PROFILE" \
             --feature-contract "$FT_ATOMIC_FEATURE_CONTRACT" \
             --entry executable:cli:ft:ft \
+            --entry executable:mux-server:frankenterm-mux-server:frankenterm-mux-server \
             --entry verifier:offline-verifier:verify-components.sh \
             --source-match verify-components.sh=scripts/atomic-component-manifest.sh \
             --input workspace.manifest=Cargo.toml \
@@ -333,13 +346,35 @@ jobs:
             --contract render-application.version="$RENDER_PROTOCOL_VERSION" \
             --contract core-wire.version="$CORE_WIRE_PROTOCOL_VERSION" \
             --contract storage.schema="$STORAGE_SCHEMA_VERSION" \
-            --contract panic.cli=unwind
+            --contract panic.cli=unwind \
+            --contract panic.mux-server=unwind
           bash "$STAGING/verify-components.sh" verify \
             --root "$STAGING" \
             --manifest "$MANIFEST"
 
           tar -C "$STAGING" -cJf "dist/${{ matrix.asset }}.tar.xz" \
-            ft verify-components.sh "${{ matrix.asset }}.component-manifest.json"
+            ft frankenterm-mux-server verify-components.sh \
+            "${{ matrix.asset }}.component-manifest.json"
+          archive_entries="$(tar -tJf "dist/${{ matrix.asset }}.tar.xz")"
+          grep -Fxq ft <<<"$archive_entries"
+          grep -Fxq frankenterm-mux-server <<<"$archive_entries"
+          grep -Fxq verify-components.sh <<<"$archive_entries"
+          grep -Fxq "${{ matrix.asset }}.component-manifest.json" <<<"$archive_entries"
+          archive_checksum="$(shasum -a 256 "dist/${{ matrix.asset }}.tar.xz" | awk '{print $1}')"
+          install_probe="$RUNNER_TEMP/frankenterm-release-install-${{ matrix.asset }}"
+          mkdir "$install_probe"
+          bash install.sh \
+            --offline "dist/${{ matrix.asset }}.tar.xz" \
+            --checksum "$archive_checksum" \
+            --dest "$install_probe" \
+            --no-app \
+            --no-gum \
+            --quiet
+          cmp "$STAGING/ft" "$install_probe/ft"
+          cmp "$STAGING/frankenterm-mux-server" \
+            "$install_probe/frankenterm-mux-server"
+          "$install_probe/ft" --version
+          "$install_probe/frankenterm-mux-server" --version
           cd dist
           shasum -a 256 "${{ matrix.asset }}.tar.xz" > "${{ matrix.asset }}.tar.xz.sha256"
 

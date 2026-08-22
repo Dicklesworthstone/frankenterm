@@ -204,7 +204,9 @@ Behavior notes:
 ```bash
 ft setup [--list-hosts] [--dry-run] [--apply]
 ft setup local
-ft setup remote <host> [--yes] [--install-ft]
+ft setup remote <host> [--yes] [--install-ft \
+  (--ft-version <release-tag> | \
+   --ft-path <target-ft> --mux-server-path <target-mux-server>)]
 ft setup config
 ft setup patch [--remove]
 ft setup shell [--remove] [--shell <bash|zsh|fish>]

@@ -297,21 +297,84 @@ resolve_version() {
 # Preflight
 # ───────────────────────────────────────────────────────────────────────────
 check_disk_space() {
-  # 50MB headroom. The ft release binary is ~19MB on macOS arm64 / ~15MB on
-  # Linux; tarball download + uncompressed extract + final installed copy
-  # all coexist briefly under $TMP and $DEST.
-  local min_kb=51200
+  # 100MB headroom. The atomic Unix archive contains both ft and the matching
+  # frankenterm-mux-server; download, extraction, staged install, and preserved
+  # previous binaries can coexist briefly under $TMP and $DEST.
+  local min_kb=102400
   local path="$DEST"
   [ ! -d "$path" ] && path=$(dirname "$path")
   if command -v df >/dev/null 2>&1; then
     local avail_kb
     avail_kb=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}')
     if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$min_kb" ]; then
-      err "Insufficient disk space in $path (need at least 50MB)"
+      err "Insufficient disk space in $path (need at least 100MB)"
       exit 1
     fi
   else
     warn "df not found; skipping disk space check"
+  fi
+}
+
+install_process_family() {
+  local ft_source="$1"
+  local mux_source="$2"
+  local ft_target="$DEST/ft"
+  local mux_target="$DEST/frankenterm-mux-server"
+  local ft_stage="${ft_target}.installing-$$"
+  local mux_stage="${mux_target}.installing-$$"
+  local stamp
+  local ft_backup=""
+  local mux_backup=""
+  stamp=$(date +%Y%m%d%H%M%S)
+
+  # Stage both binaries before changing either live name. A running mux keeps
+  # its old executable inode; the new server bytes are picked up only after an
+  # explicit, operator-controlled restart. Preserve previous bytes so a failed
+  # publish or a breaking-codec rollback remains recoverable.
+  if ! install -m 0755 "$ft_source" "$ft_stage"; then
+    err "Failed to stage ft at $ft_stage"
+    return 1
+  fi
+  if ! install -m 0755 "$mux_source" "$mux_stage"; then
+    err "Failed to stage frankenterm-mux-server at $mux_stage"
+    return 1
+  fi
+
+  if [ -e "$ft_target" ]; then
+    ft_backup="${ft_target}.previous-${stamp}-$$"
+    if ! mv "$ft_target" "$ft_backup"; then
+      err "Failed to preserve existing ft at $ft_backup"
+      return 1
+    fi
+  fi
+  if [ -e "$mux_target" ]; then
+    mux_backup="${mux_target}.previous-${stamp}-$$"
+    if ! mv "$mux_target" "$mux_backup"; then
+      err "Failed to preserve existing frankenterm-mux-server at $mux_backup"
+      if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
+      return 1
+    fi
+  fi
+
+  if ! mv "$ft_stage" "$ft_target"; then
+    err "Failed to publish staged ft at $ft_target"
+    if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
+    if [ -n "$mux_backup" ]; then mv "$mux_backup" "$mux_target" || true; fi
+    return 1
+  fi
+  if ! mv "$mux_stage" "$mux_target"; then
+    err "Failed to publish staged frankenterm-mux-server at $mux_target"
+    mv "$ft_target" "${ft_target}.failed-publish-${stamp}-$$" || true
+    if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
+    if [ -n "$mux_backup" ]; then mv "$mux_backup" "$mux_target" || true; fi
+    return 1
+  fi
+
+  ok "Installed ft → $ft_target"
+  ok "Installed frankenterm-mux-server → $mux_target"
+  if [ -n "$ft_backup" ]; then info "Previous ft preserved at $ft_backup"; fi
+  if [ -n "$mux_backup" ]; then
+    info "Previous frankenterm-mux-server preserved at $mux_backup"
   fi
 }
 
@@ -363,12 +426,16 @@ preflight_checks() {
 check_installed_version() {
   local target_ver="$1"
   [ -x "$DEST/ft" ] || return 1
-  local cur
-  cur=$("$DEST/ft" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
-  [ -z "$cur" ] && return 1
+  [ -x "$DEST/frankenterm-mux-server" ] || return 1
+  local ft_cur mux_cur
+  ft_cur=$("$DEST/ft" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
+  mux_cur=$("$DEST/frankenterm-mux-server" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
+  [ -z "$ft_cur" ] && return 1
+  [ -z "$mux_cur" ] && return 1
   # Strip leading 'v' from target_ver for comparison ("v0.2.0" vs "0.2.0")
   local stripped="${target_ver#v}"
-  [ "$cur" = "$stripped" ] || [ "$cur" = "$target_ver" ]
+  { [ "$ft_cur" = "$stripped" ] || [ "$ft_cur" = "$target_ver" ]; } &&
+    { [ "$mux_cur" = "$stripped" ] || [ "$mux_cur" = "$target_ver" ]; }
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -562,7 +629,7 @@ should_install_app() {
 }
 
 install_macos_app() {
-  local app_url dest tmp_app_tar extracted_app target_app
+  local app_url dest tmp_app_tar extracted_app target_app staged_app backup_app
   app_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${APP_ASSET}"
 
   # Destination: explicit --app-dest, else /Applications when writable, else
@@ -627,26 +694,36 @@ install_macos_app() {
   fi
 
   target_app="$dest/FrankenTerm.app"
-  # Replace any existing bundle. The path is pinned to '*/FrankenTerm.app', so
-  # this rm can only ever touch the bundle we manage.
-  if [ -e "$target_app" ]; then
-    if ! rm -rf "$target_app" 2>/dev/null; then
-      warn "Could not replace existing $target_app (permission?); skipping GUI app install"
-      return 0
-    fi
-  fi
-  # Guard the copy: under `set -e` an unhandled ditto/cp failure (perms, disk
-  # full) would abort the whole installer *after* the CLI was already placed.
+  staged_app="${target_app}.installing-$$"
+  backup_app=""
+  # Copy to a sibling staging path before changing the live bundle. This keeps
+  # updates recoverable and avoids deleting a working app before the new bundle
+  # has been copied successfully.
   if command -v ditto >/dev/null 2>&1; then
-    if ! ditto "$extracted_app" "$target_app"; then
-      warn "Failed to copy FrankenTerm.app to $target_app; skipping GUI app install"
+    if ! ditto "$extracted_app" "$staged_app"; then
+      warn "Failed to stage FrankenTerm.app at $staged_app; leaving the current app unchanged"
       return 0
     fi
   else
-    if ! cp -R "$extracted_app" "$target_app"; then
-      warn "Failed to copy FrankenTerm.app to $target_app; skipping GUI app install"
+    if ! cp -R "$extracted_app" "$staged_app"; then
+      warn "Failed to stage FrankenTerm.app at $staged_app; leaving the current app unchanged"
       return 0
     fi
+  fi
+
+  if [ -e "$target_app" ]; then
+    backup_app="${target_app}.previous-$(date +%Y%m%d%H%M%S)-$$"
+    if ! mv "$target_app" "$backup_app"; then
+      warn "Could not preserve existing $target_app; staged app remains at $staged_app"
+      return 0
+    fi
+  fi
+  if ! mv "$staged_app" "$target_app"; then
+    warn "Could not publish staged FrankenTerm.app at $target_app"
+    if [ -n "$backup_app" ] && [ ! -e "$target_app" ]; then
+      mv "$backup_app" "$target_app" || true
+    fi
+    return 0
   fi
 
   # A terminal/curl-placed bundle isn't Gatekeeper-quarantined, but strip the
@@ -670,6 +747,9 @@ install_macos_app() {
   fi
 
   ok "Installed FrankenTerm.app → $target_app"
+  if [ -n "$backup_app" ]; then
+    info "Previous FrankenTerm.app preserved at $backup_app"
+  fi
   APP_INSTALLED_PATH="$target_app"
 }
 
@@ -689,13 +769,15 @@ build_from_source() {
   ensure_rust
   command -v git >/dev/null 2>&1 || { err "git is required for --from-source"; exit 1; }
   # Try the user-specified version first. If that fails (typo, tag doesn't
-  # exist, branch was renamed), wipe any partial clone state and try the
-  # default branch as a last-resort fallback. Without the explicit rm -rf
-  # between attempts, the second clone fails too because $TMP/src may not
-  # be empty.
+  # exist, branch was renamed), preserve any partial clone state and try the
+  # default branch as a last-resort fallback. Moving the failed partial clone
+  # aside gives the second attempt an empty destination without discarding the
+  # first attempt's diagnostic state.
   if ! git clone --depth 1 --branch "$VERSION" \
        "https://github.com/${OWNER}/${REPO}.git" "$TMP/src" 2>/dev/null; then
-    rm -rf "$TMP/src"
+    if [ -e "$TMP/src" ]; then
+      mv "$TMP/src" "$TMP/src.failed-version-clone"
+    fi
     if ! git clone --depth 1 \
          "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"; then
       err "Failed to clone ${OWNER}/${REPO} (tried --branch $VERSION then default)"
@@ -704,10 +786,9 @@ build_from_source() {
     fi
     warn "Tag/branch '$VERSION' not found; built from default branch instead"
   fi
-  # Build only the ft CLI (not the GUI/mux-server) for the broadest
-  # platform coverage. Users who want the macOS .app should install
-  # from the .app bundle (separate flow) or build the workspace
-  # directly: `cargo build --profile release-interactive` after cloning.
+  # Build the CLI and mux server from the same source identity. Remote-domain
+  # releases are an atomic process family; a client-only fallback would recreate
+  # the exact codec-stranding failure that the prebuilt archives prevent.
   local panic_contract_tool="$TMP/src/scripts/check-release-panic-contract.sh"
   if [ ! -f "$panic_contract_tool" ] || \
      ! bash "$panic_contract_tool" --profiles-only; then
@@ -716,7 +797,9 @@ build_from_source() {
   fi
   # Friendly error wrapping: a bare `set -e` exit on cargo failure would
   # not give the user any actionable diagnosis.
-  if ! ( cd "$TMP/src" && cargo build --locked --profile release-interactive -p frankenterm --bin ft ); then
+  if ! ( cd "$TMP/src" && cargo build --locked --profile release-interactive \
+      -p frankenterm --bin ft \
+      -p frankenterm-mux-server --bin frankenterm-mux-server ); then
     err "Source build failed."
     err "Common causes:"
     err "  - Missing system deps on Linux: pkg-config, libcairo2-dev,"
@@ -727,9 +810,10 @@ build_from_source() {
     exit 1
   fi
   local bin="$TMP/src/target/release-interactive/ft"
+  local mux_bin="$TMP/src/target/release-interactive/frankenterm-mux-server"
   [ -x "$bin" ] || { err "Build did not produce $bin"; exit 1; }
-  install -m 0755 "$bin" "$DEST/ft"
-  ok "Installed to $DEST/ft (source build)"
+  [ -x "$mux_bin" ] || { err "Build did not produce $mux_bin"; exit 1; }
+  install_process_family "$bin" "$mux_bin"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -876,7 +960,7 @@ preflight_checks
 # we create here is auto-cleaned regardless of how we exit.
 if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] \
     && check_installed_version "$VERSION"; then
-  ok "ft $VERSION is already installed at $DEST/ft"
+  ok "ft + frankenterm-mux-server $VERSION are already installed at $DEST"
   info "Use --force to reinstall"
   # Still honour the font / GUI-app side installs even when the CLI is current,
   # so a re-run can add the .app to an existing CLI-only install. Decide once
@@ -972,21 +1056,61 @@ else
     fi
   fi
 
-  # Extract
+  # Extract into an otherwise-empty package root.  The atomic manifest verifies
+  # the complete inventory, so download/checksum sidecars in $TMP must not be
+  # allowed to masquerade as package members (or make every valid archive fail).
+  PACKAGE_ROOT="$TMP/package"
+  if ! mkdir -p "$PACKAGE_ROOT"; then
+    err "Failed to create package verification directory"
+    exit 1
+  fi
   info "Extracting $TAR"
-  if ! tar -xf "$TMP/$TAR" -C "$TMP"; then
+  if ! tar -xf "$TMP/$TAR" -C "$PACKAGE_ROOT"; then
     err "Failed to extract $TAR — archive may be corrupt or truncated"
     err "If the download was interrupted, retry; otherwise file an issue at:"
     err "  https://github.com/${OWNER}/${REPO}/issues"
     exit 1
   fi
-  BIN="$TMP/ft"
+
+  # A checksum proves archive bytes, but it cannot prove that the CLI and mux
+  # server came from one source/build identity.  Keep this atomic process-family
+  # verification mandatory even when --no-verify skips transport authenticity.
+  COMPONENT_VERIFIER="$PACKAGE_ROOT/verify-components.sh"
+  COMPONENT_MANIFEST="$PACKAGE_ROOT/${ASSET%.tar.xz}.component-manifest.json"
+  [ -f "$COMPONENT_VERIFIER" ] || {
+    err "Atomic component verifier not found in tarball"
+    err "Refusing an unverifiable client/server process-family install"
+    exit 1
+  }
+  [ -f "$COMPONENT_MANIFEST" ] || {
+    err "Atomic component manifest not found in tarball: $(basename "$COMPONENT_MANIFEST")"
+    err "Refusing an unverifiable client/server process-family install"
+    exit 1
+  }
+  info "Verifying atomic CLI/mux-server build identity"
+  if ! bash "$COMPONENT_VERIFIER" verify \
+      --root "$PACKAGE_ROOT" \
+      --manifest "$COMPONENT_MANIFEST"; then
+    err "Atomic component verification failed"
+    err "Refusing to install mixed, incomplete, or corrupt process-family bytes"
+    exit 1
+  fi
+
+  BIN="$PACKAGE_ROOT/ft"
   if [ ! -x "$BIN" ]; then
-    BIN=$(find "$TMP" -maxdepth 3 -type f -name "ft" -perm -111 2>/dev/null | head -n 1)
+    BIN=$(find "$PACKAGE_ROOT" -maxdepth 3 -type f -name "ft" -perm -111 2>/dev/null | head -n 1)
   fi
   [ -x "$BIN" ] || { err "ft binary not found in tarball"; exit 1; }
-  install -m 0755 "$BIN" "$DEST/ft"
-  ok "Installed ft → $DEST/ft"
+  MUX_BIN="$PACKAGE_ROOT/frankenterm-mux-server"
+  if [ ! -x "$MUX_BIN" ]; then
+    MUX_BIN=$(find "$PACKAGE_ROOT" -maxdepth 3 -type f -name "frankenterm-mux-server" -perm -111 2>/dev/null | head -n 1)
+  fi
+  [ -x "$MUX_BIN" ] || {
+    err "frankenterm-mux-server binary not found in tarball"
+    err "Refusing a client-only install that could strand persistent remote domains"
+    exit 1
+  }
+  install_process_family "$BIN" "$MUX_BIN"
 fi
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1031,6 +1155,7 @@ if [ "$QUIET" -eq 0 ]; then
   summary_lines+=("\033[1;32mFrankenTerm installed\033[0m")
   summary_lines+=("")
   summary_lines+=("Binary:   $DEST/ft")
+  summary_lines+=("Mux:      $DEST/frankenterm-mux-server")
   summary_lines+=("Version:  $RESOLVED_VERSION")
   if [ -n "${TARGET:-}" ]; then
     summary_lines+=("Platform: ${OS}/${ARCH} ($TARGET)")
@@ -1052,6 +1177,7 @@ if [ "$QUIET" -eq 0 ]; then
   summary_lines+=("")
   summary_lines+=("Uninstall:")
   summary_lines+=("  rm $DEST/ft")
+  summary_lines+=("  rm $DEST/frankenterm-mux-server")
   if [ "$WITH_FONT" -eq 1 ]; then
     # Select the right font path based on the platform we installed for —
     # don't concatenate Linux + macOS paths together.

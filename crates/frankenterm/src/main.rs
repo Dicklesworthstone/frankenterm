@@ -6124,7 +6124,7 @@ enum SetupCommands {
         #[arg(long)]
         yes: bool,
 
-        /// Install ft on the remote host
+        /// Install the matching ft and frankenterm-mux-server process family
         #[arg(long)]
         install_ft: bool,
 
@@ -6132,7 +6132,11 @@ enum SetupCommands {
         #[arg(long)]
         ft_path: Option<PathBuf>,
 
-        /// Install ft from git (optional tag or revision)
+        /// Path to a target-compatible local mux-server binary for scp
+        #[arg(long, requires = "ft_path")]
+        mux_server_path: Option<PathBuf>,
+
+        /// Install both components from an immutable release tag
         #[arg(long)]
         ft_version: Option<String>,
 
@@ -62029,6 +62033,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                         yes,
                         install_ft,
                         ft_path,
+                        mux_server_path,
                         ft_version,
                         timeout_secs,
                     } => {
@@ -62038,6 +62043,7 @@ async fn run(cx: &frankenterm_core::cx::Cx, robot_mode: bool) -> anyhow::Result<
                             yes,
                             install_ft,
                             ft_path: ft_path.as_deref(),
+                            mux_server_path: mux_server_path.as_deref(),
                             ft_version: ft_version.as_deref(),
                             timeout_secs,
                             verbose: cli.verbose,
@@ -76882,6 +76888,9 @@ struct RemoteCommandOutput {
 
 const REMOTE_SETUP_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const REMOTE_SETUP_MAX_STDERR_BYTES: usize = 8 * 1024 * 1024;
+const REMOTE_COMPONENT_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const ATOMIC_COMPONENT_MARKER_PREFIX: &[u8] = b"FT_ATOMIC_COMPONENT_IDENTITY_V1:";
+const ATOMIC_COMPONENT_MARKER_MAX_BYTES: usize = 512;
 
 struct RemoteSetupOptions<'a> {
     apply: bool,
@@ -76889,9 +76898,279 @@ struct RemoteSetupOptions<'a> {
     yes: bool,
     install_ft: bool,
     ft_path: Option<&'a Path>,
+    mux_server_path: Option<&'a Path>,
     ft_version: Option<&'a str>,
     timeout_secs: u64,
     verbose: u8,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct LocalComponentIdentity {
+    build_id: String,
+    target: String,
+    profile: String,
+    version: String,
+}
+
+fn read_local_component_identity(
+    path: &Path,
+    expected_component: &str,
+) -> anyhow::Result<LocalComponentIdentity> {
+    let file = fs::File::open(path)
+        .map_err(|error| anyhow::anyhow!("cannot open component {}: {error}", path.display()))?;
+    let metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!("cannot inspect component {}: {error}", path.display())
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!("component path is not a regular file: {}", path.display());
+    }
+    if metadata.len() > REMOTE_COMPONENT_MAX_BYTES {
+        anyhow::bail!(
+            "component {} exceeds the {} byte local verification limit",
+            path.display(),
+            REMOTE_COMPONENT_MAX_BYTES
+        );
+    }
+    let expected_len = usize::try_from(metadata.len()).map_err(|error| {
+        anyhow::anyhow!(
+            "component {} size cannot be represented locally: {error}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(expected_len).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot reserve {} bytes to verify component {}: {error}",
+            expected_len,
+            path.display()
+        )
+    })?;
+    file.take(REMOTE_COMPONENT_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("cannot read component {}: {error}", path.display()))?;
+    if bytes.len() != expected_len {
+        anyhow::bail!(
+            "component {} changed while its atomic identity was being verified",
+            path.display()
+        );
+    }
+    let mut identity = None;
+
+    for marker_start in bytes
+        .windows(ATOMIC_COMPONENT_MARKER_PREFIX.len())
+        .enumerate()
+        .filter_map(|(offset, candidate)| {
+            (candidate == ATOMIC_COMPONENT_MARKER_PREFIX).then_some(offset)
+        })
+    {
+        let payload_start = marker_start + ATOMIC_COMPONENT_MARKER_PREFIX.len();
+        let payload = &bytes[payload_start..];
+        let marker_len = payload
+            .iter()
+            .take(ATOMIC_COMPONENT_MARKER_MAX_BYTES)
+            .position(|byte| *byte == b';')
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "component {} contains an unterminated or oversized atomic identity marker",
+                    path.display()
+                )
+            })?;
+        let marker = std::str::from_utf8(&payload[..marker_len]).map_err(|error| {
+            anyhow::anyhow!(
+                "component {} contains a non-UTF-8 atomic identity marker: {error}",
+                path.display()
+            )
+        })?;
+        let fields: Vec<&str> = marker.split(':').collect();
+        if fields.len() != 5 {
+            anyhow::bail!(
+                "component {} contains a malformed atomic identity marker",
+                path.display()
+            );
+        }
+        let [build_id, component, target, profile, version] = fields.as_slice() else {
+            unreachable!("field count was checked above")
+        };
+        if build_id.len() != 64
+            || !build_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!(
+                "component {} is not from a sealed atomic release build",
+                path.display()
+            );
+        }
+        if *component != expected_component {
+            anyhow::bail!(
+                "component {} identifies itself as {component}, expected {expected_component}",
+                path.display()
+            );
+        }
+        if [*target, *profile, *version].iter().any(|value| {
+            value.is_empty()
+                || !value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
+                })
+        }) {
+            anyhow::bail!(
+                "component {} contains invalid target/profile/version identity fields",
+                path.display()
+            );
+        }
+        let parsed = LocalComponentIdentity {
+            build_id: (*build_id).to_string(),
+            target: (*target).to_string(),
+            profile: (*profile).to_string(),
+            version: (*version).to_string(),
+        };
+        if let Some(existing) = identity.as_ref() {
+            if existing != &parsed {
+                anyhow::bail!(
+                    "component {} contains conflicting atomic identity markers",
+                    path.display()
+                );
+            }
+        } else {
+            identity = Some(parsed);
+        }
+    }
+
+    identity.ok_or_else(|| {
+        anyhow::anyhow!(
+            "component {} has no atomic release identity marker",
+            path.display()
+        )
+    })
+}
+
+fn validate_local_process_family(ft_path: &Path, mux_server_path: &Path) -> anyhow::Result<()> {
+    let ft = read_local_component_identity(ft_path, "ft")?;
+    let mux = read_local_component_identity(mux_server_path, "frankenterm-mux-server")?;
+    if ft != mux {
+        anyhow::bail!(
+            "local ft and frankenterm-mux-server do not share one sealed build identity: ft={ft:?}, mux={mux:?}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_remote_release_tag(tag: &str) -> anyhow::Result<&str> {
+    if tag.is_empty() || tag.len() > 128 {
+        anyhow::bail!("remote release tag must contain 1 to 128 characters");
+    }
+    if tag == "git" {
+        anyhow::bail!(
+            "--ft-version git is not an immutable client/server identity; use an exact release tag"
+        );
+    }
+    if !tag.as_bytes()[0].is_ascii_alphanumeric()
+        || !tag
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "remote release tag may contain only ASCII letters, digits, dot, underscore, and hyphen"
+        );
+    }
+    Ok(tag)
+}
+
+fn validate_remote_host(host: &str) -> anyhow::Result<&str> {
+    if host.is_empty() || host.len() > 512 {
+        anyhow::bail!("remote SSH host must contain 1 to 512 characters");
+    }
+    if !(host.as_bytes()[0].is_ascii_alphanumeric() || host.starts_with('['))
+        || !host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b'@' | b':' | b'[' | b']' | b'%')
+        })
+    {
+        anyhow::bail!(
+            "remote SSH host contains whitespace, control bytes, path separators, or option syntax"
+        );
+    }
+    Ok(host)
+}
+
+fn validate_remote_mux_server_path(path: &str) -> anyhow::Result<&str> {
+    if path.is_empty() || path.len() > 4096 || !Path::new(path).is_absolute() {
+        anyhow::bail!("remote mux-server path must be a bounded absolute path");
+    }
+    if !path
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "remote mux-server path contains whitespace, control bytes, or shell metacharacters"
+        );
+    }
+    Ok(path)
+}
+
+fn remote_release_installer_command(tag: &str) -> anyhow::Result<String> {
+    let tag = validate_remote_release_tag(tag)?;
+    let installer_revision = build_meta::GIT_HASH;
+    if build_meta::GIT_DIRTY != ""
+        || installer_revision.len() != 40
+        || !installer_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!(
+            "remote release installation requires a clean build with an exact 40-hex source revision"
+        );
+    }
+    Ok(format!(
+        "installer=\"$HOME/.cache/frankenterm/install-{tag}.sh\"; \
+         mkdir -p \"$HOME/.cache/frankenterm\" \"$HOME/.local/bin\" && \
+         curl --proto '=https' --tlsv1.2 -fsSL \
+         https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/{installer_revision}/install.sh \
+         -o \"$installer\" && \
+         bash \"$installer\" --version {tag} --dest \"$HOME/.local/bin\" --no-app"
+    ))
+}
+
+fn copy_remote_component(
+    host: &str,
+    source: &Path,
+    remote_name: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    if !source.is_file() {
+        anyhow::bail!("component path is not a file: {}", source.display());
+    }
+
+    let mut scp = std::process::Command::new("scp");
+    scp.arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", timeout.as_secs()))
+        .arg(source)
+        .arg(format!(
+            "{host}:.local/bin/{remote_name}.installing-{}",
+            std::process::id()
+        ));
+    let output = run_cmd_with_timeout(
+        &mut scp,
+        timeout,
+        REMOTE_SETUP_MAX_STDOUT_BYTES,
+        REMOTE_SETUP_MAX_STDERR_BYTES,
+    )?;
+    if output.stdout.overflowed || output.stderr.overflowed {
+        anyhow::bail!("scp output exceeded the remote setup safety limit");
+    }
+    if !output.status.success() {
+        anyhow::bail!(
+            "scp of {} failed with status {}: {}",
+            source.display(),
+            output.status,
+            bounded_terminal_diagnostic(
+                &String::from_utf8_lossy(&output.stderr.bytes),
+                512,
+                1024
+            )
+        );
+    }
+    Ok(())
 }
 
 fn run_remote_command(
@@ -77003,9 +77282,46 @@ where
     use frankenterm_core::policy::Redactor;
     use std::io::Write;
 
+    validate_remote_host(host)?;
     let timeout = std::time::Duration::from_secs(options.timeout_secs.max(5));
     let apply_changes = options.apply && !options.dry_run;
     let redactor = Redactor::new();
+
+    match (
+        options.install_ft,
+        options.ft_path,
+        options.mux_server_path,
+        options.ft_version,
+    ) {
+        (false, None, None, None) => {}
+        (false, _, _, _) => {
+            anyhow::bail!(
+                "component source flags require --install-ft so the atomic process family is explicit"
+            );
+        }
+        (true, Some(ft_path), Some(mux_server_path), None) => {
+            validate_local_process_family(ft_path, mux_server_path)?;
+        }
+        (true, None, None, Some(tag)) => {
+            validate_remote_release_tag(tag)?;
+        }
+        (true, Some(_), None, None) => {
+            anyhow::bail!("--ft-path requires --mux-server-path from the exact same build");
+        }
+        (true, None, Some(_), None) => {
+            anyhow::bail!("--mux-server-path requires --ft-path from the exact same build");
+        }
+        (true, None, None, None) => {
+            anyhow::bail!(
+                "--install-ft requires either both --ft-path and --mux-server-path, or --ft-version <release-tag>"
+            );
+        }
+        (true, _, _, Some(_)) => {
+            anyhow::bail!(
+                "choose exactly one component source: local --ft-path/--mux-server-path or --ft-version"
+            );
+        }
+    }
 
     println!("ft setup remote - Remote Host Setup for '{host}'\n");
     if options.dry_run || !apply_changes {
@@ -77213,7 +77529,109 @@ where
         }
     }
 
-    // Step 4: Resolve mux-server path and install user service unit
+    // Step 4: Optionally stage the exact client/server process family before
+    // resolving the service path. Updating bytes on disk never restarts an
+    // active mux: doing so would destroy the PTYs it owns. The operator can
+    // drain and restart deliberately after this command returns.
+    if options.install_ft {
+        if apply_changes {
+            run_remote_step(
+                "Ensure remote component directory",
+                host,
+                "mkdir -p \"$HOME/.local/bin\"",
+                timeout,
+                runner,
+                &redactor,
+                options.verbose,
+                true,
+            )?;
+
+            if let (Some(ft_path), Some(mux_server_path)) =
+                (options.ft_path, options.mux_server_path)
+            {
+                copy_remote_component(host, ft_path, "ft", timeout)?;
+                copy_remote_component(
+                    host,
+                    mux_server_path,
+                    "frankenterm-mux-server",
+                    timeout,
+                )?;
+                let suffix = std::process::id();
+                let publish_command = format!(
+                    r#"set -eu
+stamp=$(date +%Y%m%d%H%M%S)
+bin="$HOME/.local/bin"
+ft_stage="$bin/ft.installing-{suffix}"
+mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
+test -f "$ft_stage" && test -f "$mux_stage"
+chmod 0755 "$ft_stage" "$mux_stage"
+ft_backup=""
+mux_backup=""
+if test -e "$bin/ft"; then
+  ft_backup="$bin/ft.previous-$stamp-$$"
+  mv "$bin/ft" "$ft_backup"
+fi
+if test -e "$bin/frankenterm-mux-server"; then
+  mux_backup="$bin/frankenterm-mux-server.previous-$stamp-$$"
+  if ! mv "$bin/frankenterm-mux-server" "$mux_backup"; then
+    test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
+    exit 1
+  fi
+fi
+if ! mv "$ft_stage" "$bin/ft"; then
+  test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
+  test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
+  exit 1
+fi
+if ! mv "$mux_stage" "$bin/frankenterm-mux-server"; then
+  mv "$bin/ft" "$bin/ft.failed-publish-$stamp-$$"
+  test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
+  test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
+  exit 1
+fi
+"$bin/ft" --version
+"$bin/frankenterm-mux-server" --version"#
+                );
+                run_remote_step(
+                    "Publish atomic FrankenTerm process family",
+                    host,
+                    &publish_command,
+                    timeout,
+                    runner,
+                    &redactor,
+                    options.verbose,
+                    true,
+                )?;
+            } else if let Some(tag) = options.ft_version {
+                let install_timeout = timeout.max(std::time::Duration::from_secs(600));
+                let install_command = remote_release_installer_command(tag)?;
+                run_remote_step(
+                    "Install verified FrankenTerm release process family",
+                    host,
+                    &install_command,
+                    install_timeout,
+                    runner,
+                    &redactor,
+                    options.verbose,
+                    true,
+                )?;
+            }
+            println!(
+                "  ✓ matching ft and mux-server bytes are staged; an active mux was not restarted"
+            );
+        } else if let (Some(ft_path), Some(mux_server_path)) =
+            (options.ft_path, options.mux_server_path)
+        {
+            println!("• Would stage the atomic FrankenTerm process family via scp");
+            println!("  ft: {}", ft_path.display());
+            println!("  mux-server: {}", mux_server_path.display());
+        } else if let Some(tag) = options.ft_version {
+            println!("• Would install verified release process family {tag}");
+            println!("  Active mux services would not be restarted automatically");
+        }
+    }
+
+    // Step 5: Resolve mux-server path and install user service unit
     let mux_path_output = run_remote_step(
         "Locate frankenterm-mux-server",
         host,
@@ -77230,8 +77648,8 @@ where
         .lines()
         .next()
         .unwrap_or("/usr/bin/frankenterm-mux-server")
-        .trim()
-        .to_string();
+        .trim();
+    let mux_server_path = validate_remote_mux_server_path(mux_server_path)?.to_string();
     let mux_unit = remote_mux_service_unit(&mux_server_path);
 
     let service_path = "~/.config/systemd/user/frankenterm-mux-server.service";
@@ -77318,7 +77736,7 @@ where
         println!("⚠ mux service status: {status}");
     }
 
-    // Step 5: Enable linger
+    // Step 6: Enable linger
     let linger_output = run_remote_step(
         "Check linger",
         host,
@@ -77350,82 +77768,16 @@ where
         println!("• Would run: sudo loginctl enable-linger $USER");
     }
 
-    // Step 6: Optional ft install
-    if options.install_ft {
-        if apply_changes {
-            run_remote_step(
-                "Ensure ~/.local/bin exists",
-                host,
-                "mkdir -p ~/.local/bin",
-                timeout,
-                runner,
-                &redactor,
-                options.verbose,
-                true,
-            )?;
-
-            if let Some(path) = options.ft_path {
-                if !path.exists() {
-                    anyhow::bail!("ft_path does not exist: {}", path.display());
-                }
-                let scp_status = std::process::Command::new("scp")
-                    .arg(path)
-                    .arg(format!("{host}:~/.local/bin/ft"))
-                    .status()?;
-                if !scp_status.success() {
-                    anyhow::bail!("scp failed with status {:?}", scp_status.code());
-                }
-                run_remote_step(
-                    "chmod +x ~/.local/bin/ft",
-                    host,
-                    "chmod +x ~/.local/bin/ft",
-                    timeout,
-                    runner,
-                    &redactor,
-                    options.verbose,
-                    true,
-                )?;
-            } else if let Some(version) = options.ft_version {
-                let install_cmd = if version.eq_ignore_ascii_case("git") {
-                    "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm"
-                        .to_string()
-                } else {
-                    format!(
-                        "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --tag {} --bin ft frankenterm",
-                        version
-                    )
-                };
-                run_remote_step(
-                    "Install ft via cargo",
-                    host,
-                    &install_cmd,
-                    timeout,
-                    runner,
-                    &redactor,
-                    options.verbose,
-                    true,
-                )?;
-            } else {
-                println!("⚠ --install-ft set but no --ft-path or --ft-version provided.");
-            }
-        } else {
-            println!("• Would install ft on remote host");
-            if let Some(path) = options.ft_path {
-                println!("  Would scp {}", path.display());
-            } else if let Some(version) = options.ft_version {
-                println!("  Would cargo install package frankenterm as binary ft ({version})");
-            } else {
-                println!("  Provide --ft-path or --ft-version to install ft");
-            }
-        }
-    }
-
     println!("\nRemote setup summary:");
     println!("  Host: {host}");
     println!(
         "  Mode: {}",
         if apply_changes { "apply" } else { "dry-run" }
     );
+    if options.install_ft {
+        println!("  Components: ft + frankenterm-mux-server (same release identity)");
+        println!("  Active mux restart: not performed (drain PTYs before restart)");
+    }
     println!("  Next: verify with `ssh {host} 'systemctl --user status frankenterm-mux-server'`");
 
     Ok(())
@@ -92358,7 +92710,8 @@ log_level = "debug"
             yes: true,
             install_ft: true,
             ft_path: None,
-            ft_version: Some("git"),
+            mux_server_path: None,
+            ft_version: Some("v0.15.2"),
             timeout_secs: 5,
             verbose: 0,
         };
@@ -92372,6 +92725,150 @@ log_level = "debug"
         assert!(!cmds.iter().any(|cmd| cmd.contains("apt-get install")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("cargo install")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("scp ")));
+    }
+
+    #[test]
+    fn remote_release_tag_rejects_shell_input_and_mutable_git_identity() {
+        for rejected in [
+            "git",
+            "--force",
+            "v0.15.2;touch-pwned",
+            "v0.15.2 $(touch-pwned)",
+            "v0.15.2\nnext-command",
+            "",
+        ] {
+            assert!(
+                validate_remote_release_tag(rejected).is_err(),
+                "hostile or mutable release selector was accepted: {rejected:?}"
+            );
+        }
+        assert_eq!(
+            validate_remote_release_tag("v0.15.2-rc.1").unwrap(),
+            "v0.15.2-rc.1"
+        );
+    }
+
+    #[test]
+    fn remote_host_rejects_ssh_and_scp_option_injection() {
+        for rejected in [
+            "-oProxyCommand=touch-pwned",
+            "host name",
+            "host/path",
+            "host\nnext-command",
+            "",
+        ] {
+            assert!(
+                validate_remote_host(rejected).is_err(),
+                "hostile remote host was accepted: {rejected:?}"
+            );
+        }
+        for accepted in [
+            "csd",
+            "user@trj.example.com",
+            "[fe80::1%en0]",
+            "builder_01",
+        ] {
+            assert_eq!(validate_remote_host(accepted).unwrap(), accepted);
+        }
+    }
+
+    #[test]
+    fn remote_mux_server_path_rejects_service_unit_injection() {
+        for rejected in [
+            "relative/frankenterm-mux-server",
+            "/safe/path\nExecStart=/tmp/hostile",
+            "/safe/path with spaces",
+            "/safe/path;touch-pwned",
+            "",
+        ] {
+            assert!(
+                validate_remote_mux_server_path(rejected).is_err(),
+                "hostile mux path was accepted: {rejected:?}"
+            );
+        }
+        assert_eq!(
+            validate_remote_mux_server_path("/home/ubuntu/.local/bin/frankenterm-mux-server")
+                .unwrap(),
+            "/home/ubuntu/.local/bin/frankenterm-mux-server"
+        );
+    }
+
+    fn write_atomic_component_fixture(
+        path: &Path,
+        build_id: &str,
+        component: &str,
+        target: &str,
+    ) {
+        std::fs::write(
+            path,
+            format!(
+                "binary-prefix\0FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:{component}:{target}:release-interactive:0.15.2;\0binary-suffix"
+            ),
+        )
+        .expect("write atomic component fixture");
+    }
+
+    #[test]
+    fn local_remote_setup_components_require_one_sealed_build_identity() {
+        let dir = tempfile::tempdir().expect("create component fixture directory");
+        let ft_path = dir.path().join("ft");
+        let mux_path = dir.path().join("frankenterm-mux-server");
+        let build_id = "a".repeat(64);
+        write_atomic_component_fixture(
+            &ft_path,
+            &build_id,
+            "ft",
+            "x86_64-unknown-linux-gnu",
+        );
+        write_atomic_component_fixture(
+            &mux_path,
+            &build_id,
+            "frankenterm-mux-server",
+            "x86_64-unknown-linux-gnu",
+        );
+        validate_local_process_family(&ft_path, &mux_path).unwrap();
+
+        write_atomic_component_fixture(
+            &mux_path,
+            &"b".repeat(64),
+            "frankenterm-mux-server",
+            "x86_64-unknown-linux-gnu",
+        );
+        assert!(validate_local_process_family(&ft_path, &mux_path).is_err());
+    }
+
+    #[test]
+    fn local_remote_setup_components_reject_unsealed_or_wrong_role_markers() {
+        let dir = tempfile::tempdir().expect("create component fixture directory");
+        let path = dir.path().join("component");
+        write_atomic_component_fixture(
+            &path,
+            "unsealed",
+            "ft",
+            "x86_64-unknown-linux-gnu",
+        );
+        assert!(read_local_component_identity(&path, "ft").is_err());
+
+        write_atomic_component_fixture(
+            &path,
+            &"c".repeat(64),
+            "frankenterm-mux-server",
+            "x86_64-unknown-linux-gnu",
+        );
+        assert!(read_local_component_identity(&path, "ft").is_err());
+    }
+
+    #[test]
+    fn remote_release_installer_is_pinned_to_the_build_revision() {
+        if build_meta::GIT_HASH == "unknown" || build_meta::GIT_DIRTY != "" {
+            return;
+        }
+        let command = remote_release_installer_command("v0.15.2").unwrap();
+        assert!(command.contains(build_meta::GIT_HASH));
+        assert!(command.contains("--version v0.15.2"));
+        assert!(command.contains("--no-app"));
+        assert!(!command.contains("/main/install.sh"));
+        assert!(!command.contains("| bash"));
     }
 
     #[test]

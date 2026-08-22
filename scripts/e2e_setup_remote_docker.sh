@@ -366,6 +366,7 @@ run_ft_setup() {
     local mode="$1"
     local host_alias="$2"
     local log_file="$3"
+    shift 3
 
     local -a cmd=("$FT_BINARY")
     if [[ "$VERBOSE" == "true" ]]; then
@@ -380,6 +381,7 @@ run_ft_setup() {
         die "unknown mode: $mode"
     fi
     cmd+=("remote" "$host_alias" "--timeout-secs" "$TIMEOUT_SECS" "--yes")
+    cmd+=("$@")
 
     "${cmd[@]}" >"$log_file" 2>&1
 }
@@ -522,17 +524,17 @@ main() {
     assert_container_sentinel "$good_alias"
     assert_container_sentinel "$bad_alias"
 
-    log "INFO" "Run 1/4: dry-run"
+    log "INFO" "Run 1/5: dry-run"
     run_ft_setup "dry-run" "$good_alias" "$SCENARIO_DIR/setup_remote_dry_run.log"
     grep -q "(dry run)" "$SCENARIO_DIR/setup_remote_dry_run.log" \
         || die "Dry-run output missing '(dry run)' marker"
 
-    log "INFO" "Run 2/4: apply"
+    log "INFO" "Run 2/5: apply"
     run_ft_setup "apply" "$good_alias" "$SCENARIO_DIR/setup_remote_apply.log"
     capture_remote_service "$good_alias" "$SCENARIO_DIR/service_unit_after_apply_1.service"
     assert_remote_state "$good_alias" || die "Expected remote service+linger state after apply"
 
-    log "INFO" "Run 3/4: apply again (idempotency)"
+    log "INFO" "Run 3/5: apply again (idempotency)"
     run_ft_setup "apply" "$good_alias" "$SCENARIO_DIR/setup_remote_apply_2.log"
     capture_remote_service "$good_alias" "$SCENARIO_DIR/service_unit_after_apply_2.service"
     if diff -u \
@@ -546,7 +548,45 @@ main() {
 
     capture_remote_snapshot "$good_alias" "$SCENARIO_DIR/remote_filesystem_snapshot.tar"
 
-    log "INFO" "Run 4/4: failure injection (expect non-zero + rollback hint)"
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        local ft_fixture="$WORK_DIR/ft-fixture"
+        local mux_fixture="$WORK_DIR/frankenterm-mux-server-fixture"
+        cat > "$ft_fixture" <<'EOF'
+#!/usr/bin/env bash
+# FT_ATOMIC_COMPONENT_IDENTITY_V1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:ft:x86_64-unknown-linux-gnu:release-interactive:0.15.2;
+if [[ "${1:-}" == "--version" ]]; then
+    echo "ft 0.15.2"
+    exit 0
+fi
+echo "ft e2e fixture"
+EOF
+        cat > "$mux_fixture" <<'EOF'
+#!/usr/bin/env bash
+# FT_ATOMIC_COMPONENT_IDENTITY_V1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:frankenterm-mux-server:x86_64-unknown-linux-gnu:release-interactive:0.15.2;
+if [[ "${1:-}" == "--version" ]]; then
+    echo "frankenterm-mux-server 0.15.2"
+    exit 0
+fi
+echo "frankenterm-mux-server e2e fixture"
+EOF
+        chmod 0755 "$ft_fixture" "$mux_fixture"
+        log "INFO" "Run 4/5: stage atomic ft + mux-server pair without restarting active service"
+        run_ft_setup \
+            "apply" \
+            "$good_alias" \
+            "$SCENARIO_DIR/setup_remote_atomic_pair.log" \
+            --install-ft \
+            --ft-path "$ft_fixture" \
+            --mux-server-path "$mux_fixture"
+        grep -q "active mux was not restarted" "$SCENARIO_DIR/setup_remote_atomic_pair.log" \
+            || die "Atomic-pair setup did not report the no-restart PTY safety contract"
+        assert_remote_state "$good_alias" \
+            || die "Atomic-pair staging changed the active service or linger state"
+        ssh "$good_alias" "test -x ~/.local/bin/ft && test -x ~/.local/bin/frankenterm-mux-server" \
+            || die "Atomic-pair staging did not publish both remote executables"
+    fi
+
+    log "INFO" "Final run: failure injection (expect non-zero + rollback hint)"
     if run_ft_setup "apply" "$bad_alias" "$SCENARIO_DIR/setup_remote_failure_injected.log"; then
         die "Failure injection run unexpectedly succeeded"
     fi
