@@ -78097,8 +78097,10 @@ fn validate_remote_mux_server_path(path: &str) -> anyhow::Result<&str> {
     Ok(path)
 }
 
-fn remote_release_installer_command(tag: &str) -> anyhow::Result<String> {
-    let tag = validate_remote_release_tag(tag)?;
+fn remote_release_installer_command(
+    tag: &str,
+    staging_suffix: &str,
+) -> anyhow::Result<String> {
     let installer_revision = build_meta::GIT_HASH;
     if build_meta::GIT_DIRTY != ""
         || installer_revision.len() != 40
@@ -78108,13 +78110,46 @@ fn remote_release_installer_command(tag: &str) -> anyhow::Result<String> {
             "remote release installation requires a clean build with an exact 40-hex source revision"
         );
     }
+    remote_release_installer_command_at_revision(
+        tag,
+        staging_suffix,
+        installer_revision,
+    )
+}
+
+fn remote_release_installer_command_at_revision(
+    tag: &str,
+    staging_suffix: &str,
+    installer_revision: &str,
+) -> anyhow::Result<String> {
+    let tag = validate_remote_release_tag(tag)?;
+    anyhow::ensure!(
+        staging_suffix.len() == 32
+            && staging_suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "release staging suffix must be 32 lowercase hex characters"
+    );
+    anyhow::ensure!(
+        installer_revision.len() == 40
+            && installer_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "installer revision must be 40 lowercase hex characters"
+    );
+    let destination = format!("$HOME/.cache/frankenterm/releases/{tag}-{staging_suffix}");
     Ok(format!(
-        "installer=\"$HOME/.cache/frankenterm/install-{tag}.sh\"; \
+        "umask 077; \
+         installer_dir=\"$HOME/.cache/frankenterm/install-{tag}-{staging_suffix}\"; \
+         installer=\"$installer_dir/install.sh\"; \
+         destination=\"{destination}\"; \
          mkdir -p \"$HOME/.cache/frankenterm\" \"$HOME/.local/bin\" && \
+         mkdir \"$installer_dir\" && \
+         mkdir \"$destination\" && \
          curl --proto '=https' --tlsv1.2 -fsSL \
          https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/{installer_revision}/install.sh \
          -o \"$installer\" && \
-         bash \"$installer\" --version {tag} --dest \"$HOME/.local/bin\" --no-app"
+         bash \"$installer\" --version {tag} --dest \"$destination\" --no-app"
     ))
 }
 
@@ -78285,7 +78320,7 @@ where
         (false, None, None, None) => {}
         (false, _, _, _) => {
             anyhow::bail!(
-                "component source flags require --install-ft so the atomic process family is explicit"
+                "component source flags require --install-ft so the matched process family is explicit"
             );
         }
         (true, Some(ft_path), Some(mux_server_path), None) => {
@@ -78349,12 +78384,18 @@ where
     // the exact split-brain that made previously configured domains appear to
     // stop reconnecting. Until PTY ownership is moved into the guardian, a
     // live mux fences activation of both components.
-    let active_mux_before_install = if options.install_ft {
+    let active_mux_before_install = {
         let output = run_remote_step(
-            "Fence FrankenTerm component activation",
+            "Fence FrankenTerm mux ownership and component activation",
             host,
             "if systemctl --user is-active --quiet frankenterm-mux-server 2>/dev/null || \
-                pgrep -u \"$(id -u)\" -f '(^|/)frankenterm-mux-server([[:space:]]|$)' >/dev/null 2>&1; then \
+                (command -v pgrep >/dev/null 2>&1 && \
+                 pgrep -u \"$(id -u)\" -f '(^|/)[f]rankenterm-mux-server([^/[:space:]]*)([[:space:]]|$)' >/dev/null 2>&1) || \
+                (command -v ps >/dev/null 2>&1 && \
+                 ps -u \"$(id -u)\" -o args= 2>/dev/null | \
+                 grep -Eq '(^|/)[f]rankenterm-mux-server([^/[:space:]]*)([[:space:]]|$)') || \
+                (! command -v pgrep >/dev/null 2>&1 && \
+                 { ! command -v ps >/dev/null 2>&1 || ! command -v grep >/dev/null 2>&1; }); then \
                 printf 'active\\n'; else printf 'inactive\\n'; fi",
             timeout,
             runner,
@@ -78362,16 +78403,60 @@ where
             options.verbose,
             false,
         )?;
-        output.stdout.lines().any(|line| line.trim() == "active")
-    } else {
-        false
-    };
-    if apply_changes && active_mux_before_install && options.ft_version.is_some() {
-        anyhow::bail!(
-            "refusing release-tag activation while the remote mux is active: the release installer cannot stage a non-active process family, and replacing only the client would break reconnect compatibility"
+        anyhow::ensure!(
+            output.status.success(),
+            "remote mux ownership fence failed; refusing to assume the host is inactive"
         );
+        match output.stdout.trim() {
+            "active" => true,
+            "inactive" => false,
+            _ => anyhow::bail!(
+                "remote mux ownership fence returned no unambiguous state; refusing component activation"
+            ),
+        }
+    };
+    if apply_changes && options.install_ft && active_mux_before_install {
+        let dump_output = run_remote_step(
+            "Capture and verify compatible pre-upgrade mux content dump",
+            host,
+            r#"set -eu
+compatible_ft="$HOME/.local/bin/ft"
+if test ! -x "$compatible_ft"; then
+  printf 'FT_PREUPGRADE_DUMP=unavailable_no_compatible_cli\n'
+elif "$compatible_ft" session dump --help >/dev/null 2>&1; then
+  stamp=$(date +%Y%m%d%H%M%S)
+  dump="$HOME/.local/share/ft/mux-dumps/pre-upgrade-$stamp-$$.json"
+  "$compatible_ft" session dump --output "$dump" --format json >/dev/null
+  "$compatible_ft" session verify-dump "$dump" --format json >/dev/null
+  printf 'FT_PREUPGRADE_DUMP=verified path=%s\n' "$dump"
+else
+  printf 'FT_PREUPGRADE_DUMP=unavailable_legacy_client\n'
+fi"#,
+            timeout.max(std::time::Duration::from_secs(600)),
+            runner,
+            &redactor,
+            options.verbose,
+            true,
+        )?;
+        let dump_marker = dump_output
+            .stdout
+            .lines()
+            .find(|line| line.starts_with("FT_PREUPGRADE_DUMP="))
+            .ok_or_else(|| anyhow::anyhow!("pre-upgrade dump command returned no status marker"))?;
+        if dump_marker.starts_with("FT_PREUPGRADE_DUMP=verified path=") {
+            println!("  ✓ compatible pre-upgrade mux dump captured and verified");
+        } else if matches!(
+            dump_marker,
+            "FT_PREUPGRADE_DUMP=unavailable_no_compatible_cli"
+                | "FT_PREUPGRADE_DUMP=unavailable_legacy_client"
+        ) {
+            println!(
+                "  ⚠ compatible pre-upgrade dump unavailable on this legacy host; staging may continue, but no verified content artifact exists"
+            );
+        } else {
+            anyhow::bail!("pre-upgrade dump command returned an invalid status marker");
+        }
     }
-
     // Step 2: Detect package manager
     let pkg_output = run_remote_step(
         "Detect package manager",
@@ -78588,6 +78673,8 @@ mux_pending="$bin/frankenterm-mux-server.pending-$stamp-$$"
 test -f "$ft_stage" && test -f "$mux_stage"
 test ! -e "$ft_pending" && test ! -e "$mux_pending"
 chmod 0755 "$ft_stage" "$mux_stage"
+"$ft_stage" --version
+"$mux_stage" --version
 mv "$ft_stage" "$ft_pending"
 if ! mv "$mux_stage" "$mux_pending"; then
   mv "$ft_pending" "$ft_stage"
@@ -78604,14 +78691,21 @@ ft_stage="$bin/ft.installing-{suffix}"
 mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
 test -f "$ft_stage" && test -f "$mux_stage"
 chmod 0755 "$ft_stage" "$mux_stage"
+"$ft_stage" --version
+"$mux_stage" --version
 ft_backup=""
 mux_backup=""
 if test -e "$bin/ft"; then
   ft_backup="$bin/ft.previous-$stamp-$$"
+  test ! -e "$ft_backup"
   mv "$bin/ft" "$ft_backup"
 fi
 if test -e "$bin/frankenterm-mux-server"; then
   mux_backup="$bin/frankenterm-mux-server.previous-$stamp-$$"
+  if test -e "$mux_backup"; then
+    test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
+    exit 1
+  fi
   if ! mv "$bin/frankenterm-mux-server" "$mux_backup"; then
     test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
     exit 1
@@ -78628,15 +78722,14 @@ if ! mv "$mux_stage" "$bin/frankenterm-mux-server"; then
   test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
   exit 1
 fi
-"$bin/ft" --version
-"$bin/frankenterm-mux-server" --version"#
+printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish\n'"#
                     )
                 };
                 run_remote_step(
                     if active_mux_before_install {
                         "Stage pending FrankenTerm process family"
                     } else {
-                        "Publish atomic FrankenTerm process family"
+                        "Publish matched FrankenTerm process family transactionally"
                     },
                     host,
                     &publish_command,
@@ -78648,9 +78741,14 @@ fi
                 )?;
             } else if let Some(tag) = options.ft_version {
                 let install_timeout = timeout.max(std::time::Duration::from_secs(600));
-                let install_command = remote_release_installer_command(tag)?;
+                let staging_suffix = uuid::Uuid::new_v4().simple().to_string();
+                let install_command = remote_release_installer_command(tag, &staging_suffix)?;
                 run_remote_step(
-                    "Install verified FrankenTerm release process family",
+                    if active_mux_before_install {
+                        "Download verified pending FrankenTerm release process family"
+                    } else {
+                        "Download verified FrankenTerm release process family for transactional publication"
+                    },
                     host,
                     &install_command,
                     install_timeout,
@@ -78659,6 +78757,91 @@ fi
                     options.verbose,
                     true,
                 )?;
+                if active_mux_before_install {
+                    let stage_pending_command = format!(
+                        r#"set -eu
+release_dir="$HOME/.cache/frankenterm/releases/{tag}-{staging_suffix}"
+bin="$HOME/.local/bin"
+ft_stage="$release_dir/ft"
+mux_stage="$release_dir/frankenterm-mux-server"
+ft_pending="$bin/ft.pending-{tag}-{staging_suffix}"
+mux_pending="$bin/frankenterm-mux-server.pending-{tag}-{staging_suffix}"
+test -f "$ft_stage" && test -f "$mux_stage"
+test ! -e "$ft_pending" && test ! -e "$mux_pending"
+chmod 0755 "$ft_stage" "$mux_stage"
+"$ft_stage" --version
+"$mux_stage" --version
+mv "$ft_stage" "$ft_pending"
+if ! mv "$mux_stage" "$mux_pending"; then
+  mv "$ft_pending" "$ft_stage"
+  exit 1
+fi
+printf 'FT_COMPONENT_ACTIVATION=pending_live_mux\n'"#
+                    );
+                    run_remote_step(
+                        "Stage verified release as a pending process family",
+                        host,
+                        &stage_pending_command,
+                        timeout,
+                        runner,
+                        &redactor,
+                        options.verbose,
+                        true,
+                    )?;
+                } else {
+                    let publish_release_command = format!(
+                        r#"set -eu
+release_dir="$HOME/.cache/frankenterm/releases/{tag}-{staging_suffix}"
+bin="$HOME/.local/bin"
+ft_stage="$release_dir/ft"
+mux_stage="$release_dir/frankenterm-mux-server"
+stamp=$(date +%Y%m%d%H%M%S)
+test -f "$ft_stage" && test -f "$mux_stage"
+chmod 0755 "$ft_stage" "$mux_stage"
+"$ft_stage" --version
+"$mux_stage" --version
+ft_backup=""
+mux_backup=""
+if test -e "$bin/ft"; then
+  ft_backup="$bin/ft.previous-$stamp-$$"
+  test ! -e "$ft_backup"
+  mv "$bin/ft" "$ft_backup"
+fi
+if test -e "$bin/frankenterm-mux-server"; then
+  mux_backup="$bin/frankenterm-mux-server.previous-$stamp-$$"
+  if test -e "$mux_backup"; then
+    test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
+    exit 1
+  fi
+  if ! mv "$bin/frankenterm-mux-server" "$mux_backup"; then
+    test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
+    exit 1
+  fi
+fi
+if ! mv "$ft_stage" "$bin/ft"; then
+  test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
+  test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
+  exit 1
+fi
+if ! mv "$mux_stage" "$bin/frankenterm-mux-server"; then
+  mv "$bin/ft" "$bin/ft.failed-publish-$stamp-$$"
+  test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
+  test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
+  exit 1
+fi
+printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish\n'"#
+                    );
+                    run_remote_step(
+                        "Publish verified release process family transactionally",
+                        host,
+                        &publish_release_command,
+                        timeout,
+                        runner,
+                        &redactor,
+                        options.verbose,
+                        true,
+                    )?;
+                }
             }
             if active_mux_before_install {
                 println!(
@@ -78680,10 +78863,12 @@ fi
         } else if let Some(tag) = options.ft_version {
             if active_mux_before_install {
                 println!(
-                    "• Would refuse release {tag}: the tag installer cannot stage without replacing the compatible live client"
+                    "• Would download and stage verified release {tag} as a pending process family"
                 );
             } else {
-                println!("• Would install verified release process family {tag}");
+                println!(
+                    "• Would download, probe, and transactionally publish verified release process family {tag}"
+                );
             }
         }
     }
@@ -78789,19 +78974,36 @@ fi"#
             options.verbose,
             true,
         )?;
-        run_remote_step(
-            "Enable mux service",
-            host,
-            "systemctl --user enable --now frankenterm-mux-server",
-            timeout,
-            runner,
-            &redactor,
-            options.verbose,
-            true,
-        )?;
+        if active_mux_before_install {
+            run_remote_step(
+                "Enable mux service without starting a second generation",
+                host,
+                "systemctl --user enable frankenterm-mux-server",
+                timeout,
+                runner,
+                &redactor,
+                options.verbose,
+                true,
+            )?;
+        } else {
+            run_remote_step(
+                "Enable and start mux service",
+                host,
+                "systemctl --user enable --now frankenterm-mux-server",
+                timeout,
+                runner,
+                &redactor,
+                options.verbose,
+                true,
+            )?;
+        }
     } else {
         println!("• Would run: systemctl --user daemon-reload");
-        println!("• Would run: systemctl --user enable --now frankenterm-mux-server");
+        if active_mux_before_install {
+            println!("• Would run: systemctl --user enable frankenterm-mux-server");
+        } else {
+            println!("• Would run: systemctl --user enable --now frankenterm-mux-server");
+        }
     }
 
     let status_output = run_remote_step(
@@ -78861,9 +79063,7 @@ fi"#
     );
     if options.install_ft {
         println!("  Components: ft + frankenterm-mux-server (same release identity)");
-        if active_mux_before_install && options.ft_version.is_some() {
-            println!("  Activation: blocked; release-tag installer cannot preserve live compatibility");
-        } else if active_mux_before_install {
+        if active_mux_before_install {
             println!("  Activation: pending; compatible live client/server pair preserved");
         } else {
             println!("  Activation: complete; no prior live mux required replacement");
@@ -94034,15 +94234,25 @@ log_level = "debug"
 
     #[cfg(unix)]
     #[test]
-    fn remote_setup_refuses_release_activation_while_mux_is_live_before_mutation() {
+    fn remote_setup_stages_release_tag_while_mux_is_live_without_replacing_active_pair() {
         use std::os::unix::process::ExitStatusExt;
         use std::sync::Mutex;
+
+        if build_meta::GIT_HASH == "unknown" || build_meta::GIT_DIRTY != "" {
+            return;
+        }
 
         let commands = Mutex::new(Vec::new());
         let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
             commands.lock().unwrap().push(command.to_string());
             let stdout = if command.contains("systemctl --user is-active") {
                 "active\n".to_string()
+            } else if command.contains("FT_PREUPGRADE_DUMP=") {
+                "FT_PREUPGRADE_DUMP=unavailable_legacy_client\n".to_string()
+            } else if command.contains("command -v frankenterm-mux-server") {
+                "/home/test/.local/bin/frankenterm-mux-server\n".to_string()
+            } else if command.contains("loginctl show-user") {
+                "Linger=yes\n".to_string()
             } else {
                 String::new()
             };
@@ -94064,12 +94274,82 @@ log_level = "debug"
             timeout_secs: 5,
             verbose: 0,
         };
+        run_remote_setup_with_runner("example", &options, &runner)
+            .expect("live mux should admit non-activating release staging");
+        let commands = commands.lock().unwrap();
+        let fence = commands
+            .iter()
+            .find(|command| command.contains("pgrep"))
+            .expect("live mux process fence command");
+        assert!(fence.contains("[f]rankenterm-mux-server([^/[:space:]]*)"));
+        let installer = commands
+            .iter()
+            .find(|command| command.contains("install-v0.15.2-"))
+            .expect("pinned release installer command");
+        let dump = commands
+            .iter()
+            .find(|command| command.contains("session verify-dump"))
+            .expect("compatible pre-upgrade dump command");
+        let dump_position = commands.iter().position(|command| command == dump).unwrap();
+        let installer_position = commands
+            .iter()
+            .position(|command| command == installer)
+            .unwrap();
+        assert!(dump_position < installer_position);
+        assert!(installer.contains("$HOME/.cache/frankenterm/releases/v0.15.2-"));
+        assert!(!installer.contains("--dest \"$HOME/.local/bin\""));
+        let pending = commands
+            .iter()
+            .find(|command| command.contains("ft.pending-v0.15.2-"))
+            .expect("release pending publication command");
+        assert!(pending.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"));
+        assert!(pending.contains("\"$ft_stage\" --version"));
+        assert!(pending.contains("\"$mux_stage\" --version"));
+        assert!(!pending.contains("mv \"$bin/ft\" \"$ft_backup\""));
+        assert!(!commands.iter().any(|command| command.contains("systemctl --user restart")));
+        assert!(!commands
+            .iter()
+            .any(|command| command.contains("systemctl --user enable --now")));
+        assert!(commands
+            .iter()
+            .any(|command| command == "systemctl --user enable frankenterm-mux-server"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_refuses_ambiguous_mux_ownership_probe_before_mutation() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::Mutex;
+
+        let commands = Mutex::new(Vec::new());
+        let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
+            commands.lock().unwrap().push(command.to_string());
+            Ok(RemoteCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 1,
+            })
+        };
+        let options = RemoteSetupOptions {
+            apply: true,
+            dry_run: false,
+            yes: true,
+            install_ft: false,
+            ft_path: None,
+            mux_server_path: None,
+            ft_version: None,
+            timeout_secs: 5,
+            verbose: 0,
+        };
 
         let error = run_remote_setup_with_runner("example", &options, &runner)
-            .expect_err("live mux must fence release-tag activation");
-        assert!(error.to_string().contains("remote mux is active"));
+            .expect_err("ambiguous ownership state must fail closed");
+        assert!(error
+            .to_string()
+            .contains("returned no unambiguous state"));
         let commands = commands.lock().unwrap();
-        assert_eq!(commands.len(), 2, "the refusal must precede every setup mutation");
+        assert_eq!(commands.len(), 2, "setup mutated after the ownership fence");
         assert_eq!(commands[0], "true");
         assert!(commands[1].contains("systemctl --user is-active"));
     }
@@ -94078,7 +94358,7 @@ log_level = "debug"
     fn remote_local_process_family_has_a_pending_live_mux_publication_path() {
         let source = include_str!("main.rs");
         let fence = source
-            .find("Fence FrankenTerm component activation")
+            .find("Fence FrankenTerm mux ownership and component activation")
             .expect("activation fence");
         let pending = source
             .find("FT_COMPONENT_ACTIVATION=pending_live_mux")
@@ -94225,15 +94505,39 @@ log_level = "debug"
 
     #[test]
     fn remote_release_installer_is_pinned_to_the_build_revision() {
-        if build_meta::GIT_HASH == "unknown" || build_meta::GIT_DIRTY != "" {
-            return;
-        }
-        let command = remote_release_installer_command("v0.15.2").unwrap();
-        assert!(command.contains(build_meta::GIT_HASH));
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let command = remote_release_installer_command_at_revision(
+            "v0.15.2",
+            "0123456789abcdef0123456789abcdef",
+            revision,
+        )
+        .unwrap();
+        assert!(command.contains(revision));
         assert!(command.contains("--version v0.15.2"));
         assert!(command.contains("--no-app"));
+        assert!(command.contains(
+            "$HOME/.cache/frankenterm/releases/v0.15.2-0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!command.contains("--dest \"$HOME/.local/bin\""));
         assert!(!command.contains("/main/install.sh"));
         assert!(!command.contains("| bash"));
+        assert!(command.contains("mkdir \"$destination\" && curl"));
+    }
+
+    #[test]
+    fn top_level_installer_launch_probes_both_staged_components_before_backup() {
+        let installer = include_str!("../../../install.sh");
+        let ft_probe = installer
+            .find("if ! \"$ft_stage\" --version")
+            .expect("staged ft launch probe");
+        let mux_probe = installer
+            .find("if ! \"$mux_stage\" --version")
+            .expect("staged mux launch probe");
+        let first_backup = installer
+            .find("if [ -e \"$ft_target\" ]")
+            .expect("installed ft backup boundary");
+        assert!(ft_probe < first_backup);
+        assert!(mux_probe < first_backup);
     }
 
     #[test]

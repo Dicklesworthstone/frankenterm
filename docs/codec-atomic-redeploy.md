@@ -133,20 +133,26 @@ When both the maximum and minimum advance, use the maintenance window:
    verifier must report `capture_complete: true`. This is a sequential
    redacted-content/topology safety artifact, not process continuity: it cannot
    keep mux-owned PTYs or agents alive.
-2. **Install the new CLI without replacing the desktop app.** Use the installer
-   from the exact release source revision, then keep the old GUI running while
-   the servers are prepared:
+
+   The v0.15.1 stranded-remote incident predates this dump command. If the
+   installed compatible client does not recognize `session dump`, there is no
+   complete automated artifact to promote: keep the old mux running, capture
+   critical pane text manually through that compatible client where possible,
+   and record the legacy gap. Never describe that fallback as a verified dump.
+
+2. **Install the candidate CLI/process-family bytes without replacing the
+   running desktop app.** Use the installer from the exact release source
+   revision. The installer transactionally publishes `ft` plus its matched mux
+   server and preserves the prior binaries; `--no-app` leaves the already-running
+   codec-compatible GUI process untouched:
 
    ```bash
    NEW_TAG=vX.Y.Z
    bash install.sh --version "$NEW_TAG" --no-app
    ```
 
-   The Unix archive must verify and install `ft` plus
-   `frankenterm-mux-server` as one process family. A client-only or mixed-build
-   archive fails closed.
 3. **Stage each remote process family without restarting its mux.** Repeat for
-   every configured domain host:
+   every configured domain host using the candidate CLI:
 
    ```bash
    SSH_HOST=trj
@@ -154,24 +160,38 @@ When both the maximum and minimum advance, use the maintenance window:
      --install-ft --ft-version "$NEW_TAG"
    ```
 
-   This preserves the previous remote binaries and any differing systemd unit,
-   updates the unit's next-start `ExecStart`, and deliberately leaves the active
-   mux inode and its PTYs untouched.
+   For a live mux, setup downloads and verifies the release pair into a unique
+   cache directory and publishes both files only as matching `pending-*` paths.
+   Before that download, it also asks the currently installed remote CLI to
+   create and verify a complete host-local dump when that legacy release
+   supports the command; a supported dump failure stops staging.
+   It deliberately leaves `~/.local/bin/ft`, the service `ExecStart`, the active
+   mux inode, and its PTYs untouched. An inactive host may transactionally
+   activate the pair immediately, restoring the prior pair if publication
+   fails. A client-only or mixed-build archive fails closed.
 4. **Drain live PTYs and new connections.** For a single mux, finish or move all
    sessions it owns. For a load-balanced fleet, drain one server at a time.
    Do not restart a mux while it owns work that cannot be recreated.
-5. **Restart the staged server deliberately.** Active client sockets drop at
-   this point; the old desktop may reject the new disjoint window until the
-   client rollout completes:
+5. **Activate the staged pair only after the host is drained.** The current
+   release does not yet provide the guardian-backed activation transaction, so
+   pending paths are a non-activating safety boundary, not an instruction to
+   overwrite files ad hoc. Stop the now-empty mux, then rerun the same setup
+   command. The inactive-host branch verifies and transactionally publishes the
+   matched pair with rollback on partial publication, updates the unit, and
+   enables the new mux. Active client sockets drop at the stop; the old desktop
+   may reject the new disjoint window until the client rollout completes:
 
    ```bash
-   ssh "$SSH_HOST" 'systemctl --user restart frankenterm-mux-server'
+   ssh "$SSH_HOST" 'systemctl --user stop frankenterm-mux-server'
+   ~/.local/bin/ft setup --apply remote "$SSH_HOST" --yes \
+     --install-ft --ft-version "$NEW_TAG"
    ssh "$SSH_HOST" 'systemctl --user status frankenterm-mux-server --no-pager'
    ```
 
-6. **Verify the new server, then update the desktop app.** Confirm a
-   same-release handshake for every remote. Re-run the exact installer without
-   `--no-app`; its same-version short circuit still installs the GUI bundle:
+6. **Verify the new server, then update the desktop app.** Confirm the server
+   identity through its service status first. Only after every target server is
+   activated should the exact installer replace the still-running compatible
+   GUI bundle:
 
    ```bash
    bash install.sh --version "$NEW_TAG"
@@ -201,12 +221,12 @@ When both the maximum and minimum advance, use the maintenance window:
   recorder/checkpoint rows preserve evidence, not live process descriptors.
 
 `ft setup remote --install-ft` fences the same split-brain at deployment time.
-With a live mux, a locally supplied exact process family is written to unique
-`pending-*` paths and the active `ft` plus mux-server bytes remain unchanged.
-The release-tag path fails before mutation because its installer cannot stage a
-non-active family. This prevents a newly activated client from becoming unable
-to speak to the still-running old mux; it does not claim to perform the later
-lossless mux handoff.
+With a live mux, either a locally supplied exact process family or a verified
+release-tag family is written to unique `pending-*` paths and the active `ft`
+plus mux-server bytes remain unchanged. Release-tag bytes are first verified in
+a unique non-active cache directory. This prevents a newly activated client
+from becoming unable to speak to the still-running old mux; it does not claim
+to perform the later lossless mux handoff.
 
 ### 3e. Rollback
 

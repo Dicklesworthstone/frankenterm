@@ -127,14 +127,36 @@ the same source revision and codec contract. If no mux is active, existing
 bytes are renamed to timestamped `previous-*` paths and a publish failure
 restores the previous pair. If a mux is active, locally supplied binaries are
 placed at unique `pending-*` paths and the currently compatible client/server
-pair is left untouched. A release-tag installer that cannot stage without
-activating fails before any setup mutation. Merely replacing the client while
-the old mux remains alive is forbidden because a codec-window mismatch makes
-all configured domains unusable even though their reconnect loop is running.
+pair is left untouched. Release-tag setup always downloads and verifies the
+pair in a unique private non-active cache directory and executes both staged version
+probes before publication. With a live owner it moves both components to
+matching `pending-<tag>-<nonce>` paths and never points the service or canonical
+client path at those bytes. With no live owner it publishes both canonical
+names transactionally and restores the previous pair on partial publication.
+Merely replacing the client while the old mux remains alive is forbidden
+because a codec-window mismatch makes all configured domains unusable even
+though their reconnect loop is running.
+
+The live-owner fence checks both the user service and manually launched mux
+executables, including `pending-*` or preserved generation names. When any mux
+generation is already live, setup may enable the service for a future boot but
+must not use `enable --now` or otherwise start a second mux generation.
+
+Before staging against a live owner, setup invokes the currently installed
+remote `~/.local/bin/ft`, which is the client most likely to remain compatible
+with that mux. If it supports `session dump`, both a complete dump and
+`verify-dump` must succeed before any candidate bytes are downloaded. A legacy
+client that predates the dump command emits an explicit unavailable warning and
+may continue to non-activating staging, but the workflow records that no
+verified content artifact exists and never promotes manual capture to proof.
 
 Pending bytes are not an automated live upgrade. The command deliberately has
 no activation step until the guardian owns PTYs and can prove a fenced handoff;
-today the operator must drain sessions before activating another mux process.
+today the operator must drain sessions, stop the empty mux, and rerun the same
+`ft setup --apply remote <host> --yes --install-ft --ft-version <tag>` command.
+The inactive-host branch transactionally publishes the verified pair, restores
+the prior pair on partial publication, and enables the new service; no operator
+should rename one pending component by hand.
 
 Before any deliberate restart, run the still-compatible client-side
 `ft session dump --format json`, then run `ft session verify-dump <path>

@@ -339,9 +339,21 @@ install_process_family() {
     err "Failed to stage frankenterm-mux-server at $mux_stage"
     return 1
   fi
+  if ! "$ft_stage" --version >/dev/null 2>&1; then
+    err "Staged ft failed its launch/version probe; installed bytes are unchanged"
+    return 1
+  fi
+  if ! "$mux_stage" --version >/dev/null 2>&1; then
+    err "Staged frankenterm-mux-server failed its launch/version probe; installed bytes are unchanged"
+    return 1
+  fi
 
   if [ -e "$ft_target" ]; then
     ft_backup="${ft_target}.previous-${stamp}-$$"
+    if [ -e "$ft_backup" ]; then
+      err "Refusing to overwrite existing ft backup at $ft_backup"
+      return 1
+    fi
     if ! mv "$ft_target" "$ft_backup"; then
       err "Failed to preserve existing ft at $ft_backup"
       return 1
@@ -349,6 +361,11 @@ install_process_family() {
   fi
   if [ -e "$mux_target" ]; then
     mux_backup="${mux_target}.previous-${stamp}-$$"
+    if [ -e "$mux_backup" ]; then
+      err "Refusing to overwrite existing frankenterm-mux-server backup at $mux_backup"
+      if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
+      return 1
+    fi
     if ! mv "$mux_target" "$mux_backup"; then
       err "Failed to preserve existing frankenterm-mux-server at $mux_backup"
       if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
