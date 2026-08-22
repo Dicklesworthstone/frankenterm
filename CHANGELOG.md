@@ -31,9 +31,32 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
 
 ### Reconnect and process-family deployment safety
 
+- Cancels every parked main-thread runnable when its owner-thread executor is
+  dropped, breaking a scheduler/queue reference cycle that could leak detached
+  futures and their admission permits across mux test or service lifetimes.
+  Queue retirement is synchronized with enqueue so a producer that reserved
+  capacity before shutdown cannot publish a runnable after the final drain.
+  The executor is now owner-thread affine in the type system because its queue
+  may contain `spawn_local` state.
 - Makes terminal domain reconnect failures visible and actionable, including
   both codec windows and explicit same-release server-upgrade or client-rollback
-  guidance instead of an apparent no-op.
+  guidance instead of an apparent no-op. Auto-connect attempts are independent
+  and lazily bounded-concurrent: a failed first domain cannot suppress later domains
+  or normal GUI publication, and initially unavailable domains retry with
+  generation-aware jittered backoff. The first retry generation is fenced on
+  successful initial GUI topology publication, so an early config reload cannot
+  race reconnect work against an unfinished or failed startup. The existing
+  bootstrap deadline now encloses transport dialing as well as codec/topology
+  RPCs, so a stalled SSH/TLS/unix connect cannot permanently occupy all bounded
+  auto-connect slots and starve later domains. Explicit or
+  configured-default remote
+  failures populate the published window with a local recovery shell while
+  compatible auto domains continue retrying. Command-palette attach and spawn
+  failures now emit the same bounded, terminal-sanitized, secret-redacted
+  durable diagnostic instead of appearing to do nothing or copying an
+  unbounded error into a toast. Fleet-wide auto-connect outages retain one
+  diagnostic per failed domain but coalesce the interactive notification, so a
+  large failure set cannot create a persistent-toast storm.
 - Ships `ft` and `frankenterm-mux-server` as one sealed release identity and
   prevents remote setup from activating one side while an incompatible mux is
   still live. Verified local and release-tag pairs are staged under matching
@@ -44,6 +67,45 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   isolated directory before transactional canonical publication with rollback.
   The top-level installer also launch-probes both staged components before
   moving either installed binary to a backup name.
+- Binds both local-binary and pinned-release installs to exact size/SHA-256
+  receipts, revalidates those bytes while moving into the randomized stage and
+  immediately before each pending or active rename, and emits the exact
+  transaction UUID in the activation receipt. Remote setup also refuses
+  receipt-authorized mutation unless a preflight marker proves the SSH command
+  channel has uncontaminated stdout. Binary backups, failed-publication
+  quarantine names, and service-unit staging/backup names use an exact unique
+  transaction identity and refuse collisions before moving active paths.
+  Local uploads require an exact nonexistence preflight receipt, stream the
+  already-open no-follow source descriptor through an SSH no-clobber create,
+  and recheck local identity plus remote digest before publication. Inactive
+  publication refuses symlink or non-regular canonical binaries and service
+  units. Service inspection likewise uses a typed shape marker and
+  never opens a symlink, directory, device, or FIFO. The live-mux process probe
+  also avoids matching its own
+  shell command, distinguishes a true no-match from probe failure, and lets an
+  inactive host reach transactional publication rather than being permanently
+  misclassified as a live-owner host. Canonical remote publication holds an
+  advisory lock on the installation-directory descriptor, restores preserved
+  components only into absent paths, and emits an explicit incomplete-rollback
+  marker instead of overwriting a concurrently occupied target. Every publish,
+  backup, quarantine, and restore rename is itself no-clobber and verifies that
+  the source disappeared and destination materialized, closing the race between
+  an absence precheck and a plain overwriting `mv`. The pinned-release cache-to-stage
+  binding holds that same directory lock, uses the same verified no-clobber move,
+  and reports a distinct incomplete rollback if its first component cannot be
+  returned to the release cache.
+- Hardens the top-level installer process-family transaction as well: both
+  package sources and existing canonical binaries must be regular non-symlink
+  files, every stage/backup/quarantine name must be absent including dangling
+  symlinks, and an apparent already-installed pair cannot bypass those shape
+  fences through symlinked executables. Rollback restores only into an absent
+  canonical path, checks every preservation move, and reports incomplete
+  recovery instead of silently ignoring a second filesystem failure.
+  FrankenTerm.app staging, backup, publication, and rollback use the same
+  no-clobber discipline and reject dangling symlinks or non-directory targets.
+  The already-installed fast path now runs inside the installer lock and
+  requires one identical sealed build identity across `ft` and the mux server;
+  matching semver strings from different builds can no longer skip repair.
 - Automates a verified pre-upgrade content dump through the currently installed
   codec-compatible remote CLI whenever that release supports `session dump`;
   legacy clients emit an explicit unavailable warning without fabricating proof.
@@ -56,6 +118,12 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
 - Adds `ft session dump` plus bounded offline `verify-dump` for private,
   redacted, checksummed live pane-text and topology safety artifacts. The schema
   explicitly refuses to claim PTY, process-memory, or executable restore state.
+  Compact payload hashing and pretty envelope serialization both write through
+  a hard byte ceiling, so JSON escape expansion fails before exceeding the
+  artifact memory envelope rather than being checked only after allocation.
+  Payload verification and topology fingerprints use bounded streaming hashes
+  over borrowed metadata, avoiding a second artifact-sized checksum buffer or
+  cloned topology strings.
 - Carries stable pane UUIDs into mux panes and continuously persists evicted
   styled scrollback rows with synchronized sequence authority, checksummed
   manifests and records, torn-tail recovery, bounded compaction, and optional
@@ -68,6 +136,21 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   symlink, privacy, checksum, identity, sequence, replacement-race, and resource
   violations; excludes uncommitted torn tails; reapplies redaction; never opens
   source content for write; and never sends bytes into a live PTY.
+- Freezes the guardian v1 authenticated request/response envelopes and pure
+  fencing state machine: bounded HMAC-before-decode framing, exact response
+  correlation, durable pane UUIDs, immutable byte-capped census snapshots,
+  monotonic lease generations and mutation sequences, idempotent effect
+  identities, ambiguous-input reconciliation, exit-time replay authority, and
+  terminal exhaustion quarantine. Mutation
+  receipts rotate through a bounded FIFO window instead of permanently
+  exhausting the guardian after 65,536 operations, while original spawn
+  identities remain protected for each pane's lifetime. Inputs awaiting a
+  durable or terminal disposition are pinned against unrelated receipt
+  pressure, and acknowledgement updates their retained request aliases through
+  a reverse index instead of a fleet-wide scan. A per-effect alias ceiling
+  prevents one ambiguous input from monopolizing the guardian's global receipt
+  budget while preserving already admitted reconciliation identities. These
+  are protocol/state proofs only; they do not yet claim live PTY continuity.
 
 ### Known continuity boundary
 
