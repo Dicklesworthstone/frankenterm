@@ -7021,11 +7021,160 @@ async fn client_thread_async(
     result
 }
 
-pub fn unix_connect_with_retry(
+struct UnixConnectStream {
+    stream: Option<UnixStream>,
+    proxy_child: Option<std::process::Child>,
+}
+
+impl UnixConnectStream {
+    fn direct(stream: UnixStream) -> Self {
+        Self {
+            stream: Some(stream),
+            proxy_child: None,
+        }
+    }
+
+    fn proxy(stream: UnixStream, child: std::process::Child) -> Self {
+        Self {
+            stream: Some(stream),
+            proxy_child: Some(child),
+        }
+    }
+
+    fn stream(&self) -> &UnixStream {
+        self.stream
+            .as_ref()
+            .expect("unix connect stream accessed while dropping")
+    }
+
+    fn stream_mut(&mut self) -> &mut UnixStream {
+        self.stream
+            .as_mut()
+            .expect("unix connect stream accessed while dropping")
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream().set_write_timeout(timeout)
+    }
+}
+
+impl std::fmt::Debug for UnixConnectStream {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("UnixConnectStream")
+            .field(
+                "proxy_pid",
+                &self.proxy_child.as_ref().map(std::process::Child::id),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+fn terminate_and_reap_proxy_child(
+    child: &mut std::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+
+    match child.kill() {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::InvalidInput => {
+            // The process exited between `try_wait` and `kill`; `wait` below
+            // remains the single reaping authority.
+        }
+        Err(error) => return Err(error),
+    }
+    child.wait()
+}
+
+impl Drop for UnixConnectStream {
+    fn drop(&mut self) {
+        // Closing the socketpair first gives a cooperative proxy an immediate
+        // EOF. We still terminate and synchronously reap the exact child we
+        // spawned: `std::process::Child` does neither on Drop, so a rejected
+        // attach candidate otherwise leaves a live SSH process and remote mux
+        // connection behind for the lifetime of the GUI.
+        drop(self.stream.take());
+        if let Some(mut child) = self.proxy_child.take() {
+            let pid = child.id();
+            if let Err(error) = terminate_and_reap_proxy_child(&mut child) {
+                log::error!("failed to terminate and reap unix proxy child {pid}: {error}");
+            }
+        }
+    }
+}
+
+impl Read for UnixConnectStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Read::read(self.stream_mut(), buf)
+    }
+}
+
+impl Write for UnixConnectStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Write::write(self.stream_mut(), buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Write::flush(self.stream_mut())
+    }
+}
+
+impl AsyncRead for UnixConnectStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        AsyncRead::poll_read(Pin::new(self.get_mut().stream_mut()), task_cx, buf)
+    }
+}
+
+impl AsyncWrite for UnixConnectStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        AsyncWrite::poll_write(Pin::new(self.get_mut().stream_mut()), task_cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        AsyncWrite::poll_write_vectored(Pin::new(self.get_mut().stream_mut()), task_cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        AsyncWrite::is_write_vectored(self.stream())
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        AsyncWrite::poll_flush(Pin::new(self.get_mut().stream_mut()), task_cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        AsyncWrite::poll_shutdown(Pin::new(self.get_mut().stream_mut()), task_cx)
+    }
+}
+
+fn unix_connect_with_retry(
     target: &UnixTarget,
     just_spawned: bool,
     max_attempts: Option<u64>,
-) -> anyhow::Result<UnixStream> {
+) -> anyhow::Result<UnixConnectStream> {
     let mut error = None;
 
     if just_spawned {
@@ -7046,7 +7195,7 @@ pub fn unix_connect_with_retry(
                 path.to_path_buf(),
                 UNIX_SOCKET_CONNECT_TIMEOUT,
             ) {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => return Ok(UnixConnectStream::direct(stream)),
                 Err(err) => {
                     error =
                         Some(Err(err).with_context(|| format!("connecting to {}", path.display())))
@@ -7097,7 +7246,10 @@ pub fn unix_connect_with_retry(
                     #[cfg(unix)]
                     unsafe {
                         use std::os::unix::io::{FromRawFd, IntoRawFd};
-                        return Ok(UnixStream::from_raw_fd(a.into_raw_fd()));
+                        return Ok(UnixConnectStream::proxy(
+                            UnixStream::from_raw_fd(a.into_raw_fd()),
+                            child,
+                        ));
                     }
                     #[cfg(windows)]
                     unsafe {
@@ -7109,8 +7261,18 @@ pub fn unix_connect_with_retry(
                         // Windows, so the `as _` cast bridges them.
                         use filedescriptor::IntoRawSocketDescriptor;
                         use std::os::windows::io::FromRawSocket;
-                        return Ok(UnixStream::from_raw_socket(a.into_socket_descriptor() as _));
+                        return Ok(UnixConnectStream::proxy(
+                            UnixStream::from_raw_socket(a.into_socket_descriptor() as _),
+                            child,
+                        ));
                     }
+                }
+
+                if let Err(cleanup_error) = terminate_and_reap_proxy_child(&mut child) {
+                    log::error!(
+                        "failed to clean up rejected unix proxy child {}: {cleanup_error}",
+                        child.id()
+                    );
                 }
             }
         }
@@ -7175,6 +7337,16 @@ pub trait AsyncReadAndWrite: Unpin + AsyncRead + AsyncWrite + std::fmt::Debug + 
 impl AsyncReadAndWrite for UnixStream {
     async fn wait_for_readable(&self) -> anyhow::Result<()> {
         UnixStream::wait_for_readable(self)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl AsyncReadAndWrite for UnixConnectStream {
+    async fn wait_for_readable(&self) -> anyhow::Result<()> {
+        self.stream()
+            .wait_for_readable()
             .await
             .map_err(Into::into)
     }
@@ -15676,6 +15848,29 @@ mod tests {
             err.to_string().contains("greater than zero"),
             "unexpected error: {:?}",
             err
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_proxy_transport_terminates_and_reaps_its_exact_child() {
+        let (stream, _peer) = UnixStream::pair().expect("create proxy lifecycle socketpair");
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn proxy-child lifecycle probe");
+        let pid = child.id();
+
+        drop(UnixConnectStream::proxy(stream, child));
+
+        let probe = std::process::Command::new("sh")
+            .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+            .status()
+            .expect("probe exact proxy-child pid after transport drop");
+        assert!(
+            !probe.success(),
+            "the transport drop must leave no live or zombie proxy child {}",
+            pid
         );
     }
 
