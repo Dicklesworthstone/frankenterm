@@ -286,7 +286,18 @@ proven:
    from a retired mux is rejected before effect.
 5. Each accepted input has an idempotency identity and an explicit effect
    acknowledgement. An ambiguous disconnect is reconciled by querying that
-   identity; blindly resending input is forbidden.
+   identity; blindly resending input is forbidden. The guardian retains the
+   original identity of every live or retained pane spawn for the pane's full
+   lifetime. Other request/effect receipts use a bounded FIFO replay window;
+   eviction cannot repeat an old mutation because its retired sequence or
+   generation is still fenced by the pane state. An input whose disposition is
+   still `accepted_not_durable` is pinned outside that FIFO until its exact
+   durable or terminal-rejection acknowledgement arrives. A reverse effect-to-
+   request index updates only its retained aliases at acknowledgement time;
+   reconciliation cost is independent of unrelated fleet receipt volume. A
+   pending effect admits at most 64 distinct request aliases, so one ambiguous
+   input cannot consume the global receipt ledger; excess aliases fail before
+   mutating any retained receipt.
 6. Raw PTY output is appended to a synchronized, checksummed sequence log before
    acknowledgement to the mux. The guardian retains a bounded replay window and
    terminal-state checkpoints that bind parser version, rows/columns, raw-output
@@ -302,6 +313,106 @@ proven:
 9. Guardian shutdown is a separate, explicit operator transaction. Stopping or
    upgrading the mux must not imply guardian shutdown, child termination, log
    truncation, or retention reclamation.
+
+#### Guardian protocol v1 freeze
+
+The first implementation must use one length-delimited binary frame with a
+fixed protocol version and a hard encoded-frame ceiling. Authentication is an
+HMAC-SHA-256 over the exact versioned header and payload bytes using a random
+32-byte token read from the private guardian token file; the token itself is
+never serialized, logged, or accepted from a command-line argument. The server
+verifies only the outer bounded frame length before locating the fixed-size MAC
+trailer, verifies that MAC in constant time, and only then decodes authenticated
+header fields or looks up a pane. Responses use the same rule: decode produces
+an opaque authenticated-response capability, and the client must match its
+operation, incarnations, request UUID, originating request-payload SHA-256, pane
+UUID, and effect UUID to the exact originating request, including the echoed
+lease generation and sequence, before consuming its payload. Resulting claim
+generations and next-sequence values
+belong in the authenticated response payload rather than mutable correlation
+header fields. Only the resulting correlated-response capability exposes the
+payload. Peer credentials are an
+additional local-transport fence, not a replacement for the token.
+
+Every request header contains all of the following:
+
+- protocol version and operation discriminant;
+- guardian incarnation UUID and requesting mux incarnation UUID;
+- request UUID plus SHA-256 of the exact operation payload;
+- durable pane UUID when the operation is pane-scoped;
+- lease generation and monotonically increasing per-lease mutation sequence;
+- operation idempotency UUID for any request that can create an external
+  effect.
+
+`Spawn` is the only request that may omit a pane lease. It carries a bounded
+serialized command, environment, working directory, initial PTY size, durable
+pane UUID, and spawn idempotency UUID. Repeating the same request UUID and
+payload digest returns the original result. Reusing either the request UUID or
+spawn idempotency UUID with different bytes is a terminal conflict and never
+spawns. `Census` is read-only and paginated under a fixed entry and byte cap.
+The first page names a nonzero authenticated snapshot UUID; the guardian binds
+it to the requesting mux incarnation, freezes that sorted durable-pane view,
+and returns the same snapshot UUID, total count, and next cursor on every page.
+Cross-incarnation UUID reuse is an identity conflict. A bounded eight-snapshot
+FIFO permits exact page retries while limiting memory. A rotated or unknown
+snapshot fails closed,
+rather than applying an ordinal cursor to a newer pane set and silently skipping
+or duplicating a concurrent spawn. Each fixed-width row carries pane UUID,
+state, generation, claiming mux and next sequence when live, pending input
+identity, exit status, and quarantine reason.
+`Claim` names the observed prior generation and returns exactly the next
+generation; it cannot skip, wrap, or revive a terminal pane. `Attach` returns
+the claimed census row, checkpoint, and bounded replay cursor.
+
+`Input`, `Resize`, `Signal`, live-pane `Close`, `Checkpoint`, `Replay`,
+`QueryInputEffect`, and `RetireLease` require the exact current lease. Mutation
+operations consume the next exact nonzero lease sequence; read-only `Attach`,
+`Replay`, and `QueryInputEffect` require sequence zero and never advance the
+mutation stream. A retention-only `Close` after observed child exit is the one
+terminal-state exception: it requires the exact retained generation and
+sequence zero, cannot signal the already-exited child, and only seals the
+retained record. The guardian rejects a stale generation, wrong mux
+incarnation, duplicate mutation sequence with different bytes, mutation
+sequence gap, or exhausted sequence before performing an effect. Input
+acknowledgements distinguish `not_seen`, `accepted_not_durable`,
+`durable_effect`, and `terminal_rejected`; only `not_seen` permits a resend of
+the same idempotency UUID. Resize, signal, close, and checkpoint operations
+have the same request-digest replay rule, so an ambiguous response is queried
+or replayed by identity rather than converted into a second effect.
+
+The per-pane protocol state machine is finite and explicit:
+
+```text
+vacant
+  -> live_unclaimed
+  -> live_claimed(generation, mux_incarnation, next_sequence, pending_input_effect?)
+  -> live_unclaimed                    [RetireLease or mux lease expiry]
+  -> exited_unclaimed(exit_status, pending_input_effect?)
+  -> closed_terminal(exit_status?)     [explicit Close after exit/retention]
+```
+
+`Spawn` is the only `vacant -> live_unclaimed` transition. `Claim` is the only
+way to enter or replace `live_claimed`; it monotonically increments the fencing
+generation. Child exit preserves census, replay, checkpoint, effect-query, and
+retention-close authority but permanently rejects new PTY/process mutations.
+An accepted input whose
+durable/terminal disposition is still ambiguous survives child exit and blocks
+lease takeover, retirement, and terminal close until that exact effect identity
+is reconciled. `closed_terminal` is queryable through the bounded idempotency
+window but cannot be claimed or spawned under the same durable pane UUID.
+Guardian incarnation rollover invalidates all transport sessions and requires a
+fresh census; persisted pane generation never decreases. Exhaustion of a
+generation, mutation sequence, output sequence, or idempotency counter is a
+terminal quarantine condition, never wrapping arithmetic. Quarantine still
+records a later child-exit status for census and forensics; it neither revives
+mutations nor discards the exhaustion reason. An explicit close issued before
+the child waiter settles likewise retains the later exit status instead of
+losing it when the mutation authority becomes terminal.
+
+These are protocol/state-machine requirements, not continuity evidence. The
+implementation must first prove them with deterministic pure-state tests and
+bounded-codec negative controls; only the later real PTY and SIGKILL lanes can
+prove live-process survival.
 
 A transactional mux upgrade may therefore stage and verify a same-build mux,
 capture and verify a content dump, stop accepting new mux mutations, retire the
@@ -321,7 +432,9 @@ per-pane, whole-payload, and whole-artifact SHA-256 checksums. The output is
 created through a no-symlink pinned directory capability with private
 permissions, never overwrites an existing file, and synchronizes both the file
 and containing directory before success is reported. Partial pane reads or
-topology drift are recorded and fail the command by default.
+topology drift are recorded and fail the command by default. Payload and
+topology checksum passes are streaming and byte-bounded; topology records
+borrow pane metadata instead of cloning remote strings into a second JSON tree.
 
 `ft session verify-dump <path>` performs bounded offline verification of the
 private regular-file shape, complete-publication marker, schema, whole-payload
