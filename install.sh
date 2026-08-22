@@ -1090,26 +1090,6 @@ fi
 mkdir -p "$DEST" 2>/dev/null || true
 preflight_checks
 
-# Already at target version short-circuit (unless --force or offline).
-# Note: the EXIT trap is already registered at script init, so any TMP
-# we create here is auto-cleaned regardless of how we exit.
-if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] \
-    && check_installed_version "$VERSION"; then
-  ok "ft + frankenterm-mux-server $VERSION are already installed at $DEST"
-  info "Use --force to reinstall"
-  # Still honour the font / GUI-app side installs even when the CLI is current,
-  # so a re-run can add the .app to an existing CLI-only install. Decide once
-  # (should_install_app may warn under --with-app) to avoid a double call.
-  app_wanted=0
-  if should_install_app; then app_wanted=1; fi
-  if [ "$WITH_FONT" -eq 1 ] || [ "$app_wanted" -eq 1 ]; then
-    TMP=$(mktemp -d)
-    if [ "$WITH_FONT" -eq 1 ]; then install_pragmasevka; fi
-    if [ "$app_wanted" -eq 1 ]; then install_macos_app; fi
-  fi
-  exit 0
-fi
-
 # ───────────────────────────────────────────────────────────────────────────
 # Atomic lock (mkdir-based — works on macOS without flock)
 # ───────────────────────────────────────────────────────────────────────────
@@ -1136,6 +1116,28 @@ else
     LOCK_DIR=""
     exit 1
   fi
+fi
+
+# Already at target version short-circuit (unless --force or offline). This
+# check belongs inside the installer lock: otherwise a concurrent same-semver
+# process-family publication can be observed between its two canonical moves.
+# check_installed_version also requires one exact sealed build identity across
+# both roles; matching --version output alone is not sufficient.
+if [ "$FORCE_INSTALL" -eq 0 ] && [ -z "$OFFLINE_TARBALL" ] && [ -n "$VERSION" ] \
+    && check_installed_version "$VERSION"; then
+  ok "ft + frankenterm-mux-server $VERSION are already installed at $DEST"
+  info "Use --force to reinstall"
+  # Still honour the font / GUI-app side installs even when the CLI is current,
+  # so a re-run can add the .app to an existing CLI-only install. Decide once
+  # (should_install_app may warn under --with-app) to avoid a double call.
+  app_wanted=0
+  if should_install_app; then app_wanted=1; fi
+  if [ "$WITH_FONT" -eq 1 ] || [ "$app_wanted" -eq 1 ]; then
+    TMP=$(mktemp -d)
+    if [ "$WITH_FONT" -eq 1 ]; then install_pragmasevka; fi
+    if [ "$app_wanted" -eq 1 ]; then install_macos_app; fi
+  fi
+  exit 0
 fi
 
 TMP=$(mktemp -d)

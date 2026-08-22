@@ -182,6 +182,11 @@ dangling symlink. A failed quarantine or restore emits
 `FT_COMPONENT_ROLLBACK_INCOMPLETE=<transaction>` and preserves the remaining
 evidence for explicit operator recovery.
 
+The top-level installer's already-current shortcut is serialized by its
+installer lock and requires the embedded sealed build marker to match across
+the CLI and mux-server roles. Equal `--version` output from different builds is
+not an installed process-family receipt and falls through to verified install.
+
 The systemd user-unit update uses a random transaction identity for both
 the non-overwriting stage and preserved prior unit; an `--install-ft` operation
 uses the same identity for components and the unit. It checks both destinations
