@@ -1722,6 +1722,7 @@ struct SimpleExecutorQueueState {
     high_priority_streak: usize,
     #[cfg(any(test, feature = "test-support"))]
     prefer_admitted: bool,
+    retired: bool,
 }
 
 struct SimpleExecutorQueue {
@@ -1750,6 +1751,7 @@ impl SimpleExecutorQueue {
                 high_priority_streak: 0,
                 #[cfg(any(test, feature = "test-support"))]
                 prefer_admitted: true,
+                retired: false,
             }),
             available: Condvar::new(),
         }
@@ -1757,7 +1759,14 @@ impl SimpleExecutorQueue {
 
     #[cfg(any(test, feature = "test-support"))]
     fn enqueue_legacy(&self, func: SpawnFunc) {
-        lock_or_recover(&self.state).legacy.push_back(func);
+        let mut state = lock_or_recover(&self.state);
+        if state.retired {
+            drop(state);
+            drop(func);
+            return;
+        }
+        state.legacy.push_back(func);
+        drop(state);
         self.available.notify_one();
     }
 
@@ -1775,6 +1784,31 @@ impl SimpleExecutorQueue {
         let enqueued_at = Instant::now();
         let estimated_bytes = admission.estimated_bytes;
         let mut state = lock_or_recover(&self.state);
+        if state.retired {
+            let depth = state
+                .admitted_high
+                .len()
+                .checked_add(state.admitted_low.len())
+                .expect("retired SimpleExecutor depth overflow");
+            let snapshot_after_enqueue = MainThreadQueueSnapshot::new(
+                depth,
+                self.task_capacity,
+                state.admitted_estimated_bytes,
+                self.estimated_byte_capacity,
+                None,
+                true,
+            )
+            .expect("retired SimpleExecutor queue accounting must remain internally consistent");
+            drop(state);
+            drop(runnable);
+            return MainThreadEnqueueReceipt {
+                queue_id: admission.queue_id,
+                scheduler_generation: admission.scheduler_generation,
+                task_ticket: admission.task_ticket,
+                enqueued_at,
+                snapshot_after_enqueue,
+            };
+        }
         let depth = state
             .admitted_high
             .len()
@@ -1916,12 +1950,28 @@ impl SimpleExecutorQueue {
             });
         Self::pop_locked(&mut state)
     }
+
+    fn retire_and_drain(&self) -> Vec<SpawnFunc> {
+        let mut state = lock_or_recover(&self.state);
+        state.retired = true;
+        let mut drained = Vec::new();
+        while let Some(func) = Self::pop_locked(&mut state) {
+            drained.push(func);
+        }
+        drop(state);
+        self.available.notify_all();
+        drained
+    }
 }
 
 pub struct SimpleExecutor {
     queue: Arc<SimpleExecutorQueue>,
     binding: Arc<MainThreadSchedulerBinding>,
     owner_thread: ThreadId,
+    // A SimpleExecutor may queue `spawn_local` futures. Moving the owner to
+    // another thread would make polling or cancellation happen on the wrong
+    // thread, so preserve that contract in the type system.
+    _owner_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Default for SimpleExecutor {
@@ -1983,6 +2033,7 @@ impl SimpleExecutor {
             queue,
             binding,
             owner_thread: std::thread::current().id(),
+            _owner_affinity: std::marker::PhantomData,
         })
     }
 
@@ -2022,11 +2073,9 @@ impl SimpleExecutor {
 
     /// Run one queued callback without waiting for work to arrive.
     ///
-    /// Test harnesses that install this executor must drain it on the same
-    /// thread before replacing the process-global schedulers. A queued local
-    /// runnable can contain thread-affine state, so allowing a later test
-    /// thread to drop the final scheduler sender would destroy that state on
-    /// the wrong thread.
+    /// Queued local runnables are owner-thread-affine. The executor type cannot
+    /// move to another thread, and dropping it cancels any callbacks that were
+    /// not explicitly drained here.
     pub fn try_tick(&self) -> anyhow::Result<bool> {
         self.ensure_owner_thread()?;
         if let Some(func) = self.queue.try_pop() {
@@ -2046,6 +2095,15 @@ impl Drop for SimpleExecutor {
         // that will never be ticked again. A newer replacement owns a distinct
         // binding, so retiring this generation cannot affect it.
         self.binding.retire();
+
+        // Each queued Runnable retains its scheduling binding, whose
+        // callbacks retain this queue. Retiring admission without draining
+        // therefore forms a strong reference cycle and leaves detached
+        // futures parked forever. Drop (do not run) every callback on the
+        // owner thread to cancel its task and release its admission permit.
+        for func in self.queue.retire_and_drain() {
+            drop(func);
+        }
     }
 }
 
@@ -3192,15 +3250,82 @@ mod tests {
     }
 
     #[test]
-    fn simple_executor_refuses_to_run_thread_local_tasks_off_owner_thread() {
+    fn simple_executor_drop_cancels_queued_work_and_releases_capacity() {
         let _lock = TEST_LOCK.lock().unwrap();
-        let exec = Arc::new(SimpleExecutor::new());
-        let wrong_thread = Arc::clone(&exec);
-        let error = std::thread::spawn(move || wrong_thread.try_tick().unwrap_err())
-            .join()
-            .unwrap();
-        assert!(error.to_string().contains("owner thread"));
-        assert!(!exec.try_tick().unwrap());
+        let accounting_errors_before = main_thread_admission_accounting_errors();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_by_task = Arc::clone(&dropped);
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let signal = DropSignal(dropped_by_task);
+        let exec = SimpleExecutor::new();
+        let task = try_spawn_with_admission(
+            MainThreadServiceClass::Input,
+            16,
+            async move {
+                let _signal = signal;
+                std::future::pending::<()>().await;
+            },
+        );
+        let MainThreadSpawnOutcome::Spawned(task) = task else {
+            panic!("fresh SimpleExecutor must admit bounded test work");
+        };
+        task.detach();
+        assert_eq!(exec.queue_snapshot().depth, 1);
+
+        drop(exec);
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(
+            main_thread_admission_accounting_errors(),
+            accounting_errors_before
+        );
+    }
+
+    #[test]
+    fn reserved_work_spawned_after_executor_drop_is_cancelled_before_enqueue() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let accounting_errors_before = main_thread_admission_accounting_errors();
+        let exec = SimpleExecutor::new();
+        let reservation = match try_reserve_main_thread(
+            MainThreadServiceClass::Input,
+            16,
+        ) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => panic!(
+                "fresh SimpleExecutor must reserve test work: {:?}",
+                rejected
+            ),
+        };
+        let binding = Arc::clone(&reservation.binding);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_by_task = Arc::clone(&dropped);
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let signal = DropSignal(dropped_by_task);
+
+        drop(exec);
+        let spawned = reservation.spawn_local(async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
+
+        assert!(spawned.initial_enqueue_receipt().snapshot_after_enqueue.retired);
+        assert!(dropped.load(Ordering::Acquire));
+        drop(spawned);
+        assert_eq!(binding.admission_snapshot().active_tasks, 0);
+        assert_eq!(
+            main_thread_admission_accounting_errors(),
+            accounting_errors_before
+        );
     }
 
     #[test]
