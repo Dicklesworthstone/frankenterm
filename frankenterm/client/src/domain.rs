@@ -1954,6 +1954,20 @@ impl ClientDomain {
             .map(Arc::clone)
     }
 
+    fn claim_initial_attachment(&self) -> anyhow::Result<InitialAttachmentClaim<'_>> {
+        self.initial_attachment_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                anyhow!(
+                    "client domain {} already has an attachment pending",
+                    self.local_domain_id
+                )
+            })?;
+        Ok(InitialAttachmentClaim {
+            pending: &self.initial_attachment_pending,
+        })
+    }
+
     fn ensure_mux_owner(&self, mux: &Arc<Mux>) -> anyhow::Result<()> {
         let owner = self
             .mux_owner
@@ -3473,13 +3487,10 @@ impl ClientDomain {
             .downcast_ref::<Self>()
             .expect("validated client-domain registration changed concrete type");
 
-        domain
-            .initial_attachment_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| anyhow!("client domain {domain_id} already has an attachment pending"))?;
-        let _claim = InitialAttachmentClaim {
-            pending: &domain.initial_attachment_pending,
-        };
+        debug_assert!(
+            domain.initial_attachment_pending.load(Ordering::Acquire),
+            "initial attachment must be claimed before transport creation"
+        );
         if domain.retired.load(Ordering::Acquire)
             || !mux
                 .get_domain(domain_id)
@@ -3790,6 +3801,13 @@ impl Domain for ClientDomain {
             }
             return Ok(());
         }
+        // Claim after the attached topology-sync fast path, but before creating
+        // a transport. The Lua startup retry and reconnect watchdog can
+        // otherwise both observe Detached and each launch a proxy command while
+        // the first handshake is still in flight. A late claim in
+        // `finish_attach` fenced topology publication but leaked the losing SSH
+        // child and left two live connections to the same remote mux.
+        let _claim = self.claim_initial_attachment()?;
 
         let domain_id = self.local_domain_id;
         let config = self.config.clone();
@@ -3899,6 +3917,38 @@ mod tests {
             .build()
             .expect("build client-domain test runtime")
             .block_on(future)
+    }
+
+    #[test]
+    fn initial_attachment_claim_is_single_flight_before_transport_creation() {
+        let config = ClientDomainConfig::Unix(UnixDomain {
+            name: "single-flight-attach-test".to_string(),
+            ..UnixDomain::default()
+        });
+        let domain = ClientDomain {
+            label: config.label(),
+            config,
+            inner: Mutex::new(None),
+            initial_attachment_pending: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            local_domain_id: 91_020,
+            mux_owner: Weak::new(),
+            mux_subscriber_id: None,
+        };
+
+        let first = domain
+            .claim_initial_attachment()
+            .expect("first attach must reserve the transport-launch authority");
+        let second = match domain.claim_initial_attachment() {
+            Ok(_) => panic!("a concurrent attach must fail before launching a transport"),
+            Err(error) => error,
+        };
+        assert!(second.to_string().contains("already has an attachment pending"));
+
+        drop(first);
+        domain
+            .claim_initial_attachment()
+            .expect("dropping the first transaction must release retry admission");
     }
 
     #[test]
