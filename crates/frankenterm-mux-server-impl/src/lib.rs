@@ -719,7 +719,11 @@ fn decode_scrollback_line_record(record: &str) -> Option<wezterm_term::Line> {
 
         let expected_sha256 = hex::decode(expected_sha256).ok()?;
         let actual_sha256 = Sha256::digest(&payload);
-        if expected_sha256.len() != 32 || expected_sha256.as_slice() != actual_sha256.as_ref() {
+        // Bind the digest through an explicit `&[u8]` view: bare `.as_ref()`
+        // is ambiguous here (E0283) because `bytes`/`asupersync` add extra
+        // `PartialEq<_>` impls for `[u8]` to the candidate set.
+        let actual_sha256: &[u8] = actual_sha256.as_ref();
+        if expected_sha256.len() != 32 || expected_sha256.as_slice() != actual_sha256 {
             return None;
         }
     }
@@ -1584,6 +1588,7 @@ mod tests {
                     stable_row,
                     None,
                 );
+                let stable_row = isize::try_from(stable_row).expect("stable row fits isize");
                 assert!(sink.store_scrollback_line(stable_row, &line, 2));
             }
             assert_eq!(sink.oldest_scrollback_row(), Some(13));
@@ -1713,6 +1718,7 @@ mod tests {
                     stable_row,
                     None,
                 );
+                let stable_row = isize::try_from(stable_row).expect("stable row fits isize");
                 assert!(sink.store_scrollback_line(stable_row, &line, 8));
             }
             let mut store = sink.lock_store("test empty forward retention state");
