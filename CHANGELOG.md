@@ -29,7 +29,59 @@ Scope window: [v0.12.0](https://github.com/Dicklesworthstone/frankenterm/release
 
 Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main>
 
-No changes yet.
+### Reconnect and process-family deployment safety
+
+- Makes terminal domain reconnect failures visible and actionable, including
+  both codec windows and explicit same-release server-upgrade or client-rollback
+  guidance instead of an apparent no-op.
+- Ships `ft` and `frankenterm-mux-server` as one sealed release identity and
+  prevents remote setup from activating one side while an incompatible mux is
+  still live. Verified local and release-tag pairs are staged under matching
+  unique `pending-*` paths until a deliberate drained activation. Manual and
+  preserved mux generations also trip the live-owner fence, which suppresses
+  `systemctl enable --now` so setup cannot start a second generation.
+  Inactive-host release pairs are likewise downloaded and launch-probed in an
+  isolated directory before transactional canonical publication with rollback.
+  The top-level installer also launch-probes both staged components before
+  moving either installed binary to a backup name.
+- Automates a verified pre-upgrade content dump through the currently installed
+  codec-compatible remote CLI whenever that release supports `session dump`;
+  legacy clients emit an explicit unavailable warning without fabricating proof.
+- Documents the breaking-codec rollout order so the compatible old desktop
+  process remains active while a separately installed candidate CLI stages and
+  drains every remote server.
+
+### Session and scrollback durability
+
+- Adds `ft session dump` plus bounded offline `verify-dump` for private,
+  redacted, checksummed live pane-text and topology safety artifacts. The schema
+  explicitly refuses to claim PTY, process-memory, or executable restore state.
+- Carries stable pane UUIDs into mux panes and continuously persists evicted
+  styled scrollback rows with synchronized sequence authority, checksummed
+  manifests and records, torn-tail recovery, bounded compaction, and optional
+  erasure sidecars.
+- Makes mmap and SQLite fallback a durable per-pane authority decision instead
+  of an uncoordinated dual write, and retains rows in memory when cold storage
+  cannot acknowledge them.
+- Adds `ft session list-durable` and `export-durable` for bounded read-only
+  discovery and transcript export of the continuous format. Export refuses
+  symlink, privacy, checksum, identity, sequence, replacement-race, and resource
+  violations; excludes uncommitted torn tails; reapplies redaction; never opens
+  source content for write; and never sends bytes into a live PTY.
+
+### Known continuity boundary
+
+- Live mux replacement is still intentionally unavailable while `LocalPane`
+  owns PTY masters and child handles. The guardian lease/replay/checkpoint
+  contract is documented, and deployment fails closed rather than describing a
+  disruptive restart or transcript export as lossless process continuity.
+
+Representative landed commits:
+[matched release process family](https://github.com/Dicklesworthstone/frankenterm/commit/80effb4302fef9f7cc172f6e3aff45f19870ab77),
+[persistent domain-spawn diagnostics](https://github.com/Dicklesworthstone/frankenterm/commit/93556402bdde9c63a8be0dd98bd94b2f64597749),
+[private dump and codec remediation](https://github.com/Dicklesworthstone/frankenterm/commit/569bfa89dd7ecfe2bc2845f845d65e09a5e34299),
+[durable pane and scrollback authority](https://github.com/Dicklesworthstone/frankenterm/commit/2342cc309e5a2b2e9f6532f390ca1be3e0c30530), and
+[operator contract updates](https://github.com/Dicklesworthstone/frankenterm/commit/9048d163019dc51c5f95e76fe2d3da8cf59b873a).
 
 ---
 
@@ -932,7 +984,7 @@ Current refs do not include a `v0.1.0` tag; the `0.1.0` sections above are chang
 ---
 
 <!-- Links -->
-[Unreleased]: https://github.com/Dicklesworthstone/frankenterm/compare/v0.14.1...main
+[Unreleased]: https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...main
 [0.13.0]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.13.0
 [0.12.0]: https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.12.0
 [0.1.0]: https://github.com/Dicklesworthstone/frankenterm/commits/main/?after=backup-before-rewrite
