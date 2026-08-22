@@ -3819,7 +3819,7 @@ impl CurrentClientDispatch {
      and rollback runbook.",
     codec::CODEC_VERSION_MIN_SUPPORTED,
     CODEC_VERSION,
-    config::wezterm_version(),
+    config::wezterm_version()
 )]
 pub struct IncompatibleVersionError {
     pub version: String,
@@ -7345,10 +7345,7 @@ impl AsyncReadAndWrite for UnixStream {
 #[async_trait]
 impl AsyncReadAndWrite for UnixConnectStream {
     async fn wait_for_readable(&self) -> anyhow::Result<()> {
-        self.stream()
-            .wait_for_readable()
-            .await
-            .map_err(Into::into)
+        self.stream().wait_for_readable().await.map_err(Into::into)
     }
 }
 
@@ -9221,8 +9218,16 @@ mod tests {
         );
 
         let reconnect = reconnect_dispatch
-            .find("let result = ClientDomain::reattach_if_current(")
+            .find("ClientDomain::reattach_if_current(")
             .expect("production reconnect dispatch call must remain present");
+        let result_assignment = reconnect_dispatch[..reconnect]
+            .rfind("let result")
+            .expect("production reconnect dispatch must retain the result binding");
+        assert_eq!(
+            reconnect_dispatch[result_assignment..reconnect].trim_end(),
+            "let result =",
+            "the awaited reattach result must remain bound for failure reporting"
+        );
         let await_end = reconnect_dispatch[reconnect..]
             .find(".await;")
             .map(|offset| reconnect + offset + ".await;".len())
@@ -10258,7 +10263,9 @@ mod tests {
     #[test]
     fn codec_authority_negotiation_covers_current_legacy_and_invalid_windows() {
         let generation = NonZeroU64::new(7).expect("test generation is nonzero");
-        let previous = CODEC_VERSION - 1;
+        let disjoint_max = codec::CODEC_VERSION_MIN_SUPPORTED
+            .checked_sub(1)
+            .expect("the supported codec window has a lower disjoint version");
         let current_peer = RpcCodecAuthority::negotiate(
             generation,
             CODEC_VERSION,
@@ -10276,8 +10283,8 @@ mod tests {
         assert_eq!(legacy.remote_min, CODEC_VERSION);
         assert_eq!(legacy.agreed, CODEC_VERSION);
 
-        assert!(RpcCodecAuthority::negotiate(generation, previous, previous).is_err());
-        assert!(RpcCodecAuthority::negotiate(generation, previous, CODEC_VERSION).is_err());
+        assert!(RpcCodecAuthority::negotiate(generation, disjoint_max, disjoint_max).is_err());
+        assert!(RpcCodecAuthority::negotiate(generation, disjoint_max, CODEC_VERSION).is_err());
         assert!(
             RpcCodecAuthority::negotiate(generation, CODEC_VERSION + 1, CODEC_VERSION + 1,)
                 .is_err()
@@ -10287,7 +10294,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ambient_real_handshake_covers_current_legacy_and_disjoint_codec_windows() {
-        let previous = CODEC_VERSION - 1;
+        let disjoint_max = codec::CODEC_VERSION_MIN_SUPPORTED
+            .checked_sub(1)
+            .expect("the supported codec window has a lower disjoint version");
         for (advertised_min, retained_min, label) in [
             (
                 codec::CODEC_VERSION_MIN_SUPPORTED,
@@ -10323,8 +10332,8 @@ mod tests {
         }
 
         for (remote_max, remote_min, label) in [
-            (previous, previous, "breaking-previous-window"),
-            (previous, CODEC_VERSION, "impossible-window"),
+            (disjoint_max, disjoint_max, "lower-disjoint-window"),
+            (disjoint_max, CODEC_VERSION, "impossible-window"),
             (CODEC_VERSION + 1, CODEC_VERSION + 1, "disjoint-window"),
         ] {
             let RealHandshakeProbe {

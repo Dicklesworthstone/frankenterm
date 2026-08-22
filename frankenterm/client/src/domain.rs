@@ -3943,7 +3943,9 @@ mod tests {
             Ok(_) => panic!("a concurrent attach must fail before launching a transport"),
             Err(error) => error,
         };
-        assert!(second.to_string().contains("already has an attachment pending"));
+        assert!(second
+            .to_string()
+            .contains("already has an attachment pending"));
 
         drop(first);
         domain
