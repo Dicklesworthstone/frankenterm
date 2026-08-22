@@ -1245,7 +1245,7 @@ impl PaneFile {
             }
             Self::revalidate_open_file(&path, &file)?;
             match ColdErasureShard::decode_bytes(&bytes) {
-                Ok(shard) if usize::from(shard.index) == index => shards.push(shard),
+                Ok(shard) if shard.index == index => shards.push(shard),
                 Ok(shard) => invalid_shards.push(format!(
                     "path index {index} contains shard index {}",
                     shard.index

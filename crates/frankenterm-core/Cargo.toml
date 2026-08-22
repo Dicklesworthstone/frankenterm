@@ -183,6 +183,7 @@ frankenterm-uds = { workspace = true, features = ["async-asupersync"] }
 sysinfo = { version = "0.39.3", default-features = false, features = ["system", "disk"] }
 
 [target.'cfg(unix)'.dependencies]
+libc.workspace = true
 nix = { workspace = true, optional = true, features = ["fs", "socket", "user"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
