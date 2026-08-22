@@ -209,19 +209,111 @@ render state, historical scrollback, processes, or agents. Captured
 `output_segments` are arbitrary stream fragments rather than an authoritative
 terminal-state snapshot and are never sent through PTY input.
 
+### Continuous cold scrollback durability
+
+The mux server continuously persists rows that leave the hot terminal viewport
+under a per-pane durable UUID. Each acknowledged row is synchronized before its
+offset becomes visible, v2 row records bind the exact serialized payload with
+SHA-256, and logical retention pruning is recorded in a synchronized sequence
+journal so stable row numbers survive a crash even before byte compaction.
+Compaction writes the retained suffix plus its base-sequence header to a sibling
+file, synchronizes it, atomically publishes it, and then collapses the journal.
+The identity manifest binds its own canonical fields with SHA-256 and records
+the next sequence explicitly, including when retention leaves zero rows. Reopen
+ignores torn content/journal tails, rejects complete malformed records,
+validates every retained serialized row, and resumes at the next exact sequence.
+If the sink cannot acknowledge a row, the terminal now keeps that row in its
+in-memory deque, does not advance the stable-row offset, and does not count a
+cold spill. This can temporarily exceed the configured hot-memory target, but
+it prevents a storage error from being converted into silent scrollback loss.
+
+The mmap store's optional SQLite fallback is pane-authoritative rather than a
+best-effort dual-write mirror. A pane that opens successfully on mmap never
+silently switches histories after a later write failure. If mmap cannot be
+established, SQLite records a durable authority marker (including for an empty
+or cleared pane), so restart selects the same history and sequence space.
+
+This continuous spill is not yet a complete pane image: it covers cold/evicted
+rows, while the current hot viewport, terminal parser/render state, PTY handles,
+and child process remain mux-owned. A guardian plus hot-state checkpoint is
+therefore still required before a mux process replacement can claim live
+process continuity.
+
+### Durable PTY guardian contract
+
+Lossless mux replacement requires a process outside the mux lifetime to own the
+native PTY master and child handle. The guardian is that authority; it is not a
+second mux backend. `LocalPane` becomes a proxy to the same FrankenTerm mux and
+terminal implementation after the following contract is implemented and
+proven:
+
+1. The per-user service manager starts one guardian before the mux. Its socket
+   directory is private, its authentication token is a private regular file,
+   and neither mux discovery nor a guessed pane UUID grants control authority.
+2. `Spawn` carries a unique request identity, bounded serialized
+   `CommandBuilder`, initial `PtySize`, and durable pane UUID. Retrying the exact
+   request returns the original pane; reusing the identity with different bytes
+   is a terminal protocol error.
+3. The guardian exclusively owns the PTY master, child waiter/signaller, writer,
+   resize handle, and raw-output reader. Mux exit or disconnect releases only a
+   control lease; it cannot close the PTY or signal the child.
+4. Exactly one mux generation holds the mutation lease for a pane. `Claim`
+   returns a monotonically increasing fencing generation, and every input,
+   resize, signal, and close request carries that generation. A delayed request
+   from a retired mux is rejected before effect.
+5. Each accepted input has an idempotency identity and an explicit effect
+   acknowledgement. An ambiguous disconnect is reconciled by querying that
+   identity; blindly resending input is forbidden.
+6. Raw PTY output is appended to a synchronized, checksummed sequence log before
+   acknowledgement to the mux. The guardian retains a bounded replay window and
+   terminal-state checkpoints that bind parser version, rows/columns, raw-output
+   sequence, hot viewport, cold-scrollback base sequence, and a content digest.
+7. `Attach` returns a census entry plus the newest verified checkpoint and raw
+   output strictly after its sequence. The mux reconstructs the terminal parser,
+   verifies the resulting digest, and only then publishes the pane into topology.
+   A gap or digest mismatch quarantines the pane for transcript recovery instead
+   of presenting invented state.
+8. Guardian census is the post-crash process authority; the last committed mux
+   topology manifest supplies window/tab/workspace placement. Reconciliation is
+   by durable pane UUID, never by mux-local numeric pane ID or PID.
+9. Guardian shutdown is a separate, explicit operator transaction. Stopping or
+   upgrading the mux must not imply guardian shutdown, child termination, log
+   truncation, or retention reclamation.
+
+A transactional mux upgrade may therefore stage and verify a same-build mux,
+capture and verify a content dump, stop accepting new mux mutations, retire the
+old mux lease, start the successor, claim/replay every guardian pane, verify
+topology and content digests, and only then commit the service-manager pointer.
+Before the guardian contract is live, the same command must fail closed when a
+mux owns live PTYs; it may offer a verified content dump and a disruptive
+restart, but it must never label that path lossless.
+
 ### Live mux content dump
 
 `ft session dump` provides a separate, read-only pre-upgrade and forensic
-artifact. It captures the current bounded pane list, redacted pane metadata,
-and redacted UTF-8 pane text into a versioned JSON envelope with per-pane and
-whole-payload SHA-256 checksums. The output is created with private permissions,
-never overwrites an existing file, is synchronized to disk, reread, and
-verified before success is reported. Partial pane reads are recorded and fail
-the command by default.
+artifact. It brackets sequential pane reads with two bounded pane listings and
+requires their structural topology fingerprints to match. It captures redacted
+pane metadata and redacted UTF-8 pane text into a versioned JSON envelope with
+per-pane, whole-payload, and whole-artifact SHA-256 checksums. The output is
+created through a no-symlink pinned directory capability with private
+permissions, never overwrites an existing file, and synchronizes both the file
+and containing directory before success is reported. Partial pane reads or
+topology drift are recorded and fail the command by default.
+
+`ft session verify-dump <path>` performs bounded offline verification of the
+private regular-file shape, complete-publication marker, schema, whole-payload
+checksum, per-pane text checksums and byte/line counts, aggregate limits,
+summary counters, completeness/error consistency, and the explicit
+non-restorable capability claims. A valid artifact can still have `complete:
+false` when it was deliberately retained with `--allow-partial`; verification
+reports that state rather than promoting it to a complete safety gate.
 
 The dump is deliberately not accepted as an executable restore image. It does
-not preserve PTY descriptors, process memory, shell/editor internal state,
-terminal parser/render state, or running-agent continuity. `ft session recover
+not provide an atomic point-in-time content snapshot and does not preserve PTY
+descriptors, process memory, shell/editor internal state, terminal parser/render
+state, or running-agent continuity. Pane IDs are mux-incarnation-local unless a
+source supplies stronger domain authority; the artifact records that provenance
+instead of claiming stable cross-restart identity. `ft session recover
 <pane_uuid>` likewise exports a redacted orphan transcript to a new file; it
 does not replay archived output into a live pane or PTY.
 

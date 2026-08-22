@@ -121,20 +121,28 @@ If no known manager:
 
 ### 6) Stage the matching FrankenTerm process family (optional)
 
-When `--install-ft` is selected, install both binaries before resolving the
-service path. The release archive and its component manifest must contain both
-executables from the same source revision and codec contract. Existing bytes
-are renamed to timestamped `previous-*` paths; a publish failure restores the
-previous pair. An active mux is deliberately not restarted: replacing that
-process would terminate every PTY it owns. The command reports that the
-operator must drain those sessions before a deliberate restart.
+When `--install-ft` is selected, treat both binaries as one process family. The
+release archive and its component manifest must contain both executables from
+the same source revision and codec contract. If no mux is active, existing
+bytes are renamed to timestamped `previous-*` paths and a publish failure
+restores the previous pair. If a mux is active, locally supplied binaries are
+placed at unique `pending-*` paths and the currently compatible client/server
+pair is left untouched. A release-tag installer that cannot stage without
+activating fails before any setup mutation. Merely replacing the client while
+the old mux remains alive is forbidden because a codec-window mismatch makes
+all configured domains unusable even though their reconnect loop is running.
+
+Pending bytes are not an automated live upgrade. The command deliberately has
+no activation step until the guardian owns PTYs and can prove a fenced handoff;
+today the operator must drain sessions before activating another mux process.
 
 Before any deliberate restart, run the still-compatible client-side
-`ft session dump --format json` and require a complete, checksum-verified
-artifact. The dump preserves redacted observable pane text and bounded topology
-metadata only. It does not preserve mux-owned PTY descriptors, process memory,
-or running-agent continuity, so it is an additional safety gate rather than
-permission to restart an undrained mux.
+`ft session dump --format json`, then run `ft session verify-dump <path>
+--format json`; require both `complete: true` and `capture_complete: true`.
+The dump preserves sequential redacted observable pane text and bounded
+topology metadata only. It does not preserve mux-owned PTY descriptors, process
+memory, or running-agent continuity, so it is an additional safety gate rather
+than permission to restart an undrained mux.
 
 ### 7) Install systemd user service for mux
 Service file path:

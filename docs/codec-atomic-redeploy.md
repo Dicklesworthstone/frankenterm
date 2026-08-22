@@ -76,10 +76,13 @@ This means:
 - **Breaking rollout remains atomic.** Advancing the minimum makes old/new
   windows disjoint by design; those peers reject the handshake until they are
   brought to a common version.
-- **In-flight workflow state survives connection drops** (the
-  recorder + checkpoint subsystem is independent of the wire
-  protocol), but any client-side cache of pane state, scrollback, or
-  pending RPCs is lost.
+- **A transport-only connection drop does not kill mux-owned PTYs.** The
+  recorder/checkpoint subsystem is independent of the wire protocol, and the
+  reconnect path can re-list and reattach panes after a compatible successor
+  connection is established. A mux process exit is categorically different:
+  the current mux owns each PTY master and child handle, so its shutdown or
+  crash can terminate the child and cannot be described as workflow survival.
+  Client-side caches and pending RPCs are generation-local in either case.
 
 ## 3. Operator runbook for a codec bump
 
@@ -120,12 +123,16 @@ When both the maximum and minimum advance, use the maintenance window:
    reachable pane text and topology metadata:
 
    ```bash
-   ~/.local/bin/ft session dump --format json
+   NEW_TAG=vX.Y.Z
+   DUMP_PATH="$HOME/.local/share/ft/mux-dumps/pre-upgrade-${NEW_TAG}-$(date +%s).json"
+   ~/.local/bin/ft session dump --output "$DUMP_PATH" --format json
+   ~/.local/bin/ft session verify-dump "$DUMP_PATH" --format json
    ```
 
-   The command must report `complete: true`, and the artifact's embedded
-   payload checksum must verify. This is a content/topology safety artifact,
-   not process continuity: it cannot keep mux-owned PTYs or agents alive.
+   Both commands must succeed, the dump must report `complete: true`, and the
+   verifier must report `capture_complete: true`. This is a sequential
+   redacted-content/topology safety artifact, not process continuity: it cannot
+   keep mux-owned PTYs or agents alive.
 2. **Install the new CLI without replacing the desktop app.** Use the installer
    from the exact release source revision, then keep the old GUI running while
    the servers are prepared:
@@ -187,10 +194,19 @@ When both the maximum and minimum advance, use the maintenance window:
 - **Recorder/replay artifacts** are not affected. The recorder log
   format is independent of the codec wire format; old recordings
   remain decodable across `CODEC_VERSION` bumps.
-- **Workflows mid-execution** survive connection drops via the
-  recorder checkpoint subsystem. Operators should expect every
-  in-flight workflow to pause on the connection drop and resume on
-  reconnect; there is no data loss but there is a visible stall.
+- **Workflows mid-execution** can survive transport-only connection drops while
+  their mux stays alive. Operators should expect a visible stall followed by
+  reattachment after a compatible reconnect. Do not extend that claim to a mux
+  restart or crash until PTY ownership has moved into the durable guardian:
+  recorder/checkpoint rows preserve evidence, not live process descriptors.
+
+`ft setup remote --install-ft` fences the same split-brain at deployment time.
+With a live mux, a locally supplied exact process family is written to unique
+`pending-*` paths and the active `ft` plus mux-server bytes remain unchanged.
+The release-tag path fails before mutation because its installer cannot stage a
+non-active family. This prevents a newly activated client from becoming unable
+to speak to the still-running old mux; it does not claim to perform the later
+lossless mux handoff.
 
 ### 3e. Rollback
 

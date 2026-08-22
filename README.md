@@ -1043,19 +1043,37 @@ ft session list --limit 50 --offset 0              # bounded page of saved sessi
 ft session show <session_id> --limit 50 --offset 0 # bounded checkpoint page
 ft session doctor                # health check for session persistence
 ft session dump                  # private, checksummed live pane-content/topology export
+ft session verify-dump <path>    # offline schema/checksum/private-file verification
 ft session recover <pane_uuid>   # export an orphan transcript; never write it to a PTY
 ft watch                         # start the persistence/observation lifecycle; may prune retained data
 ```
 
-`ft session dump` reads every currently visible mux pane through the bounded
-read-only mux API, redacts pane text and metadata, records per-pane SHA-256
-digests, and writes a mode-0600 JSON envelope under
+`ft session dump` lists the currently visible mux panes, reads each through the
+bounded read-only mux API, then lists the topology again. It redacts pane text
+and metadata, records per-pane SHA-256 digests, and writes a mode-0600 JSON
+envelope under
 `~/.local/share/ft/mux-dumps/` by default. It refuses to overwrite a path,
-fsyncs and rereads the artifact, verifies the embedded payload checksum, and
-returns failure for a partial capture unless `--allow-partial` is explicit.
+rejects symlinked path components, fsyncs both the artifact and its containing
+directory, verifies the persisted handle, and returns failure for a pane-read
+error or changed topology fingerprint unless `--allow-partial` is explicit.
+`ft session verify-dump <path>` revalidates the private regular-file shape,
+schema, complete-publication marker, payload and artifact checksums, per-pane
+text checksums and byte/line counts, aggregate limits, summary counters,
+completeness, and the explicit non-restorable capability claims without
+contacting a mux.
 This is a pre-upgrade/crash-forensics safety artifact. It preserves observable
-text and topology metadata, not live PTY file descriptors, process memory,
-shell/editor internal state, or running-agent continuity.
+redacted text and bounded topology metadata. Pane text is captured sequentially,
+not as one atomic point-in-time terminal snapshot; the schema says so explicitly.
+It does not preserve live PTY file descriptors, process memory, shell/editor
+internal state, terminal parser/render state, or running-agent continuity.
+
+On mux servers, cold rows evicted from the hot terminal viewport are also
+persisted continuously under a stable pane UUID with checksummed styled-line
+records and crash-recoverable sequence authority. A rejected cold write retains
+the row in memory instead of silently dropping it. This protects scrollback,
+but it still does not make the current mux process replaceable: PTY and child
+ownership must move into the documented guardian before live upgrades can
+preserve running processes.
 
 `ft session recover` is intentionally export-only. Historical terminal output
 is output, not shell input: recovery never creates or splits a live pane and
