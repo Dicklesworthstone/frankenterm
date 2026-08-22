@@ -23,6 +23,7 @@ path = "../../tests/e2e_workflow_trigger.rs"
 workspace = true
 
 [dependencies]
+uuid = { workspace = true, features = ["v4", "rng"] }
 frankenterm-core = { workspace = true, default-features = false }
 # GH#75: broken-pipe (EPIPE) panic-to-exit(141) handling; `ft list | head`
 # must not unwind through or crash the shipped process.

@@ -3565,6 +3565,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tru",
+ "uuid",
  "zstd",
 ]
 
@@ -3766,6 +3767,7 @@ dependencies = [
  "insta",
  "jsonschema",
  "lfucache",
+ "libc",
  "loom",
  "memchr",
  "metrics",
