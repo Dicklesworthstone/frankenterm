@@ -13618,7 +13618,10 @@ mod tests {
         let generation = rpc_transport
             .active_generation()
             .expect("header-role test transport starts live");
-        let payload = [0x6d; 257];
+        // Header-role admission must be the rejecting authority in this test.
+        // Use the smallest schema cap in the table at its exact legal boundary
+        // so encoded-body admission cannot make the negative controls vacuous.
+        let payload = [0x6d; codec::MAX_MUX_ERROR_RESPONSE_DECOMPRESSED_BYTES];
 
         for (ident, serial, authorized) in [
             (
@@ -13660,12 +13663,15 @@ mod tests {
                 "ident {ident}, serial {serial}"
             );
             if !authorized {
-                assert!(matches!(
-                    error.downcast_ref::<NotReconnectableError>(),
-                    Some(NotReconnectableError::ProtocolViolation(
-                        OrdinaryMuxProtocolError::DirectionViolation { .. }
-                    ))
-                ));
+                assert!(
+                    matches!(
+                        error.downcast_ref::<NotReconnectableError>(),
+                        Some(NotReconnectableError::ProtocolViolation(
+                            OrdinaryMuxProtocolError::DirectionViolation { .. }
+                        ))
+                    ),
+                    "ident {ident}, serial {serial} produced unexpected rejection: {error:#}"
+                );
             }
             assert_eq!(
                 usize::try_from(reader.position()).expect("cursor position fits usize"),

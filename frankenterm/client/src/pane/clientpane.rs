@@ -2739,7 +2739,7 @@ mod tests {
 
     #[test]
     fn reliable_input_trace_context_waits_for_authority_then_is_consumed_once() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
@@ -2841,7 +2841,7 @@ mod tests {
 
     #[test]
     fn v61_effect_eligible_attempt_consumes_context_before_a_v62_retry() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
@@ -2899,7 +2899,7 @@ mod tests {
 
     #[test]
     fn definitely_not_sent_effect_eligible_attempt_may_restore_trace_context() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
@@ -2957,7 +2957,7 @@ mod tests {
 
     #[test]
     fn traced_reliable_input_generation_race_restores_context_and_preserves_fifo() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let (inner, peer) = test_client_inner_with_rpc_peer(17);
@@ -3190,7 +3190,7 @@ mod tests {
 
     #[test]
     fn reliable_input_queue_has_a_hard_bound_and_retains_fifo_identity() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
@@ -3329,7 +3329,7 @@ mod tests {
 
     #[test]
     fn reliable_input_domain_detach_atomically_retires_and_closes_admission() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
@@ -3382,7 +3382,7 @@ mod tests {
 
     #[test]
     fn reliable_input_pane_authority_retirement_is_exact_registration_scoped() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
@@ -3605,7 +3605,7 @@ mod tests {
 
     #[test]
     fn render_application_acks_only_after_atomic_apply_and_deduplicates_retry() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let observed = Arc::new(StdMutex::new(Vec::new()));
@@ -4407,7 +4407,7 @@ mod tests {
 
     #[test]
     fn render_application_rejects_wrong_registration_without_mutating_either_pane() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
@@ -4486,7 +4486,7 @@ mod tests {
 
     #[test]
     fn render_delta_updates_authoritative_alt_screen_state() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);
@@ -4552,7 +4552,7 @@ mod tests {
 
     #[test]
     fn registration_slot_is_stable_and_rejects_concurrent_mux_owners() {
-        let _scope = MuxTestScope::enter();
+        let _scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let first_mux = Arc::new(Mux::new(None));
         let second_mux = Arc::new(Mux::new(None));
         let inner = test_client_inner(17);
@@ -4607,7 +4607,7 @@ mod tests {
 
     #[test]
     fn unilateral_state_alert_is_forwarded_exactly_once() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let observed = Arc::new(StdMutex::new(Vec::new()));
@@ -4680,7 +4680,7 @@ mod tests {
 
     #[test]
     fn unilateral_rejects_registration_for_a_different_pane() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let observed = Arc::new(StdMutex::new(Vec::new()));
@@ -4734,7 +4734,7 @@ mod tests {
 
     #[test]
     fn unilateral_clipboard_callback_can_reenter_set_clipboard() {
-        let scope = MuxTestScope::enter();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
         let mux = Arc::new(Mux::new(None));
         scope.set_mux(&mux);
         let inner = test_client_inner(17);

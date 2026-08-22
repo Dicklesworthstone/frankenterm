@@ -68,6 +68,7 @@ impl Drop for RestoreMux {
 #[cfg(test)]
 pub(crate) struct MuxTestScope {
     restore_mux: Option<RestoreMux>,
+    parked_scheduler: Option<promise::spawn::SimpleExecutor>,
     _lock: MutexGuard<'static, ()>,
 }
 
@@ -79,6 +80,27 @@ impl MuxTestScope {
         let restore_mux = RestoreMux::capture();
         Self {
             restore_mux: Some(restore_mux),
+            parked_scheduler: None,
+            _lock: lock,
+        }
+    }
+
+    /// Enter a mux scope whose bounded main-thread scheduler admits work but
+    /// deliberately leaves it parked for the lifetime of the test.
+    ///
+    /// This is the healthy-transport fixture for tests that register a
+    /// `ClientPane`: the production pane-bind hook must see real admission
+    /// authority, while its palette RPC must not run without a test peer. The
+    /// executor is dropped on this same test thread before the ambient mux is
+    /// restored, cancelling every parked future and releasing its admission
+    /// permit without leaking work into a later test.
+    pub(crate) fn enter_with_parked_main_thread_scheduler() -> Self {
+        let lock = lock_or_recover_and_clear(&MUX_TEST_LOCK);
+        let parked_scheduler = promise::spawn::SimpleExecutor::new();
+        let restore_mux = RestoreMux::capture();
+        Self {
+            restore_mux: Some(restore_mux),
+            parked_scheduler: Some(parked_scheduler),
             _lock: lock,
         }
     }
@@ -95,9 +117,11 @@ impl MuxTestScope {
 #[cfg(test)]
 impl Drop for MuxTestScope {
     fn drop(&mut self) {
-        // Restore while `_lock` is still held. The fields are declared in the
-        // same order as this invariant, but the explicit take makes it robust
-        // to future field reordering.
+        // Cancel parked thread-affine futures while their exact mux is still
+        // ambient, then restore the prior mux while `_lock` remains held. The
+        // explicit takes make this ordering robust to future field reordering.
+        drop(self.parked_scheduler.take());
+        install_mux_test_scheduler();
         drop(self.restore_mux.take());
     }
 }
@@ -166,6 +190,82 @@ mod mux_test_scope_tests {
             dropped.load(Ordering::SeqCst),
             "rejected admission must leave future construction and disposal with the producer"
         );
+    }
+
+    #[test]
+    fn parked_scheduler_admits_then_cancels_owned_work_on_scope_drop() {
+        let accounting_errors_before = promise::spawn::main_thread_admission_accounting_errors();
+        let scope = MuxTestScope::enter_with_parked_main_thread_scheduler();
+        let ran = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let ran_in_task = Arc::clone(&ran);
+        let probe = DropProbe(Arc::clone(&dropped));
+
+        let outcome = promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Topology,
+            4 * 1024,
+        );
+        let reservation = match outcome {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => {
+                panic!("parked scheduler must provide real bounded admission: {rejected:?}")
+            }
+        };
+        reservation
+            .spawn(async move {
+                ran_in_task.store(true, Ordering::SeqCst);
+                drop(probe);
+            })
+            .detach();
+
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(scope);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "parked work must never execute without an explicitly ticked owner"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "scope teardown must cancel and drop every parked future on its owner thread"
+        );
+        assert!(matches!(
+            promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                4 * 1024,
+            ),
+            promise::spawn::MainThreadReservationOutcome::SchedulerUnavailable
+        ));
+        assert_eq!(
+            promise::spawn::main_thread_admission_accounting_errors(),
+            accounting_errors_before,
+            "parked task cancellation must release its exact permit without accounting drift"
+        );
+    }
+
+    #[test]
+    fn scope_teardown_restores_rejecting_scheduler_after_nested_replacement() {
+        let scope = MuxTestScope::enter();
+        let nested_scheduler = promise::spawn::SimpleExecutor::new();
+        let outcome = promise::spawn::try_reserve_main_thread(
+            promise::spawn::MainThreadServiceClass::Interactive,
+            4 * 1024,
+        );
+        let reservation = match outcome {
+            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            rejected => panic!("nested scheduler must admit the probe: {rejected:?}"),
+        };
+        drop(reservation);
+        drop(nested_scheduler);
+        drop(scope);
+
+        assert!(matches!(
+            promise::spawn::try_reserve_main_thread(
+                promise::spawn::MainThreadServiceClass::Interactive,
+                4 * 1024,
+            ),
+            promise::spawn::MainThreadReservationOutcome::SchedulerUnavailable
+        ));
     }
 
     #[test]
