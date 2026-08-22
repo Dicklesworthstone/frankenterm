@@ -1008,8 +1008,13 @@ impl Domain for LocalDomain {
         .await;
         let mut writer = WriterWrapper::new(master.take_writer()?);
 
-        let term_config =
-            config::TermConfig::new_for_pane(pane_id, self.id, command_description.clone());
+        let durable_pane_id = *uuid::Uuid::new_v4().as_bytes();
+        let term_config = config::TermConfig::new_for_pane(
+            pane_id,
+            self.id,
+            durable_pane_id,
+            command_description.clone(),
+        );
         let mut terminal = frankenterm_term::Terminal::new(
             size,
             std::sync::Arc::new(term_config),
@@ -1037,6 +1042,7 @@ impl Domain for LocalDomain {
                 master,
                 Box::new(writer),
                 self.id,
+                durable_pane_id,
                 command_description,
             )),
             Err(err) => {
@@ -1060,6 +1066,7 @@ impl Domain for LocalDomain {
                     }),
                     Box::new(writer),
                     self.id,
+                    durable_pane_id,
                     command_description,
                 ))
             }

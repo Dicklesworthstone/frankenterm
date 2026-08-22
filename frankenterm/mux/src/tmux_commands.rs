@@ -767,9 +767,11 @@ impl TmuxDomainState {
         );
 
         let command_description = "tmux pane".to_string();
+        let durable_pane_id = *uuid::Uuid::new_v4().as_bytes();
         let term_config = config::TermConfig::new_for_pane(
             local_pane_id,
             self.domain_id,
+            durable_pane_id,
             command_description.clone(),
         );
         let terminal = frankenterm_term::Terminal::new(
@@ -787,6 +789,7 @@ impl TmuxDomainState {
             Box::new(pane_pty),
             Box::new(writer),
             self.domain_id,
+            durable_pane_id,
             command_description,
         ));
 

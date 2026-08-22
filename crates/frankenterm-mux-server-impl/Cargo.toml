@@ -40,7 +40,12 @@ parking_lot.workspace = true
 promise.workspace = true
 rangeset.workspace = true
 rcgen.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 termwiz = { workspace=true, features=["use_serde"] }
+tempfile.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "rng"] }
 varbincode.workspace = true
@@ -56,7 +61,6 @@ winapi = { workspace=true, features = [ "winuser" ]}
 async-trait.workspace = true
 criterion = { workspace = true }
 proptest = "1.8.0"
-tempfile.workspace = true
 
 [[bench]]
 name = "dispatch_throughput"

@@ -802,8 +802,13 @@ impl Domain for RemoteSshDomain {
         let writer = WriterWrapper::new(writer);
 
         let command_description = "RemoteSshDomain".to_string();
-        let term_config =
-            config::TermConfig::new_for_pane(pane_id, self.id, command_description.clone());
+        let durable_pane_id = *uuid::Uuid::new_v4().as_bytes();
+        let term_config = config::TermConfig::new_for_pane(
+            pane_id,
+            self.id,
+            durable_pane_id,
+            command_description.clone(),
+        );
         let terminal = frankenterm_term::Terminal::new(
             size,
             std::sync::Arc::new(term_config),
@@ -819,6 +824,7 @@ impl Domain for RemoteSshDomain {
             pty,
             Box::new(writer),
             self.id,
+            durable_pane_id,
             command_description,
         ));
         crate::domain::register_spawned_pane_or_rollback(mux, &pane)?;

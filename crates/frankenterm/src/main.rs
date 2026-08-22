@@ -1450,6 +1450,8 @@ SEE ALSO:
                                       Allow cleanup of proven-dead recovery data
     ft session preserve-recovery <id> Keep recovery data protected
     ft session doctor                 Health check on session data
+    ft session dump                   Write a private forensic live-mux export
+    ft session verify-dump <path>     Verify a dump offline
 
 SEE ALSO:
     ft snapshot   Snapshot capture/inspection (restore execution unavailable)
@@ -6729,6 +6731,16 @@ enum SessionCommands {
         /// Return success even if one or more live panes could not be captured
         #[arg(long)]
         allow_partial: bool,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Verify a previously written mux dump without contacting a live mux
+    VerifyDump {
+        /// Dump artifact to verify
+        path: PathBuf,
 
         /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
@@ -74556,16 +74568,26 @@ async fn handle_session_command(
             let payload_bytes = serde_json::to_vec(&dump)
                 .map_err(|err| anyhow::anyhow!("Failed to serialize mux dump payload: {err}"))?;
             let payload_sha256 = sha256_hex(&payload_bytes);
+            drop(payload_bytes);
             let envelope = serde_json::json!({
                 "schema": "frankenterm.mux-content-dump.v1",
+                "publication_state": "complete",
                 "payload_sha256": &payload_sha256,
                 "payload": dump,
             });
             let mut artifact_bytes = serde_json::to_vec_pretty(&envelope)
                 .map_err(|err| anyhow::anyhow!("Failed to serialize mux dump envelope: {err}"))?;
             artifact_bytes.push(b'\n');
-            write_new_private_artifact(&output_path, &artifact_bytes)?;
-            verify_mux_dump_artifact(&output_path, &artifact_bytes, &payload_sha256)?;
+            if u64::try_from(artifact_bytes.len()).unwrap_or(u64::MAX)
+                > LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES
+            {
+                anyhow::bail!(
+                    "Serialized mux dump is {} bytes, exceeding the artifact safety limit of {} bytes",
+                    artifact_bytes.len(),
+                    LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES
+                );
+            }
+            let artifact_receipt = write_new_private_artifact(&output_path, &artifact_bytes)?;
 
             let result = serde_json::json!({
                 "ok": complete || allow_partial,
@@ -74575,6 +74597,9 @@ async fn handle_session_command(
                 "pane_count": pane_count,
                 "error_count": error_count,
                 "payload_sha256": &payload_sha256,
+                "artifact_sha256": &artifact_receipt.sha256,
+                "artifact_bytes": artifact_receipt.bytes,
+                "durability": artifact_receipt.durability,
                 "redaction_applied": true,
             });
             if !print_snapshot_session_structured_output(&result, output_format)? {
@@ -74583,13 +74608,48 @@ async fn handle_session_command(
                 println!("  Complete: {complete}");
                 println!("  Panes:    {pane_count}");
                 println!("  Errors:   {error_count}");
-                println!("  SHA-256:  {payload_sha256}");
+                println!("  Payload SHA-256:  {payload_sha256}");
+                println!("  Artifact SHA-256: {}", artifact_receipt.sha256);
                 println!("  Content:  redacted");
             }
             if !complete && !allow_partial {
                 anyhow::bail!(
                     "Mux dump is incomplete ({error_count} capture error(s)); artifact retained at {}. Re-run after resolving the errors or pass --allow-partial only when a partial safety artifact is acceptable.",
                     output_path.display()
+                );
+            }
+        }
+
+        SessionCommands::VerifyDump { path, format } => {
+            let output_format = resolve_session_orphan_output_format(&format);
+            let receipt = verify_mux_dump_artifact(&path)?;
+            let result = serde_json::json!({
+                "ok": true,
+                "action": "verify_dump",
+                "path": path.display().to_string(),
+                "schema": &receipt.schema,
+                "payload_sha256": &receipt.payload_sha256,
+                "artifact_sha256": &receipt.artifact_sha256,
+                "artifact_bytes": receipt.artifact_bytes,
+                "capture_complete": receipt.capture_complete,
+                "executable_restore_image": receipt.executable_restore_image,
+                "pane_count": receipt.pane_count,
+                "error_count": receipt.error_count,
+                "content_bytes": receipt.content_bytes,
+            });
+            if !print_snapshot_session_structured_output(&result, output_format)? {
+                println!("Mux content dump verified");
+                println!("  File:             {}", path.display());
+                println!("  Schema:           {}", receipt.schema);
+                println!("  Capture complete: {}", receipt.capture_complete);
+                println!("  Panes:            {}", receipt.pane_count);
+                println!("  Errors:           {}", receipt.error_count);
+                println!("  Content bytes:    {}", receipt.content_bytes);
+                println!("  Payload SHA-256:  {}", receipt.payload_sha256);
+                println!("  Artifact SHA-256: {}", receipt.artifact_sha256);
+                println!(
+                    "  Restore image:    {}",
+                    receipt.executable_restore_image
                 );
             }
         }
@@ -74808,6 +74868,27 @@ async fn handle_session_command(
 
 const LIVE_MUX_DUMP_MAX_PANES: usize = 65_536;
 const LIVE_MUX_DUMP_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+const LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES: u64 = 384 * 1024 * 1024;
+
+#[derive(Debug)]
+struct PrivateArtifactReceipt {
+    bytes: u64,
+    sha256: String,
+    durability: &'static str,
+}
+
+#[derive(Debug)]
+struct MuxDumpVerificationReceipt {
+    schema: String,
+    payload_sha256: String,
+    artifact_sha256: String,
+    artifact_bytes: u64,
+    capture_complete: bool,
+    executable_restore_image: bool,
+    pane_count: usize,
+    error_count: usize,
+    content_bytes: usize,
+}
 
 fn default_ft_data_dir() -> PathBuf {
     if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
@@ -74843,18 +74924,172 @@ fn default_orphan_transcript_path(pane_uuid: &str) -> PathBuf {
         .join(live_mux_dump_file_name(pane_uuid, "txt"))
 }
 
-fn write_new_private_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
-    if let Some(parent) = parent {
-        fs::create_dir_all(parent).map_err(|err| {
-            anyhow::anyhow!(
-                "Failed to create artifact directory {}: {err}",
-                parent.display()
-            )
-        })?;
-    }
+fn path_contains_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
 
-    let mut options = fs::OpenOptions::new();
+fn create_private_child_directory(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::DirBuilderExt as _;
+
+        let mut builder = cap_std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        parent.create_dir_with(name, &builder)
+    }
+    #[cfg(not(unix))]
+    {
+        parent.create_dir(name)
+    }
+}
+
+fn sync_capability_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        directory.open(".")?.into_std().sync_all()
+    }
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
+fn ensure_private_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    if path_contains_parent_component(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact directory contains a parent component",
+        ));
+    }
+    let Some(leaf) = path.file_name() else {
+        let base = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        return cap_std::fs::Dir::open_ambient_dir(base, cap_std::ambient_authority());
+    };
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = ensure_private_directory_tree_nofollow(parent_path)?;
+    let leaf = Path::new(leaf);
+    let created = match create_private_child_directory(&parent, leaf) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(err) => return Err(err),
+    };
+    let directory = parent.open_dir_nofollow(leaf)?;
+    if created {
+        sync_capability_directory(&parent)?;
+    }
+    Ok(directory)
+}
+
+fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    if path_contains_parent_component(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact directory contains a parent component",
+        ));
+    }
+    let Some(leaf) = path.file_name() else {
+        let base = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        return cap_std::fs::Dir::open_ambient_dir(base, cap_std::ambient_authority());
+    };
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = open_directory_tree_nofollow(parent_path)?;
+    parent.open_dir_nofollow(Path::new(leaf))
+}
+
+fn artifact_parent_and_leaf(path: &Path) -> anyhow::Result<(cap_std::fs::Dir, PathBuf)> {
+    if path_contains_parent_component(path) {
+        anyhow::bail!(
+            "Artifact path {} contains a parent component; use a normalized path",
+            path.display()
+        );
+    }
+    let leaf = path
+        .file_name()
+        .filter(|leaf| !leaf.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("Artifact path {} has no file name", path.display()))?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = ensure_private_directory_tree_nofollow(parent_path).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to create and pin artifact directory {} without following symlinks: {err}",
+            parent_path.display()
+        )
+    })?;
+    Ok((parent, leaf))
+}
+
+fn open_artifact_parent_and_leaf(path: &Path) -> anyhow::Result<(cap_std::fs::Dir, PathBuf)> {
+    if path_contains_parent_component(path) {
+        anyhow::bail!(
+            "Artifact path {} contains a parent component; use a normalized path",
+            path.display()
+        );
+    }
+    let leaf = path
+        .file_name()
+        .filter(|leaf| !leaf.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("Artifact path {} has no file name", path.display()))?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = open_directory_tree_nofollow(parent_path).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to pin artifact directory {} without following symlinks: {err}",
+            parent_path.display()
+        )
+    })?;
+    Ok((parent, leaf))
+}
+
+fn sha256_reader(mut reader: impl Read) -> std::io::Result<(u64, String)> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| std::io::Error::other("artifact byte count overflow"))?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((total, hex::encode(hasher.finalize())))
+}
+
+fn write_new_private_artifact(
+    path: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<PrivateArtifactReceipt> {
+    let (parent, leaf) = artifact_parent_and_leaf(path)?;
+    let mut options = cap_std::fs::OpenOptions::new();
     options
         .read(true)
         .write(true)
@@ -74862,10 +75097,11 @@ fn write_new_private_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .follow(FollowSymlinks::No);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use cap_std::fs::OpenOptionsExt as _;
+
         options.mode(0o600);
     }
-    let mut file = options.open(path).map_err(|err| {
+    let mut file = parent.open_with(&leaf, &options).map_err(|err| {
         anyhow::anyhow!(
             "Failed to create new artifact {} (existing files are never overwritten): {err}",
             path.display()
@@ -74874,50 +75110,167 @@ fn write_new_private_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|err| anyhow::anyhow!("Failed to persist artifact {}: {err}", path.display()))?;
+    sync_capability_directory(&parent).map_err(|err| {
+        anyhow::anyhow!(
+            "Artifact {} was synchronized, but its directory entry durability could not be confirmed: {err}",
+            path.display()
+        )
+    })?;
+
+    let handle_metadata = file
+        .metadata()
+        .map_err(|err| anyhow::anyhow!("Failed to inspect artifact {}: {err}", path.display()))?;
+    if !handle_metadata.is_file() {
+        anyhow::bail!("Artifact is not a regular file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use cap_fs_ext::OsMetadataExt as _;
+        use cap_std::fs::PermissionsExt as _;
+
+        let path_metadata = parent.symlink_metadata(&leaf).map_err(|err| {
+            anyhow::anyhow!("Failed to revalidate artifact name {}: {err}", path.display())
+        })?;
+        if !path_metadata.is_file()
+            || path_metadata.dev() != handle_metadata.dev()
+            || path_metadata.ino() != handle_metadata.ino()
+        {
+            anyhow::bail!(
+                "Artifact name changed identity during persistence: {}",
+                path.display()
+            );
+        }
+        if handle_metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("Artifact permissions are not private: {}", path.display());
+        }
+    }
+
     file.rewind()
         .map_err(|err| anyhow::anyhow!("Failed to verify artifact {}: {err}", path.display()))?;
-    let mut persisted = Vec::with_capacity(bytes.len());
-    file.take(u64::try_from(bytes.len()).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut persisted)
+    let (persisted_bytes, persisted_sha256) = sha256_reader(&mut file)
         .map_err(|err| anyhow::anyhow!("Failed to verify artifact {}: {err}", path.display()))?;
-    if persisted != bytes {
+    let expected_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let expected_sha256 = sha256_hex(bytes);
+    if persisted_bytes != expected_bytes || persisted_sha256 != expected_sha256 {
         anyhow::bail!(
-            "Artifact verification failed for {}: persisted bytes differ from the requested dump",
+            "Artifact verification failed for {}: synchronized bytes differ from the requested artifact",
             path.display()
         );
     }
-    Ok(())
+    Ok(PrivateArtifactReceipt {
+        bytes: persisted_bytes,
+        sha256: persisted_sha256,
+        durability: "file_and_parent_directory_synced",
+    })
 }
 
-fn verify_mux_dump_artifact(
-    path: &Path,
-    expected_bytes: &[u8],
-    expected_payload_sha256: &str,
-) -> anyhow::Result<()> {
-    let mut options = fs::OpenOptions::new();
+fn read_private_artifact_bounded(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    let (parent, leaf) = open_artifact_parent_and_leaf(path)?;
+    let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
-    let file = options
-        .open(path)
-        .map_err(|err| anyhow::anyhow!("Failed to reopen mux dump {}: {err}", path.display()))?;
+    let mut file = parent.open_with(&leaf, &options).map_err(|err| {
+        anyhow::anyhow!("Failed to open mux dump {} without following symlinks: {err}", path.display())
+    })?;
     let metadata = file
         .metadata()
         .map_err(|err| anyhow::anyhow!("Failed to inspect mux dump {}: {err}", path.display()))?;
     if !metadata.is_file() {
         anyhow::bail!("Mux dump is not a regular file: {}", path.display());
     }
-    let mut persisted = Vec::with_capacity(expected_bytes.len());
-    file.take(
-        u64::try_from(expected_bytes.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(1),
-    )
-    .read_to_end(&mut persisted)
-    .map_err(|err| anyhow::anyhow!("Failed to read mux dump {}: {err}", path.display()))?;
-    if persisted != expected_bytes {
+    #[cfg(unix)]
+    {
+        use cap_fs_ext::OsMetadataExt as _;
+        use cap_std::fs::PermissionsExt as _;
+
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("Mux dump permissions are not private: {}", path.display());
+        }
+        let path_metadata = parent.symlink_metadata(&leaf).map_err(|err| {
+            anyhow::anyhow!("Failed to revalidate mux dump name {}: {err}", path.display())
+        })?;
+        if !path_metadata.is_file()
+            || path_metadata.dev() != metadata.dev()
+            || path_metadata.ino() != metadata.ino()
+        {
+            anyhow::bail!("Mux dump name changed identity: {}", path.display());
+        }
+    }
+    if metadata.len() > max_bytes {
+        anyhow::bail!(
+            "Mux dump {} is {} bytes, exceeding the verification limit of {max_bytes} bytes",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let metadata_before = DiagnosticFileSnapshot::capture_cap(&metadata)
+        .map_err(|err| anyhow::anyhow!("Failed to snapshot mux dump {}: {err}", path.display()))?;
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|err| anyhow::anyhow!("Mux dump size does not fit this platform: {err}"))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to reserve {capacity} bytes to verify mux dump {}: {err}",
+            path.display()
+        )
+    })?;
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|err| anyhow::anyhow!("Failed to read mux dump {}: {err}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        anyhow::bail!(
+            "Mux dump {} grew beyond the verification limit while being read",
+            path.display()
+        );
+    }
+    let metadata_after = file
+        .metadata()
+        .map_err(|err| anyhow::anyhow!("Failed to re-inspect mux dump {}: {err}", path.display()))?;
+    let metadata_after = DiagnosticFileSnapshot::capture_cap(&metadata_after).map_err(|err| {
+        anyhow::anyhow!("Failed to re-snapshot mux dump {}: {err}", path.display())
+    })?;
+    if metadata_after != metadata_before {
         anyhow::bail!("Mux dump changed during verification: {}", path.display());
     }
+    #[cfg(unix)]
+    {
+        use cap_fs_ext::OsMetadataExt as _;
+
+        let path_metadata_after = parent.symlink_metadata(&leaf).map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to revalidate mux dump name after reading {}: {err}",
+                path.display()
+            )
+        })?;
+        if !path_metadata_after.is_file()
+            || path_metadata_after.dev() != metadata.dev()
+            || path_metadata_after.ino() != metadata.ino()
+        {
+            anyhow::bail!(
+                "Mux dump name changed identity while being read: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(bytes)
+}
+
+fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationReceipt> {
+    let persisted = read_private_artifact_bounded(path, LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES)?;
+    let artifact_bytes = u64::try_from(persisted.len()).unwrap_or(u64::MAX);
+    let artifact_sha256 = sha256_hex(&persisted);
     let envelope: serde_json::Value = serde_json::from_slice(&persisted)
         .map_err(|err| anyhow::anyhow!("Mux dump is not valid JSON: {err}"))?;
+    let schema = envelope
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump schema is missing"))?;
+    if schema != "frankenterm.mux-content-dump.v1" {
+        anyhow::bail!("Unsupported mux dump schema {schema:?}");
+    }
+    if envelope.get("publication_state").and_then(serde_json::Value::as_str) != Some("complete") {
+        anyhow::bail!("Mux dump publication state is not complete");
+    }
     let payload = envelope
         .get("payload")
         .ok_or_else(|| anyhow::anyhow!("Mux dump payload is missing"))?;
@@ -74928,15 +75281,217 @@ fn verify_mux_dump_artifact(
         .get("payload_sha256")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Mux dump payload checksum is missing"))?;
-    if actual_payload_sha256 != expected_payload_sha256
-        || embedded_payload_sha256 != expected_payload_sha256
+    if actual_payload_sha256 != embedded_payload_sha256 {
+        anyhow::bail!("Mux dump checksum verification failed for {}", path.display());
+    }
+    if embedded_payload_sha256.len() != 64
+        || !embedded_payload_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
+        anyhow::bail!("Mux dump payload checksum is not canonical lowercase SHA-256");
+    }
+    if payload.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1) {
+        anyhow::bail!("Mux dump payload schema_version is not 1");
+    }
+    if payload
+        .get("redaction_applied")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        anyhow::bail!("Mux dump does not attest that redaction was applied");
+    }
+    let limits = payload
+        .get("limits")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump limits are missing"))?;
+    let max_panes = limits
+        .get("max_panes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=LIVE_MUX_DUMP_MAX_PANES).contains(value))
+        .ok_or_else(|| anyhow::anyhow!("Mux dump max_panes is outside the supported bounds"))?;
+    let max_total_bytes = limits
+        .get("max_total_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=LIVE_MUX_DUMP_MAX_TOTAL_BYTES).contains(value))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Mux dump max_total_bytes is outside the supported bounds")
+        })?;
+    let panes = payload
+        .get("panes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump panes array is missing"))?;
+    if panes.len() > max_panes {
         anyhow::bail!(
-            "Mux dump checksum verification failed for {}",
-            path.display()
+            "Mux dump contains {} panes, exceeding its declared limit of {max_panes}",
+            panes.len()
         );
     }
-    Ok(())
+    let errors = payload
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump errors array is missing"))?;
+    let mut pane_ids = std::collections::HashSet::with_capacity(panes.len());
+    let mut content_bytes = 0usize;
+    for pane_record in panes {
+        let pane_id = pane_record
+            .pointer("/pane/pane_id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane record is missing pane_id"))?;
+        if !pane_ids.insert(pane_id) {
+            anyhow::bail!("Mux dump contains duplicate pane_id {pane_id}");
+        }
+        let content = pane_record
+            .get("content")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} content is missing"))?;
+        if content.get("encoding").and_then(serde_json::Value::as_str) != Some("utf-8")
+            || content
+                .get("redaction_applied")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            anyhow::bail!("Mux dump pane {pane_id} has unsupported or unredacted content");
+        }
+        let text = content
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} text is missing"))?;
+        let declared_bytes = content
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} byte count is invalid"))?;
+        let declared_lines = content
+            .get("lines")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} line count is invalid"))?;
+        if declared_bytes != text.len() || declared_lines != text.lines().count() {
+            anyhow::bail!("Mux dump pane {pane_id} text size metadata is inconsistent");
+        }
+        let declared_sha256 = content
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} checksum is missing"))?;
+        if declared_sha256 != sha256_hex(text.as_bytes()) {
+            anyhow::bail!("Mux dump pane {pane_id} text checksum verification failed");
+        }
+        content_bytes = content_bytes
+            .checked_add(declared_bytes)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump aggregate content byte count overflow"))?;
+        if content_bytes > max_total_bytes {
+            anyhow::bail!(
+                "Mux dump aggregate content exceeds its declared limit of {max_total_bytes} bytes"
+            );
+        }
+    }
+    let capture_complete = payload
+        .get("complete")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump completeness flag is missing"))?;
+    if capture_complete != errors.is_empty() {
+        anyhow::bail!("Mux dump completeness flag disagrees with its capture errors");
+    }
+    let executable_restore_image = payload
+        .pointer("/capabilities/executable_restore_image")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump restore capability claim is missing"))?;
+    let required_capabilities = [
+        ("/capabilities/forensic_text_export", true),
+        ("/capabilities/bounded_topology_metadata", true),
+        ("/capabilities/executable_restore_image", false),
+        ("/capabilities/terminal_parser_render_state", false),
+        ("/capabilities/pty_descriptor_state", false),
+        ("/capabilities/process_memory_state", false),
+        ("/capabilities/running_process_continuity", false),
+        ("/capabilities/stable_cross_restart_pane_identity", false),
+    ];
+    for (pointer, expected) in required_capabilities {
+        if payload.pointer(pointer).and_then(serde_json::Value::as_bool) != Some(expected) {
+            anyhow::bail!("Mux dump capability claim {pointer} does not match the v1 contract");
+        }
+    }
+    let summary = payload
+        .get("summary")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump summary is missing"))?;
+    let summary_panes = summary
+        .get("panes_captured")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let summary_errors = summary
+        .get("capture_errors")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let summary_bytes = summary
+        .get("content_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    if summary_panes != Some(panes.len())
+        || summary_errors != Some(errors.len())
+        || summary_bytes != Some(content_bytes)
+    {
+        anyhow::bail!("Mux dump summary counters do not match the verified payload");
+    }
+    Ok(MuxDumpVerificationReceipt {
+        schema: schema.to_string(),
+        payload_sha256: actual_payload_sha256,
+        artifact_sha256,
+        artifact_bytes,
+        capture_complete,
+        executable_restore_image,
+        pane_count: panes.len(),
+        error_count: errors.len(),
+        content_bytes,
+    })
+}
+
+fn mux_dump_topology_fingerprint(
+    panes: &[frankenterm_core::wezterm::PaneInfo],
+) -> anyhow::Result<String> {
+    let topology: Vec<serde_json::Value> = panes
+        .iter()
+        .map(|pane| {
+            serde_json::json!({
+                "pane_id": pane.pane_id,
+                "tab_id": pane.tab_id,
+                "window_id": pane.window_id,
+                "domain_id": pane.domain_id,
+                "domain_name": pane.domain_name.as_deref(),
+                "workspace": pane.workspace.as_deref(),
+                "rows": pane.effective_rows(),
+                "cols": pane.effective_cols(),
+                "left_col": pane.left_col,
+                "top_row": pane.top_row,
+                "is_active": pane.is_active,
+                "is_zoomed": pane.is_zoomed,
+            })
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&topology)
+        .map_err(|err| anyhow::anyhow!("Failed to fingerprint mux topology: {err}"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn mux_dump_domain_identity(
+    pane: &frankenterm_core::wezterm::PaneInfo,
+) -> (String, &'static str) {
+    if let Some(explicit) = pane
+        .domain_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return (explicit.to_string(), "authoritative_domain_name");
+    }
+    let inferred = pane.inferred_domain();
+    if inferred != "local" {
+        return (inferred, "inferred_from_cwd_uri_authority");
+    }
+    (inferred, "defaulted_local_without_domain_authority")
 }
 
 async fn capture_live_mux_dump(
@@ -74966,6 +75521,8 @@ async fn capture_live_mux_dump(
             panes.len()
         );
     }
+    let initial_pane_count = panes.len();
+    let initial_topology_sha256 = mux_dump_topology_fingerprint(&panes)?;
 
     let redactor = frankenterm_core::redactor::Redactor::new();
     let mut captured = Vec::with_capacity(panes.len());
@@ -74974,7 +75531,8 @@ async fn capture_live_mux_dump(
     let mut domains = BTreeSet::new();
 
     for pane in panes {
-        domains.insert(redactor.redact(pane.effective_domain()));
+        let (domain_name, domain_identity_authority) = mux_dump_domain_identity(&pane);
+        domains.insert(redactor.redact(&domain_name));
         let text = match robot_get_text_on_runtime_task(wezterm.clone(), pane.pane_id, false).await {
             Ok(text) => redactor.redact(&text),
             Err(err) => {
@@ -75012,7 +75570,9 @@ async fn capture_live_mux_dump(
                 "tab_id": pane.tab_id,
                 "window_id": pane.window_id,
                 "domain_id": pane.domain_id,
-                "domain_name": pane.domain_name.as_deref().map(|value| redactor.redact(value)),
+                "domain_name": redactor.redact(&domain_name),
+                "domain_identity_authority": domain_identity_authority,
+                "identity_stability": "mux_incarnation_local_ephemeral",
                 "workspace": pane.workspace.as_deref().map(|value| redactor.redact(value)),
                 "rows": pane.effective_rows(),
                 "cols": pane.effective_cols(),
@@ -75038,6 +75598,53 @@ async fn capture_live_mux_dump(
         }));
     }
 
+    let (final_pane_count, final_topology_sha256) =
+        match robot_list_panes_on_runtime_task(wezterm).await {
+            Ok(mut final_panes) => {
+                final_panes.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
+                let final_count = final_panes.len();
+                match mux_dump_topology_fingerprint(&final_panes) {
+                    Ok(final_sha256) => {
+                        if final_sha256 != initial_topology_sha256 {
+                            errors.push(serde_json::json!({
+                                "scope": "mux_topology",
+                                "code": "topology_changed_during_capture",
+                                "initial_panes": initial_pane_count,
+                                "final_panes": final_count,
+                                "initial_topology_sha256": &initial_topology_sha256,
+                                "final_topology_sha256": &final_sha256,
+                            }));
+                        }
+                        (Some(final_count), Some(final_sha256))
+                    }
+                    Err(err) => {
+                        errors.push(serde_json::json!({
+                            "scope": "mux_topology",
+                            "code": "final_topology_fingerprint_failed",
+                            "detail": bounded_terminal_diagnostic(
+                                &redactor.redact(&err.to_string()),
+                                240,
+                                1024,
+                            ),
+                        }));
+                        (Some(final_count), None)
+                    }
+                }
+            }
+            Err(err) => {
+                errors.push(serde_json::json!({
+                    "scope": "mux_topology",
+                    "code": "final_topology_list_failed",
+                    "detail": bounded_terminal_diagnostic(
+                        &redactor.redact(&err.to_string()),
+                        240,
+                        1024,
+                    ),
+                }));
+                (None, None)
+            }
+        };
+
     Ok(serde_json::json!({
         "schema_version": 1,
         "created_at_epoch_ms": u64::try_from(now_epoch_ms()).unwrap_or(0),
@@ -75047,16 +75654,45 @@ async fn capture_live_mux_dump(
             "git_hash": build_meta::GIT_HASH,
         },
         "complete": errors.is_empty(),
+        "completeness_semantics": {
+            "meaning": "every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing",
+            "point_in_time_content_snapshot": false,
+            "pane_content_consistency": "sequential_best_effort_non_atomic",
+            "topology_consistency": "double_list_fingerprint",
+        },
+        "capabilities": {
+            "forensic_text_export": true,
+            "bounded_topology_metadata": true,
+            "executable_restore_image": false,
+            "terminal_parser_render_state": false,
+            "pty_descriptor_state": false,
+            "process_memory_state": false,
+            "running_process_continuity": false,
+            "stable_cross_restart_pane_identity": false,
+        },
         "redaction_applied": true,
         "limits": {
             "max_panes": max_panes,
             "max_total_bytes": max_total_bytes,
         },
         "summary": {
+            "panes_listed_initial": initial_pane_count,
+            "panes_listed_final": final_pane_count,
             "panes_captured": captured.len(),
             "content_bytes": total_content_bytes,
             "capture_errors": errors.len(),
             "domains": domains,
+        },
+        "topology_fence": {
+            "kind": "double_list_fingerprint",
+            "fingerprint_scope": "pane_tab_window_domain_workspace_geometry_active_zoom",
+            "initial_sha256": initial_topology_sha256,
+            "final_sha256": final_topology_sha256,
+            "stable": errors.iter().all(|error| {
+                error.get("scope").and_then(serde_json::Value::as_str) != Some("mux_topology")
+            }),
+            "mux_session_incarnation": null,
+            "authoritative_topology_revision": null,
         },
         "panes": captured,
         "errors": errors,
@@ -77244,6 +77880,7 @@ fn copy_remote_component(
     host: &str,
     source: &Path,
     remote_name: &str,
+    staging_suffix: &str,
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     if !source.is_file() {
@@ -77257,8 +77894,7 @@ fn copy_remote_component(
         .arg(format!("ConnectTimeout={}", timeout.as_secs()))
         .arg(source)
         .arg(format!(
-            "{host}:.local/bin/{remote_name}.installing-{}",
-            std::process::id()
+            "{host}:.local/bin/{remote_name}.installing-{staging_suffix}"
         ));
     let output = run_cmd_with_timeout(
         &mut scp,
@@ -77466,6 +78102,34 @@ where
         true,
     )?;
 
+    // A client binary cannot be activated independently of the mux process it
+    // speaks to. Replacing ~/.local/bin/ft while an older mux keeps running is
+    // the exact split-brain that made previously configured domains appear to
+    // stop reconnecting. Until PTY ownership is moved into the guardian, a
+    // live mux fences activation of both components.
+    let active_mux_before_install = if options.install_ft {
+        let output = run_remote_step(
+            "Fence FrankenTerm component activation",
+            host,
+            "if systemctl --user is-active --quiet frankenterm-mux-server 2>/dev/null || \
+                pgrep -u \"$(id -u)\" -f '(^|/)frankenterm-mux-server([[:space:]]|$)' >/dev/null 2>&1; then \
+                printf 'active\\n'; else printf 'inactive\\n'; fi",
+            timeout,
+            runner,
+            &redactor,
+            options.verbose,
+            false,
+        )?;
+        output.stdout.lines().any(|line| line.trim() == "active")
+    } else {
+        false
+    };
+    if apply_changes && active_mux_before_install && options.ft_version.is_some() {
+        anyhow::bail!(
+            "refusing release-tag activation while the remote mux is active: the release installer cannot stage a non-active process family, and replacing only the client would break reconnect compatibility"
+        );
+    }
+
     // Step 2: Detect package manager
     let pkg_output = run_remote_step(
         "Detect package manager",
@@ -77660,15 +78324,37 @@ where
             if let (Some(ft_path), Some(mux_server_path)) =
                 (options.ft_path, options.mux_server_path)
             {
-                copy_remote_component(host, ft_path, "ft", timeout)?;
+                let staging_suffix = uuid::Uuid::new_v4().simple().to_string();
+                copy_remote_component(host, ft_path, "ft", &staging_suffix, timeout)?;
                 copy_remote_component(
                     host,
                     mux_server_path,
                     "frankenterm-mux-server",
+                    &staging_suffix,
                     timeout,
                 )?;
-                let suffix = std::process::id();
-                let publish_command = format!(
+                let suffix = staging_suffix;
+                let publish_command = if active_mux_before_install {
+                    format!(
+                        r#"set -eu
+stamp=$(date +%Y%m%d%H%M%S)
+bin="$HOME/.local/bin"
+ft_stage="$bin/ft.installing-{suffix}"
+mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
+ft_pending="$bin/ft.pending-$stamp-$$"
+mux_pending="$bin/frankenterm-mux-server.pending-$stamp-$$"
+test -f "$ft_stage" && test -f "$mux_stage"
+test ! -e "$ft_pending" && test ! -e "$mux_pending"
+chmod 0755 "$ft_stage" "$mux_stage"
+mv "$ft_stage" "$ft_pending"
+if ! mv "$mux_stage" "$mux_pending"; then
+  mv "$ft_pending" "$ft_stage"
+  exit 1
+fi
+printf 'FT_COMPONENT_ACTIVATION=pending_live_mux\n'"#
+                    )
+                } else {
+                    format!(
                     r#"set -eu
 stamp=$(date +%Y%m%d%H%M%S)
 bin="$HOME/.local/bin"
@@ -77702,9 +78388,14 @@ if ! mv "$mux_stage" "$bin/frankenterm-mux-server"; then
 fi
 "$bin/ft" --version
 "$bin/frankenterm-mux-server" --version"#
-                );
+                    )
+                };
                 run_remote_step(
-                    "Publish atomic FrankenTerm process family",
+                    if active_mux_before_install {
+                        "Stage pending FrankenTerm process family"
+                    } else {
+                        "Publish atomic FrankenTerm process family"
+                    },
                     host,
                     &publish_command,
                     timeout,
@@ -77727,18 +78418,31 @@ fi
                     true,
                 )?;
             }
-            println!(
-                "  ✓ matching ft and mux-server bytes are staged; an active mux was not restarted"
-            );
+            if active_mux_before_install {
+                println!(
+                    "  ✓ matching ft and mux-server bytes are pending; the compatible active pair was not replaced"
+                );
+            } else {
+                println!("  ✓ matching ft and mux-server bytes are active as one process family");
+            }
         } else if let (Some(ft_path), Some(mux_server_path)) =
             (options.ft_path, options.mux_server_path)
         {
-            println!("• Would stage the atomic FrankenTerm process family via scp");
+            if active_mux_before_install {
+                println!("• Would stage a pending FrankenTerm process family via scp");
+            } else {
+                println!("• Would publish the atomic FrankenTerm process family via scp");
+            }
             println!("  ft: {}", ft_path.display());
             println!("  mux-server: {}", mux_server_path.display());
         } else if let Some(tag) = options.ft_version {
-            println!("• Would install verified release process family {tag}");
-            println!("  Active mux services would not be restarted automatically");
+            if active_mux_before_install {
+                println!(
+                    "• Would refuse release {tag}: the tag installer cannot stage without replacing the compatible live client"
+                );
+            } else {
+                println!("• Would install verified release process family {tag}");
+            }
         }
     }
 
@@ -77915,7 +78619,13 @@ fi"#
     );
     if options.install_ft {
         println!("  Components: ft + frankenterm-mux-server (same release identity)");
-        println!("  Active mux restart: not performed (drain PTYs before restart)");
+        if active_mux_before_install && options.ft_version.is_some() {
+            println!("  Activation: blocked; release-tag installer cannot preserve live compatibility");
+        } else if active_mux_before_install {
+            println!("  Activation: pending; compatible live client/server pair preserved");
+        } else {
+            println!("  Activation: complete; no prior live mux required replacement");
+        }
     }
     println!("  Next: verify with `ssh {host} 'systemctl --user status frankenterm-mux-server'`");
 
@@ -87748,8 +88458,12 @@ recorder_backend = "rusqlite"
     #[test]
     fn private_artifact_write_is_verified_and_never_overwrites() {
         let dir = tempfile::tempdir().expect("artifact tempdir");
-        let path = dir.path().join("mux-dump.json");
-        write_new_private_artifact(&path, b"first\n").expect("first private artifact write");
+        let path = dir.path().join("private").join("mux-dump.json");
+        let receipt = write_new_private_artifact(&path, b"first\n")
+            .expect("first private artifact write");
+        assert_eq!(receipt.bytes, 6);
+        assert_eq!(receipt.sha256, sha256_hex(b"first\n"));
+        assert_eq!(receipt.durability, "file_and_parent_directory_synced");
         assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
 
         let error = write_new_private_artifact(&path, b"second\n")
@@ -87764,25 +88478,130 @@ recorder_backend = "rusqlite"
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_artifact_write_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("artifact tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("create real directory");
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias).expect("create parent symlink");
+        let path = alias.join("mux-dump.json");
+        let error = write_new_private_artifact(&path, b"secret\n")
+            .expect_err("symlinked parent must fail closed");
+        assert!(error.to_string().contains("without following symlinks"));
+        assert!(!real.join("mux-dump.json").exists());
     }
 
     #[test]
     fn mux_dump_verifier_recomputes_embedded_payload_checksum() {
         let dir = tempfile::tempdir().expect("dump tempdir");
         let path = dir.path().join("mux-dump.json");
-        let payload = serde_json::json!({"complete": true, "panes": []});
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "complete": true,
+            "redaction_applied": true,
+            "limits": {
+                "max_panes": 16,
+                "max_total_bytes": 1024,
+            },
+            "capabilities": {
+                "forensic_text_export": true,
+                "bounded_topology_metadata": true,
+                "executable_restore_image": false,
+                "terminal_parser_render_state": false,
+                "pty_descriptor_state": false,
+                "process_memory_state": false,
+                "running_process_continuity": false,
+                "stable_cross_restart_pane_identity": false,
+            },
+            "summary": {
+                "panes_captured": 0,
+                "capture_errors": 0,
+                "content_bytes": 0,
+            },
+            "panes": [],
+            "errors": [],
+        });
         let payload_sha256 = sha256_hex(&serde_json::to_vec(&payload).unwrap());
         let envelope = serde_json::json!({
             "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
             "payload_sha256": &payload_sha256,
-            "payload": payload,
+            "payload": payload.clone(),
         });
         let mut bytes = serde_json::to_vec_pretty(&envelope).unwrap();
         bytes.push(b'\n');
         write_new_private_artifact(&path, &bytes).expect("write dump");
-        verify_mux_dump_artifact(&path, &bytes, &payload_sha256).expect("verify dump");
-        assert!(verify_mux_dump_artifact(&path, &bytes, &"0".repeat(64)).is_err());
+        let receipt = verify_mux_dump_artifact(&path).expect("verify dump");
+        assert_eq!(receipt.payload_sha256, payload_sha256);
+        assert!(receipt.capture_complete);
+        assert!(!receipt.executable_restore_image);
+        assert_eq!(receipt.pane_count, 0);
+        assert_eq!(receipt.error_count, 0);
+        assert_eq!(receipt.content_bytes, 0);
+
+        let mut tampered = std::fs::read(&path).expect("read dump for tamper fixture");
+        let index = tampered
+            .windows(b"true".len())
+            .position(|window| window == b"true")
+            .expect("fixture contains true");
+        tampered[index..index + 4].copy_from_slice(b"null");
+        std::fs::write(&path, tampered).expect("write same-size tampered fixture");
+        assert!(verify_mux_dump_artifact(&path).is_err());
+
+        let inconsistent_path = dir.path().join("internally-inconsistent-mux-dump.json");
+        let mut inconsistent_payload = payload;
+        inconsistent_payload["summary"]["content_bytes"] = serde_json::json!(1);
+        let inconsistent_sha256 =
+            sha256_hex(&serde_json::to_vec(&inconsistent_payload).unwrap());
+        let inconsistent_envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
+            "payload_sha256": inconsistent_sha256,
+            "payload": inconsistent_payload,
+        });
+        let mut inconsistent_bytes = serde_json::to_vec_pretty(&inconsistent_envelope).unwrap();
+        inconsistent_bytes.push(b'\n');
+        write_new_private_artifact(&inconsistent_path, &inconsistent_bytes)
+            .expect("write internally inconsistent dump");
+        let error = verify_mux_dump_artifact(&inconsistent_path)
+            .expect_err("a recomputed envelope checksum must not hide invalid internal counters");
+        assert!(error.to_string().contains("summary counters"));
+    }
+
+    #[test]
+    fn session_verify_dump_subcommand_parses_exact_path_and_format() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "session",
+            "verify-dump",
+            "/tmp/mux-dump.json",
+            "--format",
+            "json",
+        ])
+        .expect("verify-dump command parses");
+        let Some(Commands::Session { command }) = cli.command.map(|command| *command) else {
+            panic!("expected session command");
+        };
+        let SessionCommands::VerifyDump { path, format } = command else {
+            panic!("expected verify-dump subcommand");
+        };
+        assert_eq!(path, PathBuf::from("/tmp/mux-dump.json"));
+        assert_eq!(format, "json");
     }
 
     #[test]
@@ -92904,6 +93723,66 @@ log_level = "debug"
         assert!(!cmds.iter().any(|cmd| cmd.contains("apt-get install")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("cargo install")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("scp ")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_refuses_release_activation_while_mux_is_live_before_mutation() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::Mutex;
+
+        let commands = Mutex::new(Vec::new());
+        let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
+            commands.lock().unwrap().push(command.to_string());
+            let stdout = if command.contains("systemctl --user is-active") {
+                "active\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(RemoteCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: String::new(),
+                duration_ms: 1,
+            })
+        };
+        let options = RemoteSetupOptions {
+            apply: true,
+            dry_run: false,
+            yes: true,
+            install_ft: true,
+            ft_path: None,
+            mux_server_path: None,
+            ft_version: Some("v0.15.2"),
+            timeout_secs: 5,
+            verbose: 0,
+        };
+
+        let error = run_remote_setup_with_runner("example", &options, &runner)
+            .expect_err("live mux must fence release-tag activation");
+        assert!(error.to_string().contains("remote mux is active"));
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 2, "the refusal must precede every setup mutation");
+        assert_eq!(commands[0], "true");
+        assert!(commands[1].contains("systemctl --user is-active"));
+    }
+
+    #[test]
+    fn remote_local_process_family_has_a_pending_live_mux_publication_path() {
+        let source = include_str!("main.rs");
+        let fence = source
+            .find("Fence FrankenTerm component activation")
+            .expect("activation fence");
+        let pending = source
+            .find("FT_COMPONENT_ACTIVATION=pending_live_mux")
+            .expect("pending publication marker");
+        let destructive_publish = source
+            .find("ft_backup=\"\"")
+            .expect("inactive atomic publication branch");
+        assert!(fence < pending);
+        assert!(pending < destructive_publish);
+        assert!(source.contains("test ! -e \"$ft_pending\""));
+        assert!(source.contains("test ! -e \"$mux_pending\""));
     }
 
     #[test]

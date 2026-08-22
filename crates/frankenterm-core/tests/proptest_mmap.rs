@@ -671,7 +671,7 @@ fn store_falls_back_to_sqlite_when_log_path_is_unwritable() {
 }
 
 #[test]
-fn store_falls_back_to_sqlite_when_mmap_tail_offsets_are_invalidated() {
+fn established_mmap_authority_never_falls_back_to_a_stale_sqlite_history() {
     let temp = tempfile::tempdir().expect("tempdir");
     let pane = 616u64;
     let sqlite_path = temp.path().join("fallback.sqlite3");
@@ -690,8 +690,18 @@ fn store_falls_back_to_sqlite_when_mmap_tail_offsets_are_invalidated() {
         .set_len(0)
         .expect("truncate pane log");
 
-    let tail = store
+    let error = store
         .tail_lines(pane, 2)
-        .expect("tail should fall back to sqlite");
-    assert_eq!(tail, vec!["beta".to_string(), "gamma".to_string()]);
+        .expect_err("corrupt mmap authority must fail closed");
+    assert!(
+        error.to_string().contains("out of bounds")
+            || error.to_string().contains("changed")
+            || error.to_string().contains("header"),
+        "unexpected mmap authority error: {error}"
+    );
+    assert_eq!(
+        store.pane_storage_mode(pane),
+        Some(PaneStorageMode::Mmap),
+        "a later primary error must not silently fork to an uncommitted fallback history"
+    );
 }

@@ -374,6 +374,13 @@ fn text_from_semantic_zone_lines(logical_lines: &[LogicalLine], zone: &SemanticZ
 pub trait Pane: Downcast + Send + Sync {
     fn pane_id(&self) -> PaneId;
 
+    /// Stable identity for durable pane artifacts and guardian attachment.
+    /// Backends that cannot establish cross-incarnation authority return
+    /// `None`; callers must never substitute the process-local numeric ID.
+    fn durable_pane_id(&self) -> Option<[u8; 16]> {
+        None
+    }
+
     /// Returns the 0-based cursor position relative to the top left of
     /// the visible screen
     fn get_cursor_position(&self) -> StableCursorPosition;

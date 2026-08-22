@@ -7688,7 +7688,7 @@ impl Reconnectable {
             }
         };
 
-        ui.output_str("Connected!\n");
+        ui.output_str("Transport connected; protocol verification pending.\n");
         stream.set_read_timeout(Some(unix_dom.read_timeout))?;
         stream.set_write_timeout(Some(unix_dom.write_timeout))?;
         let stream: Box<dyn AsyncReadAndWrite> = Box::new(stream);
@@ -7915,7 +7915,7 @@ impl Reconnectable {
                     )
                 })?,
         ));
-        ui.output_str("TLS Connected!\n");
+        ui.output_str("TLS transport connected; protocol verification pending.\n");
         Ok(stream)
     }
 }
@@ -8101,10 +8101,15 @@ impl Client {
                                             "cannot activate reconnected mux client transport: \
                                              {err:#}"
                                         );
+                                        ui.output_str(&format!(
+                                            "Transport reconnected, but domain {local_domain_id} remains unavailable because the successor RPC transport could not be activated: {err}\n"
+                                        ));
                                         break;
                                     }
                                     backoff = base_interval;
-                                    log::error!("Reconnected!");
+                                    log::info!(
+                                        "reconnected domain {local_domain_id} transport; verifying codec and reattaching topology"
+                                    );
                                     let reattach_ui = ui.clone();
                                     match reconnect_dispatch_authority.resolve_current() {
                                         Ok(Some(dispatch)) => {
@@ -8120,6 +8125,7 @@ impl Client {
                                                             if !dispatch.rpc_generation_is_live() {
                                                                 return;
                                                             }
+                                                            let result_ui = reattach_ui.clone();
                                                             let result =
                                                                 ClientDomain::reattach_if_current(
                                                                     Arc::clone(&dispatch.mux),
@@ -8129,14 +8135,24 @@ impl Client {
                                                                     reattach_ui,
                                                                 )
                                                                 .await;
-                                                            if !dispatch.rpc_generation_is_live() {
-                                                                return;
-                                                            }
                                                             if let Err(err) = result {
                                                                 log::error!(
                                                                     "reconnected mux client reattach failed: {err:#}"
                                                                 );
+                                                                result_ui.output_str(&format!(
+                                                                    "Transport reconnected, but domain {local_domain_id} remains unavailable because codec/topology reattach failed: {err}\n"
+                                                                ));
+                                                                return;
                                                             }
+                                                            if !dispatch.rpc_generation_is_live() {
+                                                                return;
+                                                            }
+                                                            log::info!(
+                                                                "reconnected and reattached domain {local_domain_id}"
+                                                            );
+                                                            result_ui.output_str(&format!(
+                                                                "Reconnected and reattached domain {local_domain_id}.\n"
+                                                            ));
                                                         })
                                                         .detach();
                                                     reconnected = true;
@@ -8145,6 +8161,9 @@ impl Client {
                                                     log::error!(
                                                         "cannot schedule reconnect reattach for domain {local_domain_id}: {err:#}"
                                                     );
+                                                    reattach_ui.output_str(&format!(
+                                                        "Transport reconnected, but domain {local_domain_id} remains unavailable because topology reattach could not be scheduled: {err}\n"
+                                                    ));
                                                 }
                                             }
                                         }
@@ -8154,12 +8173,18 @@ impl Client {
                                                  {local_domain_id}: no exact published client \
                                                  attachment owns the successor generation"
                                             );
+                                            reattach_ui.output_str(&format!(
+                                                "Transport reconnected, but domain {local_domain_id} remains unavailable because no exact successor attachment owns the new connection.\n"
+                                            ));
                                         }
                                         Err(err) => {
                                             log::error!(
                                                 "cannot resolve reconnect reattach authority for \
                                                  domain {local_domain_id}: {err:#}"
                                             );
+                                            reattach_ui.output_str(&format!(
+                                                "Transport reconnected, but domain {local_domain_id} remains unavailable because reattach authority resolution failed: {err}\n"
+                                            ));
                                         }
                                     }
                                     break;
@@ -9035,9 +9060,38 @@ mod tests {
             .find(&post_check)
             .map(|offset| await_end + offset)
             .expect("production reconnect dispatch must retain its liveness check");
+        let failure_branch = reconnect_dispatch[await_end..]
+            .find("if let Err(err) = result")
+            .map(|offset| await_end + offset)
+            .expect("production reconnect dispatch must report reattach failure");
+        let failure_report = reconnect_dispatch[failure_branch..]
+            .find("remains unavailable because codec/topology reattach failed")
+            .map(|offset| failure_branch + offset)
+            .expect("reattach failure must be surfaced to the reconnect UI");
+        let success_report = reconnect_dispatch[await_end..]
+            .find("Reconnected and reattached domain")
+            .map(|offset| await_end + offset)
+            .expect("reattach success must be surfaced only after verification");
         assert!(
             post_check_position > await_end,
             "dispatch and its domain guard must stay alive through the post-await liveness check"
+        );
+        assert!(
+            failure_branch < post_check_position && failure_report < post_check_position,
+            "a failed codec/topology reattach retires its generation, so its error must be reported before the success-only liveness guard"
+        );
+        assert!(
+            success_report > post_check_position,
+            "the reconnect UI must not claim success before reattach and generation verification"
+        );
+        assert!(
+            !reconnect_dispatch[..reconnect].contains("Reconnected!"),
+            "transport establishment alone must never be reported as a recovered domain"
+        );
+        assert!(
+            !source.contains("ui.output_str(\"Connected!\\n\")")
+                && !source.contains("ui.output_str(\"TLS Connected!\\n\")"),
+            "transport setup must describe protocol verification as pending"
         );
     }
 

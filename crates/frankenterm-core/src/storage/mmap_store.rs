@@ -9,9 +9,9 @@
 //! log crash-safely: the retained suffix is written to a sibling temp file,
 //! fsync'd, and atomically renamed over the live log, so a crash mid-compaction
 //! leaves either the old or the compacted log intact — never a truncated one
-//! (ft-odrq7). Appends themselves are still buffered (no per-line fsync), so a
-//! crash can drop the most recent unsynced lines; durable append is tracked
-//! separately under ft-2okh0.5.1.
+//! (ft-odrq7). Successful appends synchronize their data before publishing the
+//! in-memory offset, and logical prefix pruning is recorded in a synchronized
+//! sequence journal so both content and row identity survive process crashes.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, create_dir_all};
@@ -109,6 +109,20 @@ pub enum MmapStoreError {
     ErasurePayloadCrcMismatch,
     #[error("invalid erasure shard: {0}")]
     InvalidErasureShard(String),
+    #[error("invalid pane log header: {0}")]
+    InvalidPaneLogHeader(String),
+    #[error("pane log record contains a line delimiter")]
+    InvalidLineRecord,
+    #[error("pane log record is {bytes} bytes, exceeding the {max} byte limit")]
+    PaneLogRecordTooLarge { bytes: u64, max: u64 },
+    #[error("pane log record is not valid UTF-8: {0}")]
+    InvalidPaneLogUtf8(#[from] std::string::FromUtf8Error),
+    #[error("read-only pane snapshot exceeds {limit_name} limit {limit}: observed {observed}")]
+    PaneSnapshotLimitExceeded {
+        limit_name: &'static str,
+        limit: u64,
+        observed: u64,
+    },
 }
 
 const COLD_ERASURE_DATA_SHARDS: usize = 3;
@@ -116,7 +130,28 @@ const COLD_ERASURE_TOTAL_SHARDS: usize = 5;
 const COLD_ERASURE_VERSION: u8 = 1;
 const COLD_ERASURE_MAGIC: [u8; 8] = *b"FTRSLOG1";
 const COLD_ERASURE_HEADER_LEN: usize = 8 + 1 + 1 + 1 + 1 + 8 + 4 + 4 + 4;
+const COLD_ERASURE_MAX_SHARD_BYTES: u64 = 512 * 1024 * 1024;
+const PANE_LOG_HEADER_PREFIX: &[u8] = b"\0FTMMAP1:";
+const PANE_BASE_SEQ_JOURNAL_PREFIX: &str = "FTSEQ1:";
+const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
+const PANE_BASE_SEQ_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 const GF_PRIM: u32 = 0x11d;
+
+/// An immutable, bounded view of one pane log at a stable filesystem identity.
+///
+/// The snapshot excludes a final non-newline-terminated record because an
+/// append acknowledges durability only after writing its delimiter. Opening a
+/// snapshot never creates, truncates, repairs, or changes permissions on the
+/// source log or sequence journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmapPaneReadSnapshot {
+    pub oldest_seq: Option<u64>,
+    pub next_seq: u64,
+    pub records: Vec<String>,
+    pub committed_bytes: u64,
+    pub physical_bytes: u64,
+    pub trailing_uncommitted_bytes: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ColdErasureShard {
@@ -232,8 +267,13 @@ fn cold_erasure_encode(data: &[u8]) -> Result<Vec<ColdErasureShard>, MmapStoreEr
     let original_len =
         u64::try_from(data.len()).map_err(|_| MmapStoreError::NumericOverflow("erasure_len"))?;
     let chunk_size = data.len().div_ceil(COLD_ERASURE_DATA_SHARDS);
-    let padded_len = chunk_size.saturating_mul(COLD_ERASURE_DATA_SHARDS);
-    let mut padded = Vec::with_capacity(padded_len);
+    let padded_len = chunk_size
+        .checked_mul(COLD_ERASURE_DATA_SHARDS)
+        .ok_or(MmapStoreError::NumericOverflow("erasure_padded_len"))?;
+    let mut padded = Vec::new();
+    padded
+        .try_reserve_exact(padded_len)
+        .map_err(|error| MmapStoreError::InvalidErasureShard(error.to_string()))?;
     padded.extend_from_slice(data);
     padded.resize(padded_len, 0);
     let payload_crc32 = crc32_ieee(data);
@@ -243,7 +283,11 @@ fn cold_erasure_encode(data: &[u8]) -> Result<Vec<ColdErasureShard>, MmapStoreEr
         let row = cold_erasure_generator_row(
             u8::try_from(index).map_err(|_| MmapStoreError::NumericOverflow("shard_index"))?,
         )?;
-        let mut bytes = vec![0u8; chunk_size];
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(chunk_size)
+            .map_err(|error| MmapStoreError::InvalidErasureShard(error.to_string()))?;
+        bytes.resize(chunk_size, 0);
         for byte_offset in 0..chunk_size {
             let mut acc = 0u8;
             for column in 0..COLD_ERASURE_DATA_SHARDS {
@@ -309,7 +353,14 @@ fn cold_erasure_decode(shards: &[ColdErasureShard]) -> Result<Vec<u8>, MmapStore
     }
 
     let inverse = invert_erasure_matrix(matrix)?;
-    let mut padded = vec![0u8; shard_len.saturating_mul(COLD_ERASURE_DATA_SHARDS)];
+    let padded_len = shard_len
+        .checked_mul(COLD_ERASURE_DATA_SHARDS)
+        .ok_or(MmapStoreError::NumericOverflow("erasure_padded_len"))?;
+    let mut padded = Vec::new();
+    padded
+        .try_reserve_exact(padded_len)
+        .map_err(|error| MmapStoreError::InvalidErasureShard(error.to_string()))?;
+    padded.resize(padded_len, 0);
     for byte_offset in 0..shard_len {
         for original_column in 0..COLD_ERASURE_DATA_SHARDS {
             let mut acc = 0u8;
@@ -334,7 +385,11 @@ fn cold_erasure_decode(shards: &[ColdErasureShard]) -> Result<Vec<u8>, MmapStore
             padded.len()
         )));
     }
-    let decoded = padded[..original_len].to_vec();
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(original_len)
+        .map_err(|error| MmapStoreError::InvalidErasureShard(error.to_string()))?;
+    decoded.extend_from_slice(&padded[..original_len]);
     if crc32_ieee(&decoded) != payload_crc32 {
         return Err(MmapStoreError::ErasurePayloadCrcMismatch);
     }
@@ -399,7 +454,13 @@ impl ColdErasureShard {
     fn encode_bytes(&self) -> Result<Vec<u8>, MmapStoreError> {
         let shard_len = u32::try_from(self.bytes.len())
             .map_err(|_| MmapStoreError::NumericOverflow("erasure_shard_len"))?;
-        let mut encoded = Vec::with_capacity(COLD_ERASURE_HEADER_LEN + self.bytes.len());
+        let encoded_len = COLD_ERASURE_HEADER_LEN
+            .checked_add(self.bytes.len())
+            .ok_or(MmapStoreError::NumericOverflow("erasure_encoded_len"))?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(encoded_len)
+            .map_err(|error| MmapStoreError::InvalidErasureShard(error.to_string()))?;
         encoded.extend_from_slice(&COLD_ERASURE_MAGIC);
         encoded.push(COLD_ERASURE_VERSION);
         encoded.push(u8::try_from(COLD_ERASURE_DATA_SHARDS).unwrap_or(0));
@@ -466,7 +527,11 @@ impl ColdErasureShard {
                 .try_into()
                 .map_err(|_| MmapStoreError::InvalidErasureShard("bad shard len".to_string()))?,
         ) as usize;
-        let bytes = encoded[32..].to_vec();
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(encoded.len() - COLD_ERASURE_HEADER_LEN)
+            .map_err(|error| MmapStoreError::InvalidErasureShard(error.to_string()))?;
+        bytes.extend_from_slice(&encoded[COLD_ERASURE_HEADER_LEN..]);
         if bytes.len() != shard_len {
             return Err(MmapStoreError::InvalidErasureShard(format!(
                 "shard {index} length {} != header {shard_len}",
@@ -505,62 +570,397 @@ fn cold_erasure_shard_path(log_path: &Path, index: u8) -> Result<PathBuf, MmapSt
 struct PaneFile {
     log_path: PathBuf,
     file: File,
+    base_seq_file: File,
+    /// End offset of the last newline-terminated, crash-durable record.
     file_len: u64,
+    /// The physical file contains an interrupted record after `file_len`.
+    /// Recovery truncates only that uncommitted suffix before the next append.
+    trailing_partial: bool,
+    /// Byte length of the optional in-band sequence-authority header.
+    data_start: u64,
     base_seq: u64,
     line_offsets: Vec<LineOffset>,
 }
 
 impl PaneFile {
-    fn scan_offsets(path: &Path) -> Result<(Vec<LineOffset>, u64), MmapStoreError> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut line_offsets = Vec::new();
-        let mut cursor = 0u64;
-        let mut line_buf = Vec::new();
+    fn unique_staging_path(path: &Path, purpose: &str) -> Result<PathBuf, MmapStoreError> {
+        static STAGING_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
 
+        let parent = path.parent().ok_or_else(|| {
+            MmapStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pane storage path has no parent directory",
+            ))
+        })?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                MmapStoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "pane storage path has no UTF-8 file name",
+                ))
+            })?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| {
+                MmapStoreError::Io(std::io::Error::other(format!(
+                    "system clock precedes Unix epoch: {error}"
+                )))
+            })?
+            .as_nanos();
+        let sequence = STAGING_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(parent.join(format!(
+            ".{name}.{purpose}-{}-{timestamp}-{sequence}",
+            std::process::id()
+        )))
+    }
+
+    fn publish_staging_file(staging: &Path, destination: &Path) -> Result<(), MmapStoreError> {
+        let staged_path = tempfile::TempPath::try_from_path(staging.to_path_buf())?;
+        match staged_path.persist(destination) {
+            Ok(()) => Ok(()),
+            Err(mut error) => {
+                // The caller did not authorize deleting an unpublished recovery
+                // artifact. Retain it for diagnosis if atomic publication fails.
+                error.path.disable_cleanup(true);
+                Err(error.error.into())
+            }
+        }
+    }
+
+    fn harden_open_file_permissions(file: &File) -> Result<(), MmapStoreError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    fn revalidate_open_file(path: &Path, file: &File) -> Result<(), MmapStoreError> {
+        let handle_metadata = file.metadata()?;
+        if !handle_metadata.is_file() {
+            return Err(MmapStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pane storage authority is not a regular file",
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let path_metadata = std::fs::symlink_metadata(path)?;
+            if !path_metadata.file_type().is_file()
+                || path_metadata.dev() != handle_metadata.dev()
+                || path_metadata.ino() != handle_metadata.ino()
+            {
+                return Err(MmapStoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "pane storage authority changed identity while opening",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn open_append_file(path: &Path) -> Result<(File, bool), MmapStoreError> {
+        let mut create = OpenOptions::new();
+        create.create_new(true).read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            create.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        match create.open(path) {
+            Ok(file) => {
+                Self::harden_open_file_permissions(&file)?;
+                Self::revalidate_open_file(path, &file)?;
+                Ok((file, true))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut existing = OpenOptions::new();
+                existing.read(true).append(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+
+                    existing.custom_flags(libc::O_NOFOLLOW);
+                }
+                let file = existing.open(path)?;
+                Self::harden_open_file_permissions(&file)?;
+                Self::revalidate_open_file(path, &file)?;
+                Ok((file, false))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn sync_parent_directory(path: &Path) -> Result<(), MmapStoreError> {
+        #[cfg(not(windows))]
+        {
+            let parent = path.parent().ok_or_else(|| {
+                MmapStoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "pane storage path has no parent directory",
+                ))
+            })?;
+            File::open(parent)?.sync_all()?;
+        }
+        #[cfg(windows)]
+        {
+            let _ = path;
+        }
+        Ok(())
+    }
+
+    fn base_seq_path(log_path: &Path) -> PathBuf {
+        log_path.with_extension("seq")
+    }
+
+    fn scan_base_seq_journal(file: &File) -> Result<Option<u64>, MmapStoreError> {
+        let mut file = file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(file);
+        let mut latest = None;
+        let mut record = Vec::new();
         loop {
-            let bytes_read = reader.read_until(b'\n', &mut line_buf)?;
+            let bytes_read = (&mut reader)
+                .take(129)
+                .read_until(b'\n', &mut record)?;
             if bytes_read == 0 {
                 break;
             }
-            line_offsets.push(LineOffset(cursor));
-            cursor = cursor.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
+            if record.len() > 128 {
+                return Err(MmapStoreError::InvalidPaneLogHeader(
+                    "base sequence journal record exceeds 128 bytes".to_string(),
+                ));
+            }
+            if record.ends_with(b"\n") {
+                let value = record
+                    .strip_prefix(PANE_BASE_SEQ_JOURNAL_PREFIX.as_bytes())
+                    .and_then(|bytes| bytes.strip_suffix(b"\n"))
+                    .ok_or_else(|| {
+                        MmapStoreError::InvalidPaneLogHeader(
+                            "malformed base sequence journal record".to_string(),
+                        )
+                    })?;
+                let value = std::str::from_utf8(value).map_err(|error| {
+                    MmapStoreError::InvalidPaneLogHeader(error.to_string())
+                })?;
+                let value = value.parse::<u64>().map_err(|error| {
+                    MmapStoreError::InvalidPaneLogHeader(error.to_string())
+                })?;
+                if latest.is_some_and(|previous| value < previous) {
+                    return Err(MmapStoreError::InvalidPaneLogHeader(
+                        "base sequence journal is not monotonic".to_string(),
+                    ));
+                }
+                latest = Some(value);
+            }
+            record.clear();
+        }
+        Ok(latest)
+    }
+
+    fn scan_offsets_and_base(
+        file: &File,
+    ) -> Result<(Vec<LineOffset>, u64, u64, u64), MmapStoreError> {
+        let mut file = file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(file);
+        let mut line_offsets = Vec::new();
+        let mut cursor = 0u64;
+        let mut committed_len = 0u64;
+        let mut base_seq = 0u64;
+        let mut data_start = 0u64;
+        let mut line_buf = Vec::new();
+
+        loop {
+            let bytes_read = (&mut reader)
+                .take(PANE_LOG_MAX_RECORD_BYTES.saturating_add(1))
+                .read_until(b'\n', &mut line_buf)?;
+            if bytes_read == 0 {
+                break;
+            }
+            if u64::try_from(line_buf.len()).unwrap_or(u64::MAX) > PANE_LOG_MAX_RECORD_BYTES {
+                return Err(MmapStoreError::InvalidPaneLogHeader(format!(
+                    "pane log record exceeds {PANE_LOG_MAX_RECORD_BYTES} bytes"
+                )));
+            }
+            let bytes_read = u64::try_from(bytes_read)
+                .map_err(|_| MmapStoreError::NumericOverflow("pane_log_cursor"))?;
+            let next_cursor = cursor
+                .checked_add(bytes_read)
+                .ok_or(MmapStoreError::NumericOverflow("pane_log_cursor"))?;
+            let pane_header_candidate = cursor == 0 && line_buf.starts_with(b"\0FTMMAP");
+            if line_buf.ends_with(b"\n") {
+                if cursor == 0 && line_buf.starts_with(PANE_LOG_HEADER_PREFIX) {
+                    let value = line_buf
+                        .strip_prefix(PANE_LOG_HEADER_PREFIX)
+                        .and_then(|bytes| bytes.strip_suffix(b"\n"))
+                        .ok_or_else(|| {
+                            MmapStoreError::InvalidPaneLogHeader(
+                                "missing newline-terminated base sequence".to_string(),
+                            )
+                        })?;
+                    let value = std::str::from_utf8(value).map_err(|error| {
+                        MmapStoreError::InvalidPaneLogHeader(error.to_string())
+                    })?;
+                    base_seq = value.parse::<u64>().map_err(|error| {
+                        MmapStoreError::InvalidPaneLogHeader(error.to_string())
+                    })?;
+                    data_start = next_cursor;
+                } else if pane_header_candidate {
+                    return Err(MmapStoreError::InvalidPaneLogHeader(
+                        "unsupported or malformed pane log header".to_string(),
+                    ));
+                } else {
+                    line_offsets.push(LineOffset(cursor));
+                }
+                committed_len = next_cursor;
+            } else if pane_header_candidate {
+                return Err(MmapStoreError::InvalidPaneLogHeader(
+                    "torn pane log header".to_string(),
+                ));
+            }
+            cursor = next_cursor;
             line_buf.clear();
         }
 
-        Ok((line_offsets, cursor))
+        Ok((line_offsets, committed_len, base_seq, data_start))
+    }
+
+    fn scan_offsets(path: &Path) -> Result<(Vec<LineOffset>, u64), MmapStoreError> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        let (offsets, committed_len, _base_seq, _data_start) =
+            Self::scan_offsets_and_base(&file)?;
+        Ok((offsets, committed_len))
     }
 
     fn open(base_dir: &Path, pane_id: PaneId) -> Result<Self, MmapStoreError> {
         let log_path = base_dir.join(format!("{pane_id}.log"));
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&log_path)?;
-        let (line_offsets, file_len) = Self::scan_offsets(&log_path)?;
+        let base_seq_path = Self::base_seq_path(&log_path);
+        let (file, log_created) = Self::open_append_file(&log_path)?;
+        let (mut line_offsets, file_len, log_base_seq, data_start) =
+            Self::scan_offsets_and_base(&file)?;
+        let trailing_partial = file.metadata()?.len() > file_len;
+        let (base_seq_file, base_seq_created) = Self::open_append_file(&base_seq_path)?;
+        if log_created || base_seq_created {
+            Self::sync_parent_directory(&log_path)?;
+        }
+        let journal_base_seq = if file_len == 0 {
+            // An empty synchronized content log is authoritative for clear.
+            // Reset any journal value left by a crash between clearing the log
+            // and clearing its sequence sidecar.
+            base_seq_file.set_len(0)?;
+            base_seq_file.sync_data()?;
+            None
+        } else {
+            Self::scan_base_seq_journal(&base_seq_file)?
+        };
+        let base_seq = journal_base_seq.map_or(log_base_seq, |seq| seq.max(log_base_seq));
+        let logically_pruned = base_seq.saturating_sub(log_base_seq);
+        let logically_pruned = usize::try_from(logically_pruned)
+            .map_err(|_| MmapStoreError::NumericOverflow("logically_pruned"))?;
+        if logically_pruned > line_offsets.len() {
+            return Err(MmapStoreError::InvalidPaneLogHeader(format!(
+                "base sequence journal prunes {logically_pruned} records from a log containing {}",
+                line_offsets.len()
+            )));
+        }
+        line_offsets.drain(0..logically_pruned);
 
         Ok(Self {
             log_path,
             file,
+            base_seq_file,
             file_len,
-            base_seq: 0,
+            trailing_partial,
+            data_start,
+            base_seq,
             line_offsets,
         })
     }
 
+    fn persist_base_seq(&mut self, base_seq: u64) -> Result<(), MmapStoreError> {
+        self.base_seq_file.seek(SeekFrom::End(0))?;
+        writeln!(
+            self.base_seq_file,
+            "{PANE_BASE_SEQ_JOURNAL_PREFIX}{base_seq}"
+        )?;
+        self.base_seq_file.flush()?;
+        self.base_seq_file.sync_data()?;
+        Ok(())
+    }
+
     fn append_line(&mut self, line: &str) -> Result<u64, MmapStoreError> {
-        let start = self.file.seek(SeekFrom::End(0))?;
+        if line.as_bytes().iter().any(|byte| matches!(byte, b'\n' | b'\r')) {
+            return Err(MmapStoreError::InvalidLineRecord);
+        }
+        let record_bytes = u64::try_from(line.len())
+            .map_err(|_| MmapStoreError::NumericOverflow("line_len"))?
+            .checked_add(1)
+            .ok_or(MmapStoreError::NumericOverflow("line_len"))?;
+        if record_bytes > PANE_LOG_MAX_RECORD_BYTES {
+            return Err(MmapStoreError::PaneLogRecordTooLarge {
+                bytes: record_bytes,
+                max: PANE_LOG_MAX_RECORD_BYTES,
+            });
+        }
+        let mut physical_end = self.file.seek(SeekFrom::End(0))?;
+        if self.trailing_partial {
+            // The suffix after `file_len` was never newline-terminated and
+            // therefore was never acknowledged as a record. Remove exactly
+            // that uncommitted tail before appending; otherwise a later reopen
+            // would index the tail as a real line once a separator was added.
+            self.file.set_len(self.file_len)?;
+            self.file.sync_all()?;
+            physical_end = self.file_len;
+            self.trailing_partial = false;
+        }
+        let start = physical_end;
         let seq = self
             .base_seq
-            .saturating_add(u64::try_from(self.line_offsets.len()).unwrap_or(u64::MAX));
-        self.line_offsets.push(LineOffset(start));
+            .checked_add(
+                u64::try_from(self.line_offsets.len())
+                    .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
+            )
+            .ok_or(MmapStoreError::NumericOverflow("seq"))?;
+        let new_file_len = start
+            .checked_add(
+                u64::try_from(line.len())
+                    .map_err(|_| MmapStoreError::NumericOverflow("line_len"))?,
+            )
+            .and_then(|len| len.checked_add(1))
+            .ok_or(MmapStoreError::NumericOverflow("file_len"))?;
+        // Publish the interrupted-tail state before the first write. If any
+        // write or durability operation fails, readers keep the prior
+        // committed boundary and a later append starts on a fresh line.
+        self.trailing_partial = true;
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
+        // A successful spill is a crash-durability acknowledgement, not just
+        // a userspace-buffer acknowledgement. `flush` alone can leave the
+        // newest retained line entirely in the kernel page cache when the
+        // host or mux process dies. Persist the appended data before making it
+        // visible through the in-memory index and returning success.
         self.file.flush()?;
-        self.file_len = start
-            .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
-            .saturating_add(1);
+        self.file.sync_data()?;
+        self.line_offsets.push(LineOffset(start));
+        self.file_len = new_file_len;
+        self.trailing_partial = false;
         Ok(seq)
     }
 
@@ -574,39 +974,19 @@ impl PaneFile {
 
         let line_count = self.line_offsets.len();
         let start_index = line_count.saturating_sub(n);
-        let start_offset = self.line_offsets[start_index].0;
-        if start_offset > self.file_len {
-            return Err(MmapStoreError::OffsetOutOfBounds {
-                offset: start_offset,
-                len: self.file_len,
-            });
+        let mut lines = Vec::with_capacity(line_count - start_index);
+        for index in start_index..line_count {
+            let seq = self
+                .base_seq
+                .checked_add(
+                    u64::try_from(index)
+                        .map_err(|_| MmapStoreError::NumericOverflow("line_index"))?,
+                )
+                .ok_or(MmapStoreError::NumericOverflow("seq"))?;
+            if let Some(line) = self.line_at(seq)? {
+                lines.push(line);
+            }
         }
-        let actual_len = std::fs::metadata(&self.log_path)?.len();
-        if start_offset > actual_len {
-            return Err(MmapStoreError::OffsetOutOfBounds {
-                offset: start_offset,
-                len: actual_len,
-            });
-        }
-
-        let mut tail_file = File::open(&self.log_path)?;
-        tail_file.seek(SeekFrom::Start(start_offset))?;
-        let mut tail_bytes = Vec::new();
-        tail_file.read_to_end(&mut tail_bytes)?;
-
-        let mut lines: Vec<String> = tail_bytes
-            .split(|byte| *byte == b'\n')
-            .map(|line_bytes| {
-                let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);
-                String::from_utf8_lossy(line_bytes).to_string()
-            })
-            .collect();
-
-        // Drop split()'s trailing empty segment when input ends with '\n'.
-        if tail_bytes.ends_with(b"\n") {
-            let _ = lines.pop();
-        }
-
         Ok(lines)
     }
 
@@ -626,49 +1006,81 @@ impl PaneFile {
             });
         }
 
-        let end = self
-            .line_offsets
-            .get(index + 1)
-            .map(|offset| offset.0)
-            .unwrap_or(self.file_len);
-        let len = end.saturating_sub(start.0);
-        let mut file = File::open(&self.log_path)?;
+        let mut file = self.file.try_clone()?;
         file.seek(SeekFrom::Start(start.0))?;
-        let len = usize::try_from(len).map_err(|_| MmapStoreError::NumericOverflow("line_len"))?;
-        let mut bytes = vec![0u8; len];
-        file.read_exact(&mut bytes)?;
+        let readable = self
+            .file_len
+            .saturating_sub(start.0)
+            .min(PANE_LOG_MAX_RECORD_BYTES.saturating_add(1));
+        let mut reader = BufReader::new(file.take(readable));
+        let mut bytes = Vec::new();
+        reader.read_until(b'\n', &mut bytes)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PANE_LOG_MAX_RECORD_BYTES {
+            return Err(MmapStoreError::InvalidPaneLogHeader(format!(
+                "pane log record exceeds {PANE_LOG_MAX_RECORD_BYTES} bytes"
+            )));
+        }
+        if !bytes.ends_with(b"\n") {
+            return Ok(None);
+        }
         while matches!(bytes.last(), Some(b'\n' | b'\r')) {
             bytes.pop();
         }
-        Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
+        Ok(Some(String::from_utf8(bytes)?))
     }
 
-    fn prune_before(&mut self, seq: u64) {
+    fn prune_before(&mut self, seq: u64) -> Result<(), MmapStoreError> {
         if seq <= self.base_seq {
-            return;
+            return Ok(());
         }
         let drop_count = usize::try_from(seq - self.base_seq)
             .unwrap_or(usize::MAX)
             .min(self.line_offsets.len());
-        self.line_offsets.drain(0..drop_count);
-        self.base_seq = self
+        let next_base_seq = self
             .base_seq
-            .saturating_add(u64::try_from(drop_count).unwrap_or(u64::MAX));
+            .checked_add(
+                u64::try_from(drop_count)
+                    .map_err(|_| MmapStoreError::NumericOverflow("drop_count"))?,
+            )
+            .ok_or(MmapStoreError::NumericOverflow("base_seq"))?;
+        if next_base_seq == self.base_seq {
+            return Ok(());
+        }
+        // Persist the logical prune before changing the in-memory index. A
+        // crash after this acknowledgement replays the same prefix drop when
+        // the pane log is reopened, even when byte compaction has not run.
+        self.persist_base_seq(next_base_seq)?;
+        self.line_offsets.drain(0..drop_count);
+        self.base_seq = next_base_seq;
+        Ok(())
     }
 
     fn clear(&mut self) -> Result<(), MmapStoreError> {
         self.file.set_len(0)?;
         self.file.flush()?;
+        self.file.sync_data()?;
         self.file_len = 0;
+        self.trailing_partial = false;
+        self.data_start = 0;
         self.base_seq = 0;
         self.line_offsets.clear();
+        self.base_seq_file.set_len(0)?;
+        self.base_seq_file.flush()?;
+        self.base_seq_file.sync_data()?;
         Ok(())
     }
 
     fn read_all_bytes(&self) -> Result<Vec<u8>, MmapStoreError> {
-        let mut file = File::open(&self.log_path)?;
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        file.take(self.file_len).read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != self.file_len {
+            return Err(MmapStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "pane log changed while reading committed bytes",
+            )));
+        }
         Ok(bytes)
     }
 
@@ -677,56 +1089,138 @@ impl PaneFile {
         let shards = cold_erasure_encode(&bytes)?;
         for shard in shards {
             let path = cold_erasure_shard_path(&self.log_path, shard.index)?;
-            let mut tmp_path = path.clone();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| {
-                    MmapStoreError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "erasure shard path has no file name",
-                    ))
-                })?;
-            tmp_path.set_file_name(format!("{name}.tmp"));
+            let encoded = shard.encode_bytes()?;
+            if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > COLD_ERASURE_MAX_SHARD_BYTES {
+                return Err(MmapStoreError::InvalidErasureShard(format!(
+                    "encoded shard {} exceeds the {} byte safety limit",
+                    shard.index, COLD_ERASURE_MAX_SHARD_BYTES
+                )));
+            }
+            let tmp_path = Self::unique_staging_path(&path, "erasure-installing")?;
             {
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&tmp_path)?;
-                file.write_all(&shard.encode_bytes()?)?;
+                let mut options = OpenOptions::new();
+                options.create_new(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+
+                    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+                }
+                let mut file = options.open(&tmp_path)?;
+                Self::harden_open_file_permissions(&file)?;
+                file.write_all(&encoded)?;
                 file.sync_all()?;
-            }
-            std::fs::rename(&tmp_path, &path)?;
-        }
-        if let Some(dir) = self.log_path.parent() {
-            if let Ok(dir_handle) = File::open(dir) {
-                let _ = dir_handle.sync_all();
+                Self::revalidate_open_file(&tmp_path, &file)?;
+                Self::publish_staging_file(&tmp_path, &path)?;
+                Self::revalidate_open_file(&path, &file)?;
             }
         }
+        Self::sync_parent_directory(&self.log_path)?;
         Ok(())
     }
 
     fn recover_from_erasure_sidecars(&self) -> Result<Vec<u8>, MmapStoreError> {
         let mut shards = Vec::new();
+        let mut invalid_shards = Vec::new();
         for index in 0..COLD_ERASURE_TOTAL_SHARDS {
             let index =
                 u8::try_from(index).map_err(|_| MmapStoreError::NumericOverflow("shard_index"))?;
             let path = cold_erasure_shard_path(&self.log_path, index)?;
-            match std::fs::read(&path) {
-                Ok(bytes) => shards.push(ColdErasureShard::decode_bytes(&bytes)?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut file = match options.open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
+            };
+            Self::revalidate_open_file(&path, &file)?;
+            let metadata = file.metadata()?;
+            if metadata.len() > COLD_ERASURE_MAX_SHARD_BYTES {
+                return Err(MmapStoreError::InvalidErasureShard(format!(
+                    "shard {index} exceeds the {} byte safety limit",
+                    COLD_ERASURE_MAX_SHARD_BYTES
+                )));
+            }
+            let capacity = usize::try_from(metadata.len())
+                .map_err(|_| MmapStoreError::NumericOverflow("erasure_shard_len"))?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(capacity)
+                .map_err(|error| MmapStoreError::InvalidErasureShard(error.to_string()))?;
+            (&mut file)
+                .take(COLD_ERASURE_MAX_SHARD_BYTES.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len() {
+                return Err(MmapStoreError::InvalidErasureShard(format!(
+                    "shard {index} changed length while being read"
+                )));
+            }
+            Self::revalidate_open_file(&path, &file)?;
+            match ColdErasureShard::decode_bytes(&bytes) {
+                Ok(shard) if usize::from(shard.index) == index => shards.push(shard),
+                Ok(shard) => invalid_shards.push(format!(
+                    "path index {index} contains shard index {}",
+                    shard.index
+                )),
+                Err(error) => invalid_shards.push(format!("shard {index}: {error}")),
             }
         }
-        cold_erasure_decode(&shards)
+        if shards.len() < COLD_ERASURE_DATA_SHARDS && !invalid_shards.is_empty() {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "only {} valid shard(s) remain; {}",
+                shards.len(),
+                invalid_shards.join("; ")
+            )));
+        }
+        shards.sort_by_key(|shard| {
+            (shard.original_len, shard.payload_crc32, shard.bytes.len())
+        });
+        let mut first_decode_error = None;
+        let mut start = 0usize;
+        while start < shards.len() {
+            let identity = (
+                shards[start].original_len,
+                shards[start].payload_crc32,
+                shards[start].bytes.len(),
+            );
+            let mut end = start + 1;
+            while end < shards.len()
+                && (
+                    shards[end].original_len,
+                    shards[end].payload_crc32,
+                    shards[end].bytes.len(),
+                ) == identity
+            {
+                end += 1;
+            }
+            if end - start >= COLD_ERASURE_DATA_SHARDS {
+                match cold_erasure_decode(&shards[start..end]) {
+                    Ok(decoded) => return Ok(decoded),
+                    Err(error) if first_decode_error.is_none() => first_decode_error = Some(error),
+                    Err(_) => {}
+                }
+            }
+            start = end;
+        }
+        Err(first_decode_error.unwrap_or_else(|| {
+            MmapStoreError::InsufficientErasureShards {
+                have: shards.len(),
+                need: COLD_ERASURE_DATA_SHARDS,
+            }
+        }))
     }
 
     fn stale_prefix_bytes(&self) -> u64 {
         self.line_offsets
             .first()
-            .map(|offset| offset.0)
-            .unwrap_or(self.file_len)
+            .map(|offset| offset.0.saturating_sub(self.data_start))
+            .unwrap_or_else(|| self.file_len.saturating_sub(self.data_start))
     }
 
     fn compact_retained_prefix(&mut self) -> Result<bool, MmapStoreError> {
@@ -734,18 +1228,28 @@ impl PaneFile {
         if stale_bytes == 0 {
             return Ok(false);
         }
-        if self.line_offsets.is_empty() {
-            self.clear()?;
-            return Ok(true);
-        }
-
-        let retained_len = self.file_len.saturating_sub(stale_bytes);
+        let retained_start = self
+            .data_start
+            .checked_add(stale_bytes)
+            .ok_or(MmapStoreError::NumericOverflow("retained_start"))?;
+        let retained_len = self
+            .file_len
+            .checked_sub(retained_start)
+            .ok_or(MmapStoreError::NumericOverflow("retained_len"))?;
         let retained_len = usize::try_from(retained_len)
             .map_err(|_| MmapStoreError::NumericOverflow("file_len"))?;
         let mut retained = Vec::with_capacity(retained_len);
-        let mut source = File::open(&self.log_path)?;
-        source.seek(SeekFrom::Start(stale_bytes))?;
-        source.read_to_end(&mut retained)?;
+        let mut source = self.file.try_clone()?;
+        source.seek(SeekFrom::Start(retained_start))?;
+        source
+            .take(u64::try_from(retained_len).unwrap_or(u64::MAX))
+            .read_to_end(&mut retained)?;
+        if retained.len() != retained_len {
+            return Err(MmapStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "pane log changed while preparing compacted retained bytes",
+            )));
+        }
 
         // Crash-safe compaction (ft-odrq7): write the retained suffix to a
         // sibling temp file, fsync it, then atomically rename it over the live
@@ -756,54 +1260,71 @@ impl PaneFile {
         // the pane, not just the stale prefix it was supposed to drop. With
         // temp + fsync + rename, the live log is at every instant either the
         // old (full) file or the new (compacted) file — never truncated.
-        let tmp_path = {
-            let mut path = self.log_path.clone();
-            let name = self
-                .log_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| {
-                    MmapStoreError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "scrollback log path has no file name",
-                    ))
-                })?;
-            path.set_file_name(format!("{name}.compact.tmp"));
-            path
-        };
-        {
-            // `truncate(true)` here only clears any stale temp from a previously
-            // interrupted compaction; the live log is untouched until the rename.
-            let mut compacted = OpenOptions::new()
-                .create(true)
+        let tmp_path = Self::unique_staging_path(&self.log_path, "compact-installing")?;
+        let header = format!("\0FTMMAP1:{}\n", self.base_seq);
+        let header_len = u64::try_from(header.len())
+            .map_err(|_| MmapStoreError::NumericOverflow("header_len"))?;
+        let new_file_len = header_len
+            .checked_add(
+                u64::try_from(retained.len())
+                    .map_err(|_| MmapStoreError::NumericOverflow("file_len"))?,
+            )
+            .ok_or(MmapStoreError::NumericOverflow("file_len"))?;
+        let compacted_offsets = self
+            .line_offsets
+            .iter()
+            .map(|offset| {
+                offset
+                    .0
+                    .checked_sub(retained_start)
+                    .and_then(|relative| relative.checked_add(header_len))
+                    .map(LineOffset)
+                    .ok_or(MmapStoreError::NumericOverflow("line_offset"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let compacted_file = {
+            let mut options = OpenOptions::new();
+            options
+                .create_new(true)
+                .read(true)
                 .write(true)
-                .truncate(true)
-                .open(&tmp_path)?;
+                .append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut compacted = options.open(&tmp_path)?;
+            compacted.write_all(header.as_bytes())?;
             compacted.write_all(&retained)?;
             // Persist the retained bytes before the rename so the swap can never
             // expose a partially written compacted log.
             compacted.sync_all()?;
-        }
-        std::fs::rename(&tmp_path, &self.log_path)?;
+            compacted
+        };
+        Self::revalidate_open_file(&tmp_path, &compacted_file)?;
+        Self::publish_staging_file(&tmp_path, &self.log_path)?;
+        // The open staged handle names the same inode after rename. Publish it
+        // into the object before any later fallible durability operation so an
+        // error can never leave subsequent appends writing an unlinked old log.
+        self.file = compacted_file;
+        self.file_len = new_file_len;
+        self.trailing_partial = false;
+        self.data_start = header_len;
+        self.line_offsets = compacted_offsets;
         // Make the rename itself durable: without a directory fsync a crash
         // after the rename but before the directory entry reaches disk could
-        // resurrect the pre-compaction file. Best-effort and portable — opening
-        // a directory as a `File` is not supported on every platform.
-        if let Some(dir) = self.log_path.parent() {
-            if let Ok(dir_handle) = File::open(dir) {
-                let _ = dir_handle.sync_all();
-            }
-        }
-
-        self.file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.log_path)?;
-        self.file_len = u64::try_from(retained.len())
-            .map_err(|_| MmapStoreError::NumericOverflow("file_len"))?;
-        for offset in &mut self.line_offsets {
-            offset.0 = offset.0.saturating_sub(stale_bytes);
-        }
+        // resurrect the pre-compaction file. Successful compaction requires
+        // this acknowledgement on platforms that support directory handles.
+        Self::sync_parent_directory(&self.log_path)?;
+        // The compacted log header is now the sequence authority. Collapse the
+        // append-only journal only after that header and its rename are durable;
+        // a crash at any point leaves either the old journal or the new header
+        // sufficient to recover the same base sequence.
+        self.base_seq_file.set_len(0)?;
+        self.base_seq_file.seek(SeekFrom::Start(0))?;
+        self.persist_base_seq(self.base_seq)?;
         Ok(true)
     }
 
@@ -811,11 +1332,21 @@ impl PaneFile {
         let Some(first) = self.line_offsets.first() else {
             return 0;
         };
-        self.file_len.saturating_sub(first.0)
+        self.data_start
+            .saturating_add(self.file_len.saturating_sub(first.0))
     }
 
     fn oldest_seq(&self) -> Option<u64> {
         (!self.line_offsets.is_empty()).then_some(self.base_seq)
+    }
+
+    fn next_seq(&self) -> Result<u64, MmapStoreError> {
+        self.base_seq
+            .checked_add(
+                u64::try_from(self.line_offsets.len())
+                    .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
+            )
+            .ok_or(MmapStoreError::NumericOverflow("seq"))
     }
 
     fn file_bytes(&self) -> u64 {
@@ -836,13 +1367,17 @@ impl SqliteFallbackStore {
         // surface SQLITE_BUSY immediately to the scrollback path.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
+             PRAGMA synchronous=FULL;
              PRAGMA busy_timeout=5000;
              CREATE TABLE IF NOT EXISTS mmap_scrollback_lines (
                  pane_id INTEGER NOT NULL,
                  seq INTEGER NOT NULL,
                  content TEXT NOT NULL,
                  PRIMARY KEY (pane_id, seq)
+             );
+             CREATE TABLE IF NOT EXISTS mmap_scrollback_fallback_panes (
+                 pane_id INTEGER PRIMARY KEY,
+                 next_seq INTEGER NOT NULL CHECK(next_seq >= 0)
              );
              CREATE INDEX IF NOT EXISTS idx_mmap_scrollback_lines_pane_seq
                  ON mmap_scrollback_lines(pane_id, seq DESC);",
@@ -851,8 +1386,39 @@ impl SqliteFallbackStore {
         Ok(Self { conn })
     }
 
+    fn mark_as_authority(&self, pane_id: PaneId) -> Result<(), MmapStoreError> {
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO mmap_scrollback_fallback_panes (pane_id, next_seq)
+             SELECT ?1, COALESCE(MAX(seq) + 1, 0)
+             FROM mmap_scrollback_lines
+             WHERE pane_id = ?1",
+            [pane_id_i64],
+        )?;
+        Ok(())
+    }
+
+    fn is_authority(&self, pane_id: PaneId) -> Result<bool, MmapStoreError> {
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM mmap_scrollback_fallback_panes WHERE pane_id = ?1",
+            [pane_id_i64],
+            |row| row.get(0),
+        )?;
+        Ok(count == 1)
+    }
+
+    fn should_become_authority(&self, pane_id: PaneId) -> Result<bool, MmapStoreError> {
+        // Before the authority table existed, hybrid stores mirrored every mmap
+        // append into SQLite. Prefer those surviving rows during the one-time
+        // transition so a pre-upgrade fallback history is never hidden.
+        Ok(self.is_authority(pane_id)? || self.line_count(pane_id)? > 0)
+    }
+
     fn append_line_with_seq(
-        &self,
+        &mut self,
         pane_id: PaneId,
         seq: u64,
         line: &str,
@@ -861,28 +1427,67 @@ impl SqliteFallbackStore {
             i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
         let seq_i64 = i64::try_from(seq).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
 
-        self.conn.execute(
-            "INSERT OR REPLACE INTO mmap_scrollback_lines (pane_id, seq, content)
-             VALUES (?1, ?2, ?3)",
+        let next_seq = seq
+            .checked_add(1)
+            .ok_or(MmapStoreError::NumericOverflow("seq"))?;
+        let next_seq_i64 =
+            i64::try_from(next_seq).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO mmap_scrollback_lines (pane_id, seq, content) VALUES (?1, ?2, ?3)",
             params![pane_id_i64, seq_i64, line],
         )?;
+        transaction.execute(
+            "INSERT INTO mmap_scrollback_fallback_panes (pane_id, next_seq)
+             VALUES (?1, ?2)
+             ON CONFLICT(pane_id) DO UPDATE SET next_seq = MAX(next_seq, excluded.next_seq)",
+            params![pane_id_i64, next_seq_i64],
+        )?;
+        transaction.commit()?;
 
         Ok(())
     }
 
-    fn append_line_auto_seq(&self, pane_id: PaneId, line: &str) -> Result<(), MmapStoreError> {
+    fn append_line_auto_seq(&mut self, pane_id: PaneId, line: &str) -> Result<u64, MmapStoreError> {
         let pane_id_i64 =
             i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
-        let next_seq_i64: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(seq) + 1, 0)
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO mmap_scrollback_fallback_panes (pane_id, next_seq)
+             SELECT ?1, COALESCE(MAX(seq) + 1, 0)
              FROM mmap_scrollback_lines
              WHERE pane_id = ?1",
             [pane_id_i64],
+        )?;
+        let next_seq_i64: i64 = transaction.query_row(
+            "SELECT next_seq FROM mmap_scrollback_fallback_panes WHERE pane_id = ?1",
+            [pane_id_i64],
             |row| row.get(0),
         )?;
-        let next_seq =
-            u64::try_from(next_seq_i64).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
-        self.append_line_with_seq(pane_id, next_seq, line)
+        let next_seq = u64::try_from(next_seq_i64)
+            .map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        let following_seq = next_seq
+            .checked_add(1)
+            .ok_or(MmapStoreError::NumericOverflow("seq"))?;
+        let following_seq_i64 = i64::try_from(following_seq)
+            .map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        transaction.execute(
+            "INSERT INTO mmap_scrollback_lines (pane_id, seq, content) VALUES (?1, ?2, ?3)",
+            params![pane_id_i64, next_seq_i64, line],
+        )?;
+        let updated = transaction.execute(
+            "UPDATE mmap_scrollback_fallback_panes
+             SET next_seq = ?2
+             WHERE pane_id = ?1 AND next_seq = ?3",
+            params![pane_id_i64, following_seq_i64, next_seq_i64],
+        )?;
+        if updated != 1 {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "SQLite fallback sequence authority changed during append".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(next_seq)
     }
 
     fn tail_lines(&self, pane_id: PaneId, n: usize) -> Result<Vec<String>, MmapStoreError> {
@@ -938,13 +1543,21 @@ impl SqliteFallbackStore {
         Ok(())
     }
 
-    fn clear_pane(&self, pane_id: PaneId) -> Result<(), MmapStoreError> {
+    fn clear_pane(&mut self, pane_id: PaneId) -> Result<(), MmapStoreError> {
         let pane_id_i64 =
             i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
-        self.conn.execute(
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
             "DELETE FROM mmap_scrollback_lines WHERE pane_id = ?1",
             [pane_id_i64],
         )?;
+        transaction.execute(
+            "INSERT INTO mmap_scrollback_fallback_panes (pane_id, next_seq)
+             VALUES (?1, 0)
+             ON CONFLICT(pane_id) DO UPDATE SET next_seq = 0",
+            [pane_id_i64],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -970,6 +1583,32 @@ impl SqliteFallbackStore {
         min_seq
             .map(|seq| u64::try_from(seq).map_err(|_| MmapStoreError::NumericOverflow("seq")))
             .transpose()
+    }
+
+    fn next_seq(&self, pane_id: PaneId) -> Result<u64, MmapStoreError> {
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        if self.is_authority(pane_id)? {
+            let next_seq_i64: i64 = self.conn.query_row(
+                "SELECT next_seq FROM mmap_scrollback_fallback_panes WHERE pane_id = ?1",
+                [pane_id_i64],
+                |row| row.get(0),
+            )?;
+            return u64::try_from(next_seq_i64)
+                .map_err(|_| MmapStoreError::NumericOverflow("seq"));
+        }
+        let max_seq: Option<i64> = self.conn.query_row(
+            "SELECT MAX(seq) FROM mmap_scrollback_lines WHERE pane_id = ?1",
+            [pane_id_i64],
+            |row| row.get(0),
+        )?;
+        match max_seq {
+            Some(seq) => u64::try_from(seq)
+                .map_err(|_| MmapStoreError::NumericOverflow("seq"))?
+                .checked_add(1)
+                .ok_or(MmapStoreError::NumericOverflow("seq")),
+            None => Ok(0),
+        }
     }
 }
 
@@ -1015,12 +1654,30 @@ impl MmapScrollbackStore {
         &mut self,
         pane_id: PaneId,
         line: &str,
-    ) -> Result<(), MmapStoreError> {
+    ) -> Result<u64, MmapStoreError> {
         let sqlite = self
             .sqlite_fallback
             .as_mut()
             .ok_or(MmapStoreError::UnknownPane(pane_id))?;
+        sqlite.mark_as_authority(pane_id)?;
+        self.fallback_panes.insert(pane_id);
         sqlite.append_line_auto_seq(pane_id, line)
+    }
+
+    fn sqlite_is_authority(&self, pane_id: PaneId) -> Result<bool, MmapStoreError> {
+        self.sqlite_fallback
+            .as_ref()
+            .map_or(Ok(false), |sqlite| sqlite.should_become_authority(pane_id))
+    }
+
+    fn activate_sqlite_fallback(&mut self, pane_id: PaneId) -> Result<(), MmapStoreError> {
+        let sqlite = self
+            .sqlite_fallback
+            .as_ref()
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?;
+        sqlite.mark_as_authority(pane_id)?;
+        self.fallback_panes.insert(pane_id);
+        Ok(())
     }
 
     fn tail_lines_sqlite(&self, pane_id: PaneId, n: usize) -> Result<Vec<String>, MmapStoreError> {
@@ -1029,7 +1686,10 @@ impl MmapScrollbackStore {
             .as_ref()
             .ok_or(MmapStoreError::UnknownPane(pane_id))?;
         let lines = sqlite.tail_lines(pane_id, n)?;
-        if lines.is_empty() && sqlite.line_count(pane_id)? == 0 {
+        if lines.is_empty()
+            && sqlite.line_count(pane_id)? == 0
+            && !sqlite.is_authority(pane_id)?
+        {
             return Err(MmapStoreError::UnknownPane(pane_id));
         }
         Ok(lines)
@@ -1040,11 +1700,16 @@ impl MmapScrollbackStore {
             return Ok(());
         }
 
+        if self.sqlite_is_authority(pane_id)? {
+            self.activate_sqlite_fallback(pane_id)?;
+            return Ok(());
+        }
+
         match self.pane_mut(pane_id) {
             Ok(_pane) => Ok(()),
             Err(err) => {
                 if self.sqlite_fallback.is_some() {
-                    self.fallback_panes.insert(pane_id);
+                    self.activate_sqlite_fallback(pane_id)?;
                     Ok(())
                 } else {
                     Err(err)
@@ -1053,32 +1718,46 @@ impl MmapScrollbackStore {
         }
     }
 
-    pub fn append_line(&mut self, pane_id: PaneId, line: &str) -> Result<(), MmapStoreError> {
+    pub fn append_line(&mut self, pane_id: PaneId, line: &str) -> Result<u64, MmapStoreError> {
+        if line.as_bytes().iter().any(|byte| matches!(byte, b'\n' | b'\r')) {
+            return Err(MmapStoreError::InvalidLineRecord);
+        }
+        let record_bytes = u64::try_from(line.len())
+            .map_err(|_| MmapStoreError::NumericOverflow("line_len"))?
+            .checked_add(1)
+            .ok_or(MmapStoreError::NumericOverflow("line_len"))?;
+        if record_bytes > PANE_LOG_MAX_RECORD_BYTES {
+            return Err(MmapStoreError::PaneLogRecordTooLarge {
+                bytes: record_bytes,
+                max: PANE_LOG_MAX_RECORD_BYTES,
+            });
+        }
         if self.fallback_panes.contains(&pane_id) {
             return self.append_line_sqlite_only(pane_id, line);
         }
 
-        let append_result: Result<u64, MmapStoreError> = (|| {
-            let pane = self.pane_mut(pane_id)?;
-            pane.append_line(line)
-        })();
+        if self.sqlite_is_authority(pane_id)? {
+            self.activate_sqlite_fallback(pane_id)?;
+            return self.append_line_sqlite_only(pane_id, line);
+        }
 
-        match append_result {
-            Ok(seq) => {
-                if let Some(sqlite) = self.sqlite_fallback.as_mut() {
-                    sqlite.append_line_with_seq(pane_id, seq, line)?;
+        if !self.panes.contains_key(&pane_id) {
+            if let Err(error) = self.pane_mut(pane_id) {
+                if self.sqlite_fallback.is_none() {
+                    return Err(error);
                 }
-                Ok(())
-            }
-            Err(err) => {
-                if self.sqlite_fallback.is_some() {
-                    self.fallback_panes.insert(pane_id);
-                    self.append_line_sqlite_only(pane_id, line)
-                } else {
-                    Err(err)
-                }
+                self.activate_sqlite_fallback(pane_id)?;
+                return self.append_line_sqlite_only(pane_id, line);
             }
         }
+
+        // Once a pane has an mmap authority, never silently change authorities
+        // after a write failure. Doing so can fork sequence histories because
+        // mmap and SQLite cannot participate in one atomic transaction.
+        self.panes
+            .get_mut(&pane_id)
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?
+            .append_line(line)
     }
 
     pub fn compact_pane_if_stale(
@@ -1164,7 +1843,8 @@ impl MmapScrollbackStore {
     }
 
     pub fn prune_before(&mut self, pane_id: PaneId, seq: u64) -> Result<(), MmapStoreError> {
-        if self.fallback_panes.contains(&pane_id) {
+        if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
+            self.activate_sqlite_fallback(pane_id)?;
             return self
                 .sqlite_fallback
                 .as_ref()
@@ -1173,34 +1853,37 @@ impl MmapScrollbackStore {
         }
 
         if let Some(pane) = self.panes.get_mut(&pane_id) {
-            pane.prune_before(seq);
-        }
-        if let Some(sqlite) = self.sqlite_fallback.as_ref() {
-            sqlite.prune_before(pane_id, seq)?;
+            pane.prune_before(seq)?;
         }
         Ok(())
     }
 
     pub fn clear_pane(&mut self, pane_id: PaneId) -> Result<(), MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
+            self.activate_sqlite_fallback(pane_id)?;
+            self.sqlite_fallback
+                .as_mut()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?
+                .clear_pane(pane_id)?;
+            return Ok(());
+        }
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             pane.clear()?;
-        }
-        if let Some(sqlite) = self.sqlite_fallback.as_ref() {
-            sqlite.clear_pane(pane_id)?;
         }
         if self.cold_erasure == ColdErasureMode::ReedSolomon {
             if let Some(pane) = self.panes.get(&pane_id) {
                 pane.write_erasure_sidecars()?;
             }
         }
-        self.fallback_panes.remove(&pane_id);
         Ok(())
     }
 
     pub fn refresh_pane_erasure_shards(&mut self, pane_id: PaneId) -> Result<bool, MmapStoreError> {
-        if self.cold_erasure != ColdErasureMode::ReedSolomon
-            || self.fallback_panes.contains(&pane_id)
-        {
+        if self.cold_erasure != ColdErasureMode::ReedSolomon {
+            return Ok(false);
+        }
+        if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
+            self.activate_sqlite_fallback(pane_id)?;
             return Ok(false);
         }
         let pane = self.pane_mut(pane_id)?;
@@ -1212,9 +1895,11 @@ impl MmapScrollbackStore {
         &mut self,
         pane_id: PaneId,
     ) -> Result<Option<Vec<u8>>, MmapStoreError> {
-        if self.cold_erasure != ColdErasureMode::ReedSolomon
-            || self.fallback_panes.contains(&pane_id)
-        {
+        if self.cold_erasure != ColdErasureMode::ReedSolomon {
+            return Ok(None);
+        }
+        if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
+            self.activate_sqlite_fallback(pane_id)?;
             return Ok(None);
         }
         let pane = self.pane_mut(pane_id)?;
@@ -1283,6 +1968,25 @@ impl MmapScrollbackStore {
             .flatten()
     }
 
+    pub fn next_seq(&self, pane_id: PaneId) -> Result<u64, MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) {
+            return self
+                .sqlite_fallback
+                .as_ref()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?
+                .next_seq(pane_id);
+        }
+
+        if let Some(pane) = self.panes.get(&pane_id) {
+            return pane.next_seq();
+        }
+
+        self.sqlite_fallback
+            .as_ref()
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?
+            .next_seq(pane_id)
+    }
+
     #[must_use]
     pub fn pane_storage_mode(&self, pane_id: PaneId) -> Option<PaneStorageMode> {
         if self.fallback_panes.contains(&pane_id) {
@@ -1292,10 +1996,9 @@ impl MmapScrollbackStore {
             return Some(PaneStorageMode::Mmap);
         }
         self.sqlite_fallback.as_ref().and_then(|sqlite| {
-            sqlite
-                .line_count(pane_id)
-                .ok()
-                .and_then(|count| (count > 0).then_some(PaneStorageMode::SqliteFallback))
+            sqlite.should_become_authority(pane_id).ok().and_then(|authority| {
+                authority.then_some(PaneStorageMode::SqliteFallback)
+            })
         })
     }
 }
@@ -1709,26 +2412,30 @@ mod tests {
         store.prune_before(1, 6).unwrap();
         assert!(store.compact_pane_if_stale(1, 1).unwrap());
 
-        let tmp = dir.path().join("1.log.compact.tmp");
+        let tmp_exists = std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().to_str().map(ToString::to_string))
+                .is_some_and(|name| name.starts_with(".1.log.compact-installing-"))
+        });
         assert!(
-            !tmp.exists(),
+            !tmp_exists,
             "compaction temp must be renamed away, not leaked"
         );
 
         // Reading the raw file proves the retained bytes are the WHOLE file —
         // i.e. produced by the rename, not re-grown from a zeroed-in-place log.
         let raw = std::fs::read_to_string(dir.path().join("1.log")).unwrap();
-        assert_eq!(raw, "line-6\nline-7\n");
+        assert_eq!(raw, "\0FTMMAP1:6\nline-6\nline-7\n");
         assert_eq!(store.tail_lines(1, 10).unwrap(), vec!["line-6", "line-7"]);
         assert_eq!(store.oldest_seq(1), Some(6));
     }
 
     #[test]
-    fn compaction_recovers_from_leftover_temp_of_interrupted_run() {
-        // A crash during a prior compaction can leave a stale
-        // `<pane>.log.compact.tmp`. The next compaction must overwrite
-        // (truncate) it, not append to or trip over it, so the retained data
-        // stays correct (ft-odrq7).
+    fn compaction_ignores_unowned_legacy_staging_file() {
+        // A fixed staging name can be pre-created or hard-linked. Compaction
+        // must publish through its own create-new sibling and leave the
+        // unowned path untouched.
         let dir = temp_dir();
         let mut store = file_only_store(dir.path());
 
@@ -1738,24 +2445,54 @@ mod tests {
         store.prune_before(1, 6).unwrap();
 
         // Simulate the crash-leftover temp of an interrupted compaction.
+        let unowned_target = dir.path().join("unowned-legacy-staging-target");
         std::fs::write(
-            dir.path().join("1.log.compact.tmp"),
+            &unowned_target,
             b"GARBAGE-FROM-INTERRUPTED-COMPACTION\n",
         )
         .unwrap();
+        std::fs::hard_link(&unowned_target, dir.path().join("1.log.compact.tmp")).unwrap();
 
         assert!(store.compact_pane_if_stale(1, 1).unwrap());
 
         let raw = std::fs::read_to_string(dir.path().join("1.log")).unwrap();
         assert_eq!(
-            raw, "row-6\nrow-7\n",
+            raw, "\0FTMMAP1:6\nrow-6\nrow-7\n",
             "leftover temp must not corrupt the compacted log"
         );
         assert!(!raw.contains("GARBAGE"));
         assert_eq!(store.tail_lines(1, 10).unwrap(), vec!["row-6", "row-7"]);
-        assert!(
-            !dir.path().join("1.log.compact.tmp").exists(),
-            "temp consumed by rename"
+        assert_eq!(
+            std::fs::read(dir.path().join("1.log.compact.tmp")).unwrap(),
+            b"GARBAGE-FROM-INTERRUPTED-COMPACTION\n"
+        );
+        assert_eq!(
+            std::fs::read(unowned_target).unwrap(),
+            b"GARBAGE-FROM-INTERRUPTED-COMPACTION\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_ignores_symlink_at_legacy_staging_name() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        for idx in 0..8 {
+            store.append_line(1, &format!("row-{idx}")).unwrap();
+        }
+        store.prune_before(1, 6).unwrap();
+
+        let target = dir.path().join("unrelated-target");
+        std::fs::write(&target, b"do-not-touch").unwrap();
+        symlink(&target, dir.path().join("1.log.compact.tmp")).unwrap();
+
+        assert!(store.compact_pane_if_stale(1, 1).unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"do-not-touch");
+        assert_eq!(
+            store.tail_lines(1, 10).unwrap(),
+            vec!["row-6".to_string(), "row-7".to_string()]
         );
     }
 
@@ -1771,7 +2508,7 @@ mod tests {
         assert!(store.compact_pane_if_stale(1, 1).unwrap());
 
         let raw = std::fs::read_to_string(dir.path().join("1.log")).unwrap();
-        assert_eq!(raw, "line-5\nline-6\nline-7\n");
+        assert_eq!(raw, "\0FTMMAP1:5\nline-5\nline-6\nline-7\n");
         for path in erasure_sidecar_paths(dir.path(), 1) {
             assert!(
                 !path.exists(),
@@ -1839,6 +2576,70 @@ mod tests {
     }
 
     #[test]
+    fn rs_recovery_skips_one_corrupt_shard_when_quorum_remains() {
+        let dir = temp_dir();
+        let mut store = rs_store(dir.path());
+        store.append_line(1, "quorum-survives-one-corrupt-shard").unwrap();
+        assert!(store.refresh_pane_erasure_shards(1).unwrap());
+        let raw = std::fs::read(dir.path().join("1.log")).unwrap();
+        let first_sidecar = erasure_sidecar_paths(dir.path(), 1)
+            .into_iter()
+            .next()
+            .expect("first erasure sidecar path");
+        let mut corrupt = std::fs::read(&first_sidecar).unwrap();
+        let last = corrupt.last_mut().expect("non-empty sidecar");
+        *last ^= 0xff;
+        std::fs::write(&first_sidecar, corrupt).unwrap();
+
+        assert_eq!(
+            store.recover_pane_bytes_from_erasure_shards(1).unwrap(),
+            Some(raw)
+        );
+    }
+
+    #[test]
+    fn rs_recovery_selects_coherent_quorum_across_interrupted_publication() {
+        let dir = temp_dir();
+        let mut store = rs_store(dir.path());
+        store.append_line(1, "old-generation").unwrap();
+        assert!(store.refresh_pane_erasure_shards(1).unwrap());
+        let paths = erasure_sidecar_paths(dir.path(), 1);
+        let old_first_shard = std::fs::read(&paths[0]).unwrap();
+
+        store.append_line(1, "new-generation").unwrap();
+        assert!(store.refresh_pane_erasure_shards(1).unwrap());
+        let expected = std::fs::read(dir.path().join("1.log")).unwrap();
+
+        // Simulate a crash after publishing one shard from the preceding
+        // generation over an otherwise complete new-generation set.
+        std::fs::write(&paths[0], old_first_shard).unwrap();
+        assert_eq!(
+            store.recover_pane_bytes_from_erasure_shards(1).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rs_recovery_rejects_symlinked_sidecar_without_reading_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        let mut store = rs_store(dir.path());
+        store.append_line(1, "hot-path-line").unwrap();
+        let target = dir.path().join("unrelated-erasure-target");
+        std::fs::write(&target, b"not-a-sidecar").unwrap();
+        let first_sidecar = erasure_sidecar_paths(dir.path(), 1)
+            .into_iter()
+            .next()
+            .expect("first erasure sidecar path");
+        symlink(&target, first_sidecar).unwrap();
+
+        assert!(store.recover_pane_bytes_from_erasure_shards(1).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"not-a-sidecar");
+    }
+
+    #[test]
     fn file_store_clear_pane_resets_offsets_and_content() {
         let dir = temp_dir();
         let mut store = file_only_store(dir.path());
@@ -1889,7 +2690,7 @@ mod tests {
     // --- Hybrid store (file + SQLite) ---
 
     #[test]
-    fn hybrid_store_appends_to_both() {
+    fn hybrid_store_keeps_one_authority_for_healthy_mmap_pane() {
         let dir = temp_dir();
         let db_path = dir.path().join("fallback.db");
         let mut store = hybrid_store(dir.path(), &db_path);
@@ -1900,6 +2701,49 @@ mod tests {
         let lines = store.tail_lines(1, 10).unwrap();
         assert_eq!(lines, vec!["hello", "world"]);
         assert_eq!(store.line_count(1), 2);
+
+        let conn = Connection::open(&db_path).unwrap();
+        let sqlite_line_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mmap_scrollback_lines WHERE pane_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let authority_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mmap_scrollback_fallback_panes WHERE pane_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sqlite_line_count, 0);
+        assert_eq!(authority_count, 0);
+    }
+
+    #[test]
+    fn sqlite_fallback_empty_authority_survives_clear_and_restart() {
+        let dir = temp_dir();
+        let db_path = dir.path().join("fallback.db");
+
+        {
+            let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+            assert_eq!(sqlite.append_line_auto_seq(7, "old").unwrap(), 0);
+            sqlite.clear_pane(7).unwrap();
+            assert!(sqlite.is_authority(7).unwrap());
+            assert_eq!(sqlite.next_seq(7).unwrap(), 0);
+        }
+
+        let mut reopened = hybrid_store(dir.path(), &db_path);
+        reopened.ensure_pane(7).unwrap();
+        assert_eq!(
+            reopened.pane_storage_mode(7),
+            Some(PaneStorageMode::SqliteFallback)
+        );
+        assert_eq!(reopened.tail_lines(7, 10).unwrap(), Vec::<String>::new());
+        assert_eq!(reopened.append_line(7, "new").unwrap(), 0);
+        assert_eq!(reopened.line_at(7, 0).unwrap().as_deref(), Some("new"));
+        assert!(!dir.path().join("7.log").exists());
     }
 
     #[test]
@@ -2000,6 +2844,37 @@ mod tests {
     }
 
     #[test]
+    fn file_store_rejects_embedded_line_delimiters_before_mutation() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+
+        assert!(matches!(
+            store.append_line(1, "one\ntwo"),
+            Err(MmapStoreError::InvalidLineRecord)
+        ));
+        assert!(matches!(
+            store.append_line(1, "carriage\rreturn"),
+            Err(MmapStoreError::InvalidLineRecord)
+        ));
+        assert_eq!(store.line_count(1), 0);
+        assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), b"");
+    }
+
+    #[test]
+    fn file_store_rejects_invalid_utf8_in_committed_record() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("1.log"), b"valid\ninvalid-\xff\n").unwrap();
+        let mut store = file_only_store(dir.path());
+        store.ensure_pane(1).unwrap();
+
+        assert_eq!(store.line_at(1, 0).unwrap().as_deref(), Some("valid"));
+        assert!(matches!(
+            store.line_at(1, 1),
+            Err(MmapStoreError::InvalidPaneLogUtf8(_))
+        ));
+    }
+
+    #[test]
     fn file_store_long_line() {
         let dir = temp_dir();
         let mut store = file_only_store(dir.path());
@@ -2049,13 +2924,168 @@ mod tests {
         assert_eq!(lines, vec!["first", "second"]);
     }
 
+    #[test]
+    fn file_store_compacted_base_sequence_persists_across_reopen() {
+        let dir = temp_dir();
+
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..8 {
+                store.append_line(1, &format!("line-{idx}")).unwrap();
+            }
+            store.prune_before(1, 6).unwrap();
+            assert!(store.compact_pane_if_stale(1, 1).unwrap());
+            assert_eq!(store.oldest_seq(1), Some(6));
+        }
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), Some(6));
+        assert_eq!(reopened.line_at(1, 5).unwrap(), None);
+        assert_eq!(reopened.line_at(1, 6).unwrap().as_deref(), Some("line-6"));
+        assert_eq!(reopened.line_at(1, 7).unwrap().as_deref(), Some("line-7"));
+        reopened.append_line(1, "line-8").unwrap();
+        assert_eq!(reopened.line_at(1, 8).unwrap().as_deref(), Some("line-8"));
+    }
+
+    #[test]
+    fn file_store_empty_retention_compaction_preserves_next_sequence() {
+        let dir = temp_dir();
+
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..4 {
+                assert_eq!(store.append_line(1, &format!("line-{idx}")).unwrap(), idx);
+            }
+            store.prune_before(1, 4).unwrap();
+            assert_eq!(store.oldest_seq(1), None);
+            assert_eq!(store.next_seq(1).unwrap(), 4);
+            assert!(store.compact_pane_if_stale(1, 1).unwrap());
+            assert_eq!(std::fs::read(dir.path().join("1.log")).unwrap(), b"\0FTMMAP1:4\n");
+        }
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), None);
+        assert_eq!(reopened.next_seq(1).unwrap(), 4);
+        assert_eq!(reopened.append_line(1, "line-4").unwrap(), 4);
+        assert_eq!(reopened.line_at(1, 4).unwrap().as_deref(), Some("line-4"));
+    }
+
+    #[test]
+    fn file_store_pruned_base_sequence_persists_without_compaction() {
+        let dir = temp_dir();
+
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..8 {
+                store.append_line(1, &format!("line-{idx}")).unwrap();
+            }
+            store.prune_before(1, 6).unwrap();
+            assert_eq!(store.oldest_seq(1), Some(6));
+        }
+
+        // The content log still has its stale prefix, proving that recovery is
+        // using the synchronized logical-prune journal rather than compaction.
+        let raw = std::fs::read_to_string(dir.path().join("1.log")).unwrap();
+        assert!(raw.starts_with("line-0\nline-1\n"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("1.seq")).unwrap(),
+            "FTSEQ1:6\n"
+        );
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), Some(6));
+        assert_eq!(reopened.line_at(1, 5).unwrap(), None);
+        assert_eq!(reopened.line_at(1, 6).unwrap().as_deref(), Some("line-6"));
+        assert_eq!(reopened.line_at(1, 7).unwrap().as_deref(), Some("line-7"));
+        reopened.append_line(1, "line-8").unwrap();
+        assert_eq!(reopened.line_at(1, 8).unwrap().as_deref(), Some("line-8"));
+    }
+
+    #[test]
+    fn file_store_clear_resets_persisted_sequence_authority() {
+        let dir = temp_dir();
+
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..4 {
+                store.append_line(1, &format!("old-{idx}")).unwrap();
+            }
+            store.prune_before(1, 3).unwrap();
+            store.clear_pane(1).unwrap();
+        }
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), None);
+        assert_eq!(reopened.append_line(1, "new-zero").unwrap(), 0);
+        assert_eq!(reopened.line_at(1, 0).unwrap().as_deref(), Some("new-zero"));
+        assert_eq!(std::fs::read(dir.path().join("1.seq")).unwrap(), b"");
+    }
+
+    #[test]
+    fn pane_file_sequence_journal_ignores_torn_tail_and_rejects_complete_corruption() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("1.log"), b"line-0\nline-1\n").unwrap();
+        std::fs::write(dir.path().join("1.seq"), b"FTSEQ1:1\nFTSEQ1:").unwrap();
+        let pane = PaneFile::open(dir.path(), 1).unwrap();
+        assert_eq!(pane.base_seq, 1);
+        assert_eq!(pane.line_at(1).unwrap().as_deref(), Some("line-1"));
+
+        std::fs::write(dir.path().join("2.log"), b"line-0\n").unwrap();
+        std::fs::write(dir.path().join("2.seq"), b"not-a-sequence\n").unwrap();
+        assert!(matches!(
+            PaneFile::open(dir.path(), 2),
+            Err(MmapStoreError::InvalidPaneLogHeader(_))
+        ));
+
+        std::fs::write(
+            dir.path().join("3.log"),
+            b"line-0\nline-1\nline-2\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("3.seq"), b"FTSEQ1:2\nFTSEQ1:1\n").unwrap();
+        assert!(matches!(
+            PaneFile::open(dir.path(), 3),
+            Err(MmapStoreError::InvalidPaneLogHeader(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_file_rejects_symlinked_log_and_sequence_authorities() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir();
+        let log_target = dir.path().join("unrelated-log-target");
+        std::fs::write(&log_target, b"do-not-read-or-write\n").unwrap();
+        symlink(&log_target, dir.path().join("41.log")).unwrap();
+        assert!(PaneFile::open(dir.path(), 41).is_err());
+        assert_eq!(
+            std::fs::read(&log_target).unwrap(),
+            b"do-not-read-or-write\n"
+        );
+
+        std::fs::write(dir.path().join("42.log"), b"committed\n").unwrap();
+        let sequence_target = dir.path().join("unrelated-sequence-target");
+        std::fs::write(&sequence_target, b"FTSEQ1:0\n").unwrap();
+        symlink(&sequence_target, dir.path().join("42.seq")).unwrap();
+        assert!(PaneFile::open(dir.path(), 42).is_err());
+        assert_eq!(
+            std::fs::read(&sequence_target).unwrap(),
+            b"FTSEQ1:0\n"
+        );
+    }
+
     // --- SQLite-only fallback store ---
 
     #[test]
     fn sqlite_fallback_store_basic() {
         let dir = temp_dir();
         let db_path = dir.path().join("test.db");
-        let sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+        let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
 
         sqlite.append_line_auto_seq(1, "line-a").unwrap();
         sqlite.append_line_auto_seq(1, "line-b").unwrap();
@@ -2069,7 +3099,7 @@ mod tests {
     fn sqlite_fallback_store_tail_zero() {
         let dir = temp_dir();
         let db_path = dir.path().join("test.db");
-        let sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+        let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
 
         sqlite.append_line_auto_seq(1, "data").unwrap();
 
@@ -2081,7 +3111,7 @@ mod tests {
     fn sqlite_fallback_store_multiple_panes() {
         let dir = temp_dir();
         let db_path = dir.path().join("test.db");
-        let sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+        let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
 
         sqlite.append_line_auto_seq(1, "p1-a").unwrap();
         sqlite.append_line_auto_seq(2, "p2-a").unwrap();
@@ -2096,7 +3126,7 @@ mod tests {
     fn sqlite_fallback_store_explicit_seq() {
         let dir = temp_dir();
         let db_path = dir.path().join("test.db");
-        let sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+        let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
 
         sqlite.append_line_with_seq(1, 0, "zero").unwrap();
         sqlite.append_line_with_seq(1, 1, "one").unwrap();
@@ -2110,7 +3140,7 @@ mod tests {
     fn sqlite_fallback_store_tail_partial() {
         let dir = temp_dir();
         let db_path = dir.path().join("test.db");
-        let sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+        let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
 
         for i in 0..20 {
             sqlite
@@ -2123,6 +3153,21 @@ mod tests {
             last5,
             vec!["line-15", "line-16", "line-17", "line-18", "line-19"]
         );
+    }
+
+    #[test]
+    fn sqlite_fallback_full_prune_preserves_next_sequence() {
+        let dir = temp_dir();
+        let db_path = dir.path().join("sqlite-sequence.db");
+        let mut sqlite = SqliteFallbackStore::open(&db_path).unwrap();
+
+        assert_eq!(sqlite.append_line_auto_seq(1, "zero").unwrap(), 0);
+        assert_eq!(sqlite.append_line_auto_seq(1, "one").unwrap(), 1);
+        sqlite.prune_before(1, 2).unwrap();
+        assert_eq!(sqlite.line_count(1).unwrap(), 0);
+        assert_eq!(sqlite.next_seq(1).unwrap(), 2);
+        assert_eq!(sqlite.append_line_auto_seq(1, "two").unwrap(), 2);
+        assert_eq!(sqlite.line_at(1, 2).unwrap().as_deref(), Some("two"));
     }
 
     // --- PaneFile: scan_offsets ---
@@ -2159,6 +3204,35 @@ mod tests {
         // "ab\n" at 0, "cde\n" at 3, "f\n" at 7
         assert_eq!(offsets, vec![LineOffset(0), LineOffset(3), LineOffset(7)]);
         assert_eq!(len, 9);
+    }
+
+    #[test]
+    fn pane_file_scan_offsets_excludes_torn_trailing_record() {
+        let dir = temp_dir();
+        let path = dir.path().join("torn.log");
+        std::fs::write(&path, b"complete\ninterrupted").unwrap();
+
+        let (offsets, len) = PaneFile::scan_offsets(&path).unwrap();
+        assert_eq!(offsets, vec![LineOffset(0)]);
+        assert_eq!(len, 9);
+
+        // Use the path expected by PaneFile::open for the actual recovery
+        // scenario rather than the standalone scanner fixture above.
+        std::fs::write(dir.path().join("42.log"), b"complete\ninterrupted").unwrap();
+        let mut pane = PaneFile::open(dir.path(), 42).unwrap();
+        assert!(pane.trailing_partial);
+        let seq = pane.append_line("after-recovery").unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(pane.line_at(0).unwrap().as_deref(), Some("complete"));
+        assert_eq!(pane.line_at(1).unwrap().as_deref(), Some("after-recovery"));
+        assert_eq!(
+            pane.tail_lines(2).unwrap(),
+            vec!["complete".to_string(), "after-recovery".to_string()]
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("42.log")).unwrap(),
+            b"complete\nafter-recovery\n"
+        );
     }
 
     // --- Hybrid: fallback_panes behavior ---

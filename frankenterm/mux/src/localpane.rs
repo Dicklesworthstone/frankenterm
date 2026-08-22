@@ -822,6 +822,7 @@ where
 
 pub struct LocalPane {
     pane_id: PaneId,
+    durable_pane_id: [u8; 16],
     terminal: Arc<Mutex<Terminal>>,
     process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
@@ -867,6 +868,10 @@ fn record_input_for_current_identity(registration: &PaneRegistrationSlot) {
 impl Pane for LocalPane {
     fn pane_id(&self) -> PaneId {
         self.pane_id
+    }
+
+    fn durable_pane_id(&self) -> Option<[u8; 16]> {
+        Some(self.durable_pane_id)
     }
 
     fn get_metadata(&self) -> Value {
@@ -2591,6 +2596,7 @@ impl LocalPane {
         pty: Box<dyn MasterPty>,
         writer: Box<dyn Write + Send>,
         domain_id: DomainId,
+        durable_pane_id: [u8; 16],
         command_description: String,
     ) -> Self {
         let mux_registration = Arc::new(PaneRegistrationSlot::default());
@@ -2619,6 +2625,7 @@ impl LocalPane {
 
         Self {
             pane_id,
+            durable_pane_id,
             terminal: Arc::new(Mutex::new(terminal)),
             process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),

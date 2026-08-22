@@ -1048,21 +1048,23 @@ impl Screen {
         stable_row: StableRowIndex,
         line: &Line,
         seqno: SequenceNo,
-    ) {
+    ) -> bool {
         if !self.allow_scrollback {
-            return;
+            return true;
         }
         if self.hot_scrollback_size() == 0 {
-            return;
+            return true;
         }
         let tier = self.config.scrollback_tier_config();
         if !tier.enabled {
-            return;
+            return true;
         }
         if let Some(sink) = self.config.scrollback_spill_sink() {
             let max_retained_rows = self.cold_sink_retention_rows();
-            if max_retained_rows > 0 {
-                let _stored = sink.store_scrollback_line(stable_row, line, max_retained_rows);
+            if max_retained_rows > 0
+                && !sink.store_scrollback_line(stable_row, line, max_retained_rows)
+            {
+                return false;
             }
         }
         let line_bytes = Self::estimate_line_bytes(line);
@@ -1070,6 +1072,7 @@ impl Screen {
             .scrollback_tiering
             .record_spill(line_bytes, self.tiered_scrollback_warm_max_bytes());
         self.apply_cold_spill_outcome(seqno, spill_outcome, "budget_overflow");
+        true
     }
 
     /// Force all warm-tier residency into cold-tier accounting.
@@ -3043,6 +3046,8 @@ impl Screen {
         // scrolled off the top and re-use them at the bottom.
         let to_move = lines_removed.min(num_rows);
         let mut removed_from_top = 0usize;
+        let mut spill_blocked = false;
+        let mut lines_moved = 0usize;
         let (to_remove, to_add) = {
             for _ in 0..to_move {
                 let mut line = match self.lines.remove(remove_idx) {
@@ -3051,7 +3056,15 @@ impl Screen {
                 };
                 if remove_idx == 0 && scrollback_ok {
                     let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
-                    self.record_scrollback_spill(stable_row, &line, seqno);
+                    if !self.record_scrollback_spill(stable_row, &line, seqno) {
+                        self.lines.insert(remove_idx, line);
+                        spill_blocked = true;
+                        warn!(
+                            "cold scrollback persistence failed at stable row {}; retaining the row in memory",
+                            stable_row
+                        );
+                        break;
+                    }
                     removed_from_top = removed_from_top.saturating_add(1);
                 }
                 let line = if default_blank == blank_attr {
@@ -3067,10 +3080,18 @@ impl Screen {
                 } else {
                     self.lines.insert(phys_scroll.end.saturating_sub(1), line);
                 }
+                lines_moved = lines_moved.saturating_add(1);
             }
             // We may still have some lines to add at the bottom, so
             // return revised counts for remove/add
-            (lines_removed - to_move, num_rows - to_move)
+            (
+                if spill_blocked {
+                    0
+                } else {
+                    lines_removed.saturating_sub(lines_moved)
+                },
+                num_rows.saturating_sub(lines_moved),
+            )
         };
 
         // Perform the removal
@@ -3078,14 +3099,21 @@ impl Screen {
             if let Some(removed) = self.lines.remove(remove_idx) {
                 if remove_idx == 0 && scrollback_ok {
                     let stable_row = self.stable_row_index_for_removed_top(removed_from_top);
-                    self.record_scrollback_spill(stable_row, &removed, seqno);
+                    if !self.record_scrollback_spill(stable_row, &removed, seqno) {
+                        self.lines.insert(remove_idx, removed);
+                        warn!(
+                            "cold scrollback persistence failed at stable row {}; retaining the row in memory",
+                            stable_row
+                        );
+                        break;
+                    }
                     removed_from_top = removed_from_top.saturating_add(1);
                 }
             }
         }
 
         if remove_idx == 0 && scrollback_ok {
-            self.advance_stable_row_index_offset(lines_removed);
+            self.advance_stable_row_index_offset(removed_from_top);
         }
 
         for _ in 0..to_add {
@@ -3821,6 +3849,36 @@ mod tests {
 
         fn clear_scrollback(&self) {
             self.rows.lock().expect("test sink mutex").clear();
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectingColdScrollbackSink;
+
+    impl crate::config::ScrollbackSpillSink for RejectingColdScrollbackSink {
+        fn store_scrollback_line(
+            &self,
+            _stable_row: StableRowIndex,
+            _line: &Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            false
+        }
+
+        fn load_scrollback_line(&self, _stable_row: StableRowIndex) -> Option<Line> {
+            None
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            None
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            0
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            0
         }
     }
 
@@ -5073,6 +5131,46 @@ mod tests {
             cold_sink.retained_scrollback_rows()
         );
         assert!(status.cold_sink_retained_bytes > 0);
+    }
+
+    #[test]
+    fn tiered_scrollback_retains_rows_in_memory_when_cold_sink_rejects_them() {
+        let mut screen = test_screen_with_config(
+            2,
+            8,
+            96,
+            TestTermConfig {
+                scrollback: 16,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(Arc::new(RejectingColdScrollbackSink)),
+                ..TestTermConfig::default()
+            },
+        );
+        let attrs = CellAttributes::blank();
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=8 {
+            let bottom = screen.phys_row(screen.physical_rows as VisibleRowIndex - 1);
+            screen.lines[bottom] = Line::from_text(&format!("line-{seq}"), &attrs, seq, None);
+            screen.scroll_up(&region, 1, seq, attrs.clone(), bidi_mode());
+        }
+
+        assert!(
+            screen.lines.len() > screen.physical_rows + 1,
+            "durability failure must relax the hot-memory bound instead of discarding rows"
+        );
+        assert_eq!(
+            screen.stable_row_index_offset, 0,
+            "stable identity may advance only after a row is durably accepted"
+        );
+        assert_eq!(
+            screen.scrollback_tiering.warm_spill_lines_total, 0,
+            "rejected rows must not be counted as successful cold spill"
+        );
     }
 
     #[test]

@@ -304,6 +304,7 @@ fn make_local_pane() -> LocalPane {
         Box::new(BenchMasterPty),
         Box::new(Vec::<u8>::new()),
         1 as DomainId,
+        [9; 16],
         "bench-localpane".to_string(),
     )
 }

@@ -11,6 +11,10 @@ use termwiz::cell::UnicodeVersion;
 pub struct ScrollbackSpillSinkContext {
     pub pane_id: usize,
     pub domain_id: usize,
+    /// Random identity allocated before terminal construction. Unlike the
+    /// process-local numeric pane ID, this value is safe to persist and can be
+    /// retained by an external PTY guardian across mux incarnations.
+    pub durable_pane_id: [u8; 16],
     pub command_description: String,
 }
 
@@ -70,12 +74,14 @@ impl TermConfig {
     pub fn new_for_pane(
         pane_id: usize,
         domain_id: usize,
+        durable_pane_id: [u8; 16],
         command_description: impl Into<String>,
     ) -> Self {
         let command_description = command_description.into();
         let scrollback_spill_sink = scrollback_spill_sink_for(ScrollbackSpillSinkContext {
             pane_id,
             domain_id,
+            durable_pane_id,
             command_description,
         });
         Self {
@@ -410,11 +416,12 @@ mod tests {
         set_scrollback_spill_sink_factory(Some(Arc::new(|context| {
             assert_eq!(context.pane_id, 7);
             assert_eq!(context.domain_id, 3);
+            assert_eq!(context.durable_pane_id, [7; 16]);
             assert_eq!(context.command_description, "shell");
             Some(Arc::new(TestScrollbackSpillSink))
         })));
 
-        let term_config = TermConfig::new_for_pane(7, 3, "shell");
+        let term_config = TermConfig::new_for_pane(7, 3, [7; 16], "shell");
         let sink = term_config
             .scrollback_spill_sink()
             .expect("factory should provide a sink");
@@ -438,7 +445,7 @@ mod tests {
         set_scrollback_spill_sink_factory(Some(Arc::new(|_context| {
             Some(Arc::new(TestScrollbackSpillSink))
         })));
-        let term_config = TermConfig::new_for_pane(9, 4, "poisoned-shell");
+        let term_config = TermConfig::new_for_pane(9, 4, [9; 16], "poisoned-shell");
         assert!(term_config.scrollback_spill_sink().is_some());
         set_scrollback_spill_sink_factory(None);
 
