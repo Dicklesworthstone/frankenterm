@@ -232,6 +232,29 @@ best-effort dual-write mirror. A pane that opens successfully on mmap never
 silently switches histories after a later write failure. If mmap cannot be
 established, SQLite records a durable authority marker (including for an empty
 or cleared pane), so restart selects the same history and sequence space.
+Logical-prune sequence journals are scanned under a fixed byte ceiling and
+force the existing crash-safe log compaction before approaching that ceiling,
+while the append path refuses to cross it if compaction fails. Long-lived panes
+therefore retain hot rows on pressure instead of making their own recovery
+journal unreadable.
+
+Operators can discover and export this format directly:
+
+```bash
+ft session list-durable --format json
+ft session export-durable <32-hex-durable-pane-id> --format json
+```
+
+The list path validates each private pane directory and checksummed identity
+manifest. The export path opens the content log and sequence journal read-only,
+refuses symlinks and concurrent replacement, bounds physical bytes, encoded
+records, decoded rows, and transcript bytes, and re-reads the manifest to fence
+concurrent publication. It excludes and reports a final unterminated record,
+decodes styled rows through the bounded codec, reapplies the current redactor,
+and publishes a new mode-0600 transcript with file-and-directory synchronization.
+It neither repairs nor deletes the source and never sends recovered output into
+a PTY. The older `ft session recover` command remains specific to the separate
+64-hex flat mmap orphan format; format identity is never guessed from content.
 
 This continuous spill is not yet a complete pane image: it covers cold/evicted
 rows, while the current hot viewport, terminal parser/render state, PTY handles,

@@ -123,6 +123,10 @@ pub enum MmapStoreError {
         limit: u64,
         observed: u64,
     },
+    #[error(
+        "pane sequence journal capacity {limit} bytes would be exceeded: attempted {attempted} bytes"
+    )]
+    PaneSequenceJournalFull { limit: u64, attempted: u64 },
 }
 
 const COLD_ERASURE_DATA_SHARDS: usize = 3;
@@ -135,6 +139,11 @@ const PANE_LOG_HEADER_PREFIX: &[u8] = b"\0FTMMAP1:";
 const PANE_BASE_SEQ_JOURNAL_PREFIX: &str = "FTSEQ1:";
 const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const PANE_BASE_SEQ_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
+#[cfg(not(test))]
+const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 =
+    PANE_BASE_SEQ_JOURNAL_MAX_BYTES / 4 * 3;
+#[cfg(test)]
+const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = 512;
 const GF_PRIM: u32 = 0x11d;
 
 /// An immutable, bounded view of one pane log at a stable filesystem identity.
@@ -666,6 +675,28 @@ impl PaneFile {
         Ok(())
     }
 
+    fn metadata_changed(
+        before: &std::fs::Metadata,
+        after: &std::fs::Metadata,
+    ) -> Result<bool, MmapStoreError> {
+        if before.len() != after.len() || before.modified()? != after.modified()? {
+            return Ok(true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if before.dev() != after.dev()
+                || before.ino() != after.ino()
+                || before.ctime() != after.ctime()
+                || before.ctime_nsec() != after.ctime_nsec()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn open_append_file(path: &Path) -> Result<(File, bool), MmapStoreError> {
         let mut create = OpenOptions::new();
         create.create_new(true).read(true).append(true);
@@ -724,15 +755,27 @@ impl PaneFile {
     fn scan_base_seq_journal(file: &File) -> Result<Option<u64>, MmapStoreError> {
         let mut file = file.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::new(file.take(PANE_BASE_SEQ_JOURNAL_MAX_BYTES + 1));
         let mut latest = None;
         let mut record = Vec::new();
+        let mut total_bytes = 0u64;
         loop {
             let bytes_read = (&mut reader)
                 .take(129)
                 .read_until(b'\n', &mut record)?;
             if bytes_read == 0 {
                 break;
+            }
+            total_bytes = total_bytes
+                .checked_add(
+                    u64::try_from(bytes_read)
+                        .map_err(|_| MmapStoreError::NumericOverflow("sequence_journal_bytes"))?,
+                )
+                .ok_or(MmapStoreError::NumericOverflow("sequence_journal_bytes"))?;
+            if total_bytes > PANE_BASE_SEQ_JOURNAL_MAX_BYTES {
+                return Err(MmapStoreError::InvalidPaneLogHeader(format!(
+                    "base sequence journal exceeds {PANE_BASE_SEQ_JOURNAL_MAX_BYTES} bytes"
+                )));
             }
             if record.len() > 128 {
                 return Err(MmapStoreError::InvalidPaneLogHeader(
@@ -769,9 +812,18 @@ impl PaneFile {
     fn scan_offsets_and_base(
         file: &File,
     ) -> Result<(Vec<LineOffset>, u64, u64, u64), MmapStoreError> {
+        Self::scan_offsets_and_base_bounded(file, None, None)
+    }
+
+    fn scan_offsets_and_base_bounded(
+        file: &File,
+        max_records: Option<usize>,
+        max_physical_bytes: Option<u64>,
+    ) -> Result<(Vec<LineOffset>, u64, u64, u64), MmapStoreError> {
         let mut file = file.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
-        let mut reader = BufReader::new(file);
+        let read_limit = max_physical_bytes.map_or(u64::MAX, |limit| limit.saturating_add(1));
+        let mut reader = BufReader::new(file.take(read_limit));
         let mut line_offsets = Vec::new();
         let mut cursor = 0u64;
         let mut committed_len = 0u64;
@@ -796,6 +848,15 @@ impl PaneFile {
             let next_cursor = cursor
                 .checked_add(bytes_read)
                 .ok_or(MmapStoreError::NumericOverflow("pane_log_cursor"))?;
+            if let Some(limit) = max_physical_bytes
+                && next_cursor > limit
+            {
+                return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                    limit_name: "physical_bytes",
+                    limit,
+                    observed: next_cursor,
+                });
+            }
             let pane_header_candidate = cursor == 0 && line_buf.starts_with(b"\0FTMMAP");
             if line_buf.ends_with(b"\n") {
                 if cursor == 0 && line_buf.starts_with(PANE_LOG_HEADER_PREFIX) {
@@ -819,6 +880,17 @@ impl PaneFile {
                         "unsupported or malformed pane log header".to_string(),
                     ));
                 } else {
+                    if let Some(limit) = max_records {
+                        if line_offsets.len() >= limit {
+                            return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                                limit_name: "records",
+                                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                                observed: u64::try_from(line_offsets.len())
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_add(1),
+                            });
+                        }
+                    }
                     line_offsets.push(LineOffset(cursor));
                 }
                 committed_len = next_cursor;
@@ -895,11 +967,21 @@ impl PaneFile {
     }
 
     fn persist_base_seq(&mut self, base_seq: u64) -> Result<(), MmapStoreError> {
-        self.base_seq_file.seek(SeekFrom::End(0))?;
-        writeln!(
-            self.base_seq_file,
-            "{PANE_BASE_SEQ_JOURNAL_PREFIX}{base_seq}"
-        )?;
+        let record = format!("{PANE_BASE_SEQ_JOURNAL_PREFIX}{base_seq}\n");
+        let current_len = self.base_seq_file.seek(SeekFrom::End(0))?;
+        let attempted = current_len
+            .checked_add(
+                u64::try_from(record.len())
+                    .map_err(|_| MmapStoreError::NumericOverflow("sequence_journal_bytes"))?,
+            )
+            .ok_or(MmapStoreError::NumericOverflow("sequence_journal_bytes"))?;
+        if attempted > PANE_BASE_SEQ_JOURNAL_MAX_BYTES {
+            return Err(MmapStoreError::PaneSequenceJournalFull {
+                limit: PANE_BASE_SEQ_JOURNAL_MAX_BYTES,
+                attempted,
+            });
+        }
+        self.base_seq_file.write_all(record.as_bytes())?;
         self.base_seq_file.flush()?;
         self.base_seq_file.sync_data()?;
         Ok(())
@@ -1622,6 +1704,246 @@ pub struct MmapScrollbackStore {
     cold_erasure: ColdErasureMode,
 }
 
+/// Read one pane log without taking write authority over it.
+///
+/// This is the forensic/export seam for crash recovery. All limits are checked
+/// before the returned vectors can grow beyond caller policy. The source files
+/// are opened read-only with symlink refusal where the platform supports it and
+/// are revalidated after the read so a concurrent replacement fails closed.
+pub fn read_pane_snapshot(
+    base_dir: &Path,
+    pane_id: PaneId,
+    max_records: usize,
+    max_record_bytes: u64,
+    max_physical_bytes: u64,
+) -> Result<MmapPaneReadSnapshot, MmapStoreError> {
+    let base_metadata = std::fs::symlink_metadata(base_dir)?;
+    if !base_metadata.file_type().is_dir() {
+        return Err(MmapStoreError::InvalidPaneLogHeader(
+            "pane snapshot base path is not a directory".to_string(),
+        ));
+    }
+
+    let log_path = base_dir.join(format!("{pane_id}.log"));
+    let path_metadata_before = std::fs::symlink_metadata(&log_path)?;
+    if !path_metadata_before.file_type().is_file() {
+        return Err(MmapStoreError::InvalidPaneLogHeader(
+            "pane snapshot log is not a regular file".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if path_metadata_before.permissions().mode() & 0o077 != 0 {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "pane snapshot log is not private".to_string(),
+            ));
+        }
+    }
+    if path_metadata_before.len() > max_physical_bytes {
+        return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+            limit_name: "physical_bytes",
+            limit: max_physical_bytes,
+            observed: path_metadata_before.len(),
+        });
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&log_path)?;
+    PaneFile::revalidate_open_file(&log_path, &file)?;
+    let handle_metadata_before = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if handle_metadata_before.permissions().mode() & 0o077 != 0 {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "opened pane snapshot log is not private".to_string(),
+            ));
+        }
+    }
+    let (mut line_offsets, committed_bytes, log_base_seq, _data_start) =
+        PaneFile::scan_offsets_and_base_bounded(
+            &file,
+            Some(max_records),
+            Some(max_physical_bytes),
+        )?;
+
+    let base_seq_path = PaneFile::base_seq_path(&log_path);
+    let (journal_base_seq, journal_guard) = match std::fs::symlink_metadata(&base_seq_path) {
+        Ok(path_metadata) => {
+            if !path_metadata.file_type().is_file() {
+                return Err(MmapStoreError::InvalidPaneLogHeader(
+                    "pane sequence journal is not a regular file".to_string(),
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                if path_metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(MmapStoreError::InvalidPaneLogHeader(
+                        "pane sequence journal is not private".to_string(),
+                    ));
+                }
+            }
+            if path_metadata.len() > PANE_BASE_SEQ_JOURNAL_MAX_BYTES {
+                return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                    limit_name: "sequence_journal_bytes",
+                    limit: PANE_BASE_SEQ_JOURNAL_MAX_BYTES,
+                    observed: path_metadata.len(),
+                });
+            }
+            let mut journal_options = OpenOptions::new();
+            journal_options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+
+                journal_options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let journal = journal_options.open(&base_seq_path)?;
+            PaneFile::revalidate_open_file(&base_seq_path, &journal)?;
+            let journal_metadata_before = journal.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                if journal_metadata_before.permissions().mode() & 0o077 != 0 {
+                    return Err(MmapStoreError::InvalidPaneLogHeader(
+                        "opened pane sequence journal is not private".to_string(),
+                    ));
+                }
+            }
+            let value = PaneFile::scan_base_seq_journal(&journal)?;
+            let journal_metadata_after = journal.metadata()?;
+            if PaneFile::metadata_changed(&journal_metadata_before, &journal_metadata_after)? {
+                return Err(MmapStoreError::InvalidPaneLogHeader(
+                    "pane sequence journal changed during snapshot".to_string(),
+                ));
+            }
+            PaneFile::revalidate_open_file(&base_seq_path, &journal)?;
+            (value, Some((journal, journal_metadata_before)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let base_seq = if committed_bytes == 0 {
+        log_base_seq
+    } else {
+        journal_base_seq.map_or(log_base_seq, |seq| seq.max(log_base_seq))
+    };
+    let logically_pruned = usize::try_from(base_seq.saturating_sub(log_base_seq))
+        .map_err(|_| MmapStoreError::NumericOverflow("logically_pruned"))?;
+    if logically_pruned > line_offsets.len() {
+        return Err(MmapStoreError::InvalidPaneLogHeader(format!(
+            "base sequence journal prunes {logically_pruned} records from a log containing {}",
+            line_offsets.len()
+        )));
+    }
+    line_offsets.drain(0..logically_pruned);
+    if line_offsets.len() > max_records {
+        return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+            limit_name: "records",
+            limit: u64::try_from(max_records).unwrap_or(u64::MAX),
+            observed: u64::try_from(line_offsets.len()).unwrap_or(u64::MAX),
+        });
+    }
+
+    let mut records = Vec::with_capacity(line_offsets.len());
+    let mut record_bytes = 0u64;
+    for offset in line_offsets {
+        if offset.0 > committed_bytes {
+            return Err(MmapStoreError::OffsetOutOfBounds {
+                offset: offset.0,
+                len: committed_bytes,
+            });
+        }
+        let mut source = file.try_clone()?;
+        source.seek(SeekFrom::Start(offset.0))?;
+        let readable = committed_bytes
+            .saturating_sub(offset.0)
+            .min(PANE_LOG_MAX_RECORD_BYTES.saturating_add(1));
+        let mut reader = BufReader::new(source.take(readable));
+        let mut bytes = Vec::new();
+        reader.read_until(b'\n', &mut bytes)?;
+        if !bytes.ends_with(b"\n") {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "indexed pane record is not newline terminated".to_string(),
+            ));
+        }
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        record_bytes = record_bytes
+            .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                MmapStoreError::NumericOverflow("pane_snapshot_record_bytes")
+            })?)
+            .ok_or(MmapStoreError::NumericOverflow(
+                "pane_snapshot_record_bytes",
+            ))?;
+        if record_bytes > max_record_bytes {
+            return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                limit_name: "record_bytes",
+                limit: max_record_bytes,
+                observed: record_bytes,
+            });
+        }
+        records.push(String::from_utf8(bytes)?);
+    }
+
+    let handle_metadata_after = file.metadata()?;
+    if PaneFile::metadata_changed(&handle_metadata_before, &handle_metadata_after)? {
+        return Err(MmapStoreError::InvalidPaneLogHeader(
+            "pane log changed during snapshot".to_string(),
+        ));
+    }
+    PaneFile::revalidate_open_file(&log_path, &file)?;
+    match journal_guard {
+        Some((journal, journal_metadata_before)) => {
+            let journal_metadata_after = journal.metadata()?;
+            if PaneFile::metadata_changed(&journal_metadata_before, &journal_metadata_after)? {
+                return Err(MmapStoreError::InvalidPaneLogHeader(
+                    "pane sequence journal changed during snapshot".to_string(),
+                ));
+            }
+            PaneFile::revalidate_open_file(&base_seq_path, &journal)?;
+        }
+        None => match std::fs::symlink_metadata(&base_seq_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(MmapStoreError::InvalidPaneLogHeader(
+                    "pane sequence journal appeared during snapshot".to_string(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        },
+    }
+
+    let record_count = u64::try_from(records.len())
+        .map_err(|_| MmapStoreError::NumericOverflow("pane_snapshot_records"))?;
+    let next_seq = base_seq
+        .checked_add(record_count)
+        .ok_or(MmapStoreError::NumericOverflow("pane_snapshot_next_seq"))?;
+    Ok(MmapPaneReadSnapshot {
+        oldest_seq: (!records.is_empty()).then_some(base_seq),
+        next_seq,
+        records,
+        committed_bytes,
+        physical_bytes: handle_metadata_after.len(),
+        trailing_uncommitted_bytes: handle_metadata_after.len().saturating_sub(committed_bytes),
+    })
+}
+
 impl MmapScrollbackStore {
     pub fn new(config: MmapStoreConfig) -> Result<Self, MmapStoreError> {
         create_dir_all(&config.base_dir)?;
@@ -1852,8 +2174,15 @@ impl MmapScrollbackStore {
                 .prune_before(pane_id, seq);
         }
 
+        let cold_erasure = self.cold_erasure;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             pane.prune_before(seq)?;
+            if pane.base_seq_file.metadata()?.len() >= PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES
+                && pane.compact_retained_prefix()?
+                && cold_erasure == ColdErasureMode::ReedSolomon
+            {
+                pane.write_erasure_sidecars()?;
+            }
         }
         Ok(())
     }
@@ -2395,6 +2724,58 @@ mod tests {
             store.line_at(1, 6).unwrap().as_deref(),
             Some(expected_line_6.as_str())
         );
+    }
+
+    #[test]
+    fn sequence_journal_pressure_forces_crash_safe_compaction_before_cap() {
+        let dir = temp_dir();
+        {
+            let mut store = file_only_store(dir.path());
+            for idx in 0..100 {
+                store.append_line(1, &format!("line-{idx}")).unwrap();
+            }
+            for oldest in 1..90 {
+                store.prune_before(1, oldest).unwrap();
+            }
+            assert!(
+                std::fs::metadata(dir.path().join("1.seq"))
+                    .unwrap()
+                    .len()
+                    < PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES,
+                "journal-pressure compaction must collapse sequence history"
+            );
+        }
+
+        let mut reopened = file_only_store(dir.path());
+        reopened.ensure_pane(1).unwrap();
+        assert_eq!(reopened.oldest_seq(1), Some(89));
+        assert_eq!(reopened.line_count(1), 11);
+        assert_eq!(
+            reopened.line_at(1, 89).unwrap().as_deref(),
+            Some("line-89")
+        );
+    }
+
+    #[test]
+    fn sequence_journal_capacity_refuses_prune_before_recovery_becomes_unreadable() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+        store.append_line(1, "zero").unwrap();
+        store.append_line(1, "one").unwrap();
+        store
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .base_seq_file
+            .set_len(PANE_BASE_SEQ_JOURNAL_MAX_BYTES)
+            .unwrap();
+
+        let error = store
+            .prune_before(1, 1)
+            .expect_err("journal capacity must fail before logical authority advances");
+        assert!(matches!(error, MmapStoreError::PaneSequenceJournalFull { .. }));
+        assert_eq!(store.oldest_seq(1), Some(0));
+        assert_eq!(store.line_count(1), 2);
     }
 
     #[test]
@@ -3233,6 +3614,87 @@ mod tests {
             std::fs::read(dir.path().join("42.log")).unwrap(),
             b"complete\nafter-recovery\n"
         );
+    }
+
+    #[test]
+    fn read_pane_snapshot_is_read_only_and_excludes_torn_tail() {
+        let dir = temp_dir();
+        let log_path = dir.path().join("7.log");
+        std::fs::write(&log_path, b"zero\none\ntorn").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let log_before = std::fs::metadata(&log_path).unwrap();
+
+        let snapshot = read_pane_snapshot(dir.path(), 7, 8, 1024, 1024).unwrap();
+
+        assert_eq!(snapshot.oldest_seq, Some(0));
+        assert_eq!(snapshot.next_seq, 2);
+        assert_eq!(snapshot.records, vec!["zero", "one"]);
+        assert_eq!(snapshot.committed_bytes, 9);
+        assert_eq!(snapshot.physical_bytes, 13);
+        assert_eq!(snapshot.trailing_uncommitted_bytes, 4);
+        assert!(
+            !dir.path().join("7.seq").exists(),
+            "read-only snapshot must not create a missing sequence journal"
+        );
+        let log_after = std::fs::metadata(&log_path).unwrap();
+        assert_eq!(log_after.len(), log_before.len());
+        assert_eq!(log_after.modified().ok(), log_before.modified().ok());
+    }
+
+    #[test]
+    fn read_pane_snapshot_applies_sequence_journal_and_bounds_scan() {
+        let dir = temp_dir();
+        let log_path = dir.path().join("9.log");
+        let sequence_path = dir.path().join("9.seq");
+        std::fs::write(&log_path, b"zero\none\ntwo\n").unwrap();
+        std::fs::write(&sequence_path, b"FTSEQ1:2\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(
+                &sequence_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+
+        let snapshot = read_pane_snapshot(dir.path(), 9, 3, 1024, 1024).unwrap();
+        assert_eq!(snapshot.oldest_seq, Some(2));
+        assert_eq!(snapshot.next_seq, 3);
+        assert_eq!(snapshot.records, vec!["two"]);
+
+        let error = read_pane_snapshot(dir.path(), 9, 2, 1024, 1024)
+            .expect_err("physical record scan limit must fail closed before allocation grows");
+        assert!(matches!(
+            error,
+            MmapStoreError::PaneSnapshotLimitExceeded {
+                limit_name: "records",
+                limit: 2,
+                observed: 3,
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_pane_snapshot_rejects_non_private_log_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir();
+        let log_path = dir.path().join("11.log");
+        std::fs::write(&log_path, b"exposed\n").unwrap();
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = read_pane_snapshot(dir.path(), 11, 8, 1024, 1024)
+            .expect_err("read-only export must refuse a non-private log");
+        assert!(error.to_string().contains("snapshot log is not private"));
     }
 
     // --- Hybrid: fallback_panes behavior ---

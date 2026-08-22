@@ -6747,6 +6747,43 @@ enum SessionCommands {
         format: String,
     },
 
+    /// List continuously persisted mux scrollback panes
+    ListDurable {
+        /// Maximum number of pane stores admitted during discovery
+        #[arg(long, default_value_t = 4096)]
+        max_entries: usize,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Export one continuously persisted mux pane without mutating its source
+    ExportDurable {
+        /// 32-character durable pane ID
+        pane_uuid: String,
+
+        /// New transcript file; existing files are never overwritten
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Maximum persisted rows admitted to one export
+        #[arg(long, default_value_t = 1_000_000)]
+        max_rows: usize,
+
+        /// Maximum decoded transcript bytes admitted to one export
+        #[arg(long, default_value_t = 67_108_864)]
+        max_total_bytes: usize,
+
+        /// Maximum physical log bytes admitted to one export
+        #[arg(long, default_value_t = 268_435_456)]
+        max_physical_bytes: u64,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
     /// List crash-safe scrollback files not owned by a live process
     ListOrphans {
         /// Output format: auto, plain, json, or toon
@@ -74654,6 +74691,191 @@ async fn handle_session_command(
             }
         }
 
+        SessionCommands::ListDurable {
+            max_entries,
+            format,
+        } => {
+            let output_format = resolve_session_orphan_output_format(&format);
+            if max_entries == 0 || max_entries > LIVE_SCROLLBACK_EXPORT_MAX_PANES {
+                exit_session_durable_error(
+                    &format!(
+                        "--max-entries must be in 1..={LIVE_SCROLLBACK_EXPORT_MAX_PANES}, got {max_entries}"
+                    ),
+                    output_format,
+                );
+            }
+            let scrollback_dir =
+                frankenterm_mux_server_impl::default_live_scrollback_dir();
+            let mut panes = frankenterm_mux_server_impl::list_live_scrollback_panes(
+                &scrollback_dir,
+                max_entries,
+            )
+            .unwrap_or_else(|error| {
+                let error = frankenterm_core::redactor::Redactor::new()
+                    .redact(&format!("{error:#}"));
+                exit_session_durable_error(&error, output_format)
+            });
+            let redactor = frankenterm_core::redactor::Redactor::new();
+            for pane in &mut panes {
+                if let Some(description) = pane.command_description.as_mut() {
+                    *description = redactor.redact(description);
+                }
+                if let Some(error) = pane.error.as_mut() {
+                    *error = redactor.redact(error);
+                }
+                pane.path = PathBuf::from(redactor.redact(&pane.path.display().to_string()));
+            }
+            let display_scrollback_dir = redactor.redact(&scrollback_dir.display().to_string());
+            if output_format.is_structured() {
+                print_snapshot_session_structured_output(
+                    &serde_json::json!({
+                        "ok": true,
+                        "action": "list_durable",
+                        "scrollback_dir": &display_scrollback_dir,
+                        "count": panes.len(),
+                        "panes": panes,
+                    }),
+                    output_format,
+                )?;
+                return Ok(());
+            }
+            if panes.is_empty() {
+                println!("No continuously persisted mux panes found.");
+                println!("  Directory: {display_scrollback_dir}");
+                return Ok(());
+            }
+            println!(
+                "{:<32} {:<10} {:>12} {:>12}  Command",
+                "Durable pane ID", "State", "Rows", "Next seq"
+            );
+            println!("{}", "-".repeat(110));
+            for pane in panes {
+                let rows = pane
+                    .retained_rows
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let next_seq = pane
+                    .next_seq
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let description = pane
+                    .command_description
+                    .as_deref()
+                    .or(pane.error.as_deref())
+                    .unwrap_or("-");
+                println!(
+                    "{:<32} {:<10} {:>12} {:>12}  {}",
+                    pane.durable_pane_id,
+                    pane.state,
+                    rows,
+                    next_seq,
+                    truncate_id(description, 40)
+                );
+            }
+        }
+
+        SessionCommands::ExportDurable {
+            pane_uuid,
+            output,
+            max_rows,
+            max_total_bytes,
+            max_physical_bytes,
+            format,
+        } => {
+            let output_format = resolve_session_orphan_output_format(&format);
+            if max_rows == 0 || max_rows > LIVE_SCROLLBACK_EXPORT_MAX_ROWS {
+                exit_session_durable_error(
+                    &format!(
+                        "--max-rows must be in 1..={LIVE_SCROLLBACK_EXPORT_MAX_ROWS}, got {max_rows}"
+                    ),
+                    output_format,
+                );
+            }
+            if max_total_bytes == 0
+                || max_total_bytes > LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES
+            {
+                exit_session_durable_error(
+                    &format!(
+                        "--max-total-bytes must be in 1..={LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES}, got {max_total_bytes}"
+                    ),
+                    output_format,
+                );
+            }
+            if max_physical_bytes == 0
+                || max_physical_bytes > LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES
+            {
+                exit_session_durable_error(
+                    &format!(
+                        "--max-physical-bytes must be in 1..={LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES}, got {max_physical_bytes}"
+                    ),
+                    output_format,
+                );
+            }
+            let scrollback_dir =
+                frankenterm_mux_server_impl::default_live_scrollback_dir();
+            let export = frankenterm_mux_server_impl::export_live_scrollback_transcript(
+                &scrollback_dir,
+                &pane_uuid,
+                max_rows,
+                max_total_bytes,
+                max_physical_bytes,
+            )
+            .unwrap_or_else(|error| {
+                let error = frankenterm_core::redactor::Redactor::new()
+                    .redact(&format!("{error:#}"));
+                exit_session_durable_error(&error, output_format)
+            });
+            let redactor = frankenterm_core::redactor::Redactor::new();
+            let transcript = redactor.redact(&export.transcript).into_bytes();
+            let command_description = redactor.redact(&export.command_description);
+            let output_path = output.unwrap_or_else(|| default_orphan_transcript_path(&pane_uuid));
+            let artifact = write_new_private_artifact(&output_path, &transcript).unwrap_or_else(
+                |error| {
+                    let error = redactor.redact(&format!("{error:#}"));
+                    exit_session_durable_error(&error, output_format)
+                },
+            );
+            let display_source_path = redactor.redact(&export.source_path.display().to_string());
+            let display_output_path = redactor.redact(&output_path.display().to_string());
+            let result = serde_json::json!({
+                "ok": true,
+                "action": "export_durable",
+                "mode": "read_only_export",
+                "durable_pane_id": &export.durable_pane_id,
+                "publication_state": &export.publication_state,
+                "source_pane_id": export.source_pane_id,
+                "source_domain_id": export.source_domain_id,
+                "command_description": &command_description,
+                "initial_stable_row": export.initial_stable_row,
+                "oldest_seq": export.oldest_seq,
+                "next_seq": export.next_seq,
+                "retained_rows": export.retained_rows,
+                "source_path": &display_source_path,
+                "committed_log_bytes": export.committed_log_bytes,
+                "physical_log_bytes": export.physical_log_bytes,
+                "trailing_uncommitted_bytes": export.trailing_uncommitted_bytes,
+                "output_path": &display_output_path,
+                "transcript_bytes": artifact.bytes,
+                "transcript_sha256": &artifact.sha256,
+                "durability": artifact.durability,
+                "redaction_applied": true,
+                "source_content_mutated": export.source_content_mutated,
+                "live_pty_mutated": false,
+                "executable_restore_image": false,
+            });
+            if !print_snapshot_session_structured_output(&result, output_format)? {
+                println!("Exported continuously persisted mux scrollback");
+                println!("  Durable pane ID: {}", export.durable_pane_id);
+                println!("  Source:          {display_source_path}");
+                println!("  Output:          {display_output_path}");
+                println!("  Rows:            {}", export.retained_rows);
+                println!("  Bytes:           {}", artifact.bytes);
+                println!("  SHA-256:         {}", artifact.sha256);
+                println!("  Safety:          source content was not opened for write; live PTY received no bytes");
+                println!("  Scope:           transcript export, not an executable PTY restore image");
+            }
+        }
+
         SessionCommands::ListOrphans { format } => {
             let output_format = resolve_session_orphan_output_format(&format);
             let scrollback_dir = default_scrollback_recovery_dir();
@@ -74869,6 +75091,14 @@ async fn handle_session_command(
 const LIVE_MUX_DUMP_MAX_PANES: usize = 65_536;
 const LIVE_MUX_DUMP_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES: u64 = 384 * 1024 * 1024;
+const LIVE_SCROLLBACK_EXPORT_MAX_PANES: usize =
+    frankenterm_mux_server_impl::LIVE_SCROLLBACK_EXPORT_MAX_PANES;
+const LIVE_SCROLLBACK_EXPORT_MAX_ROWS: usize =
+    frankenterm_mux_server_impl::LIVE_SCROLLBACK_EXPORT_MAX_ROWS;
+const LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES: usize =
+    frankenterm_mux_server_impl::LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES;
+const LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES: u64 =
+    frankenterm_mux_server_impl::LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES;
 
 #[derive(Debug)]
 struct PrivateArtifactReceipt {
@@ -75804,10 +76034,22 @@ fn session_orphan_discardability_error(
 }
 
 fn exit_session_orphan_error(message: &str, format: SnapshotSessionOutputFormat) -> ! {
+    exit_session_export_error("session.orphan_not_found", message, format)
+}
+
+fn exit_session_durable_error(message: &str, format: SnapshotSessionOutputFormat) -> ! {
+    exit_session_export_error("session.durable_export_failed", message, format)
+}
+
+fn exit_session_export_error(
+    error_code: &'static str,
+    message: &str,
+    format: SnapshotSessionOutputFormat,
+) -> ! {
     if format.is_structured() {
         let payload = serde_json::json!({
             "ok": false,
-            "error_code": "session.orphan_not_found",
+            "error_code": error_code,
             "error": message,
         });
         let rendered = format_snapshot_session_structured_output(&payload, format)
@@ -88601,6 +88843,71 @@ recorder_backend = "rusqlite"
             panic!("expected verify-dump subcommand");
         };
         assert_eq!(path, PathBuf::from("/tmp/mux-dump.json"));
+        assert_eq!(format, "json");
+    }
+
+    #[test]
+    fn session_durable_scrollback_subcommands_parse_limits_and_identity() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "session",
+            "list-durable",
+            "--max-entries",
+            "17",
+            "--format",
+            "toon",
+        ])
+        .expect("list-durable command parses");
+        let Some(Commands::Session { command }) = cli.command.map(|command| *command) else {
+            panic!("expected session command");
+        };
+        let SessionCommands::ListDurable {
+            max_entries,
+            format,
+        } = command
+        else {
+            panic!("expected list-durable subcommand");
+        };
+        assert_eq!(max_entries, 17);
+        assert_eq!(format, "toon");
+
+        let pane_uuid = "ab".repeat(16);
+        let cli = Cli::try_parse_from([
+            "ft",
+            "session",
+            "export-durable",
+            &pane_uuid,
+            "--output",
+            "/tmp/durable.txt",
+            "--max-rows",
+            "19",
+            "--max-total-bytes",
+            "2048",
+            "--max-physical-bytes",
+            "4096",
+            "--format",
+            "json",
+        ])
+        .expect("export-durable command parses");
+        let Some(Commands::Session { command }) = cli.command.map(|command| *command) else {
+            panic!("expected session command");
+        };
+        let SessionCommands::ExportDurable {
+            pane_uuid: parsed_uuid,
+            output,
+            max_rows,
+            max_total_bytes,
+            max_physical_bytes,
+            format,
+        } = command
+        else {
+            panic!("expected export-durable subcommand");
+        };
+        assert_eq!(parsed_uuid, pane_uuid);
+        assert_eq!(output, Some(PathBuf::from("/tmp/durable.txt")));
+        assert_eq!(max_rows, 19);
+        assert_eq!(max_total_bytes, 2048);
+        assert_eq!(max_physical_bytes, 4096);
         assert_eq!(format, "json");
     }
 

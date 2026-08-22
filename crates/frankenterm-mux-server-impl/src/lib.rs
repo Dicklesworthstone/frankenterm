@@ -89,7 +89,7 @@ struct LiveScrollbackSpillState {
     max_retained_rows: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LiveScrollbackManifestV1 {
     schema: String,
@@ -105,6 +105,77 @@ struct LiveScrollbackManifestV1 {
     next_seq: u64,
     content_log: String,
     manifest_sha256: String,
+}
+
+/// Discovery metadata for one continuously persisted mux pane.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveScrollbackDurablePane {
+    pub durable_pane_id: String,
+    pub state: String,
+    pub source_pane_id: Option<u64>,
+    pub source_domain_id: Option<u64>,
+    pub command_description: Option<String>,
+    pub retained_rows: Option<u64>,
+    pub next_seq: Option<u64>,
+    pub path: PathBuf,
+    pub error: Option<String>,
+}
+
+/// Bounded read-only transcript exported from continuously persisted mux data.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveScrollbackTranscriptExport {
+    pub durable_pane_id: String,
+    pub publication_state: String,
+    pub source_pane_id: u64,
+    pub source_domain_id: u64,
+    pub command_description: String,
+    pub initial_stable_row: Option<wezterm_term::StableRowIndex>,
+    pub oldest_seq: Option<u64>,
+    pub next_seq: u64,
+    pub retained_rows: usize,
+    pub transcript: String,
+    pub transcript_bytes: usize,
+    pub committed_log_bytes: u64,
+    pub physical_log_bytes: u64,
+    pub trailing_uncommitted_bytes: u64,
+    pub redaction_applied_before_persistence: bool,
+    pub source_content_mutated: bool,
+    pub source_path: PathBuf,
+}
+
+pub const LIVE_SCROLLBACK_EXPORT_MAX_PANES: usize = 65_536;
+pub const LIVE_SCROLLBACK_EXPORT_MAX_ROWS: usize = 4_000_000;
+pub const LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES: usize = 256 * 1024 * 1024;
+pub const LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES: u64 = 1024 * 1024 * 1024;
+const LIVE_SCROLLBACK_DISCOVERY_EXTRA_ENTRIES: usize = 4096;
+
+fn is_canonical_live_scrollback_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn filesystem_metadata_changed(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> anyhow::Result<bool> {
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl LiveScrollbackSpillSink {
@@ -380,6 +451,14 @@ impl LiveScrollbackSpillSink {
         }
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            if handle_metadata_before.permissions().mode() & 0o077 != 0 {
+                anyhow::bail!("opened scrollback manifest is not private: {}", path.display());
+            }
+        }
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::MetadataExt as _;
 
             if handle_metadata_before.dev() != path_metadata_before.dev()
@@ -398,9 +477,7 @@ impl LiveScrollbackSpillSink {
         let handle_metadata_after = file
             .metadata()
             .with_context(|| format!("reinspect scrollback manifest {}", path.display()))?;
-        if handle_metadata_before.len() != handle_metadata_after.len()
-            || handle_metadata_before.modified()? != handle_metadata_after.modified()?
-        {
+        if filesystem_metadata_changed(&handle_metadata_before, &handle_metadata_after)? {
             anyhow::bail!("scrollback manifest changed while being read: {}", path.display());
         }
         #[cfg(unix)]
@@ -862,7 +939,369 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
     }
 }
 
-fn default_live_scrollback_dir() -> PathBuf {
+fn validate_live_scrollback_manifest_identity(
+    manifest: &LiveScrollbackManifestV1,
+    durable_pane_id: &str,
+    manifest_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        manifest.schema == "frankenterm.live-scrollback-manifest.v1",
+        "unsupported live scrollback manifest schema at {}",
+        manifest_path.display()
+    );
+    anyhow::ensure!(
+        manifest.durable_pane_id == durable_pane_id,
+        "live scrollback manifest identity mismatch at {}",
+        manifest_path.display()
+    );
+    anyhow::ensure!(
+        manifest.content_log == "0.log",
+        "live scrollback manifest content path mismatch at {}",
+        manifest_path.display()
+    );
+    anyhow::ensure!(
+        matches!(
+            manifest.publication_state.as_str(),
+            "prepared" | "complete" | "cleared"
+        ),
+        "invalid live scrollback publication state at {}",
+        manifest_path.display()
+    );
+    anyhow::ensure!(
+        (manifest.retained_rows == 0) == manifest.oldest_seq.is_none(),
+        "live scrollback manifest has inconsistent retained-row bounds at {}",
+        manifest_path.display()
+    );
+    let manifest_interval_end = match manifest.oldest_seq {
+        Some(oldest) => oldest
+            .checked_add(manifest.retained_rows)
+            .ok_or_else(|| anyhow::anyhow!("live scrollback manifest sequence overflow"))?,
+        None => manifest.next_seq,
+    };
+    anyhow::ensure!(
+        manifest_interval_end == manifest.next_seq,
+        "live scrollback manifest next sequence is inconsistent at {}",
+        manifest_path.display()
+    );
+    Ok(())
+}
+
+fn validate_live_scrollback_directory(
+    path: &std::path::Path,
+    require_private: bool,
+) -> anyhow::Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect live scrollback pane directory {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "live scrollback pane path is not a directory: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        anyhow::ensure!(
+            !require_private || metadata.permissions().mode() & 0o077 == 0,
+            "live scrollback pane directory is not private: {}",
+            path.display()
+        );
+    }
+    Ok(metadata)
+}
+
+fn validate_live_scrollback_content_file(
+    path: &std::path::Path,
+    label: &'static str,
+    allow_missing: bool,
+) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(())
+        }
+        Err(error) => return Err(error).with_context(|| format!("inspect {label} {}", path.display())),
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "{label} is not a regular file: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "{label} is not private: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Enumerate continuously persisted pane stores without opening their content
+/// logs for write or attempting repair.
+pub fn list_live_scrollback_panes(
+    base_dir: &std::path::Path,
+    max_entries: usize,
+) -> anyhow::Result<Vec<LiveScrollbackDurablePane>> {
+    anyhow::ensure!(
+        (1..=LIVE_SCROLLBACK_EXPORT_MAX_PANES).contains(&max_entries),
+        "max_entries must be in 1..={LIVE_SCROLLBACK_EXPORT_MAX_PANES}"
+    );
+    let base_metadata_before = match std::fs::symlink_metadata(base_dir) {
+        Ok(_) => validate_live_scrollback_directory(base_dir, false)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect live scrollback directory {}", base_dir.display()));
+        }
+    };
+
+    let mut pane_paths = Vec::new();
+    let max_scanned_entries = max_entries.saturating_add(LIVE_SCROLLBACK_DISCOVERY_EXTRA_ENTRIES);
+    let mut scanned_entries = 0usize;
+    for entry in std::fs::read_dir(base_dir)
+        .with_context(|| format!("read live scrollback directory {}", base_dir.display()))?
+    {
+        let entry = entry?;
+        scanned_entries = scanned_entries.saturating_add(1);
+        anyhow::ensure!(
+            scanned_entries <= max_scanned_entries,
+            "live scrollback discovery exceeded the {max_scanned_entries}-entry scan limit"
+        );
+        let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
+            continue;
+        };
+        if !is_canonical_live_scrollback_id(&name) {
+            continue;
+        }
+        if pane_paths.len() >= max_entries {
+            anyhow::bail!(
+                "live scrollback directory contains more than the configured {max_entries} panes"
+            );
+        }
+        pane_paths.push((name, entry.path()));
+    }
+    pane_paths.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut panes = Vec::with_capacity(pane_paths.len());
+    for (durable_pane_id, pane_path) in pane_paths {
+        let manifest_path = pane_path.join("manifest.json");
+        let result = validate_live_scrollback_directory(&pane_path, true)
+            .and_then(|metadata_before| {
+                let manifest = LiveScrollbackSpillSink::read_manifest(&manifest_path)?;
+                let metadata_after = std::fs::symlink_metadata(&pane_path)?;
+                anyhow::ensure!(
+                    !filesystem_metadata_changed(&metadata_before, &metadata_after)?,
+                    "live scrollback pane directory changed during discovery"
+                );
+                Ok(manifest)
+            })
+            .and_then(|manifest| {
+                manifest.ok_or_else(|| anyhow::anyhow!("live scrollback manifest is missing"))
+            })
+            .and_then(|manifest| {
+                validate_live_scrollback_manifest_identity(
+                    &manifest,
+                    &durable_pane_id,
+                    &manifest_path,
+                )?;
+                Ok(manifest)
+            });
+        match result {
+            Ok(manifest) => panes.push(LiveScrollbackDurablePane {
+                durable_pane_id,
+                state: manifest.publication_state,
+                source_pane_id: Some(manifest.source_pane_id),
+                source_domain_id: Some(manifest.source_domain_id),
+                command_description: Some(manifest.command_description),
+                retained_rows: Some(manifest.retained_rows),
+                next_seq: Some(manifest.next_seq),
+                path: pane_path,
+                error: None,
+            }),
+            Err(error) => panes.push(LiveScrollbackDurablePane {
+                durable_pane_id,
+                state: "corrupt".to_string(),
+                source_pane_id: None,
+                source_domain_id: None,
+                command_description: None,
+                retained_rows: None,
+                next_seq: None,
+                path: pane_path,
+                error: Some(format!("{error:#}")),
+            }),
+        }
+    }
+    let base_metadata_after = std::fs::symlink_metadata(base_dir)?;
+    anyhow::ensure!(
+        !filesystem_metadata_changed(&base_metadata_before, &base_metadata_after)?,
+        "live scrollback base directory changed during discovery"
+    );
+    Ok(panes)
+}
+
+/// Export a continuously persisted pane as plain text without opening source
+/// files for write or sending bytes into a live PTY.
+pub fn export_live_scrollback_transcript(
+    base_dir: &std::path::Path,
+    durable_pane_id: &str,
+    max_rows: usize,
+    max_transcript_bytes: usize,
+    max_physical_bytes: u64,
+) -> anyhow::Result<LiveScrollbackTranscriptExport> {
+    anyhow::ensure!(
+        is_canonical_live_scrollback_id(durable_pane_id),
+        "invalid durable pane ID '{durable_pane_id}' (expected 32 lowercase hex characters)"
+    );
+    anyhow::ensure!(max_rows > 0, "max_rows must be greater than zero");
+    anyhow::ensure!(
+        max_rows <= LIVE_SCROLLBACK_EXPORT_MAX_ROWS,
+        "max_rows exceeds hard limit {LIVE_SCROLLBACK_EXPORT_MAX_ROWS}"
+    );
+    anyhow::ensure!(
+        max_transcript_bytes > 0,
+        "max_transcript_bytes must be greater than zero"
+    );
+    anyhow::ensure!(
+        max_transcript_bytes <= LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES,
+        "max_transcript_bytes exceeds hard limit {LIVE_SCROLLBACK_EXPORT_MAX_TRANSCRIPT_BYTES}"
+    );
+    anyhow::ensure!(
+        max_physical_bytes > 0,
+        "max_physical_bytes must be greater than zero"
+    );
+    anyhow::ensure!(
+        max_physical_bytes <= LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES,
+        "max_physical_bytes exceeds hard limit {LIVE_SCROLLBACK_EXPORT_MAX_PHYSICAL_BYTES}"
+    );
+
+    let pane_path = base_dir.join(durable_pane_id);
+    let pane_metadata_before = validate_live_scrollback_directory(&pane_path, true)?;
+    let manifest_path = pane_path.join("manifest.json");
+    let manifest_before = LiveScrollbackSpillSink::read_manifest(&manifest_path)?
+        .ok_or_else(|| anyhow::anyhow!("live scrollback manifest is missing"))?;
+    validate_live_scrollback_manifest_identity(
+        &manifest_before,
+        durable_pane_id,
+        &manifest_path,
+    )?;
+    validate_live_scrollback_content_file(&pane_path.join("0.log"), "live scrollback log", false)?;
+    validate_live_scrollback_content_file(
+        &pane_path.join("0.seq"),
+        "live scrollback sequence journal",
+        true,
+    )?;
+
+    let snapshot = frankenterm_core::storage::mmap_store::read_pane_snapshot(
+        &pane_path,
+        0,
+        max_rows,
+        max_physical_bytes,
+        max_physical_bytes,
+    )
+    .with_context(|| format!("read live scrollback content from {}", pane_path.display()))?;
+    let manifest_after = LiveScrollbackSpillSink::read_manifest(&manifest_path)?
+        .ok_or_else(|| anyhow::anyhow!("live scrollback manifest disappeared during export"))?;
+    anyhow::ensure!(
+        manifest_before == manifest_after,
+        "live scrollback manifest changed during export; retry against a stable source"
+    );
+    let pane_metadata_after = std::fs::symlink_metadata(&pane_path)?;
+    anyhow::ensure!(
+        !filesystem_metadata_changed(&pane_metadata_before, &pane_metadata_after)?,
+        "live scrollback pane directory changed during export; retry against a stable source"
+    );
+
+    if manifest_before.publication_state != "cleared" {
+        anyhow::ensure!(
+            manifest_before.retained_rows == 0 || !snapshot.records.is_empty(),
+            "live scrollback content is empty behind a manifest with retained rows"
+        );
+        anyhow::ensure!(
+            snapshot.next_seq >= manifest_before.next_seq,
+            "live scrollback content rolled back behind its published manifest"
+        );
+        if let Some(recorded) = manifest_before.oldest_seq {
+            let actual = snapshot.oldest_seq.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "live scrollback content has no oldest sequence behind a retained manifest"
+                )
+            })?;
+            anyhow::ensure!(
+                actual >= recorded,
+                "live scrollback content starts before its published retention boundary"
+            );
+        }
+    }
+
+    let records = if manifest_before.publication_state == "cleared" {
+        &[][..]
+    } else {
+        snapshot.records.as_slice()
+    };
+    if !records.is_empty() {
+        anyhow::ensure!(
+            manifest_before.initial_stable_row.is_some(),
+            "live scrollback records have no initial stable-row identity"
+        );
+    }
+
+    let mut transcript = String::new();
+    for (index, record) in records.iter().enumerate() {
+        let line = decode_scrollback_line_record(record).ok_or_else(|| {
+            anyhow::anyhow!("live scrollback record {index} failed bounded integrity decoding")
+        })?;
+        let text = line.as_str();
+        let delimiter_bytes = usize::from(!line.last_cell_was_wrapped());
+        let next_len = transcript
+            .len()
+            .checked_add(text.len())
+            .and_then(|len| len.checked_add(delimiter_bytes))
+            .ok_or_else(|| anyhow::anyhow!("live scrollback transcript length overflow"))?;
+        anyhow::ensure!(
+            next_len <= max_transcript_bytes,
+            "live scrollback transcript exceeds configured {max_transcript_bytes}-byte limit"
+        );
+        transcript.push_str(text.as_ref());
+        if !line.last_cell_was_wrapped() {
+            transcript.push('\n');
+        }
+    }
+
+    Ok(LiveScrollbackTranscriptExport {
+        durable_pane_id: durable_pane_id.to_string(),
+        publication_state: manifest_before.publication_state,
+        source_pane_id: manifest_before.source_pane_id,
+        source_domain_id: manifest_before.source_domain_id,
+        command_description: manifest_before.command_description,
+        initial_stable_row: manifest_before.initial_stable_row,
+        oldest_seq: if records.is_empty() {
+            None
+        } else {
+            snapshot.oldest_seq
+        },
+        next_seq: if records.is_empty() && manifest_after.publication_state == "cleared" {
+            manifest_after.next_seq
+        } else {
+            snapshot.next_seq
+        },
+        retained_rows: records.len(),
+        transcript_bytes: transcript.len(),
+        transcript,
+        committed_log_bytes: snapshot.committed_bytes,
+        physical_log_bytes: snapshot.physical_bytes,
+        trailing_uncommitted_bytes: snapshot.trailing_uncommitted_bytes,
+        redaction_applied_before_persistence: true,
+        source_content_mutated: false,
+        source_path: pane_path,
+    })
+}
+
+#[must_use]
+pub fn default_live_scrollback_dir() -> PathBuf {
     if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(base).join("ft").join("scrollback-lines");
     }
@@ -1306,6 +1745,225 @@ mod tests {
                 .as_ref(),
             "retained-row-34"
         );
+    }
+
+    #[test]
+    fn live_scrollback_export_is_read_only_bounded_and_discoverable() {
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let zero_limit_error = list_live_scrollback_panes(dir.path(), 0)
+            .expect_err("public discovery must reject an unbounded zero-entry policy");
+        assert!(zero_limit_error.to_string().contains("max_entries must be in"));
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 815,
+            domain_id: 31,
+            durable_pane_id: [89; 16],
+            command_description: "recoverable-shell".to_string(),
+        };
+        let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        {
+            let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .expect("create live spill sink");
+            let attrs = CellAttributes::blank();
+            assert!(sink.store_scrollback_line(
+                40,
+                &Line::from_text("recoverable-one", &attrs, 1, None),
+                8
+            ));
+            assert!(sink.store_scrollback_line(
+                41,
+                &Line::from_text("recoverable-two", &attrs, 2, None),
+                8
+            ));
+        }
+
+        let pane_dir = dir.path().join(&durable_pane_id);
+        let log_path = pane_dir.join("0.log");
+        let manifest_path = pane_dir.join("manifest.json");
+        let log_before = std::fs::metadata(&log_path).expect("log metadata before export");
+        let manifest_before =
+            std::fs::metadata(&manifest_path).expect("manifest metadata before export");
+
+        let panes = list_live_scrollback_panes(dir.path(), 8).expect("list durable panes");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].durable_pane_id, durable_pane_id);
+        assert_eq!(panes[0].state, "complete");
+        assert_eq!(panes[0].retained_rows, Some(2));
+        assert!(panes[0].error.is_none());
+
+        let export = export_live_scrollback_transcript(
+            dir.path(),
+            &durable_pane_id,
+            8,
+            1024,
+            1024 * 1024,
+        )
+        .expect("export durable transcript");
+        assert_eq!(export.transcript, "recoverable-one\nrecoverable-two\n");
+        assert_eq!(export.retained_rows, 2);
+        assert_eq!(export.oldest_seq, Some(0));
+        assert_eq!(export.next_seq, 2);
+        assert!(!export.source_content_mutated);
+        assert!(export.redaction_applied_before_persistence);
+
+        let log_after = std::fs::metadata(&log_path).expect("log metadata after export");
+        let manifest_after =
+            std::fs::metadata(&manifest_path).expect("manifest metadata after export");
+        assert_eq!(log_after.len(), log_before.len());
+        assert_eq!(log_after.modified().ok(), log_before.modified().ok());
+        assert_eq!(manifest_after.len(), manifest_before.len());
+        assert_eq!(manifest_after.modified().ok(), manifest_before.modified().ok());
+
+        let error = export_live_scrollback_transcript(
+            dir.path(),
+            &durable_pane_id,
+            1,
+            1024,
+            1024 * 1024,
+        )
+        .expect_err("row limit must fail closed");
+        assert!(error.to_string().contains("records limit 1"));
+    }
+
+    #[test]
+    fn live_scrollback_export_ignores_uncommitted_torn_tail() {
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 816,
+            domain_id: 32,
+            durable_pane_id: [90; 16],
+            command_description: "torn-tail-shell".to_string(),
+        };
+        let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        {
+            let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .expect("create live spill sink");
+            assert!(sink.store_scrollback_line(
+                50,
+                &Line::from_text("committed", &CellAttributes::blank(), 1, None),
+                8
+            ));
+        }
+        let log_path = dir.path().join(&durable_pane_id).join("0.log");
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .expect("open log for torn-tail fixture");
+        std::io::Write::write_all(&mut log, b"torn").expect("append torn tail fixture");
+        log.sync_all().expect("persist torn tail fixture");
+        drop(log);
+
+        let export = export_live_scrollback_transcript(
+            dir.path(),
+            &durable_pane_id,
+            8,
+            1024,
+            1024 * 1024,
+        )
+        .expect("export committed prefix");
+        assert_eq!(export.transcript, "committed\n");
+        assert_eq!(export.retained_rows, 1);
+        assert_eq!(export.trailing_uncommitted_bytes, 4);
+    }
+
+    #[test]
+    fn live_scrollback_export_rejects_content_pruned_behind_manifest() {
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 817,
+            domain_id: 33,
+            durable_pane_id: [91; 16],
+            command_description: "manifest-ahead-shell".to_string(),
+        };
+        let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        {
+            let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .expect("create live spill sink");
+            assert!(sink.store_scrollback_line(
+                60,
+                &Line::from_text("published", &CellAttributes::blank(), 1, None),
+                8
+            ));
+        }
+        let sequence_path = dir.path().join(&durable_pane_id).join("0.seq");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(sequence_path)
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, b"FTSEQ1:1\n")?;
+                file.sync_all()
+            })
+            .expect("persist a content boundary ahead of the manifest fixture");
+
+        let error = export_live_scrollback_transcript(
+            dir.path(),
+            &durable_pane_id,
+            8,
+            1024,
+            1024 * 1024,
+        )
+        .expect_err("an empty content snapshot must not satisfy a retained manifest");
+        assert!(error
+            .to_string()
+            .contains("content is empty behind a manifest with retained rows"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_scrollback_export_rejects_non_private_content_log() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 818,
+            domain_id: 34,
+            durable_pane_id: [92; 16],
+            command_description: "private-log-shell".to_string(),
+        };
+        let durable_pane_id = uuid::Uuid::from_bytes(context.durable_pane_id)
+            .simple()
+            .to_string();
+        {
+            let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+                .expect("create live spill sink");
+            assert!(sink.store_scrollback_line(
+                70,
+                &Line::from_text("private", &CellAttributes::blank(), 1, None),
+                8
+            ));
+        }
+        let log_path = dir.path().join(&durable_pane_id).join("0.log");
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644))
+            .expect("relax fixture permissions");
+
+        let error = export_live_scrollback_transcript(
+            dir.path(),
+            &durable_pane_id,
+            8,
+            1024,
+            1024 * 1024,
+        )
+        .expect_err("export must reject non-private source content");
+        assert!(error.to_string().contains("log is not private"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_scrollback_listing_rejects_dangling_base_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp scrollback dir");
+        let alias = dir.path().join("scrollback-lines");
+        symlink(dir.path().join("missing-target"), &alias).expect("create dangling base symlink");
+
+        let error = list_live_scrollback_panes(&alias, 8)
+            .expect_err("a dangling storage symlink must not look like an empty store");
+        assert!(error.to_string().contains("not a directory"));
     }
 
     #[test]

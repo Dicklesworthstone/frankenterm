@@ -35,6 +35,7 @@ frankenterm-sigpipe = { workspace = true }
 frankenterm-core-replay = { workspace = true, default-features = false }
 frankenterm-alloc = { workspace = true, optional = true }
 frankenterm-client.workspace = true
+frankenterm-mux-server-impl.workspace = true
 mux.workspace = true
 # Portable nonblocking socket-pair capture for finite doctor subprocess probes
 # (also used by the EPIPE integration-test substrate).

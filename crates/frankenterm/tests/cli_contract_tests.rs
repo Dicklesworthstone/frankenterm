@@ -3926,8 +3926,71 @@ fn contract_ft_0rlfq_robot_run_human_show_robot_rollback_persists_contract_and_l
 }
 
 // =============================================================================
-// Session orphan recovery CLI contract
+// Session durable and orphan recovery CLI contract
 // =============================================================================
+
+#[test]
+fn session_list_durable_defaults_to_json_for_an_empty_store() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+
+    let output = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .env_remove("FT_OUTPUT_FORMAT")
+        .args(["session", "list-durable"])
+        .output()
+        .expect("ft session list-durable should execute");
+
+    assert!(
+        output.status.success(),
+        "list-durable failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("list-durable stdout should be JSON");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["action"], "list_durable");
+    assert_eq!(payload["count"], 0);
+    assert_eq!(payload["panes"], serde_json::json!([]));
+    assert_eq!(
+        payload["scrollback_dir"],
+        data_home
+            .join("ft")
+            .join("scrollback-lines")
+            .display()
+            .to_string()
+    );
+}
+
+#[test]
+fn session_export_durable_invalid_identity_returns_structured_exit_2() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+
+    let output = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args([
+            "session",
+            "export-durable",
+            "not-a-durable-pane-id",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("ft session export-durable should execute");
+
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("export-durable stdout should be JSON");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error_code"], "session.durable_export_failed");
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expected 32 lowercase hex characters")
+    );
+}
 
 #[test]
 fn session_list_orphans_defaults_to_json_when_stdout_is_piped() {

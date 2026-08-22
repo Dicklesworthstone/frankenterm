@@ -353,7 +353,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
 | Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
 | Incident bundles | **Supported** | Wired to live collectors; publish-side snapshot path; beads coordination snapshot included |
-| Session persistence | **Capture/inspect/export supported; restore execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete, `ft session doctor`, and `ft session dump` ship. The dump is a private, redacted, checksummed export of live pane text plus bounded topology metadata; it is not a process checkpoint or executable restore image. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. Production does not currently restore panes, processes, scrollback, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
+| Session persistence | **Capture/inspect/export supported; restore execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete, `ft session doctor`, `ft session dump`, and read-only `ft session list-durable` / `export-durable` ship. The live dump is a private, redacted, checksummed export of live pane text plus bounded topology metadata; the durable export reads the committed cold-scrollback prefix for one stable pane UUID. Neither is a process checkpoint or executable restore image. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. Production does not currently restore panes, processes, hot viewport, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
@@ -1044,6 +1044,8 @@ ft session show <session_id> --limit 50 --offset 0 # bounded checkpoint page
 ft session doctor                # health check for session persistence
 ft session dump                  # private, checksummed live pane-content/topology export
 ft session verify-dump <path>    # offline schema/checksum/private-file verification
+ft session list-durable          # discover continuously persisted cold-scrollback panes
+ft session export-durable <id>   # read-only export of one 32-hex durable pane ID
 ft session recover <pane_uuid>   # export an orphan transcript; never write it to a PTY
 ft watch                         # start the persistence/observation lifecycle; may prune retained data
 ```
@@ -1074,6 +1076,16 @@ the row in memory instead of silently dropping it. This protects scrollback,
 but it still does not make the current mux process replaceable: PTY and child
 ownership must move into the documented guardian before live upgrades can
 preserve running processes.
+
+`ft session list-durable` validates and lists those per-pane manifests without
+opening their content logs for write. `ft session export-durable <id>` performs
+a bounded, read-only snapshot of the committed log prefix, rejects checksum,
+identity, sequence, privacy, replacement-race, and resource-limit failures,
+decodes the styled rows with the bounded codec, reapplies current redaction,
+and creates a new private synchronized transcript without overwriting a prior
+artifact. A final torn record is reported and excluded because it was never
+durability-acknowledged. This export is historical output, never PTY input, and
+is not an executable process checkpoint.
 
 `ft session recover` is intentionally export-only. Historical terminal output
 is output, not shell input: recovery never creates or splits a live pane and
