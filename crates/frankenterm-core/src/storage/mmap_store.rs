@@ -906,6 +906,7 @@ impl PaneFile {
         Ok((line_offsets, committed_len, base_seq, data_start))
     }
 
+    #[cfg(test)]
     fn scan_offsets(path: &Path) -> Result<(Vec<LineOffset>, u64), MmapStoreError> {
         let mut options = OpenOptions::new();
         options.read(true);
@@ -1499,6 +1500,7 @@ impl SqliteFallbackStore {
         Ok(self.is_authority(pane_id)? || self.line_count(pane_id)? > 0)
     }
 
+    #[cfg(test)]
     fn append_line_with_seq(
         &mut self,
         pane_id: PaneId,

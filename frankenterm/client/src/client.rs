@@ -13670,7 +13670,10 @@ mod tests {
                             OrdinaryMuxProtocolError::DirectionViolation { .. }
                         ))
                     ),
-                    "ident {ident}, serial {serial} produced unexpected rejection: {error:#}"
+                    "ident {}, serial {} produced unexpected rejection: {:#}",
+                    ident,
+                    serial,
+                    error
                 );
             }
             assert_eq!(

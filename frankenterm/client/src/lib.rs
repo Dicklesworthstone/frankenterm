@@ -208,7 +208,10 @@ mod mux_test_scope_tests {
         let reservation = match outcome {
             promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
             rejected => {
-                panic!("parked scheduler must provide real bounded admission: {rejected:?}")
+                panic!(
+                    "parked scheduler must provide real bounded admission: {:?}",
+                    rejected
+                )
             }
         };
         reservation
@@ -253,7 +256,7 @@ mod mux_test_scope_tests {
         );
         let reservation = match outcome {
             promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => reservation,
-            rejected => panic!("nested scheduler must admit the probe: {rejected:?}"),
+            rejected => panic!("nested scheduler must admit the probe: {:?}", rejected),
         };
         drop(reservation);
         drop(nested_scheduler);

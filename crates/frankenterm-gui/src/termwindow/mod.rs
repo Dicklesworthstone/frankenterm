@@ -162,6 +162,14 @@ pub fn get_window_class() -> String {
     lock_termwindow_mutex(&WINDOW_CLASS, "window class").clone()
 }
 
+fn should_restore_workspace_after_failed_spawn(
+    active_workspace: &str,
+    requested_workspace: &str,
+    requested_workspace_has_windows: bool,
+) -> bool {
+    !requested_workspace_has_windows && active_workspace == requested_workspace
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MouseCapture {
     UI,
@@ -7012,19 +7020,55 @@ impl TermWindow {
                         16 * 1024,
                     ) {
                         promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                            let previous_workspace = mux.active_workspace();
+                            let requested_workspace = name.clone();
                             mux.set_active_workspace(&name);
                             reservation
                                 .spawn_local(async move {
-                                    if let Err(err) = crate::spawn::spawn_command_internal(
+                                    let result = crate::spawn::spawn_command_internal(
                                         spawn,
                                         SpawnWhere::NewWindow,
                                         size,
                                         Some(src_window_id),
                                         term_config,
                                     )
-                                    .await
-                                    {
-                                        log::error!("Failed to spawn: {:#}", err);
+                                    .await;
+                                    if let Err(err) = result {
+                                        let message = crate::bounded_gui_failure_message(
+                                            "Failed to create workspace",
+                                            &err,
+                                        );
+                                        frankenterm_gui::gui_debug_log::record(
+                                            log::Level::Error,
+                                            "frankenterm_gui::workspace_spawn",
+                                            message.clone(),
+                                        );
+                                        log::error!("{message}");
+                                        persistent_toast_notification(
+                                            "Workspace creation failed",
+                                            &message,
+                                        );
+                                        let Some(mux) = Mux::try_get() else {
+                                            drop(activity);
+                                            return;
+                                        };
+                                        let requested_workspace_has_windows = !mux
+                                            .iter_windows_in_workspace(&requested_workspace)
+                                            .is_empty();
+                                        if !requested_workspace_has_windows {
+                                            // Do not overwrite a newer operator selection while
+                                            // this asynchronous spawn was pending. Roll back only
+                                            // if the failed request still owns the active value.
+                                            if should_restore_workspace_after_failed_spawn(
+                                                &mux.active_workspace(),
+                                                &requested_workspace,
+                                                requested_workspace_has_windows,
+                                            ) {
+                                                mux.set_active_workspace(&previous_workspace);
+                                            }
+                                            drop(activity);
+                                            return;
+                                        }
                                     }
                                     switcher.do_switch();
                                     drop(activity);
@@ -7032,8 +7076,17 @@ impl TermWindow {
                                 .detach();
                         }
                         rejected => {
-                            let message = format!(
-                                "main-thread scheduler rejected workspace `{name}` creation before activation: {rejected:?}"
+                            let error = anyhow!(
+                                "main-thread scheduler rejected creation before activation: {rejected:?}"
+                            );
+                            let message = crate::bounded_gui_failure_message(
+                                &format!("Failed to create workspace `{name}`"),
+                                &error,
+                            );
+                            frankenterm_gui::gui_debug_log::record(
+                                log::Level::Error,
+                                "frankenterm_gui::workspace_spawn",
+                                message.clone(),
                             );
                             log::error!("{message}");
                             persistent_toast_notification("Workspace switch failed", &message);
@@ -7079,8 +7132,15 @@ impl TermWindow {
                                 .await;
 
                                 if let Err(err) = result {
-                                    let message = format!(
-                                        "failed to attach domain `{domain_name}` to window {window}: {err:#}"
+                                    let message = crate::domain_connection_failure_message(
+                                        &domain_name,
+                                        &err,
+                                        crate::DomainConnectionRecovery::ExistingWindow,
+                                    );
+                                    frankenterm_gui::gui_debug_log::record(
+                                        log::Level::Error,
+                                        "frankenterm_gui::manual_domain_attach",
+                                        message.clone(),
                                     );
                                     log::error!("{message}");
                                     persistent_toast_notification("Domain attach failed", &message);
@@ -7089,8 +7149,18 @@ impl TermWindow {
                             .detach();
                     }
                     rejected => {
-                        let message = format!(
-                            "main-thread scheduler rejected domain `{domain_name}` attach before mutation: {rejected:?}"
+                        let error = anyhow!(
+                            "main-thread scheduler rejected attach before mutation: {rejected:?}"
+                        );
+                        let message = crate::domain_connection_failure_message(
+                            &domain_name,
+                            &error,
+                            crate::DomainConnectionRecovery::ExistingWindow,
+                        );
+                        frankenterm_gui::gui_debug_log::record(
+                            log::Level::Error,
+                            "frankenterm_gui::manual_domain_attach",
+                            message.clone(),
                         );
                         log::error!("{message}");
                         persistent_toast_notification("Domain attach failed", &message);
@@ -8358,6 +8428,25 @@ mod tests {
         webgpu_repair_failure_stage,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn failed_workspace_spawn_rolls_back_only_its_own_empty_selection() {
+        assert!(super::should_restore_workspace_after_failed_spawn(
+            "requested",
+            "requested",
+            false,
+        ));
+        assert!(!super::should_restore_workspace_after_failed_spawn(
+            "newer-operator-selection",
+            "requested",
+            false,
+        ));
+        assert!(!super::should_restore_workspace_after_failed_spawn(
+            "requested",
+            "requested",
+            true,
+        ));
+    }
 
     #[test]
     fn pane_removed_gui_cleanup_fails_closed_without_exact_deferred_authority() {

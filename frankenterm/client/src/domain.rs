@@ -3823,55 +3823,62 @@ impl Domain for ClientDomain {
             let ui = ui.clone();
             let mux = Arc::clone(mux);
             async move {
-                let mut cloned_ui = ui.clone();
-                let mux_owner = Arc::downgrade(&mux);
-                let client = spawn_into_new_thread(move || match &config {
-                    ClientDomainConfig::Unix(unix) => {
-                        let initial = true;
-                        let no_auto_start = false;
-                        Client::new_unix_domain(
-                            Some(domain_id),
-                            unix,
-                            initial,
-                            &mut cloned_ui,
-                            no_auto_start,
-                            mux_owner,
-                        )
-                    }
-                    ClientDomainConfig::Tls(tls) => {
-                        Client::new_tls(domain_id, tls, &mut cloned_ui, mux_owner)
-                    }
-                    ClientDomainConfig::Ssh(ssh) => {
-                        Client::new_ssh(domain_id, ssh, &mut cloned_ui, mux_owner)
-                    }
-                })
-                .await?;
-
-                ui.output_str("Checking server version\n");
-                let rpc = client.bootstrap_rpc_scope();
-                let mut abort_guard = rpc
-                    .abort_guard("initial mux RPC bootstrap failed, timed out, or was cancelled")?;
                 let result = with_mux_rpc_bootstrap_timeout(async {
-                    client.verify_version_compat_with_scope(&ui, &rpc).await?;
+                    let mut cloned_ui = ui.clone();
+                    let mux_owner = Arc::downgrade(&mux);
+                    let client = spawn_into_new_thread(move || match &config {
+                        ClientDomainConfig::Unix(unix) => {
+                            let initial = true;
+                            let no_auto_start = false;
+                            Client::new_unix_domain(
+                                Some(domain_id),
+                                unix,
+                                initial,
+                                &mut cloned_ui,
+                                no_auto_start,
+                                mux_owner,
+                            )
+                        }
+                        ClientDomainConfig::Tls(tls) => {
+                            Client::new_tls(domain_id, tls, &mut cloned_ui, mux_owner)
+                        }
+                        ClientDomainConfig::Ssh(ssh) => {
+                            Client::new_ssh(domain_id, ssh, &mut cloned_ui, mux_owner)
+                        }
+                    })
+                    .await?;
 
-                    ui.output_str("Version check OK!  Requesting coherent topology snapshot...\n");
-                    ClientDomain::finish_attach(
-                        &mux,
-                        domain_id,
-                        client,
-                        rpc,
-                        &abort_guard,
-                        InitialAttachmentRequest {
-                            owner_client_id,
-                            primary_window_id: window_id,
-                        },
-                    )
-                    .await
+                    ui.output_str("Checking server version\n");
+                    let rpc = client.bootstrap_rpc_scope();
+                    let mut abort_guard = rpc.abort_guard(
+                        "initial mux RPC bootstrap failed, timed out, or was cancelled",
+                    )?;
+                    let attach_result = async {
+                        client.verify_version_compat_with_scope(&ui, &rpc).await?;
+
+                        ui.output_str(
+                            "Version check OK!  Requesting coherent topology snapshot...\n",
+                        );
+                        ClientDomain::finish_attach(
+                            &mux,
+                            domain_id,
+                            client,
+                            rpc,
+                            &abort_guard,
+                            InitialAttachmentRequest {
+                                owner_client_id,
+                                primary_window_id: window_id,
+                            },
+                        )
+                        .await
+                    }
+                    .await;
+                    if attach_result.is_ok() {
+                        abort_guard.disarm();
+                    }
+                    attach_result
                 })
                 .await;
-                if result.is_ok() {
-                    abort_guard.disarm();
-                }
                 result
             }
         })

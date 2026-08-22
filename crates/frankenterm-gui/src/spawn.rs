@@ -83,7 +83,12 @@ pub fn spawn_command_impl(
                         spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config)
                             .await
                     {
-                        let message = format!("Failed to spawn: {err:#}");
+                        let message = crate::bounded_gui_failure_message("Failed to spawn", &err);
+                        frankenterm_gui::gui_debug_log::record(
+                            log::Level::Error,
+                            "frankenterm_gui::domain_spawn",
+                            message.clone(),
+                        );
                         log::error!("{message}");
                         persistent_toast_notification("Domain spawn failed", &message);
                     }

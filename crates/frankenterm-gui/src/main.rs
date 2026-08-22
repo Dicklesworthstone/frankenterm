@@ -39,6 +39,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
@@ -96,6 +97,17 @@ mod uniforms;
 mod update;
 mod utilsprites;
 use frankenterm_gui::window_state_persist;
+
+static AUTO_CONNECT_ENABLED: AtomicBool = AtomicBool::new(false);
+static AUTO_CONNECT_STARTUP_READY: AtomicBool = AtomicBool::new(false);
+static AUTO_CONNECT_SUPERVISOR_GENERATION: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// One process-local owner for the retry task. Replacing this handle drops
+    /// and cancels the old future immediately, releasing both its exact domain
+    /// operation guard and its task-lifetime scheduler admission permit.
+    static AUTO_CONNECT_SUPERVISOR_TASK: std::cell::RefCell<Option<promise::spawn::Task<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -492,7 +504,22 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
                 reservation
                     .spawn(async move {
                         if let Err(err) = update_mux_domains(&config::configuration()) {
-                            log::error!("Error updating mux domains: {:#}", err);
+                            let message = bounded_gui_failure_message(
+                                "Failed to update mux domains after configuration reload",
+                                &err,
+                            );
+                            frankenterm_gui::gui_debug_log::record(
+                                log::Level::Error,
+                                "frankenterm_gui::domain_config_reload",
+                                message.clone(),
+                            );
+                            log::error!("{message}");
+                            persistent_toast_notification(
+                                "Domain configuration reload failed",
+                                &message,
+                            );
+                        } else if AUTO_CONNECT_ENABLED.load(Ordering::Acquire) {
+                            schedule_auto_connect_domains();
                         }
                     })
                     .detach();
@@ -525,6 +552,81 @@ fn have_panes_in_domain_and_ws(
     window_ids
         .into_iter()
         .any(|window_id| mux.window_has_panes_in_domain(window_id, domain.domain_id()))
+}
+
+async fn populate_local_recovery_window_after_remote_failure(
+    mux: &Arc<Mux>,
+    failed_domain: &DomainOperationGuard,
+    window_id: mux::window::WindowId,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let client = failed_domain
+        .downcast_ref::<ClientDomain>()
+        .context("local recovery policy requires a failed client domain")?;
+    let message = domain_connection_failure_message(
+        failed_domain.domain_name(),
+        error,
+        configured_remote_recovery(
+            client.connect_automatically(),
+            AUTO_CONNECT_ENABLED.load(Ordering::Acquire),
+        ),
+    );
+    frankenterm_gui::gui_debug_log::record(
+        log::Level::Error,
+        "frankenterm_gui::remote_domain_recovery",
+        message.clone(),
+    );
+    log::error!("{message}");
+    persistent_toast_notification("Remote domain unavailable", &message);
+
+    let recovery_domain = mux
+        .get_domain_by_name("local")
+        .context("local recovery domain is not available after remote attach failure")?;
+    let config = config::configuration();
+    let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
+    crate::spawn::attach_domain_to_window_or_spawn_recovery(
+        &recovery_domain,
+        window_id,
+        None,
+        None,
+        dpi as u32,
+    )
+    .await
+    .context("spawning local recovery shell after remote attach failure")?;
+    trigger_and_log_gui_attached(MuxDomain(recovery_domain.domain_id())).await;
+    Ok(())
+}
+
+async fn preserve_or_populate_window_after_remote_failure(
+    mux: &Arc<Mux>,
+    failed_domain: &DomainOperationGuard,
+    window_id: mux::window::WindowId,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    if mux.window_has_panes_in_domain(window_id, failed_domain.domain_id()) {
+        let message = domain_connection_failure_message(
+            failed_domain.domain_name(),
+            error,
+            DomainConnectionRecovery::ExistingWindow,
+        );
+        frankenterm_gui::gui_debug_log::record(
+            log::Level::Error,
+            "frankenterm_gui::remote_domain_recovery",
+            message.clone(),
+        );
+        log::error!("{message}");
+        persistent_toast_notification("Remote domain partially opened", &message);
+        trigger_and_log_gui_attached(MuxDomain(failed_domain.domain_id())).await;
+        Ok(())
+    } else {
+        populate_local_recovery_window_after_remote_failure(
+            mux,
+            failed_domain,
+            window_id,
+            error,
+        )
+        .await
+    }
 }
 
 async fn spawn_tab_in_domain_if_mux_is_empty(
@@ -561,26 +663,378 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 
     let config = config::configuration();
     let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
-    crate::spawn::attach_domain_to_window_or_spawn_recovery(
+    if let Err(error) = crate::spawn::attach_domain_to_window_or_spawn_recovery(
         &domain, window_id, cmd, None, dpi as u32,
     )
-    .await?;
+    .await
+    {
+        if domain.downcast_ref::<ClientDomain>().is_some() {
+            preserve_or_populate_window_after_remote_failure(
+                &mux, &domain, window_id, &error,
+            )
+            .await?;
+            return Ok(());
+        }
+        return Err(error);
+    }
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
     Ok(())
 }
 
-async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
-    let mux = Mux::try_get().context("mux singleton is not available")?;
-    let domains = mux.iter_domains();
-    for dom in domains {
-        if let Some(dom) = dom.downcast_ref::<ClientDomain>() {
-            if dom.connect_automatically() {
-                let owner_client_id = mux.active_identity();
-                dom.attach(&mux, owner_client_id, None).await?;
-            }
+async fn attempt_independent_auto_connects<I, A, F>(
+    domain_names: I,
+    mut attach: A,
+) -> Vec<(String, anyhow::Error)>
+where
+    I: IntoIterator<Item = String>,
+    A: FnMut(String) -> F,
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    use futures::StreamExt as _;
+
+    const MAX_CONCURRENT_AUTO_CONNECTS: usize = 4;
+
+    let mut failures = Vec::new();
+    let mut attempts = futures::stream::iter(domain_names)
+        .map(move |name| {
+            let future = attach(name.clone());
+            async move { (name, future.await) }
+        })
+        .buffer_unordered(MAX_CONCURRENT_AUTO_CONNECTS);
+    while let Some((name, result)) = attempts.next().await {
+        if let Err(error) = result {
+            failures.push((name, error));
         }
     }
-    Ok(())
+    failures
+}
+
+fn auto_connect_domain_names(mux: &Arc<Mux>) -> Vec<String> {
+    mux.iter_domains()
+        .into_iter()
+        .filter_map(|domain| {
+            domain
+                .downcast_ref::<ClientDomain>()
+                .filter(|client| client.connect_automatically())
+                .map(|_| domain.domain_name().to_string())
+        })
+        .collect()
+}
+
+async fn attempt_auto_connect_round(
+    mux: &Arc<Mux>,
+    domain_names: Vec<String>,
+) -> Vec<(String, anyhow::Error)> {
+    attempt_independent_auto_connects(domain_names, {
+        let mux = Arc::clone(mux);
+        move |domain_name| {
+            let mux = Arc::clone(&mux);
+            async move {
+                let Some(domain) = mux.get_domain_by_name(&domain_name) else {
+                    // A config reload retired this name. The newer supervisor
+                    // generation owns whatever replaced it, so this attempt is
+                    // complete rather than retryable.
+                    return Ok(());
+                };
+                let Some(client) = domain.downcast_ref::<ClientDomain>() else {
+                    return Ok(());
+                };
+                if !client.connect_automatically() {
+                    return Ok(());
+                }
+                let owner_client_id = mux.active_identity();
+                domain.attach(&mux, owner_client_id, None).await
+            }
+        }
+    })
+    .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DomainConnectionRecovery {
+    AutomaticRetry,
+    LocalRecoveryShell,
+    ExistingWindow,
+    NoRecovery,
+}
+
+fn configured_remote_recovery(
+    connect_automatically: bool,
+    supervisor_enabled: bool,
+) -> DomainConnectionRecovery {
+    if connect_automatically && supervisor_enabled {
+        DomainConnectionRecovery::AutomaticRetry
+    } else {
+        DomainConnectionRecovery::LocalRecoveryShell
+    }
+}
+
+struct BoundedErrorWriter {
+    text: String,
+    remaining: usize,
+}
+
+impl std::fmt::Write for BoundedErrorWriter {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if self.remaining == 0 {
+            return Err(std::fmt::Error);
+        }
+        let mut retained_len = value.len().min(self.remaining);
+        while !value.is_char_boundary(retained_len) {
+            retained_len -= 1;
+        }
+        self.text.push_str(&value[..retained_len]);
+        self.remaining -= retained_len;
+        if retained_len == value.len() {
+            Ok(())
+        } else {
+            Err(std::fmt::Error)
+        }
+    }
+}
+
+fn bounded_gui_error_detail(error: &anyhow::Error) -> String {
+    use frankenterm_core::output::sanitize_redact_truncate_bounded;
+    use frankenterm_core::policy::Redactor;
+    use std::fmt::Write as _;
+
+    let mut rendered_error = BoundedErrorWriter {
+        text: String::with_capacity(4_096),
+        remaining: 4_096,
+    };
+    let _ = write!(&mut rendered_error, "{error:#}");
+    let redactor = Redactor::new();
+    sanitize_redact_truncate_bounded(&rendered_error.text, 320, 1_152, |text| {
+        redactor.redact(text)
+    })
+}
+
+fn bounded_gui_failure_message(summary: &str, error: &anyhow::Error) -> String {
+    use frankenterm_core::output::sanitize_redact_truncate_bounded;
+    use frankenterm_core::policy::Redactor;
+
+    let redactor = Redactor::new();
+    let safe_summary = sanitize_redact_truncate_bounded(summary, 128, 384, |text| {
+        redactor.redact(text)
+    });
+    format!("{safe_summary}: {}", bounded_gui_error_detail(error))
+}
+
+fn domain_connection_failure_message(
+    domain_name: &str,
+    error: &anyhow::Error,
+    recovery: DomainConnectionRecovery,
+) -> String {
+    use frankenterm_core::output::sanitize_redact_truncate_bounded;
+    use frankenterm_core::policy::Redactor;
+    let redactor = Redactor::new();
+    let safe_domain = sanitize_redact_truncate_bounded(domain_name, 96, 256, |text| {
+        redactor.redact(text)
+    });
+    let safe_error = bounded_gui_error_detail(error);
+    let recovery = match recovery {
+        DomainConnectionRecovery::AutomaticRetry => {
+            "GUI startup will continue and the domain will retry automatically after its remote mux is available"
+        }
+        DomainConnectionRecovery::LocalRecoveryShell => {
+            "GUI startup will continue in a local recovery shell; retry the domain after its remote mux is available"
+        }
+        DomainConnectionRecovery::ExistingWindow => {
+            "the current window remains usable; retry the domain after its remote mux is available"
+        }
+        DomainConnectionRecovery::NoRecovery => {
+            "the requested domain could not be opened"
+        }
+    };
+    format!("connection to domain `{safe_domain}` failed; {recovery}: {safe_error}")
+}
+
+async fn supervise_auto_connect_domains(
+    mux: Arc<Mux>,
+    generation: u64,
+    mut pending: Vec<String>,
+) {
+    let mut round = 0_u64;
+    let mut retry_delay = std::time::Duration::from_secs(1);
+    const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    while !pending.is_empty()
+        && AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
+        && AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire) == generation
+    {
+        let Some(next_round) = round.checked_add(1) else {
+            let message = "automatic domain connection retry counter exhausted; refusing to wrap retry identity";
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Error,
+                "frankenterm_gui::auto_connect",
+                message,
+            );
+            log::error!("{message}");
+            persistent_toast_notification("Domain auto-connect unavailable", message);
+            return;
+        };
+        round = next_round;
+        let failures = attempt_auto_connect_round(&mux, pending).await;
+        if AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if failures.is_empty() {
+            return;
+        }
+
+        pending = Vec::with_capacity(failures.len());
+        let mut first_round_toast = None;
+        for (domain_name, error) in failures {
+            pending.push(domain_name.clone());
+            if round == 1 || round % 20 == 0 {
+                // Auto-connect is independent per exact configured domain. A
+                // single unavailable or mixed-version remote used to abort the
+                // loop and surrounding GUI startup, so later domains were not
+                // attempted and no normal window was published. Persist the
+                // first failure and sparse reminders without creating an
+                // unbounded high-frequency diagnostic stream.
+                let message = domain_connection_failure_message(
+                    &domain_name,
+                    &error,
+                    DomainConnectionRecovery::AutomaticRetry,
+                );
+                frankenterm_gui::gui_debug_log::record(
+                    log::Level::Error,
+                    "frankenterm_gui::auto_connect",
+                    message.clone(),
+                );
+                log::error!("{message}");
+                if round == 1 && first_round_toast.is_none() {
+                    first_round_toast = Some(message);
+                }
+            }
+        }
+        if let Some(message) = first_round_toast {
+            persistent_toast_notification("Domain auto-connect failures", &message);
+        }
+
+        promise::spawn::sleep(auto_connect_retry_delay(
+            retry_delay,
+            generation,
+            round,
+        ))
+        .await;
+        retry_delay = retry_delay.saturating_mul(2).min(MAX_RETRY_DELAY);
+    }
+}
+
+fn auto_connect_retry_delay(
+    ceiling: std::time::Duration,
+    generation: u64,
+    round: u64,
+) -> std::time::Duration {
+    auto_connect_retry_delay_with_process_id(
+        ceiling,
+        generation,
+        round,
+        std::process::id(),
+    )
+}
+
+fn auto_connect_retry_delay_with_process_id(
+    ceiling: std::time::Duration,
+    generation: u64,
+    round: u64,
+    process_id: u32,
+) -> std::time::Duration {
+    let ceiling_ms = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
+    if ceiling_ms <= 1 {
+        return ceiling;
+    }
+    let jitter_width = (ceiling_ms / 4).max(1);
+    let mixed = generation
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(17)
+        ^ round.wrapping_mul(0xbf58_476d_1ce4_e5b9).rotate_left(31)
+        ^ u64::from(process_id).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let jitter = mixed % jitter_width.saturating_add(1);
+    std::time::Duration::from_millis(ceiling_ms.saturating_sub(jitter))
+}
+
+fn cancel_auto_connect_supervisor() {
+    let previous = AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take());
+    // Drop only after releasing the RefCell borrow. Cancellation may dispose
+    // future-owned domain guards and scheduler permits synchronously.
+    drop(previous);
+}
+
+const fn auto_connect_supervisor_may_schedule(enabled: bool, startup_ready: bool) -> bool {
+    enabled && startup_ready
+}
+
+fn schedule_auto_connect_domains() {
+    if !auto_connect_supervisor_may_schedule(
+        AUTO_CONNECT_ENABLED.load(Ordering::Acquire),
+        AUTO_CONNECT_STARTUP_READY.load(Ordering::Acquire),
+    ) {
+        cancel_auto_connect_supervisor();
+        return;
+    }
+    let Some(mux) = Mux::try_get() else {
+        log::error!("cannot schedule domain auto-connect without the mux singleton");
+        // A previously scheduled task owns an Arc to its mux generation. Do
+        // not leave that retired topology retrying merely because the process
+        // singleton disappeared before this replacement attempt.
+        cancel_auto_connect_supervisor();
+        return;
+    };
+    let pending = auto_connect_domain_names(&mux);
+    if pending.is_empty() {
+        cancel_auto_connect_supervisor();
+        return;
+    }
+    match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Background,
+        32 * 1024,
+    ) {
+        promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+            let generation = match AUTO_CONNECT_SUPERVISOR_GENERATION.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| current.checked_add(1),
+            ) {
+                Ok(previous) => previous + 1,
+                Err(_) => {
+                    let message = "automatic domain connection generation exhausted; preserving the current supervisor rather than reviving an ambiguous retired generation";
+                    frankenterm_gui::gui_debug_log::record(
+                        log::Level::Error,
+                        "frankenterm_gui::auto_connect",
+                        message,
+                    );
+                    log::error!("{message}");
+                    persistent_toast_notification("Domain auto-connect unavailable", message);
+                    return;
+                }
+            };
+            let task = reservation
+                .spawn_local(supervise_auto_connect_domains(mux, generation, pending))
+                .into_task();
+            AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| {
+                let replaced = slot.borrow_mut().replace(task);
+                // Replacement is intentional: the successor already owns a
+                // fresh generation and scheduler permit, so only now is it
+                // safe to cancel the prior supervisor.
+                drop(replaced);
+            });
+        }
+        rejected => {
+            let message = format!(
+                "main-thread scheduler rejected automatic domain connections before task construction: {rejected:?}; GUI startup will continue, any existing supervisor remains active, and a config reload or manual domain open can retry"
+            );
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Error,
+                "frankenterm_gui::auto_connect",
+                message.clone(),
+            );
+            log::error!("{message}");
+            persistent_toast_notification("Domain auto-connect unavailable", &message);
+        }
+    }
 }
 
 async fn trigger_gui_startup(
@@ -643,7 +1097,10 @@ fn log_gui_hook_result(event_name: &str, result: anyhow::Result<bool>) {
             log::warn!("{message}");
         }
         Err(err) => {
-            let message = format!("while processing {event_name} event: {err:#}");
+            let message = bounded_gui_failure_message(
+                &format!("while processing {event_name} event"),
+                &err,
+            );
             frankenterm_gui::gui_debug_log::record(
                 log::Level::Error,
                 "frankenterm_gui::lua",
@@ -697,10 +1154,6 @@ async fn async_run_terminal_gui(
         log::warn!("{:#}", err);
     }
 
-    if !opts.no_auto_connect {
-        connect_to_auto_connect_domains().await?;
-    }
-
     let spawn_command = match &cmd {
         Some(cmd) => Some(SpawnCommand::from_command_builder(cmd)?),
         None => None,
@@ -746,29 +1199,55 @@ async fn async_run_terminal_gui(
                 *builder
             };
 
-            let owner_client_id = mux.active_identity();
-            domain
-                .attach(&mux, owner_client_id, Some(window_id))
-                .await?;
-            let config = config::configuration();
-            let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
-            let tab = domain
-                .spawn(
-                    &mux,
-                    config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
-                    cmd.clone(),
-                    None,
-                    window_id,
-                )
-                .await?;
-            mux.activate_tab_exact_in_window(window_id, &tab, false)
-                .with_context(|| {
-                    format!(
-                        "domain `{}` spawned tab {}, but window {window_id} does not contain the exact registered tab",
-                        domain.domain_name(),
-                        tab.tab_id()
+            let remote_open_result = async {
+                let owner_client_id = mux.active_identity();
+                domain
+                    .attach(&mux, owner_client_id, Some(window_id))
+                    .await?;
+                let config = config::configuration();
+                let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
+                let tab = domain
+                    .spawn(
+                        &mux,
+                        config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
+                        cmd.clone(),
+                        None,
+                        window_id,
                     )
-                })?;
+                    .await?;
+                mux.activate_tab_exact_in_window(window_id, &tab, false)
+                    .with_context(|| {
+                        format!(
+                            "domain `{}` spawned tab {}, but window {window_id} does not contain the exact registered tab",
+                            domain.domain_name(),
+                            tab.tab_id()
+                        )
+                    })?;
+                Result::<(), anyhow::Error>::Ok(())
+            }
+            .await;
+
+            if let Err(error) = remote_open_result {
+                if domain.downcast_ref::<ClientDomain>().is_some() {
+                    // An explicitly requested remote domain must not leave an
+                    // inert empty window or terminate the whole GUI when its
+                    // mux is temporarily unavailable or still on an older
+                    // codec. Populate the already-published window with a
+                    // local recovery shell; the independent auto-connect
+                    // supervisor keeps retrying configured auto domains and
+                    // will publish their recovered topology after success.
+                    preserve_or_populate_window_after_remote_failure(
+                        &mux, domain, window_id, &error,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                return Err(anyhow!(domain_connection_failure_message(
+                    domain.domain_name(),
+                    &error,
+                    DomainConnectionRecovery::NoRecovery,
+                )));
+            }
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
@@ -1127,6 +1606,11 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     initialize_window_state_persistence();
 
     let gui = crate::frontend::try_new()?;
+    // Config reload is subscribed before the asynchronous startup transaction
+    // settles. Keep reload callbacks from starting a retry generation against
+    // an unpublished or ultimately failed initial topology.
+    AUTO_CONNECT_STARTUP_READY.store(false, Ordering::Release);
+    AUTO_CONNECT_ENABLED.store(!opts.no_auto_connect, Ordering::Release);
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
     let activity = Activity::new_for_mux(&mux);
 
@@ -1141,8 +1625,12 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     };
     startup_reservation
         .spawn_local(async move {
-            if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
-                terminate_with_error(err);
+            match async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
+                Ok(()) => {
+                    AUTO_CONNECT_STARTUP_READY.store(true, Ordering::Release);
+                    schedule_auto_connect_domains();
+                }
+                Err(err) => terminate_with_error(err),
             }
             drop(activity);
         })
@@ -1238,12 +1726,22 @@ fn terminate_with_error_message(err: &str) -> ! {
 }
 
 fn terminate_with_error(err: anyhow::Error) -> ! {
-    let mut err_text = format!("{err:#}");
+    let mut err_text = bounded_gui_failure_message("FrankenTerm startup failed", &err);
 
     let warnings = config::configuration_warnings_and_errors();
     if !warnings.is_empty() {
-        let err = warnings.join("\n");
-        err_text = format!("{err_text}\nConfiguration Error: {err}");
+        use frankenterm_core::output::sanitize_redact_truncate_bounded;
+        use frankenterm_core::policy::Redactor;
+
+        let redactor = Redactor::new();
+        let warning_text = warnings.join("\n");
+        let safe_warnings = sanitize_redact_truncate_bounded(
+            &warning_text,
+            512,
+            1_600,
+            |text| redactor.redact(text),
+        );
+        err_text = format!("{err_text}\nConfiguration error: {safe_warnings}");
     }
 
     terminate_with_error_message(&err_text)
@@ -1318,6 +1816,205 @@ fn maybe_show_configuration_error_window() {
 mod tests {
     use super::*;
     use frankenterm_core::macos_backend_select::{BackendFallbackReason, MacosBackend};
+
+    #[test]
+    fn auto_connect_failure_does_not_skip_later_independent_domains() {
+        let attempted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempted_by_attach = Arc::clone(&attempted);
+        let failures = futures::executor::block_on(attempt_independent_auto_connects(
+            ["domain-1", "domain-2", "domain-4"].map(str::to_string),
+            move |domain_name| {
+                let attempted = Arc::clone(&attempted_by_attach);
+                async move {
+                    attempted
+                        .lock()
+                        .expect("record auto-connect attempt")
+                        .push(domain_name.clone());
+                    if domain_name == "domain-1" {
+                        anyhow::bail!("planted first-domain failure");
+                    }
+                    Ok(())
+                }
+            },
+        ));
+
+        let mut attempted = attempted
+            .lock()
+            .expect("read auto-connect attempts")
+            .clone();
+        attempted.sort();
+        assert_eq!(
+            attempted,
+            vec!["domain-1", "domain-2", "domain-4"],
+            "a failed first domain must not suppress later configured auto-connect domains"
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "domain-1");
+        assert!(failures[0].1.to_string().contains("planted first-domain"));
+    }
+
+    #[test]
+    fn auto_connect_constructs_only_the_bounded_active_frontier() {
+        use std::future::Future as _;
+
+        let constructed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let constructed_by_attach = Arc::clone(&constructed);
+        let attempts = attempt_independent_auto_connects(
+            (0..32).map(|index| format!("domain-{index}")),
+            move |_domain_name| {
+                constructed_by_attach.fetch_add(1, Ordering::AcqRel);
+                futures::future::pending::<anyhow::Result<()>>()
+            },
+        );
+        futures::pin_mut!(attempts);
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            attempts.as_mut().poll(&mut context),
+            std::task::Poll::Pending
+        ));
+        let constructed = constructed.load(Ordering::Acquire);
+        assert!(
+            (1..=4).contains(&constructed),
+            "only the bounded active frontier may construct connection futures, got {constructed}"
+        );
+    }
+
+    #[test]
+    fn failed_auto_connect_name_can_be_retried_without_replaying_successes() {
+        let attempts = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
+        let attempts_by_attach = Arc::clone(&attempts);
+        let first_failures = futures::executor::block_on(attempt_independent_auto_connects(
+            ["domain-1", "domain-2"].map(str::to_string),
+            move |domain_name| {
+                let attempts = Arc::clone(&attempts_by_attach);
+                async move {
+                    let mut attempts = attempts.lock().expect("record auto-connect attempt");
+                    let count = attempts.entry(domain_name.clone()).or_default();
+                    *count += 1;
+                    if domain_name == "domain-1" && *count == 1 {
+                        anyhow::bail!("planted transient incompatibility");
+                    }
+                    Ok(())
+                }
+            },
+        ));
+        assert_eq!(first_failures.len(), 1);
+        let retry_names = first_failures
+            .into_iter()
+            .map(|(name, _error)| name)
+            .collect::<Vec<_>>();
+
+        let attempts_by_retry = Arc::clone(&attempts);
+        let second_failures = futures::executor::block_on(attempt_independent_auto_connects(
+            retry_names,
+            move |domain_name| {
+                let attempts = Arc::clone(&attempts_by_retry);
+                async move {
+                    *attempts
+                        .lock()
+                        .expect("record auto-connect retry")
+                        .entry(domain_name)
+                        .or_default() += 1;
+                    Ok(())
+                }
+            },
+        ));
+
+        assert!(second_failures.is_empty());
+        let attempts = attempts.lock().expect("read auto-connect attempt counts");
+        assert_eq!(attempts.get("domain-1"), Some(&2));
+        assert_eq!(
+            attempts.get("domain-2"),
+            Some(&1),
+            "a successful domain must leave the retry set"
+        );
+    }
+
+    #[test]
+    fn auto_connect_retry_jitter_is_deterministic_bounded_and_nonzero() {
+        let ceiling = std::time::Duration::from_secs(30);
+        let first = auto_connect_retry_delay_with_process_id(ceiling, 7, 11, 101);
+        let repeated = auto_connect_retry_delay_with_process_id(ceiling, 7, 11, 101);
+        assert_eq!(first, repeated);
+        assert!(first <= ceiling);
+        assert!(first >= std::time::Duration::from_millis(22_500));
+        assert_ne!(
+            auto_connect_retry_delay_with_process_id(ceiling, 7, 11, 101),
+            auto_connect_retry_delay_with_process_id(ceiling, 7, 11, 102),
+            "different desktop processes must de-phase"
+        );
+        assert_eq!(
+            auto_connect_retry_delay(std::time::Duration::from_millis(1), 1, 1),
+            std::time::Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn auto_connect_failure_diagnostic_is_bounded_terminal_safe_and_redacted() {
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let domain = format!("prod\u{1b}]0;forged-title\u{7}{secret}");
+        let oversized = format!("remote failure {secret} {}", "x".repeat(8_192));
+        let error = anyhow!(oversized);
+
+        let message = domain_connection_failure_message(
+            &domain,
+            &error,
+            DomainConnectionRecovery::AutomaticRetry,
+        );
+
+        assert!(message.contains("connection to domain"));
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\u{7}'));
+        assert!(message.len() <= 1_600, "diagnostic exceeded its byte budget");
+
+        let manual_message = domain_connection_failure_message(
+            &domain,
+            &error,
+            DomainConnectionRecovery::LocalRecoveryShell,
+        );
+        assert!(manual_message.contains("local recovery shell"));
+        assert!(!manual_message.contains("retry automatically"));
+        assert!(!manual_message.contains(secret));
+        assert!(!manual_message.contains('\u{1b}'));
+        assert!(
+            manual_message.len() <= 1_600,
+            "manual diagnostic exceeded its byte budget"
+        );
+
+        let existing_window_message = domain_connection_failure_message(
+            &domain,
+            &error,
+            DomainConnectionRecovery::ExistingWindow,
+        );
+        assert!(existing_window_message.contains("current window remains usable"));
+        assert!(!existing_window_message.contains("local recovery shell"));
+        assert!(!existing_window_message.contains(secret));
+        assert!(!existing_window_message.contains('\u{1b}'));
+
+        let generic_message = bounded_gui_failure_message("spawn\u{1b}]0;bad", &error);
+        assert!(generic_message.contains("[REDACTED]"));
+        assert!(!generic_message.contains(secret));
+        assert!(!generic_message.contains('\u{1b}'));
+        assert!(generic_message.len() <= 1_600);
+    }
+
+    #[test]
+    fn disabled_auto_connect_never_promises_an_automatic_retry() {
+        assert_eq!(
+            configured_remote_recovery(true, false),
+            DomainConnectionRecovery::LocalRecoveryShell
+        );
+        assert_eq!(
+            configured_remote_recovery(true, true),
+            DomainConnectionRecovery::AutomaticRetry
+        );
+        assert!(!auto_connect_supervisor_may_schedule(true, false));
+        assert!(!auto_connect_supervisor_may_schedule(false, true));
+        assert!(auto_connect_supervisor_may_schedule(true, true));
+    }
 
     type GuardedStartupFuture = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), futures::channel::oneshot::Canceled>>>,
