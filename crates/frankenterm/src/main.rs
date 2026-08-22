@@ -75190,6 +75190,8 @@ fn sync_capability_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()
 }
 
 fn ensure_private_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+
     if path_contains_parent_component(path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -75223,6 +75225,8 @@ fn ensure_private_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_st
 }
 
 fn open_directory_tree_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+
     if path_contains_parent_component(path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
