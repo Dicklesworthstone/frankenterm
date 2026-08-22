@@ -110,6 +110,7 @@ pub mod client;
 pub mod connui;
 pub mod domain;
 pub mod events;
+pub mod guardian_protocol;
 pub mod layout;
 pub mod localpane;
 pub mod pane;
