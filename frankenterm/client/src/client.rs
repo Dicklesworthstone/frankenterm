@@ -3809,19 +3809,22 @@ impl CurrentClientDispatch {
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[error(
-    "Codec version mismatch: local={} (frankenterm {}), remote={} (frankenterm {}). \
-     The peers' advertised codec compatibility windows do not overlap; \
-     this version transition requires an atomic redeploy. See \
-     docs/codec-atomic-redeploy.md for the operator runbook (server-first \
-     deploy order, expected connection drops, rollback procedure).",
+    "Codec version mismatch: local window {}..={} (frankenterm {}), remote window \
+     {remote_min_supported}..={codec_vers} (frankenterm {version}). The peers' advertised \
+     codec compatibility windows do not overlap. Stage the exact same-release ft + \
+     frankenterm-mux-server process family on the remote, drain its live PTYs, then restart \
+     that mux and retry. If those PTYs cannot be drained yet, roll back the desktop client \
+     to the last release whose codec window includes the remote server; no automatic mux \
+     restart was attempted. See docs/codec-atomic-redeploy.md for the server-first deploy \
+     and rollback runbook.",
+    codec::CODEC_VERSION_MIN_SUPPORTED,
     CODEC_VERSION,
     config::wezterm_version(),
-    codec_vers,
-    version
 )]
 pub struct IncompatibleVersionError {
     pub version: String,
     pub codec_vers: usize,
+    pub remote_min_supported: usize,
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -8319,10 +8322,11 @@ impl Client {
                     info.min_supported,
                 ) {
                     Ok(codec) => codec,
-                    Err(_) => {
+                    Err(compat_error) => {
                         let err = IncompatibleVersionError {
                             version: info.version_string,
                             codec_vers: info.codec_vers,
+                            remote_min_supported: compat_error.remote_min,
                         };
                         ui.output_str(&err.to_string());
                         log::error!("{:?}", err);
@@ -14704,6 +14708,7 @@ mod tests {
         let err = IncompatibleVersionError {
             version: "ft 0.99.99".to_string(),
             codec_vers: 47,
+            remote_min_supported: 46,
         };
         let rendered = err.to_string();
 
@@ -14725,6 +14730,11 @@ mod tests {
             "rendered error missing remote codec_vers (47): {}",
             rendered
         );
+        assert!(
+            rendered.contains("46..=47"),
+            "rendered error missing the complete remote codec window: {}",
+            rendered
+        );
 
         // Remote frankenterm version string must appear so operators
         // can correlate against deploy bundles.
@@ -14741,6 +14751,13 @@ mod tests {
         assert!(
             rendered.contains("docs/codec-atomic-redeploy.md"),
             "rendered error missing docs/codec-atomic-redeploy.md link: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("drain its live PTYs")
+                && rendered.contains("roll back the desktop client")
+                && rendered.contains("no automatic mux restart was attempted"),
+            "rendered error missing safe upgrade/rollback remediation: {}",
             rendered
         );
         assert!(
@@ -14827,6 +14844,7 @@ mod tests {
             .downcast_ref::<IncompatibleVersionError>()
             .expect("codec-window rejection must retain its typed error");
         assert_eq!(rejection.codec_vers, rejected_codec_version);
+        assert_eq!(rejection.remote_min_supported, rejected_codec_version);
         assert_eq!(transcript, ["GetCodecVersion"]);
         assert_eq!(
             rejected_reader_abort.cause(),

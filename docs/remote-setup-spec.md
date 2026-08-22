@@ -129,6 +129,13 @@ previous pair. An active mux is deliberately not restarted: replacing that
 process would terminate every PTY it owns. The command reports that the
 operator must drain those sessions before a deliberate restart.
 
+Before any deliberate restart, run the still-compatible client-side
+`ft session dump --format json` and require a complete, checksum-verified
+artifact. The dump preserves redacted observable pane text and bounded topology
+metadata only. It does not preserve mux-owned PTY descriptors, process memory,
+or running-agent continuity, so it is an additional safety gate rather than
+permission to restart an undrained mux.
+
 ### 7) Install systemd user service for mux
 Service file path:
 ```
@@ -195,6 +202,10 @@ ssh <host> "systemctl --user status frankenterm-mux-server"
 ## Idempotency Rules
 - If WezTerm already installed, skip install.
 - If service file exists and matches expected content, skip rewrite.
+- When `--install-ft` stages a new process family, preserve a differing service
+  unit under a timestamped `previous-*` name and update `ExecStart` to the
+  freshly staged mux-server path. `daemon-reload` changes only the next start;
+  the currently active mux and its PTYs are not restarted.
 - If service is enabled/active, skip enable step.
 - If linger already enabled, skip.
 - Treat `ft` and `frankenterm-mux-server` as one versioned process family;

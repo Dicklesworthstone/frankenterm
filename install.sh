@@ -768,23 +768,16 @@ build_from_source() {
   info "Building ft from source — this takes 10-30+ minutes cold-cache"
   ensure_rust
   command -v git >/dev/null 2>&1 || { err "git is required for --from-source"; exit 1; }
-  # Try the user-specified version first. If that fails (typo, tag doesn't
-  # exist, branch was renamed), preserve any partial clone state and try the
-  # default branch as a last-resort fallback. Moving the failed partial clone
-  # aside gives the second attempt an empty destination without discarding the
-  # first attempt's diagnostic state.
+  # A source fallback must preserve the exact requested release identity. A
+  # typo, missing tag, or transient clone failure must not silently build the
+  # default branch and publish different client/server bytes under the requested
+  # version label.
   if ! git clone --depth 1 --branch "$VERSION" \
        "https://github.com/${OWNER}/${REPO}.git" "$TMP/src" 2>/dev/null; then
-    if [ -e "$TMP/src" ]; then
-      mv "$TMP/src" "$TMP/src.failed-version-clone"
-    fi
-    if ! git clone --depth 1 \
-         "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"; then
-      err "Failed to clone ${OWNER}/${REPO} (tried --branch $VERSION then default)"
-      err "Check network and that https://github.com/${OWNER}/${REPO} exists"
-      exit 1
-    fi
-    warn "Tag/branch '$VERSION' not found; built from default branch instead"
+    err "Failed to clone exact release tag $VERSION from ${OWNER}/${REPO}"
+    err "Refusing to substitute the default branch for an immutable process-family identity."
+    err "Check network connectivity and confirm that the release tag exists."
+    exit 1
   fi
   # Build the CLI and mux server from the same source identity. Remote-domain
   # releases are an atomic process family; a client-only fallback would recreate

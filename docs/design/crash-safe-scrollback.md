@@ -15,11 +15,11 @@ maps them so future operators can reach either via the cross-link.
 
 | Canonical (ft-2okh0.5.x) | Session decomposition | Scope |
 | ------------------------ | --------------------- | ----- |
-| `ft-2okh0.5.1` mmap-backed scrollback (page-aligned, kill-9 survivable) | `ft-kscfg` mmap scrollback file format + write path | Format substrate at `crates/frankenterm-core/src/scrollback_mmap_format.rs` (256-byte header, tagged-length records, 17 round-trip tests). Ingest write-path wiring is in `append_captured_segment_to_mmap_scrollback`; encryption-at-rest remains separate follow-up work. |
-| `ft-2okh0.5.2` recovery protocol on launch | `ft-5te6x` recovery protocol — discover orphan scrollback + session-restore prompt | Orphan scanner at `crates/frankenterm-core/src/scrollback_mmap_recovery.rs` (OrphanState taxonomy, LockProbe trait, production `FlockLockProbe`). CLI commands are present, respect live writer locks, and `ft session recover` reports mmap replay status/counts while writing exact UTF-8 replay chunks into the replacement pane. |
+| `ft-2okh0.5.1` mmap-backed scrollback (page-aligned, kill-9 survivable) | `ft-kscfg` mmap scrollback file format + write path | Format substrate at `crates/frankenterm-core/src/scrollback_mmap_format.rs` (256-byte header and tagged-length records). `append_captured_segment_to_mmap_scrollback` exists and is exercised by tests, but the production runtime capture path does not currently call it; this file must not be represented as a production-wide scrollback guarantee. Encryption-at-rest remains separate follow-up work. |
+| `ft-2okh0.5.2` recovery protocol on launch | `ft-5te6x` recovery protocol — discover orphan scrollback + session-restore prompt | Orphan scanner at `crates/frankenterm-core/src/scrollback_mmap_recovery.rs` (OrphanState taxonomy, LockProbe trait, production `FlockLockProbe`). CLI commands respect live-writer locks. `ft session recover` exports the exact redacted UTF-8 prefix to a private transcript and never writes archived output into a live PTY. Automatic launch recovery and pane attachment are not shipped. |
 | `ft-2okh0.5.3` native tmux control protocol speaker | `ft-hs5f6` native tmux control-protocol speaker (Tier-1 RPC subset) | Wire-format substrate at `crates/frankenterm-core/src/tmux_control_protocol.rs` (TmuxCommand enum, parse_command + TmuxResponse encoder, 29 unit tests). Wired-pass blocker: `ft-l4cef`; current daemon slice probes tmux line protocol, supports live `list-sessions`, `list-windows`, `capture-pane -p -t %<pane_id>`, and `send-keys -t %<pane_id>`, and returns explicit typed `%error` frames for Tier-2 `pipe-pane` / `copy-mode`, while topology/client-lifecycle commands and the notification stream remain pending. `ft-2h56m` closed only the socket-lock/listener slice. |
 | `ft-2okh0.5.4` tmux compatibility test corpus | `ft-53zsr` tmux compatibility matrix verification | Compatibility matrix doc at `docs/term-emulator/tmux-compat-matrix.md` with substrate-pass / wired-pass taxonomy. |
-| `ft-2okh0.5.5` crash-recovery adversarial fuzz — kill-9 stress test corpus | `ft-0ulxc` crash-recovery test fixture: kill -9 mid-session integrity | 7 substrate invariant tests at `crates/frankenterm-core/tests/crash_recovery_kill9.rs` (pre-msync byte safety, pane_uuid continuity, bounded loss, mid-header tear, mid-cursor tear, msync boundary, header-only edge case). The full Unix subprocess harness is `session_recover_replays_sigkill_orphan_into_real_mux` in `crates/frankenterm/tests/cli_contract_tests.rs`: it kills a child mmap writer with SIGKILL, invokes `ft session recover`, and verifies the durable prefix on a hermetic mux pane. |
+| `ft-2okh0.5.5` crash-recovery adversarial fuzz — kill-9 stress test corpus | `ft-0ulxc` crash-recovery test fixture: kill -9 mid-session integrity | Substrate invariant tests at `crates/frankenterm-core/tests/crash_recovery_kill9.rs` cover pre-msync byte safety, pane UUID continuity, bounded loss, torn metadata, and edge cases. The Unix subprocess harness `session_recover_exports_sigkill_orphan_without_mux_mutation` kills a writer with SIGKILL, invokes `ft session recover`, and verifies the durable prefix in a private transcript without starting or mutating a mux. |
 
 This document is the foundational decision record that unblocks
 all sub-bead implementations under both decompositions. It pins
@@ -107,11 +107,15 @@ The `.bin` file is a **fixed-header + ring buffer** layout:
   movement / clear). Bumps to record_kind require a
   format_version bump (the v1 line above).
 
-## Write path contract
+## Substrate write path contract
 
-1. The ingest pipeline writes captured segments through
+The following is the contract implemented by the mmap writer/helper substrate.
+It is not currently a claim about every production capture because the live
+runtime does not call the helper.
+
+1. A caller may write a captured segment through
    `append_captured_segment_to_mmap_scrollback`, which delegates to
-   `MmapScrollback::append`.
+   `MmapScrollback::append`. Current direct callers are tests.
 2. `append` runs the **redactor** (ft-x0666 G10 surface) before
    the mmap write. Secrets never reach disk.
 3. `append` writes into the ring at `write_cursor_bytes`, wraps
@@ -125,9 +129,29 @@ The `.bin` file is a **fixed-header + ring buffer** layout:
 The in-memory ring stays as the read-side fast path. mmap is for
 durability, not access.
 
-## Recovery flow
+## Current production gaps
 
-On ft launch (sub-bead ft-5te6x):
+The standalone mux installs a separate tiered-scrollback spill sink backed by
+`MmapScrollbackStore` under `~/.local/share/ft/scrollback-lines/`. That path is
+useful but does not satisfy this document's complete crash-recovery goal:
+
+- it receives only lines evicted from the terminal hot tier, not the current
+  viewport/hot rows;
+- its file key is derived partly from the mux process ID, so a restarted server
+  cannot authoritatively associate remnants with a stable pane identity;
+- ordinary line appends flush userspace buffers but do not establish an fsync
+  boundary for every admitted line; and
+- there is no production manifest/hydration path that reconstructs terminal
+  parser/render state or reattaches live PTY descriptors after mux death.
+
+`ft session dump` closes the immediate forensic/pre-upgrade content gap by
+capturing all currently readable pane text plus topology metadata. It does not
+close these hot-state or PTY-lifetime gaps.
+
+## Manual orphan-export flow
+
+When an operator invokes the session orphan commands (automatic launch recovery
+is not wired):
 
 1. Scan `~/.local/share/ft/scrollback/` for `.bin` files whose
    `.lock` is absent or whose `flock` succeeds (no live owner).
@@ -136,13 +160,11 @@ On ft launch (sub-bead ft-5te6x):
    - Reapply the redactor (defense in depth — the secrets ledger
      might have grown since the file was written).
    - Surface the orphan via `ft session list-orphans`.
-3. The interactive picker (CLI) lets the operator `recover` or
-   `discard`. Recovered panes get a fresh `pane_id` but the
-   original `pane_uuid` is preserved for downstream identity
-   continuity. Recover reads the mmap file's linear record prefix,
-   reports record/byte/chunk counts in structured output, skips
-   non-UTF-8 records with explicit diagnostics, and replays exact
-   UTF-8 payload chunks without adding synthetic newlines.
+3. The CLI lets the operator `recover` or `discard`. Recover reads the mmap
+   file's linear record prefix, reapplies redaction, reports
+   record/byte/chunk counts, skips non-UTF-8 records with explicit diagnostics,
+   and exports the exact admitted UTF-8 bytes to a new private transcript. It
+   never creates a pane and never sends historical output through PTY input.
 
 ## Redaction + encryption boundary
 
@@ -165,21 +187,19 @@ The kill-9 substrate fixture under `ft-0ulxc` proves:
    `MS_SYNC` and the kill are best-effort; the test asserts the
    loss window is ≤ N appends or M ms (whichever the write-path
    helper enforces).
-3. **Identity continuity**: `pane_uuid` matches across the
-   kill/restart boundary; `pane_id` may change but a downstream
-   `ft session recover` resolves the right slot.
+3. **Identity continuity**: `pane_uuid` matches across the kill/restart
+   boundary and a downstream `ft session recover` resolves the right orphan
+   artifact. No live pane identity continuity is claimed.
 
 The fixture is `cfg(unix)` because SIGKILL semantics are
 POSIX-specific. Windows uses a `TerminateProcess` analog under a
 separate fixture (deferred, not in scope for v1).
 
-The Unix E2E harness under `ft-rlvsz` is gated by
-`FT_REAL_WEZTERM_TESTS=1` because it starts a real mux subprocess.
-It uses isolated `FT_WORKSPACE`, `XDG_DATA_HOME`, and `HOME`,
-waits for a child mmap writer to cross a sync boundary, sends
-SIGKILL to that child, runs the actual `ft session recover
-<pane_uuid> --format json` binary, and polls the recovered pane
-for the durable pre-kill text prefix.
+The Unix E2E harness under `ft-rlvsz` uses isolated `FT_WORKSPACE`,
+`XDG_DATA_HOME`, and `HOME`, waits for a child mmap writer to cross a sync
+boundary, sends SIGKILL to that child, runs the actual `ft session recover
+<pane_uuid> --format json` binary, and verifies the durable pre-kill text prefix
+in the exported transcript. It intentionally starts no mux process.
 
 ## Compatibility constraints
 

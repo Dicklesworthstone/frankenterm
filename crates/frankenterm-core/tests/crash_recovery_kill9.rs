@@ -43,18 +43,18 @@
 //!
 //! The bead's full e2e test now lives in
 //! `crates/frankenterm/tests/cli_contract_tests.rs` as
-//! `session_recover_replays_sigkill_orphan_into_real_mux`: a real
+//! `session_recover_exports_sigkill_orphan_without_mux_mutation`: a real
 //! child-process writer is killed with SIGKILL, `ft session recover
 //! <pane_uuid>` is invoked against isolated FT/XDG roots and a
-//! hermetic mux socket, and the recovered pane surface is polled for
-//! the durable pre-kill prefix.
+//! private transcript path, and the transcript is checked for the durable
+//! pre-kill prefix without starting or mutating a mux.
 //! Truncation is the substrate-level analog of `kill -9`: bytes
 //! that *did* hit `MS_SYNC` correspond to bytes the OS would have
 //! flushed before the kill; bytes after the truncation point
 //! correspond to the in-flight buffer that gets lost.
 //!
 //! This file keeps the byte-level crash-format invariants next to the
-//! format helpers; the CLI/mux subprocess test is intentionally placed
+//! format helpers; the CLI subprocess test is intentionally placed
 //! in the `frankenterm` crate so Cargo builds the real `ft` binary and
 //! the test can invoke that binary instead of a mock command surface.
 //!

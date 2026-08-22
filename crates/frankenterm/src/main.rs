@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Cursor, IsTerminal, Read, Write};
+use std::io::{Cursor, IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -6712,6 +6712,29 @@ enum SessionCommands {
         format: String,
     },
 
+    /// Export a checksummed, redacted snapshot of every live mux pane
+    Dump {
+        /// New output file; existing files are never overwritten
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Maximum number of panes admitted to one dump
+        #[arg(long, default_value_t = 4096)]
+        max_panes: usize,
+
+        /// Maximum aggregate UTF-8 pane-content bytes admitted to one dump
+        #[arg(long, default_value_t = 67_108_864)]
+        max_total_bytes: usize,
+
+        /// Return success even if one or more live panes could not be captured
+        #[arg(long)]
+        allow_partial: bool,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
     /// List crash-safe scrollback files not owned by a live process
     ListOrphans {
         /// Output format: auto, plain, json, or toon
@@ -6719,10 +6742,14 @@ enum SessionCommands {
         format: String,
     },
 
-    /// Attach an orphaned scrollback file to a fresh pane
+    /// Export an orphaned scrollback file without writing it into a live PTY
     Recover {
         /// 64-character pane UUID / scrollback file stem
         pane_uuid: String,
+
+        /// New transcript file; existing files are never overwritten
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
 
         /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
@@ -35092,7 +35119,6 @@ fn runtime_task_join_failure_source(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CapabilityContextSite {
     RobotOperation,
-    SessionRecoveryOperation,
     SemaphoreAcquire,
 }
 
@@ -35100,7 +35126,6 @@ impl CapabilityContextSite {
     const fn cancelled_detail(self) -> &'static str {
         match self {
             Self::RobotOperation => "robot operation cancelled",
-            Self::SessionRecoveryOperation => "session recovery operation cancelled",
             Self::SemaphoreAcquire => "semaphore acquire cancelled",
         }
     }
@@ -35145,38 +35170,6 @@ fn runtime_context_preflight(
 ) -> frankenterm_core::Result<()> {
     cx.checkpoint()
         .map_err(|_| capability_context_failure(operation, cx, site))
-}
-
-fn session_recovery_timeout_failure(
-    operation: &'static str,
-    cx: &frankenterm_core::cx::Cx,
-) -> frankenterm_core::Error {
-    if cx.root_cancel_cause().is_some() {
-        return capability_context_failure(
-            operation,
-            cx,
-            CapabilityContextSite::SessionRecoveryOperation,
-        );
-    }
-
-    // `timeout_with_cx` caps the requested timeout by the Cx deadline but
-    // returns an opaque string for either source. Inspect the content-free
-    // budget snapshot so a Cx deadline/quota remains distinct from the
-    // operation's own timeout without forwarding that string.
-    let budget = cx.budget_stats();
-    let detail = if budget.deadline.at.is_some() && budget.deadline.remaining.is_none() {
-        "capability deadline exceeded"
-    } else if budget.polls.remaining == Some(0) {
-        "capability poll quota exhausted"
-    } else if budget.cost.remaining == Some(0) {
-        "capability cost budget exhausted"
-    } else {
-        "session recovery operation timed out"
-    };
-    frankenterm_core::Error::RuntimeOperation {
-        operation,
-        source: frankenterm_core::error::RuntimeOperationSource::Backend(detail.to_string()),
-    }
 }
 
 fn semaphore_acquire_failure(
@@ -35342,62 +35335,6 @@ fn capability_context_failure_maps_every_cancel_kind_without_reason_text() {
             source: RuntimeOperationSource::Backend(detail),
         } if detail == "capability context failed"
     ));
-}
-
-#[cfg(test)]
-#[test]
-fn session_recovery_timeout_failure_preserves_budget_vs_operation_timeout() {
-    use frankenterm_core::error::RuntimeOperationSource;
-
-    fn assert_timeout_failure(
-        cx: &frankenterm_core::cx::Cx,
-        expected_cancelled: bool,
-        expected_detail: &str,
-    ) {
-        let error = session_recovery_timeout_failure("test.session.timeout", cx);
-        let frankenterm_core::Error::RuntimeOperation { operation, source } = error else {
-            panic!("timeout failure must remain a runtime operation");
-        };
-        assert_eq!(operation, "test.session.timeout");
-        let (actual_cancelled, detail) = match source {
-            RuntimeOperationSource::Cancelled(detail) => (true, detail),
-            RuntimeOperationSource::Backend(detail) => (false, detail),
-            other => panic!("timeout failure must use cancellation/backend: {other:?}"),
-        };
-        assert_eq!(actual_cancelled, expected_cancelled);
-        assert_eq!(detail, expected_detail);
-        assert!(!detail.contains("SECRET"));
-    }
-
-    let operation_timeout = frankenterm_core::cx::for_testing();
-    assert_timeout_failure(
-        &operation_timeout,
-        false,
-        "session recovery operation timed out",
-    );
-
-    let deadline = frankenterm_core::cx::Cx::for_testing_with_budget(
-        frankenterm_core::cx::Budget::new()
-            .with_deadline(frankenterm_core::runtime_async::RuntimeTime::ZERO),
-    );
-    assert_timeout_failure(&deadline, false, "capability deadline exceeded");
-
-    let poll_quota = frankenterm_core::cx::Cx::for_testing_with_budget(
-        frankenterm_core::cx::Budget::new().with_poll_quota(0),
-    );
-    assert_timeout_failure(&poll_quota, false, "capability poll quota exhausted");
-
-    let cost_budget = frankenterm_core::cx::Cx::for_testing_with_budget(
-        frankenterm_core::cx::Budget::new().with_cost_quota(0),
-    );
-    assert_timeout_failure(&cost_budget, false, "capability cost budget exhausted");
-
-    let cancelled = frankenterm_core::cx::for_testing();
-    cancelled.cancel_with(
-        frankenterm_core::outcome::CancelKind::User,
-        Some("SECRET session recovery cancellation reason"),
-    );
-    assert_timeout_failure(&cancelled, true, "session recovery operation cancelled");
 }
 
 async fn robot_list_panes_on_runtime_task(
@@ -74594,6 +74531,69 @@ async fn handle_session_command(
             print_operator_guidance(&guidance);
         }
 
+        SessionCommands::Dump {
+            output,
+            max_panes,
+            max_total_bytes,
+            allow_partial,
+            format,
+        } => {
+            let output_format = resolve_session_orphan_output_format(&format);
+            let output_path = output.unwrap_or_else(default_live_mux_dump_path);
+            let dump = capture_live_mux_dump(config, max_panes, max_total_bytes).await?;
+            let complete = dump
+                .get("complete")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let pane_count = dump
+                .get("panes")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let error_count = dump
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let payload_bytes = serde_json::to_vec(&dump)
+                .map_err(|err| anyhow::anyhow!("Failed to serialize mux dump payload: {err}"))?;
+            let payload_sha256 = sha256_hex(&payload_bytes);
+            let envelope = serde_json::json!({
+                "schema": "frankenterm.mux-content-dump.v1",
+                "payload_sha256": &payload_sha256,
+                "payload": dump,
+            });
+            let mut artifact_bytes = serde_json::to_vec_pretty(&envelope)
+                .map_err(|err| anyhow::anyhow!("Failed to serialize mux dump envelope: {err}"))?;
+            artifact_bytes.push(b'\n');
+            write_new_private_artifact(&output_path, &artifact_bytes)?;
+            verify_mux_dump_artifact(&output_path, &artifact_bytes, &payload_sha256)?;
+
+            let result = serde_json::json!({
+                "ok": complete || allow_partial,
+                "action": "dump",
+                "complete": complete,
+                "path": output_path.display().to_string(),
+                "pane_count": pane_count,
+                "error_count": error_count,
+                "payload_sha256": &payload_sha256,
+                "redaction_applied": true,
+            });
+            if !print_snapshot_session_structured_output(&result, output_format)? {
+                println!("Mux content dump written");
+                println!("  File:     {}", output_path.display());
+                println!("  Complete: {complete}");
+                println!("  Panes:    {pane_count}");
+                println!("  Errors:   {error_count}");
+                println!("  SHA-256:  {payload_sha256}");
+                println!("  Content:  redacted");
+            }
+            if !complete && !allow_partial {
+                anyhow::bail!(
+                    "Mux dump is incomplete ({error_count} capture error(s)); artifact retained at {}. Re-run after resolving the errors or pass --allow-partial only when a partial safety artifact is acceptable.",
+                    output_path.display()
+                );
+            }
+        }
+
         SessionCommands::ListOrphans { format } => {
             let output_format = resolve_session_orphan_output_format(&format);
             let scrollback_dir = default_scrollback_recovery_dir();
@@ -74647,7 +74647,11 @@ async fn handle_session_command(
             }
         }
 
-        SessionCommands::Recover { pane_uuid, format } => {
+        SessionCommands::Recover {
+            pane_uuid,
+            output,
+            format,
+        } => {
             let output_format = resolve_session_orphan_output_format(&format);
             let scrollback_dir = default_scrollback_recovery_dir();
             let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid)
@@ -74676,74 +74680,54 @@ async fn handle_session_command(
                     frankenterm_core::scrollback_mmap_recovery::DEFAULT_REPLAY_CHUNK_BYTES,
                 );
 
-            let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
-            let mux_timeout_seconds = config.cli.timeout_seconds.max(1);
-            tracing::info!(
-                pane_uuid = %pane_uuid,
-                records = replay_plan.records_read,
-                chunks = replay_plan.chunks.len(),
-                timeout_seconds = mux_timeout_seconds,
-                "starting scrollback orphan recovery replay"
-            );
-            let pane_id = session_recovery_create_pane(&wezterm, mux_timeout_seconds).await?;
-            tracing::info!(
-                pane_uuid = %pane_uuid,
-                pane_id,
-                "created recovery pane for scrollback replay"
-            );
-
-            let mut chunks_sent = 0usize;
+            let output_path = output.unwrap_or_else(|| default_orphan_transcript_path(&pane_uuid));
+            let mut decoded_transcript = String::with_capacity(replay_plan.bytes_replayed);
             for chunk in &replay_plan.chunks {
-                session_recovery_send_text_on_runtime_task(
-                    wezterm.clone(),
-                    pane_id,
-                    chunk.text.clone(),
-                )
-                .await
-                .map_err(|err| {
-                    anyhow::anyhow!(
-                        "Failed to replay scrollback record {} ({}) into pane {pane_id}: {err}",
-                        chunk.record_index,
-                        frankenterm_core::scrollback_mmap_recovery::replay_record_kind_label(
-                            chunk.record_kind
-                        )
-                    )
-                })?;
-                chunks_sent += 1;
+                decoded_transcript.push_str(&chunk.text);
             }
+            let transcript = frankenterm_core::redactor::Redactor::new()
+                .redact(&decoded_transcript)
+                .into_bytes();
+            write_new_private_artifact(&output_path, &transcript)?;
+            let transcript_sha256 = sha256_hex(&transcript);
             tracing::info!(
                 pane_uuid = %pane_uuid,
-                pane_id,
-                chunks_sent,
-                "completed scrollback orphan replay"
+                chunks_exported = replay_plan.chunks.len(),
+                path = %output_path.display(),
+                "exported orphan scrollback without live PTY mutation"
             );
 
             let payload = serde_json::json!({
                 "ok": true,
                 "action": "recover",
+                "mode": "export_only",
                 "pane_uuid": &pane_uuid,
-                "pane_id": pane_id,
-                "path": candidate.path.display().to_string(),
-                "identity": {
-                    "source_pane_uuid": &pane_uuid,
-                    "recovered_pane_uuid": &pane_uuid,
-                    "new_pane_id": pane_id,
-                },
-                "scrollback_replay": session_mmap_replay_json(&replay_plan, chunks_sent),
+                "source_path": candidate.path.display().to_string(),
+                "output_path": output_path.display().to_string(),
+                "transcript_bytes": transcript.len(),
+                "transcript_sha256": &transcript_sha256,
+                "redaction_applied": true,
+                "live_pty_mutated": false,
+                "scrollback_export": session_mmap_export_json(
+                    &replay_plan,
+                    replay_plan.chunks.len()
+                ),
             });
 
             if !print_snapshot_session_structured_output(&payload, output_format)? {
-                println!("Recovered scrollback orphan {pane_uuid}");
-                println!("  Pane ID: {pane_id}");
-                println!("  File:    {}", candidate.path.display());
+                println!("Exported scrollback orphan {pane_uuid}");
+                println!("  Source:  {}", candidate.path.display());
+                println!("  Output:  {}", output_path.display());
+                println!("  SHA-256: {transcript_sha256}");
+                println!("  Safety:  no live pane or PTY was mutated");
                 println!(
-                    "  Replay:  {} ({} of {} records, {} of {} bytes, {} chunks)",
+                    "  Export:  {} ({} of {} records, {} of {} bytes, {} chunks)",
                     replay_plan.status().as_str(),
                     replay_plan.records_replayed,
                     replay_plan.records_read,
                     replay_plan.bytes_replayed,
                     replay_plan.bytes_read,
-                    chunks_sent
+                    replay_plan.chunks.len()
                 );
                 for skipped in &replay_plan.skipped {
                     println!(
@@ -74820,6 +74804,263 @@ async fn handle_session_command(
     }
 
     Ok(())
+}
+
+const LIVE_MUX_DUMP_MAX_PANES: usize = 65_536;
+const LIVE_MUX_DUMP_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+
+fn default_ft_data_dir() -> PathBuf {
+    if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(base).join("ft");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("ft");
+    }
+    PathBuf::from(".").join(".ft")
+}
+
+fn live_mux_dump_file_name(prefix: &str, extension: &str) -> String {
+    let created_at_ms = u64::try_from(now_epoch_ms()).unwrap_or(0);
+    format!(
+        "{prefix}-{created_at_ms}-{}.{}",
+        std::process::id(),
+        extension
+    )
+}
+
+fn default_live_mux_dump_path() -> PathBuf {
+    default_ft_data_dir()
+        .join("mux-dumps")
+        .join(live_mux_dump_file_name("mux-dump", "json"))
+}
+
+fn default_orphan_transcript_path(pane_uuid: &str) -> PathBuf {
+    default_ft_data_dir()
+        .join("recovered-scrollback")
+        .join(live_mux_dump_file_name(pane_uuid, "txt"))
+}
+
+fn write_new_private_artifact(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent).map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to create artifact directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to create new artifact {} (existing files are never overwritten): {err}",
+            path.display()
+        )
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| anyhow::anyhow!("Failed to persist artifact {}: {err}", path.display()))?;
+    file.rewind()
+        .map_err(|err| anyhow::anyhow!("Failed to verify artifact {}: {err}", path.display()))?;
+    let mut persisted = Vec::with_capacity(bytes.len());
+    file.take(u64::try_from(bytes.len()).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut persisted)
+        .map_err(|err| anyhow::anyhow!("Failed to verify artifact {}: {err}", path.display()))?;
+    if persisted != bytes {
+        anyhow::bail!(
+            "Artifact verification failed for {}: persisted bytes differ from the requested dump",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn verify_mux_dump_artifact(
+    path: &Path,
+    expected_bytes: &[u8],
+    expected_payload_sha256: &str,
+) -> anyhow::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = options
+        .open(path)
+        .map_err(|err| anyhow::anyhow!("Failed to reopen mux dump {}: {err}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| anyhow::anyhow!("Failed to inspect mux dump {}: {err}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("Mux dump is not a regular file: {}", path.display());
+    }
+    let mut persisted = Vec::with_capacity(expected_bytes.len());
+    file.take(
+        u64::try_from(expected_bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut persisted)
+    .map_err(|err| anyhow::anyhow!("Failed to read mux dump {}: {err}", path.display()))?;
+    if persisted != expected_bytes {
+        anyhow::bail!("Mux dump changed during verification: {}", path.display());
+    }
+    let envelope: serde_json::Value = serde_json::from_slice(&persisted)
+        .map_err(|err| anyhow::anyhow!("Mux dump is not valid JSON: {err}"))?;
+    let payload = envelope
+        .get("payload")
+        .ok_or_else(|| anyhow::anyhow!("Mux dump payload is missing"))?;
+    let payload_bytes = serde_json::to_vec(payload)
+        .map_err(|err| anyhow::anyhow!("Mux dump payload cannot be re-serialized: {err}"))?;
+    let actual_payload_sha256 = sha256_hex(&payload_bytes);
+    let embedded_payload_sha256 = envelope
+        .get("payload_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump payload checksum is missing"))?;
+    if actual_payload_sha256 != expected_payload_sha256
+        || embedded_payload_sha256 != expected_payload_sha256
+    {
+        anyhow::bail!(
+            "Mux dump checksum verification failed for {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn capture_live_mux_dump(
+    config: &frankenterm_core::config::Config,
+    max_panes: usize,
+    max_total_bytes: usize,
+) -> anyhow::Result<serde_json::Value> {
+    if max_panes == 0 || max_panes > LIVE_MUX_DUMP_MAX_PANES {
+        anyhow::bail!(
+            "--max-panes must be in 1..={LIVE_MUX_DUMP_MAX_PANES}, got {max_panes}"
+        );
+    }
+    if max_total_bytes == 0 || max_total_bytes > LIVE_MUX_DUMP_MAX_TOTAL_BYTES {
+        anyhow::bail!(
+            "--max-total-bytes must be in 1..={LIVE_MUX_DUMP_MAX_TOTAL_BYTES}, got {max_total_bytes}"
+        );
+    }
+
+    let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+    let mut panes = robot_list_panes_on_runtime_task(wezterm.clone())
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to list live mux panes for dump: {err}"))?;
+    panes.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
+    if panes.len() > max_panes {
+        anyhow::bail!(
+            "Live mux has {} panes, exceeding the --max-panes safety limit of {max_panes}",
+            panes.len()
+        );
+    }
+
+    let redactor = frankenterm_core::redactor::Redactor::new();
+    let mut captured = Vec::with_capacity(panes.len());
+    let mut errors = Vec::new();
+    let mut total_content_bytes = 0usize;
+    let mut domains = BTreeSet::new();
+
+    for pane in panes {
+        domains.insert(redactor.redact(pane.effective_domain()));
+        let text = match robot_get_text_on_runtime_task(wezterm.clone(), pane.pane_id, false).await {
+            Ok(text) => redactor.redact(&text),
+            Err(err) => {
+                let detail = bounded_terminal_diagnostic(
+                    &redactor.redact(&err.to_string()),
+                    240,
+                    1024,
+                );
+                errors.push(serde_json::json!({
+                    "pane_id": pane.pane_id,
+                    "code": "pane_text_unavailable",
+                    "detail": detail,
+                }));
+                continue;
+            }
+        };
+
+        let next_total = total_content_bytes.saturating_add(text.len());
+        if next_total > max_total_bytes {
+            errors.push(serde_json::json!({
+                "pane_id": pane.pane_id,
+                "code": "aggregate_content_limit_exceeded",
+                "pane_bytes": text.len(),
+                "admitted_bytes": total_content_bytes,
+                "max_total_bytes": max_total_bytes,
+            }));
+            continue;
+        }
+        total_content_bytes = next_total;
+        let text_sha256 = sha256_hex(text.as_bytes());
+        let text_lines = text.lines().count();
+        captured.push(serde_json::json!({
+            "pane": {
+                "pane_id": pane.pane_id,
+                "tab_id": pane.tab_id,
+                "window_id": pane.window_id,
+                "domain_id": pane.domain_id,
+                "domain_name": pane.domain_name.as_deref().map(|value| redactor.redact(value)),
+                "workspace": pane.workspace.as_deref().map(|value| redactor.redact(value)),
+                "rows": pane.effective_rows(),
+                "cols": pane.effective_cols(),
+                "title": pane.title.as_deref().map(|value| redactor.redact(value)),
+                "cwd": pane.cwd.as_deref().map(|value| redactor.redact(value)),
+                "tty_name": pane.tty_name.as_deref().map(|value| redactor.redact(value)),
+                "cursor_x": pane.cursor_x,
+                "cursor_y": pane.cursor_y,
+                "cursor_visibility": pane.cursor_visibility,
+                "left_col": pane.left_col,
+                "top_row": pane.top_row,
+                "is_active": pane.is_active,
+                "is_zoomed": pane.is_zoomed,
+            },
+            "content": {
+                "encoding": "utf-8",
+                "redaction_applied": true,
+                "bytes": text.len(),
+                "lines": text_lines,
+                "sha256": text_sha256,
+                "text": text,
+            },
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "created_at_epoch_ms": u64::try_from(now_epoch_ms()).unwrap_or(0),
+        "source": {
+            "kind": "live_mux",
+            "ft_version": frankenterm_core::VERSION,
+            "git_hash": build_meta::GIT_HASH,
+        },
+        "complete": errors.is_empty(),
+        "redaction_applied": true,
+        "limits": {
+            "max_panes": max_panes,
+            "max_total_bytes": max_total_bytes,
+        },
+        "summary": {
+            "panes_captured": captured.len(),
+            "content_bytes": total_content_bytes,
+            "capture_errors": errors.len(),
+            "domains": domains,
+        },
+        "panes": captured,
+        "errors": errors,
+    }))
 }
 
 fn default_scrollback_recovery_dir() -> PathBuf {
@@ -75013,9 +75254,9 @@ fn session_orphan_candidates_json(
         .collect()
 }
 
-fn session_mmap_replay_json(
+fn session_mmap_export_json(
     plan: &frankenterm_core::scrollback_mmap_recovery::MmapReplayPlan,
-    chunks_sent: usize,
+    chunks_exported: usize,
 ) -> serde_json::Value {
     let kind_counts: Vec<serde_json::Value> = plan
         .kind_counts
@@ -75047,146 +75288,16 @@ fn session_mmap_replay_json(
 
     serde_json::json!({
         "status": plan.status().as_str(),
-        "mode": "mmap_linear_records",
+        "mode": "mmap_linear_records_export",
         "records_read": plan.records_read,
         "records_replayed": plan.records_replayed,
         "bytes_read": plan.bytes_read,
         "bytes_replayed": plan.bytes_replayed,
         "chunks_planned": plan.chunks.len(),
-        "chunks_sent": chunks_sent,
+        "chunks_exported": chunks_exported,
         "kind_counts": kind_counts,
         "skipped": skipped,
     })
-}
-
-async fn session_recovery_create_pane(
-    wezterm: &frankenterm_core::wezterm::WeztermHandle,
-    timeout_seconds: u64,
-) -> anyhow::Result<u64> {
-    tracing::info!(
-        timeout_seconds,
-        "listing live mux panes before recovery replay"
-    );
-    let panes = session_recovery_list_panes_on_runtime_task(wezterm.clone(), timeout_seconds)
-        .await
-        .map_err(|err| anyhow::anyhow!("Failed to list live panes before recovery spawn: {err}"))?;
-    let source_pane_id = panes
-        .first()
-        .map(|pane| pane.pane_id)
-        .ok_or_else(|| anyhow::anyhow!("Failed to create recovery pane: no live mux pane found"))?;
-
-    tracing::info!(
-        source_pane_id,
-        live_panes = panes.len(),
-        timeout_seconds,
-        "splitting live mux pane for recovery replay"
-    );
-    session_recovery_split_pane_on_runtime_task(wezterm.clone(), source_pane_id)
-        .await
-        .map_err(|err| anyhow::anyhow!("Failed to create recovery pane: {err}"))
-}
-
-async fn session_recovery_list_panes_on_runtime_task(
-    wezterm: frankenterm_core::wezterm::WeztermHandle,
-    timeout_seconds: u64,
-) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
-    let parent_cx =
-        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task =
-        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
-            runtime_context_preflight(
-                "session.recovery.list_panes.context",
-                &cx,
-                CapabilityContextSite::SessionRecoveryOperation,
-            )?;
-            match frankenterm_core::runtime_async::timeout_with_cx(
-                &cx,
-                Duration::from_secs(timeout_seconds.max(1)),
-                wezterm.list_panes_with_cx(&cx),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(session_recovery_timeout_failure(
-                    "session.recovery.list_panes.timeout",
-                    &cx,
-                )),
-            }
-        });
-    task.await.map_err(|error| {
-        runtime_task_join_failure("session.recovery.list_panes.await_task", error)
-    })?
-}
-
-async fn session_recovery_split_pane_on_runtime_task(
-    wezterm: frankenterm_core::wezterm::WeztermHandle,
-    source_pane_id: u64,
-) -> frankenterm_core::Result<u64> {
-    let parent_cx =
-        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task =
-        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
-            runtime_context_preflight(
-                "session.recovery.split_pane.context",
-                &cx,
-                CapabilityContextSite::SessionRecoveryOperation,
-            )?;
-            // The mutation primitive owns its timeout and converts every
-            // response-loss class after backend admission into
-            // `IndeterminateMutation`. An outer timeout would drop that
-            // future before it can classify the outcome and make blind replay
-            // look safe.
-            wezterm
-                .split_pane_with_cx(
-                    &cx,
-                    source_pane_id,
-                    frankenterm_core::wezterm::SplitDirection::Right,
-                    None,
-                    Some(50),
-                )
-                .await
-        });
-    task.await.map_err(|error| {
-        session_recovery_mutation_join_failure("session_recovery_split_pane", error)
-    })?
-}
-
-async fn session_recovery_send_text_on_runtime_task(
-    wezterm: frankenterm_core::wezterm::WeztermHandle,
-    pane_id: u64,
-    text: String,
-) -> frankenterm_core::Result<()> {
-    let parent_cx =
-        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-    let task =
-        frankenterm_core::runtime_async::task::spawn_with_cx(&parent_cx, move |cx| async move {
-            runtime_context_preflight(
-                "session.recovery.send_text.context",
-                &cx,
-                CapabilityContextSite::SessionRecoveryOperation,
-            )?;
-            // Once delivery is admitted, loss of the response is
-            // indeterminate. Preserve the inner mutation boundary so it can
-            // classify that outcome instead of fabricating retry safety.
-            wezterm
-                .send_text_with_options_with_cx(&cx, pane_id, &text, true, true)
-                .await
-        });
-    task.await.map_err(|error| {
-        session_recovery_mutation_join_failure("session_recovery_send_text", error)
-    })?
-}
-
-fn session_recovery_mutation_join_failure(
-    operation: &'static str,
-    error: frankenterm_core::runtime_async::task::JoinError,
-) -> frankenterm_core::Error {
-    tracing::warn!(
-        operation,
-        failure_class = ?error.kind(),
-        "lost authoritative completion at session-recovery mutation task boundary"
-    );
-    frankenterm_core::error::WeztermError::IndeterminateMutation { operation }.into()
 }
 
 fn session_mmap_replay_skip_reason_json(
@@ -77635,7 +77746,11 @@ fi
     let mux_path_output = run_remote_step(
         "Locate frankenterm-mux-server",
         host,
-        "command -v frankenterm-mux-server || which frankenterm-mux-server 2>/dev/null || echo /usr/bin/frankenterm-mux-server",
+        "if test -x \"$HOME/.local/bin/frankenterm-mux-server\"; then \
+           printf '%s\\n' \"$HOME/.local/bin/frankenterm-mux-server\"; \
+         else command -v frankenterm-mux-server || \
+           which frankenterm-mux-server 2>/dev/null || \
+           echo /usr/bin/frankenterm-mux-server; fi",
         timeout,
         runner,
         &redactor,
@@ -77668,13 +77783,31 @@ fi
     let expected_service = mux_unit.trim();
     if existing_service == expected_service {
         println!("✓ mux service unit already up to date");
-    } else if existing_service.is_empty() {
+    } else if existing_service.is_empty() || options.install_ft {
         if apply_changes {
             let install_cmd = format!(
-                "mkdir -p ~/.config/systemd/user && cat > {service_path} <<'EOF'\n{mux_unit}EOF"
+                r#"set -eu
+service="$HOME/.config/systemd/user/frankenterm-mux-server.service"
+stage="$service.installing-$$"
+backup=""
+mkdir -p "$HOME/.config/systemd/user"
+cat > "$stage" <<'EOF'
+{mux_unit}EOF
+if test -e "$service"; then
+  backup="$service.previous-$(date +%Y%m%d%H%M%S)-$$"
+  mv "$service" "$backup"
+fi
+if ! mv "$stage" "$service"; then
+  test -z "$backup" || mv "$backup" "$service"
+  exit 1
+fi"#
             );
             run_remote_step(
-                "Install mux service unit",
+                if existing_service.is_empty() {
+                    "Install mux service unit"
+                } else {
+                    "Preserve and update mux service unit"
+                },
                 host,
                 &install_cmd,
                 timeout,
@@ -77684,7 +77817,13 @@ fi
                 true,
             )?;
         } else {
-            println!("• Would install mux service unit at {service_path}");
+            if existing_service.is_empty() {
+                println!("• Would install mux service unit at {service_path}");
+            } else {
+                println!(
+                    "• Would preserve and update mux service unit to use {mux_server_path}"
+                );
+            }
         }
     } else {
         println!("⚠ mux service unit exists but differs; leaving unchanged.");
@@ -87581,7 +87720,7 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
-    fn session_mmap_replay_json_reports_actual_counts() {
+    fn session_mmap_export_json_reports_actual_counts() {
         use frankenterm_core::scrollback_mmap_format::RecordKind;
         use frankenterm_core::scrollback_mmap_recovery::{
             DEFAULT_REPLAY_CHUNK_BYTES, MmapReplayPlan,
@@ -87594,16 +87733,56 @@ recorder_backend = "rusqlite"
             ],
             DEFAULT_REPLAY_CHUNK_BYTES,
         );
-        let payload = session_mmap_replay_json(&plan, plan.chunks.len());
+        let payload = session_mmap_export_json(&plan, plan.chunks.len());
 
         assert_eq!(payload["status"], "replayed");
-        assert_eq!(payload["mode"], "mmap_linear_records");
+        assert_eq!(payload["mode"], "mmap_linear_records_export");
         assert_eq!(payload["records_read"], 2);
         assert_eq!(payload["records_replayed"], 2);
         assert_eq!(payload["bytes_read"], 9);
         assert_eq!(payload["bytes_replayed"], 9);
-        assert_eq!(payload["chunks_sent"], 2);
+        assert_eq!(payload["chunks_exported"], 2);
         assert_eq!(payload["skipped"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn private_artifact_write_is_verified_and_never_overwrites() {
+        let dir = tempfile::tempdir().expect("artifact tempdir");
+        let path = dir.path().join("mux-dump.json");
+        write_new_private_artifact(&path, b"first\n").expect("first private artifact write");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+
+        let error = write_new_private_artifact(&path, b"second\n")
+            .expect_err("existing artifact must not be overwritten");
+        assert!(error.to_string().contains("never overwritten"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn mux_dump_verifier_recomputes_embedded_payload_checksum() {
+        let dir = tempfile::tempdir().expect("dump tempdir");
+        let path = dir.path().join("mux-dump.json");
+        let payload = serde_json::json!({"complete": true, "panes": []});
+        let payload_sha256 = sha256_hex(&serde_json::to_vec(&payload).unwrap());
+        let envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "payload_sha256": &payload_sha256,
+            "payload": payload,
+        });
+        let mut bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+        bytes.push(b'\n');
+        write_new_private_artifact(&path, &bytes).expect("write dump");
+        verify_mux_dump_artifact(&path, &bytes, &payload_sha256).expect("verify dump");
+        assert!(verify_mux_dump_artifact(&path, &bytes, &"0".repeat(64)).is_err());
     }
 
     #[test]
@@ -97818,22 +97997,6 @@ log_level = "debug"
         let hint = hint.expect("indeterminate mutation must carry reconciliation guidance");
         assert!(hint.contains("Reconcile live mux state"));
         assert!(hint.contains("do not blindly retry"));
-    }
-
-    #[test]
-    fn lost_session_recovery_mutation_join_is_indeterminate() {
-        let error = session_recovery_mutation_join_failure(
-            "session_recovery_send_text",
-            frankenterm_core::runtime_async::task::JoinError::task_failed(),
-        );
-        assert!(matches!(
-            error,
-            frankenterm_core::Error::Wezterm(
-                frankenterm_core::error::WeztermError::IndeterminateMutation {
-                    operation: "session_recovery_send_text"
-                }
-            )
-        ));
     }
 
     #[test]

@@ -1,7 +1,11 @@
 # Codec version-window and atomic-redeploy constraint
 
 **Bead:** [ft-og9bi](../.beads/issues.jsonl) (track A doc of ft-kuxho)
-**Related:** [ft-kuxho](../.beads/issues.jsonl) parent epic, [`docs/codec-versions.md`](codec-versions.md), [`docs/proposals/ft-kuxho-B-codec-version-min-supported-window.md`](proposals/ft-kuxho-B-codec-version-min-supported-window.md), ft-nyvyl (slow-loris TLS handshake fix, ed413bd2)
+**Related:** [ft-kuxho](../.beads/issues.jsonl) parent epic, ft-6vfeq
+(v0.15.1 stranded-remote release repair),
+[`docs/codec-versions.md`](codec-versions.md),
+[`docs/proposals/ft-kuxho-B-codec-version-min-supported-window.md`](proposals/ft-kuxho-B-codec-version-min-supported-window.md),
+ft-nyvyl (slow-loris TLS handshake fix, ed413bd2)
 
 ## TL;DR
 
@@ -18,8 +22,12 @@ canonical version as its agreed dialect.
   `CODEC_VERSION_MIN_SUPPORTED`. Its windows are intentionally disjoint from
   the old release, so it still requires the maintenance-window runbook below.
 
-The current release is codec v57 with a v56 floor. PDU93/94 is additive and
-therefore unavailable, without wire emission, on a negotiated v56 connection.
+Do not infer the live window from this prose: read `CODEC_VERSION` and
+`CODEC_VERSION_MIN_SUPPORTED` in `frankenterm/codec/src/lib.rs`. The v0.15.1
+incident window is `61..=63`; remote mux servers left at codec 46 have no
+overlap and are rejected before topology publication. PDU93/94 was additive in
+the historical v56/v57 window and therefore unavailable, without wire
+emission, on a negotiated v56 connection.
 
 ## 1. The remaining failure mode
 
@@ -85,8 +93,11 @@ This means:
 - [ ] For every new PDU identity, confirm the registry declares its exact minimum
   dialect and producer/serial authority, and retain a negative test proving an
   older agreed dialect rejects it before serial allocation or wire emission.
-- [ ] For a breaking change, schedule a maintenance window and pre-position the
-  new client binaries on every workstation that will reconnect.
+- [ ] For a breaking change, schedule a maintenance window and confirm the Unix
+  release archive contains both `ft` and `frankenterm-mux-server`, covered by
+  the same atomic component manifest and sealed build ID.
+- [ ] Pre-position the new CLI with `--no-app`; do not launch the new desktop
+  client until every remote mux has been staged, drained, and restarted.
 
 ### 3b. Additive deploy
 
@@ -104,13 +115,66 @@ When only `CODEC_VERSION` advances and the old minimum is retained:
 
 When both the maximum and minimum advance, use the maintenance window:
 
-1. **Drain new connections to the old servers.** If you run multiple mux servers behind a load balancer, drain them one at a time. If single-server, skip to step 2.
-2. **Stop the old server.** Active sessions terminate; clients receive a connection drop.
-3. **Start the new server.** Verify it accepts a same-version handshake.
-4. **Roll clients.** Each client reconnects and resumes. Old clients reject the
-   disjoint handshake until upgraded; that fail-closed state is expected.
-5. **Verify zero old-dialect clients remain.** Check structured handshake logs
-   using the exact old and new version numbers for this release.
+1. **Capture and verify the currently compatible live mux state.** Before
+   replacing the client that can still speak to every old server, export all
+   reachable pane text and topology metadata:
+
+   ```bash
+   ~/.local/bin/ft session dump --format json
+   ```
+
+   The command must report `complete: true`, and the artifact's embedded
+   payload checksum must verify. This is a content/topology safety artifact,
+   not process continuity: it cannot keep mux-owned PTYs or agents alive.
+2. **Install the new CLI without replacing the desktop app.** Use the installer
+   from the exact release source revision, then keep the old GUI running while
+   the servers are prepared:
+
+   ```bash
+   NEW_TAG=vX.Y.Z
+   bash install.sh --version "$NEW_TAG" --no-app
+   ```
+
+   The Unix archive must verify and install `ft` plus
+   `frankenterm-mux-server` as one process family. A client-only or mixed-build
+   archive fails closed.
+3. **Stage each remote process family without restarting its mux.** Repeat for
+   every configured domain host:
+
+   ```bash
+   SSH_HOST=trj
+   ~/.local/bin/ft setup --apply remote "$SSH_HOST" --yes \
+     --install-ft --ft-version "$NEW_TAG"
+   ```
+
+   This preserves the previous remote binaries and any differing systemd unit,
+   updates the unit's next-start `ExecStart`, and deliberately leaves the active
+   mux inode and its PTYs untouched.
+4. **Drain live PTYs and new connections.** For a single mux, finish or move all
+   sessions it owns. For a load-balanced fleet, drain one server at a time.
+   Do not restart a mux while it owns work that cannot be recreated.
+5. **Restart the staged server deliberately.** Active client sockets drop at
+   this point; the old desktop may reject the new disjoint window until the
+   client rollout completes:
+
+   ```bash
+   ssh "$SSH_HOST" 'systemctl --user restart frankenterm-mux-server'
+   ssh "$SSH_HOST" 'systemctl --user status frankenterm-mux-server --no-pager'
+   ```
+
+6. **Verify the new server, then update the desktop app.** Confirm a
+   same-release handshake for every remote. Re-run the exact installer without
+   `--no-app`; its same-version short circuit still installs the GUI bundle:
+
+   ```bash
+   bash install.sh --version "$NEW_TAG"
+   ```
+
+7. **Verify automatic domain reconnect and zero old-dialect peers.** Check the
+   domain connection UI/toast and structured handshake logs for both inclusive
+   codec windows. A failure must display the local and remote windows plus the
+   safe server-upgrade/desktop-rollback choices; it must never look like a
+   no-op.
 
 ### 3d. Cross-deploy coordination
 
@@ -132,8 +196,11 @@ When both the maximum and minimum advance, use the maintenance window:
 
 For an additive bump, roll components back within the retained compatibility
 window and verify they negotiate the lower dialect. For a breaking bump, reverse
-the breaking-deploy sequence: stop the new server, start the old server, and
-roll clients back until both sides again share a window.
+the breaking-deploy sequence: drain and stop the new server, restore the
+timestamped `frankenterm-mux-server.previous-*` binary and service unit, start
+the old server, and restore the preserved desktop app/CLI until both sides again
+share a window. Never restart either server generation until its live PTYs have
+been drained.
 
 ## 4. Window invariants
 

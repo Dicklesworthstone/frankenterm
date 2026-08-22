@@ -209,6 +209,22 @@ render state, historical scrollback, processes, or agents. Captured
 `output_segments` are arbitrary stream fragments rather than an authoritative
 terminal-state snapshot and are never sent through PTY input.
 
+### Live mux content dump
+
+`ft session dump` provides a separate, read-only pre-upgrade and forensic
+artifact. It captures the current bounded pane list, redacted pane metadata,
+and redacted UTF-8 pane text into a versioned JSON envelope with per-pane and
+whole-payload SHA-256 checksums. The output is created with private permissions,
+never overwrites an existing file, is synchronized to disk, reread, and
+verified before success is reported. Partial pane reads are recorded and fail
+the command by default.
+
+The dump is deliberately not accepted as an executable restore image. It does
+not preserve PTY descriptors, process memory, shell/editor internal state,
+terminal parser/render state, or running-agent continuity. `ft session recover
+<pane_uuid>` likewise exports a redacted orphan transcript to a new file; it
+does not replay archived output into a live pane or PTY.
+
 Use `--dry-run`; `--layout-only` is currently a reserved no-op and the output
 is only the bounded descriptor/status report:
 

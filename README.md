@@ -353,7 +353,7 @@ Honest status of every shipped surface, without migration-era hand-waving.
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
 | Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
 | Incident bundles | **Supported** | Wired to live collectors; publish-side snapshot path; beads coordination snapshot included |
-| Session persistence | **Capture/inspect supported; execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete and `ft session doctor` ship. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. The layout restorer remains library/test substrate; production does not currently restore panes, processes, scrollback, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
+| Session persistence | **Capture/inspect/export supported; restore execution unavailable** | Snapshot save/list/inspect/pane-membership diff/delete, `ft session doctor`, and `ft session dump` ship. The dump is a private, redacted, checksummed export of live pane text plus bounded topology metadata; it is not a process checkpoint or executable restore image. `ft snapshot restore` and robot checkpoint rollback accept metadata-only `--dry-run` descriptor/status reporting, but every non-dry invocation fails closed before database resolution, process discovery, subprocess launch, or mux mutation. Production does not currently restore panes, processes, scrollback, mux domains, window/workspace placement, durable tab order, stable active-tab identity, or full appearance. |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
 | Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
@@ -1042,8 +1042,24 @@ ft snapshot restore <id> --dry-run # metadata-only descriptor/status report
 ft session list --limit 50 --offset 0              # bounded page of saved sessions
 ft session show <session_id> --limit 50 --offset 0 # bounded checkpoint page
 ft session doctor                # health check for session persistence
+ft session dump                  # private, checksummed live pane-content/topology export
+ft session recover <pane_uuid>   # export an orphan transcript; never write it to a PTY
 ft watch                         # start the persistence/observation lifecycle; may prune retained data
 ```
+
+`ft session dump` reads every currently visible mux pane through the bounded
+read-only mux API, redacts pane text and metadata, records per-pane SHA-256
+digests, and writes a mode-0600 JSON envelope under
+`~/.local/share/ft/mux-dumps/` by default. It refuses to overwrite a path,
+fsyncs and rereads the artifact, verifies the embedded payload checksum, and
+returns failure for a partial capture unless `--allow-partial` is explicit.
+This is a pre-upgrade/crash-forensics safety artifact. It preserves observable
+text and topology metadata, not live PTY file descriptors, process memory,
+shell/editor internal state, or running-agent continuity.
+
+`ft session recover` is intentionally export-only. Historical terminal output
+is output, not shell input: recovery never creates or splits a live pane and
+never sends archive bytes through a PTY input channel.
 
 `ft snapshot restore <id> --dry-run` reads a bounded checkpoint descriptor and
 prints a metadata-only descriptor/status report. It does not load a full restorable projection and

@@ -42,10 +42,10 @@
 //!   `crates/frankenterm/src/main.rs`; production CLI scanning uses
 //!   [`FlockLockProbe`] so live writers remain locked and disabled.
 //! - `ft session recover <id>` reads the orphaned mmap records, builds
-//!   an exact UTF-8 replay plan, and writes replay chunks into the
-//!   replacement pane via the mux command layer.
-//! - This module owns the header-level classifier and replay-plan
-//!   accounting; live pane attachment remains in the CLI command layer.
+//!   an exact UTF-8 export plan, reapplies redaction, and writes a new private
+//!   transcript. It never sends historical output through live PTY input.
+//! - This module owns the header-level classifier and export-plan accounting;
+//!   executable live-pane attachment is intentionally unavailable.
 //!
 //! # Why ship the scanner first
 //!

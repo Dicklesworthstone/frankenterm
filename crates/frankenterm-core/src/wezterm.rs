@@ -1126,6 +1126,24 @@ const MAX_CLI_BULK_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
 /// an 8 KiB byte prefix. Enforce that exact byte budget during capture.
 const MAX_CLI_ERROR_OUTPUT_BYTES: usize = 8 * 1024;
 
+fn append_mux_text_line_bounded(out: &mut String, line: &str, cap: usize) -> Result<()> {
+    let next_len = out
+        .len()
+        .saturating_add(line.len())
+        .saturating_add(1);
+    if next_len > cap {
+        return Err(WeztermError::OutputTooLarge {
+            command: "mux get-text".to_string(),
+            len: next_len,
+            cap,
+        }
+        .into());
+    }
+    out.push_str(line);
+    out.push('\n');
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CliCaptureContract {
     stdout_limit: usize,
@@ -1729,8 +1747,12 @@ impl WeztermClient {
                                 let (mut lines, _images) = resp.lines.extract_data();
                                 lines.sort_by_key(|(idx, _)| *idx);
                                 for (_, line) in lines {
-                                    out.push_str(line.as_str().as_ref());
-                                    out.push('\n');
+                                    let line = line.as_str();
+                                    append_mux_text_line_bounded(
+                                        &mut out,
+                                        line.as_ref(),
+                                        MAX_CLI_BULK_OUTPUT_BYTES,
+                                    )?;
                                 }
                             }
                             Err(e) => {
@@ -6781,6 +6803,26 @@ mod tests {
             }
             other => panic!("expected WeztermError::OutputTooLarge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn direct_mux_text_append_enforces_bulk_cap_before_growth() {
+        let mut output = String::from("abc\n");
+        append_mux_text_line_bounded(&mut output, "de", 7).expect("exact-cap append");
+        assert_eq!(output, "abc\nde\n");
+
+        let before = output.clone();
+        let error = append_mux_text_line_bounded(&mut output, "x", 7)
+            .expect_err("one byte beyond the direct-mux cap must fail");
+        assert_eq!(output, before, "failed append must not mutate output");
+        assert!(matches!(
+            error,
+            crate::Error::Wezterm(WeztermError::OutputTooLarge {
+                command,
+                len: 9,
+                cap: 7,
+            }) if command == "mux get-text"
+        ));
     }
 
     #[test]

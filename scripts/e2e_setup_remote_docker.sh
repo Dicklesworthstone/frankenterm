@@ -553,7 +553,7 @@ main() {
         local mux_fixture="$WORK_DIR/frankenterm-mux-server-fixture"
         cat > "$ft_fixture" <<'EOF'
 #!/usr/bin/env bash
-# FT_ATOMIC_COMPONENT_IDENTITY_V1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:ft:x86_64-unknown-linux-gnu:release-interactive:0.15.2;
+# FT_ATOMIC_COMPONENT_IDENTITY_V1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:ft:e2e-linux-shell:release-interactive:0.15.2;
 if [[ "${1:-}" == "--version" ]]; then
     echo "ft 0.15.2"
     exit 0
@@ -562,7 +562,7 @@ echo "ft e2e fixture"
 EOF
         cat > "$mux_fixture" <<'EOF'
 #!/usr/bin/env bash
-# FT_ATOMIC_COMPONENT_IDENTITY_V1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:frankenterm-mux-server:x86_64-unknown-linux-gnu:release-interactive:0.15.2;
+# FT_ATOMIC_COMPONENT_IDENTITY_V1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:frankenterm-mux-server:e2e-linux-shell:release-interactive:0.15.2;
 if [[ "${1:-}" == "--version" ]]; then
     echo "frankenterm-mux-server 0.15.2"
     exit 0
@@ -584,6 +584,10 @@ EOF
             || die "Atomic-pair staging changed the active service or linger state"
         ssh "$good_alias" "test -x ~/.local/bin/ft && test -x ~/.local/bin/frankenterm-mux-server" \
             || die "Atomic-pair staging did not publish both remote executables"
+        ssh "$good_alias" \
+            "grep -F \"ExecStart=\$HOME/.local/bin/frankenterm-mux-server --daemonize=false\" ~/.config/systemd/user/frankenterm-mux-server.service" \
+            >/dev/null \
+            || die "Mux service unit does not select the staged exact-build server for the next restart"
     fi
 
     log "INFO" "Final run: failure injection (expect non-zero + rollback hint)"
