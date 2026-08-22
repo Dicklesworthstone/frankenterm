@@ -1,6 +1,7 @@
 use anyhow::{Context, anyhow, bail, ensure};
 use config::TermConfig;
 use config::keyassignment::SpawnCommand;
+use frankenterm_toast_notification::persistent_toast_notification;
 use mux::activity::Activity;
 use mux::domain::SplitSource;
 use mux::tab::{FloatingPaneRect, SplitRequest};
@@ -82,15 +83,19 @@ pub fn spawn_command_impl(
                         spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config)
                             .await
                     {
-                        log::error!("Failed to spawn: {err:#}");
+                        let message = format!("Failed to spawn: {err:#}");
+                        log::error!("{message}");
+                        persistent_toast_notification("Domain spawn failed", &message);
                     }
                 })
                 .detach();
         }
         rejected => {
-            log::error!(
+            let message = format!(
                 "main-thread scheduler rejected GUI spawn command before task construction: {rejected:?}"
             );
+            log::error!("{message}");
+            persistent_toast_notification("Domain spawn failed", &message);
         }
     }
 }
