@@ -7402,6 +7402,7 @@ dependencies = [
  "frankenterm-sigpipe",
  "frankenterm-ssh",
  "frankenterm-term",
+ "hmac 0.13.0",
  "hostname",
  "k9",
  "lazy_static",
@@ -7434,6 +7435,7 @@ dependencies = [
  "url",
  "uuid",
  "winapi",
+ "zeroize",
 ]
 
 [[package]]

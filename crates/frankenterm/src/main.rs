@@ -3,6 +3,7 @@
 //! Swarm-native terminal platform CLI for large AI agent fleets.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use anyhow::Context as _;
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_core::attention_router::{
@@ -6130,11 +6132,11 @@ enum SetupCommands {
         #[arg(long)]
         install_ft: bool,
 
-        /// Path to local ft binary for scp
+        /// Path to the local ft binary for identity-fenced SSH upload
         #[arg(long)]
         ft_path: Option<PathBuf>,
 
-        /// Path to a target-compatible local mux-server binary for scp
+        /// Path to a target-compatible local mux-server binary for identity-fenced SSH upload
         #[arg(long, requires = "ft_path")]
         mux_server_path: Option<PathBuf>,
 
@@ -74602,28 +74604,25 @@ async fn handle_session_command(
                 .get("errors")
                 .and_then(serde_json::Value::as_array)
                 .map_or(0, Vec::len);
-            let payload_bytes = serde_json::to_vec(&dump)
-                .map_err(|err| anyhow::anyhow!("Failed to serialize mux dump payload: {err}"))?;
-            let payload_sha256 = sha256_hex(&payload_bytes);
-            drop(payload_bytes);
+            let (_payload_bytes, payload_sha256) = hash_json_bounded(
+                &dump,
+                LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+                JsonSerializationStyle::Compact,
+            )
+            .context("Failed to hash mux dump payload within the artifact safety limit")?;
             let envelope = serde_json::json!({
                 "schema": "frankenterm.mux-content-dump.v1",
                 "publication_state": "complete",
                 "payload_sha256": &payload_sha256,
                 "payload": dump,
             });
-            let mut artifact_bytes = serde_json::to_vec_pretty(&envelope)
-                .map_err(|err| anyhow::anyhow!("Failed to serialize mux dump envelope: {err}"))?;
+            let mut artifact_bytes = serialize_json_bounded(
+                &envelope,
+                LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES.saturating_sub(1),
+                JsonSerializationStyle::Pretty,
+            )
+            .context("Failed to serialize mux dump envelope within the artifact safety limit")?;
             artifact_bytes.push(b'\n');
-            if u64::try_from(artifact_bytes.len()).unwrap_or(u64::MAX)
-                > LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES
-            {
-                anyhow::bail!(
-                    "Serialized mux dump is {} bytes, exceeding the artifact safety limit of {} bytes",
-                    artifact_bytes.len(),
-                    LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES
-                );
-            }
             let artifact_receipt = write_new_private_artifact(&output_path, &artifact_bytes)?;
 
             let result = serde_json::json!({
@@ -75091,6 +75090,7 @@ async fn handle_session_command(
 const LIVE_MUX_DUMP_MAX_PANES: usize = 65_536;
 const LIVE_MUX_DUMP_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES: u64 = 384 * 1024 * 1024;
+const LIVE_MUX_DUMP_MAX_TOPOLOGY_BYTES: u64 = 64 * 1024 * 1024;
 const LIVE_SCROLLBACK_EXPORT_MAX_PANES: usize =
     frankenterm_mux_server_impl::LIVE_SCROLLBACK_EXPORT_MAX_PANES;
 const LIVE_SCROLLBACK_EXPORT_MAX_ROWS: usize =
@@ -75118,6 +75118,135 @@ struct MuxDumpVerificationReceipt {
     pane_count: usize,
     error_count: usize,
     content_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JsonSerializationStyle {
+    Compact,
+    Pretty,
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl BoundedJsonBuffer {
+    fn new(max_bytes: u64) -> anyhow::Result<Self> {
+        let max_bytes = usize::try_from(max_bytes)
+            .map_err(|_| anyhow::anyhow!("JSON byte limit does not fit this platform"))?;
+        Ok(Self {
+            bytes: Vec::new(),
+            max_bytes,
+        })
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("serialized JSON byte count overflow"))?;
+        if next_len > self.max_bytes {
+            return Err(std::io::Error::other(format!(
+                "serialized JSON exceeds the {} byte safety limit",
+                self.max_bytes
+            )));
+        }
+        self.bytes.try_reserve(bytes.len()).map_err(|err| {
+            std::io::Error::other(format!("cannot reserve bounded JSON output: {err}"))
+        })?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_json_bounded(
+    value: &impl serde::Serialize,
+    max_bytes: u64,
+    style: JsonSerializationStyle,
+) -> anyhow::Result<Vec<u8>> {
+    let mut buffer = BoundedJsonBuffer::new(max_bytes)?;
+    match style {
+        JsonSerializationStyle::Compact => serde_json::to_writer(&mut buffer, value),
+        JsonSerializationStyle::Pretty => serde_json::to_writer_pretty(&mut buffer, value),
+    }
+    .map_err(|err| anyhow::anyhow!("bounded JSON serialization failed: {err}"))?;
+    Ok(buffer.into_inner())
+}
+
+struct BoundedJsonHashSink {
+    hasher: sha2::Sha256,
+    bytes: u64,
+    max_bytes: u64,
+}
+
+impl BoundedJsonHashSink {
+    fn new(max_bytes: u64) -> Self {
+        use sha2::Digest as _;
+
+        Self {
+            hasher: sha2::Sha256::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn finish(self) -> (u64, String) {
+        use sha2::Digest as _;
+
+        (self.bytes, hex::encode(self.hasher.finalize()))
+    }
+}
+
+impl Write for BoundedJsonHashSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+
+        let byte_count = u64::try_from(bytes.len())
+            .map_err(|_| std::io::Error::other("serialized JSON write length overflow"))?;
+        let next = self
+            .bytes
+            .checked_add(byte_count)
+            .ok_or_else(|| std::io::Error::other("serialized JSON byte count overflow"))?;
+        if next > self.max_bytes {
+            return Err(std::io::Error::other(format!(
+                "serialized JSON exceeds the {} byte safety limit",
+                self.max_bytes
+            )));
+        }
+        self.hasher.update(bytes);
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn hash_json_bounded(
+    value: &impl serde::Serialize,
+    max_bytes: u64,
+    style: JsonSerializationStyle,
+) -> anyhow::Result<(u64, String)> {
+    let mut sink = BoundedJsonHashSink::new(max_bytes);
+    match style {
+        JsonSerializationStyle::Compact => serde_json::to_writer(&mut sink, value),
+        JsonSerializationStyle::Pretty => serde_json::to_writer_pretty(&mut sink, value),
+    }
+    .map_err(|err| anyhow::anyhow!("bounded JSON hashing failed: {err}"))?;
+    Ok(sink.finish())
 }
 
 fn default_ft_data_dir() -> PathBuf {
@@ -75508,9 +75637,12 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     let payload = envelope
         .get("payload")
         .ok_or_else(|| anyhow::anyhow!("Mux dump payload is missing"))?;
-    let payload_bytes = serde_json::to_vec(payload)
-        .map_err(|err| anyhow::anyhow!("Mux dump payload cannot be re-serialized: {err}"))?;
-    let actual_payload_sha256 = sha256_hex(&payload_bytes);
+    let (_payload_bytes, actual_payload_sha256) = hash_json_bounded(
+        payload,
+        LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+        JsonSerializationStyle::Compact,
+    )
+    .context("Mux dump payload cannot be re-serialized within the verification limit")?;
     let embedded_payload_sha256 = envelope
         .get("payload_sha256")
         .and_then(serde_json::Value::as_str)
@@ -75686,28 +75818,46 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
 fn mux_dump_topology_fingerprint(
     panes: &[frankenterm_core::wezterm::PaneInfo],
 ) -> anyhow::Result<String> {
-    let topology: Vec<serde_json::Value> = panes
+    #[derive(serde::Serialize)]
+    struct TopologyPane<'a> {
+        pane_id: u64,
+        tab_id: u64,
+        window_id: u64,
+        domain_id: Option<u64>,
+        domain_name: Option<&'a str>,
+        workspace: Option<&'a str>,
+        rows: u32,
+        cols: u32,
+        left_col: Option<u32>,
+        top_row: Option<i64>,
+        is_active: bool,
+        is_zoomed: bool,
+    }
+
+    let topology: Vec<TopologyPane<'_>> = panes
         .iter()
-        .map(|pane| {
-            serde_json::json!({
-                "pane_id": pane.pane_id,
-                "tab_id": pane.tab_id,
-                "window_id": pane.window_id,
-                "domain_id": pane.domain_id,
-                "domain_name": pane.domain_name.as_deref(),
-                "workspace": pane.workspace.as_deref(),
-                "rows": pane.effective_rows(),
-                "cols": pane.effective_cols(),
-                "left_col": pane.left_col,
-                "top_row": pane.top_row,
-                "is_active": pane.is_active,
-                "is_zoomed": pane.is_zoomed,
-            })
+        .map(|pane| TopologyPane {
+            pane_id: pane.pane_id,
+            tab_id: pane.tab_id,
+            window_id: pane.window_id,
+            domain_id: pane.domain_id,
+            domain_name: pane.domain_name.as_deref(),
+            workspace: pane.workspace.as_deref(),
+            rows: pane.effective_rows(),
+            cols: pane.effective_cols(),
+            left_col: pane.left_col,
+            top_row: pane.top_row,
+            is_active: pane.is_active,
+            is_zoomed: pane.is_zoomed,
         })
         .collect();
-    let bytes = serde_json::to_vec(&topology)
-        .map_err(|err| anyhow::anyhow!("Failed to fingerprint mux topology: {err}"))?;
-    Ok(sha256_hex(&bytes))
+    let (_bytes, fingerprint) = hash_json_bounded(
+        &topology,
+        LIVE_MUX_DUMP_MAX_TOPOLOGY_BYTES,
+        JsonSerializationStyle::Compact,
+    )
+    .context("Failed to fingerprint mux topology within its metadata safety limit")?;
+    Ok(fingerprint)
 }
 
 fn mux_dump_domain_identity(
@@ -77905,12 +78055,103 @@ struct LocalComponentIdentity {
     version: String,
 }
 
-fn read_local_component_identity(
+#[derive(Debug, Eq, PartialEq)]
+struct LocalComponentSnapshot {
+    identity: LocalComponentIdentity,
+    sha256: String,
+    byte_len: u64,
+    source_identity: DiagnosticFileSnapshot,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ValidatedLocalProcessFamily {
+    ft: LocalComponentSnapshot,
+    mux_server: LocalComponentSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ComponentByteReceipt {
+    sha256: String,
+    byte_len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcessFamilyByteReceipt {
+    ft: ComponentByteReceipt,
+    mux_server: ComponentByteReceipt,
+}
+
+impl From<&ValidatedLocalProcessFamily> for ProcessFamilyByteReceipt {
+    fn from(family: &ValidatedLocalProcessFamily) -> Self {
+        Self {
+            ft: ComponentByteReceipt {
+                sha256: family.ft.sha256.clone(),
+                byte_len: family.ft.byte_len,
+            },
+            mux_server: ComponentByteReceipt {
+                sha256: family.mux_server.sha256.clone(),
+                byte_len: family.mux_server.byte_len,
+            },
+        }
+    }
+}
+
+fn validate_process_family_byte_receipt(
+    receipt: &ProcessFamilyByteReceipt,
+) -> anyhow::Result<()> {
+    for (role, component) in [("ft", &receipt.ft), ("mux", &receipt.mux_server)] {
+        anyhow::ensure!(
+            component.byte_len > 0 && component.byte_len <= REMOTE_COMPONENT_MAX_BYTES,
+            "{role} component receipt byte length is outside the supported bound"
+        );
+        anyhow::ensure!(
+            component.sha256.len() == 64
+                && component
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "{role} component receipt has an invalid SHA-256 digest"
+        );
+    }
+    Ok(())
+}
+
+fn open_local_component_nofollow(path: &Path) -> anyhow::Result<fs::File> {
+    if path_contains_parent_component(path) {
+        anyhow::bail!(
+            "component path {} contains a parent component; use a normalized path",
+            path.display()
+        );
+    }
+    let leaf = path
+        .file_name()
+        .filter(|leaf| !leaf.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("component path {} has no file name", path.display()))?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = open_directory_tree_nofollow(parent_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot open component parent {} without following symlinks: {error}",
+            parent_path.display()
+        )
+    })?;
+    open_diagnostic_file_nofollow(&parent, Path::new(leaf)).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot open component {} without following symlinks: {error}",
+            path.display()
+        )
+    })
+}
+
+fn read_local_component_snapshot(
     path: &Path,
     expected_component: &str,
-) -> anyhow::Result<LocalComponentIdentity> {
-    let file = fs::File::open(path)
-        .map_err(|error| anyhow::anyhow!("cannot open component {}: {error}", path.display()))?;
+) -> anyhow::Result<LocalComponentSnapshot> {
+    use sha2::{Digest as _, Sha256};
+
+    let file = open_local_component_nofollow(path)?;
     let metadata = file.metadata().map_err(|error| {
         anyhow::anyhow!("cannot inspect component {}: {error}", path.display())
     })?;
@@ -77924,6 +78165,12 @@ fn read_local_component_identity(
             REMOTE_COMPONENT_MAX_BYTES
         );
     }
+    let before = DiagnosticFileSnapshot::capture(&metadata).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot capture component identity for {}: {error}",
+            path.display()
+        )
+    })?;
     let expected_len = usize::try_from(metadata.len()).map_err(|error| {
         anyhow::anyhow!(
             "component {} size cannot be represented locally: {error}",
@@ -77938,10 +78185,29 @@ fn read_local_component_identity(
             path.display()
         )
     })?;
-    file.take(REMOTE_COMPONENT_MAX_BYTES.saturating_add(1))
+    (&file)
+        .take(REMOTE_COMPONENT_MAX_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| anyhow::anyhow!("cannot read component {}: {error}", path.display()))?;
     if bytes.len() != expected_len {
+        anyhow::bail!(
+            "component {} changed while its atomic identity was being verified",
+            path.display()
+        );
+    }
+    let after_metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!(
+            "cannot re-inspect component {} after reading it: {error}",
+            path.display()
+        )
+    })?;
+    let after = DiagnosticFileSnapshot::capture(&after_metadata).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot recapture component identity for {}: {error}",
+            path.display()
+        )
+    })?;
+    if before != after {
         anyhow::bail!(
             "component {} changed while its atomic identity was being verified",
             path.display()
@@ -78029,23 +78295,34 @@ fn read_local_component_identity(
         }
     }
 
-    identity.ok_or_else(|| {
+    let identity = identity.ok_or_else(|| {
         anyhow::anyhow!(
             "component {} has no atomic release identity marker",
             path.display()
         )
+    })?;
+    Ok(LocalComponentSnapshot {
+        identity,
+        sha256: hex::encode(Sha256::digest(&bytes)),
+        byte_len: before.byte_len,
+        source_identity: before,
     })
 }
 
-fn validate_local_process_family(ft_path: &Path, mux_server_path: &Path) -> anyhow::Result<()> {
-    let ft = read_local_component_identity(ft_path, "ft")?;
-    let mux = read_local_component_identity(mux_server_path, "frankenterm-mux-server")?;
-    if ft != mux {
+fn validate_local_process_family(
+    ft_path: &Path,
+    mux_server_path: &Path,
+) -> anyhow::Result<ValidatedLocalProcessFamily> {
+    let ft = read_local_component_snapshot(ft_path, "ft")?;
+    let mux_server = read_local_component_snapshot(mux_server_path, "frankenterm-mux-server")?;
+    if ft.identity != mux_server.identity {
         anyhow::bail!(
-            "local ft and frankenterm-mux-server do not share one sealed build identity: ft={ft:?}, mux={mux:?}"
+            "local ft and frankenterm-mux-server do not share one sealed build identity: ft={:?}, mux={:?}",
+            ft.identity,
+            mux_server.identity
         );
     }
-    Ok(())
+    Ok(ValidatedLocalProcessFamily { ft, mux_server })
 }
 
 fn validate_remote_release_tag(tag: &str) -> anyhow::Result<&str> {
@@ -78153,8 +78430,92 @@ fn remote_release_installer_command_at_revision(
          curl --proto '=https' --tlsv1.2 -fsSL \
          https://raw.githubusercontent.com/Dicklesworthstone/frankenterm/{installer_revision}/install.sh \
          -o \"$installer\" && \
-         bash \"$installer\" --version {tag} --dest \"$destination\" --no-app"
+         bash \"$installer\" --version {tag} --dest \"$destination\" --no-app && \
+         ft_path=\"$destination/ft\" && \
+         mux_path=\"$destination/frankenterm-mux-server\" && \
+         test -f \"$ft_path\" && test ! -L \"$ft_path\" && \
+         test -f \"$mux_path\" && test ! -L \"$mux_path\" && \
+         ft_bytes=$(stat -c %s -- \"$ft_path\") && \
+         mux_bytes=$(stat -c %s -- \"$mux_path\") && \
+         ft_sha256=$(sha256sum -- \"$ft_path\" | cut -d ' ' -f 1) && \
+         mux_sha256=$(sha256sum -- \"$mux_path\" | cut -d ' ' -f 1) && \
+         printf 'FT_RELEASE_COMPONENT_RECEIPT_V1={tag}:ft:%s:%s:mux:%s:%s\\n' \
+           \"$ft_bytes\" \"$ft_sha256\" \"$mux_bytes\" \"$mux_sha256\""
     ))
+}
+
+fn parse_remote_release_component_receipt(
+    stdout: &str,
+    expected_tag: &str,
+) -> anyhow::Result<ProcessFamilyByteReceipt> {
+    let expected_tag = validate_remote_release_tag(expected_tag)?;
+    const PREFIX: &str = "FT_RELEASE_COMPONENT_RECEIPT_V1=";
+    anyhow::ensure!(
+        stdout.ends_with('\n') && !stdout.contains('\r'),
+        "verified release component receipt output must use an exact final LF terminator"
+    );
+    let mut receipts = stdout.lines().filter(|line| line.starts_with(PREFIX));
+    let line = receipts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("verified release installer returned no component receipt"))?;
+    anyhow::ensure!(
+        receipts.next().is_none(),
+        "verified release installer returned multiple component receipts"
+    );
+    anyhow::ensure!(
+        stdout.lines().next_back() == Some(line),
+        "verified release component receipt was not the final output line"
+    );
+    let mut fields = line[PREFIX.len()..].split(':');
+    let tag = fields.next();
+    let ft_role = fields.next();
+    let ft_bytes = fields.next();
+    let ft_sha256 = fields.next();
+    let mux_role = fields.next();
+    let mux_bytes = fields.next();
+    let mux_sha256 = fields.next();
+    anyhow::ensure!(
+        tag == Some(expected_tag)
+            && ft_role == Some("ft")
+            && mux_role == Some("mux")
+            && fields.next().is_none(),
+        "verified release installer returned a malformed or wrong-tag component receipt"
+    );
+    let parse_component = |role: &str,
+                           byte_len: &str,
+                           sha256: &str|
+     -> anyhow::Result<ComponentByteReceipt> {
+        let byte_len = byte_len
+            .parse::<u64>()
+            .with_context(|| format!("{role} component receipt has an invalid byte length"))?;
+        anyhow::ensure!(
+            byte_len > 0 && byte_len <= REMOTE_COMPONENT_MAX_BYTES,
+            "{role} component receipt byte length is outside the supported bound"
+        );
+        anyhow::ensure!(
+            sha256.len() == 64
+                && sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "{role} component receipt has an invalid SHA-256 digest"
+        );
+        Ok(ComponentByteReceipt {
+            sha256: sha256.to_string(),
+            byte_len,
+        })
+    };
+    Ok(ProcessFamilyByteReceipt {
+        ft: parse_component(
+            "ft",
+            ft_bytes.context("ft component receipt is missing its byte length")?,
+            ft_sha256.context("ft component receipt is missing its SHA-256 digest")?,
+        )?,
+        mux_server: parse_component(
+            "mux",
+            mux_bytes.context("mux component receipt is missing its byte length")?,
+            mux_sha256.context("mux component receipt is missing its SHA-256 digest")?,
+        )?,
+    })
 }
 
 fn copy_remote_component(
@@ -78163,32 +78524,73 @@ fn copy_remote_component(
     remote_name: &str,
     staging_suffix: &str,
     timeout: std::time::Duration,
+    expected: &LocalComponentSnapshot,
 ) -> anyhow::Result<()> {
-    if !source.is_file() {
-        anyhow::bail!("component path is not a file: {}", source.display());
-    }
+    anyhow::ensure!(
+        matches!(remote_name, "ft" | "frankenterm-mux-server"),
+        "unsupported remote process-family component name"
+    );
+    anyhow::ensure!(
+        staging_suffix.len() == 32
+            && staging_suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "component staging suffix must be 32 lowercase hex characters"
+    );
+    let preflight_command = remote_component_upload_preflight_command(remote_name, staging_suffix);
+    let preflight = run_remote_command(host, &preflight_command, timeout)?;
+    anyhow::ensure!(
+        preflight.status.success(),
+        "remote upload preflight for staged {remote_name} failed (exit {:?}): {}",
+        preflight.status.code().unwrap_or(-1),
+        bounded_terminal_diagnostic(&preflight.stderr, 512, 1024)
+    );
+    let expected_preflight =
+        format!("FT_REMOTE_COMPONENT_UPLOAD_READY={remote_name}:{staging_suffix}\n");
+    anyhow::ensure!(
+        preflight.stdout == expected_preflight,
+        "remote upload preflight for staged {remote_name} returned no exact receipt"
+    );
 
-    let mut scp = std::process::Command::new("scp");
-    scp.arg("-o")
+    let source_file = open_local_component_nofollow(source)?;
+    let source_before = DiagnosticFileSnapshot::capture(&source_file.metadata()?).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot capture component identity for {} before upload: {error}",
+            source.display()
+        )
+    })?;
+    anyhow::ensure!(
+        source_before == expected.source_identity,
+        "component {} changed after process-family validation and before upload",
+        source.display()
+    );
+    let upload_file = source_file.try_clone().map_err(|error| {
+        anyhow::anyhow!(
+            "cannot retain component identity handle for {} during upload: {error}",
+            source.display()
+        )
+    })?;
+    let upload_command = remote_component_upload_command(remote_name, staging_suffix);
+    let mut ssh = std::process::Command::new("ssh");
+    ssh.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg(format!("ConnectTimeout={}", timeout.as_secs()))
-        .arg(source)
-        .arg(format!(
-            "{host}:.local/bin/{remote_name}.installing-{staging_suffix}"
-        ));
-    let output = run_cmd_with_timeout(
-        &mut scp,
+        .arg(host)
+        .arg(upload_command);
+    let output = run_cmd_with_timeout_and_stdin(
+        &mut ssh,
+        std::process::Stdio::from(upload_file),
         timeout,
         REMOTE_SETUP_MAX_STDOUT_BYTES,
         REMOTE_SETUP_MAX_STDERR_BYTES,
     )?;
     if output.stdout.overflowed || output.stderr.overflowed {
-        anyhow::bail!("scp output exceeded the remote setup safety limit");
+        anyhow::bail!("component upload output exceeded the remote setup safety limit");
     }
     if !output.status.success() {
         anyhow::bail!(
-            "scp of {} failed with status {}: {}",
+            "identity-fenced upload of {} failed with status {}: {}",
             source.display(),
             output.status,
             bounded_terminal_diagnostic(
@@ -78198,7 +78600,320 @@ fn copy_remote_component(
             )
         );
     }
+    anyhow::ensure!(
+        output.stdout.bytes.is_empty(),
+        "identity-fenced component upload returned unexpected stdout"
+    );
+    let source_after = DiagnosticFileSnapshot::capture(&source_file.metadata()?).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot recapture component identity for {} after upload: {error}",
+            source.display()
+        )
+    })?;
+    anyhow::ensure!(
+        source_after == expected.source_identity,
+        "component {} changed while its identity-fenced bytes were uploaded",
+        source.display()
+    );
+
+    let verify_command = remote_component_verification_command(
+        remote_name,
+        staging_suffix,
+        expected,
+    );
+    let verification = run_remote_command(host, &verify_command, timeout)?;
+    anyhow::ensure!(
+        verification.status.success(),
+        "remote verification of staged {remote_name} failed (exit {:?}): {}",
+        verification.status.code().unwrap_or(-1),
+        bounded_terminal_diagnostic(&verification.stderr, 512, 1024)
+    );
+    let expected_receipt = format!(
+        "FT_REMOTE_COMPONENT_VERIFIED={remote_name}:{}:{}\n",
+        expected.byte_len, expected.sha256
+    );
+    anyhow::ensure!(
+        verification.stdout == expected_receipt,
+        "remote verification of staged {remote_name} returned no exact receipt"
+    );
     Ok(())
+}
+
+fn remote_component_upload_preflight_command(
+    remote_name: &str,
+    staging_suffix: &str,
+) -> String {
+    let remote_path = format!("$HOME/.local/bin/{remote_name}.installing-{staging_suffix}");
+    format!(
+        r#"set -eu
+path="{remote_path}"
+test ! -e "$path" && test ! -L "$path"
+printf 'FT_REMOTE_COMPONENT_UPLOAD_READY={remote_name}:{staging_suffix}\n'"#
+    )
+}
+
+fn remote_component_upload_command(remote_name: &str, staging_suffix: &str) -> String {
+    let remote_path = format!("$HOME/.local/bin/{remote_name}.installing-{staging_suffix}");
+    format!(
+        r#"set -euC
+umask 077
+path="{remote_path}"
+test ! -e "$path" && test ! -L "$path"
+cat > "$path""#
+    )
+}
+
+fn remote_component_verification_command(
+    remote_name: &str,
+    staging_suffix: &str,
+    expected: &LocalComponentSnapshot,
+) -> String {
+    let remote_path = format!("$HOME/.local/bin/{remote_name}.installing-{staging_suffix}");
+    format!(
+        r#"set -eu
+path="{remote_path}"
+test -f "$path" && test ! -L "$path"
+actual_bytes=$(stat -c %s -- "$path")
+test "$actual_bytes" = "{expected_bytes}"
+actual_sha256=$(sha256sum -- "$path")
+actual_sha256=${{actual_sha256%% *}}
+test "$actual_sha256" = "{expected_sha256}"
+printf 'FT_REMOTE_COMPONENT_VERIFIED={remote_name}:%s:%s\n' "$actual_bytes" "$actual_sha256""#,
+        expected_bytes = expected.byte_len,
+        expected_sha256 = expected.sha256,
+    )
+}
+
+fn local_process_family_publish_command(
+    suffix: &str,
+    process_family: &ProcessFamilyByteReceipt,
+    active_mux: bool,
+) -> anyhow::Result<String> {
+    validate_process_family_byte_receipt(process_family)?;
+    anyhow::ensure!(
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "component staging suffix must be 32 lowercase hex characters"
+    );
+    let ft_bytes = process_family.ft.byte_len;
+    let ft_sha256 = &process_family.ft.sha256;
+    let mux_bytes = process_family.mux_server.byte_len;
+    let mux_sha256 = &process_family.mux_server.sha256;
+    let prelude = format!(
+        r#"set -eu
+verify_component() {{
+  path=$1
+  expected_bytes=$2
+  expected_sha256=$3
+  test -f "$path" && test ! -L "$path" || return 1
+  actual_bytes=$(stat -c %s -- "$path") || return 1
+  test "$actual_bytes" = "$expected_bytes" || return 1
+  actual_sha256=$(sha256sum -- "$path") || return 1
+  actual_sha256=${{actual_sha256%% *}}
+  test "$actual_sha256" = "$expected_sha256" || return 1
+}}
+move_no_clobber() {{
+  source=$1
+  target=$2
+  test ! -e "$target" && test ! -L "$target" || return 1
+  mv -n "$source" "$target" || return 1
+  test ! -e "$source" && test ! -L "$source" || return 1
+  test -e "$target" || test -L "$target"
+}}
+bin="$HOME/.local/bin"
+command -v flock >/dev/null 2>&1 || {{
+  printf 'remote component publication requires flock\n' >&2
+  exit 1
+}}
+exec 9<"$bin"
+flock -n 9 || {{
+  printf 'another remote component publication owns the installation directory\n' >&2
+  exit 1
+}}
+ft_stage="$bin/ft.installing-{suffix}"
+mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
+verify_component "$ft_stage" "{ft_bytes}" "{ft_sha256}"
+verify_component "$mux_stage" "{mux_bytes}" "{mux_sha256}"
+chmod 0755 "$ft_stage" "$mux_stage"
+"$ft_stage" --version >/dev/null
+"$mux_stage" --version >/dev/null"#
+    );
+
+    if active_mux {
+        Ok(format!(
+            r#"{prelude}
+restore_pending_ft() {{
+  verify_component "$ft_pending" "{ft_bytes}" "{ft_sha256}" || return 1
+  test ! -e "$ft_stage" && test ! -L "$ft_stage" || return 1
+  move_no_clobber "$ft_pending" "$ft_stage"
+}}
+report_incomplete_rollback() {{
+  printf 'FT_COMPONENT_ROLLBACK_INCOMPLETE={suffix}\n' >&2
+}}
+ft_pending="$bin/ft.pending-{suffix}"
+mux_pending="$bin/frankenterm-mux-server.pending-{suffix}"
+test ! -e "$ft_pending" && test ! -L "$ft_pending"
+test ! -e "$mux_pending" && test ! -L "$mux_pending"
+verify_component "$ft_stage" "{ft_bytes}" "{ft_sha256}"
+move_no_clobber "$ft_stage" "$ft_pending"
+if ! verify_component "$mux_stage" "{mux_bytes}" "{mux_sha256}"; then
+  if restore_pending_ft; then
+    exit 1
+  fi
+  report_incomplete_rollback
+  exit 2
+fi
+if ! move_no_clobber "$mux_stage" "$mux_pending"; then
+  if restore_pending_ft; then
+    exit 1
+  fi
+  report_incomplete_rollback
+  exit 2
+fi
+printf 'FT_COMPONENT_ACTIVATION=pending_live_mux:{suffix}\n'"#
+        ))
+    } else {
+        Ok(format!(
+            r#"{prelude}
+restore_preserved_component() {{
+  backup=$1
+  target=$2
+  test -z "$backup" && return 0
+  test ! -e "$target" && test ! -L "$target" || return 1
+  move_no_clobber "$backup" "$target"
+}}
+report_incomplete_rollback() {{
+  printf 'FT_COMPONENT_ROLLBACK_INCOMPLETE={suffix}\n' >&2
+}}
+ft_backup=""
+mux_backup=""
+ft_backup_candidate="$bin/ft.previous-{suffix}"
+mux_backup_candidate="$bin/frankenterm-mux-server.previous-{suffix}"
+ft_failed="$bin/ft.failed-publish-{suffix}"
+test ! -e "$ft_backup_candidate" && test ! -L "$ft_backup_candidate"
+test ! -e "$mux_backup_candidate" && test ! -L "$mux_backup_candidate"
+test ! -e "$ft_failed" && test ! -L "$ft_failed"
+if test -e "$bin/ft" || test -L "$bin/ft"; then
+  test -f "$bin/ft" && test ! -L "$bin/ft"
+  ft_backup="$ft_backup_candidate"
+  move_no_clobber "$bin/ft" "$ft_backup"
+fi
+if test -e "$bin/frankenterm-mux-server" || test -L "$bin/frankenterm-mux-server"; then
+  test -f "$bin/frankenterm-mux-server" && test ! -L "$bin/frankenterm-mux-server"
+  mux_backup="$mux_backup_candidate"
+  if ! move_no_clobber "$bin/frankenterm-mux-server" "$mux_backup"; then
+    if restore_preserved_component "$ft_backup" "$bin/ft"; then
+      exit 1
+    fi
+    report_incomplete_rollback
+    exit 2
+  fi
+fi
+if ! verify_component "$ft_stage" "{ft_bytes}" "{ft_sha256}" || \
+   ! move_no_clobber "$ft_stage" "$bin/ft"; then
+  rollback_ok=1
+  restore_preserved_component "$ft_backup" "$bin/ft" || rollback_ok=0
+  restore_preserved_component "$mux_backup" "$bin/frankenterm-mux-server" || rollback_ok=0
+  if test "$rollback_ok" = 1; then
+    exit 1
+  fi
+  report_incomplete_rollback
+  exit 2
+fi
+if ! verify_component "$mux_stage" "{mux_bytes}" "{mux_sha256}" || \
+   ! move_no_clobber "$mux_stage" "$bin/frankenterm-mux-server"; then
+  rollback_ok=1
+  if verify_component "$bin/ft" "{ft_bytes}" "{ft_sha256}" && \
+     test ! -e "$ft_failed" && test ! -L "$ft_failed"; then
+    move_no_clobber "$bin/ft" "$ft_failed" || rollback_ok=0
+  else
+    rollback_ok=0
+  fi
+  restore_preserved_component "$ft_backup" "$bin/ft" || rollback_ok=0
+  restore_preserved_component "$mux_backup" "$bin/frankenterm-mux-server" || rollback_ok=0
+  if test "$rollback_ok" = 1; then
+    exit 1
+  fi
+  report_incomplete_rollback
+  exit 2
+fi
+printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish:{suffix}\n'"#
+        ))
+    }
+}
+
+fn remote_release_stage_command(
+    tag: &str,
+    suffix: &str,
+    receipt: &ProcessFamilyByteReceipt,
+) -> anyhow::Result<String> {
+    validate_process_family_byte_receipt(receipt)?;
+    let tag = validate_remote_release_tag(tag)?;
+    anyhow::ensure!(
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "release staging suffix must be 32 lowercase hex characters"
+    );
+    let ft_bytes = receipt.ft.byte_len;
+    let ft_sha256 = &receipt.ft.sha256;
+    let mux_bytes = receipt.mux_server.byte_len;
+    let mux_sha256 = &receipt.mux_server.sha256;
+    Ok(format!(
+        r#"set -eu
+verify_component() {{
+  path=$1
+  expected_bytes=$2
+  expected_sha256=$3
+  test -f "$path" && test ! -L "$path" || return 1
+  actual_bytes=$(stat -c %s -- "$path") || return 1
+  test "$actual_bytes" = "$expected_bytes" || return 1
+  actual_sha256=$(sha256sum -- "$path") || return 1
+  actual_sha256=${{actual_sha256%% *}}
+  test "$actual_sha256" = "$expected_sha256" || return 1
+}}
+move_no_clobber() {{
+  source=$1
+  target=$2
+  test ! -e "$target" && test ! -L "$target" || return 1
+  mv -n "$source" "$target" || return 1
+  test ! -e "$source" && test ! -L "$source" || return 1
+  test -e "$target" || test -L "$target"
+}}
+release_dir="$HOME/.cache/frankenterm/releases/{tag}-{suffix}"
+bin="$HOME/.local/bin"
+command -v flock >/dev/null 2>&1 || {{
+  printf 'remote release staging requires flock\n' >&2
+  exit 1
+}}
+exec 9<"$bin"
+flock -n 9 || {{
+  printf 'another remote component publication owns the installation directory\n' >&2
+  exit 1
+}}
+ft_source="$release_dir/ft"
+mux_source="$release_dir/frankenterm-mux-server"
+ft_stage="$bin/ft.installing-{suffix}"
+mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
+test ! -e "$ft_stage" && test ! -L "$ft_stage"
+test ! -e "$mux_stage" && test ! -L "$mux_stage"
+verify_component "$ft_source" "{ft_bytes}" "{ft_sha256}"
+verify_component "$mux_source" "{mux_bytes}" "{mux_sha256}"
+verify_component "$ft_source" "{ft_bytes}" "{ft_sha256}"
+move_no_clobber "$ft_source" "$ft_stage"
+if ! verify_component "$mux_source" "{mux_bytes}" "{mux_sha256}" || \
+   ! move_no_clobber "$mux_source" "$mux_stage"; then
+  if move_no_clobber "$ft_stage" "$ft_source"; then
+    exit 1
+  fi
+  printf 'FT_RELEASE_STAGE_ROLLBACK_INCOMPLETE={tag}:{suffix}\n' >&2
+  exit 2
+fi
+printf 'FT_RELEASE_COMPONENT_STAGE_V1={tag}:{suffix}\n'"#
+    ))
 }
 
 fn run_remote_command(
@@ -78251,8 +78966,13 @@ fn print_remote_output(
     if trimmed.is_empty() {
         return;
     }
-    let redacted = redactor.redact(trimmed);
-    println!("  {label}: {redacted}");
+    let safe = frankenterm_core::output::sanitize_redact_truncate_bounded(
+        trimmed,
+        1_024,
+        4_096,
+        |text| redactor.redact(text),
+    );
+    println!("  {label}: {safe}");
 }
 
 // Remote step execution keeps host, command, timing, dry-run, and injected runner fields visible.
@@ -78315,23 +79035,24 @@ where
     let apply_changes = options.apply && !options.dry_run;
     let redactor = Redactor::new();
 
-    match (
+    let local_process_family = match (
         options.install_ft,
         options.ft_path,
         options.mux_server_path,
         options.ft_version,
     ) {
-        (false, None, None, None) => {}
+        (false, None, None, None) => None,
         (false, _, _, _) => {
             anyhow::bail!(
                 "component source flags require --install-ft so the matched process family is explicit"
             );
         }
         (true, Some(ft_path), Some(mux_server_path), None) => {
-            validate_local_process_family(ft_path, mux_server_path)?;
+            Some(validate_local_process_family(ft_path, mux_server_path)?)
         }
         (true, None, None, Some(tag)) => {
             validate_remote_release_tag(tag)?;
+            None
         }
         (true, Some(_), None, None) => {
             anyhow::bail!("--ft-path requires --mux-server-path from the exact same build");
@@ -78349,7 +79070,10 @@ where
                 "choose exactly one component source: local --ft-path/--mux-server-path or --ft-version"
             );
         }
-    }
+    };
+    let component_transaction = options
+        .install_ft
+        .then(|| uuid::Uuid::new_v4().simple().to_string());
 
     println!("ft setup remote - Remote Host Setup for '{host}'\n");
     if options.dry_run || !apply_changes {
@@ -78372,16 +79096,20 @@ where
     }
 
     // Step 1: Connectivity check
-    run_remote_step(
+    let channel = run_remote_step(
         "Check SSH connectivity",
         host,
-        "true",
+        "printf 'FT_REMOTE_COMMAND_CHANNEL_V1\\n'",
         timeout,
         runner,
         &redactor,
         options.verbose,
         true,
     )?;
+    anyhow::ensure!(
+        channel.stdout == "FT_REMOTE_COMMAND_CHANNEL_V1\n",
+        "remote SSH command channel is not stdout-clean; refusing receipt-authorized mutations"
+    );
 
     // A client binary cannot be activated independently of the mux process it
     // speaks to. Replacing ~/.local/bin/ft while an older mux keeps running is
@@ -78392,15 +79120,34 @@ where
         let output = run_remote_step(
             "Fence FrankenTerm mux ownership and component activation",
             host,
-            "if systemctl --user is-active --quiet frankenterm-mux-server 2>/dev/null || \
-                (command -v pgrep >/dev/null 2>&1 && \
-                 pgrep -u \"$(id -u)\" -f '(^|/)[f]rankenterm-mux-server([^/[:space:]]*)([[:space:]]|$)' >/dev/null 2>&1) || \
-                (command -v ps >/dev/null 2>&1 && \
-                 ps -u \"$(id -u)\" -o args= 2>/dev/null | \
-                 grep -Eq '(^|/)[f]rankenterm-mux-server([^/[:space:]]*)([[:space:]]|$)') || \
-                (! command -v pgrep >/dev/null 2>&1 && \
-                 { ! command -v ps >/dev/null 2>&1 || ! command -v grep >/dev/null 2>&1; }); then \
-                printf 'active\\n'; else printf 'inactive\\n'; fi",
+            r#"set -u
+service_name='franken''term-mux-server'
+process_pattern='(^|/)[f]ranken''term-mux-server([^/[:space:]]*)([[:space:]]|$)'
+if command -v systemctl >/dev/null 2>&1 && \
+   systemctl --user is-active --quiet "$service_name" 2>/dev/null; then
+  printf 'active\n'
+  exit 0
+fi
+if command -v pgrep >/dev/null 2>&1; then
+  pgrep -u "$(id -u)" -f "$process_pattern" >/dev/null 2>&1
+  probe_status=$?
+  case "$probe_status" in
+    0) printf 'active\n'; exit 0 ;;
+    1) printf 'inactive\n'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+fi
+if command -v ps >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
+  process_list=$(ps -u "$(id -u)" -o args= 2>/dev/null) || exit 3
+  printf '%s\n' "$process_list" | grep -Eq "$process_pattern"
+  probe_status=$?
+  case "$probe_status" in
+    0) printf 'active\n'; exit 0 ;;
+    1) printf 'inactive\n'; exit 0 ;;
+    *) exit 4 ;;
+  esac
+fi
+exit 5"#,
             timeout,
             runner,
             &redactor,
@@ -78411,9 +79158,9 @@ where
             output.status.success(),
             "remote mux ownership fence failed; refusing to assume the host is inactive"
         );
-        match output.stdout.trim() {
-            "active" => true,
-            "inactive" => false,
+        match output.stdout.as_str() {
+            "active\n" => true,
+            "inactive\n" => false,
             _ => anyhow::bail!(
                 "remote mux ownership fence returned no unambiguous state; refusing component activation"
             ),
@@ -78444,10 +79191,17 @@ fi"#,
         )?;
         let dump_marker = dump_output
             .stdout
-            .lines()
-            .find(|line| line.starts_with("FT_PREUPGRADE_DUMP="))
-            .ok_or_else(|| anyhow::anyhow!("pre-upgrade dump command returned no status marker"))?;
-        if dump_marker.starts_with("FT_PREUPGRADE_DUMP=verified path=") {
+            .strip_suffix('\n')
+            .filter(|line| !line.bytes().any(|byte| matches!(byte, b'\n' | b'\r')))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pre-upgrade dump command returned no exact single-line status marker"
+                )
+            })?;
+        if let Some(path) = dump_marker.strip_prefix("FT_PREUPGRADE_DUMP=verified path=") {
+            validate_remote_mux_server_path(path).context(
+                "pre-upgrade dump command returned an unsafe or non-absolute artifact path",
+            )?;
             println!("  ✓ compatible pre-upgrade mux dump captured and verified");
         } else if matches!(
             dump_marker,
@@ -78655,81 +79409,36 @@ fi"#,
             if let (Some(ft_path), Some(mux_server_path)) =
                 (options.ft_path, options.mux_server_path)
             {
-                let staging_suffix = uuid::Uuid::new_v4().simple().to_string();
-                copy_remote_component(host, ft_path, "ft", &staging_suffix, timeout)?;
+                let process_family = local_process_family.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "validated local process-family snapshot is missing before remote copy"
+                    )
+                })?;
+                let staging_suffix = component_transaction.clone().ok_or_else(|| {
+                    anyhow::anyhow!("component transaction identity is missing before local copy")
+                })?;
+                copy_remote_component(
+                    host,
+                    ft_path,
+                    "ft",
+                    &staging_suffix,
+                    timeout,
+                    &process_family.ft,
+                )?;
                 copy_remote_component(
                     host,
                     mux_server_path,
                     "frankenterm-mux-server",
                     &staging_suffix,
                     timeout,
+                    &process_family.mux_server,
                 )?;
-                let suffix = staging_suffix;
-                let publish_command = if active_mux_before_install {
-                    format!(
-                        r#"set -eu
-stamp=$(date +%Y%m%d%H%M%S)
-bin="$HOME/.local/bin"
-ft_stage="$bin/ft.installing-{suffix}"
-mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
-ft_pending="$bin/ft.pending-$stamp-$$"
-mux_pending="$bin/frankenterm-mux-server.pending-$stamp-$$"
-test -f "$ft_stage" && test -f "$mux_stage"
-test ! -e "$ft_pending" && test ! -e "$mux_pending"
-chmod 0755 "$ft_stage" "$mux_stage"
-"$ft_stage" --version
-"$mux_stage" --version
-mv "$ft_stage" "$ft_pending"
-if ! mv "$mux_stage" "$mux_pending"; then
-  mv "$ft_pending" "$ft_stage"
-  exit 1
-fi
-printf 'FT_COMPONENT_ACTIVATION=pending_live_mux\n'"#
-                    )
-                } else {
-                    format!(
-                    r#"set -eu
-stamp=$(date +%Y%m%d%H%M%S)
-bin="$HOME/.local/bin"
-ft_stage="$bin/ft.installing-{suffix}"
-mux_stage="$bin/frankenterm-mux-server.installing-{suffix}"
-test -f "$ft_stage" && test -f "$mux_stage"
-chmod 0755 "$ft_stage" "$mux_stage"
-"$ft_stage" --version
-"$mux_stage" --version
-ft_backup=""
-mux_backup=""
-if test -e "$bin/ft"; then
-  ft_backup="$bin/ft.previous-$stamp-$$"
-  test ! -e "$ft_backup"
-  mv "$bin/ft" "$ft_backup"
-fi
-if test -e "$bin/frankenterm-mux-server"; then
-  mux_backup="$bin/frankenterm-mux-server.previous-$stamp-$$"
-  if test -e "$mux_backup"; then
-    test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
-    exit 1
-  fi
-  if ! mv "$bin/frankenterm-mux-server" "$mux_backup"; then
-    test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
-    exit 1
-  fi
-fi
-if ! mv "$ft_stage" "$bin/ft"; then
-  test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
-  test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
-  exit 1
-fi
-if ! mv "$mux_stage" "$bin/frankenterm-mux-server"; then
-  mv "$bin/ft" "$bin/ft.failed-publish-$stamp-$$"
-  test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
-  test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
-  exit 1
-fi
-printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish\n'"#
-                    )
-                };
-                run_remote_step(
+                let publish_command = local_process_family_publish_command(
+                    &staging_suffix,
+                    &ProcessFamilyByteReceipt::from(process_family),
+                    active_mux_before_install,
+                )?;
+                let publication = run_remote_step(
                     if active_mux_before_install {
                         "Stage pending FrankenTerm process family"
                     } else {
@@ -78743,11 +79452,29 @@ printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish\n'"#
                     options.verbose,
                     true,
                 )?;
+                let expected_publication_receipt = if active_mux_before_install {
+                    format!(
+                        "FT_COMPONENT_ACTIVATION=pending_live_mux:{staging_suffix}\n"
+                    )
+                } else {
+                    format!(
+                        "FT_COMPONENT_ACTIVATION=active_transactional_publish:{staging_suffix}\n"
+                    )
+                };
+                anyhow::ensure!(
+                    publication.stdout == expected_publication_receipt,
+                    "remote process-family publication returned no exact activation receipt"
+                );
+                println!("  component transaction id: {staging_suffix}");
             } else if let Some(tag) = options.ft_version {
                 let install_timeout = timeout.max(std::time::Duration::from_secs(600));
-                let staging_suffix = uuid::Uuid::new_v4().simple().to_string();
+                let staging_suffix = component_transaction.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "component transaction identity is missing before release staging"
+                    )
+                })?;
                 let install_command = remote_release_installer_command(tag, &staging_suffix)?;
-                run_remote_step(
+                let installation = run_remote_step(
                     if active_mux_before_install {
                         "Download verified pending FrankenTerm release process family"
                     } else {
@@ -78761,91 +79488,59 @@ printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish\n'"#
                     options.verbose,
                     true,
                 )?;
-                if active_mux_before_install {
-                    let stage_pending_command = format!(
-                        r#"set -eu
-release_dir="$HOME/.cache/frankenterm/releases/{tag}-{staging_suffix}"
-bin="$HOME/.local/bin"
-ft_stage="$release_dir/ft"
-mux_stage="$release_dir/frankenterm-mux-server"
-ft_pending="$bin/ft.pending-{tag}-{staging_suffix}"
-mux_pending="$bin/frankenterm-mux-server.pending-{tag}-{staging_suffix}"
-test -f "$ft_stage" && test -f "$mux_stage"
-test ! -e "$ft_pending" && test ! -e "$mux_pending"
-chmod 0755 "$ft_stage" "$mux_stage"
-"$ft_stage" --version
-"$mux_stage" --version
-mv "$ft_stage" "$ft_pending"
-if ! mv "$mux_stage" "$mux_pending"; then
-  mv "$ft_pending" "$ft_stage"
-  exit 1
-fi
-printf 'FT_COMPONENT_ACTIVATION=pending_live_mux\n'"#
-                    );
-                    run_remote_step(
-                        "Stage verified release as a pending process family",
-                        host,
-                        &stage_pending_command,
-                        timeout,
-                        runner,
-                        &redactor,
-                        options.verbose,
-                        true,
-                    )?;
+                let receipt = parse_remote_release_component_receipt(&installation.stdout, tag)?;
+                let stage_command =
+                    remote_release_stage_command(tag, &staging_suffix, &receipt)?;
+                let staging = run_remote_step(
+                    "Bind verified release bytes to the local publication stage",
+                    host,
+                    &stage_command,
+                    timeout,
+                    runner,
+                    &redactor,
+                    options.verbose,
+                    true,
+                )?;
+                let expected_stage_receipt =
+                    format!("FT_RELEASE_COMPONENT_STAGE_V1={tag}:{staging_suffix}\n");
+                anyhow::ensure!(
+                    staging.stdout == expected_stage_receipt,
+                    "remote release staging returned no exact byte-binding receipt"
+                );
+
+                let publish_command = local_process_family_publish_command(
+                    &staging_suffix,
+                    &receipt,
+                    active_mux_before_install,
+                )?;
+                let publication = run_remote_step(
+                    if active_mux_before_install {
+                        "Stage verified release as a pending process family"
+                    } else {
+                        "Publish verified release process family transactionally"
+                    },
+                    host,
+                    &publish_command,
+                    timeout,
+                    runner,
+                    &redactor,
+                    options.verbose,
+                    true,
+                )?;
+                let expected_publication_receipt = if active_mux_before_install {
+                    format!(
+                        "FT_COMPONENT_ACTIVATION=pending_live_mux:{staging_suffix}\n"
+                    )
                 } else {
-                    let publish_release_command = format!(
-                        r#"set -eu
-release_dir="$HOME/.cache/frankenterm/releases/{tag}-{staging_suffix}"
-bin="$HOME/.local/bin"
-ft_stage="$release_dir/ft"
-mux_stage="$release_dir/frankenterm-mux-server"
-stamp=$(date +%Y%m%d%H%M%S)
-test -f "$ft_stage" && test -f "$mux_stage"
-chmod 0755 "$ft_stage" "$mux_stage"
-"$ft_stage" --version
-"$mux_stage" --version
-ft_backup=""
-mux_backup=""
-if test -e "$bin/ft"; then
-  ft_backup="$bin/ft.previous-$stamp-$$"
-  test ! -e "$ft_backup"
-  mv "$bin/ft" "$ft_backup"
-fi
-if test -e "$bin/frankenterm-mux-server"; then
-  mux_backup="$bin/frankenterm-mux-server.previous-$stamp-$$"
-  if test -e "$mux_backup"; then
-    test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
-    exit 1
-  fi
-  if ! mv "$bin/frankenterm-mux-server" "$mux_backup"; then
-    test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
-    exit 1
-  fi
-fi
-if ! mv "$ft_stage" "$bin/ft"; then
-  test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
-  test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
-  exit 1
-fi
-if ! mv "$mux_stage" "$bin/frankenterm-mux-server"; then
-  mv "$bin/ft" "$bin/ft.failed-publish-$stamp-$$"
-  test -z "$ft_backup" || mv "$ft_backup" "$bin/ft"
-  test -z "$mux_backup" || mv "$mux_backup" "$bin/frankenterm-mux-server"
-  exit 1
-fi
-printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish\n'"#
-                    );
-                    run_remote_step(
-                        "Publish verified release process family transactionally",
-                        host,
-                        &publish_release_command,
-                        timeout,
-                        runner,
-                        &redactor,
-                        options.verbose,
-                        true,
-                    )?;
-                }
+                    format!(
+                        "FT_COMPONENT_ACTIVATION=active_transactional_publish:{staging_suffix}\n"
+                    )
+                };
+                anyhow::ensure!(
+                    publication.stdout == expected_publication_receipt,
+                    "remote release publication returned no exact activation receipt"
+                );
+                println!("  component transaction id: {staging_suffix}");
             }
             if active_mux_before_install {
                 println!(
@@ -78858,9 +79553,9 @@ printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish\n'"#
             (options.ft_path, options.mux_server_path)
         {
             if active_mux_before_install {
-                println!("• Would stage a pending FrankenTerm process family via scp");
+                println!("• Would stage a pending FrankenTerm process family via identity-fenced SSH upload");
             } else {
-                println!("• Would publish the atomic FrankenTerm process family via scp");
+                println!("• Would publish the atomic FrankenTerm process family via identity-fenced SSH upload");
             }
             println!("  ft: {}", ft_path.display());
             println!("  mux-server: {}", mux_server_path.display());
@@ -78903,33 +79598,66 @@ printf 'FT_COMPONENT_ACTIVATION=active_transactional_publish\n'"#
     let mux_unit = remote_mux_service_unit(&mux_server_path);
 
     let service_path = "~/.config/systemd/user/frankenterm-mux-server.service";
-    let check_service_cmd = format!("cat {service_path} 2>/dev/null || true");
+    let check_service_cmd = r#"set -u
+service="$HOME/.config/systemd/user/frankenterm-mux-server.service"
+if test ! -e "$service" && test ! -L "$service"; then
+  printf 'FT_REMOTE_SERVICE_STATE_V1=missing\n'
+elif test -f "$service" && test ! -L "$service"; then
+  printf 'FT_REMOTE_SERVICE_STATE_V1=regular\n'
+  cat "$service"
+else
+  printf 'FT_REMOTE_SERVICE_STATE_V1=unsafe_shape\n'
+fi"#;
     let service_output = run_remote_step(
         "Check mux service unit",
         host,
-        &check_service_cmd,
+        check_service_cmd,
         timeout,
         runner,
         &redactor,
         options.verbose,
         false,
     )?;
-    let existing_service = service_output.stdout.trim();
+    anyhow::ensure!(
+        service_output.status.success(),
+        "remote mux service-unit shape probe failed"
+    );
+    let existing_service = if service_output.stdout == "FT_REMOTE_SERVICE_STATE_V1=missing\n" {
+        ""
+    } else if service_output.stdout == "FT_REMOTE_SERVICE_STATE_V1=unsafe_shape\n" {
+        anyhow::bail!(
+            "remote mux service-unit path is a symlink or non-regular object; refusing to read or replace it"
+        );
+    } else if let Some(contents) = service_output
+        .stdout
+        .strip_prefix("FT_REMOTE_SERVICE_STATE_V1=regular\n")
+    {
+        contents.trim()
+    } else {
+        anyhow::bail!("remote mux service-unit shape probe returned an invalid marker");
+    };
     let expected_service = mux_unit.trim();
     if existing_service == expected_service {
         println!("✓ mux service unit already up to date");
     } else if existing_service.is_empty() || options.install_ft {
         if apply_changes {
+            let service_transaction = component_transaction
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
             let install_cmd = format!(
                 r#"set -eu
 service="$HOME/.config/systemd/user/frankenterm-mux-server.service"
-stage="$service.installing-$$"
+stage="$service.installing-{service_transaction}"
+backup_candidate="$service.previous-{service_transaction}"
 backup=""
 mkdir -p "$HOME/.config/systemd/user"
+test ! -e "$stage" && test ! -L "$stage"
+test ! -e "$backup_candidate" && test ! -L "$backup_candidate"
 cat > "$stage" <<'EOF'
 {mux_unit}EOF
-if test -e "$service"; then
-  backup="$service.previous-$(date +%Y%m%d%H%M%S)-$$"
+if test -e "$service" || test -L "$service"; then
+  test -f "$service" && test ! -L "$service"
+  backup="$backup_candidate"
   mv "$service" "$backup"
 fi
 if ! mv "$stage" "$service"; then
@@ -78951,6 +79679,7 @@ fi"#
                 options.verbose,
                 true,
             )?;
+            println!("  service transaction id: {service_transaction}");
         } else {
             if existing_service.is_empty() {
                 println!("• Would install mux service unit at {service_path}");
@@ -81003,13 +81732,36 @@ fn run_cmd_with_timeout(
     max_stderr_bytes: usize,
 ) -> std::io::Result<BoundedCommandOutput> {
     configure_diagnostic_command(cmd)?;
+    run_configured_cmd_with_timeout(cmd, timeout, max_stdout_bytes, max_stderr_bytes)
+}
+
+fn run_cmd_with_timeout_and_stdin(
+    cmd: &mut std::process::Command,
+    stdin: std::process::Stdio,
+    timeout: std::time::Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> std::io::Result<BoundedCommandOutput> {
+    cmd.stdin(stdin);
+    frankenterm_core::runtime_async::process::configure_process_group(cmd)?;
+    run_configured_cmd_with_timeout(cmd, timeout, max_stdout_bytes, max_stderr_bytes)
+}
+
+fn run_configured_cmd_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> std::io::Result<BoundedCommandOutput> {
     let (mut stdout, stdout_stdio) = diagnostic_capture_pair(max_stdout_bytes)?;
     let (mut stderr, stderr_stdio) = diagnostic_capture_pair(max_stderr_bytes)?;
     let spawn_result = cmd.stdout(stdout_stdio).stderr(stderr_stdio).spawn();
     // `Command` retains its stdio configuration for possible later spawns.
-    // Replace it immediately so our parent-side writer copies cannot suppress
-    // EOF while this invocation drains the child/tree copies.
-    cmd.stdout(std::process::Stdio::null())
+    // Replace it immediately so parent-side descriptor copies cannot extend
+    // stdin source ownership or suppress capture EOF while this invocation
+    // drains the child/tree copies.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let mut child = spawn_result?;
 
@@ -88982,7 +89734,12 @@ recorder_backend = "rusqlite"
             "panes": [],
             "errors": [],
         });
-        let payload_sha256 = sha256_hex(&serde_json::to_vec(&payload).unwrap());
+        let (_, payload_sha256) = hash_json_bounded(
+            &payload,
+            LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            JsonSerializationStyle::Compact,
+        )
+        .expect("hash dump payload within bound");
         let envelope = serde_json::json!({
             "schema": "frankenterm.mux-content-dump.v1",
             "publication_state": "complete",
@@ -89027,6 +89784,26 @@ recorder_backend = "rusqlite"
         let error = verify_mux_dump_artifact(&inconsistent_path)
             .expect_err("a recomputed envelope checksum must not hide invalid internal counters");
         assert!(error.to_string().contains("summary counters"));
+    }
+
+    #[test]
+    fn bounded_json_serialization_rejects_escape_expansion_before_exceeding_cap() {
+        let value = serde_json::json!({"text": "\0\0\0\0"});
+        let compact = serialize_json_bounded(&value, 64, JsonSerializationStyle::Compact)
+            .expect("fixture fits a sufficient bound");
+        assert!(compact.len() > 16, "control bytes must exercise JSON escaping");
+        let (hashed_bytes, hashed_sha256) =
+            hash_json_bounded(&value, 64, JsonSerializationStyle::Compact)
+                .expect("hash fixture within the same bound");
+        assert_eq!(hashed_bytes, u64::try_from(compact.len()).unwrap());
+        assert_eq!(hashed_sha256, sha256_hex(&compact));
+
+        let error = serialize_json_bounded(&value, 16, JsonSerializationStyle::Compact)
+            .expect_err("escaped JSON must fail before crossing its byte bound");
+        assert!(error.to_string().contains("bounded JSON serialization failed"));
+        let hash_error = hash_json_bounded(&value, 16, JsonSerializationStyle::Compact)
+            .expect_err("hashing escaped JSON must fail at the identical bound");
+        assert!(hash_error.to_string().contains("bounded JSON hashing failed"));
     }
 
     #[test]
@@ -94193,12 +94970,16 @@ log_level = "debug"
         let commands = Mutex::new(Vec::new());
         let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
             commands.lock().unwrap().push(command.to_string());
-            let stdout = if command.contains("command -v apt-get") {
+            let stdout = if command.contains("FT_REMOTE_COMMAND_CHANNEL_V1") {
+                "FT_REMOTE_COMMAND_CHANNEL_V1\n".to_string()
+            } else if command.contains("command -v apt-get") {
                 "/usr/bin/apt-get\n".to_string()
             } else if command.contains("command -v wezterm") {
                 String::new()
             } else if command.contains("systemctl --user is-active") {
                 "inactive\n".to_string()
+            } else if command.contains("FT_REMOTE_SERVICE_STATE_V1") {
+                "FT_REMOTE_SERVICE_STATE_V1=missing\n".to_string()
             } else if command.contains("loginctl show-user") {
                 "Linger=no\n".to_string()
             } else {
@@ -94228,12 +95009,50 @@ log_level = "debug"
         run_remote_setup_with_runner("example", &options, &runner).unwrap();
 
         let cmds = { commands.lock().unwrap().clone() };
-        assert!(cmds.iter().any(|cmd| cmd == "true"));
+        assert!(cmds
+            .iter()
+            .any(|cmd| cmd.contains("FT_REMOTE_COMMAND_CHANNEL_V1")));
         assert!(cmds.iter().any(|cmd| cmd.contains("command -v apt-get")));
         assert!(cmds.iter().any(|cmd| cmd.contains("command -v wezterm")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("apt-get install")));
         assert!(!cmds.iter().any(|cmd| cmd.contains("cargo install")));
-        assert!(!cmds.iter().any(|cmd| cmd.contains("scp ")));
+        assert!(!cmds.iter().any(|cmd| cmd.contains("cat > \"$path\"")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_rejects_stdout_contaminated_command_channel_before_mutation() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::Mutex;
+
+        let commands = Mutex::new(Vec::new());
+        let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
+            commands.lock().unwrap().push(command.to_string());
+            Ok(RemoteCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: "profile banner\nFT_REMOTE_COMMAND_CHANNEL_V1\n".to_string(),
+                stderr: String::new(),
+                duration_ms: 1,
+            })
+        };
+        let options = RemoteSetupOptions {
+            apply: true,
+            dry_run: false,
+            yes: true,
+            install_ft: false,
+            ft_path: None,
+            mux_server_path: None,
+            ft_version: None,
+            timeout_secs: 5,
+            verbose: 0,
+        };
+
+        let error = run_remote_setup_with_runner("example", &options, &runner)
+            .expect_err("stdout contamination must fail before any ownership or mutation step");
+        assert!(error.to_string().contains("stdout-clean"));
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].contains("FT_REMOTE_COMMAND_CHANNEL_V1"));
     }
 
     #[cfg(unix)]
@@ -94249,14 +95068,45 @@ log_level = "debug"
         let commands = Mutex::new(Vec::new());
         let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
             commands.lock().unwrap().push(command.to_string());
-            let stdout = if command.contains("systemctl --user is-active") {
+            let stdout = if command.contains("FT_REMOTE_COMMAND_CHANNEL_V1") {
+                "FT_REMOTE_COMMAND_CHANNEL_V1\n".to_string()
+            } else if command.contains("systemctl --user is-active") {
                 "active\n".to_string()
             } else if command.contains("FT_PREUPGRADE_DUMP=") {
                 "FT_PREUPGRADE_DUMP=unavailable_legacy_client\n".to_string()
             } else if command.contains("command -v frankenterm-mux-server") {
                 "/home/test/.local/bin/frankenterm-mux-server\n".to_string()
+            } else if command.contains("FT_REMOTE_SERVICE_STATE_V1") {
+                "FT_REMOTE_SERVICE_STATE_V1=missing\n".to_string()
             } else if command.contains("loginctl show-user") {
                 "Linger=yes\n".to_string()
+            } else if command.contains("FT_RELEASE_COMPONENT_RECEIPT_V1=") {
+                format!(
+                    "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\n",
+                    "b".repeat(64),
+                    "c".repeat(64)
+                )
+            } else if command.contains("FT_RELEASE_COMPONENT_STAGE_V1=") {
+                let literal = command
+                    .lines()
+                    .find_map(|line| {
+                        line.trim()
+                            .strip_prefix("printf '")
+                            .and_then(|value| value.strip_suffix("'"))
+                    })
+                    .expect("release stage receipt printf");
+                literal.replace("\\n", "\n")
+            } else if command.contains("FT_COMPONENT_ACTIVATION=pending_live_mux") {
+                let literal = command
+                    .lines()
+                    .find_map(|line| {
+                        let value = line.trim().strip_prefix("printf '")?.strip_suffix("'")?;
+                        value
+                            .starts_with("FT_COMPONENT_ACTIVATION=pending_live_mux")
+                            .then_some(value)
+                    })
+                    .expect("pending activation receipt printf");
+                literal.replace("\\n", "\n")
             } else {
                 String::new()
             };
@@ -94285,7 +95135,12 @@ log_level = "debug"
             .iter()
             .find(|command| command.contains("pgrep"))
             .expect("live mux process fence command");
-        assert!(fence.contains("[f]rankenterm-mux-server([^/[:space:]]*)"));
+        assert!(fence.contains("process_pattern="));
+        assert!(fence.contains("[f]ranken''term-mux-server([^/[:space:]]*)"));
+        assert!(
+            !fence.contains("frankenterm-mux-server"),
+            "the probe shell command must not contain the literal process name that pgrep searches for"
+        );
         let installer = commands
             .iter()
             .find(|command| command.contains("install-v0.15.2-"))
@@ -94304,12 +95159,24 @@ log_level = "debug"
         assert!(!installer.contains("--dest \"$HOME/.local/bin\""));
         let pending = commands
             .iter()
-            .find(|command| command.contains("ft.pending-v0.15.2-"))
+            .find(|command| command.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"))
             .expect("release pending publication command");
         assert!(pending.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"));
-        assert!(pending.contains("\"$ft_stage\" --version"));
-        assert!(pending.contains("\"$mux_stage\" --version"));
+        assert!(pending.contains("ft.pending-"));
+        assert!(pending.contains("frankenterm-mux-server.pending-"));
+        assert!(pending.contains("\"$ft_stage\" --version >/dev/null"));
+        assert!(pending.contains("\"$mux_stage\" --version >/dev/null"));
+        assert!(pending.matches(&"b".repeat(64)).count() >= 2);
+        assert!(pending.matches(&"c".repeat(64)).count() >= 2);
         assert!(!pending.contains("mv \"$bin/ft\" \"$ft_backup\""));
+        let service_publish = commands
+            .iter()
+            .find(|command| command.contains("backup_candidate=\"$service.previous-"))
+            .expect("transaction-unique service-unit publication command");
+        assert!(service_publish.contains("test ! -L \"$stage\""));
+        assert!(service_publish.contains("test ! -L \"$backup_candidate\""));
+        assert!(service_publish.contains("if test -e \"$service\" || test -L \"$service\""));
+        assert!(service_publish.contains("test -f \"$service\" && test ! -L \"$service\""));
         assert!(!commands.iter().any(|command| command.contains("systemctl --user restart")));
         assert!(!commands
             .iter()
@@ -94330,7 +95197,11 @@ log_level = "debug"
             commands.lock().unwrap().push(command.to_string());
             Ok(RemoteCommandOutput {
                 status: std::process::ExitStatus::from_raw(0),
-                stdout: String::new(),
+                stdout: if command.contains("FT_REMOTE_COMMAND_CHANNEL_V1") {
+                    "FT_REMOTE_COMMAND_CHANNEL_V1\n".to_string()
+                } else {
+                    String::new()
+                },
                 stderr: String::new(),
                 duration_ms: 1,
             })
@@ -94354,26 +95225,204 @@ log_level = "debug"
             .contains("returned no unambiguous state"));
         let commands = commands.lock().unwrap();
         assert_eq!(commands.len(), 2, "setup mutated after the ownership fence");
-        assert_eq!(commands[0], "true");
+        assert!(commands[0].contains("FT_REMOTE_COMMAND_CHANNEL_V1"));
         assert!(commands[1].contains("systemctl --user is-active"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_refuses_mux_inventory_probe_errors_before_mutation() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::Mutex;
+
+        let commands = Mutex::new(Vec::new());
+        let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
+            commands.lock().unwrap().push(command.to_string());
+            let is_channel_probe = command.contains("FT_REMOTE_COMMAND_CHANNEL_V1");
+            Ok(RemoteCommandOutput {
+                status: std::process::ExitStatus::from_raw(if is_channel_probe {
+                    0
+                } else {
+                    2 << 8
+                }),
+                stdout: if is_channel_probe {
+                    "FT_REMOTE_COMMAND_CHANNEL_V1\n".to_string()
+                } else {
+                    String::new()
+                },
+                stderr: "planted process inventory failure".to_string(),
+                duration_ms: 1,
+            })
+        };
+        let options = RemoteSetupOptions {
+            apply: true,
+            dry_run: false,
+            yes: true,
+            install_ft: false,
+            ft_path: None,
+            mux_server_path: None,
+            ft_version: None,
+            timeout_secs: 5,
+            verbose: 0,
+        };
+
+        let error = run_remote_setup_with_runner("example", &options, &runner)
+            .expect_err("process inventory errors must fail closed");
+        assert!(error.to_string().contains("ownership fence failed"));
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 2, "setup mutated after a failed ownership probe");
     }
 
     #[test]
     fn remote_local_process_family_has_a_pending_live_mux_publication_path() {
-        let source = include_str!("main.rs");
-        let fence = source
-            .find("Fence FrankenTerm mux ownership and component activation")
-            .expect("activation fence");
-        let pending = source
-            .find("FT_COMPONENT_ACTIVATION=pending_live_mux")
-            .expect("pending publication marker");
-        let destructive_publish = source
-            .find("ft_backup=\"\"")
-            .expect("inactive atomic publication branch");
-        assert!(fence < pending);
-        assert!(pending < destructive_publish);
-        assert!(source.contains("test ! -e \"$ft_pending\""));
-        assert!(source.contains("test ! -e \"$mux_pending\""));
+        let identity = LocalComponentIdentity {
+            build_id: "a".repeat(64),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            profile: "release-interactive".to_string(),
+            version: "0.15.2".to_string(),
+        };
+        let family = ValidatedLocalProcessFamily {
+            ft: LocalComponentSnapshot {
+                identity: LocalComponentIdentity {
+                    build_id: identity.build_id.clone(),
+                    target: identity.target.clone(),
+                    profile: identity.profile.clone(),
+                    version: identity.version.clone(),
+                },
+                sha256: "b".repeat(64),
+                byte_len: 101,
+                source_identity: DiagnosticFileSnapshot::synthetic(101, 1),
+            },
+            mux_server: LocalComponentSnapshot {
+                identity,
+                sha256: "c".repeat(64),
+                byte_len: 202,
+                source_identity: DiagnosticFileSnapshot::synthetic(202, 2),
+            },
+        };
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let receipt = ProcessFamilyByteReceipt::from(&family);
+        let pending = local_process_family_publish_command(suffix, &receipt, true).unwrap();
+        let active = local_process_family_publish_command(suffix, &receipt, false).unwrap();
+        let mut hostile_receipt = receipt.clone();
+        hostile_receipt.ft.sha256 = "b; touch pwned".to_string();
+        assert!(
+            local_process_family_publish_command(suffix, &hostile_receipt, false).is_err(),
+            "publication must reject an invalid receipt before shell rendering"
+        );
+
+        assert!(pending.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"));
+        assert!(pending.contains(&format!("ft.pending-{suffix}")));
+        assert!(pending.contains(&format!("frankenterm-mux-server.pending-{suffix}")));
+        assert!(pending.contains("test ! -e \"$ft_pending\""));
+        assert!(pending.contains("test ! -e \"$mux_pending\""));
+        assert!(pending.contains("test ! -L \"$ft_pending\""));
+        assert!(pending.contains("test ! -L \"$mux_pending\""));
+        assert!(pending.contains("restore_pending_ft()"));
+        assert!(pending.contains("FT_COMPONENT_ROLLBACK_INCOMPLETE="));
+        assert!(!pending.contains("ft_backup=\"\""));
+        assert!(active.contains("FT_COMPONENT_ACTIVATION=active_transactional_publish"));
+        assert!(active.contains("ft_backup=\"\""));
+        assert!(active.contains("test ! -L \"$ft_backup_candidate\""));
+        assert!(active.contains("test ! -L \"$mux_backup_candidate\""));
+        assert!(active.contains("test ! -L \"$ft_failed\""));
+        assert!(active.contains("if test -e \"$bin/ft\" || test -L \"$bin/ft\""));
+        assert!(active.contains("test -f \"$bin/ft\" && test ! -L \"$bin/ft\""));
+        assert!(active.contains(
+            "if test -e \"$bin/frankenterm-mux-server\" || test -L \"$bin/frankenterm-mux-server\""
+        ));
+        assert!(active.contains(
+            "test -f \"$bin/frankenterm-mux-server\" && test ! -L \"$bin/frankenterm-mux-server\""
+        ));
+        for command in [&pending, &active] {
+            assert!(command.contains("command -v flock"));
+            assert!(command.contains("exec 9<\"$bin\""));
+            assert!(command.contains("flock -n 9"));
+            assert!(command.contains("move_no_clobber()"));
+            assert!(command.contains("mv -n \"$source\" \"$target\""));
+            assert!(command.matches(&receipt.ft.sha256).count() >= 2);
+            assert!(command.matches(&receipt.mux_server.sha256).count() >= 2);
+        }
+        assert!(active.contains("restore_preserved_component()"));
+        assert!(active.contains("test ! -e \"$target\" && test ! -L \"$target\""));
+        assert!(active.contains("FT_COMPONENT_ROLLBACK_INCOMPLETE="));
+        assert!(!active.contains("test -z \"$ft_backup\" || mv"));
+        assert!(!active.contains("test -z \"$mux_backup\" || mv"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_process_family_partial_publish_restores_old_pair_without_overwrite() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn write_executable(path: &Path, body: &str) {
+            std::fs::write(path, body).expect("write executable fixture");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("make fixture executable");
+        }
+
+        let fixture = tempfile::tempdir().expect("create publication fixture");
+        let home = fixture.path().join("home");
+        let bin = home.join(".local/bin");
+        let shim_bin = fixture.path().join("shim-bin");
+        std::fs::create_dir_all(&bin).expect("create remote bin fixture");
+        std::fs::create_dir_all(&shim_bin).expect("create command shim directory");
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let ft_stage = bin.join(format!("ft.installing-{suffix}"));
+        let mux_stage = bin.join(format!("frankenterm-mux-server.installing-{suffix}"));
+        let ft_target = bin.join("ft");
+        let mux_target = bin.join("frankenterm-mux-server");
+        let new_ft = "#!/bin/sh\nexit 0\n";
+        let new_mux = "#!/bin/sh\nexit 0\n";
+        write_executable(&ft_stage, new_ft);
+        write_executable(&mux_stage, new_mux);
+        write_executable(&ft_target, "old-ft\n");
+        write_executable(&mux_target, "old-mux\n");
+
+        let failing_mv = shim_bin.join("mv");
+        write_executable(
+            &failing_mv,
+            "#!/bin/sh\nno_clobber=\nif test \"$1\" = -n; then\n  no_clobber=-n\n  shift\nfi\ncase \"$1:$2\" in\n  *frankenterm-mux-server.installing-*:*frankenterm-mux-server) exit 77 ;;\nesac\nexec /bin/mv $no_clobber \"$@\"\n",
+        );
+        let receipt = ProcessFamilyByteReceipt {
+            ft: ComponentByteReceipt {
+                sha256: hex::encode(sha2::Sha256::digest(new_ft.as_bytes())),
+                byte_len: u64::try_from(new_ft.len()).expect("ft fixture length fits u64"),
+            },
+            mux_server: ComponentByteReceipt {
+                sha256: hex::encode(sha2::Sha256::digest(new_mux.as_bytes())),
+                byte_len: u64::try_from(new_mux.len()).expect("mux fixture length fits u64"),
+            },
+        };
+        let command = local_process_family_publish_command(suffix, &receipt, false)
+            .expect("render inactive publication transaction");
+        let inherited_path = std::env::var_os("PATH").expect("test PATH is configured");
+        let mut path = std::ffi::OsString::from(shim_bin.as_os_str());
+        path.push(":");
+        path.push(inherited_path);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("HOME", &home)
+            .env("PATH", path)
+            .output()
+            .expect("execute planted partial publication failure");
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(std::fs::read(&ft_target).unwrap(), b"old-ft\n");
+        assert_eq!(std::fs::read(&mux_target).unwrap(), b"old-mux\n");
+        assert_eq!(
+            std::fs::read(bin.join(format!("ft.failed-publish-{suffix}"))).unwrap(),
+            new_ft.as_bytes()
+        );
+        assert!(mux_stage.is_file());
+        assert!(!bin.join(format!("ft.previous-{suffix}")).exists());
+        assert!(!bin
+            .join(format!("frankenterm-mux-server.previous-{suffix}"))
+            .exists());
+        assert!(!String::from_utf8_lossy(&output.stderr)
+            .contains("FT_COMPONENT_ROLLBACK_INCOMPLETE"));
     }
 
     #[test]
@@ -94398,7 +95447,81 @@ log_level = "debug"
     }
 
     #[test]
-    fn remote_host_rejects_ssh_and_scp_option_injection() {
+    fn remote_release_component_receipt_is_exact_bounded_and_final() {
+        let ft_sha = "b".repeat(64);
+        let mux_sha = "c".repeat(64);
+        let valid = format!(
+            "installer output\nFT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{ft_sha}:mux:202:{mux_sha}\n"
+        );
+        let receipt = parse_remote_release_component_receipt(&valid, "v0.15.2").unwrap();
+        assert_eq!(receipt.ft.byte_len, 101);
+        assert_eq!(receipt.ft.sha256, ft_sha);
+        assert_eq!(receipt.mux_server.byte_len, 202);
+        assert_eq!(receipt.mux_server.sha256, mux_sha);
+        let stage = remote_release_stage_command(
+            "v0.15.2",
+            "0123456789abcdef0123456789abcdef",
+            &receipt,
+        )
+        .unwrap();
+        assert!(stage.matches(&receipt.ft.sha256).count() >= 2);
+        assert!(stage.matches(&receipt.mux_server.sha256).count() >= 2);
+        assert!(stage.contains("test ! -L \"$ft_stage\""));
+        assert!(stage.contains("test ! -L \"$mux_stage\""));
+        assert!(stage.contains("move_no_clobber()"));
+        assert!(stage.contains("mv -n \"$source\" \"$target\""));
+        assert!(stage.contains("flock -n 9"));
+        assert!(stage.contains("FT_RELEASE_STAGE_ROLLBACK_INCOMPLETE="));
+        assert!(!stage.contains("mv \"$ft_source\" \"$ft_stage\""));
+        assert!(!stage.contains("mv \"$mux_source\" \"$mux_stage\""));
+        assert!(stage.contains("FT_RELEASE_COMPONENT_STAGE_V1=v0.15.2"));
+        assert!(
+            remote_release_stage_command("v0.15.2", "bad-suffix", &receipt).is_err()
+        );
+
+        for rejected in [
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.3:ft:101:{}:mux:202:{}\n",
+                "b".repeat(64),
+                "c".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:0:{}:mux:202:{}\n",
+                "b".repeat(64),
+                "c".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\ntrailing output\n",
+                "b".repeat(64),
+                "c".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\nFT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\n",
+                "b".repeat(64),
+                "c".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}",
+                "b".repeat(64),
+                "c".repeat(64)
+            ),
+            format!(
+                "FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2:ft:101:{}:mux:202:{}\r\n",
+                "b".repeat(64),
+                "c".repeat(64)
+            ),
+        ] {
+            assert!(
+                parse_remote_release_component_receipt(&rejected, "v0.15.2").is_err(),
+                "hostile or ambiguous component receipt was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_host_rejects_ssh_option_injection() {
         for rejected in [
             "-oProxyCommand=touch-pwned",
             "host name",
@@ -94451,7 +95574,7 @@ log_level = "debug"
         std::fs::write(
             path,
             format!(
-                "binary-prefix\0FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:{component}:{target}:release-interactive:0.15.2;\0binary-suffix"
+                "#!/bin/sh\n# FT_ATOMIC_COMPONENT_IDENTITY_V1:{build_id}:{component}:{target}:release-interactive:0.15.2;\nif test \"${{1:-}}\" = --version; then\n  printf 'fixture 0.15.2\\n'\n  exit 0\nfi\nexit 64\n"
             ),
         )
         .expect("write atomic component fixture");
@@ -94459,6 +95582,8 @@ log_level = "debug"
 
     #[test]
     fn local_remote_setup_components_require_one_sealed_build_identity() {
+        use sha2::Digest as _;
+
         let dir = tempfile::tempdir().expect("create component fixture directory");
         let ft_path = dir.path().join("ft");
         let mux_path = dir.path().join("frankenterm-mux-server");
@@ -94475,7 +95600,312 @@ log_level = "debug"
             "frankenterm-mux-server",
             "x86_64-unknown-linux-gnu",
         );
-        validate_local_process_family(&ft_path, &mux_path).unwrap();
+        let family = validate_local_process_family(&ft_path, &mux_path).unwrap();
+        let byte_receipt = ProcessFamilyByteReceipt::from(&family);
+        assert_eq!(&family.ft.identity, &family.mux_server.identity);
+        assert_eq!(family.ft.sha256.len(), 64);
+        assert_eq!(family.mux_server.sha256.len(), 64);
+        assert_eq!(family.ft.byte_len, std::fs::metadata(&ft_path).unwrap().len());
+        let expected_ft_sha256 =
+            hex::encode(sha2::Sha256::digest(std::fs::read(&ft_path).unwrap()));
+        assert_eq!(
+            family.ft.sha256.as_str(),
+            expected_ft_sha256.as_str()
+        );
+
+        let staging_suffix = "0123456789abcdef0123456789abcdef";
+        let upload_preflight = remote_component_upload_preflight_command("ft", staging_suffix);
+        assert!(upload_preflight.contains("test ! -e \"$path\" && test ! -L \"$path\""));
+        assert!(upload_preflight.contains(&format!(
+            "FT_REMOTE_COMPONENT_UPLOAD_READY=ft:{staging_suffix}"
+        )));
+        let upload = remote_component_upload_command("ft", staging_suffix);
+        assert!(upload.contains("set -euC"));
+        assert!(upload.contains("test ! -e \"$path\" && test ! -L \"$path\""));
+        assert!(upload.contains("cat > \"$path\""));
+
+        let verification = remote_component_verification_command(
+            "ft",
+            staging_suffix,
+            &family.ft,
+        );
+        assert!(verification.contains("test -f \"$path\" && test ! -L \"$path\""));
+        assert!(verification.contains(&format!(
+            "test \"$actual_bytes\" = \"{}\"",
+            family.ft.byte_len
+        )));
+        assert!(verification.contains(&format!(
+            "test \"$actual_sha256\" = \"{}\"",
+            family.ft.sha256
+        )));
+        assert!(verification.contains("FT_REMOTE_COMPONENT_VERIFIED=ft:%s:%s"));
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Write as _;
+
+            let remote_home = dir.path().join("remote-home");
+            let remote_bin = remote_home.join(".local/bin");
+            std::fs::create_dir_all(&remote_bin).expect("create remote component fixture path");
+            let remote_stage = remote_bin.join(
+                "ft.installing-0123456789abcdef0123456789abcdef",
+            );
+            let uploaded = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&upload)
+                .env("HOME", &remote_home)
+                .stdin(std::process::Stdio::from(
+                    std::fs::File::open(&ft_path).expect("open exact component upload fixture"),
+                ))
+                .output()
+                .expect("execute identity-fenced component upload fixture");
+            assert!(
+                uploaded.status.success(),
+                "exact component upload must succeed: {}",
+                String::from_utf8_lossy(&uploaded.stderr)
+            );
+            assert!(uploaded.stdout.is_empty());
+            assert_eq!(
+                std::fs::read(&remote_stage).expect("read exact uploaded component"),
+                std::fs::read(&ft_path).expect("read local exact component")
+            );
+
+            let refused_overwrite = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&upload)
+                .env("HOME", &remote_home)
+                .stdin(std::process::Stdio::from(
+                    std::fs::File::open(&mux_path).expect("open planted overwrite fixture"),
+                ))
+                .output()
+                .expect("execute component upload no-clobber fixture");
+            assert!(
+                !refused_overwrite.status.success(),
+                "an occupied upload stage must never be overwritten"
+            );
+            assert_eq!(
+                std::fs::read(&remote_stage).expect("read preserved uploaded component"),
+                std::fs::read(&ft_path).expect("read preserved local component")
+            );
+
+            let accepted = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&verification)
+                .env("HOME", &remote_home)
+                .output()
+                .expect("execute remote component verification fixture");
+            assert!(
+                accepted.status.success(),
+                "exact staged bytes must pass: {}",
+                String::from_utf8_lossy(&accepted.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&accepted.stdout),
+                format!(
+                    "FT_REMOTE_COMPONENT_VERIFIED=ft:{}:{}\n",
+                    family.ft.byte_len, family.ft.sha256
+                )
+            );
+
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&remote_stage)
+                .expect("open staged component fixture for planted corruption")
+                .write_all(b"planted-byte-mismatch")
+                .expect("plant staged component mismatch");
+            let rejected = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&verification)
+                .env("HOME", &remote_home)
+                .output()
+                .expect("execute mismatched remote component verification fixture");
+            assert!(
+                !rejected.status.success(),
+                "a changed remote stage must fail before publication"
+            );
+            assert!(rejected.stdout.is_empty());
+
+            let publish_command = local_process_family_publish_command(
+                "0123456789abcdef0123456789abcdef",
+                &byte_receipt,
+                false,
+            )
+            .expect("render exact local process-family publication transaction");
+            assert!(
+                publish_command.matches(&family.ft.sha256).count() >= 2,
+                "ft bytes must be verified both before execution and immediately before publication"
+            );
+            assert!(
+                publish_command
+                    .matches(&family.mux_server.sha256)
+                    .count()
+                    >= 2,
+                "mux bytes must be verified both before execution and immediately before publication"
+            );
+            assert!(publish_command.contains("--version >/dev/null"));
+            assert!(
+                local_process_family_publish_command("not-a-suffix", &byte_receipt, false)
+                    .is_err(),
+                "publication must reject a shell-unsafe staging suffix"
+            );
+
+            let remote_mux_stage = remote_bin.join(
+                "frankenterm-mux-server.installing-0123456789abcdef0123456789abcdef",
+            );
+            std::fs::copy(&mux_path, &remote_mux_stage)
+                .expect("stage exact mux component fixture bytes");
+            let rejected_publication = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&publish_command)
+                .env("HOME", &remote_home)
+                .output()
+                .expect("execute corrupted process-family publication fixture");
+            assert!(
+                !rejected_publication.status.success(),
+                "publication must recheck and reject a stage changed after its copy receipt"
+            );
+            assert!(rejected_publication.stdout.is_empty());
+            assert!(!remote_bin.join("ft").exists());
+            assert!(!remote_bin.join("frankenterm-mux-server").exists());
+
+            std::fs::copy(&ft_path, &remote_stage)
+                .expect("restore exact ft stage for transactional publication");
+            let accepted_publication = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&publish_command)
+                .env("HOME", &remote_home)
+                .output()
+                .expect("execute exact process-family publication fixture");
+            assert!(
+                accepted_publication.status.success(),
+                "exact process family must publish: {}",
+                String::from_utf8_lossy(&accepted_publication.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&accepted_publication.stdout),
+                "FT_COMPONENT_ACTIVATION=active_transactional_publish:0123456789abcdef0123456789abcdef\n"
+            );
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(
+                    std::fs::read(remote_bin.join("ft")).unwrap()
+                )),
+                family.ft.sha256
+            );
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(
+                    std::fs::read(remote_bin.join("frankenterm-mux-server")).unwrap()
+                )),
+                family.mux_server.sha256
+            );
+
+            let pending_publish = local_process_family_publish_command(
+                "fedcba9876543210fedcba9876543210",
+                &byte_receipt,
+                true,
+            )
+            .expect("render active-mux pending transaction");
+            assert!(pending_publish.contains("FT_COMPONENT_ACTIVATION=pending_live_mux"));
+            assert!(pending_publish.matches(&family.ft.sha256).count() >= 2);
+            assert!(pending_publish.matches(&family.mux_server.sha256).count() >= 2);
+            let pending_suffix = "fedcba9876543210fedcba9876543210";
+            let pending_ft_stage = remote_bin.join(format!("ft.installing-{pending_suffix}"));
+            let pending_mux_stage =
+                remote_bin.join(format!("frankenterm-mux-server.installing-{pending_suffix}"));
+            std::fs::copy(&ft_path, &pending_ft_stage)
+                .expect("stage ft fixture for pending no-clobber test");
+            std::fs::copy(&mux_path, &pending_mux_stage)
+                .expect("stage mux fixture for pending no-clobber test");
+            std::os::unix::fs::symlink(
+                remote_bin.join("missing-pending-target"),
+                remote_bin.join(format!("ft.pending-{pending_suffix}")),
+            )
+            .expect("plant dangling pending destination symlink");
+            let rejected_pending = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&pending_publish)
+                .env("HOME", &remote_home)
+                .output()
+                .expect("execute pending destination no-clobber fixture");
+            assert!(
+                !rejected_pending.status.success(),
+                "a dangling pending destination symlink must reject before either stage moves"
+            );
+            assert!(pending_ft_stage.is_file());
+            assert!(pending_mux_stage.is_file());
+            assert!(!remote_bin
+                .join(format!("frankenterm-mux-server.pending-{pending_suffix}"))
+                .exists());
+
+            let release_suffix = "11111111111111111111111111111111";
+            let release_dir = remote_home
+                .join(".cache/frankenterm/releases")
+                .join(format!("v0.15.2-{release_suffix}"));
+            std::fs::create_dir_all(&release_dir)
+                .expect("create verified release fixture directory");
+            std::fs::copy(&ft_path, release_dir.join("ft"))
+                .expect("stage verified release ft fixture");
+            std::fs::copy(
+                &mux_path,
+                release_dir.join("frankenterm-mux-server"),
+            )
+            .expect("stage verified release mux fixture");
+            let release_stage_command =
+                remote_release_stage_command("v0.15.2", release_suffix, &byte_receipt)
+                    .expect("render verified release byte-binding transaction");
+            let release_staging = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&release_stage_command)
+                .env("HOME", &remote_home)
+                .output()
+                .expect("execute verified release byte-binding fixture");
+            assert!(
+                release_staging.status.success(),
+                "verified release bytes must bind to publication stage: {}",
+                String::from_utf8_lossy(&release_staging.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&release_staging.stdout),
+                format!("FT_RELEASE_COMPONENT_STAGE_V1=v0.15.2:{release_suffix}\n")
+            );
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(
+                    std::fs::read(remote_bin.join(format!(
+                        "ft.installing-{release_suffix}"
+                    )))
+                    .unwrap()
+                )),
+                family.ft.sha256
+            );
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(
+                    std::fs::read(remote_bin.join(format!(
+                        "frankenterm-mux-server.installing-{release_suffix}"
+                    )))
+                    .unwrap()
+                )),
+                family.mux_server.sha256
+            );
+
+            let symlink_suffix = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            std::os::unix::fs::symlink(
+                &ft_path,
+                remote_bin.join(format!("ft.installing-{symlink_suffix}")),
+            )
+            .expect("create planted remote component symlink");
+            let symlink_verification =
+                remote_component_verification_command("ft", symlink_suffix, &family.ft);
+            let symlink_rejected = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&symlink_verification)
+                .env("HOME", &remote_home)
+                .output()
+                .expect("execute symlink remote component verification fixture");
+            assert!(
+                !symlink_rejected.status.success(),
+                "a staged symlink must fail before publication"
+            );
+            assert!(symlink_rejected.stdout.is_empty());
+        }
 
         write_atomic_component_fixture(
             &mux_path,
@@ -94490,13 +95920,19 @@ log_level = "debug"
     fn local_remote_setup_components_reject_unsealed_or_wrong_role_markers() {
         let dir = tempfile::tempdir().expect("create component fixture directory");
         let path = dir.path().join("component");
+        assert!(
+            read_local_component_snapshot(Path::new("../component"), "ft")
+                .expect_err("parent traversal must fail before opening a component")
+                .to_string()
+                .contains("parent component")
+        );
         write_atomic_component_fixture(
             &path,
             "unsealed",
             "ft",
             "x86_64-unknown-linux-gnu",
         );
-        assert!(read_local_component_identity(&path, "ft").is_err());
+        assert!(read_local_component_snapshot(&path, "ft").is_err());
 
         write_atomic_component_fixture(
             &path,
@@ -94504,7 +95940,20 @@ log_level = "debug"
             "frankenterm-mux-server",
             "x86_64-unknown-linux-gnu",
         );
-        assert!(read_local_component_identity(&path, "ft").is_err());
+        assert!(read_local_component_snapshot(&path, "ft").is_err());
+
+        #[cfg(unix)]
+        {
+            let symlink_path = dir.path().join("component-symlink");
+            std::os::unix::fs::symlink(&path, &symlink_path)
+                .expect("create planted local component symlink");
+            let error = read_local_component_snapshot(&symlink_path, "ft")
+                .expect_err("local component symlinks must fail before staging");
+            assert!(
+                error.to_string().contains("without following symlinks"),
+                "unexpected local symlink rejection: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -94526,11 +95975,25 @@ log_level = "debug"
         assert!(!command.contains("/main/install.sh"));
         assert!(!command.contains("| bash"));
         assert!(command.contains("mkdir \"$destination\" && curl"));
+        assert!(command.contains("FT_RELEASE_COMPONENT_RECEIPT_V1=v0.15.2"));
+        assert!(command.contains("stat -c %s"));
+        assert!(command.contains("sha256sum"));
     }
 
     #[test]
     fn top_level_installer_launch_probes_both_staged_components_before_backup() {
         let installer = include_str!("../../../install.sh");
+        assert!(installer.contains("Refusing process-family source paths that are symlinks"));
+        assert!(installer.contains("Refusing to reuse an existing process-family transaction path"));
+        assert!(installer.contains("[ -L \"$ft_target\" ]"));
+        assert!(installer.contains("[ -L \"$mux_target\" ]"));
+        assert!(installer.contains("[ -L \"$ft_backup_candidate\" ]"));
+        assert!(installer.contains("[ -L \"$mux_backup_candidate\" ]"));
+        assert!(installer.contains("restore_preserved_component()"));
+        assert!(installer.contains("Cannot restore preserved $label because its target path is occupied"));
+        assert!(installer.contains("Process-family rollback was incomplete; preserved bytes require operator recovery"));
+        assert!(!installer.contains("mv \"$ft_backup\" \"$ft_target\" || true"));
+        assert!(!installer.contains("mv \"$mux_backup\" \"$mux_target\" || true"));
         let ft_probe = installer
             .find("if ! \"$ft_stage\" --version")
             .expect("staged ft launch probe");

@@ -161,7 +161,20 @@ When both the maximum and minimum advance, use the maintenance window:
    ```
 
    For a live mux, setup downloads and verifies the release pair into a unique
-   cache directory and publishes both files only as matching `pending-*` paths.
+   cache directory and publishes both files only as matching
+   `pending-<transaction-uuid>` paths. The printed transaction UUID and exact
+   activation receipt identify the pair without path globbing; retained
+   size/SHA-256 receipts are checked again while binding to the publication
+   stage and immediately before the pending renames. Publication, preservation,
+   quarantine, and rollback moves are themselves no-clobber, so a name occupied
+   after its precheck is retained rather than overwritten. Release-cache binding
+   holds the same installation-directory lock and restores the first component
+   on a failed second bind, with an explicit incomplete-rollback marker if that
+   restoration target was occupied. Local uploads additionally
+   require an exact nonexistence receipt before identity-fenced SSH upload and reject any staged or
+   canonical symlink/non-regular object. The live-process probe constructs its
+   search expression from split shell literals so `pgrep -f` cannot match the
+   probe command itself and turn an inactive host into a false live-owner result.
    Before that download, it also asks the currently installed remote CLI to
    create and verify a complete host-local dump when that legacy release
    supports the command; a supported dump failure stops staging.
@@ -201,7 +214,10 @@ When both the maximum and minimum advance, use the maintenance window:
    domain connection UI/toast and structured handshake logs for both inclusive
    codec windows. A failure must display the local and remote windows plus the
    safe server-upgrade/desktop-rollback choices; it must never look like a
-   no-op.
+   no-op. One failing domain must not suppress later configured domains or
+   ordinary GUI startup. Initially unavailable auto domains retry independently
+   with bounded concurrency and jittered backoff; an explicit or default remote
+   start opens a local recovery shell rather than leaving an inert window.
 
 ### 3d. Cross-deploy coordination
 
@@ -233,10 +249,10 @@ to perform the later lossless mux handoff.
 For an additive bump, roll components back within the retained compatibility
 window and verify they negotiate the lower dialect. For a breaking bump, reverse
 the breaking-deploy sequence: drain and stop the new server, restore the
-timestamped `frankenterm-mux-server.previous-*` binary and service unit, start
-the old server, and restore the preserved desktop app/CLI until both sides again
-share a window. Never restart either server generation until its live PTYs have
-been drained.
+exact transaction-identified `frankenterm-mux-server.previous-*` binary and
+service unit, start the old server, and restore the preserved desktop app/CLI
+until both sides again share a window. Never restart either server generation
+until its live PTYs have been drained.
 
 ## 4. Window invariants
 

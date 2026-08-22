@@ -315,6 +315,32 @@ check_disk_space() {
   fi
 }
 
+move_no_clobber() {
+  local source="$1"
+  local target="$2"
+
+  [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+  mv -n "$source" "$target" || return 1
+  [ ! -e "$source" ] && [ ! -L "$source" ] || return 1
+  [ -e "$target" ] || [ -L "$target" ]
+}
+
+restore_preserved_component() {
+  local backup="$1"
+  local target="$2"
+  local label="$3"
+
+  [ -z "$backup" ] && return 0
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    err "Cannot restore preserved $label because its target path is occupied: $target"
+    return 1
+  fi
+  if ! move_no_clobber "$backup" "$target"; then
+    err "Failed to restore preserved $label from $backup to $target"
+    return 1
+  fi
+}
+
 install_process_family() {
   local ft_source="$1"
   local mux_source="$2"
@@ -322,10 +348,42 @@ install_process_family() {
   local mux_target="$DEST/frankenterm-mux-server"
   local ft_stage="${ft_target}.installing-$$"
   local mux_stage="${mux_target}.installing-$$"
+  local ft_failed=""
   local stamp
   local ft_backup=""
   local mux_backup=""
+  local ft_backup_candidate=""
+  local mux_backup_candidate=""
+  local recovery_failed=0
   stamp=$(date +%Y%m%d%H%M%S)
+  ft_failed="${ft_target}.failed-publish-${stamp}-$$"
+  ft_backup_candidate="${ft_target}.previous-${stamp}-$$"
+  mux_backup_candidate="${mux_target}.previous-${stamp}-$$"
+
+  if [ ! -f "$ft_source" ] || [ -L "$ft_source" ] || \
+     [ ! -f "$mux_source" ] || [ -L "$mux_source" ]; then
+    err "Refusing process-family source paths that are symlinks or non-regular files"
+    return 1
+  fi
+
+  if [ -e "$ft_stage" ] || [ -L "$ft_stage" ] || \
+     [ -e "$mux_stage" ] || [ -L "$mux_stage" ] || \
+     [ -e "$ft_failed" ] || [ -L "$ft_failed" ] || \
+     [ -e "$ft_backup_candidate" ] || [ -L "$ft_backup_candidate" ] || \
+     [ -e "$mux_backup_candidate" ] || [ -L "$mux_backup_candidate" ]; then
+    err "Refusing to reuse an existing process-family transaction path"
+    return 1
+  fi
+  if { [ -e "$ft_target" ] || [ -L "$ft_target" ]; } && \
+     { [ ! -f "$ft_target" ] || [ -L "$ft_target" ]; }; then
+    err "Refusing to replace non-regular or symlink ft target at $ft_target"
+    return 1
+  fi
+  if { [ -e "$mux_target" ] || [ -L "$mux_target" ]; } && \
+     { [ ! -f "$mux_target" ] || [ -L "$mux_target" ]; }; then
+    err "Refusing to replace non-regular or symlink frankenterm-mux-server target at $mux_target"
+    return 1
+  fi
 
   # Stage both binaries before changing either live name. A running mux keeps
   # its old executable inode; the new server bytes are picked up only after an
@@ -348,42 +406,73 @@ install_process_family() {
     return 1
   fi
 
-  if [ -e "$ft_target" ]; then
-    ft_backup="${ft_target}.previous-${stamp}-$$"
-    if [ -e "$ft_backup" ]; then
+  if [ -e "$ft_target" ] || [ -L "$ft_target" ]; then
+    if [ ! -f "$ft_target" ] || [ -L "$ft_target" ]; then
+      err "Refusing to replace non-regular or symlink ft target at $ft_target"
+      return 1
+    fi
+    ft_backup="$ft_backup_candidate"
+    if [ -e "$ft_backup" ] || [ -L "$ft_backup" ]; then
       err "Refusing to overwrite existing ft backup at $ft_backup"
       return 1
     fi
-    if ! mv "$ft_target" "$ft_backup"; then
+    if ! move_no_clobber "$ft_target" "$ft_backup"; then
       err "Failed to preserve existing ft at $ft_backup"
       return 1
     fi
   fi
-  if [ -e "$mux_target" ]; then
-    mux_backup="${mux_target}.previous-${stamp}-$$"
-    if [ -e "$mux_backup" ]; then
-      err "Refusing to overwrite existing frankenterm-mux-server backup at $mux_backup"
-      if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
+  if [ -e "$mux_target" ] || [ -L "$mux_target" ]; then
+    if [ ! -f "$mux_target" ] || [ -L "$mux_target" ]; then
+      err "Refusing to replace non-regular or symlink frankenterm-mux-server target at $mux_target"
+      if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+        recovery_failed=1
+      fi
+      [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
       return 1
     fi
-    if ! mv "$mux_target" "$mux_backup"; then
+    mux_backup="$mux_backup_candidate"
+    if [ -e "$mux_backup" ] || [ -L "$mux_backup" ]; then
+      err "Refusing to overwrite existing frankenterm-mux-server backup at $mux_backup"
+      if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+        recovery_failed=1
+      fi
+      [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
+      return 1
+    fi
+    if ! move_no_clobber "$mux_target" "$mux_backup"; then
       err "Failed to preserve existing frankenterm-mux-server at $mux_backup"
-      if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
+      if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+        recovery_failed=1
+      fi
+      [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
       return 1
     fi
   fi
 
-  if ! mv "$ft_stage" "$ft_target"; then
+  if ! move_no_clobber "$ft_stage" "$ft_target"; then
     err "Failed to publish staged ft at $ft_target"
-    if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
-    if [ -n "$mux_backup" ]; then mv "$mux_backup" "$mux_target" || true; fi
+    if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+      recovery_failed=1
+    fi
+    if ! restore_preserved_component "$mux_backup" "$mux_target" "frankenterm-mux-server"; then
+      recovery_failed=1
+    fi
+    [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
     return 1
   fi
-  if ! mv "$mux_stage" "$mux_target"; then
+  if ! move_no_clobber "$mux_stage" "$mux_target"; then
     err "Failed to publish staged frankenterm-mux-server at $mux_target"
-    mv "$ft_target" "${ft_target}.failed-publish-${stamp}-$$" || true
-    if [ -n "$ft_backup" ]; then mv "$ft_backup" "$ft_target" || true; fi
-    if [ -n "$mux_backup" ]; then mv "$mux_backup" "$mux_target" || true; fi
+    if ! move_no_clobber "$ft_target" "$ft_failed"; then
+      err "Failed to quarantine newly published ft at $ft_failed"
+      recovery_failed=1
+    fi
+    if ! restore_preserved_component "$ft_backup" "$ft_target" "ft"; then
+      recovery_failed=1
+    fi
+    if ! restore_preserved_component "$mux_backup" "$mux_target" "frankenterm-mux-server"; then
+      recovery_failed=1
+    fi
+    [ "$recovery_failed" -eq 0 ] || err "Process-family rollback was incomplete; preserved bytes require operator recovery"
     return 1
   fi
 
@@ -442,17 +531,38 @@ preflight_checks() {
 
 check_installed_version() {
   local target_ver="$1"
-  [ -x "$DEST/ft" ] || return 1
-  [ -x "$DEST/frankenterm-mux-server" ] || return 1
-  local ft_cur mux_cur
+  [ -f "$DEST/ft" ] && [ ! -L "$DEST/ft" ] && [ -x "$DEST/ft" ] || return 1
+  [ -f "$DEST/frankenterm-mux-server" ] && \
+    [ ! -L "$DEST/frankenterm-mux-server" ] && \
+    [ -x "$DEST/frankenterm-mux-server" ] || return 1
+  local ft_cur mux_cur ft_identity mux_identity
   ft_cur=$("$DEST/ft" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
   mux_cur=$("$DEST/frankenterm-mux-server" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
   [ -z "$ft_cur" ] && return 1
   [ -z "$mux_cur" ] && return 1
   # Strip leading 'v' from target_ver for comparison ("v0.2.0" vs "0.2.0")
   local stripped="${target_ver#v}"
-  { [ "$ft_cur" = "$stripped" ] || [ "$ft_cur" = "$target_ver" ]; } &&
-    { [ "$mux_cur" = "$stripped" ] || [ "$mux_cur" = "$target_ver" ]; }
+  { [ "$ft_cur" = "$stripped" ] || [ "$ft_cur" = "$target_ver" ]; } || return 1
+  { [ "$mux_cur" = "$stripped" ] || [ "$mux_cur" = "$target_ver" ]; } || return 1
+
+  # Semver is not a process-family identity: two rebuilds of the same tag can
+  # carry different codec or source bytes. Admit the fast path only when each
+  # binary exposes one sealed marker and those markers differ solely by role.
+  command -v grep >/dev/null 2>&1 || return 1
+  command -v sed >/dev/null 2>&1 || return 1
+  command -v sort >/dev/null 2>&1 || return 1
+  ft_identity=$(LC_ALL=C grep -aoE \
+    'FT_ATOMIC_COMPONENT_IDENTITY_V1:[0-9a-f]{64}:ft:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*;' \
+    "$DEST/ft" 2>/dev/null | sed 's/:ft:/:ROLE:/' | sort -u || true)
+  mux_identity=$(LC_ALL=C grep -aoE \
+    'FT_ATOMIC_COMPONENT_IDENTITY_V1:[0-9a-f]{64}:frankenterm-mux-server:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*;' \
+    "$DEST/frankenterm-mux-server" 2>/dev/null | \
+    sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u || true)
+  [ -n "$ft_identity" ] || return 1
+  [ -n "$mux_identity" ] || return 1
+  [ "$(printf '%s\n' "$ft_identity" | awk 'END { print NR }')" -eq 1 ] || return 1
+  [ "$(printf '%s\n' "$mux_identity" | awk 'END { print NR }')" -eq 1 ] || return 1
+  [ "$ft_identity" = "$mux_identity" ]
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -713,6 +823,15 @@ install_macos_app() {
   target_app="$dest/FrankenTerm.app"
   staged_app="${target_app}.installing-$$"
   backup_app=""
+  if [ -e "$staged_app" ] || [ -L "$staged_app" ]; then
+    warn "Refusing to reuse existing app staging path $staged_app"
+    return 0
+  fi
+  if { [ -e "$target_app" ] || [ -L "$target_app" ]; } && \
+     { [ ! -d "$target_app" ] || [ -L "$target_app" ]; }; then
+    warn "Refusing to replace non-directory or symlink app target at $target_app"
+    return 0
+  fi
   # Copy to a sibling staging path before changing the live bundle. This keeps
   # updates recoverable and avoids deleting a working app before the new bundle
   # has been copied successfully.
@@ -728,17 +847,23 @@ install_macos_app() {
     fi
   fi
 
-  if [ -e "$target_app" ]; then
+  if [ -e "$target_app" ] || [ -L "$target_app" ]; then
     backup_app="${target_app}.previous-$(date +%Y%m%d%H%M%S)-$$"
-    if ! mv "$target_app" "$backup_app"; then
+    if [ -e "$backup_app" ] || [ -L "$backup_app" ]; then
+      warn "Refusing to overwrite existing app backup at $backup_app"
+      return 0
+    fi
+    if ! move_no_clobber "$target_app" "$backup_app"; then
       warn "Could not preserve existing $target_app; staged app remains at $staged_app"
       return 0
     fi
   fi
-  if ! mv "$staged_app" "$target_app"; then
+  if ! move_no_clobber "$staged_app" "$target_app"; then
     warn "Could not publish staged FrankenTerm.app at $target_app"
-    if [ -n "$backup_app" ] && [ ! -e "$target_app" ]; then
-      mv "$backup_app" "$target_app" || true
+    if [ -n "$backup_app" ] && [ ! -e "$target_app" ] && [ ! -L "$target_app" ]; then
+      if ! move_no_clobber "$backup_app" "$target_app"; then
+        err "App rollback was incomplete; preserved bundle requires operator recovery at $backup_app"
+      fi
     fi
     return 0
   fi
