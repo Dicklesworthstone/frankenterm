@@ -334,6 +334,16 @@ struct JournalScan {
     last_input_identity: Option<(u64, Uuid, u64)>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InjectedAppendFault {
+    BeforeWrite,
+    AfterHeader,
+    AfterCiphertext,
+    BeforeSync,
+    AfterSync,
+}
+
 /// Exclusive append and recovery authority for one durable pane's input log.
 pub struct GuardianInputJournal {
     file: File,
@@ -349,6 +359,8 @@ pub struct GuardianInputJournal {
     last_input_identity: Option<(u64, Uuid, u64)>,
     directory_entry_sync_required: bool,
     poisoned: bool,
+    #[cfg(test)]
+    injected_append_fault: Option<InjectedAppendFault>,
 }
 
 impl GuardianInputJournal {
@@ -408,6 +420,8 @@ impl GuardianInputJournal {
             last_input_identity: scan.last_input_identity,
             directory_entry_sync_required: initialized,
             poisoned: false,
+            #[cfg(test)]
+            injected_append_fault: None,
         })
     }
 
@@ -464,6 +478,24 @@ impl GuardianInputJournal {
         parent_directory.sync_all()?;
         self.directory_entry_sync_required = false;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_append_fault(&mut self, fault: InjectedAppendFault) {
+        self.injected_append_fault = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn fail_append_if_injected(
+        &mut self,
+        stage: InjectedAppendFault,
+    ) -> std::io::Result<()> {
+        if self.injected_append_fault == Some(stage) {
+            self.injected_append_fault = None;
+            Err(std::io::Error::other("injected guardian input append fault"))
+        } else {
+            Ok(())
+        }
     }
 
     /// Synchronize a new intent before any input bytes are forwarded.
@@ -589,10 +621,21 @@ impl GuardianInputJournal {
         );
         let header = encode_record_header(header_prefix, nonce, record_digest);
         let result = (|| -> std::io::Result<()> {
+            #[cfg(test)]
+            self.fail_append_if_injected(InjectedAppendFault::BeforeWrite)?;
             self.file.seek(SeekFrom::Start(self.committed_bytes))?;
             self.file.write_all(&header)?;
+            #[cfg(test)]
+            self.fail_append_if_injected(InjectedAppendFault::AfterHeader)?;
             self.file.write_all(&ciphertext)?;
-            self.file.sync_all()
+            #[cfg(test)]
+            self.fail_append_if_injected(InjectedAppendFault::AfterCiphertext)?;
+            #[cfg(test)]
+            self.fail_append_if_injected(InjectedAppendFault::BeforeSync)?;
+            self.file.sync_all()?;
+            #[cfg(test)]
+            self.fail_append_if_injected(InjectedAppendFault::AfterSync)?;
+            Ok(())
         })();
         if let Err(error) = result {
             self.poisoned = true;
@@ -1356,6 +1399,112 @@ mod tests {
             assert_eq!(
                 std::fs::metadata(&path).expect("crash-cut metadata").len(),
                 u64::try_from(cut).expect("fixture cut fits u64")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_append_failures_poison_and_reconcile_without_replay() {
+        for fault in [
+            InjectedAppendFault::BeforeWrite,
+            InjectedAppendFault::AfterHeader,
+            InjectedAppendFault::AfterCiphertext,
+            InjectedAppendFault::BeforeSync,
+            InjectedAppendFault::AfterSync,
+        ] {
+            let temp = tempfile::tempdir().expect("create fault fixture tempdir");
+            let path = temp.path().join(format!("input-{fault:?}.journal"));
+            let input = identity(7, 0x6e, 0xb3);
+            let mut journal = GuardianInputJournal::open(
+                create_file(&path),
+                pane(),
+                cipher(),
+                GuardianInputJournalLimits::default(),
+            )
+            .expect("initialize fault fixture");
+            journal
+                .sync_parent_directory_and_activate(&open_directory(temp.path()))
+                .expect("activate fault fixture");
+            journal.append_intent_and_sync(input, 2).expect("intent");
+            let committed_intent_bytes = journal.committed_bytes();
+            journal.inject_append_fault(fault);
+            assert!(matches!(
+                journal.append_disposition_and_sync(
+                    input,
+                    GuardianInputDisposition::AcceptedNotDurable,
+                ),
+                Err(GuardianInputJournalError::Io(_))
+            ));
+            assert!(journal.is_poisoned());
+            assert!(matches!(
+                journal.append_disposition_and_sync(
+                    input,
+                    GuardianInputDisposition::AcceptedNotDurable,
+                ),
+                Err(GuardianInputJournalError::Poisoned)
+            ));
+            drop(journal);
+
+            let mut recovered = GuardianInputJournal::open(
+                open_file(&path),
+                pane(),
+                cipher(),
+                GuardianInputJournalLimits::default(),
+            )
+            .expect("reconcile injected append failure");
+            let recovered_disposition = recovered
+                .effect(input.effect_id())
+                .expect("effect retained")
+                .disposition();
+            match fault {
+                InjectedAppendFault::BeforeWrite => {
+                    assert_eq!(recovered.tail(), GuardianInputJournalTail::Clean);
+                    assert_eq!(
+                        recovered_disposition,
+                        GuardianInputDisposition::Intent
+                    );
+                    assert_eq!(recovered.committed_bytes(), committed_intent_bytes);
+                }
+                InjectedAppendFault::AfterHeader => {
+                    assert!(matches!(
+                        recovered.tail(),
+                        GuardianInputJournalTail::Incomplete {
+                            committed_bytes,
+                            trailing_bytes,
+                        } if committed_bytes == committed_intent_bytes
+                            && trailing_bytes == RECORD_HEADER_BYTES_U64
+                    ));
+                    assert_eq!(
+                        recovered_disposition,
+                        GuardianInputDisposition::Intent
+                    );
+                }
+                InjectedAppendFault::AfterCiphertext
+                | InjectedAppendFault::BeforeSync
+                | InjectedAppendFault::AfterSync => {
+                    assert_eq!(recovered.tail(), GuardianInputJournalTail::Clean);
+                    assert_eq!(
+                        recovered_disposition,
+                        GuardianInputDisposition::AcceptedNotDurable
+                    );
+                    let before_retry = recovered.record_count();
+                    let receipt = recovered
+                        .append_disposition_and_sync(
+                            input,
+                            GuardianInputDisposition::AcceptedNotDurable,
+                        )
+                        .expect("reconcile exact accepted publication");
+                    assert_eq!(
+                        receipt.disposition(),
+                        GuardianInputDisposition::AcceptedNotDurable
+                    );
+                    assert_eq!(recovered.record_count(), before_retry);
+                }
+            }
+            assert_ne!(
+                recovered_disposition.recovery_protocol_state(),
+                InputEffectState::NotSeen
             );
         }
     }
