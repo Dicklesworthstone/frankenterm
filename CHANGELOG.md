@@ -194,7 +194,11 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   marker) so a rotated UUID can never recreate a different pane view,
   monotonic lease generations and mutation sequences, idempotent effect
   identities, ambiguous-input reconciliation, exit-time replay authority, and
-  terminal exhaustion quarantine. Mutation
+  terminal exhaustion quarantine. An exact mux-incarnation disconnect
+  transition retires unambiguous leases only after the transport proves its
+  final authenticated connection gone, pins ambiguous input until journal
+  reconciliation, and makes delayed old-incarnation notifications harmless to
+  successor claims. Mutation
   receipts rotate through a bounded FIFO window instead of permanently
   exhausting the guardian after 65,536 operations, while original spawn
   identities remain protected for each pane's lifetime. Inputs awaiting a

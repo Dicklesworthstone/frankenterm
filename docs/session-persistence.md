@@ -283,7 +283,11 @@ proven:
    is a terminal protocol error.
 3. The guardian exclusively owns the PTY master, child waiter/signaller, writer,
    resize handle, and raw-output reader. Mux exit or disconnect releases only a
-   control lease; it cannot close the PTY or signal the child.
+   control lease; it cannot close the PTY or signal the child. The transport
+   layer tracks authenticated connections per exact mux incarnation and calls
+   the state machine's idempotent disconnect-retirement transition only after
+   the final connection is proven gone. A delayed notification for an old
+   incarnation cannot retire successor leases.
 4. Exactly one mux generation holds the mutation lease for a pane. `Claim`
    returns a monotonically increasing fencing generation, and every input,
    resize, signal, and close request carries that generation. A delayed request
@@ -488,7 +492,12 @@ vacant
 
 `Spawn` is the only `vacant -> live_unclaimed` transition. `Claim` is the only
 way to enter or replace `live_claimed`; it monotonically increments the fencing
-generation. Child exit preserves census, replay, checkpoint, effect-query, and
+generation. `RetireLease` handles an orderly mux handoff. Abrupt transport loss
+uses an exact mux-incarnation retirement transition: unambiguous leases become
+`live_unclaimed`, while a pane with `accepted_not_durable` input remains pinned
+until its journal disposition resolves, after which retirement is retried. The
+transition is idempotent, rejects nil identity, and cannot affect panes already
+claimed by a successor incarnation. Child exit preserves census, replay, checkpoint, effect-query, and
 retention-close authority but permanently rejects new PTY/process mutations.
 An accepted input whose
 durable/terminal disposition is still ambiguous survives child exit and blocks

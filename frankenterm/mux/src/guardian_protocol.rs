@@ -1624,6 +1624,14 @@ pub enum GuardianPaneState {
     },
 }
 
+/// Result of retiring leases after the transport layer proves that one mux
+/// incarnation has no remaining live authenticated connections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GuardianMuxLeaseRetirement {
+    pub retired_panes: usize,
+    pub pending_input_panes: usize,
+}
+
 impl GuardianPaneState {
     #[must_use]
     pub const fn generation(&self) -> u64 {
@@ -2168,6 +2176,45 @@ impl GuardianProtocolState {
     #[must_use]
     pub fn pane_state(&self, pane_id: Uuid) -> Option<&GuardianPaneState> {
         self.panes.get(&pane_id)
+    }
+
+    /// Retire every unambiguous live lease owned by one disconnected mux.
+    ///
+    /// The transport must call this only after it has proved that no
+    /// authenticated connection for `mux_incarnation` remains. The exact
+    /// incarnation fence makes a delayed disconnect notification harmless
+    /// after a successor has claimed the pane. A pane with an
+    /// `AcceptedNotDurable` input remains claimed and blocks takeover until the
+    /// journal resolves that effect; the caller invokes this method again after
+    /// reconciliation.
+    pub fn retire_disconnected_mux_leases(
+        &mut self,
+        mux_incarnation: Uuid,
+    ) -> Result<GuardianMuxLeaseRetirement, GuardianProtocolError> {
+        require_nonzero(mux_incarnation, "mux incarnation")?;
+        let mut result = GuardianMuxLeaseRetirement::default();
+        for state in self.panes.values_mut() {
+            let GuardianPaneState::LiveClaimed {
+                generation,
+                mux_incarnation: owner,
+                pending_input_effect,
+                ..
+            } = state
+            else {
+                continue;
+            };
+            if *owner != mux_incarnation {
+                continue;
+            }
+            if pending_input_effect.is_some() {
+                result.pending_input_panes += 1;
+                continue;
+            }
+            let generation = *generation;
+            *state = GuardianPaneState::LiveUnclaimed { generation };
+            result.retired_panes += 1;
+        }
+        Ok(result)
     }
 
     pub fn mark_exited(&mut self, pane_id: Uuid, exit_status: i32) -> Result<(), GuardianProtocolError> {
@@ -5031,6 +5078,141 @@ mod tests {
             Err(GuardianProtocolError::StaleLease)
         );
         assert!(!state.effects.contains_key(&id(13)));
+    }
+
+    #[test]
+    fn disconnected_mux_retirement_is_incarnation_fenced_and_input_safe() {
+        let guardian = id(1);
+        let old_mux = id(2);
+        let successor_mux = id(3);
+        let first_pane = id(40);
+        let pending_pane = id(41);
+        let successor_pane = id(42);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        let spawn = |pane, request_byte, effect_byte| {
+            let payload = spawn_payload("lease-retirement-fixture");
+            request(
+                GuardianOperation::Spawn,
+                guardian,
+                old_mux,
+                id(request_byte),
+                Some(pane),
+                0,
+                0,
+                Some(id(effect_byte)),
+                &payload,
+            )
+        };
+
+        apply_request(&mut state, &spawn(first_pane, 10, 11)).unwrap();
+        apply_request(&mut state, &spawn(pending_pane, 12, 13)).unwrap();
+        apply_request(&mut state, &spawn(successor_pane, 14, 15)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, old_mux, first_pane, 0, 16, 17),
+        )
+        .unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, old_mux, pending_pane, 0, 18, 19),
+        )
+        .unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, successor_mux, successor_pane, 0, 20, 21),
+        )
+        .unwrap();
+        let pending_input = request(
+            GuardianOperation::Input,
+            guardian,
+            old_mux,
+            id(22),
+            Some(pending_pane),
+            1,
+            1,
+            Some(id(23)),
+            b"ambiguous-before-disconnect",
+        );
+        apply_request(&mut state, &pending_input).unwrap();
+
+        assert_eq!(
+            state.retire_disconnected_mux_leases(old_mux).unwrap(),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 1,
+                pending_input_panes: 1,
+            }
+        );
+        assert!(matches!(
+            state.pane_state(first_pane),
+            Some(GuardianPaneState::LiveUnclaimed { generation: 1 })
+        ));
+        assert!(matches!(
+            state.pane_state(pending_pane),
+            Some(GuardianPaneState::LiveClaimed {
+                mux_incarnation,
+                pending_input_effect: Some(effect),
+                ..
+            }) if *mux_incarnation == old_mux && *effect == id(23)
+        ));
+        assert!(matches!(
+            state.pane_state(successor_pane),
+            Some(GuardianPaneState::LiveClaimed { mux_incarnation, .. })
+                if *mux_incarnation == successor_mux
+        ));
+        let stale_resize = request(
+            GuardianOperation::Resize,
+            guardian,
+            old_mux,
+            id(30),
+            Some(first_pane),
+            1,
+            1,
+            Some(id(31)),
+            &resize_payload(30, 100),
+        );
+        assert_eq!(
+            apply_request(&mut state, &stale_resize),
+            Err(GuardianProtocolError::StaleLease),
+            "disconnect retirement must fence the dead mux before any later effect"
+        );
+        assert!(!state.effects.contains_key(&id(31)));
+        assert_eq!(
+            apply_request(
+                &mut state,
+                &claim_request(guardian, successor_mux, pending_pane, 1, 24, 25),
+            ),
+            Err(GuardianProtocolError::InputDurabilityPending)
+        );
+
+        apply_request(
+            &mut state,
+            &claim_request(guardian, successor_mux, first_pane, 1, 26, 27),
+        )
+        .unwrap();
+        state
+            .mark_input_durable(input_effect_identity(&pending_input))
+            .unwrap();
+        assert_eq!(
+            state.retire_disconnected_mux_leases(old_mux).unwrap(),
+            GuardianMuxLeaseRetirement {
+                retired_panes: 1,
+                pending_input_panes: 0,
+            }
+        );
+        apply_request(
+            &mut state,
+            &claim_request(guardian, successor_mux, pending_pane, 1, 28, 29),
+        )
+        .unwrap();
+        assert_eq!(
+            state.retire_disconnected_mux_leases(old_mux).unwrap(),
+            GuardianMuxLeaseRetirement::default(),
+            "a delayed disconnect notification must not retire successor leases"
+        );
+        assert_eq!(
+            state.retire_disconnected_mux_leases(Uuid::nil()),
+            Err(GuardianProtocolError::ZeroIdentity("mux incarnation"))
+        );
     }
 
     #[test]
