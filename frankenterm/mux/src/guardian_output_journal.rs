@@ -19,7 +19,10 @@
 
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    aead::{
+        Aead, KeyInit, Payload,
+        rand_core::{OsRng, RngCore as _},
+    },
 };
 use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
@@ -27,6 +30,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const FILE_MAGIC: [u8; 8] = *b"FTGOUT01";
 const RECORD_MAGIC: [u8; 8] = *b"FTGOR001";
@@ -100,8 +104,107 @@ pub struct GuardianOutputCipher {
     key_id: [u8; KEY_ID_BYTES],
 }
 
+/// In-memory guardian output-journal key material.
+///
+/// This type is intentionally non-cloneable, zeroizes its owned bytes on drop,
+/// and never exposes those bytes through `Debug`.  The service keyring may use
+/// `write_exact` only while provisioning a private, securely opened key file;
+/// all ordinary consumers should derive a [`GuardianOutputCipher`] instead.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct GuardianOutputKey {
+    bytes: [u8; GuardianOutputCipher::KEY_BYTES],
+}
+
+impl GuardianOutputKey {
+    /// Generate a new key from the operating system random source.
+    pub fn generate() -> Result<Self, GuardianOutputJournalError> {
+        let mut bytes = [0_u8; GuardianOutputCipher::KEY_BYTES];
+        if OsRng.try_fill_bytes(&mut bytes).is_err() {
+            bytes.zeroize();
+            return Err(GuardianOutputJournalError::EntropyUnavailable);
+        }
+        if let Err(error) = GuardianOutputCipher::try_from_key_slice(&bytes) {
+            bytes.zeroize();
+            return Err(error);
+        }
+        Ok(Self { bytes })
+    }
+
+    /// Load exactly one key and reject truncated or trailing bytes.
+    pub fn read_exact<R: Read>(reader: &mut R) -> Result<Self, GuardianOutputJournalError> {
+        let mut bytes = [0_u8; GuardianOutputCipher::KEY_BYTES];
+        if let Err(error) = reader.read_exact(&mut bytes) {
+            bytes.zeroize();
+            return Err(GuardianOutputJournalError::KeyFileRead(error));
+        }
+        let mut trailing = [0_u8; 1];
+        match reader.read(&mut trailing) {
+            Ok(0) => {}
+            Ok(_) => {
+                bytes.zeroize();
+                return Err(GuardianOutputJournalError::InvalidEncryptionKey(
+                    "guardian output key file contains trailing bytes",
+                ));
+            }
+            Err(error) => {
+                bytes.zeroize();
+                return Err(GuardianOutputJournalError::KeyFileRead(error));
+            }
+        }
+        if let Err(error) = GuardianOutputCipher::try_from_key_slice(&bytes) {
+            bytes.zeroize();
+            return Err(error);
+        }
+        Ok(Self { bytes })
+    }
+
+    /// Persist the exact key bytes to a caller-owned private descriptor.
+    pub fn write_exact<W: Write>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), GuardianOutputJournalError> {
+        writer
+            .write_all(&self.bytes)
+            .map_err(GuardianOutputJournalError::KeyFileWrite)
+    }
+
+    /// Derive the encryption authority without exposing raw key material.
+    pub fn cipher(&self) -> Result<GuardianOutputCipher, GuardianOutputJournalError> {
+        GuardianOutputCipher::try_from_key_slice(&self.bytes)
+    }
+
+    /// Return the nonsecret fingerprint used to bind segments to this key.
+    pub fn key_id(&self) -> [u8; KEY_ID_BYTES] {
+        let digest = Sha256::digest(&self.bytes);
+        let mut key_id = [0_u8; KEY_ID_BYTES];
+        key_id.copy_from_slice(&digest[..KEY_ID_BYTES]);
+        key_id
+    }
+
+    /// Compare two in-memory authorities without exposing either key.
+    #[must_use]
+    pub fn has_same_material(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl std::fmt::Debug for GuardianOutputKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianOutputKey")
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl GuardianOutputCipher {
     pub const KEY_BYTES: usize = 32;
+
+    /// Return the nonsecret fingerprint bound into each encrypted segment.
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; KEY_ID_BYTES] {
+        self.key_id
+    }
 
     pub fn try_from_key_slice(key: &[u8]) -> Result<Self, GuardianOutputJournalError> {
         if key.len() != Self::KEY_BYTES {
@@ -132,20 +235,23 @@ impl GuardianOutputCipher {
         plaintext_bytes: u32,
         plaintext: &[u8],
     ) -> Result<([u8; NONCE_BYTES], Vec<u8>), GuardianOutputJournalError> {
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let mut nonce_bytes = [0_u8; NONCE_BYTES];
+        if OsRng.try_fill_bytes(&mut nonce_bytes).is_err() {
+            nonce_bytes.zeroize();
+            return Err(GuardianOutputJournalError::EntropyUnavailable);
+        }
+        let nonce = XNonce::from_slice(&nonce_bytes);
         let aad = record_aad(identity, sequence, plaintext_bytes);
         let ciphertext = self
             .cipher
             .encrypt(
-                &nonce,
+                nonce,
                 Payload {
                     msg: plaintext,
                     aad: &aad,
                 },
             )
             .map_err(|_| GuardianOutputJournalError::EncryptionFailed)?;
-        let mut nonce_bytes = [0_u8; NONCE_BYTES];
-        nonce_bytes.copy_from_slice(nonce.as_ref());
         Ok((nonce_bytes, ciphertext))
     }
 
@@ -401,6 +507,12 @@ pub enum GuardianOutputJournalError {
     InvalidSegmentIdentity(&'static str),
     #[error("invalid guardian output encryption key: {0}")]
     InvalidEncryptionKey(&'static str),
+    #[error("operating system entropy is unavailable for guardian output encryption")]
+    EntropyUnavailable,
+    #[error("guardian output key file read failed")]
+    KeyFileRead(#[source] std::io::Error),
+    #[error("guardian output key file write failed")]
+    KeyFileWrite(#[source] std::io::Error),
     #[error("guardian output record encryption failed")]
     EncryptionFailed,
     #[error("guardian output record authentication or decryption failed")]
@@ -1015,7 +1127,20 @@ fn read_u64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write as _};
+
+    #[cfg(unix)]
+    fn create_journal_file(path: &std::path::Path) -> File {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.mode(0o600);
+        }
+        options.open(path).expect("create private test journal")
+    }
 
     fn pane() -> Uuid {
         Uuid::from_bytes([0x42; 16])
@@ -1320,5 +1445,174 @@ mod tests {
         let rendered = format!("{receipt:?}");
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("ab"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_file_creation_activation_append_and_reopen_are_contiguous() {
+        let directory = tempfile::tempdir().expect("create journal directory");
+        let path = directory.path().join("segment.ftgout");
+        let parent = File::open(directory.path()).expect("open parent directory");
+        let payload = b"FT-REAL-FILE-PLAINTEXT-MUST-NOT-APPEAR";
+
+        let mut journal = GuardianOutputJournal::open(
+            create_journal_file(&path),
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize journal");
+        assert!(journal.directory_entry_sync_required());
+        assert!(matches!(
+            journal.append_and_sync(payload),
+            Err(GuardianOutputJournalError::DirectoryEntryNotDurable)
+        ));
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("durably activate journal");
+        let first = journal
+            .append_and_sync(payload)
+            .expect("append first synchronized record");
+        assert_eq!(first.sequence(), 1);
+        let committed_after_first = first.committed_log_bytes();
+        drop(journal);
+
+        let bytes = std::fs::read(&path).expect("read encrypted journal bytes");
+        assert_eq!(
+            u64::try_from(bytes.len()).expect("journal length fits u64"),
+            committed_after_first
+        );
+        assert!(!bytes
+            .windows(payload.len())
+            .any(|window| window == payload));
+
+        let reopened_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("reopen journal");
+        let mut reopened = GuardianOutputJournal::open(
+            reopened_file,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("validate reopened journal");
+        assert!(!reopened.directory_entry_sync_required());
+        assert_eq!(reopened.record_count(), 1);
+        assert_eq!(reopened.next_sequence(), Some(2));
+        let second = reopened
+            .append_and_sync(b"second")
+            .expect("append contiguous record after reopen");
+        assert_eq!(second.sequence(), 2);
+        assert!(second.committed_log_bytes() > committed_after_first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_file_torn_tail_is_preserved_and_cannot_be_appended() {
+        let directory = tempfile::tempdir().expect("create journal directory");
+        let path = directory.path().join("torn.ftgout");
+        let parent = File::open(directory.path()).expect("open parent directory");
+        let mut journal = GuardianOutputJournal::open(
+            create_journal_file(&path),
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize journal");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate journal");
+        let receipt = journal
+            .append_and_sync(b"committed")
+            .expect("append committed prefix");
+        drop(journal);
+
+        let mut external = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open crash-tail writer");
+        external
+            .write_all(&RECORD_MAGIC[..3])
+            .and_then(|()| external.sync_all())
+            .expect("persist simulated torn tail");
+        drop(external);
+        let physical_bytes = std::fs::metadata(&path)
+            .expect("inspect torn journal")
+            .len();
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("reopen torn journal");
+        let mut reopened = GuardianOutputJournal::open(
+            file,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("recover verified prefix from torn journal");
+        assert_eq!(reopened.committed_bytes(), receipt.committed_log_bytes());
+        assert_eq!(reopened.record_count(), 1);
+        assert!(matches!(
+            reopened.tail(),
+            GuardianOutputJournalTail::Incomplete {
+                committed_bytes,
+                trailing_bytes: 3,
+            } if committed_bytes == receipt.committed_log_bytes()
+        ));
+        assert!(matches!(
+            reopened.append_and_sync(b"must-not-overwrite-tail"),
+            Err(GuardianOutputJournalError::IncompleteTail)
+        ));
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("reinspect preserved torn journal")
+                .len(),
+            physical_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_length_change_poisoning_is_sticky() {
+        let directory = tempfile::tempdir().expect("create journal directory");
+        let path = directory.path().join("poison.ftgout");
+        let parent = File::open(directory.path()).expect("open parent directory");
+        let mut journal = GuardianOutputJournal::open(
+            create_journal_file(&path),
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize journal");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate journal");
+        journal
+            .append_and_sync(b"committed")
+            .expect("append committed prefix");
+
+        let mut external = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open external writer");
+        external
+            .write_all(b"unexpected")
+            .and_then(|()| external.sync_all())
+            .expect("persist external length change");
+        drop(external);
+
+        assert!(matches!(
+            journal.append_and_sync(b"ambiguous"),
+            Err(GuardianOutputJournalError::ExternalLengthChange { .. })
+        ));
+        assert!(journal.is_poisoned());
+        assert!(matches!(
+            journal.append_and_sync(b"no-retry"),
+            Err(GuardianOutputJournalError::Poisoned)
+        ));
     }
 }

@@ -2,7 +2,41 @@ use super::*;
 use mlua::UserDataRef;
 use mux::domain::{DomainId, DomainState};
 use mux::DomainOperationGuard;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DomainIntent {
+    Attached,
+    Detached,
+}
+
+pub type DomainIntentFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+pub type DomainIntentRecorder =
+    Arc<dyn Fn(String, DomainIntent) -> DomainIntentFuture + Send + Sync + 'static>;
+
+static DOMAIN_INTENT_RECORDER: OnceLock<DomainIntentRecorder> = OnceLock::new();
+
+/// Install the process-owned persistence callback used by GUI clients.
+///
+/// Non-GUI consumers intentionally leave this unset and retain the original
+/// in-memory attach/detach behavior. The first installed recorder remains the
+/// authority for the process lifetime so a config reload cannot replace it.
+pub fn install_domain_intent_recorder(recorder: DomainIntentRecorder) {
+    let _ = DOMAIN_INTENT_RECORDER.set(recorder);
+}
+
+async fn record_domain_intent(
+    domain_name: String,
+    intent: DomainIntent,
+) -> anyhow::Result<()> {
+    if let Some(recorder) = DOMAIN_INTENT_RECORDER.get() {
+        recorder(domain_name, intent).await?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MuxDomain(pub DomainId);
@@ -54,6 +88,14 @@ impl UserData for MuxDomain {
                 let domain = this.resolve(&mux)?;
                 let window_id = window.map(|w| w.0);
                 let owner_client_id = mux.active_identity();
+                if domain.detachable() {
+                    record_domain_intent(
+                        domain.domain_name().to_string(),
+                        DomainIntent::Attached,
+                    )
+                    .await
+                    .map_err(mlua::Error::external)?;
+                }
                 crate::run_on_main_thread(
                     promise::spawn::MainThreadServiceClass::Topology,
                     "attach domain",
@@ -73,15 +115,30 @@ impl UserData for MuxDomain {
             },
         );
 
-        methods.add_method("detach", |_, this, _: ()| {
+        methods.add_async_method("detach", |_, this, _: ()| async move {
             let mux = get_mux()?;
             let domain = this.resolve(&mux)?;
-            domain.detach().map_err(|err| {
-                mlua::Error::external(format!(
-                    "failed to detach domain {}: {err:#}",
-                    domain.domain_name()
-                ))
-            })
+            if domain.detachable() {
+                record_domain_intent(
+                    domain.domain_name().to_string(),
+                    DomainIntent::Detached,
+                )
+                .await
+                .map_err(mlua::Error::external)?;
+            }
+            crate::run_on_main_thread(
+                promise::spawn::MainThreadServiceClass::Topology,
+                "detach domain",
+                || async move {
+                    domain.detach().map_err(|err| {
+                        mlua::Error::external(format!(
+                            "failed to detach domain {}: {err:#}",
+                            domain.domain_name()
+                        ))
+                    })
+                },
+            )
+            .await?
         });
 
         methods.add_method("state", |_, this, _: ()| {

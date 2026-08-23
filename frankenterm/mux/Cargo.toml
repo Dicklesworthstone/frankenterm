@@ -91,6 +91,7 @@ k9.workspace = true
 promise = { workspace = true, features = ["test-support"] }
 proptest = "1.8.0"
 serde_json.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "event_bus"

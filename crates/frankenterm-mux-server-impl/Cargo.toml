@@ -19,6 +19,8 @@ async-channel.workspace = true
 asupersync.workspace = true
 async_ossl = { workspace = true, default-features = false, features = ["async-asupersync"] }
 base64.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 codec = { workspace = true, default-features = false, features = ["async-asupersync"] }
 config.workspace = true
 dns-lookup.workspace = true
