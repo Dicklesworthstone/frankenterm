@@ -77,6 +77,20 @@ impl Default for KittyImageState {
 // cap to assert the rejection path without constructing a
 // 16 MiB+ payload.
 impl KittyImageState {
+    /// Whether no out-of-band Kitty state would be lost by the v1 terminal
+    /// checkpoint policy. Screen-attached image cells are checked separately;
+    /// this covers incomplete transmissions, reusable image IDs, and placement
+    /// bookkeeping that line serialization alone cannot reconstruct.
+    pub(crate) fn is_empty_for_checkpoint(&self) -> bool {
+        self.accumulator.is_empty()
+            && self.accumulator_encoded_bytes == 0
+            && self.max_image_id == 0
+            && self.number_to_id.is_empty()
+            && self.id_to_data.is_empty()
+            && self.placements.is_empty()
+            && self.used_memory == 0
+    }
+
     /// Override the per-image transmission-size cap.
     pub(crate) fn set_max_transmission_bytes(&mut self, bytes: usize) {
         self.max_transmission_bytes = bytes;

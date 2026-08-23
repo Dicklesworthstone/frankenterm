@@ -31,6 +31,8 @@ mod iterm;
 mod keyboard;
 mod kitty;
 mod mouse;
+#[cfg(feature = "use_serde")]
+pub mod checkpoint;
 pub(crate) mod performer;
 mod sixel;
 use crate::terminalstate::image::*;

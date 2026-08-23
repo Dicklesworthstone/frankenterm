@@ -80,6 +80,22 @@ pub struct Screen {
     forced_rollback_cause: Option<LastGoodFrameRollbackCause>,
 }
 
+/// Semantic screen fields retained by the guardian checkpoint codec.
+///
+/// Caches, workers, telemetry, and configuration capabilities are rebuilt by
+/// `Screen::new` during restore and are intentionally absent here.
+#[cfg(feature = "use_serde")]
+pub(crate) struct ScreenCheckpointParts {
+    pub lines: Vec<Line>,
+    pub stable_row_index_offset: usize,
+    pub allow_scrollback: bool,
+    pub keyboard_stack: Vec<KeyboardEncoding>,
+    pub physical_rows: usize,
+    pub physical_cols: usize,
+    pub dpi: u32,
+    pub saved_cursor: Option<SavedCursor>,
+}
+
 #[cfg_attr(feature = "use_serde", derive(Deserialize, Serialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TieredScrollbackStatus {
@@ -876,6 +892,20 @@ fn scrollback_hot_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback
 }
 
 impl Screen {
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn checkpoint_parts(&self) -> ScreenCheckpointParts {
+        ScreenCheckpointParts {
+            lines: self.lines.iter().cloned().collect(),
+            stable_row_index_offset: self.stable_row_index_offset,
+            allow_scrollback: self.allow_scrollback,
+            keyboard_stack: self.keyboard_stack.clone(),
+            physical_rows: self.physical_rows,
+            physical_cols: self.physical_cols,
+            dpi: self.dpi,
+            saved_cursor: self.saved_cursor.clone(),
+        }
+    }
+
     /// Create a new Screen with the specified dimensions.
     /// The Cells in the viewable portion of the screen are set to the
     /// default cell attributes.
