@@ -184,7 +184,7 @@ impl GuardianOperation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct GuardianRequestHeader {
     pub protocol_version: u16,
     pub operation: GuardianOperation,
@@ -196,6 +196,23 @@ pub struct GuardianRequestHeader {
     pub lease_generation: u64,
     pub lease_sequence: u64,
     pub effect_id: Option<Uuid>,
+}
+
+impl std::fmt::Debug for GuardianRequestHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianRequestHeader")
+            .field("protocol_version", &self.protocol_version)
+            .field("operation", &self.operation)
+            .field("guardian_incarnation", &self.guardian_incarnation)
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("request_id", &self.request_id)
+            .field("pane_id", &self.pane_id)
+            .field("lease_generation", &self.lease_generation)
+            .field("lease_sequence", &self.lease_sequence)
+            .field("effect_id", &self.effect_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GuardianRequestHeader {
@@ -376,7 +393,7 @@ impl GuardianRejectionCode {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct GuardianResponseHeader {
     pub protocol_version: u16,
     pub operation: GuardianOperation,
@@ -390,6 +407,24 @@ pub struct GuardianResponseHeader {
     pub lease_generation: u64,
     pub lease_sequence: u64,
     pub effect_id: Option<Uuid>,
+}
+
+impl std::fmt::Debug for GuardianResponseHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianResponseHeader")
+            .field("protocol_version", &self.protocol_version)
+            .field("operation", &self.operation)
+            .field("status", &self.status)
+            .field("guardian_incarnation", &self.guardian_incarnation)
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("request_id", &self.request_id)
+            .field("pane_id", &self.pane_id)
+            .field("lease_generation", &self.lease_generation)
+            .field("lease_sequence", &self.lease_sequence)
+            .field("effect_id", &self.effect_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GuardianResponseHeader {
@@ -910,7 +945,7 @@ pub enum InputEffectState {
 /// runtime durability completion to the full authenticated fingerprint keeps a
 /// delayed journal acknowledgement for that old UUID from completing a newer
 /// input that happens to reuse it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianInputEffectIdentity {
     pane_id: Uuid,
     mux_incarnation: Uuid,
@@ -918,6 +953,19 @@ pub struct GuardianInputEffectIdentity {
     sequence: u64,
     effect_id: Uuid,
     payload_sha256: [u8; 32],
+}
+
+impl std::fmt::Debug for GuardianInputEffectIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianInputEffectIdentity")
+            .field("pane_id", &self.pane_id)
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("generation", &self.generation)
+            .field("sequence", &self.sequence)
+            .field("effect_id", &self.effect_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GuardianInputEffectIdentity {
@@ -945,10 +993,19 @@ impl GuardianInputEffectIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianInputEffectQuery {
     sequence: u64,
     payload_sha256: [u8; 32],
+}
+
+impl std::fmt::Debug for GuardianInputEffectQuery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianInputEffectQuery")
+            .field("sequence", &self.sequence)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GuardianInputEffectQuery {
@@ -1998,7 +2055,7 @@ impl<E: std::error::Error + 'static> std::error::Error for GuardianEffectTransac
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 struct EffectFingerprint {
     operation: GuardianOperation,
     pane_id: Uuid,
@@ -2006,6 +2063,19 @@ struct EffectFingerprint {
     lease_generation: u64,
     lease_sequence: u64,
     payload_sha256: [u8; 32],
+}
+
+impl std::fmt::Debug for EffectFingerprint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EffectFingerprint")
+            .field("operation", &self.operation)
+            .field("pane_id", &self.pane_id)
+            .field("mux_incarnation", &self.mux_incarnation)
+            .field("lease_generation", &self.lease_generation)
+            .field("lease_sequence", &self.lease_sequence)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3700,6 +3770,10 @@ mod tests {
         );
 
         let query = GuardianInputEffectQuery::new(7, [0x3c; 32]).unwrap();
+        assert!(
+            !format!("{query:?}").contains(&format!("{:?}", [0x3c; 32])),
+            "query diagnostics must not expose a dictionary-testable input digest"
+        );
         assert_eq!(
             GuardianInputEffectQuery::decode(&query.encode()).unwrap(),
             query
@@ -4032,7 +4106,13 @@ mod tests {
         ));
         assert_eq!(format!("{:?}", secret()), "GuardianSecret([REDACTED])");
         let original = spawn_request(id(1), id(2), id(3));
+        let payload_digest_debug = format!("{:?}", original.header.payload_sha256);
         assert!(!format!("{original:?}").contains("bounded-command"));
+        assert!(
+            !format!("{original:?}").contains(&payload_digest_debug)
+                && !format!("{:?}", original.header).contains(&payload_digest_debug),
+            "request diagnostics must not expose a dictionary-testable payload digest"
+        );
         let frame = encode_guardian_request(&secret(), &original).unwrap();
         assert!(frame.len() <= GUARDIAN_MAX_FRAME_BYTES);
         assert_eq!(
@@ -4071,6 +4151,14 @@ mod tests {
         };
         let authenticated_request = authenticate(&original_request);
         let response = GuardianResponseEnvelope::success(&authenticated_request, &reply).unwrap();
+        let request_digest_debug = format!("{:?}", response.header.request_payload_sha256);
+        let response_digest_debug = format!("{:?}", response.header.payload_sha256);
+        let response_header_debug = format!("{:?}", response.header);
+        assert!(
+            !response_header_debug.contains(&request_digest_debug)
+                && !response_header_debug.contains(&response_digest_debug),
+            "response-header diagnostics must not expose content-derived digests"
+        );
         assert_eq!(
             GuardianResponseEnvelope::success(
                 &authenticated_request,
@@ -5042,6 +5130,11 @@ mod tests {
             Some(effect),
             b"hello",
         );
+        let input_digest_debug = format!("{:?}", input.header.payload_sha256);
+        assert!(
+            !format!("{:?}", input_effect_identity(&input)).contains(&input_digest_debug),
+            "durability-identity diagnostics must not expose the input digest"
+        );
         let query_payload = input_effect_query_payload(&input);
         let query = request(
             GuardianOperation::QueryInputEffect,
@@ -5063,6 +5156,10 @@ mod tests {
             "only an effect at or beyond the unconsumed sequence fence may be reported as safe to resend"
         );
         let receipt = apply_request(&mut state, &input).unwrap();
+        assert!(
+            !format!("{state:?}").contains(&input_digest_debug),
+            "state-machine diagnostics must not expose retained input digests"
+        );
         assert_eq!(
             receipt,
             GuardianReply::InputReceipt {

@@ -224,7 +224,10 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   a safely retryable failure. Spawn requests carry a bounded serialized
   `CommandBuilder` plus fixed PTY geometry and require its one canonical v1
   byte encoding, so ignored JSON fields cannot become an authenticated hidden
-  payload. Resize and signal requests use fixed operation-tagged payloads, and
+  payload. Default diagnostics now omit content-derived payload digests from
+  request/response headers, input-effect queries, durability identities, and
+  retained state; hiding only the raw input would leave low-entropy commands
+  dictionary-testable. Resize and signal requests use fixed operation-tagged payloads, and
   every currently payload-free control
   operation—including checkpoint and replay—rejects hidden trailing bytes.
   Success replies likewise use operation-typed fixed

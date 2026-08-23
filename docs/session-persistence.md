@@ -403,7 +403,11 @@ spawns. The serialized command writes through the payload byte ceiling during
 encoding rather than allocating first and checking later; decoding requires
 the one canonical v1 serialization byte-for-byte, so ignored JSON fields or
 alternate encodings cannot carry authenticated hidden data. Its debug surface
-is content-free. Resize geometry and the supported terminate signal have fixed
+is content-free. Request headers, response headers, retained effect
+fingerprints, input-effect queries, and durability-completion identities also
+omit content-derived SHA-256 values from `Debug`; raw payload omission alone is
+not sufficient because a low-entropy input digest is dictionary-testable.
+Resize geometry and the supported terminate signal have fixed
 operation-tagged payloads, while claim, attach, close, checkpoint, replay,
 lease retirement, and `Hello` reject hidden trailing payload bytes.
 `QueryInputEffect` has a fixed operation-tagged payload containing the original
