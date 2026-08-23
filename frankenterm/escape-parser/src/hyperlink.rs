@@ -2,7 +2,7 @@ use crate::{Result, ensure, format_err};
 use core::hash::{Hash, Hasher};
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
 #[cfg(feature = "use_serde")]
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::allocate::*;
 
@@ -66,7 +66,7 @@ fn decode_percent_escapes(input: &str) -> Result<String> {
     Ok(String::from_utf8(out)?)
 }
 
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "use_serde", derive(Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub struct Hyperlink {
     params: HashMap<String, String>,
@@ -74,6 +74,28 @@ pub struct Hyperlink {
     /// If the link was produced by an implicit or matching rule,
     /// this field will be set to true.
     implicit: bool,
+}
+
+#[cfg(feature = "use_serde")]
+impl Serialize for Hyperlink {
+    fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // HashMap iteration order is randomized. Sorting here preserves the
+        // existing wire shape while giving terminal checkpoints and render
+        // snapshots one canonical byte representation for equivalent links.
+        let params: BTreeMap<&str, &str> = self
+            .params
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let mut state = serializer.serialize_struct("Hyperlink", 3)?;
+        state.serialize_field("params", &params)?;
+        state.serialize_field("uri", &self.uri)?;
+        state.serialize_field("implicit", &self.implicit)?;
+        state.end()
+    }
 }
 
 impl Hyperlink {
@@ -413,6 +435,29 @@ mod tests {
             h1.finish(),
             h2.finish(),
             "shape hash must not depend on HashMap insertion order"
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn serialization_is_canonical_across_param_insertion_order() {
+        let mut params_a = HashMap::new();
+        params_a.insert("zeta".to_string(), "last".to_string());
+        params_a.insert("alpha".to_string(), "first".to_string());
+
+        let mut params_b = HashMap::new();
+        params_b.insert("alpha".to_string(), "first".to_string());
+        params_b.insert("zeta".to_string(), "last".to_string());
+
+        let a = Hyperlink::new_with_params("https://example.com", params_a);
+        let b = Hyperlink::new_with_params("https://example.com", params_b);
+        let encoded_a = serde_json::to_vec(&a).expect("serialize first hyperlink");
+        let encoded_b = serde_json::to_vec(&b).expect("serialize second hyperlink");
+
+        assert_eq!(encoded_a, encoded_b);
+        assert_eq!(
+            serde_json::from_slice::<Hyperlink>(&encoded_a).expect("deserialize hyperlink"),
+            a
         );
     }
 }
