@@ -351,6 +351,15 @@ proven:
    A checkpoint must either serialize the complete incremental parser state or
    prove that its raw-output sequence ends at a parser ground-state boundary;
    screen rows alone cannot represent a partial CSI, OSC, or DCS sequence.
+   The ground-state proof uses
+   `frankenterm_escape_parser::parser::Parser::is_recovery_ground`, not the
+   lower-level VT transition state alone: semantic Sixel, short-DCS, termcap,
+   and tmux-control parsers can retain state outside that table. The checkpoint
+   must carry the exact `RECOVERY_CHECKPOINT_PARSER_ID` and the exact output
+   record sequence processed into the snapshotted terminal model. Capture waits
+   for those identities to coincide; it never combines an older ground offset
+   with newer screen state, because replaying that suffix would duplicate
+   already-applied terminal effects.
 7. `Attach` returns a census entry plus the newest verified checkpoint and raw
    output strictly after its sequence. The mux reconstructs the terminal parser
    behind a replay gate whose writer discards parser-generated device replies and

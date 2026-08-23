@@ -229,6 +229,15 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   complete corruption, torn tails, external writes, and ambiguous I/O fail
   closed without truncating evidence. This remains a descriptor-level storage
   primitive until the guardian PTY runtime and takeover recovery path are wired.
+- Adds an explicit escape-parser recovery-ground authority and versioned parser
+  checkpoint identity. The authority rejects partial CSI, OSC, DCS, Sixel,
+  termcap, UTF-8, and tmux-control state even when the underlying VT transition
+  table alone appears idle. A terminal checkpoint may therefore bind a fresh
+  parser only to the exact processed raw-output sequence at which this stricter
+  predicate was true; older output offsets paired with newer screen state are
+  forbidden because suffix replay would duplicate terminal effects. This is a
+  checkpoint substrate only; canonical terminal-state encoding and live
+  guardian capture remain pending.
 - Freezes the guardian v1 authenticated request/response envelopes and pure
   fencing state machine: bounded HMAC-before-decode framing, exact response
   correlation, a token-authenticated payload-free `Hello` bootstrap that is
