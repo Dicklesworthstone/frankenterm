@@ -236,6 +236,16 @@ pub struct Parser {
     print_batching: bool,
 }
 
+/// Versioned identity for the parser state contract used by durable terminal
+/// checkpoints.
+///
+/// A checkpoint may be restored with a fresh parser only when it was captured
+/// at [`Parser::is_recovery_ground`] and carries this exact identity. Any
+/// change that alters the interpretation of retained raw terminal bytes must
+/// change this value so an older checkpoint fails closed instead of silently
+/// reconstructing different terminal state.
+pub const RECOVERY_CHECKPOINT_PARSER_ID: &str = "frankenterm.escape-parser.recovery-ground.v1";
+
 impl Default for Parser {
     fn default() -> Self {
         Self::new()
@@ -253,6 +263,39 @@ impl Parser {
             state: RefCell::new(state),
             print_batching: default_print_batching(),
         }
+    }
+
+    /// Returns whether this parser can be replaced by a fresh parser at the
+    /// current raw-output boundary without losing incremental parse state.
+    ///
+    /// This is deliberately stricter than the underlying VT machine's Ground
+    /// state. The semantic parser can also retain a Sixel, short-DCS, termcap,
+    /// or tmux-control parser outside the VT transition table. Durable
+    /// checkpoints must reject all of those states as well. Callers must bind
+    /// a positive result to the exact processed raw-output sequence; using an
+    /// earlier sequence with a newer terminal model would duplicate output on
+    /// replay.
+    #[must_use]
+    pub fn is_recovery_ground(&self) -> bool {
+        if !self.state_machine.is_ground() {
+            return false;
+        }
+
+        let state = self.state.borrow();
+        state.sixel.is_none()
+            && state.dcs.is_none()
+            && !state.discarding_short_dcs
+            && state.get_tcap.is_none()
+            && {
+                #[cfg(feature = "tmux_cc")]
+                {
+                    state.tmux_state.is_none()
+                }
+                #[cfg(not(feature = "tmux_cc"))]
+                {
+                    true
+                }
+            }
     }
 
     /// Enable or disable ground-state printable-run coalescing (Round-5 D1,
@@ -793,6 +836,50 @@ mod test {
                 Some(falsey),
             ));
         }
+    }
+
+    #[test]
+    fn recovery_ground_requires_complete_streaming_sequences() {
+        let mut parser = Parser::new();
+        assert!(parser.is_recovery_ground());
+
+        parser.parse(b"\x1b[38;2", |_| {});
+        assert!(!parser.is_recovery_ground());
+        parser.parse(b";1;2;3m", |_| {});
+        assert!(parser.is_recovery_ground());
+
+        parser.parse(b"\x1b]2;partial title", |_| {});
+        assert!(!parser.is_recovery_ground());
+        parser.parse(b"\x07", |_| {});
+        assert!(parser.is_recovery_ground());
+
+        parser.parse(b"\x1bP$qm", |_| {});
+        assert!(!parser.is_recovery_ground());
+        parser.parse(b"\x1b\\", |_| {});
+        assert!(parser.is_recovery_ground());
+
+        parser.parse(&[0xe2, 0x82], |_| {});
+        assert!(!parser.is_recovery_ground());
+        parser.parse(&[0xac], |_| {});
+        assert!(parser.is_recovery_ground());
+    }
+
+    #[cfg(feature = "tmux_cc")]
+    #[test]
+    fn recovery_ground_rejects_active_tmux_control_parser() {
+        let mut parser = Parser::new();
+        parser.parse(b"\x1bP1000p\x1b\\", |_| {});
+
+        assert!(parser.state_machine.is_ground());
+        assert!(!parser.is_recovery_ground());
+    }
+
+    #[test]
+    fn recovery_checkpoint_parser_identity_is_versioned_and_nonempty() {
+        assert_eq!(
+            RECOVERY_CHECKPOINT_PARSER_ID,
+            "frankenterm.escape-parser.recovery-ground.v1"
+        );
     }
 
     // <https://github.com/markbt/streampager/issues/57>
