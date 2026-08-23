@@ -4,8 +4,11 @@
 //! A transport must decode and authenticate a complete frame here before it is allowed to
 //! route the request to a pane runtime.  The pure state machine is the authority for spawn
 //! idempotency, lease generations, mutation sequencing, and ambiguous input reconciliation.
+//! A fresh mux first uses the authenticated `Hello` operation to learn the current guardian
+//! incarnation; nil incarnation scope is otherwise forbidden.
 
 use hmac::{Hmac, KeyInit, Mac};
+use portable_pty::{PtySize, cmdbuilder::CommandBuilder};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
@@ -43,6 +46,16 @@ const RESPONSE_FRAME_MIN_BYTES: usize =
     FRAME_LENGTH_BYTES + RESPONSE_FRAME_HEADER_BYTES + GUARDIAN_MAC_BYTES;
 const RESPONSE_PAYLOAD_LENGTH_OFFSET: usize =
     FRAME_LENGTH_BYTES + RESPONSE_FRAME_HEADER_BYTES - std::mem::size_of::<u32>();
+const SPAWN_PAYLOAD_MAGIC: [u8; 4] = *b"GSP1";
+const RESIZE_PAYLOAD_MAGIC: [u8; 4] = *b"GRS1";
+const SIGNAL_PAYLOAD_MAGIC: [u8; 4] = *b"GSG1";
+const INPUT_EFFECT_QUERY_PAYLOAD_MAGIC: [u8; 4] = *b"GIQ1";
+const REJECTION_PAYLOAD_MAGIC: [u8; 4] = *b"GRE1";
+const SPAWN_PAYLOAD_FIXED_BYTES: usize = 16;
+const RESIZE_PAYLOAD_BYTES: usize = 12;
+const SIGNAL_PAYLOAD_BYTES: usize = 5;
+const INPUT_EFFECT_QUERY_PAYLOAD_BYTES: usize = 44;
+const REJECTION_PAYLOAD_BYTES: usize = 6;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -103,6 +116,9 @@ pub enum GuardianOperation {
     Replay = 10,
     QueryInputEffect = 11,
     RetireLease = 12,
+    /// Authenticated bootstrap that discovers the current guardian
+    /// incarnation before any pane-scoped request can be formed.
+    Hello = 13,
 }
 
 impl GuardianOperation {
@@ -120,6 +136,7 @@ impl GuardianOperation {
             10 => Ok(Self::Replay),
             11 => Ok(Self::QueryInputEffect),
             12 => Ok(Self::RetireLease),
+            13 => Ok(Self::Hello),
             other => Err(GuardianProtocolError::UnknownOperation(other)),
         }
     }
@@ -271,6 +288,94 @@ impl GuardianResponseStatus {
     }
 }
 
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianRejectionCode {
+    InvalidRequest = 1,
+    GuardianIncarnationMismatch = 2,
+    PaneNotFound = 3,
+    PaneAlreadyExists = 4,
+    RequestIdentityConflict = 5,
+    EffectIdentityConflict = 6,
+    PaneTerminal = 7,
+    ClaimGenerationMismatch = 8,
+    StaleLease = 9,
+    RepeatedSequence = 10,
+    SequenceGap = 11,
+    GenerationExhausted = 12,
+    SequenceExhausted = 13,
+    CapacityExhausted = 14,
+    RequestAliasCapacityExhausted = 15,
+    InputDurabilityPending = 16,
+    InputDurabilityIdentityMismatch = 17,
+    CensusSnapshotNotFound = 18,
+    CensusSnapshotIdentityConflict = 19,
+    InvalidCensusCursor = 20,
+    InternalInvariant = 21,
+}
+
+impl GuardianRejectionCode {
+    #[must_use]
+    pub const fn status(self) -> GuardianResponseStatus {
+        match self {
+            Self::PaneNotFound
+            | Self::SequenceGap
+            | Self::CapacityExhausted
+            | Self::RequestAliasCapacityExhausted
+            | Self::InputDurabilityPending => GuardianResponseStatus::Rejected,
+            _ => GuardianResponseStatus::Terminal,
+        }
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; REJECTION_PAYLOAD_BYTES] {
+        let mut payload = [0_u8; REJECTION_PAYLOAD_BYTES];
+        payload[..4].copy_from_slice(&REJECTION_PAYLOAD_MAGIC);
+        payload[4..].copy_from_slice(&(self as u16).to_be_bytes());
+        payload
+    }
+
+    pub fn decode(
+        status: GuardianResponseStatus,
+        payload: &[u8],
+    ) -> Result<Self, GuardianProtocolError> {
+        if status == GuardianResponseStatus::Success
+            || payload.len() != REJECTION_PAYLOAD_BYTES
+            || payload.get(..4) != Some(REJECTION_PAYLOAD_MAGIC.as_slice())
+        {
+            return Err(GuardianProtocolError::InvalidRejectionPayload);
+        }
+        let code = match read_u16(payload, 4)? {
+            1 => Self::InvalidRequest,
+            2 => Self::GuardianIncarnationMismatch,
+            3 => Self::PaneNotFound,
+            4 => Self::PaneAlreadyExists,
+            5 => Self::RequestIdentityConflict,
+            6 => Self::EffectIdentityConflict,
+            7 => Self::PaneTerminal,
+            8 => Self::ClaimGenerationMismatch,
+            9 => Self::StaleLease,
+            10 => Self::RepeatedSequence,
+            11 => Self::SequenceGap,
+            12 => Self::GenerationExhausted,
+            13 => Self::SequenceExhausted,
+            14 => Self::CapacityExhausted,
+            15 => Self::RequestAliasCapacityExhausted,
+            16 => Self::InputDurabilityPending,
+            17 => Self::InputDurabilityIdentityMismatch,
+            18 => Self::CensusSnapshotNotFound,
+            19 => Self::CensusSnapshotIdentityConflict,
+            20 => Self::InvalidCensusCursor,
+            21 => Self::InternalInvariant,
+            _ => return Err(GuardianProtocolError::InvalidRejectionPayload),
+        };
+        if code.status() != status {
+            return Err(GuardianProtocolError::InvalidRejectionPayload);
+        }
+        Ok(code)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuardianResponseHeader {
     pub protocol_version: u16,
@@ -289,7 +394,7 @@ pub struct GuardianResponseHeader {
 
 impl GuardianResponseHeader {
     #[must_use]
-    pub fn new(
+    fn new(
         request: &GuardianRequestHeader,
         status: GuardianResponseStatus,
         payload: &[u8],
@@ -313,17 +418,60 @@ impl GuardianResponseHeader {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct GuardianResponseEnvelope {
-    pub header: GuardianResponseHeader,
-    pub payload: Vec<u8>,
+    header: GuardianResponseHeader,
+    payload: Vec<u8>,
+}
+
+impl GuardianResponseEnvelope {
+    #[must_use]
+    pub const fn header(&self) -> &GuardianResponseHeader {
+        &self.header
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn success(
+        request: &AuthenticatedGuardianRequest,
+        reply: &GuardianReply,
+    ) -> Result<Self, GuardianProtocolError> {
+        let payload = reply.encode_for_operation(request.header.operation)?;
+        let response = Self {
+            header: GuardianResponseHeader::new(
+                &request.header,
+                GuardianResponseStatus::Success,
+                &payload,
+            ),
+            payload,
+        };
+        reply.require_response_identity(&response.header)?;
+        reply.require_request_payload(request)?;
+        Ok(response)
+    }
+
+    pub fn rejection(
+        request: &AuthenticatedGuardianRequest,
+        code: GuardianRejectionCode,
+    ) -> Self {
+        let payload = code.encode().to_vec();
+        Self {
+            header: GuardianResponseHeader::new(&request.header, code.status(), &payload),
+            payload,
+        }
+    }
 }
 
 impl std::fmt::Debug for GuardianResponseEnvelope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GuardianResponseEnvelope")
-            .field("header", &self.header)
+            .field("protocol_version", &self.header.protocol_version)
+            .field("operation", &self.header.operation)
+            .field("status", &self.header.status)
             .field("payload_len", &self.payload.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -362,6 +510,233 @@ impl AuthenticatedGuardianResponse {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub struct GuardianSpawnPayload {
+    command: CommandBuilder,
+    size: PtySize,
+}
+
+impl std::fmt::Debug for GuardianSpawnPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianSpawnPayload")
+            .field("command_args", &self.command.get_argv().len())
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardianSpawnPayload {
+    pub fn new(command: CommandBuilder, size: PtySize) -> Result<Self, GuardianProtocolError> {
+        let payload = Self { command, size };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> &CommandBuilder {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> PtySize {
+        self.size
+    }
+
+    pub fn into_parts(self) -> (CommandBuilder, PtySize) {
+        (self.command, self.size)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, GuardianProtocolError> {
+        self.validate()?;
+        let command_limit = GUARDIAN_MAX_PAYLOAD_BYTES
+            .checked_sub(SPAWN_PAYLOAD_FIXED_BYTES)
+            .ok_or(GuardianProtocolError::PayloadTooLarge)?;
+        let mut command = GuardianBoundedPayloadBuffer::new(command_limit);
+        if serde_json::to_writer(&mut command, &self.command).is_err() {
+            return Err(if command.exceeded {
+                GuardianProtocolError::PayloadTooLarge
+            } else {
+                GuardianProtocolError::InvalidOperationPayload
+            });
+        }
+        let command = command.into_inner();
+        let total = SPAWN_PAYLOAD_FIXED_BYTES
+            .checked_add(command.len())
+            .ok_or(GuardianProtocolError::PayloadTooLarge)?;
+        if total > GUARDIAN_MAX_PAYLOAD_BYTES {
+            return Err(GuardianProtocolError::PayloadTooLarge);
+        }
+        let mut payload = Vec::with_capacity(total);
+        payload.extend_from_slice(&SPAWN_PAYLOAD_MAGIC);
+        encode_pty_size(&mut payload, self.size);
+        payload.extend_from_slice(
+            &u32::try_from(command.len())
+                .map_err(|_| GuardianProtocolError::PayloadTooLarge)?
+                .to_be_bytes(),
+        );
+        payload.extend_from_slice(&command);
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() < SPAWN_PAYLOAD_FIXED_BYTES
+            || payload.len() > GUARDIAN_MAX_PAYLOAD_BYTES
+            || payload.get(..4) != Some(SPAWN_PAYLOAD_MAGIC.as_slice())
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let size = decode_pty_size(
+            payload
+                .get(4..12)
+                .ok_or(GuardianProtocolError::InvalidOperationPayload)?,
+        )?;
+        let command_len = usize::try_from(read_u32(payload, 12)?)
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let expected = SPAWN_PAYLOAD_FIXED_BYTES
+            .checked_add(command_len)
+            .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+        if payload.len() != expected {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let command_bytes = payload
+            .get(SPAWN_PAYLOAD_FIXED_BYTES..)
+            .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+        let command: CommandBuilder = serde_json::from_slice(command_bytes)
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let command_limit = GUARDIAN_MAX_PAYLOAD_BYTES
+            .checked_sub(SPAWN_PAYLOAD_FIXED_BYTES)
+            .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+        let mut canonical = GuardianBoundedPayloadBuffer::new(command_limit);
+        serde_json::to_writer(&mut canonical, &command)
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let canonical = canonical.into_inner();
+        if canonical.as_slice() != command_bytes {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        Self::new(command, size)
+    }
+
+    fn validate(&self) -> Result<(), GuardianProtocolError> {
+        if self
+            .command
+            .get_argv()
+            .first()
+            .is_none_or(|program| program.is_empty())
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianResizePayload(PtySize);
+
+impl GuardianResizePayload {
+    #[must_use]
+    pub const fn new(size: PtySize) -> Self {
+        Self(size)
+    }
+
+    #[must_use]
+    pub const fn size(self) -> PtySize {
+        self.0
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; RESIZE_PAYLOAD_BYTES] {
+        let mut payload = Vec::with_capacity(RESIZE_PAYLOAD_BYTES);
+        payload.extend_from_slice(&RESIZE_PAYLOAD_MAGIC);
+        encode_pty_size(&mut payload, self.0);
+        let mut encoded = [0_u8; RESIZE_PAYLOAD_BYTES];
+        encoded.copy_from_slice(&payload);
+        encoded
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != RESIZE_PAYLOAD_BYTES
+            || payload.get(..4) != Some(RESIZE_PAYLOAD_MAGIC.as_slice())
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        Ok(Self::new(decode_pty_size(&payload[4..])?))
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianSignal {
+    Terminate = 1,
+}
+
+impl GuardianSignal {
+    #[must_use]
+    pub fn encode(self) -> [u8; SIGNAL_PAYLOAD_BYTES] {
+        let mut payload = [0_u8; SIGNAL_PAYLOAD_BYTES];
+        payload[..4].copy_from_slice(&SIGNAL_PAYLOAD_MAGIC);
+        payload[4] = self as u8;
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != SIGNAL_PAYLOAD_BYTES
+            || payload.get(..4) != Some(SIGNAL_PAYLOAD_MAGIC.as_slice())
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        match payload[4] {
+            1 => Ok(Self::Terminate),
+            _ => Err(GuardianProtocolError::InvalidOperationPayload),
+        }
+    }
+}
+
+struct GuardianBoundedPayloadBuffer {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl GuardianBoundedPayloadBuffer {
+    const fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            exceeded: false,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::io::Write for GuardianBoundedPayloadBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("guardian payload length overflow"))?;
+        if next > self.max_bytes {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "guardian payload serialization exceeded its byte ceiling",
+            ));
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|error| std::io::Error::other(format!("guardian payload reserve: {error}")))?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct CorrelatedGuardianResponse(GuardianResponseEnvelope);
 
@@ -389,6 +764,38 @@ impl CorrelatedGuardianResponse {
     pub const fn envelope(&self) -> &GuardianResponseEnvelope {
         &self.0
     }
+
+    pub fn success_reply(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReply, GuardianProtocolError> {
+        if self.0.header.status != GuardianResponseStatus::Success {
+            return Err(GuardianProtocolError::NonSuccessResponse);
+        }
+        let header = &self.0.header;
+        let request_header = &request.header;
+        if header.protocol_version != request_header.protocol_version
+            || header.operation != request_header.operation
+            || header.guardian_incarnation != request_header.guardian_incarnation
+            || header.mux_incarnation != request_header.mux_incarnation
+            || header.request_id != request_header.request_id
+            || header.request_payload_sha256 != request_header.payload_sha256
+            || header.pane_id != request_header.pane_id
+            || header.lease_generation != request_header.lease_generation
+            || header.lease_sequence != request_header.lease_sequence
+            || header.effect_id != request_header.effect_id
+        {
+            return Err(GuardianProtocolError::ResponseRequestMismatch);
+        }
+        let reply = GuardianReply::decode_for_operation(self.0.header.operation, &self.0.payload)?;
+        reply.require_response_identity(&self.0.header)?;
+        reply.require_request_payload(request)?;
+        Ok(reply)
+    }
+
+    pub fn rejection_code(&self) -> Result<GuardianRejectionCode, GuardianProtocolError> {
+        GuardianRejectionCode::decode(self.0.header.status, &self.0.payload)
+    }
 }
 
 impl AuthenticatedGuardianRequest {
@@ -410,6 +817,8 @@ impl AuthenticatedGuardianRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardianCensusPageRequest {
+    /// Nil only for cursor zero to request a new guardian-allocated snapshot;
+    /// continuation pages echo the nonzero UUID returned by the first reply.
     pub snapshot_id: Uuid,
     pub cursor: u64,
     pub max_entries: u16,
@@ -468,7 +877,12 @@ impl GuardianCensusPageRequest {
     }
 
     fn validate(self) -> Result<(), GuardianProtocolError> {
-        if self.snapshot_id.is_nil()
+        let snapshot_identity_is_valid = if self.cursor == 0 {
+            self.snapshot_id.is_nil()
+        } else {
+            !self.snapshot_id.is_nil()
+        };
+        if !snapshot_identity_is_valid
             || self.max_entries == 0
             || self.max_entries > GUARDIAN_MAX_CENSUS_ENTRIES
             || self.max_bytes < GUARDIAN_MIN_CENSUS_PAGE_BYTES
@@ -486,6 +900,110 @@ pub enum InputEffectState {
     AcceptedNotDurable,
     DurableEffect,
     TerminalRejected,
+}
+
+/// Exact authority for completing one authenticated input effect.
+///
+/// Effect UUIDs may be reused only after their bounded receipt rotates and a
+/// later generation/sequence fence makes the old mutation impossible. Binding
+/// runtime durability completion to the full authenticated fingerprint keeps a
+/// delayed journal acknowledgement for that old UUID from completing a newer
+/// input that happens to reuse it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianInputEffectIdentity {
+    pane_id: Uuid,
+    mux_incarnation: Uuid,
+    generation: u64,
+    sequence: u64,
+    effect_id: Uuid,
+    payload_sha256: [u8; 32],
+}
+
+impl GuardianInputEffectIdentity {
+    pub fn from_authenticated_request(
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<Self, GuardianProtocolError> {
+        validate_request_envelope(request)?;
+        if request.header.operation != GuardianOperation::Input {
+            return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
+        }
+        Ok(Self {
+            pane_id: request
+                .header
+                .pane_id
+                .ok_or(GuardianProtocolError::InputDurabilityIdentityMismatch)?,
+            mux_incarnation: request.header.mux_incarnation,
+            generation: request.header.lease_generation,
+            sequence: request.header.lease_sequence,
+            effect_id: request
+                .header
+                .effect_id
+                .ok_or(GuardianProtocolError::InputDurabilityIdentityMismatch)?,
+            payload_sha256: request.header.payload_sha256,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianInputEffectQuery {
+    sequence: u64,
+    payload_sha256: [u8; 32],
+}
+
+impl GuardianInputEffectQuery {
+    pub fn new(
+        sequence: u64,
+        payload_sha256: [u8; 32],
+    ) -> Result<Self, GuardianProtocolError> {
+        if sequence == 0 {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        Ok(Self {
+            sequence,
+            payload_sha256,
+        })
+    }
+
+    #[must_use]
+    pub fn encode(self) -> [u8; INPUT_EFFECT_QUERY_PAYLOAD_BYTES] {
+        let mut payload = [0_u8; INPUT_EFFECT_QUERY_PAYLOAD_BYTES];
+        payload[..4].copy_from_slice(&INPUT_EFFECT_QUERY_PAYLOAD_MAGIC);
+        payload[4..12].copy_from_slice(&self.sequence.to_be_bytes());
+        payload[12..].copy_from_slice(&self.payload_sha256);
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        if payload.len() != INPUT_EFFECT_QUERY_PAYLOAD_BYTES
+            || payload[..4] != INPUT_EFFECT_QUERY_PAYLOAD_MAGIC
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
+        }
+        let mut payload_sha256 = [0_u8; 32];
+        payload_sha256.copy_from_slice(&payload[12..]);
+        Self::new(read_u64(payload, 4)?, payload_sha256)
+    }
+}
+
+impl InputEffectState {
+    const fn to_wire(self) -> u8 {
+        match self {
+            Self::NotSeen => 0,
+            Self::AcceptedNotDurable => 1,
+            Self::DurableEffect => 2,
+            Self::TerminalRejected => 3,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self, GuardianProtocolError> {
+        match value {
+            0 => Ok(Self::NotSeen),
+            1 => Ok(Self::AcceptedNotDurable),
+            2 => Ok(Self::DurableEffect),
+            3 => Ok(Self::TerminalRejected),
+            _ => Err(GuardianProtocolError::InvalidReplyPayload),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -511,6 +1029,9 @@ pub struct GuardianCensusEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GuardianReply {
+    Hello {
+        guardian_incarnation: Uuid,
+    },
     Spawned { pane_id: Uuid, generation: u64 },
     CensusPage {
         snapshot_id: Uuid,
@@ -531,6 +1052,484 @@ pub enum GuardianReply {
     LeaseRetired { pane_id: Uuid, generation: u64 },
     InputEffect { effect_id: Uuid, state: InputEffectState },
     ReplayReady { pane_id: Uuid, generation: u64 },
+}
+
+impl GuardianReply {
+    pub fn encode_for_operation(
+        &self,
+        operation: GuardianOperation,
+    ) -> Result<Vec<u8>, GuardianProtocolError> {
+        self.require_operation(operation)?;
+        let capacity = match self {
+            Self::Hello { .. } => 16,
+            Self::CensusPage { entries, .. } => usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES)
+                .ok()
+                .and_then(|header| {
+                    usize::try_from(GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES)
+                        .ok()
+                        .and_then(|entry| entry.checked_mul(entries.len()))
+                        .and_then(|entries| header.checked_add(entries))
+                })
+                .ok_or(GuardianProtocolError::PayloadTooLarge)?,
+            Self::Spawned { .. } | Self::LeaseRetired { .. } | Self::ReplayReady { .. } => 24,
+            Self::Claimed { .. }
+            | Self::Attached { .. }
+            | Self::MutationApplied { .. } => 32,
+            Self::InputReceipt { .. } => 49,
+            Self::InputEffect { .. } => 17,
+        };
+        if capacity > GUARDIAN_MAX_PAYLOAD_BYTES {
+            return Err(GuardianProtocolError::PayloadTooLarge);
+        }
+        let mut payload = Vec::with_capacity(capacity);
+        match self {
+            Self::Hello {
+                guardian_incarnation,
+            } => push_uuid(&mut payload, *guardian_incarnation),
+            Self::Spawned {
+                pane_id,
+                generation,
+            }
+            | Self::LeaseRetired {
+                pane_id,
+                generation,
+            }
+            | Self::ReplayReady {
+                pane_id,
+                generation,
+            } => {
+                push_uuid(&mut payload, *pane_id);
+                payload.extend_from_slice(&generation.to_be_bytes());
+            }
+            Self::CensusPage {
+                snapshot_id,
+                entries,
+                next_cursor,
+                total_panes,
+            } => {
+                if snapshot_id.is_nil()
+                    || entries.len() > usize::from(GUARDIAN_MAX_CENSUS_ENTRIES)
+                    || u64::try_from(entries.len()).unwrap_or(u64::MAX) > *total_panes
+                {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                push_uuid(&mut payload, *snapshot_id);
+                payload.extend_from_slice(&next_cursor.unwrap_or(u64::MAX).to_be_bytes());
+                payload.extend_from_slice(&total_panes.to_be_bytes());
+                payload.extend_from_slice(
+                    &u16::try_from(entries.len())
+                        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?
+                        .to_be_bytes(),
+                );
+                for entry in entries {
+                    entry.encode_into(&mut payload)?;
+                }
+            }
+            Self::Claimed {
+                pane_id,
+                generation,
+                next_sequence,
+            }
+            | Self::Attached {
+                pane_id,
+                generation,
+                next_sequence,
+            } => {
+                push_uuid(&mut payload, *pane_id);
+                payload.extend_from_slice(&generation.to_be_bytes());
+                payload.extend_from_slice(&next_sequence.to_be_bytes());
+            }
+            Self::InputReceipt {
+                pane_id,
+                generation,
+                sequence,
+                effect_id,
+                state,
+            } => {
+                push_uuid(&mut payload, *pane_id);
+                payload.extend_from_slice(&generation.to_be_bytes());
+                payload.extend_from_slice(&sequence.to_be_bytes());
+                push_uuid(&mut payload, *effect_id);
+                payload.push(state.to_wire());
+            }
+            Self::MutationApplied {
+                pane_id,
+                generation,
+                sequence,
+            } => {
+                push_uuid(&mut payload, *pane_id);
+                payload.extend_from_slice(&generation.to_be_bytes());
+                payload.extend_from_slice(&sequence.to_be_bytes());
+            }
+            Self::InputEffect { effect_id, state } => {
+                push_uuid(&mut payload, *effect_id);
+                payload.push(state.to_wire());
+            }
+        }
+        if payload.len() != capacity {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "guardian-reply-encoded-size",
+            ));
+        }
+        Ok(payload)
+    }
+
+    pub fn decode_for_operation(
+        operation: GuardianOperation,
+        payload: &[u8],
+    ) -> Result<Self, GuardianProtocolError> {
+        if payload.len() > GUARDIAN_MAX_PAYLOAD_BYTES {
+            return Err(GuardianProtocolError::PayloadTooLarge);
+        }
+        let reply = match operation {
+            GuardianOperation::Hello => {
+                require_reply_len(payload, 16)?;
+                Self::Hello {
+                    guardian_incarnation: read_required_uuid(payload, 0)?,
+                }
+            }
+            GuardianOperation::Spawn => {
+                require_reply_len(payload, 24)?;
+                Self::Spawned {
+                    pane_id: read_required_uuid(payload, 0)?,
+                    generation: read_u64(payload, 16)?,
+                }
+            }
+            GuardianOperation::Census => {
+                let header_bytes = usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+                if payload.len() < header_bytes {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                let snapshot_id = read_required_uuid(payload, 0)?;
+                let cursor = read_u64(payload, 16)?;
+                let next_cursor = (cursor != u64::MAX).then_some(cursor);
+                let total_panes = read_u64(payload, 24)?;
+                let count = usize::from(read_u16(payload, 32)?);
+                if count > usize::from(GUARDIAN_MAX_CENSUS_ENTRIES) {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                let entry_bytes = usize::try_from(GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES)
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+                let expected = entry_bytes
+                    .checked_mul(count)
+                    .and_then(|entries| header_bytes.checked_add(entries))
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                require_reply_len(payload, expected)?;
+                if u64::try_from(count).unwrap_or(u64::MAX) > total_panes {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                let mut entries = Vec::with_capacity(count);
+                for index in 0..count {
+                    let offset = header_bytes
+                        .checked_add(
+                            entry_bytes
+                                .checked_mul(index)
+                                .ok_or(GuardianProtocolError::InvalidReplyPayload)?,
+                        )
+                        .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+                    entries.push(GuardianCensusEntry::decode_from(
+                        payload
+                            .get(offset..offset + entry_bytes)
+                            .ok_or(GuardianProtocolError::InvalidReplyPayload)?,
+                    )?);
+                }
+                Self::CensusPage {
+                    snapshot_id,
+                    entries,
+                    next_cursor,
+                    total_panes,
+                }
+            }
+            GuardianOperation::Claim | GuardianOperation::Attach => {
+                require_reply_len(payload, 32)?;
+                let pane_id = read_required_uuid(payload, 0)?;
+                let generation = read_u64(payload, 16)?;
+                let next_sequence = read_u64(payload, 24)?;
+                if generation == 0 || next_sequence == 0 {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
+                }
+                if operation == GuardianOperation::Claim {
+                    Self::Claimed {
+                        pane_id,
+                        generation,
+                        next_sequence,
+                    }
+                } else {
+                    Self::Attached {
+                        pane_id,
+                        generation,
+                        next_sequence,
+                    }
+                }
+            }
+            GuardianOperation::Input => {
+                require_reply_len(payload, 49)?;
+                Self::InputReceipt {
+                    pane_id: read_required_uuid(payload, 0)?,
+                    generation: read_u64(payload, 16)?,
+                    sequence: read_u64(payload, 24)?,
+                    effect_id: read_required_uuid(payload, 32)?,
+                    state: InputEffectState::from_wire(payload[48])?,
+                }
+            }
+            GuardianOperation::Resize
+            | GuardianOperation::Signal
+            | GuardianOperation::Close
+            | GuardianOperation::Checkpoint => {
+                require_reply_len(payload, 32)?;
+                Self::MutationApplied {
+                    pane_id: read_required_uuid(payload, 0)?,
+                    generation: read_u64(payload, 16)?,
+                    sequence: read_u64(payload, 24)?,
+                }
+            }
+            GuardianOperation::Replay => {
+                require_reply_len(payload, 24)?;
+                Self::ReplayReady {
+                    pane_id: read_required_uuid(payload, 0)?,
+                    generation: read_u64(payload, 16)?,
+                }
+            }
+            GuardianOperation::QueryInputEffect => {
+                require_reply_len(payload, 17)?;
+                Self::InputEffect {
+                    effect_id: read_required_uuid(payload, 0)?,
+                    state: InputEffectState::from_wire(payload[16])?,
+                }
+            }
+            GuardianOperation::RetireLease => {
+                require_reply_len(payload, 24)?;
+                Self::LeaseRetired {
+                    pane_id: read_required_uuid(payload, 0)?,
+                    generation: read_u64(payload, 16)?,
+                }
+            }
+        };
+        reply.require_operation(operation)?;
+        Ok(reply)
+    }
+
+    fn require_operation(
+        &self,
+        operation: GuardianOperation,
+    ) -> Result<(), GuardianProtocolError> {
+        let matches = matches!(
+            (operation, self),
+            (GuardianOperation::Hello, Self::Hello { .. })
+                | (GuardianOperation::Spawn, Self::Spawned { .. })
+                | (GuardianOperation::Census, Self::CensusPage { .. })
+                | (GuardianOperation::Claim, Self::Claimed { .. })
+                | (GuardianOperation::Attach, Self::Attached { .. })
+                | (GuardianOperation::Input, Self::InputReceipt { .. })
+                | (
+                    GuardianOperation::Resize
+                        | GuardianOperation::Signal
+                        | GuardianOperation::Close
+                        | GuardianOperation::Checkpoint,
+                    Self::MutationApplied { .. }
+                )
+                | (GuardianOperation::Replay, Self::ReplayReady { .. })
+                | (
+                    GuardianOperation::QueryInputEffect,
+                    Self::InputEffect { .. }
+                )
+                | (GuardianOperation::RetireLease, Self::LeaseRetired { .. })
+        );
+        if matches {
+            let valid = match self {
+                Self::Hello {
+                    guardian_incarnation,
+                } => !guardian_incarnation.is_nil(),
+                Self::Spawned {
+                    pane_id,
+                    generation,
+                } => !pane_id.is_nil() && *generation == 0,
+                Self::CensusPage {
+                    snapshot_id,
+                    entries,
+                    next_cursor,
+                    total_panes,
+                } => {
+                    !snapshot_id.is_nil()
+                        && *total_panes <= u64::try_from(GUARDIAN_MAX_PANES).unwrap_or(u64::MAX)
+                        && u64::try_from(entries.len()).unwrap_or(u64::MAX) <= *total_panes
+                        && next_cursor.is_none_or(|cursor| {
+                            cursor > 0 && cursor < *total_panes && !entries.is_empty()
+                        })
+                        && entries
+                            .windows(2)
+                            .all(|pair| pair[0].pane_id < pair[1].pane_id)
+                        && entries
+                            .iter()
+                            .all(|entry| entry.validate_wire_shape().is_ok())
+                }
+                Self::Claimed {
+                    pane_id,
+                    generation,
+                    next_sequence,
+                }
+                | Self::Attached {
+                    pane_id,
+                    generation,
+                    next_sequence,
+                } => !pane_id.is_nil() && *generation > 0 && *next_sequence > 0,
+                Self::InputReceipt {
+                    pane_id,
+                    generation,
+                    sequence,
+                    effect_id,
+                    state,
+                } => {
+                    !pane_id.is_nil()
+                        && *generation > 0
+                        && *sequence > 0
+                        && !effect_id.is_nil()
+                        && *state != InputEffectState::NotSeen
+                }
+                Self::MutationApplied {
+                    pane_id,
+                    generation,
+                    sequence,
+                } => {
+                    !pane_id.is_nil()
+                        && if operation == GuardianOperation::Close && *sequence == 0 {
+                            true
+                        } else {
+                            *generation > 0 && *sequence > 0
+                        }
+                }
+                Self::LeaseRetired {
+                    pane_id,
+                    generation,
+                } => !pane_id.is_nil() && *generation > 0,
+                Self::InputEffect { effect_id, .. } => !effect_id.is_nil(),
+                Self::ReplayReady { pane_id, .. } => !pane_id.is_nil(),
+            };
+            if valid {
+                Ok(())
+            } else {
+                Err(GuardianProtocolError::InvalidReplyPayload)
+            }
+        } else {
+            Err(GuardianProtocolError::ReplyOperationMismatch { operation })
+        }
+    }
+
+    fn require_response_identity(
+        &self,
+        header: &GuardianResponseHeader,
+    ) -> Result<(), GuardianProtocolError> {
+        self.require_operation(header.operation)?;
+        let matches = match self {
+            Self::Hello { .. } => {
+                header.guardian_incarnation.is_nil()
+                    && header.pane_id.is_none()
+                    && header.effect_id.is_none()
+            }
+            Self::Spawned {
+                pane_id,
+                generation,
+            } => header.pane_id == Some(*pane_id) && *generation == 0,
+            Self::CensusPage { .. } => header.pane_id.is_none() && header.effect_id.is_none(),
+            Self::Claimed {
+                pane_id,
+                generation,
+                next_sequence,
+            } => {
+                header.pane_id == Some(*pane_id)
+                    && header
+                        .lease_generation
+                        .checked_add(1)
+                        .is_some_and(|expected| expected == *generation)
+                    && *next_sequence == 1
+            }
+            Self::Attached {
+                pane_id,
+                generation,
+                ..
+            } => header.pane_id == Some(*pane_id) && header.lease_generation == *generation,
+            Self::InputReceipt {
+                pane_id,
+                generation,
+                sequence,
+                effect_id,
+                ..
+            } => {
+                header.pane_id == Some(*pane_id)
+                    && header.lease_generation == *generation
+                    && header.lease_sequence == *sequence
+                    && header.effect_id == Some(*effect_id)
+            }
+            Self::MutationApplied {
+                pane_id,
+                generation,
+                sequence,
+            } => {
+                header.pane_id == Some(*pane_id)
+                    && header.lease_generation == *generation
+                    && header.lease_sequence == *sequence
+            }
+            Self::LeaseRetired {
+                pane_id,
+                generation,
+            }
+            | Self::ReplayReady {
+                pane_id,
+                generation,
+            } => header.pane_id == Some(*pane_id) && header.lease_generation == *generation,
+            Self::InputEffect { effect_id, .. } => header.effect_id == Some(*effect_id),
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        }
+    }
+
+    fn require_request_payload(
+        &self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<(), GuardianProtocolError> {
+        let Self::CensusPage {
+            snapshot_id,
+            entries,
+            next_cursor,
+            total_panes,
+        } = self
+        else {
+            return Ok(());
+        };
+        let page = GuardianCensusPageRequest::decode(&request.payload)?;
+        let entry_count =
+            u64::try_from(entries.len()).map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        let encoded_bytes = GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES
+            .checked_mul(
+                u32::try_from(entries.len())
+                    .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+            )
+            .and_then(|entries_bytes| {
+                GUARDIAN_CENSUS_PAGE_HEADER_BYTES.checked_add(entries_bytes)
+            })
+            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+        let end = page
+            .cursor
+            .checked_add(entry_count)
+            .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+        let expected_next = (end < *total_panes).then_some(end);
+        if entries.len() > usize::from(page.max_entries)
+            || encoded_bytes > page.max_bytes
+            || (page.cursor == 0 && snapshot_id.is_nil())
+            || (page.cursor > 0 && *snapshot_id != page.snapshot_id)
+            || page.cursor > *total_panes
+            || end > *total_panes
+            || (end < *total_panes && entries.is_empty())
+            || *next_cursor != expected_next
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -644,12 +1643,165 @@ impl GuardianCensusEntry {
             },
         }
     }
+
+    fn encode_into(&self, payload: &mut Vec<u8>) -> Result<(), GuardianProtocolError> {
+        self.validate_wire_shape()?;
+        let start = payload.len();
+        push_uuid(payload, self.pane_id);
+        payload.push(self.status.to_wire());
+        payload.extend_from_slice(&self.generation.to_be_bytes());
+        push_optional_uuid(payload, self.mux_incarnation);
+        payload.extend_from_slice(&self.next_sequence.unwrap_or(0).to_be_bytes());
+        push_optional_uuid(payload, self.pending_input_effect);
+        payload.extend_from_slice(&self.exit_status.unwrap_or(0).to_be_bytes());
+        payload.push(
+            self.quarantine_reason
+                .map_or(0, GuardianQuarantineReason::to_wire),
+        );
+        payload.push(u8::from(self.exit_status.is_some()));
+        if payload.len().saturating_sub(start)
+            != usize::try_from(GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES).unwrap_or(usize::MAX)
+        {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "guardian-census-entry-encoded-size",
+            ));
+        }
+        Ok(())
+    }
+
+    fn decode_from(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
+        require_reply_len(
+            payload,
+            usize::try_from(GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES)
+                .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?,
+        )?;
+        let status = GuardianCensusPaneStatus::from_wire(payload[16])?;
+        let next_sequence = match read_u64(payload, 41)? {
+            0 => None,
+            value => Some(value),
+        };
+        let flags = payload[70];
+        if flags & !1 != 0 {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let encoded_exit_status = read_i32(payload, 65)?;
+        let exit_status = if flags & 1 == 0 {
+            if encoded_exit_status != 0 {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+            None
+        } else {
+            Some(encoded_exit_status)
+        };
+        let entry = Self {
+            pane_id: read_required_uuid(payload, 0)?,
+            status,
+            generation: read_u64(payload, 17)?,
+            mux_incarnation: read_optional_uuid(payload, 25)?,
+            next_sequence,
+            pending_input_effect: read_optional_uuid(payload, 49)?,
+            exit_status,
+            quarantine_reason: GuardianQuarantineReason::from_wire(payload[69])?,
+        };
+        entry.validate_wire_shape()?;
+        Ok(entry)
+    }
+
+    fn validate_wire_shape(&self) -> Result<(), GuardianProtocolError> {
+        if self.pane_id.is_nil()
+            || self.next_sequence == Some(0)
+            || self.mux_incarnation.is_some_and(|value| value.is_nil())
+            || self.pending_input_effect.is_some_and(|value| value.is_nil())
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let valid = match self.status {
+            GuardianCensusPaneStatus::LiveUnclaimed => {
+                self.mux_incarnation.is_none()
+                    && self.next_sequence.is_none()
+                    && self.pending_input_effect.is_none()
+                    && self.exit_status.is_none()
+                    && self.quarantine_reason.is_none()
+            }
+            GuardianCensusPaneStatus::LiveClaimed => {
+                self.generation > 0
+                    && self.mux_incarnation.is_some()
+                    && self.next_sequence.is_some()
+                    && self.exit_status.is_none()
+                    && self.quarantine_reason.is_none()
+            }
+            GuardianCensusPaneStatus::ExitedUnclaimed => {
+                self.mux_incarnation.is_none()
+                    && self.next_sequence.is_none()
+                    && self.exit_status.is_some()
+                    && self.quarantine_reason.is_none()
+            }
+            GuardianCensusPaneStatus::ClosedTerminal => {
+                self.mux_incarnation.is_none()
+                    && self.next_sequence.is_none()
+                    && self.pending_input_effect.is_none()
+                    && self.quarantine_reason.is_none()
+            }
+            GuardianCensusPaneStatus::Quarantined => {
+                self.mux_incarnation.is_none()
+                    && self.next_sequence.is_none()
+                    && self.pending_input_effect.is_none()
+                    && self.quarantine_reason.is_some()
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuardianQuarantineReason {
     GenerationExhausted,
     SequenceExhausted,
+}
+
+impl GuardianCensusPaneStatus {
+    const fn to_wire(self) -> u8 {
+        match self {
+            Self::LiveUnclaimed => 1,
+            Self::LiveClaimed => 2,
+            Self::ExitedUnclaimed => 3,
+            Self::ClosedTerminal => 4,
+            Self::Quarantined => 5,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self, GuardianProtocolError> {
+        match value {
+            1 => Ok(Self::LiveUnclaimed),
+            2 => Ok(Self::LiveClaimed),
+            3 => Ok(Self::ExitedUnclaimed),
+            4 => Ok(Self::ClosedTerminal),
+            5 => Ok(Self::Quarantined),
+            _ => Err(GuardianProtocolError::InvalidReplyPayload),
+        }
+    }
+}
+
+impl GuardianQuarantineReason {
+    const fn to_wire(self) -> u8 {
+        match self {
+            Self::GenerationExhausted => 1,
+            Self::SequenceExhausted => 2,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Option<Self>, GuardianProtocolError> {
+        match value {
+            0 => Ok(None),
+            1 => Ok(Some(Self::GenerationExhausted)),
+            2 => Ok(Some(Self::SequenceExhausted)),
+            _ => Err(GuardianProtocolError::InvalidReplyPayload),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -735,6 +1887,107 @@ pub enum GuardianProtocolError {
     CensusSnapshotNotFound(Uuid),
     #[error("guardian census snapshot UUID was reused by a different mux incarnation")]
     CensusSnapshotIdentityConflict,
+    #[error("guardian success reply payload is malformed or violates its operation schema")]
+    InvalidReplyPayload,
+    #[error("guardian reply variant does not match operation {operation:?}")]
+    ReplyOperationMismatch { operation: GuardianOperation },
+    #[error("guardian correlated response is not a success reply")]
+    NonSuccessResponse,
+    #[error("guardian rejection payload is malformed or disagrees with its response status")]
+    InvalidRejectionPayload,
+    #[error("guardian operation payload is malformed or violates its frozen schema")]
+    InvalidOperationPayload,
+}
+
+impl GuardianRejectionCode {
+    #[must_use]
+    pub const fn from_protocol_error(error: &GuardianProtocolError) -> Self {
+        match error {
+            GuardianProtocolError::GuardianIncarnationMismatch => {
+                Self::GuardianIncarnationMismatch
+            }
+            GuardianProtocolError::PaneNotFound(_) => Self::PaneNotFound,
+            GuardianProtocolError::PaneAlreadyExists(_) => Self::PaneAlreadyExists,
+            GuardianProtocolError::RequestIdentityConflict => Self::RequestIdentityConflict,
+            GuardianProtocolError::EffectIdentityConflict => Self::EffectIdentityConflict,
+            GuardianProtocolError::PaneTerminal => Self::PaneTerminal,
+            GuardianProtocolError::ClaimGenerationMismatch { .. } => {
+                Self::ClaimGenerationMismatch
+            }
+            GuardianProtocolError::StaleLease => Self::StaleLease,
+            GuardianProtocolError::RepeatedSequence { .. } => Self::RepeatedSequence,
+            GuardianProtocolError::SequenceGap { .. } => Self::SequenceGap,
+            GuardianProtocolError::GenerationExhausted => Self::GenerationExhausted,
+            GuardianProtocolError::SequenceExhausted => Self::SequenceExhausted,
+            GuardianProtocolError::CapacityExhausted => Self::CapacityExhausted,
+            GuardianProtocolError::RequestAliasCapacityExhausted { .. } => {
+                Self::RequestAliasCapacityExhausted
+            }
+            GuardianProtocolError::InputDurabilityPending => Self::InputDurabilityPending,
+            GuardianProtocolError::InputDurabilityIdentityMismatch => {
+                Self::InputDurabilityIdentityMismatch
+            }
+            GuardianProtocolError::CensusSnapshotNotFound(_) => Self::CensusSnapshotNotFound,
+            GuardianProtocolError::CensusSnapshotIdentityConflict => {
+                Self::CensusSnapshotIdentityConflict
+            }
+            GuardianProtocolError::InvalidCensusCursor { .. } => Self::InvalidCensusCursor,
+            GuardianProtocolError::StateInvariantViolation(_) => Self::InternalInvariant,
+            GuardianProtocolError::TruncatedFrame
+            | GuardianProtocolError::FrameLengthMismatch { .. }
+            | GuardianProtocolError::FrameTooLarge
+            | GuardianProtocolError::PayloadTooLarge
+            | GuardianProtocolError::InvalidMagic
+            | GuardianProtocolError::UnsupportedVersion(_)
+            | GuardianProtocolError::UnknownOperation(_)
+            | GuardianProtocolError::UnknownResponseStatus(_)
+            | GuardianProtocolError::ReservedFlags
+            | GuardianProtocolError::AuthenticationFailed
+            | GuardianProtocolError::ResponseRequestMismatch
+            | GuardianProtocolError::SecretInitializationFailed
+            | GuardianProtocolError::WeakSecret
+            | GuardianProtocolError::PayloadDigestMismatch
+            | GuardianProtocolError::ZeroIdentity(_)
+            | GuardianProtocolError::InvalidOperationScope { .. }
+            | GuardianProtocolError::MissingEffectQueryIdentity
+            | GuardianProtocolError::InvalidCensusPage
+            | GuardianProtocolError::InvalidReplyPayload
+            | GuardianProtocolError::ReplyOperationMismatch { .. }
+            | GuardianProtocolError::NonSuccessResponse
+            | GuardianProtocolError::InvalidRejectionPayload
+            | GuardianProtocolError::InvalidOperationPayload => Self::InvalidRequest,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum GuardianEffectTransactionError<E> {
+    Protocol(GuardianProtocolError),
+    Effect(E),
+}
+
+impl<E> From<GuardianProtocolError> for GuardianEffectTransactionError<E> {
+    fn from(error: GuardianProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for GuardianEffectTransactionError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Effect(error) => write!(formatter, "guardian runtime effect failed: {error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for GuardianEffectTransactionError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::Effect(error) => Some(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -767,12 +2020,21 @@ struct GuardianCensusSnapshot {
     entries: Vec<GuardianCensusEntry>,
 }
 
+#[derive(Debug, Default)]
+struct ReceiptCapacityPlan {
+    request_queue_pops: usize,
+    request_ids: Vec<Uuid>,
+    effect_queue_pops: usize,
+    effect_ids: Vec<Uuid>,
+}
+
 #[derive(Debug)]
 pub struct GuardianProtocolState {
     incarnation: Uuid,
     panes: BTreeMap<Uuid, GuardianPaneState>,
     census_snapshots: HashMap<Uuid, GuardianCensusSnapshot>,
     census_snapshot_order: VecDeque<Uuid>,
+    next_census_snapshot_sequence: u128,
     requests: HashMap<Uuid, StoredRequest>,
     effects: HashMap<Uuid, StoredEffect>,
     effect_request_ids: HashMap<Uuid, HashSet<Uuid>>,
@@ -795,6 +2057,7 @@ impl GuardianProtocolState {
             panes: BTreeMap::new(),
             census_snapshots: HashMap::new(),
             census_snapshot_order: VecDeque::new(),
+            next_census_snapshot_sequence: 1,
             requests: HashMap::new(),
             effects: HashMap::new(),
             effect_request_ids: HashMap::new(),
@@ -870,16 +2133,26 @@ impl GuardianProtocolState {
         }
     }
 
-    pub fn apply(
+    /// Apply an authenticated operation that cannot create or mutate a runtime effect.
+    ///
+    /// Effect-producing requests must use [`Self::apply_effect_transactionally`]. Keeping
+    /// the surfaces separate prevents a transport from advancing a lease or recording a
+    /// spawn before the corresponding PTY/process operation has actually succeeded.
+    pub fn apply_observation(
         &mut self,
         request: &AuthenticatedGuardianRequest,
     ) -> Result<GuardianReply, GuardianProtocolError> {
         validate_request_envelope(request)?;
-        if request.header.guardian_incarnation != self.incarnation {
+        if request.header.operation != GuardianOperation::Hello
+            && request.header.guardian_incarnation != self.incarnation
+        {
             return Err(GuardianProtocolError::GuardianIncarnationMismatch);
         }
 
         match request.header.operation {
+            GuardianOperation::Hello => Ok(GuardianReply::Hello {
+                guardian_incarnation: self.incarnation,
+            }),
             GuardianOperation::Census => {
                 let page = GuardianCensusPageRequest::decode(&request.payload)?;
                 self.census(page, request.header.mux_incarnation)
@@ -887,25 +2160,70 @@ impl GuardianProtocolState {
             GuardianOperation::Attach => self.attach(request),
             GuardianOperation::Replay => self.replay(request),
             GuardianOperation::QueryInputEffect => self.query_input_effect(request),
-            operation if operation.creates_effect() => self.apply_effect(request),
-            _ => Err(GuardianProtocolError::StateInvariantViolation(
-                "operation-classification",
-            )),
+            operation => Err(GuardianProtocolError::InvalidOperationScope { operation }),
+        }
+    }
+
+    /// Fence, execute, and commit one effect-producing request.
+    ///
+    /// The callback is invoked only for a new effect identity, after authentication,
+    /// generation, sequence, capacity, and idempotency validation. Exact request/effect
+    /// replays return their original receipt without invoking it. A successful pane transition
+    /// and its new receipts are committed only after the callback returns `Ok(())`. Exhausted
+    /// generation/sequence counters are the deliberate exception: preflight rejects the effect
+    /// and terminally quarantines the pane so wrapped authority can never be revived.
+    ///
+    /// A callback error MUST mean that the runtime effect was not externally observable.
+    /// In particular, an input write that may have written any bytes must return `Ok(())` so
+    /// the protocol records `AcceptedNotDurable`; the runtime must then reconcile that exact
+    /// effect through `mark_input_durable` or `mark_input_terminal_rejected`. Blindly treating
+    /// a partial/ambiguous input write as `Err` would make retry duplication possible.
+    pub fn apply_effect_transactionally<E>(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+        perform_effect: impl FnOnce(&GuardianReply) -> Result<(), E>,
+    ) -> Result<GuardianReply, GuardianEffectTransactionError<E>> {
+        validate_request_envelope(request)?;
+        if request.header.guardian_incarnation != self.incarnation {
+            return Err(GuardianProtocolError::GuardianIncarnationMismatch.into());
+        }
+        if !request.header.operation.creates_effect() {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: request.header.operation,
+            }
+            .into());
+        }
+        self.apply_effect_transaction_inner(request, perform_effect)
+    }
+
+    #[cfg(test)]
+    fn apply(
+        &mut self,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<GuardianReply, GuardianProtocolError> {
+        if request.header.operation.creates_effect() {
+            match self.apply_effect_transactionally(request, |_| Ok::<(), std::convert::Infallible>(()))) {
+                Ok(reply) => Ok(reply),
+                Err(GuardianEffectTransactionError::Protocol(error)) => Err(error),
+                Err(GuardianEffectTransactionError::Effect(never)) => match never {},
+            }
+        } else {
+            self.apply_observation(request)
         }
     }
 
     pub fn mark_input_durable(
         &mut self,
-        effect_id: Uuid,
+        identity: GuardianInputEffectIdentity,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        self.transition_pending_input(effect_id, InputEffectState::DurableEffect)
+        self.transition_pending_input(identity, InputEffectState::DurableEffect)
     }
 
     pub fn mark_input_terminal_rejected(
         &mut self,
-        effect_id: Uuid,
+        identity: GuardianInputEffectIdentity,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        self.transition_pending_input(effect_id, InputEffectState::TerminalRejected)
+        self.transition_pending_input(identity, InputEffectState::TerminalRejected)
     }
 
     fn census(
@@ -913,14 +2231,17 @@ impl GuardianProtocolState {
         page: GuardianCensusPageRequest,
         mux_incarnation: Uuid,
     ) -> Result<GuardianReply, GuardianProtocolError> {
-        if self
-            .census_snapshots
-            .get(&page.snapshot_id)
-            .is_some_and(|snapshot| snapshot.mux_incarnation != mux_incarnation)
-        {
-            return Err(GuardianProtocolError::CensusSnapshotIdentityConflict);
-        }
-        if page.cursor == 0 && !self.census_snapshots.contains_key(&page.snapshot_id) {
+        let snapshot_id = if page.cursor == 0 {
+            let next_sequence = self
+                .next_census_snapshot_sequence
+                .checked_add(1)
+                .ok_or(GuardianProtocolError::CapacityExhausted)?;
+            let snapshot_id = Uuid::from_u128(self.next_census_snapshot_sequence);
+            if snapshot_id.is_nil() || self.census_snapshots.contains_key(&snapshot_id) {
+                return Err(GuardianProtocolError::StateInvariantViolation(
+                    "guardian-census-snapshot-sequence",
+                ));
+            }
             let entries = self
                 .panes
                 .iter()
@@ -934,19 +2255,30 @@ impl GuardianProtocolState {
                 self.census_snapshots.remove(&retired);
             }
             self.census_snapshots.insert(
-                page.snapshot_id,
+                snapshot_id,
                 GuardianCensusSnapshot {
                     mux_incarnation,
                     entries,
                 },
             );
-            self.census_snapshot_order.push_back(page.snapshot_id);
+            self.census_snapshot_order.push_back(snapshot_id);
+            self.next_census_snapshot_sequence = next_sequence;
+            snapshot_id
+        } else {
+            page.snapshot_id
+        };
+        if self
+            .census_snapshots
+            .get(&snapshot_id)
+            .is_some_and(|snapshot| snapshot.mux_incarnation != mux_incarnation)
+        {
+            return Err(GuardianProtocolError::CensusSnapshotIdentityConflict);
         }
         let snapshot = self
             .census_snapshots
-            .get(&page.snapshot_id)
+            .get(&snapshot_id)
             .ok_or(GuardianProtocolError::CensusSnapshotNotFound(
-                page.snapshot_id,
+                snapshot_id,
             ))?;
         let total_panes = u64::try_from(snapshot.entries.len())
             .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
@@ -983,7 +2315,7 @@ impl GuardianProtocolState {
             None
         };
         Ok(GuardianReply::CensusPage {
-            snapshot_id: page.snapshot_id,
+            snapshot_id,
             entries,
             next_cursor,
             total_panes,
@@ -992,7 +2324,7 @@ impl GuardianProtocolState {
 
     fn transition_pending_input(
         &mut self,
-        effect_id: Uuid,
+        identity: GuardianInputEffectIdentity,
         target: InputEffectState,
     ) -> Result<GuardianReply, GuardianProtocolError> {
         if !matches!(
@@ -1001,11 +2333,18 @@ impl GuardianProtocolState {
         ) {
             return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
         }
+        let effect_id = identity.effect_id;
         let stored = self
             .effects
             .get(&effect_id)
             .ok_or(GuardianProtocolError::InputDurabilityIdentityMismatch)?;
-        if stored.fingerprint.operation != GuardianOperation::Input {
+        if stored.fingerprint.operation != GuardianOperation::Input
+            || stored.fingerprint.pane_id != identity.pane_id
+            || stored.fingerprint.mux_incarnation != identity.mux_incarnation
+            || stored.fingerprint.lease_generation != identity.generation
+            || stored.fingerprint.lease_sequence != identity.sequence
+            || stored.fingerprint.payload_sha256 != identity.payload_sha256
+        {
             return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
         }
         if stored.state == target {
@@ -1157,14 +2496,22 @@ impl GuardianProtocolState {
             .header
             .effect_id
             .ok_or(GuardianProtocolError::MissingEffectQueryIdentity)?;
-        let state = self
-            .effects
-            .get(&effect_id)
-            .filter(|stored| {
-                stored.fingerprint.pane_id == pane_id
+        let query = GuardianInputEffectQuery::decode(&request.payload)?;
+        let state = match self.effects.get(&effect_id) {
+            None => InputEffectState::NotSeen,
+            Some(stored)
+                if stored.fingerprint.pane_id == pane_id
                     && stored.fingerprint.operation == GuardianOperation::Input
-            })
-            .map_or(InputEffectState::NotSeen, |stored| stored.state);
+                    && stored.fingerprint.lease_generation == request.header.lease_generation
+                    && stored.fingerprint.lease_sequence == query.sequence
+                    && stored.fingerprint.payload_sha256 == query.payload_sha256 =>
+            {
+                stored.state
+            }
+            Some(_) => {
+                return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
+            }
+        };
         Ok(GuardianReply::InputEffect { effect_id, state })
     }
 
@@ -1193,10 +2540,11 @@ impl GuardianProtocolState {
         }
     }
 
-    fn apply_effect(
+    fn apply_effect_transaction_inner<E>(
         &mut self,
         request: &AuthenticatedGuardianRequest,
-    ) -> Result<GuardianReply, GuardianProtocolError> {
+        perform_effect: impl FnOnce(&GuardianReply) -> Result<(), E>,
+    ) -> Result<GuardianReply, GuardianEffectTransactionError<E>> {
         let pane_id = request
             .header
             .pane_id
@@ -1222,7 +2570,7 @@ impl GuardianProtocolState {
             if stored.fingerprint == fingerprint && stored.effect_id == effect_id {
                 return Ok(stored.reply.clone());
             }
-            return Err(GuardianProtocolError::RequestIdentityConflict);
+            return Err(GuardianProtocolError::RequestIdentityConflict.into());
         }
         if let Some(stored) = self.effects.get(&effect_id) {
             if stored.fingerprint == fingerprint {
@@ -1240,10 +2588,11 @@ impl GuardianProtocolState {
                     return Err(GuardianProtocolError::RequestAliasCapacityExhausted {
                         effect_id,
                         max_aliases: GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT,
-                    });
+                    }
+                    .into());
                 }
-                self.prepare_receipt_capacity(true, false)?;
-                self.make_receipt_capacity(true, false)?;
+                let capacity = self.plan_receipt_capacity(true, false)?;
+                self.commit_receipt_capacity(capacity);
                 self.requests.insert(
                     request.header.request_id,
                     StoredRequest {
@@ -1262,54 +2611,19 @@ impl GuardianProtocolState {
                 }
                 return Ok(reply);
             }
-            return Err(GuardianProtocolError::EffectIdentityConflict);
+            return Err(GuardianProtocolError::EffectIdentityConflict.into());
         }
-        self.prepare_receipt_capacity(true, true)?;
+        let (reply, next_pane_state) =
+            self.plan_new_effect(pane_id, effect_id, request)?;
+        let capacity = self.plan_receipt_capacity(true, true)?;
 
-        let reply = match request.header.operation {
-            GuardianOperation::Spawn => self.spawn(pane_id)?,
-            GuardianOperation::Claim => self.claim(pane_id, request)?,
-            GuardianOperation::RetireLease => self.retire_lease(pane_id, request)?,
-            GuardianOperation::Input => {
-                let GuardianReply::MutationApplied {
-                    pane_id,
-                    generation,
-                    sequence,
-                } = self.apply_live_mutation(pane_id, request)?
-                else {
-                    return Err(GuardianProtocolError::StateInvariantViolation(
-                        "input-mutation-reply-variant",
-                    ));
-                };
-                let Some(GuardianPaneState::LiveClaimed {
-                    pending_input_effect,
-                    ..
-                }) = self.panes.get_mut(&pane_id)
-                else {
-                    return Err(GuardianProtocolError::StateInvariantViolation(
-                        "input-claimed-pane",
-                    ));
-                };
-                *pending_input_effect = Some(effect_id);
-                GuardianReply::InputReceipt {
-                    pane_id,
-                    generation,
-                    sequence,
-                    effect_id,
-                    state: InputEffectState::AcceptedNotDurable,
-                }
-            }
-            GuardianOperation::Resize
-            | GuardianOperation::Signal
-            | GuardianOperation::Checkpoint => self.apply_live_mutation(pane_id, request)?,
-            GuardianOperation::Close => self.close(pane_id, request)?,
-            _ => {
-                return Err(GuardianProtocolError::StateInvariantViolation(
-                    "effect-operation-classification",
-                ));
-            }
-        };
-        self.make_receipt_capacity(true, true)?;
+        perform_effect(&reply).map_err(GuardianEffectTransactionError::Effect)?;
+
+        // The exact eviction set was proven before the callback, but historical receipts
+        // remain untouched until the runtime effect succeeds. Committing the precomputed
+        // plan cannot fail, so a callback error leaves every protocol map and queue intact.
+        self.commit_receipt_capacity(capacity);
+        self.panes.insert(pane_id, next_pane_state);
         self.effects.insert(
             effect_id,
             StoredEffect {
@@ -1346,99 +2660,189 @@ impl GuardianProtocolState {
         Ok(reply)
     }
 
-    fn prepare_receipt_capacity(
-        &self,
-        new_request: bool,
-        new_effect: bool,
-    ) -> Result<(), GuardianProtocolError> {
-        if (new_request
-            && self.requests.len() >= self.receipt_capacity
-            && self.transient_request_order.is_empty())
-            || (new_effect
-                && self.effects.len() >= self.receipt_capacity
-                && self.transient_effect_order.is_empty())
-        {
-            return Err(GuardianProtocolError::CapacityExhausted);
-        }
-        Ok(())
-    }
-
-    fn make_receipt_capacity(
+    fn plan_new_effect(
         &mut self,
-        new_request: bool,
-        new_effect: bool,
-    ) -> Result<(), GuardianProtocolError> {
-        if new_request {
-            while self.requests.len() >= self.receipt_capacity {
-                let request_id = self
-                    .transient_request_order
-                    .pop_front()
-                    .ok_or(GuardianProtocolError::CapacityExhausted)?;
-                debug_assert!(!self.protected_spawn_requests.contains(&request_id));
-                if let Some(request) = self.requests.remove(&request_id) {
-                    if let Some(request_ids) =
-                        self.effect_request_ids.get_mut(&request.effect_id)
-                    {
-                        request_ids.remove(&request_id);
-                    }
+        pane_id: Uuid,
+        effect_id: Uuid,
+        request: &AuthenticatedGuardianRequest,
+    ) -> Result<(GuardianReply, GuardianPaneState), GuardianProtocolError> {
+        match request.header.operation {
+            GuardianOperation::Spawn => {
+                if self.panes.contains_key(&pane_id) {
+                    return Err(GuardianProtocolError::PaneAlreadyExists(pane_id));
                 }
+                if self.panes.len() >= GUARDIAN_MAX_PANES {
+                    return Err(GuardianProtocolError::CapacityExhausted);
+                }
+                Ok((
+                    GuardianReply::Spawned {
+                        pane_id,
+                        generation: 0,
+                    },
+                    GuardianPaneState::LiveUnclaimed { generation: 0 },
+                ))
             }
-        }
-        if new_effect {
-            while self.effects.len() >= self.receipt_capacity {
-                let effect_id = self
-                    .transient_effect_order
-                    .pop_front()
-                    .ok_or(GuardianProtocolError::CapacityExhausted)?;
-                debug_assert!(!self.protected_spawn_effects.contains(&effect_id));
-                self.effects.remove(&effect_id);
-                self.effect_request_ids.remove(&effect_id);
+            GuardianOperation::Claim => {
+                let state = self
+                    .panes
+                    .get(&pane_id)
+                    .cloned()
+                    .ok_or(GuardianProtocolError::PaneNotFound(pane_id))?;
+                let current = state.generation();
+                if current != request.header.lease_generation {
+                    return Err(GuardianProtocolError::ClaimGenerationMismatch {
+                        observed: request.header.lease_generation,
+                        current,
+                    });
+                }
+                if matches!(
+                    state,
+                    GuardianPaneState::ExitedUnclaimed { .. }
+                        | GuardianPaneState::ClosedTerminal { .. }
+                        | GuardianPaneState::Quarantined { .. }
+                ) {
+                    return Err(GuardianProtocolError::PaneTerminal);
+                }
+                if matches!(
+                    state,
+                    GuardianPaneState::LiveClaimed {
+                        pending_input_effect: Some(_),
+                        ..
+                    }
+                ) {
+                    return Err(GuardianProtocolError::InputDurabilityPending);
+                }
+                let Some(generation) = current.checked_add(1) else {
+                    self.panes.insert(
+                        pane_id,
+                        GuardianPaneState::Quarantined {
+                            generation: current,
+                            reason: GuardianQuarantineReason::GenerationExhausted,
+                            exit_status: None,
+                        },
+                    );
+                    return Err(GuardianProtocolError::GenerationExhausted);
+                };
+                Ok((
+                    GuardianReply::Claimed {
+                        pane_id,
+                        generation,
+                        next_sequence: 1,
+                    },
+                    GuardianPaneState::LiveClaimed {
+                        generation,
+                        mux_incarnation: request.header.mux_incarnation,
+                        next_sequence: 1,
+                        pending_input_effect: None,
+                    },
+                ))
             }
+            GuardianOperation::RetireLease => {
+                let (sequence, _next_state) = self.plan_exact_sequence(pane_id, request)?;
+                let generation = request.header.lease_generation;
+                let _ = sequence;
+                Ok((
+                    GuardianReply::LeaseRetired {
+                        pane_id,
+                        generation,
+                    },
+                    GuardianPaneState::LiveUnclaimed { generation },
+                ))
+            }
+            GuardianOperation::Input => {
+                let (sequence, mut next_state) = self.plan_exact_sequence(pane_id, request)?;
+                let GuardianPaneState::LiveClaimed {
+                    pending_input_effect,
+                    ..
+                } = &mut next_state
+                else {
+                    return Err(GuardianProtocolError::StateInvariantViolation(
+                        "planned-input-claimed-pane",
+                    ));
+                };
+                *pending_input_effect = Some(effect_id);
+                Ok((
+                    GuardianReply::InputReceipt {
+                        pane_id,
+                        generation: request.header.lease_generation,
+                        sequence,
+                        effect_id,
+                        state: InputEffectState::AcceptedNotDurable,
+                    },
+                    next_state,
+                ))
+            }
+            GuardianOperation::Resize
+            | GuardianOperation::Signal
+            | GuardianOperation::Checkpoint => {
+                let (sequence, next_state) = self.plan_exact_sequence(pane_id, request)?;
+                Ok((
+                    GuardianReply::MutationApplied {
+                        pane_id,
+                        generation: request.header.lease_generation,
+                        sequence,
+                    },
+                    next_state,
+                ))
+            }
+            GuardianOperation::Close => {
+                if let Some(GuardianPaneState::ExitedUnclaimed {
+                    generation,
+                    exit_status,
+                    pending_input_effect,
+                }) = self.panes.get(&pane_id)
+                {
+                    if pending_input_effect.is_some() {
+                        return Err(GuardianProtocolError::InputDurabilityPending);
+                    }
+                    if *generation != request.header.lease_generation
+                        || request.header.lease_sequence != 0
+                    {
+                        return Err(GuardianProtocolError::StaleLease);
+                    }
+                    return Ok((
+                        GuardianReply::MutationApplied {
+                            pane_id,
+                            generation: *generation,
+                            sequence: 0,
+                        },
+                        GuardianPaneState::ClosedTerminal {
+                            generation: *generation,
+                            exit_status: Some(*exit_status),
+                        },
+                    ));
+                }
+                let (sequence, _next_state) = self.plan_exact_sequence(pane_id, request)?;
+                let generation = request.header.lease_generation;
+                Ok((
+                    GuardianReply::MutationApplied {
+                        pane_id,
+                        generation,
+                        sequence,
+                    },
+                    GuardianPaneState::ClosedTerminal {
+                        generation,
+                        exit_status: None,
+                    },
+                ))
+            }
+            _ => Err(GuardianProtocolError::StateInvariantViolation(
+                "effect-operation-classification",
+            )),
         }
-        Ok(())
     }
 
-    fn spawn(&mut self, pane_id: Uuid) -> Result<GuardianReply, GuardianProtocolError> {
-        if self.panes.contains_key(&pane_id) {
-            return Err(GuardianProtocolError::PaneAlreadyExists(pane_id));
-        }
-        if self.panes.len() >= GUARDIAN_MAX_PANES {
-            return Err(GuardianProtocolError::CapacityExhausted);
-        }
-        self.panes.insert(
-            pane_id,
-            GuardianPaneState::LiveUnclaimed { generation: 0 },
-        );
-        Ok(GuardianReply::Spawned {
-            pane_id,
-            generation: 0,
-        })
-    }
-
-    fn claim(
+    fn plan_exact_sequence(
         &mut self,
         pane_id: Uuid,
         request: &AuthenticatedGuardianRequest,
-    ) -> Result<GuardianReply, GuardianProtocolError> {
+    ) -> Result<(u64, GuardianPaneState), GuardianProtocolError> {
+        let expected = self.require_current_lease(pane_id, request)?;
         let state = self
             .panes
-            .get_mut(&pane_id)
+            .get(&pane_id)
+            .cloned()
             .ok_or(GuardianProtocolError::PaneNotFound(pane_id))?;
-        let current = state.generation();
-        if current != request.header.lease_generation {
-            return Err(GuardianProtocolError::ClaimGenerationMismatch {
-                observed: request.header.lease_generation,
-                current,
-            });
-        }
-        if matches!(
-            state,
-            GuardianPaneState::ExitedUnclaimed { .. }
-                | GuardianPaneState::ClosedTerminal { .. }
-                | GuardianPaneState::Quarantined { .. }
-        ) {
-            return Err(GuardianProtocolError::PaneTerminal);
-        }
         if matches!(
             state,
             GuardianPaneState::LiveClaimed {
@@ -1448,25 +2852,117 @@ impl GuardianProtocolState {
         ) {
             return Err(GuardianProtocolError::InputDurabilityPending);
         }
-        let Some(generation) = current.checked_add(1) else {
-            *state = GuardianPaneState::Quarantined {
-                generation: current,
-                reason: GuardianQuarantineReason::GenerationExhausted,
-                exit_status: None,
-            };
-            return Err(GuardianProtocolError::GenerationExhausted);
+        if request.header.lease_sequence < expected {
+            return Err(GuardianProtocolError::RepeatedSequence {
+                expected,
+                observed: request.header.lease_sequence,
+            });
+        }
+        if request.header.lease_sequence > expected {
+            return Err(GuardianProtocolError::SequenceGap {
+                expected,
+                observed: request.header.lease_sequence,
+            });
+        }
+        let Some(next_sequence) = expected.checked_add(1) else {
+            self.panes.insert(
+                pane_id,
+                GuardianPaneState::Quarantined {
+                    generation: request.header.lease_generation,
+                    reason: GuardianQuarantineReason::SequenceExhausted,
+                    exit_status: None,
+                },
+            );
+            return Err(GuardianProtocolError::SequenceExhausted);
         };
-        *state = GuardianPaneState::LiveClaimed {
+        let GuardianPaneState::LiveClaimed {
             generation,
-            mux_incarnation: request.header.mux_incarnation,
-            next_sequence: 1,
-            pending_input_effect: None,
+            mux_incarnation,
+            pending_input_effect,
+            ..
+        } = state
+        else {
+            return Err(GuardianProtocolError::StateInvariantViolation(
+                "planned-exact-sequence-current-lease",
+            ));
         };
-        Ok(GuardianReply::Claimed {
-            pane_id,
-            generation,
-            next_sequence: 1,
-        })
+        Ok((
+            expected,
+            GuardianPaneState::LiveClaimed {
+                generation,
+                mux_incarnation,
+                next_sequence,
+                pending_input_effect,
+            },
+        ))
+    }
+
+    fn plan_receipt_capacity(
+        &self,
+        new_request: bool,
+        new_effect: bool,
+    ) -> Result<ReceiptCapacityPlan, GuardianProtocolError> {
+        let mut plan = ReceiptCapacityPlan::default();
+        if new_request && self.requests.len() >= self.receipt_capacity {
+            let needed = self.requests.len() - self.receipt_capacity + 1;
+            for (index, request_id) in self.transient_request_order.iter().enumerate() {
+                if self.requests.contains_key(request_id) && !plan.request_ids.contains(request_id) {
+                    plan.request_ids.push(*request_id);
+                    if plan.request_ids.len() == needed {
+                        plan.request_queue_pops = index + 1;
+                        break;
+                    }
+                }
+            }
+            if plan.request_ids.len() != needed {
+                return Err(GuardianProtocolError::CapacityExhausted);
+            }
+        }
+        if new_effect && self.effects.len() >= self.receipt_capacity {
+            let needed = self.effects.len() - self.receipt_capacity + 1;
+            for (index, effect_id) in self.transient_effect_order.iter().enumerate() {
+                if self.effects.contains_key(effect_id) && !plan.effect_ids.contains(effect_id) {
+                    plan.effect_ids.push(*effect_id);
+                    if plan.effect_ids.len() == needed {
+                        plan.effect_queue_pops = index + 1;
+                        break;
+                    }
+                }
+            }
+            if plan.effect_ids.len() != needed {
+                return Err(GuardianProtocolError::CapacityExhausted);
+            }
+        }
+        Ok(plan)
+    }
+
+    fn commit_receipt_capacity(&mut self, plan: ReceiptCapacityPlan) {
+        for _ in 0..plan.request_queue_pops {
+            let _ = self.transient_request_order.pop_front();
+        }
+        for request_id in plan.request_ids {
+            debug_assert!(!self.protected_spawn_requests.contains(&request_id));
+            if let Some(request) = self.requests.remove(&request_id) {
+                if let Some(request_ids) = self.effect_request_ids.get_mut(&request.effect_id) {
+                    request_ids.remove(&request_id);
+                }
+            }
+        }
+        for _ in 0..plan.effect_queue_pops {
+            let _ = self.transient_effect_order.pop_front();
+        }
+        for effect_id in plan.effect_ids {
+            debug_assert!(!self.protected_spawn_effects.contains(&effect_id));
+            self.effects.remove(&effect_id);
+            if let Some(request_ids) = self.effect_request_ids.remove(&effect_id) {
+                for request_id in request_ids {
+                    debug_assert!(!self.protected_spawn_requests.contains(&request_id));
+                    self.requests.remove(&request_id);
+                    self.transient_request_order
+                        .retain(|queued| *queued != request_id);
+                }
+            }
+        }
     }
 
     fn require_current_lease(
@@ -1491,134 +2987,6 @@ impl GuardianProtocolState {
         }
     }
 
-    fn require_exact_sequence(
-        &mut self,
-        pane_id: Uuid,
-        request: &AuthenticatedGuardianRequest,
-    ) -> Result<(u64, u64), GuardianProtocolError> {
-        let expected = self.require_current_lease(pane_id, request)?;
-        if matches!(
-            self.panes.get(&pane_id),
-            Some(GuardianPaneState::LiveClaimed {
-                pending_input_effect: Some(_),
-                ..
-            })
-        ) {
-            return Err(GuardianProtocolError::InputDurabilityPending);
-        }
-        if request.header.lease_sequence < expected {
-            return Err(GuardianProtocolError::RepeatedSequence {
-                expected,
-                observed: request.header.lease_sequence,
-            });
-        }
-        if request.header.lease_sequence > expected {
-            return Err(GuardianProtocolError::SequenceGap {
-                expected,
-                observed: request.header.lease_sequence,
-            });
-        }
-        let Some(next) = expected.checked_add(1) else {
-            let generation = request.header.lease_generation;
-            self.panes.insert(
-                pane_id,
-                GuardianPaneState::Quarantined {
-                    generation,
-                    reason: GuardianQuarantineReason::SequenceExhausted,
-                    exit_status: None,
-                },
-            );
-            return Err(GuardianProtocolError::SequenceExhausted);
-        };
-        Ok((expected, next))
-    }
-
-    fn apply_live_mutation(
-        &mut self,
-        pane_id: Uuid,
-        request: &AuthenticatedGuardianRequest,
-    ) -> Result<GuardianReply, GuardianProtocolError> {
-        let (sequence, next) = self.require_exact_sequence(pane_id, request)?;
-        let Some(GuardianPaneState::LiveClaimed { next_sequence, .. }) =
-            self.panes.get_mut(&pane_id)
-        else {
-            return Err(GuardianProtocolError::StateInvariantViolation(
-                "exact-sequence-current-lease",
-            ));
-        };
-        *next_sequence = next;
-        Ok(GuardianReply::MutationApplied {
-            pane_id,
-            generation: request.header.lease_generation,
-            sequence,
-        })
-    }
-
-    fn retire_lease(
-        &mut self,
-        pane_id: Uuid,
-        request: &AuthenticatedGuardianRequest,
-    ) -> Result<GuardianReply, GuardianProtocolError> {
-        let (sequence, _next) = self.require_exact_sequence(pane_id, request)?;
-        let generation = request.header.lease_generation;
-        self.panes
-            .insert(pane_id, GuardianPaneState::LiveUnclaimed { generation });
-        let _ = sequence;
-        Ok(GuardianReply::LeaseRetired {
-            pane_id,
-            generation,
-        })
-    }
-
-    fn close(
-        &mut self,
-        pane_id: Uuid,
-        request: &AuthenticatedGuardianRequest,
-    ) -> Result<GuardianReply, GuardianProtocolError> {
-        if let Some(GuardianPaneState::ExitedUnclaimed {
-            generation,
-            exit_status,
-            pending_input_effect,
-        }) = self.panes.get(&pane_id)
-        {
-            if pending_input_effect.is_some() {
-                return Err(GuardianProtocolError::InputDurabilityPending);
-            }
-            if *generation != request.header.lease_generation
-                || request.header.lease_sequence != 0
-            {
-                return Err(GuardianProtocolError::StaleLease);
-            }
-            let generation = *generation;
-            let exit_status = *exit_status;
-            self.panes.insert(
-                pane_id,
-                GuardianPaneState::ClosedTerminal {
-                    generation,
-                    exit_status: Some(exit_status),
-                },
-            );
-            return Ok(GuardianReply::MutationApplied {
-                pane_id,
-                generation,
-                sequence: 0,
-            });
-        }
-        let (sequence, _next) = self.require_exact_sequence(pane_id, request)?;
-        let generation = request.header.lease_generation;
-        self.panes.insert(
-            pane_id,
-            GuardianPaneState::ClosedTerminal {
-                generation,
-                exit_status: None,
-            },
-        );
-        Ok(GuardianReply::MutationApplied {
-            pane_id,
-            generation,
-            sequence,
-        })
-    }
 }
 
 pub fn encode_guardian_request(
@@ -1876,7 +3244,15 @@ fn validate_response_envelope(
     if <[u8; 32]>::from(Sha256::digest(&response.payload)) != header.payload_sha256 {
         return Err(GuardianProtocolError::PayloadDigestMismatch);
     }
-    require_nonzero(header.guardian_incarnation, "guardian incarnation")?;
+    if header.operation == GuardianOperation::Hello {
+        if !header.guardian_incarnation.is_nil() {
+            return Err(GuardianProtocolError::InvalidOperationScope {
+                operation: header.operation,
+            });
+        }
+    } else {
+        require_nonzero(header.guardian_incarnation, "guardian incarnation")?;
+    }
     require_nonzero(header.mux_incarnation, "mux incarnation")?;
     require_nonzero(header.request_id, "request")?;
     if header.pane_id.is_some_and(|pane_id| pane_id.is_nil()) {
@@ -1885,7 +3261,56 @@ fn validate_response_envelope(
     if header.effect_id.is_some_and(|effect_id| effect_id.is_nil()) {
         return Err(GuardianProtocolError::ZeroIdentity("effect"));
     }
+    validate_operation_scope(
+        header.operation,
+        header.pane_id,
+        header.effect_id,
+        header.lease_generation,
+        header.lease_sequence,
+    )?;
+    if header.status == GuardianResponseStatus::Success {
+        let reply = GuardianReply::decode_for_operation(header.operation, &response.payload)?;
+        reply.require_response_identity(header)?;
+    } else {
+        GuardianRejectionCode::decode(header.status, &response.payload)?;
+    }
     Ok(())
+}
+
+fn validate_operation_scope(
+    operation: GuardianOperation,
+    pane_id: Option<Uuid>,
+    effect_id: Option<Uuid>,
+    lease_generation: u64,
+    lease_sequence: u64,
+) -> Result<(), GuardianProtocolError> {
+    let pane_required = !matches!(operation, GuardianOperation::Census | GuardianOperation::Hello);
+    let lease_required = operation.requires_lease();
+    let effect_required =
+        operation.creates_effect() || operation == GuardianOperation::QueryInputEffect;
+    let spawn_scope_ok = operation != GuardianOperation::Spawn
+        || (lease_generation == 0 && lease_sequence == 0);
+    let observation_scope_ok = !matches!(operation, GuardianOperation::Census | GuardianOperation::Hello)
+        || (pane_id.is_none()
+            && effect_id.is_none()
+            && lease_generation == 0
+            && lease_sequence == 0);
+    let claim_scope_ok = operation != GuardianOperation::Claim || lease_sequence == 0;
+    let sequence_scope_ok = operation.uses_mutation_sequence() || lease_sequence == 0;
+    if pane_required != pane_id.is_some()
+        || effect_required != effect_id.is_some()
+        || (!lease_required
+            && !matches!(operation, GuardianOperation::Spawn | GuardianOperation::Claim)
+            && (lease_generation != 0 || lease_sequence != 0))
+        || !spawn_scope_ok
+        || !observation_scope_ok
+        || !claim_scope_ok
+        || !sequence_scope_ok
+    {
+        Err(GuardianProtocolError::InvalidOperationScope { operation })
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_request_envelope(
@@ -1903,7 +3328,14 @@ fn validate_request_envelope(
     if <[u8; 32]>::from(Sha256::digest(&request.payload)) != header.payload_sha256 {
         return Err(GuardianProtocolError::PayloadDigestMismatch);
     }
-    require_nonzero(header.guardian_incarnation, "guardian incarnation")?;
+    let operation = header.operation;
+    if operation == GuardianOperation::Hello {
+        if !header.guardian_incarnation.is_nil() {
+            return Err(GuardianProtocolError::InvalidOperationScope { operation });
+        }
+    } else {
+        require_nonzero(header.guardian_incarnation, "guardian incarnation")?;
+    }
     require_nonzero(header.mux_incarnation, "mux incarnation")?;
     require_nonzero(header.request_id, "request")?;
     if header.pane_id.is_some_and(|pane_id| pane_id.is_nil()) {
@@ -1913,34 +3345,16 @@ fn validate_request_envelope(
         return Err(GuardianProtocolError::ZeroIdentity("effect"));
     }
 
-    let operation = header.operation;
-    let pane_required = operation != GuardianOperation::Census;
-    let lease_required = operation.requires_lease();
-    let effect_required = operation.creates_effect() || operation == GuardianOperation::QueryInputEffect;
-    let spawn_scope_ok = operation != GuardianOperation::Spawn
-        || (header.lease_generation == 0 && header.lease_sequence == 0);
-    let census_scope_ok = operation != GuardianOperation::Census
-        || (header.pane_id.is_none()
-            && header.effect_id.is_none()
-            && header.lease_generation == 0
-            && header.lease_sequence == 0);
-    let claim_scope_ok = operation != GuardianOperation::Claim || header.lease_sequence == 0;
-    let sequence_scope_ok = operation.uses_mutation_sequence() || header.lease_sequence == 0;
-    if pane_required != header.pane_id.is_some()
-        || effect_required != header.effect_id.is_some()
-        || (!lease_required
-            && !matches!(operation, GuardianOperation::Spawn | GuardianOperation::Claim)
-            && (header.lease_generation != 0 || header.lease_sequence != 0))
-        || !spawn_scope_ok
-        || !census_scope_ok
-        || !claim_scope_ok
-        || !sequence_scope_ok
-    {
-        return Err(GuardianProtocolError::InvalidOperationScope { operation });
-    }
+    validate_operation_scope(
+        operation,
+        header.pane_id,
+        header.effect_id,
+        header.lease_generation,
+        header.lease_sequence,
+    )?;
     match operation {
-        GuardianOperation::Spawn if request.payload.is_empty() => {
-            return Err(GuardianProtocolError::InvalidOperationScope { operation });
+        GuardianOperation::Spawn => {
+            GuardianSpawnPayload::decode(&request.payload)?;
         }
         GuardianOperation::Census => {
             GuardianCensusPageRequest::decode(&request.payload)?;
@@ -1949,6 +3363,26 @@ fn validate_request_envelope(
             if request.payload.is_empty() || request.payload.len() > GUARDIAN_MAX_INPUT_BYTES =>
         {
             return Err(GuardianProtocolError::InvalidOperationScope { operation });
+        }
+        GuardianOperation::Resize => {
+            GuardianResizePayload::decode(&request.payload)?;
+        }
+        GuardianOperation::Signal => {
+            GuardianSignal::decode(&request.payload)?;
+        }
+        GuardianOperation::QueryInputEffect => {
+            GuardianInputEffectQuery::decode(&request.payload)?;
+        }
+        GuardianOperation::Hello
+        | GuardianOperation::Claim
+        | GuardianOperation::Attach
+        | GuardianOperation::Close
+        | GuardianOperation::Checkpoint
+        | GuardianOperation::Replay
+        | GuardianOperation::RetireLease
+            if !request.payload.is_empty() =>
+        {
+            return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         _ => {}
     }
@@ -1975,6 +3409,26 @@ fn push_u32(buffer: &mut Vec<u8>, value: u32) {
     buffer.extend_from_slice(&value.to_be_bytes());
 }
 
+fn encode_pty_size(buffer: &mut Vec<u8>, size: PtySize) {
+    buffer.extend_from_slice(&size.rows.to_be_bytes());
+    buffer.extend_from_slice(&size.cols.to_be_bytes());
+    buffer.extend_from_slice(&size.pixel_width.to_be_bytes());
+    buffer.extend_from_slice(&size.pixel_height.to_be_bytes());
+}
+
+fn decode_pty_size(payload: &[u8]) -> Result<PtySize, GuardianProtocolError> {
+    if payload.len() != 8 {
+        return Err(GuardianProtocolError::InvalidOperationPayload);
+    }
+    let size = PtySize {
+        rows: u16::from_be_bytes([payload[0], payload[1]]),
+        cols: u16::from_be_bytes([payload[2], payload[3]]),
+        pixel_width: u16::from_be_bytes([payload[4], payload[5]]),
+        pixel_height: u16::from_be_bytes([payload[6], payload[7]]),
+    };
+    Ok(size)
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, GuardianProtocolError> {
     let value = bytes
         .get(offset..offset + 2)
@@ -1998,6 +3452,13 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, GuardianProtocolError> {
     ]))
 }
 
+fn read_i32(bytes: &[u8], offset: usize) -> Result<i32, GuardianProtocolError> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
+    Ok(i32::from_be_bytes([value[0], value[1], value[2], value[3]]))
+}
+
 fn read_uuid(bytes: &[u8], offset: usize) -> Result<Uuid, GuardianProtocolError> {
     let value = bytes
         .get(offset..offset + 16)
@@ -2010,6 +3471,23 @@ fn read_uuid(bytes: &[u8], offset: usize) -> Result<Uuid, GuardianProtocolError>
 fn read_optional_uuid(bytes: &[u8], offset: usize) -> Result<Option<Uuid>, GuardianProtocolError> {
     let value = read_uuid(bytes, offset)?;
     Ok((!value.is_nil()).then_some(value))
+}
+
+fn read_required_uuid(bytes: &[u8], offset: usize) -> Result<Uuid, GuardianProtocolError> {
+    let value = read_uuid(bytes, offset).map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+    if value.is_nil() {
+        Err(GuardianProtocolError::InvalidReplyPayload)
+    } else {
+        Ok(value)
+    }
+}
+
+fn require_reply_len(payload: &[u8], expected: usize) -> Result<(), GuardianProtocolError> {
+    if payload.len() == expected {
+        Ok(())
+    } else {
+        Err(GuardianProtocolError::InvalidReplyPayload)
+    }
 }
 
 #[cfg(test)]
@@ -2063,7 +3541,47 @@ mod tests {
         state.apply(&authenticate(request))
     }
 
+    fn input_effect_identity(
+        request: &GuardianRequestEnvelope,
+    ) -> GuardianInputEffectIdentity {
+        GuardianInputEffectIdentity::from_authenticated_request(&authenticate(request))
+            .expect("test input request carries an exact authenticated effect identity")
+    }
+
+    fn input_effect_query_payload(
+        request: &GuardianRequestEnvelope,
+    ) -> [u8; INPUT_EFFECT_QUERY_PAYLOAD_BYTES] {
+        assert_eq!(request.header.operation, GuardianOperation::Input);
+        GuardianInputEffectQuery::new(
+            request.header.lease_sequence,
+            request.header.payload_sha256,
+        )
+        .expect("test input request carries a nonzero mutation sequence")
+        .encode()
+    }
+
+    fn pty_size(rows: u16, cols: u16) -> PtySize {
+        PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    fn resize_payload(rows: u16, cols: u16) -> [u8; RESIZE_PAYLOAD_BYTES] {
+        GuardianResizePayload::new(pty_size(rows, cols)).encode()
+    }
+
+    fn spawn_payload(command: &str) -> Vec<u8> {
+        GuardianSpawnPayload::new(CommandBuilder::new(command), pty_size(24, 80))
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
     fn spawn_request(guardian: Uuid, mux: Uuid, pane: Uuid) -> GuardianRequestEnvelope {
+        let payload = spawn_payload("bounded-command");
         request(
             GuardianOperation::Spawn,
             guardian,
@@ -2073,7 +3591,7 @@ mod tests {
             0,
             0,
             Some(id(5)),
-            b"bounded-command",
+            &payload,
         )
     }
 
@@ -2096,6 +3614,378 @@ mod tests {
             Some(id(effect_byte)),
             b"",
         )
+    }
+
+    #[test]
+    fn effect_payloads_are_typed_bounded_and_content_free_in_debug() {
+        let mut command = CommandBuilder::new("fixture-program");
+        command.arg("super-secret-argument");
+        command.env("FIXTURE_TOKEN", "super-secret-environment");
+        let spawn = GuardianSpawnPayload::new(command, pty_size(31, 101)).unwrap();
+        let debug = format!("{spawn:?}");
+        assert!(!debug.contains("super-secret"));
+        let encoded = spawn.encode().unwrap();
+        assert!(encoded.len() <= GUARDIAN_MAX_PAYLOAD_BYTES);
+        assert_eq!(GuardianSpawnPayload::decode(&encoded).unwrap(), spawn);
+        let mut hidden_field = encoded.clone();
+        let insertion = hidden_field.len() - 1;
+        hidden_field.splice(insertion..insertion, b",\"hidden\":true".iter().copied());
+        let hidden_command_bytes = hidden_field.len() - SPAWN_PAYLOAD_FIXED_BYTES;
+        hidden_field[12..16].copy_from_slice(
+            &u32::try_from(hidden_command_bytes)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert_eq!(
+            GuardianSpawnPayload::decode(&hidden_field),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        assert_eq!(
+            GuardianSpawnPayload::new(CommandBuilder::new(""), pty_size(24, 80)),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+
+        let resize = GuardianResizePayload::new(pty_size(44, 132));
+        assert_eq!(GuardianResizePayload::decode(&resize.encode()).unwrap(), resize);
+        let zero_geometry = GuardianResizePayload::new(pty_size(0, 0));
+        assert_eq!(
+            GuardianResizePayload::decode(&zero_geometry.encode()).unwrap(),
+            zero_geometry
+        );
+        assert_eq!(
+            GuardianSignal::decode(&GuardianSignal::Terminate.encode()).unwrap(),
+            GuardianSignal::Terminate
+        );
+        let mut unknown_signal = GuardianSignal::Terminate.encode();
+        unknown_signal[4] = 2;
+        assert_eq!(
+            GuardianSignal::decode(&unknown_signal),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+
+        let query = GuardianInputEffectQuery::new(7, [0x3c; 32]).unwrap();
+        assert_eq!(
+            GuardianInputEffectQuery::decode(&query.encode()).unwrap(),
+            query
+        );
+        assert_eq!(
+            GuardianInputEffectQuery::new(0, [0x3c; 32]),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        let mut query_with_trailing_bytes = query.encode().to_vec();
+        query_with_trailing_bytes.push(0);
+        assert_eq!(
+            GuardianInputEffectQuery::decode(&query_with_trailing_bytes),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+
+        let oversized = GuardianSpawnPayload::new(
+            CommandBuilder::new("x".repeat(GUARDIAN_MAX_PAYLOAD_BYTES)),
+            pty_size(24, 80),
+        )
+        .unwrap();
+        assert_eq!(
+            oversized.encode(),
+            Err(GuardianProtocolError::PayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn payload_free_operations_reject_authenticated_trailing_bytes() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        for (index, operation) in [
+            GuardianOperation::Claim,
+            GuardianOperation::Attach,
+            GuardianOperation::Close,
+            GuardianOperation::Checkpoint,
+            GuardianOperation::Replay,
+            GuardianOperation::RetireLease,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request_id = Uuid::from_u128(0x100 + index as u128);
+            let effect_id = operation
+                .creates_effect()
+                .then(|| Uuid::from_u128(0x200 + index as u128));
+            let envelope = request(
+                operation,
+                guardian,
+                mux,
+                request_id,
+                Some(pane),
+                u64::from(operation != GuardianOperation::Claim),
+                u64::from(operation.uses_mutation_sequence()),
+                effect_id,
+                b"hidden-trailing-byte",
+            );
+            assert_eq!(
+                encode_guardian_request(&secret(), &envelope),
+                Err(GuardianProtocolError::InvalidOperationPayload),
+                "{operation:?} must reject an authenticated undeclared payload"
+            );
+        }
+    }
+
+    #[test]
+    fn hello_authenticates_bootstrap_before_guardian_incarnation_is_known() {
+        let guardian = id(1);
+        let mux = id(2);
+        let hello = request(
+            GuardianOperation::Hello,
+            Uuid::nil(),
+            mux,
+            id(30),
+            None,
+            0,
+            0,
+            None,
+            b"",
+        );
+        let authenticated = authenticate(&hello);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        let reply = state.apply_observation(&authenticated).unwrap();
+        assert_eq!(
+            reply,
+            GuardianReply::Hello {
+                guardian_incarnation: guardian,
+            }
+        );
+        let response = GuardianResponseEnvelope::success(&authenticated, &reply).unwrap();
+        let correlated = decode_guardian_response(
+            &secret(),
+            &encode_guardian_response(&secret(), &response).unwrap(),
+        )
+        .unwrap()
+        .correlate(&authenticated.header)
+        .unwrap();
+        assert_eq!(correlated.success_reply(&authenticated).unwrap(), reply);
+
+        let noncanonical_known_incarnation = request(
+            GuardianOperation::Hello,
+            guardian,
+            mux,
+            id(31),
+            None,
+            0,
+            0,
+            None,
+            b"",
+        );
+        assert_eq!(
+            encode_guardian_request(&secret(), &noncanonical_known_incarnation),
+            Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Hello,
+            })
+        );
+        let hidden_payload = request(
+            GuardianOperation::Hello,
+            Uuid::nil(),
+            mux,
+            id(32),
+            None,
+            0,
+            0,
+            None,
+            b"hidden",
+        );
+        assert_eq!(
+            encode_guardian_request(&secret(), &hidden_payload),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        let census_page = GuardianCensusPageRequest::new(
+            Uuid::nil(),
+            0,
+            1,
+            GUARDIAN_MIN_CENSUS_PAGE_BYTES,
+        )
+        .unwrap();
+        let nil_guardian_census = request(
+            GuardianOperation::Census,
+            Uuid::nil(),
+            mux,
+            id(33),
+            None,
+            0,
+            0,
+            None,
+            &census_page.encode(),
+        );
+        assert_eq!(
+            encode_guardian_request(&secret(), &nil_guardian_census),
+            Err(GuardianProtocolError::ZeroIdentity("guardian incarnation")),
+            "nil guardian scope must remain exclusive to the authenticated Hello bootstrap"
+        );
+    }
+
+    #[test]
+    fn failed_runtime_effect_does_not_publish_spawn_or_consume_replay_identity() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let request = authenticate(&spawn_request(guardian, mux, pane));
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        let invocations = std::cell::Cell::new(0usize);
+
+        let failed = state.apply_effect_transactionally(&request, |_| {
+            invocations.set(invocations.get() + 1);
+            Err("injected spawn failure")
+        });
+        assert!(matches!(
+            failed,
+            Err(GuardianEffectTransactionError::Effect("injected spawn failure"))
+        ));
+        assert_eq!(invocations.get(), 1);
+        assert_eq!(state.pane_state(pane), None);
+
+        let first = state
+            .apply_effect_transactionally(&request, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(invocations.get(), 2);
+        assert_eq!(
+            state.pane_state(pane),
+            Some(&GuardianPaneState::LiveUnclaimed { generation: 0 })
+        );
+
+        let replay = state
+            .apply_effect_transactionally(&request, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(invocations.get(), 2, "exact replay must not respawn");
+
+        let mut alias_envelope = request.envelope().clone();
+        alias_envelope.header.request_id = id(10);
+        let alias = authenticate(&alias_envelope);
+        let alias_reply = state
+            .apply_effect_transactionally(&alias, |_| {
+                invocations.set(invocations.get() + 1);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(alias_reply, first);
+        assert_eq!(
+            invocations.get(),
+            2,
+            "same-effect request alias must not respawn"
+        );
+    }
+
+    #[test]
+    fn failed_runtime_effect_does_not_evict_historical_receipts() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let mut state = GuardianProtocolState::new_with_receipt_capacity(guardian, 2).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        let claim = claim_request(guardian, mux, pane, 0, 6, 7);
+        let claimed = apply_request(&mut state, &claim).unwrap();
+        assert_eq!(state.requests.len(), 2);
+        assert_eq!(state.effects.len(), 2);
+
+        let resize = authenticate(&request(
+            GuardianOperation::Resize,
+            guardian,
+            mux,
+            id(8),
+            Some(pane),
+            1,
+            1,
+            Some(id(9)),
+            &resize_payload(25, 81),
+        ));
+        assert!(matches!(
+            state.apply_effect_transactionally(&resize, |_| Err("injected resize failure")),
+            Err(GuardianEffectTransactionError::Effect(
+                "injected resize failure"
+            ))
+        ));
+        assert!(state.requests.contains_key(&id(6)));
+        assert!(state.effects.contains_key(&id(7)));
+        assert!(!state.requests.contains_key(&id(8)));
+        assert!(!state.effects.contains_key(&id(9)));
+        assert_eq!(state.requests.len(), 2);
+        assert_eq!(state.effects.len(), 2);
+
+        let replay_callback_invoked = std::cell::Cell::new(false);
+        let replay = state
+            .apply_effect_transactionally(&authenticate(&claim), |_| {
+                replay_callback_invoked.set(true);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(replay, claimed);
+        assert!(!replay_callback_invoked.get());
+    }
+
+    #[test]
+    fn failed_runtime_mutation_does_not_advance_lease_sequence() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let mut state = GuardianProtocolState::new(guardian).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 6, 7),
+        )
+        .unwrap();
+        let input = authenticate(&request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(8),
+            Some(pane),
+            1,
+            1,
+            Some(id(9)),
+            b"effect-once",
+        ));
+
+        let failed = state.apply_effect_transactionally(&input, |_| Err("zero-byte write"));
+        assert!(matches!(
+            failed,
+            Err(GuardianEffectTransactionError::Effect("zero-byte write"))
+        ));
+        assert_eq!(
+            state.pane_state(pane),
+            Some(&GuardianPaneState::LiveClaimed {
+                generation: 1,
+                mux_incarnation: mux,
+                next_sequence: 1,
+                pending_input_effect: None,
+            })
+        );
+
+        let accepted = state
+            .apply_effect_transactionally(&input, |_| Ok::<(), &str>(()))
+            .unwrap();
+        assert_eq!(
+            accepted,
+            GuardianReply::InputReceipt {
+                pane_id: pane,
+                generation: 1,
+                sequence: 1,
+                effect_id: id(9),
+                state: InputEffectState::AcceptedNotDurable,
+            }
+        );
+        assert_eq!(
+            state.pane_state(pane),
+            Some(&GuardianPaneState::LiveClaimed {
+                generation: 1,
+                mux_incarnation: mux,
+                next_sequence: 2,
+                pending_input_effect: Some(id(9)),
+            })
+        );
     }
 
     #[test]
@@ -2139,16 +4029,23 @@ mod tests {
             Err(GuardianProtocolError::TruncatedFrame)
         );
         let original_request = spawn_request(id(1), id(2), id(3));
-        let payload = b"spawned:0".to_vec();
-        let response = GuardianResponseEnvelope {
-            header: GuardianResponseHeader::new(
-                &original_request.header,
-                GuardianResponseStatus::Success,
-                &payload,
-            ),
-            payload,
+        let reply = GuardianReply::Spawned {
+            pane_id: id(3),
+            generation: 0,
         };
-        assert!(!format!("{response:?}").contains("spawned:0"));
+        let authenticated_request = authenticate(&original_request);
+        let response = GuardianResponseEnvelope::success(&authenticated_request, &reply).unwrap();
+        assert_eq!(
+            GuardianResponseEnvelope::success(
+                &authenticated_request,
+                &GuardianReply::Spawned {
+                    pane_id: id(8),
+                    generation: 0,
+                },
+            ),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
+        assert!(!format!("{response:?}").contains(&id(3).to_string()));
         let frame = encode_guardian_response(&secret(), &response).unwrap();
         let authenticated = decode_guardian_response(&secret(), &frame).unwrap();
         let correlated = authenticated
@@ -2156,6 +4053,29 @@ mod tests {
             .correlate(&original_request.header)
             .unwrap();
         assert_eq!(correlated.envelope(), &response);
+        assert_eq!(
+            correlated.success_reply(&authenticated_request).unwrap(),
+            reply
+        );
+
+        let mismatched_payload = GuardianReply::Spawned {
+            pane_id: id(8),
+            generation: 0,
+        }
+        .encode_for_operation(GuardianOperation::Spawn)
+        .unwrap();
+        let mismatched_response = GuardianResponseEnvelope {
+            header: GuardianResponseHeader::new(
+                &original_request.header,
+                GuardianResponseStatus::Success,
+                &mismatched_payload,
+            ),
+            payload: mismatched_payload,
+        };
+        assert_eq!(
+            encode_guardian_response(&secret(), &mismatched_response),
+            Err(GuardianProtocolError::ResponseRequestMismatch)
+        );
 
         let different_request = spawn_request(id(1), id(2), id(8));
         assert_eq!(
@@ -2175,12 +4095,11 @@ mod tests {
 
         let mut wrong_lease = response.clone();
         wrong_lease.header.lease_generation = 1;
-        let wrong_lease_frame = encode_guardian_response(&secret(), &wrong_lease).unwrap();
-        let authenticated_wrong_lease =
-            decode_guardian_response(&secret(), &wrong_lease_frame).unwrap();
         assert_eq!(
-            authenticated_wrong_lease.correlate(&original_request.header),
-            Err(GuardianProtocolError::ResponseRequestMismatch)
+            encode_guardian_response(&secret(), &wrong_lease),
+            Err(GuardianProtocolError::InvalidOperationScope {
+                operation: GuardianOperation::Spawn,
+            })
         );
 
         let mut malformed_length = frame.clone();
@@ -2204,6 +4123,308 @@ mod tests {
         assert_eq!(
             decode_guardian_response(&secret(), &tampered),
             Err(GuardianProtocolError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn authenticated_rejections_are_typed_content_free_and_status_consistent() {
+        let original_request = spawn_request(id(1), id(2), id(3));
+        let authenticated_request = authenticate(&original_request);
+        let all_codes = [
+            GuardianRejectionCode::InvalidRequest,
+            GuardianRejectionCode::GuardianIncarnationMismatch,
+            GuardianRejectionCode::PaneNotFound,
+            GuardianRejectionCode::PaneAlreadyExists,
+            GuardianRejectionCode::RequestIdentityConflict,
+            GuardianRejectionCode::EffectIdentityConflict,
+            GuardianRejectionCode::PaneTerminal,
+            GuardianRejectionCode::ClaimGenerationMismatch,
+            GuardianRejectionCode::StaleLease,
+            GuardianRejectionCode::RepeatedSequence,
+            GuardianRejectionCode::SequenceGap,
+            GuardianRejectionCode::GenerationExhausted,
+            GuardianRejectionCode::SequenceExhausted,
+            GuardianRejectionCode::CapacityExhausted,
+            GuardianRejectionCode::RequestAliasCapacityExhausted,
+            GuardianRejectionCode::InputDurabilityPending,
+            GuardianRejectionCode::InputDurabilityIdentityMismatch,
+            GuardianRejectionCode::CensusSnapshotNotFound,
+            GuardianRejectionCode::CensusSnapshotIdentityConflict,
+            GuardianRejectionCode::InvalidCensusCursor,
+            GuardianRejectionCode::InternalInvariant,
+        ];
+        for code in all_codes {
+            let response = GuardianResponseEnvelope::rejection(&authenticated_request, code);
+            assert_eq!(response.header.status, code.status());
+            assert_eq!(response.payload.len(), REJECTION_PAYLOAD_BYTES);
+            let decoded = decode_guardian_response(
+                &secret(),
+                &encode_guardian_response(&secret(), &response).unwrap(),
+            )
+            .unwrap()
+            .correlate(&original_request.header)
+            .unwrap();
+            assert_eq!(decoded.rejection_code().unwrap(), code);
+        }
+
+        let rejection = GuardianResponseEnvelope::rejection(
+            &authenticated_request,
+            GuardianRejectionCode::CapacityExhausted,
+        );
+        assert_eq!(rejection.header.status, GuardianResponseStatus::Rejected);
+        assert_eq!(rejection.payload.len(), REJECTION_PAYLOAD_BYTES);
+        let correlated = decode_guardian_response(
+            &secret(),
+            &encode_guardian_response(&secret(), &rejection).unwrap(),
+        )
+        .unwrap()
+        .correlate(&original_request.header)
+        .unwrap();
+        assert_eq!(
+            correlated.rejection_code().unwrap(),
+            GuardianRejectionCode::CapacityExhausted
+        );
+        assert_eq!(
+            correlated.success_reply(&authenticated_request),
+            Err(GuardianProtocolError::NonSuccessResponse)
+        );
+
+        let terminal = GuardianResponseEnvelope::rejection(
+            &authenticated_request,
+            GuardianRejectionCode::StaleLease,
+        );
+        assert_eq!(terminal.header.status, GuardianResponseStatus::Terminal);
+        assert_eq!(
+            GuardianRejectionCode::from_protocol_error(&GuardianProtocolError::StaleLease),
+            GuardianRejectionCode::StaleLease
+        );
+        assert_eq!(
+            GuardianRejectionCode::from_protocol_error(
+                &GuardianProtocolError::InputDurabilityPending
+            )
+            .status(),
+            GuardianResponseStatus::Rejected
+        );
+
+        let mut mismatched_status = terminal.clone();
+        mismatched_status.header.status = GuardianResponseStatus::Rejected;
+        assert_eq!(
+            encode_guardian_response(&secret(), &mismatched_status),
+            Err(GuardianProtocolError::InvalidRejectionPayload)
+        );
+        let mut unknown_code = terminal;
+        unknown_code.payload[4..].copy_from_slice(&u16::MAX.to_be_bytes());
+        unknown_code.header.payload_sha256 = Sha256::digest(&unknown_code.payload).into();
+        assert_eq!(
+            encode_guardian_response(&secret(), &unknown_code),
+            Err(GuardianProtocolError::InvalidRejectionPayload)
+        );
+    }
+
+    #[test]
+    fn success_reply_wire_round_trip_is_operation_typed_and_census_bounded() {
+        let reply = GuardianReply::CensusPage {
+            snapshot_id: id(20),
+            entries: vec![
+                GuardianCensusEntry {
+                    pane_id: id(21),
+                    status: GuardianCensusPaneStatus::LiveUnclaimed,
+                    generation: 0,
+                    mux_incarnation: None,
+                    next_sequence: None,
+                    pending_input_effect: None,
+                    exit_status: None,
+                    quarantine_reason: None,
+                },
+                GuardianCensusEntry {
+                    pane_id: id(22),
+                    status: GuardianCensusPaneStatus::LiveClaimed,
+                    generation: 3,
+                    mux_incarnation: Some(id(30)),
+                    next_sequence: Some(7),
+                    pending_input_effect: Some(id(31)),
+                    exit_status: None,
+                    quarantine_reason: None,
+                },
+                GuardianCensusEntry {
+                    pane_id: id(23),
+                    status: GuardianCensusPaneStatus::ExitedUnclaimed,
+                    generation: 3,
+                    mux_incarnation: None,
+                    next_sequence: None,
+                    pending_input_effect: None,
+                    exit_status: Some(-9),
+                    quarantine_reason: None,
+                },
+                GuardianCensusEntry {
+                    pane_id: id(24),
+                    status: GuardianCensusPaneStatus::ClosedTerminal,
+                    generation: 4,
+                    mux_incarnation: None,
+                    next_sequence: None,
+                    pending_input_effect: None,
+                    exit_status: Some(i32::MIN),
+                    quarantine_reason: None,
+                },
+                GuardianCensusEntry {
+                    pane_id: id(25),
+                    status: GuardianCensusPaneStatus::Quarantined,
+                    generation: u64::MAX,
+                    mux_incarnation: None,
+                    next_sequence: None,
+                    pending_input_effect: None,
+                    exit_status: None,
+                    quarantine_reason: Some(GuardianQuarantineReason::GenerationExhausted),
+                },
+            ],
+            next_cursor: None,
+            total_panes: 5,
+        };
+        let encoded = reply
+            .encode_for_operation(GuardianOperation::Census)
+            .unwrap();
+        assert_eq!(
+            encoded.len(),
+            usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap()
+                + 5 * usize::try_from(GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES).unwrap()
+        );
+        assert_eq!(
+            GuardianReply::decode_for_operation(GuardianOperation::Census, &encoded).unwrap(),
+            reply
+        );
+        let mut noncanonical_absent_exit_status = encoded.clone();
+        let first_exit_status_byte = usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap()
+            + 65;
+        noncanonical_absent_exit_status[first_exit_status_byte] = 1;
+        assert_eq!(
+            GuardianReply::decode_for_operation(
+                GuardianOperation::Census,
+                &noncanonical_absent_exit_status,
+            ),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
+
+        let page = GuardianCensusPageRequest::new(
+            Uuid::nil(),
+            0,
+            GUARDIAN_MAX_CENSUS_ENTRIES,
+            GUARDIAN_MAX_CENSUS_BYTES,
+        )
+        .unwrap();
+        let census_request = authenticate(&request(
+            GuardianOperation::Census,
+            id(1),
+            id(2),
+            id(40),
+            None,
+            0,
+            0,
+            None,
+            &page.encode(),
+        ));
+        let response = GuardianResponseEnvelope::success(&census_request, &reply).unwrap();
+        let correlated = decode_guardian_response(
+            &secret(),
+            &encode_guardian_response(&secret(), &response).unwrap(),
+        )
+        .unwrap()
+        .correlate(&census_request.header)
+        .unwrap();
+        assert_eq!(correlated.success_reply(&census_request).unwrap(), reply);
+
+        let entry_limited_page = GuardianCensusPageRequest::new(
+            Uuid::nil(),
+            0,
+            4,
+            GUARDIAN_MAX_CENSUS_BYTES,
+        )
+        .unwrap();
+        let entry_limited_request = authenticate(&request(
+            GuardianOperation::Census,
+            id(1),
+            id(2),
+            id(41),
+            None,
+            0,
+            0,
+            None,
+            &entry_limited_page.encode(),
+        ));
+        assert_eq!(
+            GuardianResponseEnvelope::success(&entry_limited_request, &reply),
+            Err(GuardianProtocolError::InvalidReplyPayload),
+            "the server must not authenticate more entries than the exact request admitted"
+        );
+        let oversized_payload = reply
+            .encode_for_operation(GuardianOperation::Census)
+            .unwrap();
+        let forged_correlated_page = CorrelatedGuardianResponse(GuardianResponseEnvelope {
+            header: GuardianResponseHeader::new(
+                &entry_limited_request.header,
+                GuardianResponseStatus::Success,
+                &oversized_payload,
+            ),
+            payload: oversized_payload,
+        });
+        assert_eq!(
+            forged_correlated_page.success_reply(&entry_limited_request),
+            Err(GuardianProtocolError::InvalidReplyPayload),
+            "the correlated consumer must independently enforce the exact request ceiling"
+        );
+
+        let four_entry_bytes = GUARDIAN_CENSUS_PAGE_HEADER_BYTES
+            + 4 * GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES;
+        let byte_limited_page = GuardianCensusPageRequest::new(
+            Uuid::nil(),
+            0,
+            GUARDIAN_MAX_CENSUS_ENTRIES,
+            four_entry_bytes,
+        )
+        .unwrap();
+        let byte_limited_request = authenticate(&request(
+            GuardianOperation::Census,
+            id(1),
+            id(2),
+            id(42),
+            None,
+            0,
+            0,
+            None,
+            &byte_limited_page.encode(),
+        ));
+        assert_eq!(
+            GuardianResponseEnvelope::success(&byte_limited_request, &reply),
+            Err(GuardianProtocolError::InvalidReplyPayload),
+            "the server must not authenticate a page larger than the exact byte budget"
+        );
+
+        let mut false_cursor = reply.clone();
+        let GuardianReply::CensusPage { next_cursor, .. } = &mut false_cursor else {
+            unreachable!();
+        };
+        *next_cursor = Some(4);
+        assert_eq!(
+            GuardianResponseEnvelope::success(&census_request, &false_cursor),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
+
+        let mut malformed_flags = encoded;
+        let first_entry_flags =
+            usize::try_from(GUARDIAN_CENSUS_PAGE_HEADER_BYTES).unwrap() + 70;
+        malformed_flags[first_entry_flags] = 0x80;
+        assert_eq!(
+            GuardianReply::decode_for_operation(GuardianOperation::Census, &malformed_flags),
+            Err(GuardianProtocolError::InvalidReplyPayload)
+        );
+        assert_eq!(
+            GuardianReply::Spawned {
+                pane_id: id(3),
+                generation: 0,
+            }
+            .encode_for_operation(GuardianOperation::Signal),
+            Err(GuardianProtocolError::ReplyOperationMismatch {
+                operation: GuardianOperation::Signal,
+            })
         );
     }
 
@@ -2246,7 +4467,7 @@ mod tests {
     #[test]
     fn census_pagination_is_fixed_width_and_cap_checked() {
         let page = GuardianCensusPageRequest::new(
-            id(90),
+            Uuid::nil(),
             0,
             GUARDIAN_MAX_CENSUS_ENTRIES,
             GUARDIAN_MAX_CENSUS_BYTES,
@@ -2255,7 +4476,7 @@ mod tests {
         assert_eq!(GuardianCensusPageRequest::decode(&page.encode()).unwrap(), page);
         assert_eq!(
             GuardianCensusPageRequest::new(
-                id(90),
+                Uuid::nil(),
                 0,
                 GUARDIAN_MAX_CENSUS_ENTRIES + 1,
                 GUARDIAN_MIN_CENSUS_PAGE_BYTES,
@@ -2263,12 +4484,12 @@ mod tests {
             Err(GuardianProtocolError::InvalidCensusPage)
         );
         assert_eq!(
-            GuardianCensusPageRequest::new(id(90), 0, 0, GUARDIAN_MIN_CENSUS_PAGE_BYTES),
+            GuardianCensusPageRequest::new(Uuid::nil(), 0, 0, GUARDIAN_MIN_CENSUS_PAGE_BYTES),
             Err(GuardianProtocolError::InvalidCensusPage)
         );
         assert_eq!(
             GuardianCensusPageRequest::new(
-                id(90),
+                Uuid::nil(),
                 0,
                 1,
                 GUARDIAN_MIN_CENSUS_PAGE_BYTES - 1,
@@ -2277,8 +4498,17 @@ mod tests {
         );
         assert_eq!(
             GuardianCensusPageRequest::new(
-                Uuid::nil(),
+                id(90),
                 0,
+                1,
+                GUARDIAN_MIN_CENSUS_PAGE_BYTES,
+            ),
+            Err(GuardianProtocolError::InvalidCensusPage)
+        );
+        assert_eq!(
+            GuardianCensusPageRequest::new(
+                Uuid::nil(),
+                1,
                 1,
                 GUARDIAN_MIN_CENSUS_PAGE_BYTES,
             ),
@@ -2317,7 +4547,7 @@ mod tests {
             )
             .unwrap(),
             GuardianReply::CensusPage {
-                snapshot_id: id(90),
+                snapshot_id: Uuid::from_u128(1),
                 entries: Vec::new(),
                 next_cursor: None,
                 total_panes: 0,
@@ -2333,6 +4563,7 @@ mod tests {
         for (pane_byte, request_byte, effect_byte) in
             [(40, 41, 42), (20, 21, 22), (30, 31, 32)]
         {
+            let payload = spawn_payload("census-pane");
             let spawn = request(
                 GuardianOperation::Spawn,
                 guardian,
@@ -2342,7 +4573,7 @@ mod tests {
                 0,
                 0,
                 Some(id(effect_byte)),
-                b"census-pane",
+                &payload,
             );
             apply_request(&mut state, &spawn).unwrap();
         }
@@ -2369,10 +4600,9 @@ mod tests {
         };
         let two_entry_bytes = GUARDIAN_CENSUS_PAGE_HEADER_BYTES
             + 2 * GUARDIAN_CENSUS_ENTRY_ENCODED_BYTES;
-        let snapshot_id = id(60);
         let first = apply_request(
             &mut state,
-            &census(50, snapshot_id, 0, 2, two_entry_bytes),
+            &census(50, Uuid::nil(), 0, 2, two_entry_bytes),
         )
         .unwrap();
         let GuardianReply::CensusPage {
@@ -2384,7 +4614,8 @@ mod tests {
         else {
             panic!("census must return a bounded page");
         };
-        assert_eq!(first_snapshot_id, snapshot_id);
+        assert!(!first_snapshot_id.is_nil());
+        let snapshot_id = first_snapshot_id;
         assert_eq!(total_panes, 3);
         assert_eq!(next_cursor, Some(2));
         assert_eq!(
@@ -2403,7 +4634,7 @@ mod tests {
 
         let conflicting_page = GuardianCensusPageRequest::new(
             snapshot_id,
-            0,
+            2,
             1,
             GUARDIAN_MIN_CENSUS_PAGE_BYTES,
         )
@@ -2424,6 +4655,7 @@ mod tests {
             Err(GuardianProtocolError::CensusSnapshotIdentityConflict)
         );
 
+        let concurrent_spawn_payload = spawn_payload("concurrent-census-pane");
         let concurrent_spawn = request(
             GuardianOperation::Spawn,
             guardian,
@@ -2433,7 +4665,7 @@ mod tests {
             0,
             0,
             Some(id(44)),
-            b"concurrent-census-pane",
+            &concurrent_spawn_payload,
         );
         apply_request(&mut state, &concurrent_spawn).unwrap();
 
@@ -2471,7 +4703,7 @@ mod tests {
             &mut state,
             &census(
                 52,
-                snapshot_id,
+                Uuid::nil(),
                 0,
                 GUARDIAN_MAX_CENSUS_ENTRIES,
                 GUARDIAN_MIN_CENSUS_PAGE_BYTES,
@@ -2484,8 +4716,9 @@ mod tests {
                 snapshot_id: observed_snapshot_id,
                 entries,
                 next_cursor: Some(1),
-                total_panes: 3,
-            } if observed_snapshot_id == snapshot_id
+                total_panes: 4,
+            } if observed_snapshot_id != snapshot_id
+                && !observed_snapshot_id.is_nil()
                 && entries.len() == 1
                 && entries[0].pane_id == id(20)
         ));
@@ -2530,9 +4763,8 @@ mod tests {
         let mut state = GuardianProtocolState::new(guardian).unwrap();
         for offset in 0..=GUARDIAN_MAX_CENSUS_SNAPSHOTS {
             let offset = u8::try_from(offset).expect("test snapshot offset fits u8");
-            let snapshot_id = id(70 + offset);
             let page = GuardianCensusPageRequest::new(
-                snapshot_id,
+                Uuid::nil(),
                 0,
                 1,
                 GUARDIAN_MIN_CENSUS_PAGE_BYTES,
@@ -2556,7 +4788,8 @@ mod tests {
                     entries,
                     next_cursor: None,
                     total_panes: 0,
-                } if observed == snapshot_id && entries.is_empty()
+                } if observed == Uuid::from_u128(u128::from(offset) + 1)
+                    && entries.is_empty()
             ));
         }
         assert_eq!(
@@ -2568,7 +4801,7 @@ mod tests {
             GUARDIAN_MAX_CENSUS_SNAPSHOTS
         );
 
-        let retired_snapshot = id(70);
+        let retired_snapshot = Uuid::from_u128(1);
         let stale_page = GuardianCensusPageRequest::new(
             retired_snapshot,
             1,
@@ -2736,7 +4969,7 @@ mod tests {
             1,
             1,
             Some(id(11)),
-            b"100x30",
+            &resize_payload(30, 100),
         );
         assert_eq!(
             apply_request(&mut state, &resize).unwrap(),
@@ -2804,6 +5037,7 @@ mod tests {
             "every request alias for ambiguous input must remain pinned"
         );
 
+        let query_payload = input_effect_query_payload(&input);
         let query = request(
             GuardianOperation::QueryInputEffect,
             guardian,
@@ -2813,7 +5047,7 @@ mod tests {
             1,
             0,
             Some(effect),
-            b"",
+            &query_payload,
         );
         assert_eq!(
             apply_request(&mut state, &query).unwrap(),
@@ -2841,7 +5075,7 @@ mod tests {
             1,
             2,
             Some(id(26)),
-            b"120x40",
+            &resize_payload(40, 120),
         );
         assert_eq!(
             apply_request(&mut state, &successor),
@@ -2853,7 +5087,9 @@ mod tests {
             Err(GuardianProtocolError::InputDurabilityPending)
         );
         assert_eq!(
-            state.mark_input_durable(effect).unwrap(),
+            state
+                .mark_input_durable(input_effect_identity(&input))
+                .unwrap(),
             GuardianReply::InputReceipt {
                 pane_id: pane,
                 generation: 1,
@@ -2909,7 +5145,7 @@ mod tests {
             1,
             3,
             Some(id(28)),
-            b"explicit-close",
+            b"",
         );
         assert!(apply_request(&mut state, &close).is_ok());
         let terminal_query = request(
@@ -2921,7 +5157,7 @@ mod tests {
             1,
             0,
             Some(effect),
-            b"",
+            &query_payload,
         );
         assert_eq!(
             apply_request(&mut state, &terminal_query).unwrap(),
@@ -2962,7 +5198,7 @@ mod tests {
             1,
             2,
             Some(id(31)),
-            b"80x24",
+            &resize_payload(24, 80),
         );
         assert_eq!(
             apply_request(&mut state, &skipped),
@@ -2982,7 +5218,7 @@ mod tests {
             1,
             1,
             Some(id(33)),
-            b"80x24",
+            &resize_payload(24, 80),
         );
         apply_request(&mut state, &first).unwrap();
         let repeated = request(
@@ -2994,7 +5230,7 @@ mod tests {
             1,
             1,
             Some(id(35)),
-            b"TERM",
+            &GuardianSignal::Terminate.encode(),
         );
         assert_eq!(
             apply_request(&mut state, &repeated),
@@ -3059,7 +5295,9 @@ mod tests {
         );
         assert_eq!(apply_request(&mut state, &input).unwrap(), pending_receipt);
         assert!(matches!(
-            state.mark_input_durable(effect).unwrap(),
+            state
+                .mark_input_durable(input_effect_identity(&input))
+                .unwrap(),
             GuardianReply::InputReceipt {
                 state: InputEffectState::DurableEffect,
                 ..
@@ -3135,13 +5373,15 @@ mod tests {
             1,
             0,
             Some(id(44)),
-            b"retention-close",
+            b"",
         );
         assert_eq!(
             apply_request(&mut state, &close),
             Err(GuardianProtocolError::InputDurabilityPending)
         );
-        state.mark_input_durable(effect).unwrap();
+        state
+            .mark_input_durable(input_effect_identity(&input))
+            .unwrap();
         assert_eq!(
             apply_request(&mut state, &close).unwrap(),
             GuardianReply::MutationApplied {
@@ -3185,7 +5425,9 @@ mod tests {
         );
         apply_request(&mut state, &input).unwrap();
         assert_eq!(
-            state.mark_input_terminal_rejected(effect).unwrap(),
+            state
+                .mark_input_terminal_rejected(input_effect_identity(&input))
+                .unwrap(),
             GuardianReply::InputReceipt {
                 pane_id: pane,
                 generation: 1,
@@ -3195,7 +5437,7 @@ mod tests {
             }
         );
         assert_eq!(
-            state.mark_input_durable(effect),
+            state.mark_input_durable(input_effect_identity(&input)),
             Err(GuardianProtocolError::InputDurabilityIdentityMismatch)
         );
         let successor = request(
@@ -3207,7 +5449,7 @@ mod tests {
             1,
             2,
             Some(id(53)),
-            b"100x30",
+            &resize_payload(30, 100),
         );
         assert!(apply_request(&mut state, &successor).is_ok());
     }
@@ -3233,7 +5475,7 @@ mod tests {
                 1,
                 sequence,
                 Some(id(effect_byte)),
-                b"120x40",
+                &resize_payload(40, 120),
             )
         };
         let resize_one = resize(8, 9, 1);
@@ -3271,6 +5513,63 @@ mod tests {
     }
 
     #[test]
+    fn effect_eviction_removes_newer_request_aliases_as_one_identity_unit() {
+        let guardian = id(1);
+        let mux = id(2);
+        let pane = id(3);
+        let mut state = GuardianProtocolState::new_with_receipt_capacity(guardian, 4).unwrap();
+        apply_request(&mut state, &spawn_request(guardian, mux, pane)).unwrap();
+        apply_request(
+            &mut state,
+            &claim_request(guardian, mux, pane, 0, 6, 7),
+        )
+        .unwrap();
+
+        let resize = |request_byte, effect_byte, sequence| {
+            request(
+                GuardianOperation::Resize,
+                guardian,
+                mux,
+                id(request_byte),
+                Some(pane),
+                1,
+                sequence,
+                Some(id(effect_byte)),
+                &resize_payload(40, 120),
+            )
+        };
+        let first = resize(8, 9, 1);
+        apply_request(&mut state, &first).unwrap();
+        apply_request(&mut state, &resize(10, 11, 2)).unwrap();
+
+        let mut newer_first_alias = first.clone();
+        newer_first_alias.header.request_id = id(12);
+        assert_eq!(
+            apply_request(&mut state, &newer_first_alias).unwrap(),
+            apply_request(&mut state, &first).unwrap()
+        );
+        apply_request(&mut state, &resize(13, 14, 3)).unwrap();
+        apply_request(&mut state, &resize(15, 16, 4)).unwrap();
+
+        assert!(!state.effects.contains_key(&id(9)));
+        assert!(!state.requests.contains_key(&newer_first_alias.header.request_id));
+        assert!(!state
+            .effect_request_ids
+            .values()
+            .any(|request_ids| request_ids.contains(&newer_first_alias.header.request_id)));
+        assert!(!state
+            .transient_request_order
+            .contains(&newer_first_alias.header.request_id));
+
+        let reused_effect_identity = resize(17, 9, 5);
+        apply_request(&mut state, &reused_effect_identity).unwrap();
+        assert_eq!(
+            apply_request(&mut state, &newer_first_alias),
+            Err(GuardianProtocolError::EffectIdentityConflict)
+        );
+    }
+
+    #[test]
     fn receipt_pressure_pins_ambiguous_input_until_its_terminal_disposition() {
         let guardian = id(1);
         let mux = id(2);
@@ -3298,6 +5597,7 @@ mod tests {
         );
         apply_request(&mut state, &input).unwrap();
 
+        let second_spawn_payload = spawn_payload("second-bounded-command");
         let second_spawn = request(
             GuardianOperation::Spawn,
             guardian,
@@ -3307,7 +5607,7 @@ mod tests {
             0,
             0,
             Some(id(11)),
-            b"second-bounded-command",
+            &second_spawn_payload,
         );
         apply_request(&mut state, &second_spawn).unwrap();
         apply_request(
@@ -3326,7 +5626,7 @@ mod tests {
                 1,
                 sequence,
                 Some(id(effect_byte)),
-                b"90x28",
+                &resize_payload(28, 90),
             )
         };
         apply_request(&mut state, &resize(14, 15, 1)).unwrap();
@@ -3343,7 +5643,9 @@ mod tests {
             }) if *effect == input_effect
         ));
 
-        state.mark_input_durable(input_effect).unwrap();
+        state
+            .mark_input_durable(input_effect_identity(&input))
+            .unwrap();
         assert!(state.transient_effect_order.contains(&input_effect));
         apply_request(&mut state, &resize(18, 19, 3)).unwrap();
         assert!(state.effects.contains_key(&input_effect));
@@ -3360,6 +5662,87 @@ mod tests {
             }),
             "receipt eviction must never permit a second input effect"
         );
+
+        let stale_durability_identity = input_effect_identity(&input);
+        let reused_input = request(
+            GuardianOperation::Input,
+            guardian,
+            mux,
+            id(22),
+            Some(first_pane),
+            1,
+            2,
+            Some(input_effect),
+            b"later-input-reusing-rotated-effect-uuid",
+        );
+        assert!(matches!(
+            apply_request(&mut state, &reused_input).unwrap(),
+            GuardianReply::InputReceipt {
+                pane_id,
+                generation: 1,
+                sequence: 2,
+                effect_id,
+                state: InputEffectState::AcceptedNotDurable,
+            } if pane_id == first_pane && effect_id == input_effect
+        ));
+        let stale_query_payload = input_effect_query_payload(&input);
+        let stale_query = request(
+            GuardianOperation::QueryInputEffect,
+            guardian,
+            mux,
+            id(23),
+            Some(first_pane),
+            1,
+            0,
+            Some(input_effect),
+            &stale_query_payload,
+        );
+        assert_eq!(
+            apply_request(&mut state, &stale_query),
+            Err(GuardianProtocolError::InputDurabilityIdentityMismatch),
+            "a delayed query must not observe the disposition of a newer input that reused a rotated effect UUID"
+        );
+        let current_query_payload = input_effect_query_payload(&reused_input);
+        let current_query = request(
+            GuardianOperation::QueryInputEffect,
+            guardian,
+            mux,
+            id(24),
+            Some(first_pane),
+            1,
+            0,
+            Some(input_effect),
+            &current_query_payload,
+        );
+        assert_eq!(
+            apply_request(&mut state, &current_query).unwrap(),
+            GuardianReply::InputEffect {
+                effect_id: input_effect,
+                state: InputEffectState::AcceptedNotDurable,
+            }
+        );
+        assert_eq!(
+            state.mark_input_durable(stale_durability_identity),
+            Err(GuardianProtocolError::InputDurabilityIdentityMismatch),
+            "a delayed journal acknowledgement must not complete a newer input that reused a rotated effect UUID"
+        );
+        assert!(matches!(
+            state.pane_state(first_pane),
+            Some(GuardianPaneState::LiveClaimed {
+                pending_input_effect: Some(effect),
+                ..
+            }) if *effect == input_effect
+        ));
+        assert!(matches!(
+            state
+                .mark_input_durable(input_effect_identity(&reused_input))
+                .unwrap(),
+            GuardianReply::InputReceipt {
+                sequence: 2,
+                state: InputEffectState::DurableEffect,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3378,7 +5761,13 @@ mod tests {
         let guardian = id(1);
         let mux = id(2);
         let pane = id(3);
-        let mut generation_state = GuardianProtocolState::new(guardian).unwrap();
+        let mut generation_state =
+            GuardianProtocolState::new_with_receipt_capacity(guardian, 1).unwrap();
+        apply_request(
+            &mut generation_state,
+            &spawn_request(guardian, mux, pane),
+        )
+        .unwrap();
         generation_state.panes.insert(
             pane,
             GuardianPaneState::LiveUnclaimed {
