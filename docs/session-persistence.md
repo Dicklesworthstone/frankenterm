@@ -304,7 +304,11 @@ proven:
    fingerprint rather than the effect UUID alone. After a resolved receipt
    rotates and its UUID is reused under a later fence, a delayed journal
    completion for the old fingerprint is therefore rejected without changing
-   the new pending input. A
+   the new pending input. Once a resolved receipt rotates, a query below the
+   pane's consumed sequence fence returns `disposition_unavailable`, never
+   `not_seen`; receipt eviction therefore cannot falsely authorize a resend.
+   `not_seen` is reserved for an identity whose sequence fence proves that the
+   input has not been consumed. A
    pending effect admits at most 64 distinct request aliases, so one ambiguous
    input cannot consume the global receipt ledger; excess aliases fail before
    mutating any retained receipt. When an ordinary effect rotates out of the
@@ -443,9 +447,13 @@ sequence zero, cannot signal the already-exited child, and only seals the
 retained record. The guardian rejects a stale generation, wrong live mux
 incarnation, duplicate mutation sequence with different bytes, mutation
 sequence gap, or exhausted sequence before performing an effect. Input
-acknowledgements distinguish `not_seen`, `accepted_not_durable`,
-`durable_effect`, and `terminal_rejected`; only `not_seen` permits a resend of
-the same idempotency UUID. Resize, signal, close, and checkpoint operations
+effect queries distinguish `not_seen`, `accepted_not_durable`,
+`durable_effect`, `terminal_rejected`, and `disposition_unavailable`; only
+`not_seen` permits a resend of the same idempotency UUID, while
+`disposition_unavailable` requires operator/runtime reconciliation without
+replay. A newly accepted input acknowledgement can contain only one of the
+three applied-effect states, never either query-only state. Resize, signal,
+close, and checkpoint operations
 have the same request-digest replay rule, so an ambiguous response is queried
 or replayed by identity rather than converted into a second effect.
 

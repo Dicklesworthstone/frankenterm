@@ -900,6 +900,7 @@ pub enum InputEffectState {
     AcceptedNotDurable,
     DurableEffect,
     TerminalRejected,
+    DispositionUnavailable,
 }
 
 /// Exact authority for completing one authenticated input effect.
@@ -992,6 +993,7 @@ impl InputEffectState {
             Self::AcceptedNotDurable => 1,
             Self::DurableEffect => 2,
             Self::TerminalRejected => 3,
+            Self::DispositionUnavailable => 4,
         }
     }
 
@@ -1001,6 +1003,7 @@ impl InputEffectState {
             1 => Ok(Self::AcceptedNotDurable),
             2 => Ok(Self::DurableEffect),
             3 => Ok(Self::TerminalRejected),
+            4 => Ok(Self::DispositionUnavailable),
             _ => Err(GuardianProtocolError::InvalidReplyPayload),
         }
     }
@@ -1385,7 +1388,12 @@ impl GuardianReply {
                         && *generation > 0
                         && *sequence > 0
                         && !effect_id.is_nil()
-                        && *state != InputEffectState::NotSeen
+                        && matches!(
+                            state,
+                            InputEffectState::AcceptedNotDurable
+                                | InputEffectState::DurableEffect
+                                | InputEffectState::TerminalRejected
+                        )
                 }
                 Self::MutationApplied {
                     pane_id,
@@ -2498,7 +2506,7 @@ impl GuardianProtocolState {
             .ok_or(GuardianProtocolError::MissingEffectQueryIdentity)?;
         let query = GuardianInputEffectQuery::decode(&request.payload)?;
         let state = match self.effects.get(&effect_id) {
-            None => InputEffectState::NotSeen,
+            None => self.missing_input_effect_state(pane_id, query.sequence)?,
             Some(stored)
                 if stored.fingerprint.pane_id == pane_id
                     && stored.fingerprint.operation == GuardianOperation::Input
@@ -2513,6 +2521,34 @@ impl GuardianProtocolState {
             }
         };
         Ok(GuardianReply::InputEffect { effect_id, state })
+    }
+
+    fn missing_input_effect_state(
+        &self,
+        pane_id: Uuid,
+        sequence: u64,
+    ) -> Result<InputEffectState, GuardianProtocolError> {
+        match self.panes.get(&pane_id) {
+            Some(GuardianPaneState::LiveClaimed { next_sequence, .. }) => {
+                if sequence < *next_sequence {
+                    Ok(InputEffectState::DispositionUnavailable)
+                } else {
+                    Ok(InputEffectState::NotSeen)
+                }
+            }
+            Some(GuardianPaneState::LiveUnclaimed { generation: 0 })
+            | Some(GuardianPaneState::ExitedUnclaimed { generation: 0, .. })
+            | Some(GuardianPaneState::ClosedTerminal { generation: 0, .. }) => {
+                Ok(InputEffectState::NotSeen)
+            }
+            Some(
+                GuardianPaneState::LiveUnclaimed { .. }
+                | GuardianPaneState::ExitedUnclaimed { .. }
+                | GuardianPaneState::ClosedTerminal { .. }
+                | GuardianPaneState::Quarantined { .. },
+            ) => Ok(InputEffectState::DispositionUnavailable),
+            None => Err(GuardianProtocolError::PaneNotFound(pane_id)),
+        }
     }
 
     fn require_effect_query_authority(
@@ -5006,6 +5042,26 @@ mod tests {
             Some(effect),
             b"hello",
         );
+        let query_payload = input_effect_query_payload(&input);
+        let query = request(
+            GuardianOperation::QueryInputEffect,
+            guardian,
+            mux,
+            id(22),
+            Some(pane),
+            1,
+            0,
+            Some(effect),
+            &query_payload,
+        );
+        assert_eq!(
+            apply_request(&mut state, &query).unwrap(),
+            GuardianReply::InputEffect {
+                effect_id: effect,
+                state: InputEffectState::NotSeen,
+            },
+            "only an effect at or beyond the unconsumed sequence fence may be reported as safe to resend"
+        );
         let receipt = apply_request(&mut state, &input).unwrap();
         assert_eq!(
             receipt,
@@ -5037,18 +5093,6 @@ mod tests {
             "every request alias for ambiguous input must remain pinned"
         );
 
-        let query_payload = input_effect_query_payload(&input);
-        let query = request(
-            GuardianOperation::QueryInputEffect,
-            guardian,
-            mux,
-            id(22),
-            Some(pane),
-            1,
-            0,
-            Some(effect),
-            &query_payload,
-        );
         assert_eq!(
             apply_request(&mut state, &query).unwrap(),
             GuardianReply::InputEffect {
@@ -5654,6 +5698,26 @@ mod tests {
             !state.effects.contains_key(&input_effect),
             "a resolved input may rotate only after its sequence fence is durable"
         );
+        let evicted_query_payload = input_effect_query_payload(&input);
+        let evicted_query = request(
+            GuardianOperation::QueryInputEffect,
+            guardian,
+            mux,
+            id(31),
+            Some(first_pane),
+            1,
+            0,
+            Some(input_effect),
+            &evicted_query_payload,
+        );
+        assert_eq!(
+            apply_request(&mut state, &evicted_query).unwrap(),
+            GuardianReply::InputEffect {
+                effect_id: input_effect,
+                state: InputEffectState::DispositionUnavailable,
+            },
+            "an evicted receipt below the durable sequence fence must never masquerade as safe to resend"
+        );
         assert_eq!(
             apply_request(&mut state, &input),
             Err(GuardianProtocolError::RepeatedSequence {
@@ -5720,6 +5784,18 @@ mod tests {
                 effect_id: input_effect,
                 state: InputEffectState::AcceptedNotDurable,
             }
+        );
+        assert_eq!(
+            GuardianReply::InputReceipt {
+                pane_id: first_pane,
+                generation: 1,
+                sequence: 1,
+                effect_id: input_effect,
+                state: InputEffectState::DispositionUnavailable,
+            }
+            .encode_for_operation(GuardianOperation::Input),
+            Err(GuardianProtocolError::InvalidReplyPayload),
+            "receipt-window uncertainty is a query result, never an acknowledgement of a newly accepted input"
         );
         assert_eq!(
             state.mark_input_durable(stale_durability_identity),

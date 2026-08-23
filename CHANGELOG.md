@@ -211,7 +211,10 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   an evicted receipt cannot complete a newer input that reused its UUID. Input
   effect queries now carry the original input sequence and payload digest in a
   fixed tagged payload; UUID reuse with a different fingerprint fails closed
-  rather than returning the newer input's disposition. Runtime
+  rather than returning the newer input's disposition. A rotated receipt below
+  the pane's consumed sequence fence reports `disposition_unavailable` instead
+  of the resend-authorizing `not_seen`, and that uncertainty state is rejected
+  from newly accepted input acknowledgements. Runtime
   effects use a separate transactional API: authentication, generation,
   sequence, capacity, and idempotency checks precede the callback; a failed
   zero-effect callback neither publishes a spawn, advances its lease, nor
