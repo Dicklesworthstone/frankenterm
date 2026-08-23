@@ -531,11 +531,19 @@ preflight_checks() {
 
 check_installed_version() {
   local target_ver="$1"
+  # Fail closed before invoking either installed component or entering a
+  # pipeline.  A missing pipeline utility must not be discovered only after one
+  # side of the process family has already been executed.
+  command -v head >/dev/null 2>&1 || return 1
+  command -v grep >/dev/null 2>&1 || return 1
+  command -v sed >/dev/null 2>&1 || return 1
+  command -v sort >/dev/null 2>&1 || return 1
+  command -v awk >/dev/null 2>&1 || return 1
   [ -f "$DEST/ft" ] && [ ! -L "$DEST/ft" ] && [ -x "$DEST/ft" ] || return 1
   [ -f "$DEST/frankenterm-mux-server" ] && \
     [ ! -L "$DEST/frankenterm-mux-server" ] && \
     [ -x "$DEST/frankenterm-mux-server" ] || return 1
-  local ft_cur mux_cur ft_identity mux_identity
+  local ft_cur mux_cur ft_identity mux_identity expected_identity_suffix
   ft_cur=$("$DEST/ft" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
   mux_cur=$("$DEST/frankenterm-mux-server" --version 2>/dev/null | head -1 | awk '{print $2}' || echo "")
   [ -z "$ft_cur" ] && return 1
@@ -548,9 +556,6 @@ check_installed_version() {
   # Semver is not a process-family identity: two rebuilds of the same tag can
   # carry different codec or source bytes. Admit the fast path only when each
   # binary exposes one sealed marker and those markers differ solely by role.
-  command -v grep >/dev/null 2>&1 || return 1
-  command -v sed >/dev/null 2>&1 || return 1
-  command -v sort >/dev/null 2>&1 || return 1
   ft_identity=$(LC_ALL=C grep -aoE \
     'FT_ATOMIC_COMPONENT_IDENTITY_V1:[0-9a-f]{64}:ft:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*;' \
     "$DEST/ft" 2>/dev/null | sed 's/:ft:/:ROLE:/' | sort -u || true)
@@ -562,7 +567,12 @@ check_installed_version() {
   [ -n "$mux_identity" ] || return 1
   [ "$(printf '%s\n' "$ft_identity" | awk 'END { print NR }')" -eq 1 ] || return 1
   [ "$(printf '%s\n' "$mux_identity" | awk 'END { print NR }')" -eq 1 ] || return 1
-  [ "$ft_identity" = "$mux_identity" ]
+  [ "$ft_identity" = "$mux_identity" ] || return 1
+  # Matching stale or non-shipping markers are still not the requested release.
+  # TARGET is resolved by detect_platform before this function can run.
+  [ -n "${TARGET:-}" ] || return 1
+  expected_identity_suffix="${TARGET}:release-interactive:${stripped};"
+  [ "${ft_identity##*:ROLE:}" = "$expected_identity_suffix" ]
 }
 
 # ───────────────────────────────────────────────────────────────────────────

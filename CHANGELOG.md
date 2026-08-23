@@ -57,6 +57,19 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   unbounded error into a toast. Fleet-wide auto-connect outages retain one
   diagnostic per failed domain but coalesce the interactive notification, so a
   large failure set cannot create a persistent-toast storm.
+- Keeps attached remote-domain reconnect supervision alive indefinitely by
+  default with capped backoff and one reused connection window. The finite
+  dial/cycle retry budget remains available only as an explicit operator
+  opt-in, so a long outage no longer converts the default supervisor into
+  permanent detach. Backoff doubling saturates before applying the configured
+  ceiling, so even an extreme duration setting cannot overflow and panic the
+  supervisor. Configuration loading now rejects a zero base delay, a maximum
+  below the base, and a zero healthy-session fence; those values previously
+  enabled a zero-delay CPU spin, a backwards backoff jump, or accidental
+  defeat of an explicitly finite cycle budget. A transient topology-scheduler admission rejection after
+  transport connect now fences that exact successor generation and routes it
+  through ordinary retirement/retry instead of silently terminating the
+  unlimited supervisor.
 - Ships `ft` and `frankenterm-mux-server` as one sealed release identity and
   prevents remote setup from activating one side while an incompatible mux is
   still live. Verified local and release-tag pairs are staged under matching
@@ -105,7 +118,14 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   no-clobber discipline and reject dangling symlinks or non-directory targets.
   The already-installed fast path now runs inside the installer lock and
   requires one identical sealed build identity across `ft` and the mux server;
-  matching semver strings from different builds can no longer skip repair.
+  matching semver strings from different builds can no longer skip repair. The
+  shared marker must also name the resolved target, `release-interactive`
+  profile, and requested version, so a mutually consistent stale, debug, or
+  translated-target pair cannot suppress repair. Its version/marker pipeline
+  prerequisites fail closed before either installed component executes. A
+  shell regression test covers exact-pair admission, mismatched-build,
+  stale-version, non-shipping-profile, wrong-target, and conflicting
+  multi-marker rejection.
 - Automates a verified pre-upgrade content dump through the currently installed
   codec-compatible remote CLI whenever that release supports `session dump`;
   legacy clients emit an explicit unavailable warning without fabricating proof.
@@ -121,9 +141,37 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   Compact payload hashing and pretty envelope serialization both write through
   a hard byte ceiling, so JSON escape expansion fails before exceeding the
   artifact memory envelope rather than being checked only after allocation.
-  Payload verification and topology fingerprints use bounded streaming hashes
-  over borrowed metadata, avoiding a second artifact-sized checksum buffer or
-  cloned topology strings.
+  Payload verification and topology fingerprints use bounded streaming hashes.
+  The topology projection hashes the same redacted canonical domain/workspace
+  strings published in the artifact rather than retaining a dictionary-testable
+  digest of pre-redaction values. The frozen v1 verifier requires one canonical pretty
+  encoding plus exact field sets for the envelope, payload, metadata, content,
+  topology, and each error variant; duplicate or unknown JSON members cannot
+  smuggle discarded unredacted bytes behind a valid recomputed checksum. The
+  verifier independently reapplies the canonical redactor to every serialized
+  string value and requires a fixed point, so a checksum-valid writer cannot inject a
+  recognizable secret behind a truthful-looking redaction flag; rejection
+  diagnostics do not echo the offending material. The
+  canonical comparison is streamed against the bounded input rather than
+  allocating a second artifact-sized output buffer. Before the allocating JSON
+  parse, a zero-retention streaming preflight enforces global node, map-entry,
+  sequence-entry, decoded-string-byte, and nesting-depth ceilings, so a
+  byte-bounded artifact cannot amplify into an unbounded in-memory value tree.
+  Offline verification also checks the pane metadata schema,
+  source/consistency contract, exactly one capture-or-error outcome per
+  initially listed pane, exact equality with a sorted unique initial-pane-ID
+  manifest, unique capture-error ownership, aggregate-limit
+  arithmetic, captured-domain inclusion, sorted domain summary, topology-fence
+  kind and scope, recomputation of complete-capture fingerprints from canonical
+  redacted pane metadata, canonical initial/final fingerprints, and agreement among
+  the completeness flag, topology stability, counts, and recorded errors; a
+  checksum-valid but internally false continuity claim is rejected. `session
+  dump` releases its producer-side pane-text tree before publication, then
+  releases the artifact-sized serialization buffer and runs that same offline
+  verifier against the durably published file before it can emit success,
+  comparing the independent verifier and producer receipts; an
+  invalid artifact is retained for diagnosis but never reported as a valid
+  pre-upgrade safety gate.
 - Carries stable pane UUIDs into mux panes and continuously persists evicted
   styled scrollback rows with synchronized sequence authority, checksummed
   manifests and records, torn-tail recovery, bounded compaction, and optional
@@ -138,7 +186,12 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   source content for write; and never sends bytes into a live PTY.
 - Freezes the guardian v1 authenticated request/response envelopes and pure
   fencing state machine: bounded HMAC-before-decode framing, exact response
-  correlation, durable pane UUIDs, immutable byte-capped census snapshots,
+  correlation, a token-authenticated payload-free `Hello` bootstrap that is
+  the sole nil guardian-incarnation scope and returns the current nonzero
+  incarnation in a fixed typed payload, durable pane UUIDs, immutable
+  byte-capped census snapshots,
+  guardian-allocated snapshot identities (nil only as the first-page request
+  marker) so a rotated UUID can never recreate a different pane view,
   monotonic lease generations and mutation sequences, idempotent effect
   identities, ambiguous-input reconciliation, exit-time replay authority, and
   terminal exhaustion quarantine. Mutation
@@ -149,8 +202,44 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   pressure, and acknowledgement updates their retained request aliases through
   a reverse index instead of a fleet-wide scan. A per-effect alias ceiling
   prevents one ambiguous input from monopolizing the guardian's global receipt
-  budget while preserving already admitted reconciliation identities. These
-  are protocol/state proofs only; they do not yet claim live PTY continuity.
+  budget while preserving already admitted reconciliation identities. Receipt
+  rotation evicts an effect and every surviving request alias as one coherent
+  identity unit, so a newer alias cannot outlive its effect fingerprint and
+  later disagree with a reused bounded-window effect UUID. Runtime durability
+  completion is likewise bound to the full authenticated pane/mux/generation/
+  sequence/effect/payload-digest fingerprint, so a delayed acknowledgement for
+  an evicted receipt cannot complete a newer input that reused its UUID. Input
+  effect queries now carry the original input sequence and payload digest in a
+  fixed tagged payload; UUID reuse with a different fingerprint fails closed
+  rather than returning the newer input's disposition. Runtime
+  effects use a separate transactional API: authentication, generation,
+  sequence, capacity, and idempotency checks precede the callback; a failed
+  zero-effect callback neither publishes a spawn, advances its lease, nor
+  evicts any historical replay receipt; and
+  exact replays never invoke the callback again. Ambiguous input is explicitly
+  committed as accepted-not-durable for exact reconciliation, never exposed as
+  a safely retryable failure. Spawn requests carry a bounded serialized
+  `CommandBuilder` plus fixed PTY geometry and require its one canonical v1
+  byte encoding, so ignored JSON fields cannot become an authenticated hidden
+  payload. Resize and signal requests use fixed operation-tagged payloads, and
+  every currently payload-free control
+  operation—including checkpoint and replay—rejects hidden trailing bytes.
+  Success replies likewise use operation-typed fixed
+  binary payloads, and the public envelope can only be created through the
+  typed success/rejection constructors; the common encoder and decoder both
+  revalidate operation scope, reply schema, and response identity. Bounded
+  fixed-width census rows preserve the full `i32`
+  exit-status range with an explicit presence bit, and the correlated client
+  rechecks pane, effect, generation, sequence, census cursor, and the exact
+  requesting page's entry and encoded-byte ceilings inside the authenticated
+  payload before consuming it. The server-side success constructor applies
+  those same per-request page ceilings, so it cannot authenticate an oversized
+  page merely because the page remains under the protocol-global cap. These are
+  protocol/state proofs only; they do not yet claim live PTY continuity.
+  Non-success responses now use fixed content-free rejection codes whose
+  transient/terminal classification is authenticated and checked before the
+  correlated client exposes it; arbitrary runtime error strings never become
+  guardian control-plane payloads.
 
 ### Known continuity boundary
 
