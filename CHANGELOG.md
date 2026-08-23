@@ -184,6 +184,15 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   symlink, privacy, checksum, identity, sequence, replacement-race, and resource
   violations; excludes uncommitted torn tails; reapplies redaction; never opens
   source content for write; and never sends bytes into a live PTY.
+- Introduces the guardian raw-output journal substrate with mandatory
+  XChaCha20-Poly1305 encryption, pane- and segment-bound record digests, strict
+  byte/record admission caps, synchronized append receipts, poisoned recovery
+  after ambiguous I/O, and read-only preservation of incomplete crash tails.
+  Segment headers enforce a globally contiguous predecessor
+  segment/sequence/digest chain, and a newly created segment cannot accept
+  output before both its file and parent directory entry are synchronized.
+  This is storage/format substrate only; it is not yet wired to a live guardian
+  PTY reader and does not claim mux-crash process continuity.
 - Freezes the guardian v1 authenticated request/response envelopes and pure
   fencing state machine: bounded HMAC-before-decode framing, exact response
   correlation, a token-authenticated payload-free `Hello` bootstrap that is

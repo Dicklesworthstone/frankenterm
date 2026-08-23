@@ -320,9 +320,15 @@ proven:
    it as one identity unit; an alias can never outlive and disagree with its
    effect fingerprint.
 6. Raw PTY output is appended to a synchronized, checksummed sequence log before
-   acknowledgement to the mux. The guardian retains a bounded replay window and
-   terminal-state checkpoints that bind parser version, rows/columns, raw-output
-   sequence, hot viewport, cold-scrollback base sequence, and a content digest.
+   acknowledgement to the mux. Exact raw bytes are mandatory-encrypted at rest;
+   redaction would change terminal semantics, so no plaintext persistence mode is
+   permitted. Bounded segments carry nonzero identities, globally contiguous
+   output sequences, and an exact predecessor segment/sequence/terminal-digest
+   chain so rollover can neither reuse an output identity nor hide a gap. A new
+   segment cannot accept output until its file and parent directory entry are
+   synchronized. The guardian retains a bounded replay window and terminal-state
+   checkpoints that bind parser version, rows/columns, raw-output sequence, hot
+   viewport, cold-scrollback base sequence, and a content digest.
    A checkpoint must either serialize the complete incremental parser state or
    prove that its raw-output sequence ends at a parser ground-state boundary;
    screen rows alone cannot represent a partial CSI, OSC, or DCS sequence.
