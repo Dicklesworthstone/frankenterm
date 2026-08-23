@@ -48,6 +48,7 @@ use frankenterm_core::frame_budget_a11y_gate as frame_budget_a11y;
 use frankenterm_core::session_pane_state::TerminalState;
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::accessibility_preferences::config_with_accessibility_palette;
+use frankenterm_gui::domain_reconnect_manifest::{self, DomainAttachmentIntent};
 use frankenterm_gui::floating_panes::{
     GuiFloatingPaneController, emit_floating_pane_a11y_messages, floating_pane_id_to_mux_pane_id,
     mux_pane_id_to_floating_pane_id,
@@ -7101,7 +7102,71 @@ impl TermWindow {
                 let domain = self
                     .mux_or_err("detach domain")?
                     .resolve_spawn_tab_domain(Some(pane.pane_id()), domain)?;
-                domain.detach()?;
+                let domain_name = domain.domain_name().to_string();
+                crate::cancel_auto_connect_supervisor();
+                match promise::spawn::try_reserve_main_thread(
+                    promise::spawn::MainThreadServiceClass::Topology,
+                    8 * 1024,
+                ) {
+                    promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
+                        reservation
+                            .spawn_local(async move {
+                                let result = async {
+                                    let persisted_name = domain_name.clone();
+                                    promise::spawn::spawn_into_new_thread(move || {
+                                        domain_reconnect_manifest::set_intent(
+                                            &persisted_name,
+                                            DomainAttachmentIntent::Detached,
+                                        )
+                                        .map(|_| ())
+                                        .map_err(anyhow::Error::new)
+                                    })
+                                    .await?;
+                                    // Keep the exact admitted domain generation
+                                    // resolved by the operator action alive across
+                                    // persistence. A config reload may publish a
+                                    // replacement with the same name while the
+                                    // worker fsyncs; name-based re-resolution here
+                                    // would detach that successor instead.
+                                    domain.detach()?;
+                                    Result::<(), anyhow::Error>::Ok(())
+                                }
+                                .await;
+                                if let Err(error) = result {
+                                    let message = crate::bounded_gui_failure_message(
+                                        "Failed to persist and detach domain",
+                                        &error,
+                                    );
+                                    frankenterm_gui::gui_debug_log::record(
+                                        log::Level::Error,
+                                        "frankenterm_gui::manual_domain_detach",
+                                        message.clone(),
+                                    );
+                                    log::error!("{message}");
+                                    persistent_toast_notification("Domain detach failed", &message);
+                                }
+                                crate::schedule_auto_connect_domains();
+                            })
+                            .detach();
+                    }
+                    rejected => {
+                        let error = anyhow!(
+                            "main-thread scheduler rejected detach before persistence or mutation: {rejected:?}"
+                        );
+                        let message = crate::bounded_gui_failure_message(
+                            "Failed to detach domain",
+                            &error,
+                        );
+                        frankenterm_gui::gui_debug_log::record(
+                            log::Level::Error,
+                            "frankenterm_gui::manual_domain_detach",
+                            message.clone(),
+                        );
+                        log::error!("{message}");
+                        persistent_toast_notification("Domain detach failed", &message);
+                        crate::schedule_auto_connect_domains();
+                    }
+                }
             }
             AttachDomain(domain) => {
                 let window = self.mux_window_id;

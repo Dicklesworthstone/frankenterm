@@ -31,6 +31,20 @@ pub async fn attach_domain_to_window_or_spawn_recovery(
     let domain_name = domain.domain_name().to_string();
     let owner_client_id = mux.active_identity();
 
+    if domain.downcast_ref::<frankenterm_client::domain::ClientDomain>().is_some() {
+        let persisted_domain_name = domain_name.clone();
+        promise::spawn::spawn_into_new_thread(move || {
+            frankenterm_gui::domain_reconnect_manifest::set_intent(
+                &persisted_domain_name,
+                frankenterm_gui::domain_reconnect_manifest::DomainAttachmentIntent::Attached,
+            )
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
+        })
+        .await
+        .context("persisting domain attachment intent before attach")?;
+    }
+
     domain
         .attach(&mux, owner_client_id, Some(window_id))
         .await

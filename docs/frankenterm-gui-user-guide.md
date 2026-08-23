@@ -180,6 +180,34 @@ SSH domain fields (optional per entry):
 - `connect_automatically`
 - `default_prog`
 
+### Remembered domain attachments
+
+FrankenTerm remembers an explicit remote-domain attach or detach across GUI
+restarts. This is a desired-attachment preference, not a serialized network
+connection or a promise that an incompatible or unavailable mux can be reached.
+The built-in reconnect supervisor applies three states:
+
+- no remembered record: follow the domain's `connect_automatically` setting;
+- remembered attached: keep retrying the configured domain even when
+  `connect_automatically` is false;
+- remembered detached: do not auto-connect that domain, even when its
+  `connect_automatically` setting is true.
+
+An explicit later attach or detach replaces the remembered choice before the
+mux mutation begins, so an unreachable domain can still retain the operator's
+desired state. A Lua script that later calls `domain:attach()` is itself an
+explicit attach and changes a remembered detached state back to attached; a
+periodic user-authored Lua watchdog therefore remains authoritative over its
+own actions.
+
+The preference is stored under FrankenTerm's mode-0700 private data directory
+in two alternating, mode-0600 checksummed files. It stores only
+domain-separated SHA-256 fingerprints of domain aliases, never raw aliases,
+addresses, usernames, socket
+paths, or credentials. If neither slot is valid, FrankenTerm reports the fault
+and falls back only to explicit `connect_automatically = true` configuration;
+damaged optional preference state cannot silently broaden connection authority.
+
 ### Accessibility Timing
 
 `click_interval_ms` controls how much time FrankenTerm allows between successive clicks when deciding whether a gesture counts as a double-click or triple-click selection. The default is `500`, which matches common desktop defaults, but operators who need a slower cadence can raise it to `1000`-`2000` in `frankenterm.toml`.

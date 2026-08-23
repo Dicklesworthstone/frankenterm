@@ -5,6 +5,7 @@
 
 pub mod accessibility_preferences;
 pub mod adaptive_fps_loop;
+pub mod domain_reconnect_manifest;
 pub mod floating_panes;
 pub mod gpu_regression;
 pub mod gpu_regression_fuzz;

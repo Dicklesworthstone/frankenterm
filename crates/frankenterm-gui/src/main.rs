@@ -96,7 +96,11 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
-use frankenterm_gui::window_state_persist;
+use frankenterm_gui::{
+    domain_reconnect_manifest,
+    domain_reconnect_manifest::DomainAttachmentIntent,
+    window_state_persist,
+};
 
 static AUTO_CONNECT_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUTO_CONNECT_STARTUP_READY: AtomicBool = AtomicBool::new(false);
@@ -503,6 +507,11 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
             promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
                 reservation
                     .spawn(async move {
+                        // Fence the retired retry generation before changing
+                        // the domain registry. Otherwise it can acquire and
+                        // attach an old same-name registration while the
+                        // replacement topology is being published.
+                        cancel_auto_connect_supervisor();
                         if let Err(err) = update_mux_domains(&config::configuration()) {
                             let message = bounded_gui_failure_message(
                                 "Failed to update mux domains after configuration reload",
@@ -518,6 +527,14 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
                                 "Domain configuration reload failed",
                                 &message,
                             );
+                            if AUTO_CONNECT_ENABLED.load(Ordering::Acquire) {
+                                // Rebuild supervision from whichever registry
+                                // state survived the failed update; leaving the
+                                // old task cancelled forever would convert a
+                                // transient reload failure into permanent loss
+                                // of reconnect service.
+                                schedule_auto_connect_domains();
+                            }
                         } else if AUTO_CONNECT_ENABLED.load(Ordering::Acquire) {
                             schedule_auto_connect_domains();
                         }
@@ -709,7 +726,7 @@ where
     failures
 }
 
-fn auto_connect_domain_names(mux: &Arc<Mux>) -> Vec<String> {
+fn configured_auto_connect_domain_names(mux: &Arc<Mux>) -> Vec<String> {
     mux.iter_domains()
         .into_iter()
         .filter_map(|domain| {
@@ -719,6 +736,23 @@ fn auto_connect_domain_names(mux: &Arc<Mux>) -> Vec<String> {
                 .map(|_| domain.domain_name().to_string())
         })
         .collect()
+}
+
+fn auto_connect_domain_names(
+    mux: &Arc<Mux>,
+) -> Result<Vec<String>, domain_reconnect_manifest::DomainReconnectManifestError> {
+    let manifest = domain_reconnect_manifest::load()?;
+    Ok(mux
+        .iter_domains()
+        .into_iter()
+        .filter_map(|domain| {
+            domain.downcast_ref::<ClientDomain>().and_then(|client| {
+                manifest
+                    .should_connect(domain.domain_name(), client.connect_automatically())
+                    .then(|| domain.domain_name().to_string())
+            })
+        })
+        .collect())
 }
 
 async fn attempt_auto_connect_round(
@@ -736,10 +770,7 @@ async fn attempt_auto_connect_round(
                     // complete rather than retryable.
                     return Ok(());
                 };
-                let Some(client) = domain.downcast_ref::<ClientDomain>() else {
-                    return Ok(());
-                };
-                if !client.connect_automatically() {
+                if domain.downcast_ref::<ClientDomain>().is_none() {
                     return Ok(());
                 }
                 let owner_client_id = mux.active_identity();
@@ -983,7 +1014,26 @@ fn schedule_auto_connect_domains() {
         cancel_auto_connect_supervisor();
         return;
     };
-    let pending = auto_connect_domain_names(&mux);
+    let pending = match auto_connect_domain_names(&mux) {
+        Ok(pending) => pending,
+        Err(error) => {
+            // A damaged optional preference must never become connection
+            // authority. Explicit configuration remains usable, while the
+            // privacy-safe error tells the operator that remembered intent
+            // was ignored rather than silently widening it.
+            let message = format!(
+                "remembered domain attachment intent is unavailable and was ignored; only explicit connect_automatically configuration will be used: {error}"
+            );
+            frankenterm_gui::gui_debug_log::record(
+                log::Level::Error,
+                "frankenterm_gui::auto_connect",
+                message.clone(),
+            );
+            log::error!("{message}");
+            persistent_toast_notification("Remembered domain connections unavailable", &message);
+            configured_auto_connect_domain_names(&mux)
+        }
+    };
     if pending.is_empty() {
         cancel_auto_connect_supervisor();
         return;
@@ -1200,6 +1250,19 @@ async fn async_run_terminal_gui(
             };
 
             let remote_open_result = async {
+                if domain.downcast_ref::<ClientDomain>().is_some() {
+                    let persisted_domain_name = domain.domain_name().to_string();
+                    promise::spawn::spawn_into_new_thread(move || {
+                        domain_reconnect_manifest::set_intent(
+                            &persisted_domain_name,
+                            DomainAttachmentIntent::Attached,
+                        )
+                        .map(|_| ())
+                        .map_err(anyhow::Error::new)
+                    })
+                    .await
+                    .context("persisting explicitly requested domain attachment intent")?;
+                }
                 let owner_client_id = mux.active_identity();
                 domain
                     .attach(&mux, owner_client_id, Some(window_id))
@@ -1651,6 +1714,24 @@ fn initialize_window_state_persistence() {
             failure.code()
         );
     }
+
+    mux_lua::install_domain_intent_recorder(Arc::new(|domain_name, intent| {
+        Box::pin(async move {
+            if domain_name == "local" {
+                return Ok(());
+            }
+            let intent = match intent {
+                mux_lua::DomainIntent::Attached => DomainAttachmentIntent::Attached,
+                mux_lua::DomainIntent::Detached => DomainAttachmentIntent::Detached,
+            };
+            promise::spawn::spawn_into_new_thread(move || {
+                domain_reconnect_manifest::set_intent(&domain_name, intent)
+                    .map(|_| ())
+                    .map_err(anyhow::Error::new)
+            })
+            .await
+        })
+    }));
 }
 
 fn run_gui_event_loop(gui: Rc<crate::frontend::GuiFrontEnd>) -> anyhow::Result<()> {
