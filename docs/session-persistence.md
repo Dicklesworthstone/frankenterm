@@ -370,6 +370,38 @@ proven:
    the pane into topology. A gap, unsupported parser state, or digest mismatch
    keeps the live writer unreachable and quarantines the pane for transcript
    recovery instead of presenting invented state.
+
+#### Canonical terminal checkpoint v1 inventory
+
+The terminal payload is a semantic model, not a dump of Rust struct memory.
+Its canonical encoding uses fixed field order and sorted map keys so equivalent
+state has one byte representation and one digest. Version 1 must cover all of
+the following before it can be published:
+
+| Class | Required state |
+|---|---|
+| Boundary | Format version, durable pane UUID, parser compatibility identity, immutable output segment UUID, synchronized output record sequence and digest, rows, columns, payload length, and payload digest. |
+| Screens | Primary and alternate line/cell/attribute content, stable-row base, active-screen selector, physical geometry, saved cursor for each screen, keyboard encoding stacks, and wrap markers. |
+| Performer | Active pen and cursor, pending wrap, insert/autowrap/origin/reverse/synchronized-output modes, horizontal and vertical margins, saved DEC modes, keypad/cursor-key/newline/bracketed-paste modes, mouse modes, charset selection, tab stops, and keyboard encoding. |
+| Metadata | Window/icon title, progress, current directory, palette overrides, sixel color registers, user variables, terminal program/version, and sequence numbers. |
+| Unicode and layout | Active Unicode width version, bounded custom width map, Unicode-version stack, bidi state, focus/lost-focus fences, pixel geometry, and DPI. |
+| Graphics | Every referenced image and out-of-band Kitty placement/transmission state under explicit byte/count/frame caps, or an explicit unsupported-graphics rejection. Silently omitting graphics is forbidden. |
+
+Configuration objects, PTY writers, clipboard/download/notification/device
+handlers, caches, worker threads, telemetry counters, and scheduler state are
+capabilities or derived state and are never deserialized from a checkpoint.
+Restore constructs a new terminal behind a discard writer and inert handlers,
+validates and installs only the semantic model, replays the authenticated raw
+suffix, compares the resulting canonical semantic digest, and only then swaps
+in live capabilities atomically.
+
+The decoder applies an outer payload-byte ceiling before allocation, then
+independent row, cell, stack, map, string, custom-width, image, placement, and
+frame ceilings with checked arithmetic. Unknown versions, duplicate or
+noncanonical map keys, invalid enum tags, impossible geometry/margins/cursors,
+line sequence numbers newer than the terminal sequence, incomplete graphics,
+trailing bytes, and any canonical re-encode mismatch are terminal corruption.
+The last verified checkpoint and raw-log prefix remain untouched for recovery.
 8. Guardian census is the post-crash process authority; the last committed mux
    topology manifest supplies window/tab/workspace placement. Reconciliation is
    by durable pane UUID, never by mux-local numeric pane ID or PID.
