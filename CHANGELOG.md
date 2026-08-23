@@ -57,6 +57,17 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   unbounded error into a toast. Fleet-wide auto-connect outages retain one
   diagnostic per failed domain but coalesce the interactive notification, so a
   large failure set cannot create a persistent-toast storm.
+- Remembers explicit remote-domain attachment intent across GUI restarts in a
+  bounded, checksummed two-slot manifest. Domain aliases are persisted only as
+  domain-separated SHA-256 fingerprints; the authority directory is mode 0700,
+  while private files are mode 0600, no-follow, single-link, owner-matched, and
+  synchronized before the new generation becomes authoritative. A remembered
+  attach overrides a false `connect_automatically` default, a remembered detach
+  suppresses the built-in supervisor, and an absent record continues to follow configuration. Manual,
+  command-palette, and Lua attach/detach paths durably publish intent before
+  mutating the mux, while a torn inactive slot falls back to the last verified
+  generation. Corrupt optional state fails visibly and leaves only explicit
+  `connect_automatically = true` configuration eligible for automatic dialing.
 - Keeps attached remote-domain reconnect supervision alive indefinitely by
   default with capped backoff and one reused connection window. The finite
   dial/cycle retry budget remains available only as an explicit operator
@@ -191,6 +202,16 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   Segment headers enforce a globally contiguous predecessor
   segment/sequence/digest chain, and a newly created segment cannot accept
   output before both its file and parent directory entry are synchronized.
+  Adds the descriptor/capability-based encryption-key authority: fallible OS
+  entropy, zeroizing in-memory keys, private no-follow single-link key files,
+  contiguous immutable activation generations, crash-safe append-only rotation,
+  and historical-key lookup for old segments. Referenced weak, truncated,
+  symlinked, hard-linked, permission-unsafe, missing, or identity-mismatched keys
+  fail closed; an incomplete unactivated rotation leaf is preserved without
+  superseding the last durable activation and cannot be selected by a forged
+  segment key ID. The pinned active key and complete activation inventory are
+  revalidated before cipher use and rotation, so same-process authority cannot
+  silently survive external key mutation or a concurrent activation advance.
   This is storage/format substrate only; it is not yet wired to a live guardian
   PTY reader and does not claim mux-crash process continuity.
 - Freezes the guardian v1 authenticated request/response envelopes and pure

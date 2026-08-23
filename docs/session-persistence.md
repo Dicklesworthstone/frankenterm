@@ -326,7 +326,23 @@ proven:
    output sequences, and an exact predecessor segment/sequence/terminal-digest
    chain so rollover can neither reuse an output identity nor hide a gap. A new
    segment cannot accept output until its file and parent directory entry are
-   synchronized. The guardian retains a bounded replay window and terminal-state
+   synchronized. Key authority lives in a pinned mode-0700 capability
+   directory. Each random 32-byte key is an immutable mode-0600, no-follow,
+   single-link regular file whose lowercase ID is the first eight bytes of its
+   SHA-256 fingerprint. Append-only, checksummed activation records start at
+   generation one and remain contiguous; rotation synchronizes the new key and
+   its directory entry before publishing the next activation. Existing segment
+   writers retain their original cipher until rollover, and historical keys are
+   never overwritten or discarded while an activation can reference them. A
+   torn unactivated key from an interrupted rotation is preserved but cannot
+   supersede the prior activation or satisfy historical segment lookup. The
+   pinned active key and full activation inventory are revalidated before new
+   cipher use or rotation, so external key mutation and concurrent activation
+   advancement fail closed. A missing, truncated, symlinked, hard-linked,
+   permission-unsafe, wrong-ID, or corrupt referenced key fails closed. Key
+   bytes are zeroized when their in-memory authority is dropped and never enter
+   `Debug`, argv, environment variables, receipts, dumps, or log fields.
+   The guardian retains a bounded replay window and terminal-state
    checkpoints that bind parser version, rows/columns, raw-output sequence, hot
    viewport, cold-scrollback base sequence, and a content digest.
    A checkpoint must either serialize the complete incremental parser state or
