@@ -70,6 +70,11 @@ impl GuardianOutputJournalLimits {
                 "max_record_bytes must be nonzero",
             ));
         }
+        if self.max_record_bytes > u32::MAX - AEAD_TAG_BYTES {
+            return Err(GuardianOutputJournalError::InvalidLimits(
+                "max_record_bytes must leave room for the AEAD tag",
+            ));
+        }
         if self.max_records == 0 {
             return Err(GuardianOutputJournalError::InvalidLimits(
                 "max_records must be nonzero",
@@ -329,7 +334,7 @@ pub enum GuardianOutputJournalTail {
     },
 }
 
-/// Receipt that may be forwarded to a mux only after `sync_data` succeeds.
+/// Receipt that may be forwarded to a mux only after `sync_all` succeeds.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianOutputAppendReceipt {
     segment_id: Uuid,
@@ -436,11 +441,17 @@ pub enum GuardianOutputJournalError {
     EmptyRecord { offset: u64 },
     #[error("guardian output record is too large: {observed} > {maximum}")]
     RecordByteLimit { observed: u64, maximum: u32 },
-    #[error("guardian output ciphertext length is invalid: expected {expected}, observed {observed}")]
+    #[error(
+        "guardian output ciphertext length is invalid: expected {expected}, observed {observed}"
+    )]
     CiphertextLengthMismatch { expected: u32, observed: u32 },
-    #[error("guardian output plaintext length is invalid after authentication: expected {expected}, observed {observed}")]
+    #[error(
+        "guardian output plaintext length is invalid after authentication: expected {expected}, observed {observed}"
+    )]
     PlaintextLengthMismatch { expected: u32, observed: u32 },
-    #[error("guardian output sequence mismatch at byte {offset}: expected {expected}, observed {observed}")]
+    #[error(
+        "guardian output sequence mismatch at byte {offset}: expected {expected}, observed {observed}"
+    )]
     SequenceMismatch {
         offset: u64,
         expected: u64,
@@ -456,7 +467,9 @@ pub enum GuardianOutputJournalError {
     IncompleteTail,
     #[error("guardian output journal is poisoned after an ambiguous write or sync failure")]
     Poisoned,
-    #[error("guardian output journal length changed outside its exclusive owner: expected {expected}, observed {observed}")]
+    #[error(
+        "guardian output journal length changed outside its exclusive owner: expected {expected}, observed {observed}"
+    )]
     ExternalLengthChange { expected: u64, observed: u64 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -513,7 +526,7 @@ impl GuardianOutputJournal {
             let header = encode_file_header(identity, cipher.key_id);
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&header)?;
-            file.sync_data()?;
+            file.sync_all()?;
             physical_bytes = FILE_HEADER_BYTES_U64;
         }
         if physical_bytes < FILE_HEADER_BYTES_U64 {
@@ -690,7 +703,7 @@ impl GuardianOutputJournal {
             self.file.seek(SeekFrom::Start(self.committed_bytes))?;
             self.file.write_all(&header)?;
             self.file.write_all(&ciphertext)?;
-            self.file.sync_data()
+            self.file.sync_all()
         })();
         if let Err(error) = result {
             self.poisoned = true;
