@@ -218,6 +218,17 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   remain terminal failures.
   This is storage/format substrate only; it is not yet wired to a live guardian
   PTY reader and does not claim mux-crash process continuity.
+- Adds the guardian input-effect journal substrate. It synchronizes an encrypted
+  exact intent and a conservative `AcceptedNotDurable` marker before a PTY write
+  may become observable, then permits only a proven `Durable` or
+  `KnownNotApplied` refinement. Fixed-size records encrypt the mux, generation,
+  sequence, effect, payload-fingerprint, and input-length identity under a
+  separate AEAD domain; raw keystrokes are never stored. Record and effect
+  limits bound recovery memory and disk growth, digest chaining detects
+  reordering, exact per-phase receipts reconcile acknowledgement loss, and
+  complete corruption, torn tails, external writes, and ambiguous I/O fail
+  closed without truncating evidence. This remains a descriptor-level storage
+  primitive until the guardian PTY runtime and takeover recovery path are wired.
 - Freezes the guardian v1 authenticated request/response envelopes and pure
   fencing state machine: bounded HMAC-before-decode framing, exact response
   correlation, a token-authenticated payload-free `Hello` bootstrap that is

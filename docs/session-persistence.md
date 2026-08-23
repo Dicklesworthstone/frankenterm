@@ -512,6 +512,25 @@ became observable. A possibly partial input write is therefore committed as
 `accepted_not_durable` and reconciled by its exact effect UUID; it must never be
 reported as a safely retryable callback failure.
 
+The guardian input-effect journal makes that callback rule crash-safe without
+persisting raw keystrokes. For each input it synchronizes the encrypted exact
+identity and then a conservative `accepted_not_durable` marker before calling
+any PTY write that could expose bytes. A definitely zero-byte result may refine
+that marker to `known_not_applied`; a successful or possibly partial result may
+only refine it to `durable`, or remain conservatively pending. The payload
+SHA-256 is encrypted rather than written as plaintext because low-entropy key
+events are dictionary-testable. The input log uses an input-domain-separated
+AEAD surface of the activated guardian journal key; rotation must retain an old
+key generation while either an output segment or input log still references
+it. Each fixed-size record authenticates its clear
+framing and predecessor digest, and recovery enforces monotonic journal order,
+lease-generation input order, exact legal transitions, bounded effect/record
+counts, and immutable torn-tail preservation. Per-phase synchronized receipts
+make an exact publication retry idempotent after acknowledgement loss. This is
+currently a storage primitive: until guardian runtime recovery rehydrates the
+protocol state and owns the PTY write sequence, it is not live input-durability
+or mux-crash continuity evidence.
+
 The per-pane protocol state machine is finite and explicit:
 
 ```text
