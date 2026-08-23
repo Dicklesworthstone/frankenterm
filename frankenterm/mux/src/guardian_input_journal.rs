@@ -1650,6 +1650,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn torn_file_header_is_preserved_and_never_reinitialized() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let path = temp.path().join("input.journal");
+        let complete_header = encode_file_header(pane(), cipher().key_id());
+        let mut file = create_file(&path);
+        file.write_all(&complete_header[..FILE_HEADER_BYTES - 1])
+            .expect("write torn header");
+        file.sync_all().expect("sync torn header");
+        drop(file);
+        assert!(matches!(
+            GuardianInputJournal::open(
+                open_file(&path),
+                pane(),
+                cipher(),
+                GuardianInputJournalLimits::default(),
+            ),
+            Err(GuardianInputJournalError::TornFileHeader {
+                expected: FILE_HEADER_BYTES,
+                actual,
+            }) if actual == u64::try_from(FILE_HEADER_BYTES - 1)
+                .expect("fixture header length fits u64")
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("torn header metadata").len(),
+            u64::try_from(FILE_HEADER_BYTES - 1).expect("fixture header length fits u64")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recomputed_outer_digest_cannot_bypass_aead_authentication() {
         let temp = tempfile::tempdir().expect("create tempdir");
         let path = temp.path().join("input.journal");
