@@ -111,6 +111,7 @@ pub mod connui;
 pub mod domain;
 pub mod events;
 pub mod guardian_input_journal;
+pub mod guardian_checkpoint;
 pub mod guardian_output_journal;
 pub mod guardian_protocol;
 pub mod layout;
