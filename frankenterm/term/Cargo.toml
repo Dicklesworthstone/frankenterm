@@ -33,6 +33,7 @@ num-traits.workspace = true
 ordered-float.workspace = true
 serde = {workspace=true, features = ["rc"]}
 terminfo.workspace = true
+thiserror.workspace = true
 unicode-normalization.workspace = true
 url.workspace = true
 frankenterm-bidi.workspace = true
