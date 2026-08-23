@@ -74622,8 +74622,31 @@ async fn handle_session_command(
                 JsonSerializationStyle::Pretty,
             )
             .context("Failed to serialize mux dump envelope within the artifact safety limit")?;
+            // The envelope owns the complete producer-side pane-text tree. Release it
+            // before publication and verifier reread so the verification lane cannot
+            // stack that tree with the persisted artifact bytes and parsed verifier tree.
+            drop(envelope);
             artifact_bytes.push(b'\n');
             let artifact_receipt = write_new_private_artifact(&output_path, &artifact_bytes)?;
+            drop(artifact_bytes);
+            let verification = verify_mux_dump_artifact(&output_path).with_context(|| {
+                format!(
+                    "Mux dump was durably retained at {}, but its offline verifier rejected the published artifact",
+                    output_path.display()
+                )
+            })?;
+            if verification.payload_sha256 != payload_sha256
+                || verification.artifact_sha256 != artifact_receipt.sha256
+                || verification.artifact_bytes != artifact_receipt.bytes
+                || verification.capture_complete != complete
+                || verification.pane_count != pane_count
+                || verification.error_count != error_count
+            {
+                anyhow::bail!(
+                    "Mux dump was durably retained at {}, but its verified publication receipt disagrees with the producer receipt",
+                    output_path.display()
+                );
+            }
 
             let result = serde_json::json!({
                 "ok": complete || allow_partial,
@@ -74633,8 +74656,8 @@ async fn handle_session_command(
                 "pane_count": pane_count,
                 "error_count": error_count,
                 "payload_sha256": &payload_sha256,
-                "artifact_sha256": &artifact_receipt.sha256,
-                "artifact_bytes": artifact_receipt.bytes,
+                "artifact_sha256": &verification.artifact_sha256,
+                "artifact_bytes": verification.artifact_bytes,
                 "durability": artifact_receipt.durability,
                 "redaction_applied": true,
             });
@@ -74645,7 +74668,7 @@ async fn handle_session_command(
                 println!("  Panes:    {pane_count}");
                 println!("  Errors:   {error_count}");
                 println!("  Payload SHA-256:  {payload_sha256}");
-                println!("  Artifact SHA-256: {}", artifact_receipt.sha256);
+                println!("  Artifact SHA-256: {}", verification.artifact_sha256);
                 println!("  Content:  redacted");
             }
             if !complete && !allow_partial {
@@ -75185,6 +75208,349 @@ fn serialize_json_bounded(
     Ok(buffer.into_inner())
 }
 
+struct ExactJsonEncodingWriter<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    max_bytes: usize,
+}
+
+impl<'a> ExactJsonEncodingWriter<'a> {
+    fn new(expected: &'a [u8], max_bytes: u64) -> anyhow::Result<Self> {
+        let max_bytes = usize::try_from(max_bytes)
+            .map_err(|_| anyhow::anyhow!("JSON byte limit does not fit this platform"))?;
+        if expected.len() > max_bytes {
+            anyhow::bail!("persisted JSON exceeds its canonical comparison limit");
+        }
+        Ok(Self {
+            expected,
+            offset: 0,
+            max_bytes,
+        })
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        if self.offset != self.expected.len() {
+            anyhow::bail!("persisted JSON has trailing or missing canonical bytes");
+        }
+        Ok(())
+    }
+}
+
+impl Write for ExactJsonEncodingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("canonical JSON byte count overflow"))?;
+        if next > self.max_bytes || self.expected.get(self.offset..next) != Some(bytes) {
+            return Err(std::io::Error::other(
+                "persisted JSON differs from its canonical encoding",
+            ));
+        }
+        self.offset = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn verify_exact_pretty_json_encoding(
+    value: &impl serde::Serialize,
+    expected: &[u8],
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    let mut writer = ExactJsonEncodingWriter::new(expected, max_bytes)?;
+    serde_json::to_writer_pretty(&mut writer, value)
+        .map_err(|err| anyhow::anyhow!("canonical JSON serialization failed: {err}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|err| anyhow::anyhow!("canonical JSON newline comparison failed: {err}"))?;
+    writer.finish()
+}
+
+#[derive(Clone, Copy)]
+struct JsonStructureLimits {
+    max_nodes: usize,
+    max_map_entries: usize,
+    max_sequence_entries: usize,
+    max_string_bytes: u64,
+    max_depth: usize,
+}
+
+const LIVE_MUX_DUMP_JSON_STRUCTURE_LIMITS: JsonStructureLimits = JsonStructureLimits {
+    // A maximal valid dump has fewer than four million structural nodes:
+    // 65,536 pane outcomes, 28 map entries per captured pane, the initial ID
+    // manifest, and the bounded domain/error collections. Keep bounded headroom
+    // without permitting byte-small scalar arrays to amplify without limit.
+    max_nodes: 4_200_000,
+    max_map_entries: 1_900_000,
+    max_sequence_entries: 262_144,
+    max_string_bytes: LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+    max_depth: 32,
+};
+
+struct JsonStructureBudget {
+    limits: JsonStructureLimits,
+    nodes: std::cell::Cell<usize>,
+    map_entries: std::cell::Cell<usize>,
+    sequence_entries: std::cell::Cell<usize>,
+    string_bytes: std::cell::Cell<u64>,
+}
+
+impl JsonStructureBudget {
+    fn new(limits: JsonStructureLimits) -> Self {
+        Self {
+            limits,
+            nodes: std::cell::Cell::new(0),
+            map_entries: std::cell::Cell::new(0),
+            sequence_entries: std::cell::Cell::new(0),
+            string_bytes: std::cell::Cell::new(0),
+        }
+    }
+
+    fn consume(
+        counter: &std::cell::Cell<usize>,
+        amount: usize,
+        limit: usize,
+        label: &'static str,
+    ) -> Result<(), String> {
+        let next = counter
+            .get()
+            .checked_add(amount)
+            .ok_or_else(|| format!("Mux dump JSON {label} count overflow"))?;
+        if next > limit {
+            return Err(format!(
+                "Mux dump JSON exceeds the {limit} {label} safety limit"
+            ));
+        }
+        counter.set(next);
+        Ok(())
+    }
+
+    fn consume_node(&self, depth: usize) -> Result<(), String> {
+        if depth > self.limits.max_depth {
+            return Err(format!(
+                "Mux dump JSON exceeds the {} level nesting safety limit",
+                self.limits.max_depth
+            ));
+        }
+        Self::consume(&self.nodes, 1, self.limits.max_nodes, "node")
+    }
+
+    fn consume_map_entry(&self) -> Result<(), String> {
+        Self::consume(
+            &self.map_entries,
+            1,
+            self.limits.max_map_entries,
+            "map entry",
+        )
+    }
+
+    fn consume_sequence_entry(&self) -> Result<(), String> {
+        Self::consume(
+            &self.sequence_entries,
+            1,
+            self.limits.max_sequence_entries,
+            "sequence entry",
+        )
+    }
+
+    fn consume_string(&self, bytes: usize) -> Result<(), String> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| "Mux dump JSON decoded string length overflow".to_string())?;
+        let next = self
+            .string_bytes
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| "Mux dump JSON decoded string byte count overflow".to_string())?;
+        if next > self.limits.max_string_bytes {
+            return Err(format!(
+                "Mux dump JSON exceeds the {} decoded string byte safety limit",
+                self.limits.max_string_bytes
+            ));
+        }
+        self.string_bytes.set(next);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JsonStructureSeed<'a> {
+    budget: &'a JsonStructureBudget,
+    depth: usize,
+}
+
+impl JsonStructureSeed<'_> {
+    fn child(self) -> Self {
+        Self {
+            budget: self.budget,
+            depth: self.depth.saturating_add(1),
+        }
+    }
+
+    fn map_budget_error<E: serde::de::Error>(error: String) -> E {
+        E::custom(error)
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for JsonStructureSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget
+            .consume_node(self.depth)
+            .map_err(Self::map_budget_error)?;
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonStructureSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON within the mux dump structural safety budget")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.budget
+            .consume_string(value.len())
+            .map_err(Self::map_budget_error)
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::DeserializeSeed::deserialize(self.child(), deserializer)
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::DeserializeSeed::deserialize(self.child(), deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(self.child())?.is_some() {
+            self.budget
+                .consume_sequence_entry()
+                .map_err(Self::map_budget_error)?;
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        while map.next_key_seed(self.child())?.is_some() {
+            self.budget
+                .consume_map_entry()
+                .map_err(Self::map_budget_error)?;
+            map.next_value_seed(self.child())?;
+        }
+        Ok(())
+    }
+}
+
+fn verify_json_structure_bounded(
+    bytes: &[u8],
+    limits: JsonStructureLimits,
+) -> anyhow::Result<()> {
+    let budget = JsonStructureBudget::new(limits);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    serde::de::DeserializeSeed::deserialize(
+        JsonStructureSeed {
+            budget: &budget,
+            depth: 0,
+        },
+        &mut deserializer,
+    )
+    .map_err(|error| anyhow::anyhow!("Mux dump JSON structural preflight failed: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| anyhow::anyhow!("Mux dump JSON has trailing data: {error}"))
+}
+
+fn require_mux_dump_redaction_fixed_point(
+    value: &serde_json::Value,
+    redactor: &frankenterm_core::redactor::Redactor,
+) -> anyhow::Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            if redactor.redact(text) != *text {
+                anyhow::bail!(
+                    "Mux dump contains a serialized string that is not a canonical redaction fixed point"
+                );
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                require_mux_dump_redaction_fixed_point(value, redactor)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                require_mux_dump_redaction_fixed_point(value, redactor)?;
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
 struct BoundedJsonHashSink {
     hasher: sha2::Sha256,
     bytes: u64,
@@ -75447,6 +75813,24 @@ fn sha256_reader(mut reader: impl Read) -> std::io::Result<(u64, String)> {
     Ok((total, hex::encode(hasher.finalize())))
 }
 
+fn is_canonical_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn require_exact_json_object_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+    context: &str,
+) -> anyhow::Result<()> {
+    if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
+        anyhow::bail!("Mux dump {context} does not match the frozen v1 field set");
+    }
+    Ok(())
+}
+
 fn write_new_private_artifact(
     path: &Path,
     bytes: &[u8],
@@ -75622,8 +76006,29 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     let persisted = read_private_artifact_bounded(path, LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES)?;
     let artifact_bytes = u64::try_from(persisted.len()).unwrap_or(u64::MAX);
     let artifact_sha256 = sha256_hex(&persisted);
+    verify_json_structure_bounded(&persisted, LIVE_MUX_DUMP_JSON_STRUCTURE_LIMITS)?;
     let envelope: serde_json::Value = serde_json::from_slice(&persisted)
         .map_err(|err| anyhow::anyhow!("Mux dump is not valid JSON: {err}"))?;
+    let envelope_object = envelope
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Mux dump envelope is not an object"))?;
+    require_exact_json_object_keys(
+        envelope_object,
+        &["schema", "publication_state", "payload_sha256", "payload"],
+        "envelope",
+    )?;
+    verify_exact_pretty_json_encoding(
+        &envelope,
+        &persisted,
+        LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+    )
+    .context(
+        "Mux dump does not use the one canonical v1 artifact encoding; duplicate keys and alternate encodings are forbidden",
+    )?;
+    require_mux_dump_redaction_fixed_point(
+        &envelope,
+        &frankenterm_core::redactor::Redactor::new(),
+    )?;
     let schema = envelope
         .get("schema")
         .and_then(serde_json::Value::as_str)
@@ -75637,6 +76042,27 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     let payload = envelope
         .get("payload")
         .ok_or_else(|| anyhow::anyhow!("Mux dump payload is missing"))?;
+    let payload_object = payload
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Mux dump payload is not an object"))?;
+    require_exact_json_object_keys(
+        payload_object,
+        &[
+            "schema_version",
+            "created_at_epoch_ms",
+            "source",
+            "complete",
+            "completeness_semantics",
+            "capabilities",
+            "redaction_applied",
+            "limits",
+            "summary",
+            "topology_fence",
+            "panes",
+            "errors",
+        ],
+        "payload",
+    )?;
     let (_payload_bytes, actual_payload_sha256) = hash_json_bounded(
         payload,
         LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
@@ -75650,15 +76076,72 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     if actual_payload_sha256 != embedded_payload_sha256 {
         anyhow::bail!("Mux dump checksum verification failed for {}", path.display());
     }
-    if embedded_payload_sha256.len() != 64
-        || !embedded_payload_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
+    if !is_canonical_lowercase_sha256(embedded_payload_sha256) {
         anyhow::bail!("Mux dump payload checksum is not canonical lowercase SHA-256");
     }
     if payload.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1) {
         anyhow::bail!("Mux dump payload schema_version is not 1");
+    }
+    if payload
+        .get("created_at_epoch_ms")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+        || payload.pointer("/source/kind").and_then(serde_json::Value::as_str)
+            != Some("live_mux")
+        || !payload
+            .pointer("/source/ft_version")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        || !payload
+            .pointer("/source/git_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    {
+        anyhow::bail!("Mux dump source identity metadata is invalid");
+    }
+    require_exact_json_object_keys(
+        payload
+            .get("source")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump source metadata is not an object"))?,
+        &["kind", "ft_version", "git_hash"],
+        "source metadata",
+    )?;
+    require_exact_json_object_keys(
+        payload
+            .get("completeness_semantics")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump completeness metadata is not an object"))?,
+        &[
+            "meaning",
+            "point_in_time_content_snapshot",
+            "pane_content_consistency",
+            "topology_consistency",
+        ],
+        "completeness metadata",
+    )?;
+    let required_completeness_semantics = [
+        (
+            "/completeness_semantics/meaning",
+            serde_json::json!("every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing"),
+        ),
+        (
+            "/completeness_semantics/point_in_time_content_snapshot",
+            serde_json::json!(false),
+        ),
+        (
+            "/completeness_semantics/pane_content_consistency",
+            serde_json::json!("sequential_best_effort_non_atomic"),
+        ),
+        (
+            "/completeness_semantics/topology_consistency",
+            serde_json::json!("double_list_fingerprint"),
+        ),
+    ];
+    for (pointer, expected) in required_completeness_semantics {
+        if payload.pointer(pointer) != Some(&expected) {
+            anyhow::bail!("Mux dump completeness claim {pointer} does not match the v1 contract");
+        }
     }
     if payload
         .get("redaction_applied")
@@ -75671,6 +76154,24 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .get("limits")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("Mux dump limits are missing"))?;
+    require_exact_json_object_keys(limits, &["max_panes", "max_total_bytes"], "limits")?;
+    require_exact_json_object_keys(
+        payload
+            .get("capabilities")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump capabilities are not an object"))?,
+        &[
+            "forensic_text_export",
+            "bounded_topology_metadata",
+            "executable_restore_image",
+            "terminal_parser_render_state",
+            "pty_descriptor_state",
+            "process_memory_state",
+            "running_process_continuity",
+            "stable_cross_restart_pane_identity",
+        ],
+        "capabilities",
+    )?;
     let max_panes = limits
         .get("max_panes")
         .and_then(serde_json::Value::as_u64)
@@ -75700,19 +76201,128 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("Mux dump errors array is missing"))?;
     let mut pane_ids = std::collections::HashSet::with_capacity(panes.len());
+    let mut captured_domains = BTreeSet::new();
     let mut content_bytes = 0usize;
     for pane_record in panes {
-        let pane_id = pane_record
-            .pointer("/pane/pane_id")
+        let pane_record_object = pane_record
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane record is not an object"))?;
+        require_exact_json_object_keys(pane_record_object, &["pane", "content"], "pane record")?;
+        let pane = pane_record
+            .get("pane")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane metadata is missing"))?;
+        require_exact_json_object_keys(
+            pane,
+            &[
+                "pane_id",
+                "tab_id",
+                "window_id",
+                "domain_id",
+                "domain_name",
+                "domain_identity_authority",
+                "identity_stability",
+                "workspace",
+                "rows",
+                "cols",
+                "title",
+                "cwd",
+                "tty_name",
+                "cursor_x",
+                "cursor_y",
+                "cursor_visibility",
+                "left_col",
+                "top_row",
+                "is_active",
+                "is_zoomed",
+            ],
+            "pane metadata",
+        )?;
+        let pane_id = pane
+            .get("pane_id")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("Mux dump pane record is missing pane_id"))?;
         if !pane_ids.insert(pane_id) {
             anyhow::bail!("Mux dump contains duplicate pane_id {pane_id}");
         }
+        for field in ["tab_id", "window_id"] {
+            if pane.get(field).and_then(serde_json::Value::as_u64).is_none() {
+                anyhow::bail!("Mux dump pane {pane_id} {field} is invalid");
+            }
+        }
+        match pane.get("domain_id") {
+            Some(serde_json::Value::Null) => {}
+            Some(value) if value.as_u64().is_some() => {}
+            _ => anyhow::bail!("Mux dump pane {pane_id} domain_id is invalid"),
+        }
+        let domain_name = pane
+            .get("domain_name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} domain_name is invalid"))?;
+        captured_domains.insert(domain_name);
+        if !matches!(
+            pane.get("domain_identity_authority")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                "authoritative_domain_name"
+                    | "inferred_from_cwd_uri_authority"
+                    | "defaulted_local_without_domain_authority"
+            )
+        ) || pane
+            .get("identity_stability")
+            .and_then(serde_json::Value::as_str)
+            != Some("mux_incarnation_local_ephemeral")
+        {
+            anyhow::bail!("Mux dump pane {pane_id} identity metadata is invalid");
+        }
+        for field in ["workspace", "title", "cwd", "tty_name"] {
+            match pane.get(field) {
+                Some(serde_json::Value::Null | serde_json::Value::String(_)) => {}
+                _ => anyhow::bail!("Mux dump pane {pane_id} {field} is invalid"),
+            }
+        }
+        match pane.get("cursor_visibility") {
+            Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(value))
+                if matches!(value.as_str(), "Visible" | "Hidden") => {}
+            _ => anyhow::bail!("Mux dump pane {pane_id} cursor_visibility is invalid"),
+        }
+        for field in ["rows", "cols"] {
+            if !pane
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value <= u64::from(u32::MAX))
+            {
+                anyhow::bail!("Mux dump pane {pane_id} {field} is invalid");
+            }
+        }
+        for field in ["cursor_x", "cursor_y", "left_col"] {
+            match pane.get(field) {
+                Some(serde_json::Value::Null) => {}
+                Some(value) if value.as_u64().is_some_and(|value| value <= u64::from(u32::MAX)) => {}
+                _ => anyhow::bail!("Mux dump pane {pane_id} {field} is invalid"),
+            }
+        }
+        match pane.get("top_row") {
+            Some(serde_json::Value::Null) => {}
+            Some(value) if value.as_i64().is_some() => {}
+            _ => anyhow::bail!("Mux dump pane {pane_id} top_row is invalid"),
+        }
+        for field in ["is_active", "is_zoomed"] {
+            if pane.get(field).and_then(serde_json::Value::as_bool).is_none() {
+                anyhow::bail!("Mux dump pane {pane_id} {field} is invalid");
+            }
+        }
         let content = pane_record
             .get("content")
             .and_then(serde_json::Value::as_object)
             .ok_or_else(|| anyhow::anyhow!("Mux dump pane {pane_id} content is missing"))?;
+        require_exact_json_object_keys(
+            content,
+            &["encoding", "redaction_applied", "bytes", "lines", "sha256", "text"],
+            "pane content",
+        )?;
         if content.get("encoding").and_then(serde_json::Value::as_str) != Some("utf-8")
             || content
                 .get("redaction_applied")
@@ -75754,6 +76364,105 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
             );
         }
     }
+    let mut error_pane_ids = std::collections::HashSet::new();
+    let mut topology_error_count = 0usize;
+    let mut topology_error_code = None;
+    for error in errors {
+        let error = error
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Mux dump capture error is not an object"))?;
+        let code = error
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump capture error code is missing"))?;
+        let is_topology_error = match error.get("scope") {
+            None => false,
+            Some(value) if value.as_str() == Some("mux_topology") => true,
+            Some(_) => anyhow::bail!("Mux dump capture error has an unsupported scope"),
+        };
+        let expected_error_keys: &[&str] = match (is_topology_error, code) {
+            (false, "pane_text_unavailable") => &["pane_id", "code", "detail"],
+            (false, "aggregate_content_limit_exceeded") => &[
+                "pane_id",
+                "code",
+                "pane_bytes",
+                "admitted_bytes",
+                "max_total_bytes",
+            ],
+            (true, "topology_changed_during_capture") => &[
+                "scope",
+                "code",
+                "initial_panes",
+                "final_panes",
+                "initial_topology_sha256",
+                "final_topology_sha256",
+            ],
+            (true, "final_topology_fingerprint_failed" | "final_topology_list_failed") => {
+                &["scope", "code", "detail"]
+            }
+            _ => anyhow::bail!("Mux dump contains an invalid capture error code"),
+        };
+        require_exact_json_object_keys(error, expected_error_keys, "capture error")?;
+        if is_topology_error {
+            topology_error_count = topology_error_count.saturating_add(1);
+            if topology_error_count > 1
+                || !matches!(
+                    code,
+                    "topology_changed_during_capture"
+                        | "final_topology_fingerprint_failed"
+                        | "final_topology_list_failed"
+                )
+            {
+                anyhow::bail!("Mux dump contains an invalid topology capture error");
+            }
+            topology_error_code = Some(code);
+        } else {
+            let pane_id = error
+                .get("pane_id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("Mux dump pane capture error lacks pane_id"))?;
+            if !matches!(code, "pane_text_unavailable" | "aggregate_content_limit_exceeded")
+                || !error_pane_ids.insert(pane_id)
+                || pane_ids.contains(&pane_id)
+            {
+                anyhow::bail!("Mux dump contains an invalid pane capture error");
+            }
+            match code {
+                "pane_text_unavailable"
+                    if !error
+                        .get("detail")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|detail| detail.len() <= 1024) =>
+                {
+                    anyhow::bail!("Mux dump pane-text error detail is invalid");
+                }
+                "aggregate_content_limit_exceeded" => {
+                    let pane_bytes = error
+                        .get("pane_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| anyhow::anyhow!("Mux dump limited pane byte count is invalid"))?;
+                    let admitted_bytes = error
+                        .get("admitted_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| anyhow::anyhow!("Mux dump admitted byte count is invalid"))?;
+                    if error
+                        .get("max_total_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        != Some(max_total_bytes)
+                        || admitted_bytes > max_total_bytes
+                        || admitted_bytes > content_bytes
+                        || admitted_bytes.saturating_add(pane_bytes) <= max_total_bytes
+                    {
+                        anyhow::bail!("Mux dump aggregate-limit error evidence is inconsistent");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     let capture_complete = payload
         .get("complete")
         .and_then(serde_json::Value::as_bool)
@@ -75784,6 +76493,18 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
         .get("summary")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("Mux dump summary is missing"))?;
+    require_exact_json_object_keys(
+        summary,
+        &[
+            "panes_listed_initial",
+            "panes_listed_final",
+            "panes_captured",
+            "content_bytes",
+            "capture_errors",
+            "domains",
+        ],
+        "summary",
+    )?;
     let summary_panes = summary
         .get("panes_captured")
         .and_then(serde_json::Value::as_u64)
@@ -75802,6 +76523,221 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     {
         anyhow::bail!("Mux dump summary counters do not match the verified payload");
     }
+    let initial_pane_count = summary
+        .get("panes_listed_initial")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value <= max_panes)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Mux dump initial pane count is missing or exceeds max_panes")
+        })?;
+    if panes.len() > initial_pane_count {
+        anyhow::bail!("Mux dump captured more panes than its initial topology listed");
+    }
+    if panes.len().saturating_add(error_pane_ids.len()) != initial_pane_count {
+        anyhow::bail!("Mux dump pane outcomes do not cover its initial topology exactly once");
+    }
+    let final_pane_count = match summary.get("panes_listed_final") {
+        Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or_else(|| anyhow::anyhow!("Mux dump final pane count is invalid"))?,
+        ),
+        None => anyhow::bail!("Mux dump final pane count is missing"),
+    };
+    let domains = summary
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump domain summary is missing"))?;
+    let mut previous_domain: Option<&str> = None;
+    let mut summary_domains = BTreeSet::new();
+    for domain in domains {
+        let domain = domain
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Mux dump domain summary contains a non-string"))?;
+        if previous_domain.is_some_and(|previous| previous >= domain) {
+            anyhow::bail!("Mux dump domain summary is not a unique sorted set");
+        }
+        previous_domain = Some(domain);
+        summary_domains.insert(domain);
+    }
+    if domains.len() > initial_pane_count || (initial_pane_count > 0 && domains.is_empty()) {
+        anyhow::bail!("Mux dump domain summary is inconsistent with its initial pane count");
+    }
+    if !captured_domains.is_subset(&summary_domains) {
+        anyhow::bail!("Mux dump domain summary omits a captured pane domain");
+    }
+    if capture_complete && summary_domains != captured_domains {
+        anyhow::bail!("Mux dump complete claim has an inconsistent domain summary");
+    }
+
+    let topology = payload
+        .get("topology_fence")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump topology fence is missing"))?;
+    require_exact_json_object_keys(
+        topology,
+        &[
+            "kind",
+            "fingerprint_scope",
+            "initial_pane_ids",
+            "initial_sha256",
+            "final_sha256",
+            "stable",
+            "mux_session_incarnation",
+            "authoritative_topology_revision",
+        ],
+        "topology fence",
+    )?;
+    if topology.get("kind").and_then(serde_json::Value::as_str)
+        != Some("double_list_fingerprint")
+        || topology
+            .get("fingerprint_scope")
+            .and_then(serde_json::Value::as_str)
+            != Some("pane_tab_window_redacted_domain_workspace_geometry_active_zoom")
+    {
+        anyhow::bail!("Mux dump topology fence kind or scope is unsupported");
+    }
+    let initial_pane_ids = topology
+        .get("initial_pane_ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump initial pane identity manifest is missing"))?;
+    if initial_pane_ids.len() != initial_pane_count {
+        anyhow::bail!("Mux dump initial pane identity count disagrees with its summary");
+    }
+    let mut initial_pane_id_set = std::collections::HashSet::with_capacity(initial_pane_count);
+    let mut previous_initial_pane_id = None;
+    for pane_id in initial_pane_ids {
+        let pane_id = pane_id
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("Mux dump initial pane identity is invalid"))?;
+        if previous_initial_pane_id.is_some_and(|previous| previous >= pane_id)
+            || !initial_pane_id_set.insert(pane_id)
+        {
+            anyhow::bail!("Mux dump initial pane identity manifest is not a unique sorted set");
+        }
+        previous_initial_pane_id = Some(pane_id);
+    }
+    let outcome_pane_ids = pane_ids
+        .iter()
+        .chain(error_pane_ids.iter())
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if outcome_pane_ids != initial_pane_id_set {
+        anyhow::bail!("Mux dump pane outcomes do not match its initial identity manifest");
+    }
+    let initial_topology_sha256 = topology
+        .get("initial_sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| is_canonical_lowercase_sha256(value))
+        .ok_or_else(|| anyhow::anyhow!("Mux dump initial topology checksum is invalid"))?;
+    if capture_complete {
+        let recomputed_topology_sha256 = mux_dump_topology_fingerprint_from_records(panes)?;
+        if recomputed_topology_sha256 != initial_topology_sha256 {
+            anyhow::bail!(
+                "Mux dump initial topology checksum does not match its canonical redacted pane metadata"
+            );
+        }
+    }
+    let final_topology_sha256 = match topology.get("final_sha256") {
+        Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|checksum| is_canonical_lowercase_sha256(checksum))
+                .ok_or_else(|| anyhow::anyhow!("Mux dump final topology checksum is invalid"))?,
+        ),
+        None => anyhow::bail!("Mux dump final topology checksum is missing"),
+    };
+    let topology_stable = topology
+        .get("stable")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!("Mux dump topology stability flag is missing"))?;
+    let has_topology_error = errors.iter().any(|error| {
+        error.get("scope").and_then(serde_json::Value::as_str) == Some("mux_topology")
+    });
+    if topology_stable == has_topology_error {
+        anyhow::bail!("Mux dump topology stability flag disagrees with its capture errors");
+    }
+    if topology_stable
+        && (final_topology_sha256 != Some(initial_topology_sha256)
+            || final_pane_count != Some(initial_pane_count))
+    {
+        anyhow::bail!("Mux dump stable topology fence has mismatched final evidence");
+    }
+    match topology_error_code {
+        None if !topology_stable => {
+            anyhow::bail!("Mux dump unstable topology fence lacks a topology error")
+        }
+        Some("topology_changed_during_capture")
+            if final_topology_sha256.is_none()
+                || final_topology_sha256 == Some(initial_topology_sha256)
+                || final_pane_count.is_none() =>
+        {
+            anyhow::bail!("Mux dump topology-change error lacks mismatched final evidence")
+        }
+        Some("final_topology_fingerprint_failed")
+            if final_pane_count.is_none() || final_topology_sha256.is_some() =>
+        {
+            anyhow::bail!("Mux dump fingerprint-failure error disagrees with final evidence")
+        }
+        Some("final_topology_list_failed")
+            if final_pane_count.is_some() || final_topology_sha256.is_some() =>
+        {
+            anyhow::bail!("Mux dump final-list error disagrees with final evidence")
+        }
+        _ => {}
+    }
+    if let Some(code) = topology_error_code {
+        let error = errors
+            .iter()
+            .find(|error| {
+                error.get("scope").and_then(serde_json::Value::as_str) == Some("mux_topology")
+            })
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump topology error evidence is missing"))?;
+        match code {
+            "topology_changed_during_capture"
+                if error.get("initial_panes").and_then(serde_json::Value::as_u64)
+                    != u64::try_from(initial_pane_count).ok()
+                    || error.get("final_panes").and_then(serde_json::Value::as_u64)
+                        != final_pane_count.and_then(|count| u64::try_from(count).ok())
+                    || error
+                        .get("initial_topology_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(initial_topology_sha256)
+                    || error
+                        .get("final_topology_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        != final_topology_sha256 =>
+            {
+                anyhow::bail!("Mux dump topology-change error details disagree with its fence");
+            }
+            "final_topology_fingerprint_failed" | "final_topology_list_failed"
+                if !error
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|detail| detail.len() <= 1024) =>
+            {
+                anyhow::bail!("Mux dump topology failure detail is invalid");
+            }
+            _ => {}
+        }
+    }
+    if capture_complete
+        && (initial_pane_count != panes.len()
+            || final_pane_count != Some(panes.len())
+            || !topology_stable)
+    {
+        anyhow::bail!("Mux dump complete claim disagrees with its topology evidence");
+    }
+    if topology.get("mux_session_incarnation") != Some(&serde_json::Value::Null)
+        || topology.get("authoritative_topology_revision") != Some(&serde_json::Value::Null)
+    {
+        anyhow::bail!("Mux dump v1 must not claim unavailable authoritative topology identity");
+    }
     Ok(MuxDumpVerificationReceipt {
         schema: schema.to_string(),
         payload_sha256: actual_payload_sha256,
@@ -75815,42 +76751,23 @@ fn verify_mux_dump_artifact(path: &Path) -> anyhow::Result<MuxDumpVerificationRe
     })
 }
 
-fn mux_dump_topology_fingerprint(
-    panes: &[frankenterm_core::wezterm::PaneInfo],
-) -> anyhow::Result<String> {
-    #[derive(serde::Serialize)]
-    struct TopologyPane<'a> {
-        pane_id: u64,
-        tab_id: u64,
-        window_id: u64,
-        domain_id: Option<u64>,
-        domain_name: Option<&'a str>,
-        workspace: Option<&'a str>,
-        rows: u32,
-        cols: u32,
-        left_col: Option<u32>,
-        top_row: Option<i64>,
-        is_active: bool,
-        is_zoomed: bool,
-    }
+#[derive(serde::Serialize)]
+struct MuxDumpTopologyPane<'a> {
+    pane_id: u64,
+    tab_id: u64,
+    window_id: u64,
+    domain_id: Option<u64>,
+    domain_name: std::borrow::Cow<'a, str>,
+    workspace: Option<std::borrow::Cow<'a, str>>,
+    rows: u32,
+    cols: u32,
+    left_col: Option<u32>,
+    top_row: Option<i64>,
+    is_active: bool,
+    is_zoomed: bool,
+}
 
-    let topology: Vec<TopologyPane<'_>> = panes
-        .iter()
-        .map(|pane| TopologyPane {
-            pane_id: pane.pane_id,
-            tab_id: pane.tab_id,
-            window_id: pane.window_id,
-            domain_id: pane.domain_id,
-            domain_name: pane.domain_name.as_deref(),
-            workspace: pane.workspace.as_deref(),
-            rows: pane.effective_rows(),
-            cols: pane.effective_cols(),
-            left_col: pane.left_col,
-            top_row: pane.top_row,
-            is_active: pane.is_active,
-            is_zoomed: pane.is_zoomed,
-        })
-        .collect();
+fn hash_mux_dump_topology(topology: &[MuxDumpTopologyPane<'_>]) -> anyhow::Result<String> {
     let (_bytes, fingerprint) = hash_json_bounded(
         &topology,
         LIVE_MUX_DUMP_MAX_TOPOLOGY_BYTES,
@@ -75858,6 +76775,119 @@ fn mux_dump_topology_fingerprint(
     )
     .context("Failed to fingerprint mux topology within its metadata safety limit")?;
     Ok(fingerprint)
+}
+
+fn mux_dump_topology_fingerprint(
+    panes: &[frankenterm_core::wezterm::PaneInfo],
+    redactor: &frankenterm_core::redactor::Redactor,
+) -> anyhow::Result<String> {
+    let mut topology: Vec<MuxDumpTopologyPane<'_>> = panes
+        .iter()
+        .map(|pane| {
+            let (domain_name, _) = mux_dump_domain_identity(pane);
+            MuxDumpTopologyPane {
+                pane_id: pane.pane_id,
+                tab_id: pane.tab_id,
+                window_id: pane.window_id,
+                domain_id: pane.domain_id,
+                domain_name: std::borrow::Cow::Owned(redactor.redact(&domain_name)),
+                workspace: pane
+                    .workspace
+                    .as_deref()
+                    .map(|workspace| std::borrow::Cow::Owned(redactor.redact(workspace))),
+                rows: pane.effective_rows(),
+                cols: pane.effective_cols(),
+                left_col: pane.left_col,
+                top_row: pane.top_row,
+                is_active: pane.is_active,
+                is_zoomed: pane.is_zoomed,
+            }
+        })
+        .collect();
+    topology.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
+    hash_mux_dump_topology(&topology)
+}
+
+fn mux_dump_topology_fingerprint_from_records(
+    pane_records: &[serde_json::Value],
+) -> anyhow::Result<String> {
+    let mut topology = Vec::with_capacity(pane_records.len());
+    for pane_record in pane_records {
+        let pane = pane_record
+            .get("pane")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Mux dump topology pane metadata is missing"))?;
+        let required_u64 = |field: &'static str| {
+            pane.get(field)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("Mux dump topology field {field} is invalid"))
+        };
+        let optional_u32 = |field: &'static str| -> anyhow::Result<Option<u32>> {
+            match pane.get(field) {
+                Some(serde_json::Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .map(Some)
+                    .ok_or_else(|| anyhow::anyhow!("Mux dump topology field {field} is invalid")),
+                None => Err(anyhow::anyhow!(
+                    "Mux dump topology field {field} is missing"
+                )),
+            }
+        };
+        let domain_id = match pane.get("domain_id") {
+            Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("Mux dump topology domain_id is invalid"))?,
+            ),
+            None => anyhow::bail!("Mux dump topology domain_id is missing"),
+        };
+        let workspace = match pane.get("workspace") {
+            Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) => {
+                Some(std::borrow::Cow::Borrowed(value.as_str()))
+            }
+            _ => anyhow::bail!("Mux dump topology workspace is invalid"),
+        };
+        topology.push(MuxDumpTopologyPane {
+            pane_id: required_u64("pane_id")?,
+            tab_id: required_u64("tab_id")?,
+            window_id: required_u64("window_id")?,
+            domain_id,
+            domain_name: std::borrow::Cow::Borrowed(
+                pane.get("domain_name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Mux dump topology domain_name is invalid")
+                    })?,
+            ),
+            workspace,
+            rows: u32::try_from(required_u64("rows")?)
+                .map_err(|_| anyhow::anyhow!("Mux dump topology rows are invalid"))?,
+            cols: u32::try_from(required_u64("cols")?)
+                .map_err(|_| anyhow::anyhow!("Mux dump topology cols are invalid"))?,
+            left_col: optional_u32("left_col")?,
+            top_row: match pane.get("top_row") {
+                Some(serde_json::Value::Null) => None,
+                Some(value) => Some(value.as_i64().ok_or_else(|| {
+                    anyhow::anyhow!("Mux dump topology top_row is invalid")
+                })?),
+                None => anyhow::bail!("Mux dump topology top_row is missing"),
+            },
+            is_active: pane
+                .get("is_active")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| anyhow::anyhow!("Mux dump topology is_active is invalid"))?,
+            is_zoomed: pane
+                .get("is_zoomed")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| anyhow::anyhow!("Mux dump topology is_zoomed is invalid"))?,
+        });
+    }
+    topology.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
+    hash_mux_dump_topology(&topology)
 }
 
 fn mux_dump_domain_identity(
@@ -75905,10 +76935,12 @@ async fn capture_live_mux_dump(
             panes.len()
         );
     }
-    let initial_pane_count = panes.len();
-    let initial_topology_sha256 = mux_dump_topology_fingerprint(&panes)?;
-
     let redactor = frankenterm_core::redactor::Redactor::new();
+    let initial_pane_count = panes.len();
+    let mut initial_pane_ids = panes.iter().map(|pane| pane.pane_id).collect::<Vec<_>>();
+    initial_pane_ids.sort_unstable();
+    let initial_topology_sha256 = mux_dump_topology_fingerprint(&panes, &redactor)?;
+
     let mut captured = Vec::with_capacity(panes.len());
     let mut errors = Vec::new();
     let mut total_content_bytes = 0usize;
@@ -75987,7 +77019,7 @@ async fn capture_live_mux_dump(
             Ok(mut final_panes) => {
                 final_panes.sort_by_key(|pane| (pane.window_id, pane.tab_id, pane.pane_id));
                 let final_count = final_panes.len();
-                match mux_dump_topology_fingerprint(&final_panes) {
+                match mux_dump_topology_fingerprint(&final_panes, &redactor) {
                     Ok(final_sha256) => {
                         if final_sha256 != initial_topology_sha256 {
                             errors.push(serde_json::json!({
@@ -76069,7 +77101,8 @@ async fn capture_live_mux_dump(
         },
         "topology_fence": {
             "kind": "double_list_fingerprint",
-            "fingerprint_scope": "pane_tab_window_domain_workspace_geometry_active_zoom",
+            "fingerprint_scope": "pane_tab_window_redacted_domain_workspace_geometry_active_zoom",
+            "initial_pane_ids": initial_pane_ids,
             "initial_sha256": initial_topology_sha256,
             "final_sha256": final_topology_sha256,
             "stable": errors.iter().all(|error| {
@@ -76201,7 +77234,7 @@ fn exit_session_export_error(
     format: SnapshotSessionOutputFormat,
 ) -> ! {
     if format.is_structured() {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "ok": false,
             "error_code": error_code,
             "error": message,
@@ -89710,7 +90743,19 @@ recorder_backend = "rusqlite"
         let path = dir.path().join("mux-dump.json");
         let payload = serde_json::json!({
             "schema_version": 1,
+            "created_at_epoch_ms": 1,
+            "source": {
+                "kind": "live_mux",
+                "ft_version": "0.15.2-test",
+                "git_hash": "fixture",
+            },
             "complete": true,
+            "completeness_semantics": {
+                "meaning": "every initially listed pane was read within limits and the topology fingerprint was unchanged on the final listing",
+                "point_in_time_content_snapshot": false,
+                "pane_content_consistency": "sequential_best_effort_non_atomic",
+                "topology_consistency": "double_list_fingerprint",
+            },
             "redaction_applied": true,
             "limits": {
                 "max_panes": 16,
@@ -89727,13 +90772,66 @@ recorder_backend = "rusqlite"
                 "stable_cross_restart_pane_identity": false,
             },
             "summary": {
-                "panes_captured": 0,
+                "panes_listed_initial": 1,
+                "panes_listed_final": 1,
+                "panes_captured": 1,
                 "capture_errors": 0,
-                "content_bytes": 0,
+                "content_bytes": 6,
+                "domains": ["local"],
             },
-            "panes": [],
+            "topology_fence": {
+                "kind": "double_list_fingerprint",
+                "fingerprint_scope": "pane_tab_window_redacted_domain_workspace_geometry_active_zoom",
+                "initial_pane_ids": [1],
+                "initial_sha256": "a".repeat(64),
+                "final_sha256": "a".repeat(64),
+                "stable": true,
+                "mux_session_incarnation": null,
+                "authoritative_topology_revision": null,
+            },
+            "panes": [{
+                "pane": {
+                    "pane_id": 1,
+                    "tab_id": 2,
+                    "window_id": 3,
+                    "domain_id": null,
+                    "domain_name": "local",
+                    "domain_identity_authority": "defaulted_local_without_domain_authority",
+                    "identity_stability": "mux_incarnation_local_ephemeral",
+                    "workspace": null,
+                    "rows": 0,
+                    "cols": 0,
+                    "title": null,
+                    "cwd": null,
+                    "tty_name": null,
+                    "cursor_x": null,
+                    "cursor_y": null,
+                    "cursor_visibility": null,
+                    "left_col": null,
+                    "top_row": null,
+                    "is_active": true,
+                    "is_zoomed": false,
+                },
+                "content": {
+                    "encoding": "utf-8",
+                    "redaction_applied": true,
+                    "bytes": 6,
+                    "lines": 1,
+                    "sha256": sha256_hex(b"hello\n"),
+                    "text": "hello\n",
+                },
+            }],
             "errors": [],
         });
+        let topology_sha256 = mux_dump_topology_fingerprint_from_records(
+            payload["panes"]
+                .as_array()
+                .expect("fixture panes are an array"),
+        )
+        .expect("fingerprint canonical fixture topology");
+        payload["topology_fence"]["initial_sha256"] =
+            serde_json::json!(&topology_sha256);
+        payload["topology_fence"]["final_sha256"] = serde_json::json!(&topology_sha256);
         let (_, payload_sha256) = hash_json_bounded(
             &payload,
             LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
@@ -89753,9 +90851,66 @@ recorder_backend = "rusqlite"
         assert_eq!(receipt.payload_sha256, payload_sha256);
         assert!(receipt.capture_complete);
         assert!(!receipt.executable_restore_image);
-        assert_eq!(receipt.pane_count, 0);
+        assert_eq!(receipt.pane_count, 1);
         assert_eq!(receipt.error_count, 0);
-        assert_eq!(receipt.content_bytes, 0);
+        assert_eq!(receipt.content_bytes, 6);
+
+        let secret_injection_path = dir.path().join("secret-injection-mux-dump.json");
+        let mut secret_injection_payload = payload.clone();
+        let planted_secret = "AKIAIOSFODNN7EXAMPLE";
+        secret_injection_payload["panes"][0]["pane"]["title"] =
+            serde_json::json!(planted_secret);
+        let (_, secret_injection_sha256) = hash_json_bounded(
+            &secret_injection_payload,
+            LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            JsonSerializationStyle::Compact,
+        )
+        .expect("hash secret-injection fixture");
+        let secret_injection_envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
+            "payload_sha256": secret_injection_sha256,
+            "payload": secret_injection_payload,
+        });
+        let mut secret_injection_bytes =
+            serde_json::to_vec_pretty(&secret_injection_envelope).unwrap();
+        secret_injection_bytes.push(b'\n');
+        write_new_private_artifact(&secret_injection_path, &secret_injection_bytes)
+            .expect("write secret-injection dump");
+        let secret_injection_error = verify_mux_dump_artifact(&secret_injection_path)
+            .expect_err("a recomputed payload checksum must not authorize an injected secret");
+        let secret_injection_message = secret_injection_error.to_string();
+        assert!(secret_injection_message.contains("canonical redaction fixed point"));
+        assert!(
+            !secret_injection_message.contains(planted_secret),
+            "redaction-verification errors must never echo rejected secret material"
+        );
+
+        let mutated_topology_path = dir.path().join("mutated-topology-mux-dump.json");
+        let mut mutated_topology_payload = payload.clone();
+        mutated_topology_payload["panes"][0]["pane"]["rows"] = serde_json::json!(1);
+        let (_, mutated_topology_payload_sha256) = hash_json_bounded(
+            &mutated_topology_payload,
+            LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            JsonSerializationStyle::Compact,
+        )
+        .expect("hash topology-mutation fixture");
+        let mutated_topology_envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
+            "payload_sha256": mutated_topology_payload_sha256,
+            "payload": mutated_topology_payload,
+        });
+        let mut mutated_topology_bytes =
+            serde_json::to_vec_pretty(&mutated_topology_envelope).unwrap();
+        mutated_topology_bytes.push(b'\n');
+        write_new_private_artifact(&mutated_topology_path, &mutated_topology_bytes)
+            .expect("write topology-mutation dump");
+        let mutation_error = verify_mux_dump_artifact(&mutated_topology_path)
+            .expect_err("a recomputed payload checksum must not hide changed pane topology");
+        assert!(mutation_error
+            .to_string()
+            .contains("canonical redacted pane metadata"));
 
         let mut tampered = std::fs::read(&path).expect("read dump for tamper fixture");
         let index = tampered
@@ -89765,6 +90920,128 @@ recorder_backend = "rusqlite"
         tampered[index..index + 4].copy_from_slice(b"null");
         std::fs::write(&path, tampered).expect("write same-size tampered fixture");
         assert!(verify_mux_dump_artifact(&path).is_err());
+
+        let inconsistent_topology_path = dir.path().join("inconsistent-topology-mux-dump.json");
+        let mut inconsistent_topology_payload = payload.clone();
+        inconsistent_topology_payload["topology_fence"]["stable"] = serde_json::json!(false);
+        let (_, inconsistent_topology_sha256) = hash_json_bounded(
+            &inconsistent_topology_payload,
+            LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            JsonSerializationStyle::Compact,
+        )
+        .expect("hash inconsistent topology fixture");
+        let inconsistent_topology_envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
+            "payload_sha256": inconsistent_topology_sha256,
+            "payload": inconsistent_topology_payload,
+        });
+        let mut inconsistent_topology_bytes =
+            serde_json::to_vec_pretty(&inconsistent_topology_envelope).unwrap();
+        inconsistent_topology_bytes.push(b'\n');
+        write_new_private_artifact(&inconsistent_topology_path, &inconsistent_topology_bytes)
+            .expect("write inconsistent topology dump");
+        let topology_error = verify_mux_dump_artifact(&inconsistent_topology_path)
+            .expect_err("a recomputed checksum must not hide a false topology stability flag");
+        assert!(topology_error.to_string().contains("topology stability"));
+
+        let missing_outcome_path = dir.path().join("missing-pane-outcome-mux-dump.json");
+        let mut missing_outcome_payload = payload.clone();
+        missing_outcome_payload["panes"] = serde_json::json!([]);
+        missing_outcome_payload["summary"]["panes_captured"] = serde_json::json!(0);
+        missing_outcome_payload["summary"]["content_bytes"] = serde_json::json!(0);
+        let (_, missing_outcome_sha256) = hash_json_bounded(
+            &missing_outcome_payload,
+            LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            JsonSerializationStyle::Compact,
+        )
+        .expect("hash missing pane outcome fixture");
+        let missing_outcome_envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
+            "payload_sha256": missing_outcome_sha256,
+            "payload": missing_outcome_payload,
+        });
+        let mut missing_outcome_bytes =
+            serde_json::to_vec_pretty(&missing_outcome_envelope).unwrap();
+        missing_outcome_bytes.push(b'\n');
+        write_new_private_artifact(&missing_outcome_path, &missing_outcome_bytes)
+            .expect("write missing pane outcome dump");
+        let outcome_error = verify_mux_dump_artifact(&missing_outcome_path)
+            .expect_err("a recomputed checksum must not hide a missing pane outcome");
+        assert!(outcome_error.to_string().contains("pane outcomes"));
+
+        let wrong_identity_path = dir.path().join("wrong-pane-identity-mux-dump.json");
+        let mut wrong_identity_payload = payload.clone();
+        wrong_identity_payload["topology_fence"]["initial_pane_ids"] = serde_json::json!([2]);
+        let (_, wrong_identity_sha256) = hash_json_bounded(
+            &wrong_identity_payload,
+            LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            JsonSerializationStyle::Compact,
+        )
+        .expect("hash wrong pane identity fixture");
+        let wrong_identity_envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
+            "payload_sha256": wrong_identity_sha256,
+            "payload": wrong_identity_payload,
+        });
+        let mut wrong_identity_bytes =
+            serde_json::to_vec_pretty(&wrong_identity_envelope).unwrap();
+        wrong_identity_bytes.push(b'\n');
+        write_new_private_artifact(&wrong_identity_path, &wrong_identity_bytes)
+            .expect("write wrong pane identity dump");
+        let identity_error = verify_mux_dump_artifact(&wrong_identity_path)
+            .expect_err("a recomputed checksum must not change an initial pane identity");
+        assert!(identity_error.to_string().contains("initial identity manifest"));
+
+        let hidden_field_path = dir.path().join("hidden-field-mux-dump.json");
+        let mut hidden_field_payload = payload.clone();
+        hidden_field_payload["unredacted_hidden_field"] =
+            serde_json::json!("must never pass a redaction-attesting v1 verifier");
+        let (_, hidden_field_sha256) = hash_json_bounded(
+            &hidden_field_payload,
+            LIVE_MUX_DUMP_MAX_ARTIFACT_BYTES,
+            JsonSerializationStyle::Compact,
+        )
+        .expect("hash hidden-field fixture");
+        let hidden_field_envelope = serde_json::json!({
+            "schema": "frankenterm.mux-content-dump.v1",
+            "publication_state": "complete",
+            "payload_sha256": hidden_field_sha256,
+            "payload": hidden_field_payload,
+        });
+        let mut hidden_field_bytes = serde_json::to_vec_pretty(&hidden_field_envelope).unwrap();
+        hidden_field_bytes.push(b'\n');
+        write_new_private_artifact(&hidden_field_path, &hidden_field_bytes)
+            .expect("write hidden-field dump");
+        let hidden_field_error = verify_mux_dump_artifact(&hidden_field_path)
+            .expect_err("a recomputed checksum must not authorize unknown v1 fields");
+        assert!(hidden_field_error.to_string().contains("frozen v1 field set"));
+
+        let duplicate_key_path = dir.path().join("duplicate-key-mux-dump.json");
+        let mut duplicate_key_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+        let duplicate_target = b"\"redaction_applied\": true";
+        let duplicate_position = duplicate_key_bytes
+            .windows(duplicate_target.len())
+            .position(|window| window == duplicate_target)
+            .expect("fixture contains a redaction assertion");
+        let line_start = duplicate_key_bytes[..duplicate_position]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1);
+        let indentation = duplicate_key_bytes[line_start..duplicate_position].to_vec();
+        let mut duplicate_prefix = b"\"redaction_applied\": false,\n".to_vec();
+        duplicate_prefix.extend_from_slice(&indentation);
+        duplicate_key_bytes.splice(duplicate_position..duplicate_position, duplicate_prefix);
+        duplicate_key_bytes.push(b'\n');
+        write_new_private_artifact(&duplicate_key_path, &duplicate_key_bytes)
+            .expect("write duplicate-key dump");
+        let duplicate_key_error = verify_mux_dump_artifact(&duplicate_key_path)
+            .expect_err("duplicate JSON keys must not hide discarded unredacted bytes");
+        assert!(duplicate_key_error
+            .to_string()
+            .contains("canonical v1 artifact encoding"));
 
         let inconsistent_path = dir.path().join("internally-inconsistent-mux-dump.json");
         let mut inconsistent_payload = payload;
@@ -89787,6 +91064,65 @@ recorder_backend = "rusqlite"
     }
 
     #[test]
+    fn mux_dump_json_structural_preflight_bounds_allocating_parse_shape() {
+        let generous = JsonStructureLimits {
+            max_nodes: 64,
+            max_map_entries: 16,
+            max_sequence_entries: 16,
+            max_string_bytes: 128,
+            max_depth: 8,
+        };
+        verify_json_structure_bounded(br#"{"items":[1,2],"label":"ok"}"#, generous)
+            .expect("small canonical fixture stays within every structure budget");
+
+        let mut nodes = generous;
+        nodes.max_nodes = 3;
+        let error = verify_json_structure_bounded(b"[0,1,2]", nodes)
+            .expect_err("root plus three scalar nodes must exceed a three-node budget");
+        assert!(error.to_string().contains("node safety limit"));
+
+        let mut entries = generous;
+        entries.max_sequence_entries = 2;
+        let error = verify_json_structure_bounded(b"[0,1,2]", entries)
+            .expect_err("the third array element must exceed the sequence budget");
+        assert!(error.to_string().contains("sequence entry safety limit"));
+
+        let mut map_entries = generous;
+        map_entries.max_map_entries = 1;
+        let error = verify_json_structure_bounded(br#"{"one":1,"two":2}"#, map_entries)
+            .expect_err("the second object member must exceed the map budget");
+        assert!(error.to_string().contains("map entry safety limit"));
+
+        let mut strings = generous;
+        strings.max_string_bytes = 4;
+        let error = verify_json_structure_bounded(br#"{"key":"value"}"#, strings)
+            .expect_err("decoded keys and values share one string byte budget");
+        assert!(error.to_string().contains("decoded string byte safety limit"));
+
+        let mut depth = generous;
+        depth.max_depth = 1;
+        let error = verify_json_structure_bounded(b"[[0]]", depth)
+            .expect_err("a scalar below two arrays must exceed depth one");
+        assert!(error.to_string().contains("nesting safety limit"));
+
+        let source = include_str!("main.rs");
+        let verifier = source
+            .split_once("fn verify_mux_dump_artifact(")
+            .map(|(_, verifier)| verifier)
+            .expect("mux dump verifier remains present");
+        let preflight = verifier
+            .find("verify_json_structure_bounded(&persisted")
+            .expect("structural preflight remains in the verifier");
+        let allocating_parse = verifier
+            .find("serde_json::from_slice(&persisted)")
+            .expect("allocating JSON parse remains in the verifier");
+        assert!(
+            preflight < allocating_parse,
+            "zero-retention structural preflight must precede allocating JSON parse"
+        );
+    }
+
+    #[test]
     fn bounded_json_serialization_rejects_escape_expansion_before_exceeding_cap() {
         let value = serde_json::json!({"text": "\0\0\0\0"});
         let compact = serialize_json_bounded(&value, 64, JsonSerializationStyle::Compact)
@@ -89804,6 +91140,45 @@ recorder_backend = "rusqlite"
         let hash_error = hash_json_bounded(&value, 16, JsonSerializationStyle::Compact)
             .expect_err("hashing escaped JSON must fail at the identical bound");
         assert!(hash_error.to_string().contains("bounded JSON hashing failed"));
+    }
+
+    #[test]
+    fn session_dump_publication_requires_offline_verifier_receipt() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("SessionCommands::Dump {")
+            .expect("session dump branch remains present");
+        let end = source[start..]
+            .find("SessionCommands::VerifyDump")
+            .map(|offset| start + offset)
+            .expect("session verify-dump branch follows dump");
+        let branch = &source[start..end];
+        let write = branch
+            .find("write_new_private_artifact(&output_path, &artifact_bytes)")
+            .expect("dump publication remains no-clobber and durable");
+        let release_tree = branch
+            .find("drop(envelope)")
+            .expect("the producer pane-text tree must be released before publication");
+        let release_buffer = branch
+            .find("drop(artifact_bytes)")
+            .expect("the artifact-sized producer buffer must be released before reread");
+        let verify = branch
+            .find("verify_mux_dump_artifact(&output_path)")
+            .expect("published dumps must pass the offline verifier in-process");
+        let success_output = branch
+            .find("let result = serde_json::json!")
+            .expect("dump success output remains present");
+        assert!(
+            release_tree < write
+                && write < release_buffer
+                && release_buffer < verify
+                && verify < success_output,
+            "dump success must follow producer-tree release, durable publication, buffer release, and offline verification"
+        );
+        assert!(
+            branch[verify..success_output].contains("verified publication receipt disagrees"),
+            "producer and verifier receipts must be compared before success"
+        );
     }
 
     #[test]
@@ -96005,6 +97380,160 @@ log_level = "debug"
             .expect("installed ft backup boundary");
         assert!(ft_probe < first_backup);
         assert!(mux_probe < first_backup);
+
+        let lock_acquired = installer
+            .find("if mkdir \"$LOCK_DIR\"")
+            .expect("installer lock acquisition");
+        let installed_version_check = installer
+            .find("&& check_installed_version \"$VERSION\"")
+            .expect("sealed installed-version fast path");
+        assert!(lock_acquired < installed_version_check);
+        assert!(installer.contains("command -v head >/dev/null 2>&1 || return 1"));
+        assert!(installer.contains("command -v awk >/dev/null 2>&1 || return 1"));
+        assert!(installer.contains("sed 's/:ft:/:ROLE:/' | sort -u"));
+        assert!(installer.contains(
+            "sed 's/:frankenterm-mux-server:/:ROLE:/' | sort -u"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn top_level_installer_same_semver_fast_path_requires_exact_sealed_identity() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let installer = include_str!("../../../install.sh");
+        let function_start = installer
+            .find("check_installed_version() {")
+            .expect("installed-version function start");
+        let function_end_marker = "\n}\n\n# ───────────────────────────────────────────────────────────────────────────\n# PATH integration";
+        let relative_end = installer[function_start..]
+            .find(function_end_marker)
+            .expect("installed-version function end");
+        let function_end = function_start + relative_end + 2;
+        let function_source = &installer[function_start..function_end];
+
+        let dir = tempfile::tempdir().expect("create installed process-family fixture");
+        let ft_path = dir.path().join("ft");
+        let mux_path = dir.path().join("frankenterm-mux-server");
+        let build_id = "a".repeat(64);
+        write_atomic_component_fixture(
+            &ft_path,
+            &build_id,
+            "ft",
+            "x86_64-unknown-linux-gnu",
+        );
+        write_atomic_component_fixture(
+            &mux_path,
+            &build_id,
+            "frankenterm-mux-server",
+            "x86_64-unknown-linux-gnu",
+        );
+        for path in [&ft_path, &mux_path] {
+            let mut permissions = std::fs::metadata(path)
+                .expect("read component fixture metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions)
+                .expect("make component fixture executable");
+        }
+
+        let check = |expected_success: bool| {
+            let script = format!(
+                "DEST={}\nTARGET=x86_64-unknown-linux-gnu\n{}\ncheck_installed_version v0.15.2",
+                shell_single_quote(&dir.path().to_string_lossy()),
+                function_source
+            );
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .status()
+                .expect("execute installed-version shell function");
+            assert_eq!(status.success(), expected_success);
+        };
+
+        check(true);
+
+        write_atomic_component_fixture(
+            &mux_path,
+            &"b".repeat(64),
+            "frankenterm-mux-server",
+            "x86_64-unknown-linux-gnu",
+        );
+        check(false);
+
+        for (path, component) in [
+            (&ft_path, "ft"),
+            (&mux_path, "frankenterm-mux-server"),
+        ] {
+            write_atomic_component_fixture(
+                path,
+                &build_id,
+                component,
+                "x86_64-unknown-linux-gnu",
+            );
+            let stale = std::fs::read_to_string(path)
+                .expect("read stale-version fixture")
+                .replace("release-interactive:0.15.2;", "release-interactive:0.15.1;");
+            std::fs::write(path, stale).expect("write stale-version fixture");
+        }
+        check(false);
+
+        for (path, component) in [
+            (&ft_path, "ft"),
+            (&mux_path, "frankenterm-mux-server"),
+        ] {
+            write_atomic_component_fixture(
+                path,
+                &build_id,
+                component,
+                "x86_64-unknown-linux-gnu",
+            );
+            let debug = std::fs::read_to_string(path)
+                .expect("read non-shipping-profile fixture")
+                .replace("release-interactive:0.15.2;", "debug:0.15.2;");
+            std::fs::write(path, debug).expect("write non-shipping-profile fixture");
+        }
+        check(false);
+
+        write_atomic_component_fixture(
+            &ft_path,
+            &build_id,
+            "ft",
+            "aarch64-unknown-linux-gnu",
+        );
+        write_atomic_component_fixture(
+            &mux_path,
+            &build_id,
+            "frankenterm-mux-server",
+            "aarch64-unknown-linux-gnu",
+        );
+        check(false);
+
+        write_atomic_component_fixture(
+            &ft_path,
+            &build_id,
+            "ft",
+            "x86_64-unknown-linux-gnu",
+        );
+        write_atomic_component_fixture(
+            &mux_path,
+            &build_id,
+            "frankenterm-mux-server",
+            "x86_64-unknown-linux-gnu",
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&mux_path)
+            .and_then(|mut file| {
+                use std::io::Write as _;
+                writeln!(
+                    file,
+                    "# FT_ATOMIC_COMPONENT_IDENTITY_V1:{}:frankenterm-mux-server:x86_64-unknown-linux-gnu:release-interactive:0.15.2;",
+                    "c".repeat(64)
+                )
+            })
+            .expect("append conflicting sealed identity");
+        check(false);
     }
 
     #[test]

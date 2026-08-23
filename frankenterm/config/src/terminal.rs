@@ -545,6 +545,8 @@ mod tests {
         assert_eq!(handle.ssh_max_poll_delay_ms, 2000);
         assert_eq!(handle.client_reconnect_base_interval_ms, 1000);
         assert_eq!(handle.client_reconnect_max_interval_ms, 10000);
+        assert_eq!(handle.client_reconnect_max_attempts, 0);
+        assert_eq!(handle.client_reconnect_healthy_session_ms, 30000);
         assert_eq!(handle.render_base_poll_interval_ms, 20);
         assert_eq!(handle.render_max_poll_interval_ms, 30000);
         assert_eq!(handle.connui_poll_timeout_ms, 200);

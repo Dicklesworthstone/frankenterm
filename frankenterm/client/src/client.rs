@@ -8089,6 +8089,21 @@ impl Reconnectable {
     }
 }
 
+#[must_use]
+const fn reconnect_cycle_budget_exhausted(max_attempts: u32, failed_cycles: u32) -> bool {
+    max_attempts != 0 && failed_cycles > max_attempts
+}
+
+#[must_use]
+const fn reconnect_dial_budget_exhausted(max_attempts: u32, dial_attempts: u32) -> bool {
+    max_attempts != 0 && dial_attempts >= max_attempts
+}
+
+#[must_use]
+fn next_reconnect_backoff(backoff: Duration, max_interval: Duration) -> Duration {
+    backoff.saturating_mul(2).min(max_interval)
+}
+
 impl Client {
     fn matches_dispatch_authority(&self, authority: &ClientDispatchAuthority) -> bool {
         Arc::ptr_eq(&self.incarnation, &authority.client_incarnation)
@@ -8227,12 +8242,12 @@ impl Client {
                         }
 
                         failed_cycles = failed_cycles.saturating_add(1);
-                        if max_attempts != 0 && failed_cycles > max_attempts {
+                        if reconnect_cycle_budget_exhausted(max_attempts, failed_cycles) {
                             log::error!(
                                 "giving up on domain {local_domain_id}: {failed_cycles} \
                                  reconnect cycles without a session lasting {healthy_session:?} \
-                                 (last error: {e}). Raise \
-                                 client_reconnect_max_attempts to keep retrying."
+                                 (last error: {e}). Set \
+                                 client_reconnect_max_attempts to 0 to keep retrying."
                             );
                             if let Some(ui) = reconnect_ui.as_ref() {
                                 ui.output_str(&format!(
@@ -8248,9 +8263,10 @@ impl Client {
                             ui
                         });
 
-                        // Bounded, unlike before: a host that is simply down
-                        // never returns Ok here, and an unbounded loop meant
-                        // the domain retried until the app exited.
+                        // The default zero budget deliberately retries until
+                        // recovery or app exit. Operators that explicitly set
+                        // a nonzero budget bound this down-host dial loop as
+                        // well as the rapid connect/drop cycles above.
                         let mut reconnected = false;
                         let mut dial_attempts: u32 = 0;
                         loop {
@@ -8330,9 +8346,30 @@ impl Client {
                                                     log::error!(
                                                         "cannot schedule reconnect reattach for domain {local_domain_id}: {err:#}"
                                                     );
-                                                    reattach_ui.output_str(&format!(
-                                                        "Transport reconnected, but domain {local_domain_id} remains unavailable because topology reattach could not be scheduled: {err}\n"
-                                                    ));
+                                                    match dispatch.inner.client
+                                                        .abort_rpc_transport_generation(
+                                                            &rpc,
+                                                            "successor topology scheduler admission failed",
+                                                        )
+                                                    {
+                                                        Ok(()) => {
+                                                            reattach_ui.output_str(&format!(
+                                                                "Transport reconnected, but domain {local_domain_id} remains unavailable because topology reattach could not be scheduled: {err}. The exact successor generation was fenced and will be retried.\n"
+                                                            ));
+                                                            // Let the aborted reader enter the
+                                                            // ordinary retirement path so it can
+                                                            // mint a fresh transport generation.
+                                                            reconnected = true;
+                                                        }
+                                                        Err(abort_err) => {
+                                                            reattach_ui.output_str(&format!(
+                                                                "Transport reconnected, but domain {local_domain_id} remains unavailable because topology reattach could not be scheduled ({err}) and the exact successor generation could not be fenced ({abort_err}).\n"
+                                                            ));
+                                                            log::error!(
+                                                                "cannot fence reconnect generation after topology scheduler rejection for domain {local_domain_id}: {abort_err:#}"
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -8360,13 +8397,16 @@ impl Client {
                                 }
                                 Err(err) => {
                                     dial_attempts = dial_attempts.saturating_add(1);
-                                    if max_attempts != 0 && dial_attempts >= max_attempts {
+                                    if reconnect_dial_budget_exhausted(
+                                        max_attempts,
+                                        dial_attempts,
+                                    ) {
                                         ui.output_str(&format!(
                                             "giving up after {dial_attempts} attempts: {err}\n"
                                         ));
                                         break;
                                     }
-                                    backoff = (backoff + backoff).min(max_interval);
+                                    backoff = next_reconnect_backoff(backoff, max_interval);
                                     ui.output_str(&format!(
                                         "problem reconnecting: {}; will reconnect in {:?}\n",
                                         err, backoff
@@ -8377,8 +8417,8 @@ impl Client {
                         if !reconnected {
                             log::error!(
                                 "giving up on domain {local_domain_id}: could not reconnect \
-                                 after {dial_attempts} attempts (last error: {e}). Raise \
-                                 client_reconnect_max_attempts to keep retrying."
+                                 after {dial_attempts} attempts (last error: {e}). Set \
+                                 client_reconnect_max_attempts to 0 to keep retrying."
                             );
                             break;
                         }
@@ -8848,9 +8888,18 @@ impl Client {
             .as_ref()
             .filter(|authority| authority.generation == generation)
             .ok_or_else(|| anyhow!("mux RPC scope has no exact reader abort authority"))?;
-        self.rpc_transport
-            .request_generation_abort(reader_abort, reason);
-        Ok(())
+        if self
+            .rpc_transport
+            .request_generation_abort(reader_abort, reason)
+            || reader_abort.aborted_error().is_some()
+        {
+            Ok(())
+        } else {
+            bail!(
+                "mux RPC generation {} could not be fenced because its exact reader authority is stale",
+                generation
+            )
+        }
     }
 
     pub async fn resolve_pane_id(&self, pane_id: Option<PaneId>) -> anyhow::Result<PaneId> {
@@ -9192,6 +9241,35 @@ mod tests {
     }
 
     #[test]
+    fn zero_reconnect_attempt_limit_never_exhausts_either_retry_budget() {
+        for observed_attempts in [0, 1, 2, u32::MAX] {
+            assert!(!reconnect_cycle_budget_exhausted(0, observed_attempts));
+            assert!(!reconnect_dial_budget_exhausted(0, observed_attempts));
+        }
+
+        assert!(!reconnect_cycle_budget_exhausted(3, 3));
+        assert!(reconnect_cycle_budget_exhausted(3, 4));
+        assert!(!reconnect_dial_budget_exhausted(3, 2));
+        assert!(reconnect_dial_budget_exhausted(3, 3));
+    }
+
+    #[test]
+    fn reconnect_backoff_saturates_before_applying_the_configured_ceiling() {
+        assert_eq!(
+            next_reconnect_backoff(Duration::from_secs(3), Duration::from_secs(10)),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            next_reconnect_backoff(Duration::from_secs(8), Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            next_reconnect_backoff(Duration::MAX, Duration::MAX),
+            Duration::MAX
+        );
+    }
+
+    #[test]
     fn reconnect_dispatch_source_borrows_domain_guard_through_post_await_check() {
         let source = include_str!("client.rs");
         let dispatch_start =
@@ -9269,6 +9347,17 @@ mod tests {
             !source.contains("ui.output_str(\"Connected!\\n\")")
                 && !source.contains("ui.output_str(\"TLS Connected!\\n\")"),
             "transport setup must describe protocol verification as pending"
+        );
+        let scheduler_rejection = reconnect_dispatch
+            .find("cannot schedule reconnect reattach")
+            .expect("reconnect dispatch must retain bounded scheduler rejection handling");
+        let scheduler_retry = &reconnect_dispatch[scheduler_rejection..];
+        assert!(
+            scheduler_retry.contains("abort_rpc_transport_generation(")
+                && scheduler_retry
+                    .contains("successor topology scheduler admission failed")
+                && scheduler_retry.contains("reconnected = true"),
+            "transient scheduler rejection must fence the exact successor and enter ordinary generation retirement before retry"
         );
     }
 

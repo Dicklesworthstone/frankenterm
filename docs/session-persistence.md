@@ -273,6 +273,10 @@ proven:
 1. The per-user service manager starts one guardian before the mux. Its socket
    directory is private, its authentication token is a private regular file,
    and neither mux discovery nor a guessed pane UUID grants control authority.
+   A newly started mux sends the token-authenticated, payload-free `Hello`
+   bootstrap with a nil guardian-incarnation marker and receives the current
+   nonzero incarnation in the typed success payload before issuing census or
+   pane requests; no unauthenticated side file is incarnation authority.
 2. `Spawn` carries a unique request identity, bounded serialized
    `CommandBuilder`, initial `PtySize`, and durable pane UUID. Retrying the exact
    request returns the original pane; reusing the identity with different bytes
@@ -295,9 +299,18 @@ proven:
    durable or terminal-rejection acknowledgement arrives. A reverse effect-to-
    request index updates only its retained aliases at acknowledgement time;
    reconciliation cost is independent of unrelated fleet receipt volume. A
+   runtime acknowledgement carries the full authenticated pane, mux
+   incarnation, generation, sequence, effect UUID, and payload-digest
+   fingerprint rather than the effect UUID alone. After a resolved receipt
+   rotates and its UUID is reused under a later fence, a delayed journal
+   completion for the old fingerprint is therefore rejected without changing
+   the new pending input. A
    pending effect admits at most 64 distinct request aliases, so one ambiguous
    input cannot consume the global receipt ledger; excess aliases fail before
-   mutating any retained receipt.
+   mutating any retained receipt. When an ordinary effect rotates out of the
+   bounded window, every surviving request alias for that effect rotates with
+   it as one identity unit; an alias can never outlive and disagree with its
+   effect fingerprint.
 6. Raw PTY output is appended to a synchronized, checksummed sequence log before
    acknowledgement to the mux. The guardian retains a bounded replay window and
    terminal-state checkpoints that bind parser version, rows/columns, raw-output
@@ -313,6 +326,17 @@ proven:
 9. Guardian shutdown is a separate, explicit operator transaction. Stopping or
    upgrading the mux must not imply guardian shutdown, child termination, log
    truncation, or retention reclamation.
+
+The standalone guardian must not reproduce the mux's current per-pane reader
+and parser thread costs. One bounded readiness loop owns the listening socket,
+authenticated client connections, and every native PTY master descriptor;
+bounded connection buffers and a fixed spawn-worker pool feed that loop. Child
+status is reaped through bounded event/poll integration, not one permanent
+waiter thread per pane. The admission ceiling applies before a socket, spawn
+job, pane record, output buffer, or descriptor is published, and backpressure
+must stop reads rather than allocate an unbounded per-pane backlog. A platform
+without a safe supported readiness/child-reaping implementation remains on the
+explicit legacy mux-owned path; it must not silently claim guardian continuity.
 
 #### Guardian protocol v1 freeze
 
@@ -330,9 +354,24 @@ UUID, and effect UUID to the exact originating request, including the echoed
 lease generation and sequence, before consuming its payload. Resulting claim
 generations and next-sequence values
 belong in the authenticated response payload rather than mutable correlation
-header fields. Only the resulting correlated-response capability exposes the
-payload. Peer credentials are an
+header fields. Success payloads use an operation-typed fixed binary schema;
+fixed-width census rows carry an explicit exit-status presence flag so every
+`i32` exit value remains representable without a sentinel; when that flag is
+absent, its value bytes must use the one canonical zero encoding. Success and
+rejection constructors are the only public response-envelope creation paths,
+and the common encoder and decoder both revalidate operation scope, typed reply
+shape, and echoed identity. After frame correlation, the client
+also matches pane, effect, generation, and sequence identities inside the
+decoded success payload before exposing it. Only the resulting
+correlated-response capability exposes the payload. Peer credentials are an
 additional local-transport fence, not a replacement for the token.
+
+Authenticated non-success responses carry a fixed, content-free rejection
+code rather than an error string. The code's frozen classification must agree
+with the envelope status: transient capacity/input-durability gates are
+`rejected`, while an exact request that can never become valid is `terminal`.
+Malformed or status-inconsistent rejection payloads fail before the correlated
+client exposes their code.
 
 Every request header contains all of the following:
 
@@ -344,34 +383,64 @@ Every request header contains all of the following:
 - operation idempotency UUID for any request that can create an external
   effect.
 
+`Hello` is the sole bootstrap exception to the nonzero guardian-incarnation
+rule. Its authenticated request and correlated response header carry a
+canonical nil marker, while its fixed 16-byte success payload carries the
+current nonzero guardian incarnation. It has no pane, lease, effect, or payload
+scope. A nonnil request marker, trailing payload bytes, malformed response, or
+use of nil by any other operation fails closed.
+
 `Spawn` is the only request that may omit a pane lease. It carries a bounded
 serialized command, environment, working directory, initial PTY size, durable
 pane UUID, and spawn idempotency UUID. Repeating the same request UUID and
 payload digest returns the original result. Reusing either the request UUID or
 spawn idempotency UUID with different bytes is a terminal conflict and never
-spawns. `Census` is read-only and paginated under a fixed entry and byte cap.
-The first page names a nonzero authenticated snapshot UUID; the guardian binds
-it to the requesting mux incarnation, freezes that sorted durable-pane view,
-and returns the same snapshot UUID, total count, and next cursor on every page.
-Cross-incarnation UUID reuse is an identity conflict. A bounded eight-snapshot
-FIFO permits exact page retries while limiting memory. A rotated or unknown
-snapshot fails closed,
-rather than applying an ordinal cursor to a newer pane set and silently skipping
-or duplicating a concurrent spawn. Each fixed-width row carries pane UUID,
+spawns. The serialized command writes through the payload byte ceiling during
+encoding rather than allocating first and checking later; decoding requires
+the one canonical v1 serialization byte-for-byte, so ignored JSON fields or
+alternate encodings cannot carry authenticated hidden data. Its debug surface
+is content-free. Resize geometry and the supported terminate signal have fixed
+operation-tagged payloads, while claim, attach, close, checkpoint, replay,
+lease retirement, and `Hello` reject hidden trailing payload bytes.
+`QueryInputEffect` has a fixed operation-tagged payload containing the original
+input mutation sequence and payload SHA-256. The effect UUID alone is
+insufficient because a resolved bounded-window receipt may rotate and that UUID
+may later be reused under a different fence; an exact mismatch fails closed
+rather than returning the newer input's disposition.
+`Census` is read-only and paginated under a fixed entry and byte cap.
+The first-page request carries a canonical nil new-snapshot marker; the
+guardian allocates a nonzero incarnation-local snapshot UUID, binds it to the
+requesting mux incarnation, freezes that sorted durable-pane view, and returns
+that UUID, total count, and next cursor. Continuation pages must echo the
+returned nonzero UUID. Cross-incarnation UUID use is an identity conflict. A
+bounded eight-snapshot FIFO permits continuation-page retries while limiting
+memory. A rotated or unknown nonzero snapshot can never recreate state and
+fails closed rather than applying an ordinal cursor to a newer pane set and
+silently skipping
+or duplicating a concurrent spawn. Both the response producer and correlated
+consumer enforce the exact originating request's entry and encoded-byte page
+ceilings in addition to the global protocol cap. Each fixed-width row carries pane UUID,
 state, generation, claiming mux and next sequence when live, pending input
 identity, exit status, and quarantine reason.
 `Claim` names the observed prior generation and returns exactly the next
-generation; it cannot skip, wrap, or revive a terminal pane. `Attach` returns
-the claimed census row, checkpoint, and bounded replay cursor.
+generation; it cannot skip, wrap, or revive a terminal pane. The frozen base
+`Attach` reply acknowledges only the exact pane, generation, and next mutation
+sequence. Checkpoint and bounded raw-output replay transfer belong to the later
+output-journal protocol tranche; the identity-only base reply must not be
+described as continuity evidence.
 
-`Input`, `Resize`, `Signal`, live-pane `Close`, `Checkpoint`, `Replay`,
-`QueryInputEffect`, and `RetireLease` require the exact current lease. Mutation
-operations consume the next exact nonzero lease sequence; read-only `Attach`,
-`Replay`, and `QueryInputEffect` require sequence zero and never advance the
-mutation stream. A retention-only `Close` after observed child exit is the one
+`Input`, `Resize`, `Signal`, live-pane `Close`, `Checkpoint`, and
+`RetireLease` require the exact current lease. Mutation operations consume the
+next exact nonzero lease sequence. Read-only `Attach`, `Replay`, and
+`QueryInputEffect` require header sequence zero and never advance the mutation stream;
+the query payload separately carries the original input sequence and digest;
+on a live claimed pane they require the exact claiming mux and generation.
+After exit or terminal retention, `Replay` and `QueryInputEffect` instead use
+the exact retained generation as recovery authority because no live mutation
+lease remains. A retention-only `Close` after observed child exit is the other
 terminal-state exception: it requires the exact retained generation and
 sequence zero, cannot signal the already-exited child, and only seals the
-retained record. The guardian rejects a stale generation, wrong mux
+retained record. The guardian rejects a stale generation, wrong live mux
 incarnation, duplicate mutation sequence with different bytes, mutation
 sequence gap, or exhausted sequence before performing an effect. Input
 acknowledgements distinguish `not_seen`, `accepted_not_durable`,
@@ -379,6 +448,20 @@ acknowledgements distinguish `not_seen`, `accepted_not_durable`,
 the same idempotency UUID. Resize, signal, close, and checkpoint operations
 have the same request-digest replay rule, so an ambiguous response is queried
 or replayed by identity rather than converted into a second effect.
+
+The implementation exposes runtime effects only through a transactional API,
+not the pure observation surface. It validates authentication, incarnation,
+idempotency, capacity, pane state, generation, and sequence before invoking a
+new-effect callback. An exact request or effect replay returns its retained
+receipt without invoking that callback. The pane transition and new receipt
+are committed only after callback success; receipt capacity is preflighted but
+its exact eviction plan is likewise deferred until success. A zero-effect
+spawn/resize/signal failure therefore cannot create a phantom pane, consume a
+sequence, or discard an older replay receipt. Callback failure is
+permitted only when no bytes, signal, resize, process, or other external effect
+became observable. A possibly partial input write is therefore committed as
+`accepted_not_durable` and reconciled by its exact effect UUID; it must never be
+reported as a safely retryable callback failure.
 
 The per-pane protocol state machine is finite and explicit:
 
@@ -400,6 +483,12 @@ durable/terminal disposition is still ambiguous survives child exit and blocks
 lease takeover, retirement, and terminal close until that exact effect identity
 is reconciled. `closed_terminal` is queryable through the bounded idempotency
 window but cannot be claimed or spawned under the same durable pane UUID.
+Full terminal output/checkpoint state may be compacted under the declared
+retention policy, but the pane UUID and original spawn request/effect identity
+remain as a durable tombstone. Reaching the pane/tombstone ceiling fails closed;
+it never auto-evicts a tombstone to admit a new spawn. Reclamation requires a
+separately authenticated explicit retention transaction with a durable receipt,
+and a reclaimed UUID is never implicitly reusable as a new process identity.
 Guardian incarnation rollover invalidates all transport sessions and requires a
 fresh census; persisted pane generation never decreases. Exhaustion of a
 generation, mutation sequence, output sequence, or idempotency counter is a
@@ -433,16 +522,44 @@ created through a no-symlink pinned directory capability with private
 permissions, never overwrites an existing file, and synchronizes both the file
 and containing directory before success is reported. Partial pane reads or
 topology drift are recorded and fail the command by default. Payload and
-topology checksum passes are streaming and byte-bounded; topology records
-borrow pane metadata instead of cloning remote strings into a second JSON tree.
+topology checksum passes are streaming and byte-bounded. The topology projection
+uses the same redacted canonical domain/workspace strings published in the
+artifact, so its digest cannot retain a dictionary-testable pre-redaction value.
+The command releases its producer-side pane-text tree before publication. After
+durable publication, it also releases the artifact-sized serialization buffer,
+rereads the private file through `verify-dump`, and compares the independent
+producer/verifier receipts before reporting success. A rejected artifact
+remains retained at its no-clobber path for diagnosis.
+These unkeyed checksums detect corruption and internal inconsistency; they do
+not authenticate origin against an actor who can rewrite the private artifact
+and recompute every digest.
 
 `ft session verify-dump <path>` performs bounded offline verification of the
 private regular-file shape, complete-publication marker, schema, whole-payload
 checksum, per-pane text checksums and byte/line counts, aggregate limits,
-summary counters, completeness/error consistency, and the explicit
-non-restorable capability claims. A valid artifact can still have `complete:
-false` when it was deliberately retained with `--allow-partial`; verification
-reports that state rather than promoting it to a complete safety gate.
+the one canonical v1 JSON encoding, exact field sets at every nested object,
+pane metadata, exact outcome equality with the sorted unique initial-pane-ID
+manifest, unique capture-error ownership, sorted domain summaries,
+summary counters, topology-fence kind/scope/fingerprints, completeness/error
+consistency, and the explicit non-restorable capability claims. A `complete:
+true` artifact is accepted only when its initial/final pane counts match every
+captured pane, its initial fingerprint recomputes from the canonical redacted
+pane metadata, and its initial/final topology fingerprints agree. A valid artifact
+can still have `complete: false` when it was deliberately retained with
+`--allow-partial`; verification reports that state rather than promoting it to
+a complete safety gate. Duplicate and unknown JSON members fail closed so
+discarded or hidden bytes cannot coexist with a `redaction_applied` attestation.
+The verifier also reapplies the current canonical redactor to every serialized
+string value and requires the entire artifact to be a redaction fixed point. A writer
+therefore cannot inject recognizable secret material, recompute every unkeyed
+checksum, and retain a valid redaction attestation; rejection diagnostics never
+echo the offending string.
+Canonical comparison streams serializer output against the already bounded
+artifact bytes; it does not allocate a second artifact-sized buffer. Before
+the allocating JSON parse, a zero-retention streaming preflight applies global
+node, map-entry, sequence-entry, decoded-string-byte, and nesting-depth limits,
+preventing a byte-small structural payload from amplifying into an unbounded
+value tree.
 
 The dump is deliberately not accepted as an executable restore image. It does
 not provide an atomic point-in-time content snapshot and does not preserve PTY

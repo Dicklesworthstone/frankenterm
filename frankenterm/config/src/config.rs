@@ -629,22 +629,26 @@ pub struct Config {
     #[dynamic(default = "default_ssh_max_poll_delay_ms")]
     pub ssh_max_poll_delay_ms: u64,
 
-    /// Base interval for client reconnect backoff in milliseconds. Default: 1000.
+    /// Base interval for client reconnect backoff in milliseconds. Must be
+    /// greater than zero. Default: 1000.
     #[dynamic(default = "default_client_reconnect_base_interval_ms")]
     pub client_reconnect_base_interval_ms: u64,
 
-    /// Maximum interval for client reconnect backoff in milliseconds. Default: 10000.
+    /// Maximum interval for client reconnect backoff in milliseconds. Must be
+    /// at least `client_reconnect_base_interval_ms`. Default: 10000.
     #[dynamic(default = "default_client_reconnect_max_interval_ms")]
     pub client_reconnect_max_interval_ms: u64,
 
-    /// How many times a client domain may re-enter the reconnect loop before
-    /// giving up on it for this session. Default: 3. Set to 0 for unlimited.
+    /// How many failed reconnect cycles or dial attempts a client domain may
+    /// tolerate before giving up for this session. Default: 0 (unlimited). A
+    /// nonzero value is an explicit operator opt-in to terminal detach after
+    /// that retry budget is exhausted.
     ///
-    /// This bounds *cycles*, not the retries inside one cycle: reconnecting to
-    /// a host that accepts the connection and then immediately drops the
-    /// session is the failure mode this exists for. Each such cycle used to
-    /// reset the backoff and open a fresh connection window, so a machine that
-    /// was down but still reachable produced an endless stream of windows.
+    /// The same nonzero value bounds both the dial loop while a host is down
+    /// and repeated cycles where a host accepts the connection and immediately
+    /// drops the session. Each such cycle used to reset the backoff and open a
+    /// fresh connection window, so a machine that was down but still reachable
+    /// produced an endless stream of windows.
     ///
     /// A connection that stays up for at least
     /// `client_reconnect_healthy_session_ms` is treated as genuinely
@@ -654,7 +658,8 @@ pub struct Config {
     pub client_reconnect_max_attempts: u32,
 
     /// How long a reconnected session must survive before it counts as
-    /// recovered and resets `client_reconnect_max_attempts`. Default: 30000.
+    /// recovered and resets `client_reconnect_max_attempts`. Must be greater
+    /// than zero. Default: 30000.
     #[dynamic(default = "default_client_reconnect_healthy_session_ms")]
     pub client_reconnect_healthy_session_ms: u64,
 
@@ -1636,6 +1641,23 @@ impl Config {
     /// Check for logical conflicts in the config
     pub fn check_consistency(&self) -> anyhow::Result<()> {
         self.check_domain_consistency()?;
+        self.check_client_reconnect_consistency()?;
+        Ok(())
+    }
+
+    fn check_client_reconnect_consistency(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.client_reconnect_base_interval_ms > 0,
+            "client_reconnect_base_interval_ms must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.client_reconnect_max_interval_ms >= self.client_reconnect_base_interval_ms,
+            "client_reconnect_max_interval_ms must be greater than or equal to client_reconnect_base_interval_ms"
+        );
+        anyhow::ensure!(
+            self.client_reconnect_healthy_session_ms > 0,
+            "client_reconnect_healthy_session_ms must be greater than zero"
+        );
         Ok(())
     }
 
@@ -2147,7 +2169,7 @@ fn default_client_reconnect_max_interval_ms() -> u64 {
 }
 
 fn default_client_reconnect_max_attempts() -> u32 {
-    3
+    0
 }
 
 fn default_client_reconnect_healthy_session_ms() -> u64 {
@@ -2992,6 +3014,35 @@ fn default_colr_rasterizer() -> FontRasterizerSelection {
 mod tests {
     use super::*;
     use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
+
+    #[test]
+    fn reconnect_timer_consistency_rejects_zero_and_inverted_bounds() {
+        let mut config = Config::default();
+        config
+            .check_consistency()
+            .expect("default reconnect timer bounds are valid");
+
+        config.client_reconnect_base_interval_ms = 0;
+        let error = config
+            .check_consistency()
+            .expect_err("zero reconnect base interval must not create a busy retry loop");
+        assert!(error.to_string().contains("base_interval_ms"));
+
+        config.client_reconnect_base_interval_ms = 2_000;
+        config.client_reconnect_max_interval_ms = 1_000;
+        let error = config
+            .check_consistency()
+            .expect_err("reconnect maximum must not be below its initial delay");
+        assert!(error.to_string().contains("max_interval_ms"));
+
+        config.client_reconnect_base_interval_ms = 1_000;
+        config.client_reconnect_max_interval_ms = 10_000;
+        config.client_reconnect_healthy_session_ms = 0;
+        let error = config
+            .check_consistency()
+            .expect_err("zero healthy-session fence would erase every finite failure budget");
+        assert!(error.to_string().contains("healthy_session_ms"));
+    }
 
     // ── DroppedFileQuoting::escape ─────────────────────────────
 
