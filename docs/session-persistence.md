@@ -338,7 +338,10 @@ proven:
    supersede the prior activation or satisfy historical segment lookup. The
    pinned active key and full activation inventory are revalidated before new
    cipher use or rotation, so external key mutation and concurrent activation
-   advancement fail closed. A missing, truncated, symlinked, hard-linked,
+   advancement fail closed. An exact retry after activation acknowledgement
+   loss reopens and synchronizes the immutable record, then verifies its
+   decoded identity, referenced key, and the full contiguous inventory before
+   returning success. A missing, truncated, symlinked, hard-linked,
    permission-unsafe, wrong-ID, or corrupt referenced key fails closed. Key
    bytes are zeroized when their in-memory authority is dropped and never enter
    `Debug`, argv, environment variables, receipts, dumps, or log fields.

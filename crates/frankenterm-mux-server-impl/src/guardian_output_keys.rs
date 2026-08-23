@@ -347,23 +347,55 @@ fn publish_activation(
 ) -> Result<(), GuardianOutputKeyringError> {
     let name = activation_name(activation);
     let bytes = encode_activation(activation);
-    let mut file = create_private_file(directory, &name).map_err(|error| match error {
-        GuardianOutputKeyringError::Io(ref io)
-            if io.kind() == std::io::ErrorKind::AlreadyExists =>
-        {
-            GuardianOutputKeyringError::AmbiguousGeneration
+    let publication = (|| {
+        let mut file = create_private_file(directory, &name).map_err(|error| match error {
+            GuardianOutputKeyringError::Io(ref io)
+                if io.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                GuardianOutputKeyringError::AmbiguousGeneration
+            }
+            other => other,
+        })?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        validate_opened_file(
+            directory,
+            OsStr::new(&name),
+            &file,
+            ACTIVATION_BYTES as u64,
+        )?;
+        sync_directory(directory)
+    })();
+    match publication {
+        Ok(()) => Ok(()),
+        Err(publication_error) => {
+            // Creation, file sync, or directory sync may report an error after
+            // the exact activation became visible. Reopen and synchronize that
+            // immutable record, then validate the complete contiguous
+            // inventory and referenced key before treating this as an
+            // acknowledgement-loss retry. A partial or conflicting generation
+            // cannot pass this reconciliation.
+            match reconcile_activation_publication(directory, activation) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(publication_error),
+            }
         }
-        other => other,
-    })?;
-    file.write_all(&bytes)?;
+    }
+}
+
+fn reconcile_activation_publication(
+    directory: &CapDir,
+    activation: Activation,
+) -> Result<(), GuardianOutputKeyringError> {
+    let name = activation_name(activation);
+    let file = open_validated_file(directory, OsStr::new(&name), ACTIVATION_BYTES as u64)?;
     file.sync_all()?;
-    validate_opened_file(
-        directory,
-        OsStr::new(&name),
-        &file,
-        ACTIVATION_BYTES as u64,
-    )?;
-    sync_directory(directory)
+    if read_activation(file)? != activation {
+        return Err(GuardianOutputKeyringError::InvalidActivation);
+    }
+    sync_directory(directory)?;
+    let key = load_key(directory, activation.key_id)?;
+    verify_latest_authority(directory, activation, &key)
 }
 
 fn load_key(
@@ -738,6 +770,28 @@ mod tests {
             Err(GuardianOutputKeyringError::UnactivatedKey)
         ));
         assert!(directory.path().join(key_name(unactivated_id)).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_activation_retry_reconciles_acknowledgement_loss() {
+        let directory = tempfile::tempdir().expect("create retry keyring");
+        let keyring = GuardianOutputKeyring::open_or_provision(open_private_directory(
+            directory.path(),
+        ))
+        .expect("provision keyring");
+        let next_key = GuardianOutputKey::generate().expect("generate retry key");
+        let activation = Activation {
+            generation: 2,
+            key_id: next_key.key_id(),
+        };
+        publish_key(&keyring.directory, &next_key).expect("publish retry key");
+        publish_activation(&keyring.directory, activation).expect("publish activation");
+
+        publish_activation(&keyring.directory, activation)
+            .expect("reconcile exact already-published activation");
+        verify_latest_authority(&keyring.directory, activation, &next_key)
+            .expect("retain exact reconciled authority");
     }
 
     #[cfg(unix)]

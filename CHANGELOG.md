@@ -212,6 +212,10 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   segment key ID. The pinned active key and complete activation inventory are
   revalidated before cipher use and rotation, so same-process authority cannot
   silently survive external key mutation or a concurrent activation advance.
+  An exact activation retry after acknowledgement loss reopens and synchronizes
+  the immutable record, referenced key, and full contiguous inventory before
+  accepting the already-published generation; partial or conflicting records
+  remain terminal failures.
   This is storage/format substrate only; it is not yet wired to a live guardian
   PTY reader and does not claim mux-crash process continuity.
 - Freezes the guardian v1 authenticated request/response envelopes and pure
