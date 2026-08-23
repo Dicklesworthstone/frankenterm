@@ -323,11 +323,19 @@ proven:
    acknowledgement to the mux. The guardian retains a bounded replay window and
    terminal-state checkpoints that bind parser version, rows/columns, raw-output
    sequence, hot viewport, cold-scrollback base sequence, and a content digest.
+   A checkpoint must either serialize the complete incremental parser state or
+   prove that its raw-output sequence ends at a parser ground-state boundary;
+   screen rows alone cannot represent a partial CSI, OSC, or DCS sequence.
 7. `Attach` returns a census entry plus the newest verified checkpoint and raw
-   output strictly after its sequence. The mux reconstructs the terminal parser,
-   verifies the resulting digest, and only then publishes the pane into topology.
-   A gap or digest mismatch quarantines the pane for transcript recovery instead
-   of presenting invented state.
+   output strictly after its sequence. The mux reconstructs the terminal parser
+   behind a replay gate whose writer discards parser-generated device replies and
+   whose clipboard, download, notification, and device-control handlers are inert.
+   Replayed bytes must never write into the surviving child or invoke host-facing
+   callbacks. The mux verifies the resulting digest and parser boundary before it
+   atomically installs the live guardian writer and approved handlers and publishes
+   the pane into topology. A gap, unsupported parser state, or digest mismatch
+   keeps the live writer unreachable and quarantines the pane for transcript
+   recovery instead of presenting invented state.
 8. Guardian census is the post-crash process authority; the last committed mux
    topology manifest supplies window/tab/workspace placement. Reconciliation is
    by durable pane UUID, never by mux-local numeric pane ID or PID.
