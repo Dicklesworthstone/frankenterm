@@ -81,6 +81,7 @@ impl KittyImageState {
     /// checkpoint policy. Screen-attached image cells are checked separately;
     /// this covers incomplete transmissions, reusable image IDs, and placement
     /// bookkeeping that line serialization alone cannot reconstruct.
+    #[cfg(feature = "use_serde")]
     pub(crate) fn is_empty_for_checkpoint(&self) -> bool {
         self.accumulator.is_empty()
             && self.accumulator_encoded_bytes == 0
@@ -89,6 +90,11 @@ impl KittyImageState {
             && self.id_to_data.is_empty()
             && self.placements.is_empty()
             && self.used_memory == 0
+    }
+
+    #[cfg(all(test, feature = "use_serde"))]
+    pub(crate) fn mark_nonempty_for_checkpoint_test(&mut self) {
+        self.max_image_id = 1;
     }
 
     /// Override the per-image transmission-size cap.

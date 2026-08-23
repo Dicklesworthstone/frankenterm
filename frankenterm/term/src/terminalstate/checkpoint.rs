@@ -365,3 +365,79 @@ impl std::fmt::Display for TerminalCheckpointError {
 }
 
 impl std::error::Error for TerminalCheckpointError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Terminal;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct CheckpointTestConfig;
+
+    impl TerminalConfiguration for CheckpointTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn terminal() -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(CheckpointTestConfig),
+            "FrankenTerm",
+            "checkpoint-test",
+            Box::new(Vec::<u8>::new()),
+        )
+    }
+
+    #[test]
+    fn semantic_projection_roundtrips_and_tracks_both_screens() {
+        let mut terminal = terminal();
+        terminal.advance_bytes(b"primary\x1b]2;checkpoint-title\x07");
+        terminal.advance_bytes(b"\x1b[?1049h\x1b[31malternate");
+        let checkpoint = TerminalCheckpointV1::capture(&terminal).expect("capture terminal");
+        let encoded = serde_json::to_vec(&checkpoint).expect("serialize checkpoint");
+        let decoded: TerminalCheckpointV1 =
+            serde_json::from_slice(&encoded).expect("deserialize checkpoint");
+
+        assert_eq!(decoded, checkpoint);
+        assert!(checkpoint.alternate_screen_active);
+        assert_eq!(checkpoint.title, "checkpoint-title");
+        assert_ne!(checkpoint.primary_screen.lines, checkpoint.alternate_screen.lines);
+    }
+
+    #[test]
+    fn unsupported_out_of_band_graphics_fail_closed() {
+        let mut terminal = terminal();
+        terminal.kitty_img.mark_nonempty_for_checkpoint_test();
+
+        assert_eq!(
+            TerminalCheckpointV1::capture(&terminal),
+            Err(TerminalCheckpointError::UnsupportedGraphicsState)
+        );
+    }
+
+    #[test]
+    fn canonical_projection_sorts_terminal_maps() {
+        let mut first = terminal();
+        first.user_vars.insert("zeta".into(), "last".into());
+        first.user_vars.insert("alpha".into(), "first".into());
+        let mut second = terminal();
+        second.user_vars.insert("alpha".into(), "first".into());
+        second.user_vars.insert("zeta".into(), "last".into());
+
+        let first = TerminalCheckpointV1::capture(&first).expect("capture first terminal");
+        let second = TerminalCheckpointV1::capture(&second).expect("capture second terminal");
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first terminal"),
+            serde_json::to_vec(&second).expect("serialize second terminal")
+        );
+    }
+}
