@@ -228,6 +228,55 @@ impl GuardianOutputCipher {
         Ok(Self { cipher, key_id })
     }
 
+    /// Seal guardian-owned journal metadata under a caller-supplied,
+    /// domain-separated associated-data envelope.
+    ///
+    /// This crate-private surface lets the input-effect journal reuse the
+    /// provisioned guardian key without exposing key bytes or reusing the raw
+    /// output record identity. Callers must include a unique format domain and
+    /// the complete cleartext record header in `aad`.
+    pub(crate) fn seal_guardian_metadata(
+        &self,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<([u8; NONCE_BYTES], Vec<u8>), GuardianOutputJournalError> {
+        let mut nonce_bytes = [0_u8; NONCE_BYTES];
+        if OsRng.try_fill_bytes(&mut nonce_bytes).is_err() {
+            nonce_bytes.zeroize();
+            return Err(GuardianOutputJournalError::EntropyUnavailable);
+        }
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|_| GuardianOutputJournalError::EncryptionFailed)?;
+        Ok((nonce_bytes, ciphertext))
+    }
+
+    /// Authenticate and open guardian-owned journal metadata produced by
+    /// [`Self::seal_guardian_metadata`].
+    pub(crate) fn open_guardian_metadata(
+        &self,
+        nonce_bytes: &[u8; NONCE_BYTES],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, GuardianOutputJournalError> {
+        self.cipher
+            .decrypt(
+                XNonce::from_slice(nonce_bytes),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| GuardianOutputJournalError::DecryptionFailed)
+    }
+
     fn seal(
         &self,
         identity: GuardianOutputSegmentIdentity,

@@ -969,6 +969,30 @@ impl std::fmt::Debug for GuardianInputEffectIdentity {
 }
 
 impl GuardianInputEffectIdentity {
+    pub fn new(
+        pane_id: Uuid,
+        mux_incarnation: Uuid,
+        generation: u64,
+        sequence: u64,
+        effect_id: Uuid,
+        payload_sha256: [u8; 32],
+    ) -> Result<Self, GuardianProtocolError> {
+        require_nonzero(pane_id, "pane id")?;
+        require_nonzero(mux_incarnation, "mux incarnation")?;
+        require_nonzero(effect_id, "effect id")?;
+        if generation == 0 || sequence == 0 {
+            return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
+        }
+        Ok(Self {
+            pane_id,
+            mux_incarnation,
+            generation,
+            sequence,
+            effect_id,
+            payload_sha256,
+        })
+    }
+
     pub fn from_authenticated_request(
         request: &AuthenticatedGuardianRequest,
     ) -> Result<Self, GuardianProtocolError> {
@@ -976,20 +1000,50 @@ impl GuardianInputEffectIdentity {
         if request.header.operation != GuardianOperation::Input {
             return Err(GuardianProtocolError::InputDurabilityIdentityMismatch);
         }
-        Ok(Self {
-            pane_id: request
+        Self::new(
+            request
                 .header
                 .pane_id
                 .ok_or(GuardianProtocolError::InputDurabilityIdentityMismatch)?,
-            mux_incarnation: request.header.mux_incarnation,
-            generation: request.header.lease_generation,
-            sequence: request.header.lease_sequence,
-            effect_id: request
+            request.header.mux_incarnation,
+            request.header.lease_generation,
+            request.header.lease_sequence,
+            request
                 .header
                 .effect_id
                 .ok_or(GuardianProtocolError::InputDurabilityIdentityMismatch)?,
-            payload_sha256: request.header.payload_sha256,
-        })
+            request.header.payload_sha256,
+        )
+    }
+
+    #[must_use]
+    pub const fn pane_id(self) -> Uuid {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub const fn mux_incarnation(self) -> Uuid {
+        self.mux_incarnation
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn effect_id(self) -> Uuid {
+        self.effect_id
+    }
+
+    #[must_use]
+    pub const fn payload_sha256(self) -> [u8; 32] {
+        self.payload_sha256
     }
 }
 
