@@ -236,8 +236,16 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   parser only to the exact processed raw-output sequence at which this stricter
   predicate was true; older output offsets paired with newer screen state are
   forbidden because suffix replay would duplicate terminal effects. This is a
-  checkpoint substrate only; canonical terminal-state encoding and live
-  guardian capture remain pending.
+  checkpoint substrate only; live guardian capture remains pending. The first
+  capability-free terminal projection now covers both screen buffers and saved
+  cursors plus the complete performer, mode, margin, keyboard, mouse, palette,
+  metadata, Unicode-width, bidi, focus, geometry, and sequence state. It sorts
+  terminal maps for canonical encoding and rejects out-of-band graphics until
+  their bounded v1 representation exists. OSC-8 hyperlink serialization also
+  now sorts its internal parameter map, closing a pre-existing path where
+  identical styled lines could produce different checkpoint/render digests.
+  Strict decode bounds, restore validation, atomic publication, and live
+  guardian integration remain pending.
 - Freezes the guardian v1 authenticated request/response envelopes and pure
   fencing state machine: bounded HMAC-before-decode framing, exact response
   correlation, a token-authenticated payload-free `Hello` bootstrap that is
