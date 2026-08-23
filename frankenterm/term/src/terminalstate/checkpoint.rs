@@ -349,8 +349,19 @@ impl TerminalCheckpointV1 {
     }
 }
 
-#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum TerminalCheckpointError {
-    #[error("terminal contains graphics state unsupported by checkpoint v1")]
     UnsupportedGraphicsState,
 }
+
+impl std::fmt::Display for TerminalCheckpointError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedGraphicsState => formatter.write_str(
+                "terminal contains graphics state unsupported by checkpoint v1",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TerminalCheckpointError {}
