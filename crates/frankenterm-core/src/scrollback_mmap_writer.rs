@@ -44,7 +44,11 @@ const V2_STATE_SLOTS_OFFSET: usize = 88;
 const V2_STATE_CHECKSUM_OFFSET: usize = 48;
 const V2_STATE_CHECKSUM_BYTES: usize = 16;
 const V2_RECORD_MAGIC: [u8; 4] = *b"FTR2";
-const V2_RECORD_HEADER_SIZE: usize = 64;
+/// Fixed authenticated record-header bytes used by fresh v2 ring files.
+///
+/// This is public so external conformance/property tests can size a
+/// deliberately non-wrapping ring without encoding the retired v1 overhead.
+pub const V2_RECORD_HEADER_SIZE: usize = 64;
 const V2_RECORD_DIGEST_OFFSET: usize = 32;
 const V2_RECORD_DIGEST_BYTES: usize = 32;
 const V2_STATE_HASH_DOMAIN: &[u8] = b"frankenterm.scrollback.v2.state\0";

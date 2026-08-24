@@ -1,6 +1,7 @@
-use frankenterm_core::scrollback_mmap_format::{HEADER_SIZE, RECORD_HEADER_SIZE, RecordKind};
+use frankenterm_core::scrollback_mmap_format::{HEADER_SIZE, RecordKind};
 use frankenterm_core::scrollback_mmap_writer::{
-    LinearRecordReadLimits, MmapScrollback, MmapScrollbackConfig, read_linear_records,
+    LinearRecordReadLimits, MmapScrollback, MmapScrollbackConfig, V2_RECORD_HEADER_SIZE,
+    read_linear_records,
 };
 use proptest::prelude::*;
 use sha2::{Digest as _, Sha256};
@@ -43,8 +44,9 @@ fn required_capacity(records: &[(RecordKind, Vec<u8>)]) -> u64 {
     let max_streaming_records = records.len().saturating_mul(2) as u64;
 
     payload_bytes
-        .saturating_add(max_streaming_records.saturating_mul(RECORD_HEADER_SIZE as u64))
+        .saturating_add(max_streaming_records.saturating_mul(V2_RECORD_HEADER_SIZE as u64))
         .saturating_add(64)
+        .max(V2_RECORD_HEADER_SIZE as u64 + 1)
 }
 
 fn read_limits(path: &Path) -> LinearRecordReadLimits {
@@ -188,7 +190,7 @@ proptest! {
         let expected_total: u64 = persisted
             .records
             .iter()
-            .map(|(_, payload)| RECORD_HEADER_SIZE as u64 + payload.len() as u64)
+            .map(|(_, payload)| V2_RECORD_HEADER_SIZE as u64 + payload.len() as u64)
             .sum();
 
         prop_assert_eq!(header.write_cursor_bytes, expected_total);
@@ -198,20 +200,20 @@ proptest! {
 
     #[test]
     fn proptest_scrollback_mmap_writer_oversized_payload_is_tail_truncated_to_capacity(
-        cap_bytes in (RECORD_HEADER_SIZE as u64 + 1)..=96_u64,
-        payload in prop::collection::vec(Just(b'z'), 97..=192),
+        cap_bytes in (V2_RECORD_HEADER_SIZE as u64 + 1)..=128_u64,
+        payload in prop::collection::vec(Just(b'z'), 129..=256),
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut writer = MmapScrollback::open(config_for(&dir, "pane-truncate", cap_bytes))
             .expect("open writer");
-        let max_payload = cap_bytes as usize - RECORD_HEADER_SIZE;
+        let max_payload = cap_bytes as usize - V2_RECORD_HEADER_SIZE;
         prop_assume!(payload.len() > max_payload);
 
         let report = writer.append(RecordKind::Text, &payload).expect("append oversized payload");
 
         prop_assert_eq!(report.payload_bytes, max_payload);
-        prop_assert_eq!(report.write_cursor_bytes, cap_bytes);
-        prop_assert_eq!(writer.header().write_cursor_bytes, cap_bytes);
+        prop_assert_eq!(report.write_cursor_bytes, 0);
+        prop_assert_eq!(writer.header().write_cursor_bytes, 0);
         prop_assert_eq!(writer.header().total_bytes_written, cap_bytes);
         prop_assert_eq!(writer.header().capacity_bytes, cap_bytes);
     }
@@ -239,7 +241,7 @@ proptest! {
         let expected_cursor: u64 = read_back
             .records
             .iter()
-            .map(|(_, payload)| RECORD_HEADER_SIZE as u64 + payload.len() as u64)
+            .map(|(_, payload)| V2_RECORD_HEADER_SIZE as u64 + payload.len() as u64)
             .sum();
         let reopened = MmapScrollback::open(config).expect("reopen writer");
         prop_assert_eq!(reopened.header().capacity_bytes, cap_bytes);

@@ -772,8 +772,11 @@ impl GuardianService {
                     self.accept_connections()?;
                 }
             } else if event.token == self.output_completion_token {
-                self.runtime.handle_output_completions();
-                self.handle_input_completions();
+                // Drain worker completions only after every connection event
+                // in this readiness batch. A ready authenticated Hello must
+                // publish its lifecycle observation before deferred retirement
+                // can replay from a co-ready input completion.
+                continue;
             } else if self.runtime.owns_pty_token(event.token) {
                 if event.readable || event.closed {
                     self.runtime.handle_pty_ready(event.token);
@@ -1015,8 +1018,11 @@ impl GuardianService {
                 if response.header().status == GuardianResponseStatus::Success {
                     let mux_incarnation = request.header().mux_incarnation;
                     if self
-                        .runtime
-                        .observe_connected_mux(mux_incarnation, connection.generation)
+                        .mux_connections
+                        .observe_authenticated_hello(
+                            connection.identity(token),
+                            mux_incarnation,
+                        )
                         .is_err()
                     {
                         self.transport_failures =
@@ -1025,11 +1031,6 @@ impl GuardianService {
                         return FrameProcessing::Close;
                     }
                     connection.mux_incarnation = Some(mux_incarnation);
-                    let active = self
-                        .active_mux_connections
-                        .entry(mux_incarnation)
-                        .or_insert(0);
-                    *active = active.saturating_add(1);
                 } else {
                     connection.close_after_write = true;
                 }
@@ -1123,6 +1124,7 @@ impl GuardianService {
                 GuardianRuntimeInputCompletionState::Empty
                 | GuardianRuntimeInputCompletionState::Disconnected => break,
             };
+            self.replay_deferred_mux_retirements();
             let token = completion.route.connection_token;
             let Some(mut connection) = self.connections.remove(&token) else {
                 // The originating peer disconnected. Runtime restoration and
@@ -1164,30 +1166,54 @@ impl GuardianService {
 
     fn finish_connection(&mut self, token: Token, mut connection: Connection) {
         let _ = self.poll.registry().deregister(&mut connection.stream);
-        self.free_connection_tokens.push(token.0);
         self.lifecycle.authority_disconnected(token);
-        let Some(mux_incarnation) = connection.mux_incarnation else {
+        let identity = connection.identity(token);
+        let observed = self
+            .mux_connections
+            .observe_disconnect(identity, connection.mux_incarnation);
+        self.free_connection_tokens.push(token.0);
+        if observed.is_err() {
+            self.transport_failures = self.transport_failures.saturating_add(1);
             return;
-        };
-        let final_connection = match self.active_mux_connections.get_mut(&mux_incarnation) {
-            Some(active) if *active > 1 => {
-                *active -= 1;
-                false
-            }
-            Some(_) => true,
-            None => {
-                self.transport_failures = self.transport_failures.saturating_add(1);
-                false
-            }
-        };
-        if final_connection {
-            self.active_mux_connections.remove(&mux_incarnation);
-            if self
+        }
+        self.replay_deferred_mux_retirements();
+    }
+
+    /// Replay only a readiness-loop-owned final-disconnect observation whose
+    /// exact mux membership is still empty at the last possible moment.
+    fn replay_deferred_mux_retirements(&mut self) {
+        loop {
+            let retirement = match self.mux_connections.next_replayable_retirement() {
+                Ok(Some(retirement)) => retirement,
+                Ok(None) => return,
+                Err(_) => {
+                    self.transport_failures = self.transport_failures.saturating_add(1);
+                    return;
+                }
+            };
+            let result = match self
                 .runtime
-                .retire_disconnected_mux(mux_incarnation, connection.generation)
+                .retire_disconnected_mux(retirement.mux_incarnation)
+            {
+                Ok(Some(result)) => result,
+                Ok(None) => return,
+                Err(_) => {
+                    self.transport_failures = self.transport_failures.saturating_add(1);
+                    return;
+                }
+            };
+            if result.pending_input_panes != 0
+                || result.indeterminate_checkpoint_panes != 0
+            {
+                return;
+            }
+            if self
+                .mux_connections
+                .complete_retirement(retirement)
                 .is_err()
             {
                 self.transport_failures = self.transport_failures.saturating_add(1);
+                return;
             }
         }
     }
