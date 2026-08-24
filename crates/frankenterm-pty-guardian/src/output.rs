@@ -17,7 +17,8 @@ use mux::guardian_checkpoint::{
     GuardianCheckpointBoundaryError, GuardianCheckpointCipher, GuardianCheckpointCipherError,
     GuardianCheckpointStageBindingV1, GuardianCheckpointStageRecordContextV1,
     GuardianCheckpointStageRecordKindV1, GuardianCheckpointStageScopeV1,
-    GuardianCheckpointValidatedSealWitnessV1, GuardianEncryptedCheckpointStageRecordV1,
+    GuardianCheckpointStageSealIntentV1, GuardianCheckpointValidatedManifestAuthorityV1,
+    GuardianEncryptedCheckpointStageRecordV1,
 };
 use mux::guardian_input_journal::{
     GuardianInputCompletionError, GuardianInputJournal, GuardianInputJournalError,
@@ -232,8 +233,13 @@ impl GuardianCheckpointStageStoreError {
 }
 
 pub(crate) enum GuardianCheckpointOriginAuthority<'a> {
-    Record(&'a GuardianPaneOutputJournal),
-    Genesis { spawn_effect_id: Uuid },
+    Record {
+        journal: &'a GuardianPaneOutputJournal,
+        manifest_authority: GuardianCheckpointValidatedManifestAuthorityV1,
+    },
+    Genesis {
+        manifest_authority: GuardianCheckpointValidatedManifestAuthorityV1,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -319,6 +325,11 @@ struct CheckpointStageCensus {
     total_bytes: u64,
 }
 
+enum CheckpointStageCreateOutcome {
+    Created(File),
+    Existing,
+}
+
 struct CheckpointStageRequestShape {
     scope: GuardianCheckpointScopeV1,
     path_scope: CheckpointStagePathScope,
@@ -389,7 +400,7 @@ struct CheckpointStageUploadInspection {
     publication_id: Uuid,
     next_index: u32,
     committed_bytes: u64,
-    sealed: bool,
+    seal_context: Option<GuardianCheckpointStageRecordContextV1>,
     candidate_digest: [u8; 32],
     chunk_set_digest: [u8; 32],
 }
@@ -956,11 +967,10 @@ impl GuardianPaneOutputJournal {
         self.initial_remaining_records
     }
 
-    fn validated_checkpoint_seal_witness(
+    fn validate_checkpoint_record_origin(
         &self,
         descriptor: &GuardianCheckpointArtifactDescriptorV1,
-        canonical_terminal_payload: &[u8],
-    ) -> Result<GuardianCheckpointValidatedSealWitnessV1, GuardianCheckpointStageStoreError> {
+    ) -> Result<(), GuardianCheckpointStageStoreError> {
         let authority = self
             .authority
             .lock()
@@ -1019,16 +1029,12 @@ impl GuardianPaneOutputJournal {
             .next_record()?
             .ok_or(GuardianCheckpointStageStoreError::OriginAuthorityMismatch)?;
         let receipt = recovered.receipt();
+        descriptor.validate_record_authority(segment.segment_identity, receipt)?;
         drop(recovered);
-        let witness = descriptor.validated_record_seal_witness(
-            canonical_terminal_payload,
-            segment.segment_identity,
-            receipt,
-        )?;
         authority
             .validate_path_authority()
             .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
-        Ok(witness)
+        Ok(())
     }
 }
 
@@ -1075,7 +1081,7 @@ impl GuardianCheckpointStageStore {
             return Err(GuardianCheckpointStageStoreError::Conflict);
         }
         let shape = CheckpointStageRequestShape::from_request(request)?;
-        let begin_payload = shape.begin_payload()?;
+        let begin_payload = Zeroizing::new(shape.begin_payload()?);
         if begin_payload.len() != CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
@@ -1094,14 +1100,7 @@ impl GuardianCheckpointStageStore {
                     return Err(GuardianCheckpointStageStoreError::Poisoned);
                 }
                 let publication_id = Uuid::new_v4();
-                let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
-                    &shape.binding,
-                    shape.upload_id,
-                    publication_id,
-                    &begin_payload,
-                )?;
-                let record = inner.cipher.seal(context, &begin_payload)?;
-                let record_bytes = checkpoint_record_bytes(&record)?;
+                let record_bytes = checkpoint_record_bytes_for_plaintext(begin_payload.len())?;
                 checkpoint_stage_require_capacity(
                     inner,
                     &census,
@@ -1110,7 +1109,19 @@ impl GuardianCheckpointStageStore {
                     record_bytes,
                 )?;
                 let path = checkpoint_candidate_path(inner, shape.key())?;
-                let _created = checkpoint_write_record_new(inner, &path, &record)?;
+                match checkpoint_create_record_new(inner, &path)? {
+                    CheckpointStageCreateOutcome::Created(file) => {
+                        let intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
+                            &shape.binding,
+                            shape.upload_id,
+                            publication_id,
+                            begin_payload,
+                        )?;
+                        let record = inner.cipher.seal(intent)?;
+                        checkpoint_write_created_record(inner, &path, file, &record)?;
+                    }
+                    CheckpointStageCreateOutcome::Existing => {}
+                }
                 census = checkpoint_stage_census(inner)?;
             }
             let inspection = checkpoint_inspect_upload(inner, &census, &shape)?
@@ -1150,23 +1161,14 @@ impl GuardianCheckpointStageStore {
                     inspection.publication_id,
                     index,
                     offset,
-                    bytes.as_slice(),
+                    bytes,
                 )?;
                 return checkpoint_chunk_progress(&shape, index);
             }
-            if index != inspection.next_index || inspection.sealed {
+            if index != inspection.next_index || inspection.seal_context.is_some() {
                 return Err(GuardianCheckpointStageStoreError::OutOfOrder);
             }
-            let context = GuardianCheckpointStageRecordContextV1::chunk(
-                &shape.binding,
-                shape.upload_id,
-                inspection.publication_id,
-                index,
-                offset,
-                bytes.as_slice(),
-            )?;
-            let record = inner.cipher.seal(context, bytes.as_slice())?;
-            let record_bytes = checkpoint_record_bytes(&record)?;
+            let record_bytes = checkpoint_record_bytes_for_plaintext(bytes.len())?;
             checkpoint_stage_require_capacity(
                 inner,
                 &census,
@@ -1180,18 +1182,31 @@ impl GuardianCheckpointStageStore {
                 inspection.publication_id,
                 index,
             )?;
-            let created = checkpoint_write_record_new(inner, &path, &record)?;
-            if !created {
-                census = checkpoint_stage_census(inner)?;
-                checkpoint_validate_exact_chunk_retry(
-                    inner,
-                    &census,
-                    &shape,
-                    inspection.publication_id,
-                    index,
-                    offset,
-                    bytes.as_slice(),
-                )?;
+            match checkpoint_create_record_new(inner, &path)? {
+                CheckpointStageCreateOutcome::Created(file) => {
+                    let intent = GuardianCheckpointStageSealIntentV1::chunk(
+                        &shape.binding,
+                        shape.upload_id,
+                        inspection.publication_id,
+                        index,
+                        offset,
+                        bytes,
+                    )?;
+                    let record = inner.cipher.seal(intent)?;
+                    checkpoint_write_created_record(inner, &path, file, &record)?;
+                }
+                CheckpointStageCreateOutcome::Existing => {
+                    census = checkpoint_stage_census(inner)?;
+                    checkpoint_validate_exact_chunk_retry(
+                        inner,
+                        &census,
+                        &shape,
+                        inspection.publication_id,
+                        index,
+                        offset,
+                        bytes,
+                    )?;
+                }
             }
             census = checkpoint_stage_census(inner)?;
             inspection = checkpoint_inspect_upload(inner, &census, &shape)?
@@ -1228,45 +1243,48 @@ impl GuardianCheckpointStageStore {
                 inspection.publication_id,
             )?;
             request.validate_staged_plaintext(payload.as_slice())?;
-            let witness = match origin_authority {
-                GuardianCheckpointOriginAuthority::Record(journal)
+            let manifest_authority = match origin_authority {
+                GuardianCheckpointOriginAuthority::Record {
+                    journal,
+                    manifest_authority,
+                }
                     if matches!(shape.path_scope, CheckpointStagePathScope::Pane { .. }) =>
                 {
-                    journal.validated_checkpoint_seal_witness(
-                        &shape.canonical_descriptor,
-                        payload.as_slice(),
-                    )?
+                    journal.validate_checkpoint_record_origin(&shape.canonical_descriptor)?;
+                    manifest_authority
                 }
-                GuardianCheckpointOriginAuthority::Genesis { spawn_effect_id }
-                    if shape.path_scope
-                        == (CheckpointStagePathScope::Genesis { spawn_effect_id }) =>
+                GuardianCheckpointOriginAuthority::Genesis { manifest_authority }
+                    if matches!(shape.path_scope, CheckpointStagePathScope::Genesis { .. }) =>
                 {
-                    shape
-                        .canonical_descriptor
-                        .validated_genesis_seal_witness(spawn_effect_id, payload.as_slice())?
+                    manifest_authority
                 }
-                GuardianCheckpointOriginAuthority::Record(_)
+                GuardianCheckpointOriginAuthority::Record { .. }
                 | GuardianCheckpointOriginAuthority::Genesis { .. } => {
                     return Err(GuardianCheckpointStageStoreError::OriginAuthorityMismatch);
                 }
             };
-            let manifest = checkpoint_seal_manifest(
+            let manifest = Zeroizing::new(checkpoint_seal_manifest(
                 &shape,
                 inspection.candidate_digest,
                 inspection.chunk_set_digest,
-            )?;
-            if inspection.sealed {
+            )?.to_vec());
+            if let Some(observed_context) = inspection.seal_context {
+                let intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
+                    &shape.binding,
+                    manifest_authority,
+                    shape.upload_id,
+                    inspection.publication_id,
+                    manifest,
+                )?;
+                if !checkpoint_context_public_identity_matches(
+                    &observed_context,
+                    &intent.context(),
+                ) {
+                    return Err(GuardianCheckpointStageStoreError::Poisoned);
+                }
                 return Ok(checkpoint_sealed_reply(&shape));
             }
-            let context = GuardianCheckpointStageRecordContextV1::seal_manifest(
-                &shape.binding,
-                &witness,
-                shape.upload_id,
-                inspection.publication_id,
-                &manifest,
-            )?;
-            let record = inner.cipher.seal(context, &manifest)?;
-            let record_bytes = checkpoint_record_bytes(&record)?;
+            let record_bytes = checkpoint_record_bytes_for_plaintext(manifest.len())?;
             checkpoint_stage_require_capacity(
                 inner,
                 &census,
@@ -1279,11 +1297,32 @@ impl GuardianCheckpointStageStore {
                 shape.key(),
                 inspection.publication_id,
             )?;
-            let _created = checkpoint_write_record_new(inner, &path, &record)?;
+            let created = checkpoint_create_record_new(inner, &path)?;
+            let intent = GuardianCheckpointStageSealIntentV1::seal_manifest(
+                &shape.binding,
+                manifest_authority,
+                shape.upload_id,
+                inspection.publication_id,
+                manifest,
+            )?;
+            let expected_context = intent.context();
+            match created {
+                CheckpointStageCreateOutcome::Created(file) => {
+                    let record = inner.cipher.seal(intent)?;
+                    checkpoint_write_created_record(inner, &path, file, &record)?;
+                }
+                CheckpointStageCreateOutcome::Existing => drop(intent),
+            }
             census = checkpoint_stage_census(inner)?;
             let sealed = checkpoint_inspect_upload(inner, &census, &shape)?
                 .ok_or(GuardianCheckpointStageStoreError::CandidateAbsent)?;
-            if !sealed.sealed {
+            let Some(observed_context) = sealed.seal_context else {
+                return Err(GuardianCheckpointStageStoreError::Poisoned);
+            };
+            if !checkpoint_context_public_identity_matches(
+                &observed_context,
+                &expected_context,
+            ) {
                 return Err(GuardianCheckpointStageStoreError::Poisoned);
             }
             Ok(checkpoint_sealed_reply(&shape))
@@ -1716,18 +1755,34 @@ fn checkpoint_record_bytes(
     Ok(actual)
 }
 
-fn checkpoint_write_record_new(
+fn checkpoint_record_bytes_for_plaintext(
+    plaintext_bytes: usize,
+) -> Result<u64, GuardianCheckpointStageStoreError> {
+    u64::try_from(plaintext_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(CHECKPOINT_STAGE_RECORD_OVERHEAD_BYTES))
+        .ok_or(GuardianCheckpointStageStoreError::Capacity)
+}
+
+fn checkpoint_create_record_new(
     inner: &GuardianCheckpointStageStoreInner,
     path: &Path,
-    record: &GuardianEncryptedCheckpointStageRecordV1,
-) -> Result<bool, GuardianCheckpointStageStoreError> {
-    let mut file = match create_private_file_new_at(&inner.directory, &inner.directory_path, path) {
-        Ok(file) => file,
+) -> Result<CheckpointStageCreateOutcome, GuardianCheckpointStageStoreError> {
+    match create_private_file_new_at(&inner.directory, &inner.directory_path, path) {
+        Ok(file) => Ok(CheckpointStageCreateOutcome::Created(file)),
         Err(GuardianOutputError::Io { source, .. }) if source.kind() == ErrorKind::AlreadyExists => {
-            return Ok(false);
+            Ok(CheckpointStageCreateOutcome::Existing)
         }
-        Err(error) => return Err(error.into()),
-    };
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn checkpoint_write_created_record(
+    inner: &GuardianCheckpointStageStoreInner,
+    path: &Path,
+    mut file: File,
+    record: &GuardianEncryptedCheckpointStageRecordV1,
+) -> Result<(), GuardianCheckpointStageStoreError> {
     let expected_bytes = checkpoint_record_bytes(record)?;
     let header = record.fixed_header();
     file.write_all(&header).map_err(|error| {
@@ -1757,7 +1812,7 @@ fn checkpoint_write_record_new(
         path,
         identity,
     )?;
-    Ok(true)
+    Ok(())
 }
 
 fn checkpoint_open_record(
@@ -1987,7 +2042,7 @@ fn checkpoint_inspect_upload(
             Err(GuardianCheckpointStageStoreError::Poisoned)
         };
     };
-    let begin_payload = shape.begin_payload()?;
+    let begin_payload = Zeroizing::new(shape.begin_payload()?);
     let (candidate_context, candidate_plaintext) = checkpoint_open_record(
         inner,
         candidate,
@@ -1998,16 +2053,17 @@ fn checkpoint_inspect_upload(
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
     let publication_id = candidate_context.publication_id();
-    let expected_candidate = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+    let candidate_digest = checkpoint_candidate_digest(&begin_payload);
+    let expected_candidate_intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
         &shape.binding,
         shape.upload_id,
         publication_id,
-        &begin_payload,
+        begin_payload,
     )?;
+    let expected_candidate = expected_candidate_intent.context();
     if !checkpoint_context_public_identity_matches(&candidate_context, &expected_candidate) {
         return Err(GuardianCheckpointStageStoreError::Conflict);
     }
-    let candidate_digest = checkpoint_candidate_digest(&begin_payload);
     let mut chunk_set = Sha256::new();
     chunk_set.update(CHECKPOINT_STAGE_CHUNK_SET_DIGEST_DOMAIN);
     chunk_set.update(shape.total_bytes.to_le_bytes());
@@ -2040,20 +2096,23 @@ fn checkpoint_inspect_upload(
         let expected_bytes_u32 = u32::try_from(expected_bytes)
             .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
         let (context, plaintext) = checkpoint_open_record(inner, entry, expected_bytes_u32)?;
-        let expected_context = GuardianCheckpointStageRecordContextV1::chunk(
+        let plaintext_bytes = u64::try_from(plaintext.len())
+            .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
+        let chunk_digest = checkpoint_chunk_digest(*index, offset, plaintext.as_slice())?;
+        let expected_intent = GuardianCheckpointStageSealIntentV1::chunk(
             &shape.binding,
             shape.upload_id,
             publication_id,
             *index,
             offset,
-            plaintext.as_slice(),
+            plaintext,
         )?;
+        let expected_context = expected_intent.context();
         if !checkpoint_context_public_identity_matches(&context, &expected_context)
-            || u64::try_from(plaintext.len()).ok() != Some(expected_bytes)
+            || plaintext_bytes != expected_bytes
         {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
-        let chunk_digest = checkpoint_chunk_digest(*index, offset, plaintext.as_slice())?;
         chunk_set.update(index.to_le_bytes());
         chunk_set.update(offset.to_le_bytes());
         chunk_set.update(expected_bytes_u32.to_le_bytes());
@@ -2065,7 +2124,7 @@ fn checkpoint_inspect_upload(
     let next_index = u32::try_from(chunks.len())
         .map_err(|_| GuardianCheckpointStageStoreError::Capacity)?;
     let chunk_set_digest: [u8; 32] = chunk_set.finalize().into();
-    let sealed = if let Some(seal) = seal {
+    let seal_context = if let Some(seal) = seal {
         let publication = match seal.role {
             CheckpointStageFileRole::Seal { publication_id } => publication_id,
             CheckpointStageFileRole::Candidate | CheckpointStageFileRole::Chunk { .. } => {
@@ -2096,15 +2155,15 @@ fn checkpoint_inspect_upload(
         {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
-        true
+        Some(seal_context)
     } else {
-        false
+        None
     };
     Ok(Some(CheckpointStageUploadInspection {
         publication_id,
         next_index,
         committed_bytes,
-        sealed,
+        seal_context,
         candidate_digest,
         chunk_set_digest,
     }))
