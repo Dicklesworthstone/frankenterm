@@ -3,6 +3,7 @@ use clap::*;
 use config::configuration;
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
+use frankenterm_mux_server_impl::generation_lifetime::GenerationLifetimeLease;
 use frankenterm_mux_server_impl::{
     MuxDomainUpdateOutcome, reconcile_mux_domains_for_server, update_mux_domains_for_server,
 };
@@ -234,6 +235,29 @@ fn run() -> anyhow::Result<()> {
     if opts.daemonize {
         daemonize::spawn_daemonized_copy(daemonized_child_args(&opts), &config)?;
         return Ok(());
+    }
+
+    // A daemonized parent returns above without ever becoming a mux owner; its
+    // re-exec child reaches this point and acquires independently. Keep this
+    // RAII value in `run` so a managed server holds its shared generation
+    // lifetime lease from before listener creation through graceful shutdown.
+    let generation_lifetime = GenerationLifetimeLease::acquire_for_current_process()
+        .context("acquire mux managed-generation lifetime authority")?;
+    if let Some(metadata) = generation_lifetime.metadata() {
+        log::info!(
+            "frankenterm-mux-server-generation-lifetime-ready generation={} generations_dev={} generations_ino={} generation_dev={} generation_ino={} lease_dev={} lease_ino={} executable_dev={} executable_ino={}",
+            metadata.generation_id(),
+            metadata.generations_directory().device(),
+            metadata.generations_directory().inode(),
+            metadata.generation_directory().device(),
+            metadata.generation_directory().inode(),
+            metadata.lifetime_lease().device(),
+            metadata.lifetime_lease().inode(),
+            metadata.executable().device(),
+            metadata.executable().inode(),
+        );
+    } else {
+        log::info!("frankenterm-mux-server-generation-lifetime-unmanaged");
     }
 
     // [ft-gqbpk] Install SIGTERM + SIGINT handlers before any startup path

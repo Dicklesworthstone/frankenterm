@@ -361,8 +361,9 @@ impl GuardianCheckpointArtifactDescriptorV1 {
     }
 
     /// Validate untrusted wire fields and claimed stable identities before
-    /// returning an opaque descriptor authority. The terminal payload itself
-    /// must still pass [`Self::validate_canonical_payload`] before sealing.
+    /// returning descriptor identity data. The terminal payload itself must
+    /// still pass [`Self::validate_canonical_payload`], and this claimed value
+    /// cannot authorize final publication.
     #[allow(clippy::too_many_arguments)]
     pub fn from_claimed_parts(
         claimed_boundary_identity_digest: [u8; 32],
@@ -1742,7 +1743,7 @@ fn checkpoint_stage_inner_plaintext(
     inner_plaintext.extend_from_slice(&CHECKPOINT_STAGE_INNER_TRAILER_MAGIC);
     inner_plaintext.extend_from_slice(&CHECKPOINT_STAGE_INNER_TRAILER_VERSION.to_le_bytes());
     inner_plaintext.extend_from_slice(&[0; 4]);
-    inner_plaintext.extend_from_slice(&plaintext_digest);
+    inner_plaintext.extend_from_slice(plaintext_digest);
     if inner_plaintext.len() != inner_bytes {
         return Err(GuardianCheckpointCipherError::ArithmeticOverflow);
     }
@@ -3706,9 +3707,24 @@ mod tests {
             1
         );
         assert!(intent_implementation.contains("pub const fn context(&self)"));
+        assert!(intent_implementation
+            .contains("authority: GuardianCheckpointValidatedManifestAuthorityV1,"));
         assert!(!intent_implementation.contains("pub fn plaintext("));
         assert!(!intent_implementation.contains("pub fn plaintext_digest("));
         assert!(!intent_implementation.contains("pub const fn plaintext_digest("));
+
+        let cipher_impl_start = source
+            .find("impl GuardianCheckpointCipher {")
+            .expect("find checkpoint cipher implementation");
+        let cipher_debug_start = source[cipher_impl_start..]
+            .find("impl std::fmt::Debug for GuardianCheckpointCipher")
+            .map(|offset| cipher_impl_start + offset)
+            .expect("find checkpoint cipher Debug implementation");
+        let cipher_implementation = &source[cipher_impl_start..cipher_debug_start];
+        assert!(cipher_implementation
+            .contains("intent: GuardianCheckpointStageSealIntentV1,"));
+        assert!(!cipher_implementation
+            .contains("intent: &GuardianCheckpointStageSealIntentV1,"));
 
         let permit_impl_start = source
             .find("impl GuardianCheckpointGenesisSpawnPermitV1 {")
@@ -3720,7 +3736,9 @@ mod tests {
         let permit_implementation = &source[permit_impl_start..permit_debug_start];
         assert!(permit_implementation.contains("#[cfg(test)]"));
         assert!(permit_implementation.contains("fn issue_for_test(spawn_effect_id: Uuid)"));
+        assert_eq!(permit_implementation.matches("fn ").count(), 1);
         assert!(!permit_implementation.contains("pub fn "));
+        assert!(!permit_implementation.contains("pub("));
         assert!(!permit_implementation.contains("pub const fn "));
 
         let context_start = source
