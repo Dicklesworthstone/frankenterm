@@ -1,8 +1,9 @@
 use crate::color::{LinearRgba, RgbColor};
-use crate::{Sixel, SixelData};
+use crate::{StringSequenceError, StringSequenceKind, Sixel, SixelData};
 
 const MAX_PARAMS: usize = 5;
 const MAX_SIXEL_SIZE: usize = 100_000_000;
+const MAX_SIXEL_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
 fn sixel_color_number(value: i64) -> u16 {
     value.clamp(0, i64::from(u16::MAX)) as u16
@@ -51,10 +52,20 @@ pub struct SixelBuilder {
     param_no: usize,
     current_command: u8,
     malformed: bool,
+    max_retained_bytes: usize,
+    pending_sequence_error: Option<StringSequenceError>,
 }
 
 impl SixelBuilder {
     pub fn new(params: &[i64]) -> Self {
+        Self::new_with_max_retained_bytes(params, MAX_SIXEL_RETAINED_BYTES)
+    }
+
+    pub(super) fn new_with_max_retained_bytes(
+        params: &[i64],
+        max_retained_bytes: usize,
+    ) -> Self {
+        let max_retained_bytes = max_retained_bytes.min(MAX_SIXEL_RETAINED_BYTES);
         let pan = match params.get(0).unwrap_or(&0) {
             7 | 8 | 9 => 1,
             0 | 1 | 5 | 6 => 2,
@@ -82,21 +93,71 @@ impl SixelBuilder {
             params: [-1; MAX_PARAMS],
             current_command: 0,
             malformed: false,
+            max_retained_bytes,
+            pending_sequence_error: None,
         }
     }
 
+    pub fn take_sequence_error(&mut self) -> Option<StringSequenceError> {
+        self.pending_sequence_error.take()
+    }
+
+    fn reject(&mut self, error: StringSequenceError) {
+        self.sixel.data.clear();
+        self.malformed = true;
+        if self.pending_sequence_error.is_none() {
+            self.pending_sequence_error = Some(error);
+        }
+    }
+
+    fn push_data(&mut self, data: SixelData) {
+        if self.malformed {
+            return;
+        }
+
+        let retained_bytes = self
+            .sixel
+            .data
+            .len()
+            .saturating_add(1)
+            .saturating_mul(core::mem::size_of::<SixelData>());
+        if retained_bytes > self.max_retained_bytes {
+            log::warn!(
+                "sixel parser exceeded {} retained bytes; discarding the command until DCS terminator",
+                self.max_retained_bytes,
+            );
+            self.reject(StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::Sixel,
+                maximum: self.max_retained_bytes,
+            });
+            return;
+        }
+        if self.sixel.data.try_reserve(1).is_err() {
+            log::warn!("sixel parser could not reserve bounded retained state; discarding command");
+            self.reject(StringSequenceError::AllocationFailed {
+                kind: StringSequenceKind::Sixel,
+            });
+            return;
+        }
+        self.sixel.data.push(data);
+    }
+
     pub fn push(&mut self, data: u8) {
+        if self.malformed {
+            return;
+        }
+
         match data {
             b'$' => {
                 self.finish_command();
-                self.sixel.data.push(SixelData::CarriageReturn);
+                self.push_data(SixelData::CarriageReturn);
             }
             b'-' => {
                 self.finish_command();
-                self.sixel.data.push(SixelData::NewLine);
+                self.push_data(SixelData::NewLine);
             }
             0x3f..=0x7e if self.current_command == b'!' => {
-                self.sixel.data.push(SixelData::Repeat {
+                self.push_data(SixelData::Repeat {
                     repeat_count: self.params[0] as u32,
                     data: data - 0x3f,
                 });
@@ -104,7 +165,7 @@ impl SixelBuilder {
             }
             0x3f..=0x7e => {
                 self.finish_command();
-                self.sixel.data.push(SixelData::Data(data - 0x3f));
+                self.push_data(SixelData::Data(data - 0x3f));
             }
             b'#' | b'!' | b'"' => {
                 self.finish_command();
@@ -139,6 +200,10 @@ impl SixelBuilder {
     }
 
     fn finish_command(&mut self) {
+        if self.malformed {
+            return;
+        }
+
         match self.current_command {
             b'!' => {
                 self.malformed = true;
@@ -152,7 +217,7 @@ impl SixelBuilder {
                 let c = self.params[4];
 
                 if system == 1 {
-                    self.sixel.data.push(SixelData::DefineColorMapHSL {
+                    self.push_data(SixelData::DefineColorMapHSL {
                         color_number,
                         hue_angle: sixel_hue_angle(a),
                         lightness: sixel_percent_u8(b),
@@ -160,18 +225,14 @@ impl SixelBuilder {
                     });
                 } else {
                     let rgb = sixel_rgb_percent_to_color(a, b, c);
-                    self.sixel
-                        .data
-                        .push(SixelData::DefineColorMapRGB { color_number, rgb });
+                    self.push_data(SixelData::DefineColorMapRGB { color_number, rgb });
                 }
             }
             b'#' => {
                 // Use a color
                 let color_number = sixel_color_number(self.params[0]);
 
-                self.sixel
-                    .data
-                    .push(SixelData::SelectColorMapEntry(color_number));
+                self.push_data(SixelData::SelectColorMapEntry(color_number));
             }
             b'"' => {
                 // Set raster attributes
@@ -198,9 +259,6 @@ impl SixelBuilder {
                     let (size, overflow) =
                         (pixel_width as usize).overflowing_mul(pixel_height as usize);
 
-                    // Ideally we'd just use `try_reserve` here, but that is
-                    // nightly Rust only at the time of writing this comment:
-                    // <https://github.com/rust-lang/rust/issues/48043>
                     if size > MAX_SIXEL_SIZE || overflow {
                         log::error!(
                             "Ignoring sixel data {}x{} because {} bytes \
@@ -212,11 +270,12 @@ impl SixelBuilder {
                         );
                         self.sixel.pixel_width = None;
                         self.sixel.pixel_height = None;
-                        self.sixel.data.clear();
-                        self.malformed = true;
+                        self.reject(StringSequenceError::LimitExceeded {
+                            kind: StringSequenceKind::Sixel,
+                            maximum: MAX_SIXEL_SIZE,
+                        });
                         return;
                     }
-                    self.sixel.data.reserve(size);
                 }
             }
             _ => {}
@@ -630,6 +689,59 @@ mod test {
         assert!(b.sixel.data.is_empty());
         assert!(b.sixel.pixel_width.is_none());
         assert!(b.sixel.pixel_height.is_none());
+        assert!(b.sixel.data.capacity() <= 4);
+        assert_eq!(
+            b.take_sequence_error(),
+            Some(StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::Sixel,
+                maximum: MAX_SIXEL_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn raster_metadata_does_not_preallocate_pixel_area() {
+        let mut b = SixelBuilder::new(&[]);
+
+        b.push(b'"');
+        for byte in b"1;1;1000;1000" {
+            b.push(*byte);
+        }
+        b.finish();
+
+        assert_eq!(b.sixel.pixel_width, Some(1000));
+        assert_eq!(b.sixel.pixel_height, Some(1000));
+        assert_eq!(b.sixel.data.capacity(), 0);
+        assert_eq!(b.take_sequence_error(), None);
+    }
+
+    #[test]
+    fn builder_retained_limit_discards_across_push_calls() {
+        let max_retained_bytes = core::mem::size_of::<SixelData>() * 2;
+        let mut b = SixelBuilder::new_with_max_retained_bytes(&[], max_retained_bytes);
+
+        b.push(0x3f);
+        b.push(0x40);
+        assert_eq!(b.sixel.data.len(), 2);
+
+        b.push(0x41);
+        assert!(b.sixel.data.is_empty());
+        assert!(b.malformed);
+        for _ in 0..32 {
+            b.push(0x42);
+            assert!(b.sixel.data.is_empty());
+        }
+        b.finish();
+
+        assert!(!b.should_emit());
+        assert_eq!(
+            b.take_sequence_error(),
+            Some(StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::Sixel,
+                maximum: max_retained_bytes,
+            })
+        );
+        assert_eq!(b.take_sequence_error(), None);
     }
 
     #[test]
