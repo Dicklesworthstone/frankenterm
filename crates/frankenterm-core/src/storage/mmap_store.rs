@@ -127,6 +127,10 @@ pub enum MmapStoreError {
         "pane sequence journal capacity {limit} bytes would be exceeded: attempted {attempted} bytes"
     )]
     PaneSequenceJournalFull { limit: u64, attempted: u64 },
+    #[error("unable to allocate a unique versioned pane ledger identity")]
+    VersionedPaneIdentityExhausted,
+    #[error("staged pane ledger failed exact reopen verification")]
+    StagedPaneVerificationFailed,
 }
 
 const COLD_ERASURE_DATA_SHARDS: usize = 3;
@@ -139,12 +143,28 @@ const PANE_LOG_HEADER_PREFIX: &[u8] = b"\0FTMMAP1:";
 const PANE_BASE_SEQ_JOURNAL_PREFIX: &str = "FTSEQ1:";
 const PANE_LOG_MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const PANE_BASE_SEQ_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
+const VERSIONED_PANE_ID_ATTEMPTS: usize = 128;
 #[cfg(not(test))]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 =
     PANE_BASE_SEQ_JOURNAL_MAX_BYTES / 4 * 3;
 #[cfg(test)]
 const PANE_BASE_SEQ_JOURNAL_COMPACT_BYTES: u64 = 512;
 const GF_PRIM: u32 = 0x11d;
+
+fn next_versioned_pane_id() -> PaneId {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            let bytes = duration.as_nanos().to_le_bytes();
+            u64::from_le_bytes(bytes[..8].try_into().expect("fixed timestamp slice"))
+        });
+    let process = u64::from(std::process::id());
+    let candidate = timestamp.rotate_left(17) ^ process.rotate_left(41) ^ sequence;
+    candidate | (1_u64 << 63)
+}
 
 /// An immutable, bounded view of one pane log at a stable filesystem identity.
 ///
@@ -160,6 +180,53 @@ pub struct MmapPaneReadSnapshot {
     pub committed_bytes: u64,
     pub physical_bytes: u64,
     pub trailing_uncommitted_bytes: u64,
+}
+
+/// Fully synchronized, exact replacement ledger that is not yet reachable
+/// through its caller-owned publication manifest.
+///
+/// The ledger ID is nonsecret. Row content remains on private files and is
+/// never exposed through `Debug`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MmapStagedPaneLedger {
+    pane_id: PaneId,
+    record_count: usize,
+    record_bytes: u64,
+    committed_bytes: u64,
+}
+
+impl MmapStagedPaneLedger {
+    #[must_use]
+    pub const fn pane_id(self) -> PaneId {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub const fn record_count(self) -> usize {
+        self.record_count
+    }
+
+    #[must_use]
+    pub const fn record_bytes(self) -> u64 {
+        self.record_bytes
+    }
+
+    #[must_use]
+    pub const fn committed_bytes(self) -> u64 {
+        self.committed_bytes
+    }
+}
+
+impl std::fmt::Debug for MmapStagedPaneLedger {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MmapStagedPaneLedger")
+            .field("pane_id", &self.pane_id)
+            .field("record_count", &self.record_count)
+            .field("record_bytes", &self.record_bytes)
+            .field("committed_bytes", &self.committed_bytes)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,6 +659,55 @@ struct PaneFile {
 }
 
 impl PaneFile {
+    fn create_new_private_append_file(path: &Path) -> Result<Option<File>, MmapStoreError> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(path) {
+            Ok(file) => {
+                Self::harden_open_file_permissions(&file)?;
+                Self::revalidate_open_file(path, &file)?;
+                Ok(Some(file))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn create_versioned(base_dir: &Path, pane_id: PaneId) -> Result<Option<Self>, MmapStoreError> {
+        let log_path = base_dir.join(format!("{pane_id}.log"));
+        let Some(file) = Self::create_new_private_append_file(&log_path)? else {
+            return Ok(None);
+        };
+        let base_seq_path = Self::base_seq_path(&log_path);
+        let Some(base_seq_file) = Self::create_new_private_append_file(&base_seq_path)? else {
+            // The new empty log is intentionally retained as an unreachable
+            // diagnostic artifact. Synchronize it before refusing this
+            // colliding identity; callers never delete uncertain artifacts.
+            file.sync_all()?;
+            Self::sync_parent_directory(&log_path)?;
+            return Ok(None);
+        };
+        file.sync_all()?;
+        base_seq_file.sync_all()?;
+        Self::sync_parent_directory(&log_path)?;
+        Ok(Some(Self {
+            log_path,
+            file,
+            base_seq_file,
+            file_len: 0,
+            trailing_partial: false,
+            data_start: 0,
+            base_seq: 0,
+            line_offsets: Vec::new(),
+        }))
+    }
+
     fn unique_staging_path(path: &Path, purpose: &str) -> Result<PathBuf, MmapStoreError> {
         static STAGING_SEQUENCE: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
@@ -1435,6 +1551,10 @@ impl PaneFile {
     fn file_bytes(&self) -> u64 {
         self.file_len
     }
+
+    fn sequence_file_bytes(&self) -> Result<u64, MmapStoreError> {
+        Ok(self.base_seq_file.metadata()?.len())
+    }
 }
 
 #[derive(Debug)]
@@ -1893,11 +2013,21 @@ pub fn read_pane_snapshot(
             .ok_or(MmapStoreError::NumericOverflow(
                 "pane_snapshot_record_bytes",
             ))?;
-        if record_bytes > max_record_bytes {
+        let record_count_with_current = records
+            .len()
+            .checked_add(1)
+            .ok_or(MmapStoreError::NumericOverflow("record_delimiters"))?;
+        let committed_byte_limit_observation = record_bytes
+            .checked_add(
+                u64::try_from(record_count_with_current)
+                    .map_err(|_| MmapStoreError::NumericOverflow("record_delimiters"))?,
+            )
+            .ok_or(MmapStoreError::NumericOverflow("committed_bytes"))?;
+        if committed_byte_limit_observation > max_record_bytes {
             return Err(MmapStoreError::PaneSnapshotLimitExceeded {
-                limit_name: "record_bytes",
+                limit_name: "committed_bytes",
                 limit: max_record_bytes,
-                observed: record_bytes,
+                observed: committed_byte_limit_observation,
             });
         }
         records.push(String::from_utf8(bytes)?);
@@ -1962,6 +2092,133 @@ impl MmapScrollbackStore {
             fallback_panes: HashSet::new(),
             cold_erasure: config.cold_erasure,
         })
+    }
+
+    /// Open a manifest-selected pane without creating either ledger file.
+    pub fn open_existing_pane(&mut self, pane_id: PaneId) -> Result<(), MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) || self.sqlite_is_authority(pane_id)? {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "versioned pane authority cannot resolve through SQLite fallback".to_string(),
+            ));
+        }
+        let log_path = self.base_dir.join(format!("{pane_id}.log"));
+        let sequence_path = PaneFile::base_seq_path(&log_path);
+        for path in [&log_path, &sequence_path] {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.file_type().is_file() {
+                return Err(MmapStoreError::InvalidPaneLogHeader(
+                    "versioned pane ledger path is not a regular file".to_string(),
+                ));
+            }
+        }
+        let pane = PaneFile::open(&self.base_dir, pane_id)?;
+        self.panes.insert(pane_id, pane);
+        Ok(())
+    }
+
+    /// Stage a complete replacement ledger under a fresh unreachable pane ID.
+    ///
+    /// Every record and both ledger files are synchronized before return. The
+    /// caller must publish its authenticated pointer manifest separately; a
+    /// failure here never modifies any previously published pane ledger.
+    pub fn stage_versioned_pane_replacement(
+        &mut self,
+        records: &[String],
+        max_records: usize,
+        max_record_bytes: u64,
+    ) -> Result<MmapStagedPaneLedger, MmapStoreError> {
+        if records.len() > max_records {
+            return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                limit_name: "records",
+                limit: u64::try_from(max_records).unwrap_or(u64::MAX),
+                observed: u64::try_from(records.len()).unwrap_or(u64::MAX),
+            });
+        }
+        let record_bytes = records.iter().try_fold(0_u64, |total, record| {
+            total
+                .checked_add(
+                    u64::try_from(record.len())
+                        .map_err(|_| MmapStoreError::NumericOverflow("record_bytes"))?,
+                )
+                .ok_or(MmapStoreError::NumericOverflow("record_bytes"))
+        })?;
+        let record_delimiters = u64::try_from(records.len())
+            .map_err(|_| MmapStoreError::NumericOverflow("record_delimiters"))?;
+        let committed_byte_limit_observation = record_bytes
+            .checked_add(record_delimiters)
+            .ok_or(MmapStoreError::NumericOverflow("committed_bytes"))?;
+        if committed_byte_limit_observation > max_record_bytes {
+            return Err(MmapStoreError::PaneSnapshotLimitExceeded {
+                limit_name: "committed_bytes",
+                limit: max_record_bytes,
+                observed: committed_byte_limit_observation,
+            });
+        }
+
+        let mut selected = None;
+        for _ in 0..VERSIONED_PANE_ID_ATTEMPTS {
+            let pane_id = next_versioned_pane_id();
+            if pane_id == 0 || self.panes.contains_key(&pane_id) {
+                continue;
+            }
+            if let Some(pane) = PaneFile::create_versioned(&self.base_dir, pane_id)? {
+                selected = Some((pane_id, pane));
+                break;
+            }
+        }
+        let (pane_id, mut pane) =
+            selected.ok_or(MmapStoreError::VersionedPaneIdentityExhausted)?;
+        for record in records {
+            pane.append_line(record)?;
+        }
+        pane.file.sync_all()?;
+        pane.base_seq_file.sync_all()?;
+        PaneFile::sync_parent_directory(&pane.log_path)?;
+        let committed_bytes = pane.file_len;
+        if committed_bytes != committed_byte_limit_observation {
+            return Err(MmapStoreError::StagedPaneVerificationFailed);
+        }
+        drop(pane);
+
+        let staged = MmapStagedPaneLedger {
+            pane_id,
+            record_count: records.len(),
+            record_bytes,
+            committed_bytes,
+        };
+        self.verify_staged_pane_ledger(staged, records)?;
+        Ok(staged)
+    }
+
+    /// Reopen a staged ledger from disk and prove its exact contiguous bytes.
+    /// This is safe both before and after the caller publishes its manifest.
+    pub fn verify_staged_pane_ledger(
+        &mut self,
+        staged: MmapStagedPaneLedger,
+        expected_records: &[String],
+    ) -> Result<(), MmapStoreError> {
+        if expected_records.len() != staged.record_count {
+            return Err(MmapStoreError::StagedPaneVerificationFailed);
+        }
+        let pane = PaneFile::open(&self.base_dir, staged.pane_id)?;
+        if pane.base_seq != 0
+            || pane.line_offsets.len() != staged.record_count
+            || pane.file_len != staged.committed_bytes
+            || pane.next_seq()?
+                != u64::try_from(staged.record_count)
+                    .map_err(|_| MmapStoreError::NumericOverflow("record_count"))?
+        {
+            return Err(MmapStoreError::StagedPaneVerificationFailed);
+        }
+        for (sequence, expected) in expected_records.iter().enumerate() {
+            let sequence = u64::try_from(sequence)
+                .map_err(|_| MmapStoreError::NumericOverflow("sequence"))?;
+            if pane.line_at(sequence)?.as_deref() != Some(expected.as_str()) {
+                return Err(MmapStoreError::StagedPaneVerificationFailed);
+            }
+        }
+        self.panes.insert(staged.pane_id, pane);
+        Ok(())
     }
 
     fn pane_mut(&mut self, pane_id: PaneId) -> Result<&mut PaneFile, MmapStoreError> {
@@ -2277,6 +2534,18 @@ impl MmapScrollbackStore {
             .get(&pane_id)
             .map(PaneFile::file_bytes)
             .unwrap_or(0)
+    }
+
+    pub fn sequence_file_bytes(&self, pane_id: PaneId) -> Result<u64, MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) {
+            return Err(MmapStoreError::InvalidPaneLogHeader(
+                "SQLite fallback has no versioned sequence ledger".to_string(),
+            ));
+        }
+        self.panes
+            .get(&pane_id)
+            .ok_or(MmapStoreError::UnknownPane(pane_id))?
+            .sequence_file_bytes()
     }
 
     #[must_use]
