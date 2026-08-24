@@ -3,6 +3,12 @@ use crate::terminalstate::performer::Performer;
 use frankenterm_escape_parser::parser::Parser;
 use std::sync::Arc;
 
+/// Versioned identity for terminal-model semantics used by guardian suffix
+/// replay. Bump this whenever Performer, width, eviction, reset, or checkpoint
+/// semantics can map the same parsed actions to different terminal state.
+pub const RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID: &str =
+    "frankenterm.term.recovery-replay-semantics.v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum ClipboardSelection {
@@ -118,6 +124,363 @@ pub struct Terminal {
     parser: Parser,
 }
 
+/// Opaque canonical checkpoint captured from one terminal while its own parser
+/// was recovery-ground.  The fields are deliberately private so a guardian
+/// cannot pair state bytes with an unrelated parser instance.
+#[cfg(feature = "use_serde")]
+pub struct RecoveryTerminalCheckpointV1 {
+    canonical_payload: Vec<u8>,
+    rows: usize,
+    cols: usize,
+}
+
+#[cfg(feature = "use_serde")]
+impl RecoveryTerminalCheckpointV1 {
+    #[must_use]
+    pub fn canonical_payload(&self) -> &[u8] {
+        &self.canonical_payload
+    }
+
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    #[must_use]
+    pub const fn cols(&self) -> usize {
+        self.cols
+    }
+
+    #[must_use]
+    pub fn into_canonical_payload(self) -> Vec<u8> {
+        self.canonical_payload
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Debug for RecoveryTerminalCheckpointV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryTerminalCheckpointV1")
+            .field("canonical_payload", &"[REDACTED]")
+            .field("payload_bytes", &self.canonical_payload.len())
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .finish()
+    }
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Eq, PartialEq)]
+pub enum RecoveryTerminalCheckpointError {
+    ParserNotRecoveryGround,
+    Checkpoint(crate::terminalstate::checkpoint::TerminalCheckpointError),
+}
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Display for RecoveryTerminalCheckpointError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParserNotRecoveryGround => formatter.write_str(
+                "terminal parser is not at a recoverable output boundary",
+            ),
+            Self::Checkpoint(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::error::Error for RecoveryTerminalCheckpointError {}
+
+/// Off-topology terminal used for authenticated guardian replay.  It exposes
+/// only capability-gated action application, semantic checkpointing, and a
+/// consuming transition to a live writer.
+#[cfg(feature = "use_serde")]
+pub struct InertTerminal {
+    terminal: Terminal,
+    replay_projection: crate::terminalstate::checkpoint::CheckpointReplayConfigV1,
+    checkpoint_limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
+    replayed_records: usize,
+    replayed_bytes: usize,
+    replay_failed: bool,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Debug, Eq, PartialEq)]
+pub enum InertTerminalError {
+    EmptyReplayRecord,
+    ReplayResourceLimit {
+        resource: &'static str,
+        observed: usize,
+        maximum: usize,
+    },
+    ReplayAccountingOverflow(&'static str),
+    ReplayActionAllocation,
+    ReplayStringSequence(frankenterm_escape_parser::StringSequenceError),
+    ReplayPoisoned,
+    ParserNotRecoveryGround,
+    UnsupportedGraphicsAction,
+    ReplayConfigurationMismatch,
+    RetieringRequired,
+    WriterActivation,
+    Checkpoint(crate::terminalstate::checkpoint::TerminalCheckpointError),
+}
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Display for InertTerminalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyReplayRecord => {
+                formatter.write_str("guardian replay record must not be empty")
+            }
+            Self::ReplayResourceLimit {
+                resource,
+                observed,
+                maximum,
+            } => write!(
+                formatter,
+                "guardian replay {resource} exceeds its limit: {observed} > {maximum}"
+            ),
+            Self::ReplayAccountingOverflow(resource) => {
+                write!(formatter, "guardian replay {resource} accounting overflowed")
+            }
+            Self::ReplayActionAllocation => {
+                formatter.write_str("guardian replay could not reserve its action batch")
+            }
+            Self::ReplayStringSequence(_) => formatter.write_str(
+                "guardian replay parser rejected an oversized or unallocatable string sequence",
+            ),
+            Self::ReplayPoisoned => {
+                formatter.write_str("guardian replay was permanently poisoned by an earlier error")
+            }
+            Self::ParserNotRecoveryGround => formatter.write_str(
+                "guardian replay parser is not at a recoverable output boundary",
+            ),
+            Self::UnsupportedGraphicsAction => formatter.write_str(
+                "guardian replay rejected a graphics action with external or uncheckpointed state",
+            ),
+            Self::ReplayConfigurationMismatch => formatter.write_str(
+                "guardian replay configuration does not match the intended live configuration",
+            ),
+            Self::RetieringRequired => formatter.write_str(
+                "guardian activation requires checked scrollback re-tiering",
+            ),
+            Self::WriterActivation => {
+                formatter.write_str("guardian replay could not activate the live writer")
+            }
+            Self::Checkpoint(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl std::error::Error for InertTerminalError {}
+
+#[cfg(feature = "use_serde")]
+impl std::fmt::Debug for InertTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InertTerminal")
+            .field("seqno", &self.terminal.current_seqno())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl InertTerminal {
+    pub(crate) fn from_restored_state(
+        state: TerminalState,
+        replay_projection: crate::terminalstate::checkpoint::CheckpointReplayConfigV1,
+        checkpoint_limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
+    ) -> Self {
+        Self {
+            terminal: Terminal::from_restored_state(state),
+            replay_projection,
+            checkpoint_limits,
+            replayed_records: 0,
+            replayed_bytes: 0,
+            replay_failed: false,
+        }
+    }
+
+    /// Replay one authenticated raw-output journal record through this
+    /// terminal's owned parser. The full record is parsed into a fallibly grown
+    /// batch and capability-checked before Performer sees its first action, so
+    /// rejection cannot partially mutate terminal state. Any error permanently
+    /// poisons this inert terminal because its parser may already have consumed
+    /// bytes that cannot safely be skipped or retried.
+    pub fn replay_bytes(&mut self, bytes: &[u8]) -> Result<(), InertTerminalError> {
+        use frankenterm_escape_parser::osc::ITermProprietary;
+        use frankenterm_escape_parser::{Action, OperatingSystemCommand};
+
+        if self.replay_failed {
+            return Err(InertTerminalError::ReplayPoisoned);
+        }
+        if bytes.is_empty() {
+            self.replay_failed = true;
+            return Err(InertTerminalError::EmptyReplayRecord);
+        }
+        if bytes.len() > self.checkpoint_limits.max_replay_record_bytes {
+            self.replay_failed = true;
+            return Err(InertTerminalError::ReplayResourceLimit {
+                resource: "record_bytes",
+                observed: bytes.len(),
+                maximum: self.checkpoint_limits.max_replay_record_bytes,
+            });
+        }
+        let next_total_bytes = self
+            .replayed_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| {
+                self.replay_failed = true;
+                InertTerminalError::ReplayAccountingOverflow("total_bytes")
+            })?;
+        if next_total_bytes > self.checkpoint_limits.max_replay_total_bytes {
+            self.replay_failed = true;
+            return Err(InertTerminalError::ReplayResourceLimit {
+                resource: "total_bytes",
+                observed: next_total_bytes,
+                maximum: self.checkpoint_limits.max_replay_total_bytes,
+            });
+        }
+        let next_record_count = self.replayed_records.checked_add(1).ok_or_else(|| {
+            self.replay_failed = true;
+            InertTerminalError::ReplayAccountingOverflow("record_count")
+        })?;
+        if next_record_count > self.checkpoint_limits.max_replay_records {
+            self.replay_failed = true;
+            return Err(InertTerminalError::ReplayResourceLimit {
+                resource: "record_count",
+                observed: next_record_count,
+                maximum: self.checkpoint_limits.max_replay_records,
+            });
+        }
+        if self
+            .terminal
+            .current_seqno()
+            .checked_add(1)
+            .is_none_or(|next| next == SequenceNo::MAX)
+        {
+            self.replay_failed = true;
+            return Err(InertTerminalError::ReplayAccountingOverflow("terminal_seqno"));
+        }
+
+        let mut actions = Vec::new();
+        let mut allocation_failed = false;
+        let mut action_limit_exceeded = false;
+        let max_actions = self.checkpoint_limits.max_replay_actions_per_record;
+        self.terminal.parser.parse(bytes, |action| {
+            if allocation_failed || action_limit_exceeded {
+                return;
+            }
+            if actions.len() >= max_actions {
+                action_limit_exceeded = true;
+                return;
+            }
+            if actions.try_reserve(1).is_err() {
+                allocation_failed = true;
+                return;
+            }
+            actions.push(action);
+        });
+        if let Some(error) = self.terminal.parser.take_string_sequence_error() {
+            self.replay_failed = true;
+            return Err(InertTerminalError::ReplayStringSequence(error));
+        }
+        if allocation_failed {
+            self.replay_failed = true;
+            return Err(InertTerminalError::ReplayActionAllocation);
+        }
+        if action_limit_exceeded {
+            self.replay_failed = true;
+            return Err(InertTerminalError::ReplayResourceLimit {
+                resource: "actions_per_record",
+                observed: self
+                    .checkpoint_limits
+                    .max_replay_actions_per_record
+                    .saturating_add(1),
+                maximum: self.checkpoint_limits.max_replay_actions_per_record,
+            });
+        }
+
+        let unsupported = actions.iter().any(|action| match action {
+            Action::Sixel(_) | Action::KittyImage(_) => true,
+            Action::OperatingSystemCommand(command) => matches!(
+                command.as_ref(),
+                OperatingSystemCommand::ITermProprietary(ITermProprietary::File(file))
+                    if file.inline
+            ),
+            _ => false,
+        });
+        if unsupported {
+            self.replay_failed = true;
+            return Err(InertTerminalError::UnsupportedGraphicsAction);
+        }
+        self.terminal.perform_actions(actions);
+        self.replayed_bytes = next_total_bytes;
+        self.replayed_records = next_record_count;
+        Ok(())
+    }
+
+    pub fn checkpoint(
+        &self,
+    ) -> Result<crate::terminalstate::checkpoint::TerminalCheckpointV1, InertTerminalError> {
+        if self.replay_failed {
+            return Err(InertTerminalError::ReplayPoisoned);
+        }
+        if !self.terminal.parser.is_recovery_ground() {
+            return Err(InertTerminalError::ParserNotRecoveryGround);
+        }
+        crate::terminalstate::checkpoint::TerminalCheckpointV1::capture_with_limits(
+            &self.terminal,
+            self.checkpoint_limits,
+        )
+        .map_err(InertTerminalError::Checkpoint)
+    }
+
+    /// Consume the off-topology model and replace its entire discard writer
+    /// with a newly spawned live writer.  Buffered replay replies are owned by
+    /// the discarded writer object and cannot cross this transition.
+    pub fn into_live(
+        mut self,
+        live_config: Arc<dyn TerminalConfiguration>,
+        writer: Box<dyn std::io::Write + Send>,
+    ) -> Result<Terminal, InertTerminalError> {
+        if self.replay_failed {
+            return Err(InertTerminalError::ReplayPoisoned);
+        }
+        if !self.terminal.parser.is_recovery_ground() {
+            return Err(InertTerminalError::ParserNotRecoveryGround);
+        }
+        if live_config.scrollback_tier_config().enabled {
+            return Err(InertTerminalError::RetieringRequired);
+        }
+        let live_projection_matches = self
+            .replay_projection
+            .matches_stable(live_config.as_ref(), self.checkpoint_limits)
+            .map_err(InertTerminalError::Checkpoint)?;
+        if !live_projection_matches {
+            return Err(InertTerminalError::ReplayConfigurationMismatch);
+        }
+        self.terminal.state.set_config(live_config);
+        let installed_projection_matches = self
+            .replay_projection
+            .matches_stable(
+                self.terminal.state.get_config().as_ref(),
+                self.checkpoint_limits,
+            )
+            .map_err(InertTerminalError::Checkpoint)?;
+        if !installed_projection_matches {
+            return Err(InertTerminalError::ReplayConfigurationMismatch);
+        }
+        self.terminal
+            .state
+            .activate_inert_writer(writer)
+            .map_err(|_| InertTerminalError::WriterActivation)?;
+        Ok(self.terminal)
+    }
+}
+
 impl Deref for Terminal {
     type Target = TerminalState;
 
@@ -155,6 +518,41 @@ impl Default for TerminalSize {
 }
 
 impl Terminal {
+    pub(crate) fn from_restored_state(state: TerminalState) -> Self {
+        Self {
+            state,
+            parser: Parser::new(),
+        }
+    }
+
+    /// Capture one bounded canonical recovery payload from this terminal's
+    /// model only when this terminal's own parser can be replaced by a fresh
+    /// parser at the same boundary.
+    #[cfg(feature = "use_serde")]
+    pub fn capture_recovery_checkpoint(
+        &self,
+        limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
+    ) -> Result<RecoveryTerminalCheckpointV1, RecoveryTerminalCheckpointError> {
+        if !self.parser.is_recovery_ground() {
+            return Err(RecoveryTerminalCheckpointError::ParserNotRecoveryGround);
+        }
+        let checkpoint =
+            crate::terminalstate::checkpoint::TerminalCheckpointV1::capture_with_limits(
+                &self.state,
+                limits,
+            )
+            .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
+        let canonical_payload = checkpoint
+            .to_canonical_json(limits)
+            .map_err(RecoveryTerminalCheckpointError::Checkpoint)?;
+        let size = self.state.get_size();
+        Ok(RecoveryTerminalCheckpointV1 {
+            canonical_payload,
+            rows: size.rows,
+            cols: size.cols,
+        })
+    }
+
     /// Construct a new Terminal.
     /// `physical_rows` and `physical_cols` describe the dimensions
     /// of the visible portion of the terminal display in terms of
@@ -247,6 +645,39 @@ mod tests {
 
         fn color_palette(&self) -> ColorPalette {
             ColorPalette::default()
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn recovery_checkpoint_requires_its_own_parser_to_be_ground() {
+        for incomplete in [
+            b"\x1b[".as_slice(),
+            b"\x1b]2;unfinished".as_slice(),
+            b"\x1bPq".as_slice(),
+            b"\xc3".as_slice(),
+        ] {
+            let mut terminal = Terminal::new(
+                TerminalSize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 640,
+                    pixel_height: 384,
+                    dpi: 96,
+                },
+                Arc::new(PropTermConfig),
+                "FrankenTerm",
+                "recovery-checkpoint-test",
+                Box::new(Vec::<u8>::new()),
+            );
+            terminal.advance_bytes(incomplete);
+
+            assert!(matches!(
+                terminal.capture_recovery_checkpoint(
+                    crate::terminalstate::checkpoint::TerminalCheckpointLimits::default(),
+                ),
+                Err(RecoveryTerminalCheckpointError::ParserNotRecoveryGround)
+            ));
         }
     }
 

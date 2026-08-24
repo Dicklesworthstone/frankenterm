@@ -439,6 +439,7 @@ pub struct TerminalState {
     term_version: String,
 
     writer: BufWriter<ThreadedWriter>,
+    writer_is_inert: bool,
 
     image_cache: lru::LruCache<[u8; 32], Arc<ImageData>>,
     sixel_scrolls_right: bool,
@@ -528,8 +529,10 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
 /// back-pressure when there is a lot of data to read,
 /// and we're in control of the write side, which represents
 /// input from the interactive user, or pastes.
-struct ThreadedWriter {
-    sender: Sender<WriterMessage>,
+enum ThreadedWriter {
+    Live { sender: Sender<WriterMessage> },
+    Inert,
+    Failed,
 }
 
 enum WriterMessage {
@@ -538,16 +541,26 @@ enum WriterMessage {
 }
 
 impl ThreadedWriter {
-    fn new(mut writer: Box<dyn std::io::Write + Send>) -> Self {
+    fn new(writer: Box<dyn std::io::Write + Send>) -> Self {
+        match Self::try_new(writer) {
+            Ok(writer) => writer,
+            Err(err) => {
+                log::error!("failed to spawn terminal threaded writer: {err:#}");
+                Self::Failed
+            }
+        }
+    }
+
+    fn try_new(mut writer: Box<dyn std::io::Write + Send>) -> std::io::Result<Self> {
         let (sender, receiver) = channel::<WriterMessage>();
 
-        if let Err(err) = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("terminal-threaded-writer".to_string())
             .spawn(move || {
                 while let Ok(msg) = receiver.recv() {
                     match msg {
                         WriterMessage::Data(buf) => {
-                            if writer.write(&buf).is_err() {
+                            if writer.write_all(&buf).is_err() {
                                 break;
                             }
                         }
@@ -561,31 +574,55 @@ impl ThreadedWriter {
                         }
                     }
                 }
-            })
-        {
-            log::error!("failed to spawn terminal threaded writer: {err:#}");
-        }
+            })?;
 
-        Self { sender }
+        Ok(Self::Live { sender })
+    }
+
+    const fn inert() -> Self {
+        Self::Inert
     }
 }
 
 impl std::io::Write for ThreadedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.sender
-            .send(WriterMessage::Data(buf.to_vec()))
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
-        Ok(buf.len())
+        match self {
+            Self::Live { sender } => {
+                let mut owned = Vec::new();
+                owned.try_reserve_exact(buf.len()).map_err(|_| {
+                    std::io::Error::other("terminal writer allocation failed")
+                })?;
+                owned.extend_from_slice(buf);
+                sender
+                    .send(WriterMessage::Data(owned))
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
+                Ok(buf.len())
+            }
+            Self::Inert => Ok(buf.len()),
+            Self::Failed => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "terminal writer is unavailable",
+            )),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let (ack_sender, ack_receiver) = channel();
-        self.sender
-            .send(WriterMessage::Flush(ack_sender))
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
-        ack_receiver
-            .recv()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?
+        match self {
+            Self::Live { sender } => {
+                let (ack_sender, ack_receiver) = channel();
+                sender
+                    .send(WriterMessage::Flush(ack_sender))
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
+                ack_receiver
+                    .recv()
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?
+            }
+            Self::Inert => Ok(()),
+            Self::Failed => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "terminal writer is unavailable",
+            )),
+        }
     }
 }
 
@@ -600,9 +637,49 @@ impl TerminalState {
         term_version: &str,
         writer: Box<dyn std::io::Write + Send>,
     ) -> TerminalState {
-        let writer = BufWriter::new(ThreadedWriter::new(writer));
+        Self::new_with_writer(
+            size,
+            config,
+            term_program,
+            term_version,
+            ThreadedWriter::new(writer),
+            false,
+        )
+    }
+
+    fn new_with_writer(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        writer: ThreadedWriter,
+        writer_is_inert: bool,
+    ) -> TerminalState {
         let seqno = 1;
         let screen = ScreenOrAlt::new(size, &config, seqno, config.bidi_mode());
+        Self::new_with_prebuilt_screen(
+            size,
+            config,
+            term_program,
+            term_version,
+            writer,
+            writer_is_inert,
+            seqno,
+            screen,
+        )
+    }
+
+    fn new_with_prebuilt_screen(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        writer: ThreadedWriter,
+        writer_is_inert: bool,
+        seqno: SequenceNo,
+        screen: ScreenOrAlt,
+    ) -> TerminalState {
+        let writer = BufWriter::new(writer);
 
         let color_map = default_color_map();
 
@@ -667,6 +744,7 @@ impl TerminalState {
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
             writer,
+            writer_is_inert,
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
             kitty_img: {
@@ -688,6 +766,23 @@ impl TerminalState {
             bidi_hint: None,
             progress: Progress::default(),
         }
+    }
+
+    pub(crate) fn activate_inert_writer(
+        &mut self,
+        writer: Box<dyn std::io::Write + Send>,
+    ) -> std::io::Result<()> {
+        if !self.writer_is_inert {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "terminal writer is already live",
+            ));
+        }
+        let live = BufWriter::new(ThreadedWriter::try_new(writer)?);
+        let inert = std::mem::replace(&mut self.writer, live);
+        self.writer_is_inert = false;
+        drop(inert);
+        Ok(())
     }
 
     pub fn enable_conpty_quirks(&mut self) {

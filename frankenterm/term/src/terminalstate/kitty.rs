@@ -77,6 +77,25 @@ impl Default for KittyImageState {
 // cap to assert the rejection path without constructing a
 // 16 MiB+ payload.
 impl KittyImageState {
+    /// Build the capability-free Kitty shell used by checkpoint restore.
+    ///
+    /// Checkpoint v1 admits only quiescent Kitty state, so restore must not
+    /// construct or retain any image payload, placement, or partial transfer.
+    /// It does retain the allocation high-water mark and installs the replay
+    /// configuration's resource limits before the terminal becomes reachable.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn quiescent_for_checkpoint_restore(
+        image_budget_bytes: usize,
+        max_transmission_bytes: usize,
+        max_image_id: u32,
+    ) -> Self {
+        let mut state = Self::default();
+        state.image_budget_bytes = image_budget_bytes;
+        state.set_max_transmission_bytes(max_transmission_bytes);
+        state.restore_quiescent_checkpoint_high_water(max_image_id);
+        state
+    }
+
     /// Return the image-ID allocation high-water mark only when no active
     /// out-of-band Kitty state would be lost by checkpoint v1. Screen-attached
     /// image cells are checked separately; this covers incomplete

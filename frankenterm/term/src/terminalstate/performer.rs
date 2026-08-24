@@ -653,7 +653,11 @@ impl<'a> Performer<'a> {
         // We buffer up the chars to increase the chances of correctly grouping graphemes into cells
         let max_title_len = self.config.max_accumulating_title_len();
         if let Some(title) = self.accumulating_title.as_mut() {
-            if title.len() < max_title_len {
+            if title
+                .len()
+                .checked_add(c.len_utf8())
+                .is_some_and(|next_len| next_len <= max_title_len)
+            {
                 title.push(c);
             } else {
                 // Title exceeded cap — discard accumulation to prevent unbounded growth
@@ -1213,19 +1217,24 @@ impl<'a> Performer<'a> {
                 }
                 ITermProprietary::File(image) => self.set_image(*image),
                 ITermProprietary::SetUserVar { name, value } => {
-                    // Cap user_vars to prevent unbounded growth from
-                    // long-running sessions emitting many SetUserVar sequences.
-                    if self.user_vars.len() >= self.config.max_user_vars()
-                        && !self.user_vars.contains_key(&*name)
-                    {
-                        // Evict an arbitrary entry to make room
-                        if let Some(oldest_key) = self.user_vars.keys().next().cloned() {
-                            self.user_vars.remove(&oldest_key);
+                    let maximum = self.config.max_user_vars();
+                    if maximum != 0 {
+                        // HashMap iteration is randomized, so choose the
+                        // lexicographically smallest key when deterministic
+                        // eviction is required. This keeps guardian replay
+                        // byte-for-byte equivalent to the live model.
+                        if !self.user_vars.contains_key(&*name) {
+                            while self.user_vars.len() >= maximum {
+                                let Some(evicted) = self.user_vars.keys().min().cloned() else {
+                                    break;
+                                };
+                                self.user_vars.remove(&evicted);
+                            }
                         }
-                    }
-                    self.user_vars.insert(name.clone(), value.clone());
-                    if let Some(handler) = self.alert_handler.as_mut() {
-                        handler.alert(Alert::SetUserVar { name, value });
+                        self.user_vars.insert(name.clone(), value.clone());
+                        if let Some(handler) = self.alert_handler.as_mut() {
+                            handler.alert(Alert::SetUserVar { name, value });
+                        }
                     }
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Set(n)) => {
@@ -1234,19 +1243,32 @@ impl<'a> Performer<'a> {
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Push(label)) => {
                     // Cap stack depth to prevent unbounded growth from
                     // unbalanced Push operations in long-running sessions.
-                    if self.unicode_version_stack.len()
-                        >= self.config.max_unicode_version_stack_depth()
-                    {
+                    let maximum = self.config.max_unicode_version_stack_depth();
+                    if maximum == 0 {
                         log::warn!(
                             "unicode version stack depth limit ({}) reached, \
-                             dropping oldest entry",
-                            self.config.max_unicode_version_stack_depth()
+                             rejecting push",
+                            maximum
                         );
-                        self.unicode_version_stack.remove(0);
+                    } else {
+                        let remove_count = self
+                            .unicode_version_stack
+                            .len()
+                            .saturating_add(1)
+                            .saturating_sub(maximum);
+                        if remove_count != 0 {
+                            log::warn!(
+                                "unicode version stack depth limit ({}) reached, \
+                                 dropping {} oldest entries",
+                                maximum,
+                                remove_count
+                            );
+                            drop(self.unicode_version_stack.drain(..remove_count));
+                        }
+                        let vers = self.unicode_version.clone();
+                        self.unicode_version_stack
+                            .push(UnicodeVersionStackEntry { vers, label });
                     }
-                    let vers = self.unicode_version.clone();
-                    self.unicode_version_stack
-                        .push(UnicodeVersionStackEntry { vers, label });
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Pop(None)) => {
                     if let Some(entry) = self.unicode_version_stack.pop() {
