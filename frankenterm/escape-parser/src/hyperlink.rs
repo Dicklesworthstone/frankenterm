@@ -220,7 +220,8 @@ impl Hyperlink {
             } else {
                 osc[1].split(|byte| *byte == b':').count()
             };
-            let mut guarded_params = Vec::with_capacity(param_count);
+            let mut guarded_params: Vec<(Zeroizing<String>, Zeroizing<String>)> =
+                Vec::with_capacity(param_count);
             if !osc[1].is_empty() {
                 for pair in osc[1].split(|byte| *byte == b':') {
                     let separator = pair

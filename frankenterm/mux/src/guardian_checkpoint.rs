@@ -4140,6 +4140,7 @@ mod tests {
     }
 
     const PROTOCOL_DELIVERY_CRITICAL_TYPES: &[&str] = &[
+        "GuardianCheckpointStageRequestV1",
         "GuardianCheckpointStageChunkDeliveryV1",
         "GuardianCheckpointChunkDelivery",
         "GuardianCheckpointChunkNonDuplicable",
@@ -4167,13 +4168,16 @@ mod tests {
     #[derive(Default)]
     struct ProtocolDeliveryAstInventory {
         structs: Vec<ProtocolDeliveryStructSurface>,
+        stage_bodies: Vec<syn::ItemEnum>,
         derives: Vec<String>,
         impls: Vec<String>,
         methods: Vec<AuthorityMethodSurface>,
+        ownership_methods: Vec<(String, syn::ImplItemFn)>,
         return_sites: Vec<String>,
         construction_sites: Vec<String>,
         storage: Vec<ProtocolDeliveryStorageSurface>,
         uses: Vec<syn::ItemUse>,
+        extern_crates: Vec<syn::ItemExternCrate>,
         protected_uses: Vec<syn::ItemUse>,
         type_aliases: Vec<syn::ItemType>,
         impl_associated_types: Vec<(String, syn::ImplItemType)>,
@@ -4542,6 +4546,14 @@ mod tests {
             visit::visit_item_use(self, item);
         }
 
+        fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            self.extern_crates.push(item.clone());
+            visit::visit_item_extern_crate(self, item);
+        }
+
         fn visit_field(&mut self, field: &'ast syn::Field) {
             if Self::cfg_test_only(&field.attrs) {
                 return;
@@ -4611,6 +4623,9 @@ mod tests {
                 return;
             }
             let owner = item.ident.to_string();
+            if owner == "GuardianCheckpointStageBodyV1" {
+                self.stage_bodies.push(item.clone());
+            }
             for variant in &item.variants {
                 if Self::cfg_test_only(&variant.attrs) {
                     continue;
@@ -4712,6 +4727,25 @@ mod tests {
             }
             let owner = self.current_impl_owner.clone();
             self.record_signature(owner.as_deref(), &function.sig, &function.vis);
+            if matches!(
+                (owner.as_deref(), function.sig.ident.to_string().as_str()),
+                (
+                    Some("GuardianCheckpointStageChunkDeliveryV1"),
+                    "into_bytes"
+                ) | (Some("GuardianCheckpointStageRequestV1"), "into_chunk")
+                    | (Some("GuardianCheckpointStageRequestV1"), "encode")
+                    | (
+                        Some("GuardianCheckpointStageRequestV1"),
+                        "into_zeroizing_payload"
+                    )
+            ) {
+                let mut exact = function.clone();
+                exact.attrs.clear();
+                self.ownership_methods.push((
+                    owner.as_deref().unwrap_or("<unknown>").to_owned(),
+                    exact,
+                ));
+            }
             if owner.as_deref().is_some_and(Self::protected) {
                 self.record_conditional(
                     &format!(
@@ -5008,6 +5042,23 @@ mod tests {
         });
     }
 
+    fn sort_protocol_ownership_methods(methods: &mut [(String, syn::ImplItemFn)]) {
+        methods.sort_by(|left, right| {
+            (&left.0, left.1.sig.ident.to_string())
+                .cmp(&(&right.0, right.1.sig.ident.to_string()))
+        });
+    }
+
+    fn expected_protocol_ownership_method(
+        owner: &str,
+        source: &str,
+    ) -> (String, syn::ImplItemFn) {
+        (
+            owner.to_owned(),
+            syn::parse_str(source).expect("parse frozen protocol ownership method"),
+        )
+    }
+
     fn assert_protocol_delivery_surface_is_closed() {
         let syntax = syn::parse_file(include_str!("guardian_protocol.rs"))
             .expect("parse the complete guardian protocol module as Rust syntax");
@@ -5032,6 +5083,18 @@ mod tests {
             ),
             expected_protocol_delivery_struct(
                 r#"
+                    pub struct GuardianCheckpointStageRequestV1 {
+                        scope: GuardianCheckpointScopeV1,
+                        upload_id: Uuid,
+                        descriptor: GuardianCheckpointDescriptorV1,
+                        chunk_bytes: u32,
+                        total_chunks: u32,
+                        body: GuardianCheckpointStageBodyV1,
+                    }
+                "#,
+            ),
+            expected_protocol_delivery_struct(
+                r#"
                     pub struct GuardianCheckpointChunkDelivery {
                         descriptor: GuardianCheckpointDescriptorV1,
                         offset: u64,
@@ -5044,6 +5107,19 @@ mod tests {
         ];
         sort_protocol_delivery_structs(&mut expected_structs);
         assert_eq!(inventory.structs, expected_structs);
+        assert_eq!(
+            inventory.stage_bodies,
+            vec![syn::parse_str::<syn::ItemEnum>(
+                r#"
+                    enum GuardianCheckpointStageBodyV1 {
+                        Begin,
+                        Chunk(GuardianCheckpointStageChunkDeliveryV1),
+                        Seal,
+                    }
+                "#,
+            )
+            .expect("parse frozen checkpoint Stage body enum")]
+        );
 
         inventory.derives.sort();
         assert_eq!(inventory.derives, Vec::<String>::new());
@@ -5054,6 +5130,8 @@ mod tests {
             "GuardianCheckpointStageChunkDeliveryV1:ZeroizeOnDrop",
             "GuardianCheckpointStageChunkDeliveryV1:Drop",
             "GuardianCheckpointStageChunkDeliveryV1:<inherent>",
+            "GuardianCheckpointStageRequestV1:std::fmt::Debug",
+            "GuardianCheckpointStageRequestV1:<inherent>",
             "GuardianCheckpointChunkDelivery:std::fmt::Debug",
             "GuardianCheckpointChunkDelivery:ZeroizeOnDrop",
             "GuardianCheckpointChunkDelivery:Drop",
@@ -5110,6 +5188,144 @@ mod tests {
                 "fn into_chunk(self) -> Result<GuardianCheckpointStageChunkDeliveryV1, GuardianProtocolError>",
             ),
             expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "private",
+                false,
+                "fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn begin(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn chunk(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32, index: u32, bytes: Zeroizing<Vec<u8>>) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn seal(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "private",
+                false,
+                "fn new(scope: GuardianCheckpointScopeV1, upload_id: Uuid, descriptor: GuardianCheckpointDescriptorV1, chunk_bytes: u32, body: GuardianCheckpointStageBodyV1) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn scope(&self) -> GuardianCheckpointScopeV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn upload_id(&self) -> Uuid",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn checkpoint_id(&self) -> GuardianCheckpointIdentityDigest",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn boundary_id(&self) -> GuardianCheckpointBoundaryIdentityDigest",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn total_bytes(&self) -> u64",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn descriptor(&self) -> GuardianCheckpointDescriptorV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn chunk_bytes(&self) -> u32",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn total_chunks(&self) -> u32",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn kind(&self) -> GuardianCheckpointStageKindV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "const fn chunk_position(&self) -> Option<(u32, u64)>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn encode(&self) -> Result<Vec<u8>, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn into_zeroizing_payload(self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "private",
+                false,
+                "fn encoded_capacity(&self) -> Result<usize, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "private",
+                false,
+                "fn encode_into(&self, payload: &mut Vec<u8>, capacity: usize) -> Result<(), GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "private",
+                false,
+                "fn validate(&self) -> Result<(), GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "pub",
+                false,
+                "fn validate_staged_plaintext(&self, canonical_terminal_payload: &[u8]) -> Result<(), GuardianProtocolError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageRequestV1",
+                "private",
+                false,
+                "fn validate_header(&self, header: &GuardianRequestHeader) -> Result<(), GuardianProtocolError>",
+            ),
+            expected_authority_method(
                 "GuardianCheckpointChunkDelivery",
                 "private",
                 false,
@@ -5162,13 +5378,20 @@ mod tests {
         assert_eq!(inventory.methods, expected_methods);
 
         inventory.return_sites.sort();
-        assert_eq!(
-            inventory.return_sites,
-            vec![
-                "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new:pub:production".to_owned(),
-                "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::into_chunk:pub:production".to_owned(),
-            ]
-        );
+        let mut expected_return_sites = vec![
+            "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new:pub:production",
+            "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::into_chunk:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::begin:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode:pub:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::new:private:production",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal:pub:production",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_return_sites.sort();
+        assert_eq!(inventory.return_sites, expected_return_sites);
 
         inventory.construction_sites.sort();
         let mut expected_construction_sites = vec![
@@ -5180,6 +5403,13 @@ mod tests {
             "GuardianCheckpointChunkNonDuplicable@GuardianCheckpointStageRequestV1::decode",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::chunk",
             "GuardianCheckpointStageChunkDeliveryV1@GuardianCheckpointStageRequestV1::decode",
+            "GuardianCheckpointStageRequestV1@<free>::validate_request_envelope",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::begin",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::chunk",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::decode",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::new",
+            "GuardianCheckpointStageRequestV1@GuardianCheckpointStageRequestV1::seal",
+            "GuardianCheckpointStageRequestV1@GuardianReply::require_request_payload",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -5233,6 +5463,7 @@ mod tests {
             ]
         );
         assert_eq!(inventory.protected_uses, Vec::<syn::ItemUse>::new());
+        assert_eq!(inventory.extern_crates, Vec::<syn::ItemExternCrate>::new());
         assert_eq!(
             inventory.type_aliases,
             vec![
