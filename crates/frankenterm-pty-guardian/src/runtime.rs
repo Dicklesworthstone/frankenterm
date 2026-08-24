@@ -2456,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn final_disconnect_during_input_is_replayed_after_completion_and_retires_the_lease() {
+    fn retirement_waits_for_worker_owned_protocol_without_retaining_transport_state() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (entered_tx, entered_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
@@ -2483,22 +2483,25 @@ mod tests {
             .expect("write entered before disconnect");
         assert_eq!(
             runtime
-                .retire_disconnected_mux(Uuid::from_u128(2), 11)
-                .expect("defer final disconnect"),
-            GuardianMuxLeaseRetirement::default()
-        );
-        assert_eq!(
-            runtime.pending_mux_retirements,
-            [PendingMuxRetirement {
-                mux_incarnation: Uuid::from_u128(2),
-                disconnected_connection_generation: 11,
-            }]
+                .retire_disconnected_mux(Uuid::from_u128(2))
+                .expect("runtime reports worker-owned protocol"),
+            None,
+            "transport must retain the deferred retirement authority"
         );
 
         release_tx.send(()).expect("release write");
         let completion = wait_for_input_completion(&mut runtime);
         assert!(completion.response.is_some());
-        assert!(runtime.pending_mux_retirements.is_empty());
+        assert_eq!(
+            runtime
+                .retire_disconnected_mux(Uuid::from_u128(2))
+                .expect("retirement applies after protocol restoration"),
+            Some(GuardianMuxLeaseRetirement {
+                retired_panes: 1,
+                pending_input_panes: 0,
+                indeterminate_checkpoint_panes: 0,
+            })
+        );
         assert!(matches!(
             runtime
                 .protocol
@@ -2506,97 +2509,7 @@ mod tests {
                 .and_then(|protocol| protocol.pane_state(pane_id)),
             Some(GuardianPaneState::LiveUnclaimed { generation: 1 })
         ));
-    }
-
-    #[test]
-    fn authenticated_reconnect_cancels_only_the_older_worker_deferred_retirement() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (entered_tx, entered_rx) = sync_channel(1);
-        let (release_tx, release_rx) = sync_channel(1);
-        let (_directory, _poll, mut runtime, pane_id) = claimed_runtime_with_writer(Box::new(
-            BlockingWriter {
-                calls,
-                entered: entered_tx,
-                release: release_rx,
-            },
-        ));
-        let request = authenticated_input_request_for(
-            Uuid::from_u128(91),
-            pane_id,
-            Uuid::from_u128(92),
-            b"disconnect-reconnect-race",
-        );
-        let route = input_route(7, 11, &request);
-        assert!(matches!(
-            runtime.submit_input(request, route),
-            GuardianInputSubmission::Pending
-        ));
-        entered_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("write entered before disconnect");
-
-        let mux_incarnation = Uuid::from_u128(2);
-        runtime
-            .retire_disconnected_mux(mux_incarnation, 11)
-            .expect("defer final disconnect while worker owns protocol");
-        assert_eq!(runtime.pending_mux_retirements.len(), 1);
-
-        let hello = authenticated_hello_request(Uuid::from_u128(93), mux_incarnation);
-        let hello_response = runtime
-            .dispatch(&hello)
-            .expect("cached Hello succeeds while worker owns protocol");
-        assert_eq!(hello_response.header().status, GuardianResponseStatus::Success);
-
-        runtime
-            .observe_connected_mux(mux_incarnation, 10)
-            .expect("older connection observation is well formed");
-        runtime
-            .observe_connected_mux(mux_incarnation, 11)
-            .expect("equal connection observation is well formed");
-        assert_eq!(
-            runtime.pending_mux_retirements,
-            [PendingMuxRetirement {
-                mux_incarnation,
-                disconnected_connection_generation: 11,
-            }],
-            "an older or equal observation cannot cancel the disconnect"
-        );
-        let unrelated_mux = Uuid::from_u128(94);
-        runtime
-            .retire_disconnected_mux(unrelated_mux, 9)
-            .expect("defer an unrelated mux disconnect");
-        runtime
-            .observe_connected_mux(mux_incarnation, 12)
-            .expect("new authenticated connection generation is accepted");
-        assert_eq!(
-            runtime.pending_mux_retirements,
-            [PendingMuxRetirement {
-                mux_incarnation: unrelated_mux,
-                disconnected_connection_generation: 9,
-            }],
-            "the reconnect cancels only its own mux retirement"
-        );
-
-        release_tx.send(()).expect("release input write");
-        let completion = wait_for_input_completion(&mut runtime);
-        assert!(completion.response.is_some());
-        assert!(matches!(
-            runtime
-                .protocol
-                .as_ref()
-                .and_then(|protocol| protocol.pane_state(pane_id)),
-            Some(GuardianPaneState::LiveClaimed {
-                generation: 1,
-                mux_incarnation: owner,
-                ..
-            }) if *owner == mux_incarnation
-        ));
-        assert!(runtime
-            .retire_disconnected_mux(mux_incarnation, 0)
-            .is_err());
-        assert!(runtime.observe_connected_mux(mux_incarnation, 0).is_err());
-        assert!(runtime.retire_disconnected_mux(Uuid::nil(), 13).is_err());
-        assert!(runtime.observe_connected_mux(Uuid::nil(), 13).is_err());
+        assert!(runtime.retire_disconnected_mux(Uuid::nil()).is_err());
     }
 
     #[test]

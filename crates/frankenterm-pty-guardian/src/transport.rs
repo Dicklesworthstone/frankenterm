@@ -223,6 +223,233 @@ impl Connection {
             accepted_at: Instant::now(),
         }
     }
+
+    fn identity(&self, token: Token) -> ConnectionIdentity {
+        ConnectionIdentity {
+            token,
+            generation: self.generation,
+        }
+    }
+}
+
+/// Exact identity of one accepted connection-token lifetime.
+///
+/// Generation fences token recycling only. It is deliberately never compared
+/// across distinct connections to decide lifecycle order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ConnectionIdentity {
+    token: Token,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingMuxRetirementObservation {
+    mux_incarnation: Uuid,
+    disconnect_observation_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MuxConnectionTrackingError {
+    InvalidIdentity,
+    CapacityExhausted,
+    ObservationEpochExhausted,
+    StaleConnection,
+    ConnectionAlreadyAuthenticated,
+    MembershipMismatch,
+    ActiveMembershipAtReplay,
+    PendingRetirementMismatch,
+    Poisoned,
+}
+
+/// Readiness-loop-owned connection lifecycle and retirement authority.
+///
+/// `live_connections` is the exact authenticated-membership source of truth,
+/// keyed by token plus that token's current generation. Observation epochs are
+/// allocated only as lifecycle events are processed by this single owner, so a
+/// delayed valid Hello orders after an already-processed disconnect regardless
+/// of which connection happened to be accepted first.
+struct MuxConnectionTracker {
+    live_connections: HashMap<ConnectionIdentity, Option<Uuid>>,
+    pending_retirements: Vec<PendingMuxRetirementObservation>,
+    max_connections: usize,
+    observation_epoch: u64,
+    poisoned: bool,
+}
+
+impl MuxConnectionTracker {
+    fn new(max_connections: usize) -> Result<Self, GuardianServiceError> {
+        if max_connections == 0 || max_connections > MAX_CONNECTIONS {
+            return Err(GuardianServiceError::InvalidConfiguration(
+                "mux connection tracker capacity is invalid",
+            ));
+        }
+        let mut live_connections = HashMap::new();
+        live_connections.try_reserve(max_connections).map_err(|_| {
+            GuardianServiceError::InvalidConfiguration(
+                "mux connection tracker allocation failed",
+            )
+        })?;
+        let mut pending_retirements = Vec::new();
+        pending_retirements
+            .try_reserve_exact(max_connections)
+            .map_err(|_| {
+                GuardianServiceError::InvalidConfiguration(
+                    "mux retirement tracker allocation failed",
+                )
+            })?;
+        Ok(Self {
+            live_connections,
+            pending_retirements,
+            max_connections,
+            observation_epoch: 0,
+            poisoned: false,
+        })
+    }
+
+    fn next_observation_epoch(&mut self) -> Result<u64, MuxConnectionTrackingError> {
+        let Some(epoch) = self.observation_epoch.checked_add(1) else {
+            self.poisoned = true;
+            return Err(MuxConnectionTrackingError::ObservationEpochExhausted);
+        };
+        self.observation_epoch = epoch;
+        Ok(epoch)
+    }
+
+    fn require_healthy(&self) -> Result<(), MuxConnectionTrackingError> {
+        if self.poisoned {
+            Err(MuxConnectionTrackingError::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn observe_accept(
+        &mut self,
+        identity: ConnectionIdentity,
+    ) -> Result<(), MuxConnectionTrackingError> {
+        self.require_healthy()?;
+        if identity.token == LISTENER_TOKEN || identity.generation == 0 {
+            return Err(MuxConnectionTrackingError::InvalidIdentity);
+        }
+        if self.live_connections.contains_key(&identity)
+            || self
+                .live_connections
+                .keys()
+                .any(|live| live.token == identity.token)
+        {
+            return Err(MuxConnectionTrackingError::StaleConnection);
+        }
+        if self.live_connections.len() >= self.max_connections {
+            return Err(MuxConnectionTrackingError::CapacityExhausted);
+        }
+        self.next_observation_epoch()?;
+        self.live_connections.insert(identity, None);
+        Ok(())
+    }
+
+    fn observe_authenticated_hello(
+        &mut self,
+        identity: ConnectionIdentity,
+        mux_incarnation: Uuid,
+    ) -> Result<(), MuxConnectionTrackingError> {
+        self.require_healthy()?;
+        if mux_incarnation.is_nil() {
+            return Err(MuxConnectionTrackingError::InvalidIdentity);
+        }
+        match self.live_connections.get(&identity) {
+            Some(None) => {}
+            Some(Some(_)) => {
+                return Err(MuxConnectionTrackingError::ConnectionAlreadyAuthenticated);
+            }
+            None => return Err(MuxConnectionTrackingError::StaleConnection),
+        }
+        let hello_observation_epoch = self.next_observation_epoch()?;
+        self.live_connections
+            .insert(identity, Some(mux_incarnation));
+        self.pending_retirements.retain(|retirement| {
+            retirement.mux_incarnation != mux_incarnation
+                || retirement.disconnect_observation_epoch >= hello_observation_epoch
+        });
+        Ok(())
+    }
+
+    fn observe_disconnect(
+        &mut self,
+        identity: ConnectionIdentity,
+        connection_mux_incarnation: Option<Uuid>,
+    ) -> Result<(), MuxConnectionTrackingError> {
+        self.require_healthy()?;
+        let Some(tracked_mux_incarnation) = self.live_connections.get(&identity).copied() else {
+            return Err(MuxConnectionTrackingError::StaleConnection);
+        };
+        if tracked_mux_incarnation != connection_mux_incarnation {
+            self.poisoned = true;
+            return Err(MuxConnectionTrackingError::MembershipMismatch);
+        }
+        let disconnect_observation_epoch = self.next_observation_epoch()?;
+        self.live_connections.remove(&identity);
+        let Some(mux_incarnation) = tracked_mux_incarnation else {
+            return Ok(());
+        };
+        if self.has_authenticated_membership(mux_incarnation) {
+            return Ok(());
+        }
+        if let Some(retirement) = self
+            .pending_retirements
+            .iter_mut()
+            .find(|retirement| retirement.mux_incarnation == mux_incarnation)
+        {
+            retirement.disconnect_observation_epoch = disconnect_observation_epoch;
+            return Ok(());
+        }
+        if self.pending_retirements.len() >= self.max_connections {
+            self.poisoned = true;
+            return Err(MuxConnectionTrackingError::CapacityExhausted);
+        }
+        self.pending_retirements
+            .push(PendingMuxRetirementObservation {
+                mux_incarnation,
+                disconnect_observation_epoch,
+            });
+        Ok(())
+    }
+
+    fn has_authenticated_membership(&self, mux_incarnation: Uuid) -> bool {
+        self.live_connections
+            .values()
+            .any(|membership| *membership == Some(mux_incarnation))
+    }
+
+    fn next_replayable_retirement(
+        &mut self,
+    ) -> Result<Option<PendingMuxRetirementObservation>, MuxConnectionTrackingError> {
+        self.require_healthy()?;
+        let Some(retirement) = self.pending_retirements.first().copied() else {
+            return Ok(None);
+        };
+        if self.has_authenticated_membership(retirement.mux_incarnation) {
+            self.poisoned = true;
+            return Err(MuxConnectionTrackingError::ActiveMembershipAtReplay);
+        }
+        Ok(Some(retirement))
+    }
+
+    fn complete_retirement(
+        &mut self,
+        completed: PendingMuxRetirementObservation,
+    ) -> Result<(), MuxConnectionTrackingError> {
+        self.require_healthy()?;
+        let Some(position) = self
+            .pending_retirements
+            .iter()
+            .position(|pending| *pending == completed)
+        else {
+            self.poisoned = true;
+            return Err(MuxConnectionTrackingError::PendingRetirementMismatch);
+        };
+        self.pending_retirements.remove(position);
+        Ok(())
+    }
 }
 
 enum FrameProcessing {
@@ -324,7 +551,7 @@ pub struct GuardianService {
     secret: GuardianSecret,
     runtime: GuardianRuntime,
     connections: HashMap<Token, Connection>,
-    active_mux_connections: HashMap<Uuid, usize>,
+    mux_connections: MuxConnectionTracker,
     free_connection_tokens: Vec<usize>,
     poll_interval: Duration,
     transport_failures: u64,
@@ -404,12 +631,7 @@ impl GuardianService {
         connections.try_reserve(config.max_connections).map_err(|_| {
             GuardianServiceError::InvalidConfiguration("connection map allocation failed")
         })?;
-        let mut active_mux_connections = HashMap::new();
-        active_mux_connections
-            .try_reserve(config.max_connections)
-            .map_err(|_| {
-                GuardianServiceError::InvalidConfiguration("mux map allocation failed")
-            })?;
+        let mux_connections = MuxConnectionTracker::new(config.max_connections)?;
         let events = Events::with_capacity(endpoint_capacity);
 
         // Private output-directory/key provisioning is the earlier deliberate
@@ -443,7 +665,7 @@ impl GuardianService {
             secret,
             runtime,
             connections,
-            active_mux_connections,
+            mux_connections,
             free_connection_tokens,
             poll_interval: config.poll_interval,
             transport_failures: 0,
@@ -597,12 +819,19 @@ impl GuardianService {
                 continue;
             };
             let token = Token(raw_token);
+            let identity = ConnectionIdentity { token, generation };
             if self
                 .poll
                 .registry()
                 .register(&mut stream, token, Interest::READABLE)
                 .is_err()
             {
+                self.free_connection_tokens.push(raw_token);
+                self.transport_failures = self.transport_failures.saturating_add(1);
+                continue;
+            }
+            if self.mux_connections.observe_accept(identity).is_err() {
+                let _ = self.poll.registry().deregister(&mut stream);
                 self.free_connection_tokens.push(raw_token);
                 self.transport_failures = self.transport_failures.saturating_add(1);
                 continue;
