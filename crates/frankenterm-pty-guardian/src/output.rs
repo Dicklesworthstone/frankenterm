@@ -1159,16 +1159,13 @@ impl GuardianCheckpointStageStore {
             return Err(GuardianCheckpointStageStoreError::Conflict);
         }
         let shape = CheckpointStageRequestShape::from_request(&request)?;
-        let (index, offset, protocol_digest) = request
-            .chunk_position()
-            .ok_or(GuardianCheckpointStageStoreError::Conflict)?;
-        let protocol_digest = Zeroizing::new(protocol_digest);
-        let bytes = request.into_chunk_bytes()?;
-        let observed_digest =
-            Zeroizing::new(<[u8; 32]>::from(Sha256::digest(bytes.as_slice())));
-        if !checkpoint_bytes_match(observed_digest.as_slice(), protocol_digest.as_slice()) {
+        let chunk = request.into_chunk()?;
+        let (index, offset) = chunk.position();
+        let observed_digest = checkpoint_zeroizing_sha256_digest(chunk.bytes());
+        if !checkpoint_bytes_match(observed_digest.as_slice(), chunk.chunk_digest()) {
             return Err(GuardianCheckpointStageStoreError::Conflict);
         }
+        let bytes = chunk.into_bytes();
         self.with_exclusive_directory(|inner| {
             let mut census = checkpoint_stage_census(inner)?;
             let mut inspection = checkpoint_inspect_upload(
@@ -2308,6 +2305,13 @@ fn checkpoint_bytes_match(left: &[u8], right: &[u8]) -> bool {
         .zip(right)
         .fold(0_u8, |difference, (left, right)| difference | (*left ^ *right))
         == 0
+}
+
+fn checkpoint_zeroizing_sha256_digest(bytes: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut digest = Zeroizing::new([0_u8; 32]);
+    let output: &mut sha2::digest::Output<Sha256> = (&mut *digest).into();
+    Sha256::new_with_prefix(bytes).finalize_into(output);
+    digest
 }
 
 /// Descriptor-pinned encrypted input WAL owned by the live-input worker while
@@ -5090,9 +5094,10 @@ mod tests {
                 let offset = u64::from(index)
                     .checked_mul(u64::from(chunk_bytes))
                     .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
+                let digest = checkpoint_zeroizing_sha256_digest(bytes);
                 wire.extend_from_slice(&index.to_be_bytes());
                 wire.extend_from_slice(&offset.to_be_bytes());
-                wire.extend_from_slice(&<[u8; 32]>::from(Sha256::digest(bytes)));
+                wire.extend_from_slice(digest.as_slice());
                 wire.extend_from_slice(
                     &u32::try_from(bytes.len())
                         .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?

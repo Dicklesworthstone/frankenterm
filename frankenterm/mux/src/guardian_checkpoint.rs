@@ -3474,6 +3474,10 @@ mod tests {
         }
     }
 
+    fn expected_use(item: &str) -> syn::ItemUse {
+        syn::parse_str(item).expect("parse frozen production use item")
+    }
+
     #[derive(Default)]
     struct AuthoritySurfaceAstInventory {
         derives: Vec<String>,
@@ -5790,12 +5794,182 @@ mod tests {
             "GuardianCheckpointValidatedStageAssemblyV1:ordered_chunk_set_identity:private",
             "GuardianCheckpointValidatedStageAssemblyV1:publication_id:private",
             "GuardianCheckpointValidatedStageAssemblyV1:seal_request:private",
+            "LiveParserCheckpointAck:boundary:private",
+            "LiveParserCheckpointAck:boundary_digest:private",
+            "LiveParserCheckpointAck:registration_wire_identity:private",
+            "LiveParserCheckpointAck:terminal_checkpoint:private",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
         expected_fields.sort();
         assert_eq!(inventory.fields, expected_fields);
+
+        sort_authority_fields(&mut inventory.field_surfaces);
+        let mut expected_field_surfaces = vec![
+            expected_authority_field(
+                "GuardianCheckpointCandidateIdentityV1",
+                "digest",
+                "Zeroizing<[u8; 32]>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointGenesisSpawnPermitV1",
+                "_private",
+                "()",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointGenesisSpawnPermitV1",
+                "spawn_effect_id",
+                "Uuid",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointManifestRetryCapabilityV1",
+                "operation",
+                "GuardianCheckpointValidatedManifestOperationV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointManifestSealCapabilitiesV1",
+                "primary",
+                "GuardianCheckpointValidatedManifestOperationV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointManifestSealCapabilitiesV1",
+                "retry",
+                "GuardianCheckpointManifestRetryCapabilityV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "chunk_bytes",
+                "u32",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "committed_bytes",
+                "u64",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "hasher",
+                "Sha256",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "next_index",
+                "u32",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "total_bytes",
+                "u64",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "total_chunks",
+                "u32",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointOrderedChunkSetIdentityV1",
+                "digest",
+                "Zeroizing<[u8; 32]>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointStageSealIntentV1",
+                "context",
+                "GuardianCheckpointStageRecordContextV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointStageSealIntentV1",
+                "expected_plaintext_digest",
+                "Zeroizing<[u8; 32]>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointStageSealIntentV1",
+                "plaintext",
+                "Zeroizing<Vec<u8>>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedManifestAuthorityV1",
+                "binding",
+                "GuardianCheckpointStageBindingV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "binding",
+                "GuardianCheckpointStageBindingV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "canonical_manifest",
+                "Zeroizing<Vec<u8>>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "context",
+                "GuardianCheckpointStageRecordContextV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "expected_manifest_digest",
+                "Zeroizing<[u8; 32]>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "expected_operation_digest",
+                "Zeroizing<[u8; 32]>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "expected_plaintext_digest",
+                "Zeroizing<[u8; 32]>",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedStageAssemblyV1",
+                "_private",
+                "()",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedStageAssemblyV1",
+                "candidate_identity",
+                "GuardianCheckpointCandidateIdentityV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedStageAssemblyV1",
+                "ordered_chunk_set_identity",
+                "GuardianCheckpointOrderedChunkSetIdentityV1",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedStageAssemblyV1",
+                "publication_id",
+                "Uuid",
+            ),
+            expected_authority_field(
+                "GuardianCheckpointValidatedStageAssemblyV1",
+                "seal_request",
+                "GuardianCheckpointStageRequestV1",
+            ),
+            expected_authority_field(
+                "LiveParserCheckpointAck",
+                "boundary",
+                "GuardianCheckpointBoundary",
+            ),
+            expected_authority_field(
+                "LiveParserCheckpointAck",
+                "boundary_digest",
+                "[u8; 32]",
+            ),
+            expected_authority_field(
+                "LiveParserCheckpointAck",
+                "registration_wire_identity",
+                "[u8; 16]",
+            ),
+            expected_authority_field(
+                "LiveParserCheckpointAck",
+                "terminal_checkpoint",
+                "RecoveryTerminalCheckpointV2",
+            ),
+        ];
+        sort_authority_fields(&mut expected_field_surfaces);
+        assert_eq!(inventory.field_surfaces, expected_field_surfaces);
 
         inventory.impls.sort();
         let mut expected_impls = vec![
@@ -5823,6 +5997,8 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1:Debug",
             "GuardianCheckpointValidatedStageAssemblyV1:<inherent>",
             "GuardianCheckpointValidatedStageAssemblyV1:Debug",
+            "LiveParserCheckpointAck:<inherent>",
+            "LiveParserCheckpointAck:Debug",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -5855,12 +6031,275 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
             "GuardianCheckpointValidatedManifestOperationV1::validate:private:production",
             "GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
+            "LiveParserCheckpointAck::boundary:pub:production",
+            "LiveParserCheckpointAck::boundary_digest:pub:production",
+            "LiveParserCheckpointAck::capture:private:production",
+            "LiveParserCheckpointAck::checkpoint_artifact_identity_digest:pub:production",
+            "LiveParserCheckpointAck::durable_pane_id:pub:production",
+            "LiveParserCheckpointAck::into_parts:pub:production",
+            "LiveParserCheckpointAck::journal_cumulative_plaintext_bytes:pub:production",
+            "LiveParserCheckpointAck::output_boundary_identity_digest:pub:production",
+            "LiveParserCheckpointAck::output_committed_log_bytes:pub:production",
+            "LiveParserCheckpointAck::output_record_digest:pub:production",
+            "LiveParserCheckpointAck::output_sequence:pub:production",
+            "LiveParserCheckpointAck::parser_stream_bytes:pub:production",
+            "LiveParserCheckpointAck::registration_wire_identity:pub:production",
+            "LiveParserCheckpointAck::segment_id:pub:production",
+            "LiveParserCheckpointAck::terminal_checkpoint:pub:production",
+            "LiveParserCheckpointAck::terminal_payload_bytes:pub:production",
+            "LiveParserCheckpointAck::terminal_payload_digest:pub:production",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
         expected_methods.sort();
         assert_eq!(inventory.inherent_methods, expected_methods);
+
+        sort_authority_methods(&mut inventory.method_surfaces);
+        let mut expected_method_surfaces = vec![
+            expected_authority_method(
+                "GuardianCheckpointGenesisSpawnPermitV1",
+                "private",
+                true,
+                "fn issue_for_test(spawn_effect_id: Uuid) -> Self",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCandidateIdentityV1",
+                "pub",
+                false,
+                "fn from_canonical_begin_plaintext(plaintext: &Zeroizing<Vec<u8>>) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCandidateIdentityV1",
+                "private",
+                false,
+                "fn digest(&self) -> &[u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCandidateIdentityV1",
+                "private",
+                false,
+                "fn is_zero(&self) -> bool",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointOrderedChunkSetIdentityV1",
+                "private",
+                false,
+                "fn digest(&self) -> &[u8; 32]",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointOrderedChunkSetIdentityV1",
+                "private",
+                false,
+                "fn is_zero(&self) -> bool",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "pub",
+                false,
+                "fn new(total_bytes: u64, chunk_bytes: u32, total_chunks: u32) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "pub",
+                false,
+                "fn push_authenticated_chunk(&mut self, index: u32, offset: u64, plaintext: &Zeroizing<Vec<u8>>) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointOrderedChunkSetBuilderV1",
+                "pub",
+                false,
+                "fn finish(self) -> Result<GuardianCheckpointOrderedChunkSetIdentityV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedStageAssemblyV1",
+                "private",
+                true,
+                "fn issue_for_test(seal_request: GuardianCheckpointStageRequestV1, publication_id: Uuid, candidate_identity: GuardianCheckpointCandidateIdentityV1, ordered_chunk_set_identity: GuardianCheckpointOrderedChunkSetIdentityV1) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestAuthorityV1",
+                "pub",
+                false,
+                "fn from_live_capture(binding: &GuardianCheckpointStageBindingV1, capture: LiveParserCheckpointAck) -> Result<Self, GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestAuthorityV1",
+                "pub",
+                false,
+                "fn from_genesis_spawn_permit(binding: &GuardianCheckpointStageBindingV1, permit: GuardianCheckpointGenesisSpawnPermitV1, terminal_checkpoint: &RecoveryTerminalCheckpointV2) -> Result<Self, GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestAuthorityV1",
+                "pub",
+                false,
+                "fn bind_seal_operation(self, assembly: GuardianCheckpointValidatedStageAssemblyV1) -> Result<GuardianCheckpointManifestSealCapabilitiesV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageSealIntentV1",
+                "pub",
+                false,
+                "fn candidate_metadata(binding: &GuardianCheckpointStageBindingV1, upload_id: Uuid, publication_id: Uuid, plaintext: Zeroizing<Vec<u8>>) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageSealIntentV1",
+                "pub",
+                false,
+                "fn chunk(binding: &GuardianCheckpointStageBindingV1, upload_id: Uuid, publication_id: Uuid, index: u32, offset: u64, plaintext: Zeroizing<Vec<u8>>) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageSealIntentV1",
+                "pub",
+                false,
+                "const fn context(&self) -> GuardianCheckpointStageRecordContextV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointStageSealIntentV1",
+                "private",
+                false,
+                "fn from_binding(kind: GuardianCheckpointStageRecordKindV1, binding: &GuardianCheckpointStageBindingV1, upload_id: Uuid, publication_id: Uuid, chunk_position: Option<(u32, u64)>, plaintext: Zeroizing<Vec<u8>>) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "pub",
+                false,
+                "const fn context(&self) -> GuardianCheckpointStageRecordContextV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "private",
+                false,
+                "fn from_validated_parts(binding: GuardianCheckpointStageBindingV1, publication_id: Uuid, canonical_manifest: Zeroizing<Vec<u8>>) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointValidatedManifestOperationV1",
+                "private",
+                false,
+                "fn validate(&self) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointManifestRetryCapabilityV1",
+                "pub",
+                false,
+                "const fn context(&self) -> GuardianCheckpointStageRecordContextV1",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointManifestSealCapabilitiesV1",
+                "private",
+                false,
+                "fn from_authority(authority: GuardianCheckpointValidatedManifestAuthorityV1, assembly: GuardianCheckpointValidatedStageAssemblyV1) -> Result<Self, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointManifestSealCapabilitiesV1",
+                "pub",
+                false,
+                "fn into_primary_and_retry(self) -> (GuardianCheckpointValidatedManifestOperationV1, GuardianCheckpointManifestRetryCapabilityV1)",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "private",
+                false,
+                "fn capture(registration_wire_identity: [u8; 16], durable_pane_id: Uuid, segment: GuardianOutputSegmentIdentity, output: GuardianOutputAppendReceipt, target_parser_stream_bytes: u64, terminal_checkpoint: RecoveryTerminalCheckpointV2) -> Result<Self, GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn registration_wire_identity(&self) -> [u8; 16]",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn durable_pane_id(&self) -> Uuid",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn segment_id(&self) -> Uuid",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn output_sequence(&self) -> u64",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn output_record_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn output_committed_log_bytes(&self) -> u64",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn journal_cumulative_plaintext_bytes(&self) -> u64",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn parser_stream_bytes(&self) -> u64",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn terminal_payload_bytes(&self) -> u64",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn terminal_payload_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "fn output_boundary_identity_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "fn checkpoint_artifact_identity_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn boundary_digest(&self) -> [u8; 32]",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn boundary(&self) -> &GuardianCheckpointBoundary",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "const fn terminal_checkpoint(&self) -> &RecoveryTerminalCheckpointV2",
+            ),
+            expected_authority_method(
+                "LiveParserCheckpointAck",
+                "pub",
+                false,
+                "fn into_parts(self) -> (GuardianCheckpointBoundary, RecoveryTerminalCheckpointV2)",
+            ),
+        ];
+        sort_authority_methods(&mut expected_method_surfaces);
+        assert_eq!(inventory.method_surfaces, expected_method_surfaces);
 
         inventory.cipher_methods.sort();
         let mut expected_cipher_methods = vec![
@@ -5883,6 +6322,188 @@ mod tests {
         expected_cipher_methods.sort();
         assert_eq!(inventory.cipher_methods, expected_cipher_methods);
 
+        sort_authority_methods(&mut inventory.cipher_method_surfaces);
+        let mut expected_cipher_method_surfaces = vec![
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn from_output_cipher(output_cipher: &GuardianOutputCipher) -> Self",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "const fn key_id(&self) -> [u8; CHECKPOINT_STAGE_KEY_ID_BYTES]",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal(&self, intent: GuardianCheckpointStageSealIntentV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_manifest(&self, operation: GuardianCheckpointValidatedManifestOperationV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn retry_seal_manifest(&self, retry: &GuardianCheckpointManifestRetryCapabilityV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "private",
+                false,
+                "fn seal_validated_manifest(&self, operation: &GuardianCheckpointValidatedManifestOperationV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "private",
+                false,
+                "fn seal_exact_payload(&self, context: GuardianCheckpointStageRecordContextV1, plaintext: &[u8], expected_plaintext_digest: &[u8; 32]) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn open_manifest(&self, operation: GuardianCheckpointValidatedManifestOperationV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn retry_open_manifest(&self, retry: &GuardianCheckpointManifestRetryCapabilityV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "private",
+                false,
+                "fn open_validated_manifest(&self, operation: &GuardianCheckpointValidatedManifestOperationV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn open(&self, expected_context: &GuardianCheckpointStageRecordContextV1, record: &GuardianEncryptedCheckpointStageRecordV1, max_plaintext_bytes: u32) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "private",
+                false,
+                "fn open_exact_payload(&self, expected_context: &GuardianCheckpointStageRecordContextV1, record: &GuardianEncryptedCheckpointStageRecordV1, max_plaintext_bytes: u32) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError>",
+            ),
+        ];
+        sort_authority_methods(&mut expected_cipher_method_surfaces);
+        assert_eq!(
+            inventory.cipher_method_surfaces,
+            expected_cipher_method_surfaces
+        );
+
+        sort_authority_methods(&mut inventory.authority_signature_surfaces);
+        let mut expected_authority_signatures = expected_method_surfaces.clone();
+        for owner in [
+            "GuardianCheckpointCandidateIdentityV1",
+            "GuardianCheckpointGenesisSpawnPermitV1",
+            "GuardianCheckpointManifestRetryCapabilityV1",
+            "GuardianCheckpointManifestSealCapabilitiesV1",
+            "GuardianCheckpointOrderedChunkSetBuilderV1",
+            "GuardianCheckpointOrderedChunkSetIdentityV1",
+            "GuardianCheckpointStageSealIntentV1",
+            "GuardianCheckpointValidatedManifestAuthorityV1",
+            "GuardianCheckpointValidatedManifestOperationV1",
+            "GuardianCheckpointValidatedStageAssemblyV1",
+            "LiveParserCheckpointAck",
+        ] {
+            expected_authority_signatures.push(expected_authority_method(
+                owner,
+                "private",
+                false,
+                "fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result",
+            ));
+        }
+        for owner in [
+            "GuardianCheckpointCandidateIdentityV1",
+            "GuardianCheckpointOrderedChunkSetIdentityV1",
+        ] {
+            expected_authority_signatures.push(expected_authority_method(
+                owner,
+                "private",
+                false,
+                "fn eq(&self, other: &Self) -> bool",
+            ));
+        }
+        expected_authority_signatures.extend([
+            expected_authority_method(
+                "GuardianCheckpointArtifactDescriptorV1",
+                "pub",
+                false,
+                "fn from_live_capture(capture: &LiveParserCheckpointAck) -> Result<Self, GuardianCheckpointBoundaryError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal(&self, intent: GuardianCheckpointStageSealIntentV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn seal_manifest(&self, operation: GuardianCheckpointValidatedManifestOperationV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn retry_seal_manifest(&self, retry: &GuardianCheckpointManifestRetryCapabilityV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "private",
+                false,
+                "fn seal_validated_manifest(&self, operation: &GuardianCheckpointValidatedManifestOperationV1) -> Result<GuardianEncryptedCheckpointStageRecordV1, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn open_manifest(&self, operation: GuardianCheckpointValidatedManifestOperationV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "pub",
+                false,
+                "fn retry_open_manifest(&self, retry: &GuardianCheckpointManifestRetryCapabilityV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "GuardianCheckpointCipher",
+                "private",
+                false,
+                "fn open_validated_manifest(&self, operation: &GuardianCheckpointValidatedManifestOperationV1, record: &GuardianEncryptedCheckpointStageRecordV1) -> Result<(), GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "<free>",
+                "private",
+                false,
+                "fn checkpoint_canonical_seal_manifest(encoded_seal_request: &[u8], candidate_identity: &GuardianCheckpointCandidateIdentityV1, ordered_chunk_set_identity: &GuardianCheckpointOrderedChunkSetIdentityV1) -> Result<Zeroizing<Vec<u8>>, GuardianCheckpointCipherError>",
+            ),
+            expected_authority_method(
+                "<free>",
+                "pub(crate)",
+                false,
+                "fn capture_and_bind_live_parser_checkpoint(pane: &Arc<dyn Pane>, capture_operation: &PaneRegistrationOperationLease, request: &LiveParserCaptureRequest, pending_actions: &mut Vec<Action>, ground: RecoveryGroundBoundary<'_>) -> Result<LiveParserCheckpointAck, LiveParserCaptureAndBindError>",
+            ),
+        ]);
+        sort_authority_methods(&mut expected_authority_signatures);
+        assert_eq!(
+            inventory.authority_signature_surfaces,
+            expected_authority_signatures
+        );
+
         inventory.return_sites.sort();
         let mut expected_return_sites = vec![
             "GuardianCheckpointCandidateIdentityV1@GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext:pub:production",
@@ -5900,6 +6521,8 @@ mod tests {
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointManifestSealCapabilitiesV1::into_primary_and_retry:pub:production",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts:private:production",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test:private:test",
+            "LiveParserCheckpointAck@<free>::capture_and_bind_live_parser_checkpoint:pub(crate):production",
+            "LiveParserCheckpointAck@LiveParserCheckpointAck::capture:private:production",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -5920,14 +6543,129 @@ mod tests {
             "GuardianCheckpointValidatedManifestAuthorityV1@GuardianCheckpointValidatedManifestAuthorityV1::from_live_capture",
             "GuardianCheckpointValidatedManifestOperationV1@GuardianCheckpointValidatedManifestOperationV1::from_validated_parts",
             "GuardianCheckpointValidatedStageAssemblyV1@GuardianCheckpointValidatedStageAssemblyV1::issue_for_test",
+            "LiveParserCheckpointAck@LiveParserCheckpointAck::capture",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
         expected_construction_sites.sort();
         assert_eq!(inventory.construction_sites, expected_construction_sites);
+
+        assert_eq!(
+            inventory.uses,
+            vec![
+                expected_use(
+                    "use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputSegmentIdentity};",
+                ),
+                expected_use(
+                    "use crate::guardian_protocol::{GuardianCheckpointScopeV1, GuardianCheckpointStageKindV1, GuardianCheckpointStageRequestV1};",
+                ),
+                expected_use("use crate::pane::Pane;"),
+                expected_use(
+                    "use crate::{LiveParserCheckpointControl, LiveParserCheckpointError, PaneRegistrationGeneration, PaneRegistrationOperationLease};",
+                ),
+                expected_use(
+                    "use frankenterm_term::{RECOVERY_TERMINAL_REPLAY_SEMANTICS_ID, RecoveryTerminalCheckpointError, RecoveryTerminalCheckpointV2, terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2}};",
+                ),
+                expected_use("use sha2::{Digest as _, Sha256};"),
+                expected_use("use std::convert::TryFrom;"),
+                expected_use("use std::sync::{Arc, Weak};"),
+                expected_use(
+                    "use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;",
+                ),
+                expected_use(
+                    "use termwiz::escape::{parser::RecoveryGroundBoundary, Action};",
+                ),
+                expected_use("use thiserror::Error;"),
+                expected_use("use uuid::Uuid;"),
+                expected_use("use zeroize::{Zeroize, Zeroizing};"),
+            ]
+        );
+
+        inventory.expression_macros.sort_by(|left, right| {
+            (&left.owner, &left.function).cmp(&(&right.owner, &right.function))
+        });
+        let mut expected_expression_macros = vec![
+            expected_authority_macro(
+                "GuardianCheckpointCipher",
+                "seal",
+                "matches!(context.kind, GuardianCheckpointStageRecordKindV1::CandidateMetadata | GuardianCheckpointStageRecordKindV1::Chunk)",
+            ),
+            expected_authority_macro(
+                "GuardianCheckpointOriginV1",
+                "is_genesis",
+                "matches!(self.kind, GuardianCheckpointOriginKindV1::Genesis { .. })",
+            ),
+        ];
+        expected_expression_macros.sort_by(|left, right| {
+            (&left.owner, &left.function).cmp(&(&right.owner, &right.function))
+        });
+        assert_eq!(inventory.expression_macros, expected_expression_macros);
+
         assert_eq!(inventory.aliases_or_storage, Vec::<String>::new());
         assert_eq!(inventory.item_macros, Vec::<String>::new());
+        assert_eq!(inventory.modules, Vec::<String>::new());
+        assert_eq!(inventory.traits, Vec::<String>::new());
+        assert_eq!(inventory.associated_items, Vec::<String>::new());
+        assert_eq!(inventory.external_storage_sites, Vec::<String>::new());
+        assert_eq!(inventory.projection_sites, Vec::<String>::new());
+        assert_eq!(inventory.unexpected_attributes, Vec::<String>::new());
+        assert_eq!(inventory.unexpected_derives, Vec::<String>::new());
+
+        let cfg_attr_clone_copy_mutation = syn::parse_file(
+            r#"
+                #[cfg_attr(not(test), derive(Clone, Copy))]
+                pub struct GuardianCheckpointValidatedManifestAuthorityV1 {
+                    binding: GuardianCheckpointStageBindingV1,
+                }
+            "#,
+        )
+        .expect("parse cfg_attr production Clone/Copy mutation");
+        let mut cfg_attr_inventory = AuthoritySurfaceAstInventory::default();
+        cfg_attr_inventory.visit_file(&cfg_attr_clone_copy_mutation);
+        cfg_attr_inventory.derives.sort();
+        assert_eq!(
+            cfg_attr_inventory.derives,
+            vec![
+                "GuardianCheckpointValidatedManifestAuthorityV1:Clone".to_owned(),
+                "GuardianCheckpointValidatedManifestAuthorityV1:Copy".to_owned(),
+            ]
+        );
+        assert_eq!(
+            cfg_attr_inventory.unexpected_attributes,
+            vec!["cfg_attr".to_owned()]
+        );
+
+        let alias_factory_mutation = syn::parse_file(
+            r#"
+                use self::GuardianCheckpointValidatedManifestAuthorityV1 as DuplicableAuthority;
+                impl DuplicableAuthority {
+                    fn duplicate(self) -> Self { self }
+                }
+            "#,
+        )
+        .expect("parse use-as authority mutation");
+        let mut alias_inventory = AuthoritySurfaceAstInventory::default();
+        alias_inventory.visit_file(&alias_factory_mutation);
+        assert_eq!(alias_inventory.uses.len(), 1);
+        assert_ne!(
+            alias_inventory.uses,
+            vec![expected_use(
+                "use self::GuardianCheckpointValidatedManifestAuthorityV1;"
+            )]
+        );
+
+        let projection_storage_mutation = syn::parse_file(
+            r#"
+                struct Wrapper {
+                    authority: <AuthorityFactory as Factory>::Authority,
+                }
+            "#,
+        )
+        .expect("parse QSelf projection storage mutation");
+        let mut projection_inventory = AuthoritySurfaceAstInventory::default();
+        projection_inventory.visit_file(&projection_storage_mutation);
+        assert_eq!(projection_inventory.projection_sites.len(), 1);
 
         let plaintext = b"single-use zeroizing seal intent";
         let (descriptor, _, _, _) = record_descriptor();
