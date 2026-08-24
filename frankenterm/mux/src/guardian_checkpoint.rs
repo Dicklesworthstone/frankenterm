@@ -42,14 +42,18 @@ const GENESIS_BOUNDARY_IDENTITY_DIGEST_DOMAIN: &[u8] =
 const CHECKPOINT_ARTIFACT_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-artifact-identity.v1\0";
 const CHECKPOINT_STAGE_RECORD_AEAD_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-phase-a-record.v1\0";
+    b"frankenterm.guardian-checkpoint-phase-a-record.v2\0";
 const CHECKPOINT_STAGE_PLAINTEXT_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-phase-a-plaintext.v1\0";
-const CHECKPOINT_STAGE_RECORD_MAGIC: [u8; 8] = *b"FTGCPA01";
+const CHECKPOINT_STAGE_RECORD_MAGIC: [u8; 8] = *b"FTGCPA02";
 const CHECKPOINT_STAGE_INNER_TRAILER_MAGIC: [u8; 8] = *b"FTGCPI01";
 
 /// Version of the encrypted Phase-A checkpoint staging-record format.
-pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION: u32 = 1;
+///
+/// Version 1 was source-visible with a rejected sealing-authority model. A
+/// version-2 magic, version, and AEAD domain ensure no such record can be
+/// mistaken for a record minted by the consuming-intent authority model.
+pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION: u32 = 2;
 /// Exact fixed header size emitted beside one encrypted staging-record body.
 pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES: usize = 232;
 /// Hard per-record plaintext admission bound shared with checkpoint uploads.
@@ -287,8 +291,10 @@ impl std::fmt::Debug for GuardianCheckpointOriginV1 {
 
 /// Canonical metadata sufficient to recompute one stable checkpoint identity.
 ///
-/// All fields are private so callers cannot manufacture an authority by
-/// pairing terminal bytes with an unrelated journal or Spawn boundary.
+/// Private fields prevent unchecked construction, but this value remains only
+/// validated identity data. In particular, [`Self::from_claimed_parts`] does
+/// not prove that a parser/output boundary or Spawn effect actually occurred;
+/// final publication requires a separate nonconstructible authority.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct GuardianCheckpointArtifactDescriptorV1 {
     origin: GuardianCheckpointOriginV1,
@@ -666,6 +672,11 @@ impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1 {
 /// consumes the guardian's exact retained Spawn-effect permit. The authority
 /// is intentionally neither `Clone` nor `Copy` and is consumed by the one
 /// manifest sealing intent.
+///
+/// A future cross-process constructor may safely consume an opaque
+/// guardian-runtime attestation that proves the same facts. Keeping that
+/// extension on this private-field authority type avoids ever accepting raw
+/// descriptor fields or a raw Spawn UUID as publication authority.
 pub struct GuardianCheckpointValidatedManifestAuthorityV1 {
     boundary_identity_digest: [u8; 32],
     checkpoint_identity_digest: [u8; 32],
@@ -944,7 +955,7 @@ impl GuardianCheckpointStageBindingV1 {
         ) {
             Ok(())
         } else {
-            Err(GuardianCheckpointCipherError::SealWitnessMismatch)
+            Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch)
         }
     }
 }
@@ -1375,7 +1386,7 @@ impl GuardianCheckpointCipher {
                     &context.checkpoint_identity_digest,
                     &authority.checkpoint_identity_digest,
                 ) {
-                    return Err(GuardianCheckpointCipherError::SealWitnessMismatch);
+                    return Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch);
                 }
             }
             _ => return Err(GuardianCheckpointCipherError::InvalidKindAuthority),
@@ -1649,8 +1660,8 @@ pub enum GuardianCheckpointCipherError {
     CaptureGenerationMismatch,
     #[error("Genesis checkpoint does not use the reserved capture generation")]
     GenesisCaptureGenerationMismatch,
-    #[error("checkpoint seal witness does not match its stage binding")]
-    SealWitnessMismatch,
+    #[error("checkpoint manifest authority does not match its stage binding")]
+    ManifestAuthorityMismatch,
     #[error("checkpoint upload identity must be nonnil")]
     NilUploadIdentity,
     #[error("checkpoint publication identity must be nonnil")]
@@ -1659,8 +1670,6 @@ pub enum GuardianCheckpointCipherError {
     ZeroBoundaryIdentity,
     #[error("checkpoint staging artifact identity must be nonzero")]
     ZeroCheckpointIdentity,
-    #[error("checkpoint staging plaintext digest must be nonzero")]
-    ZeroPlaintextDigest,
     #[error("checkpoint staging record kind is invalid")]
     InvalidRecordKind,
     #[error("checkpoint staging chunk identity is invalid")]
@@ -3668,6 +3677,137 @@ mod tests {
     }
 
     #[test]
+    fn seal_intent_is_single_use_and_records_retain_only_persisted_claims() {
+        assert!(std::mem::needs_drop::<GuardianCheckpointStageSealIntentV1>());
+        assert!(!std::mem::needs_drop::<
+            GuardianCheckpointStageRecordContextV1
+        >());
+
+        let source = include_str!("guardian_checkpoint.rs");
+        let intent_start = source
+            .find("pub struct GuardianCheckpointStageSealIntentV1 {")
+            .expect("find seal-intent declaration");
+        let intent_impl_start = source[intent_start..]
+            .find("impl GuardianCheckpointStageSealIntentV1 {")
+            .map(|offset| intent_start + offset)
+            .expect("find seal-intent implementation");
+        let intent_debug_start = source[intent_impl_start..]
+            .find("impl std::fmt::Debug for GuardianCheckpointStageSealIntentV1")
+            .map(|offset| intent_impl_start + offset)
+            .expect("find seal-intent Debug implementation");
+        let intent_declaration = &source[intent_start..intent_impl_start];
+        let intent_implementation = &source[intent_impl_start..intent_debug_start];
+        assert!(intent_declaration.contains("Zeroizing<[u8; 32]>"));
+        assert!(intent_declaration.contains("Zeroizing<Vec<u8>>"));
+        assert!(!intent_declaration.contains("#[derive(Clone"));
+        assert_eq!(intent_implementation.matches("    pub fn ").count(), 3);
+        assert_eq!(
+            intent_implementation.matches("    pub const fn ").count(),
+            1
+        );
+        assert!(intent_implementation.contains("pub const fn context(&self)"));
+        assert!(!intent_implementation.contains("pub fn plaintext("));
+        assert!(!intent_implementation.contains("pub fn plaintext_digest("));
+        assert!(!intent_implementation.contains("pub const fn plaintext_digest("));
+
+        let permit_impl_start = source
+            .find("impl GuardianCheckpointGenesisSpawnPermitV1 {")
+            .expect("find Genesis permit implementation");
+        let permit_debug_start = source[permit_impl_start..]
+            .find("impl std::fmt::Debug for GuardianCheckpointGenesisSpawnPermitV1")
+            .map(|offset| permit_impl_start + offset)
+            .expect("find Genesis permit Debug implementation");
+        let permit_implementation = &source[permit_impl_start..permit_debug_start];
+        assert!(permit_implementation.contains("#[cfg(test)]"));
+        assert!(permit_implementation.contains("fn issue_for_test(spawn_effect_id: Uuid)"));
+        assert!(!permit_implementation.contains("pub fn "));
+        assert!(!permit_implementation.contains("pub const fn "));
+
+        let context_start = source
+            .find("pub struct GuardianCheckpointStageRecordContextV1 {")
+            .expect("find persisted context declaration");
+        let context_impl_start = source[context_start..]
+            .find("impl GuardianCheckpointStageRecordContextV1 {")
+            .map(|offset| context_start + offset)
+            .expect("find persisted context implementation");
+        let context_declaration = &source[context_start..context_impl_start];
+        assert!(!context_declaration.contains("plaintext_digest"));
+        assert!(!context_declaration.contains("authority"));
+
+        let record_start = source
+            .find("pub struct GuardianEncryptedCheckpointStageRecordV1 {")
+            .expect("find encrypted-record declaration");
+        let record_impl_start = source[record_start..]
+            .find("impl GuardianEncryptedCheckpointStageRecordV1 {")
+            .map(|offset| record_start + offset)
+            .expect("find encrypted-record implementation");
+        let record_declaration = &source[record_start..record_impl_start];
+        assert!(!record_declaration.contains("plaintext_digest"));
+        assert!(!record_declaration.contains("authority"));
+
+        let plaintext = b"single-use zeroizing seal intent";
+        let (descriptor, _, _, _) = record_descriptor();
+        let binding = record_stage_binding(descriptor, 7);
+        let intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
+            &binding,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            stage_plaintext(plaintext),
+        )
+        .expect("construct consuming candidate intent");
+        let persisted_claim = intent.context();
+        let cipher = checkpoint_stage_cipher(0x7a);
+        let record = cipher.seal(intent).expect("consume candidate intent");
+        assert_eq!(record.context(), persisted_claim);
+        let reconstructed = GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+            &record.fixed_header(),
+            record.ciphertext().to_vec(),
+            GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+        )
+        .expect("reconstruct persisted wire claim");
+        assert_eq!(reconstructed.context(), persisted_claim);
+    }
+
+    #[test]
+    fn repaired_checkpoint_format_rejects_source_exposed_v1_records() {
+        let plaintext = b"v2 checkpoint format fence";
+        let (descriptor, _, _, _) = record_descriptor();
+        let binding = record_stage_binding(descriptor, 7);
+        let intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
+            &binding,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            stage_plaintext(plaintext),
+        )
+        .expect("construct v2 format intent");
+        let cipher = checkpoint_stage_cipher(0x7b);
+        let record = cipher.seal(intent).expect("seal v2 format record");
+
+        let mut v1_header = record.fixed_header();
+        v1_header[..8].copy_from_slice(b"FTGCPA01");
+        v1_header[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &v1_header,
+                record.ciphertext().to_vec(),
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidFixedHeader)
+        ));
+
+        let mut version_only_splice = record.fixed_header();
+        version_only_splice[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &version_only_splice,
+                record.ciphertext().to_vec(),
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::UnsupportedVersion { observed: 1 })
+        ));
+    }
+
+    #[test]
     fn checkpoint_stage_scope_is_exact_for_pane_and_genesis_descriptors() {
         let plaintext = b"scope-bound metadata";
         let (record_descriptor, _, _, _) = record_descriptor();
@@ -3909,7 +4049,7 @@ mod tests {
                 publication_id,
                 stage_plaintext(plaintext),
             ),
-            Err(GuardianCheckpointCipherError::SealWitnessMismatch)
+            Err(GuardianCheckpointCipherError::ManifestAuthorityMismatch)
         ));
 
         let spawn_effect_id = Uuid::new_v4();
@@ -4007,7 +4147,7 @@ mod tests {
         let header = record.fixed_header();
         assert_eq!(&header[FORMER_CLEAR_DIGEST_OFFSET..], &[0; 32]);
         let aad = checkpoint_stage_record_aad(cipher.key_id(), &context);
-        let expected_domain = b"frankenterm.guardian-checkpoint-phase-a-record.v1\0";
+        let expected_domain = b"frankenterm.guardian-checkpoint-phase-a-record.v2\0";
         assert_eq!(&aad[..expected_domain.len()], expected_domain);
         assert_eq!(
             &aad[expected_domain.len()..expected_domain.len() + 4],
@@ -4415,6 +4555,24 @@ mod tests {
                 Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
             ));
         }
+
+        let mut length_spliced_intent =
+            GuardianCheckpointStageSealIntentV1::candidate_metadata(
+                &binding,
+                candidate_context.upload_id(),
+                candidate_context.publication_id(),
+                stage_plaintext(expected_plaintext),
+            )
+            .expect("construct length-splice intent");
+        length_spliced_intent.context.plaintext_bytes = length_spliced_intent
+            .context
+            .plaintext_bytes
+            .checked_sub(1)
+            .expect("fixture plaintext has more than one byte");
+        assert!(matches!(
+            cipher.seal(length_spliced_intent),
+            Err(GuardianCheckpointCipherError::PlaintextIdentityMismatch)
+        ));
 
         let valid_intent = GuardianCheckpointStageSealIntentV1::candidate_metadata(
             &binding,
