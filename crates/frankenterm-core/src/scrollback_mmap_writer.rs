@@ -16,10 +16,11 @@ use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollo
 use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
 use fs2::FileExt;
 use sha2::{Digest as _, Sha256};
+use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CAP_BYTES: u64 = 50 * 1024 * 1024;
 pub const HARD_MAX_LINEAR_RECORD_FILE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -114,7 +115,7 @@ pub struct LinearRecordReadLimits {
     pub max_payload_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LinearRecordSnapshot {
     pub header: ScrollbackHeader,
     pub records: Vec<(RecordKind, Vec<u8>)>,
@@ -125,6 +126,19 @@ pub struct LinearRecordSnapshot {
     /// record; callers must preserve this status instead of presenting the
     /// salvaged prefix as a complete export.
     pub completeness: LinearRecordCompleteness,
+}
+
+impl fmt::Debug for LinearRecordSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LinearRecordSnapshot")
+            .field("header", &self.header)
+            .field("record_count", &self.records.len())
+            .field("payload_bytes", &self.payload_bytes)
+            .field("source_identity", &self.source_identity)
+            .field("completeness", &self.completeness)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,7 +317,6 @@ pub struct MmapAppendReport {
     pub synced: bool,
 }
 
-#[derive(Debug)]
 pub struct MmapScrollback {
     file: File,
     lock_file: File,
@@ -311,17 +324,42 @@ pub struct MmapScrollback {
     lock_path: PathBuf,
     header: ScrollbackHeader,
     appends_since_sync: u64,
-    last_sync_at: SystemTime,
+    last_sync_at: Instant,
     sync_every_appends: u64,
     sync_interval: Duration,
     redactor: StreamingRedactor,
     pending_record_kind: Option<RecordKind>,
     v2_state: V2RingState,
     active_state_slot: usize,
+    /// Whether `active_state_slot` has been published since the last
+    /// successful data sync. While dirty, later publications reuse this slot
+    /// so the other slot remains the immutable last-sync recovery authority.
+    state_slot_dirty: bool,
     used_bytes: u64,
     prewrite_sync_required: bool,
     #[cfg(test)]
     sync_observer: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl fmt::Debug for MmapScrollback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MmapScrollback")
+            .field("path", &self.path)
+            .field("lock_path", &self.lock_path)
+            .field("header", &self.header)
+            .field("appends_since_sync", &self.appends_since_sync)
+            .field("sync_every_appends", &self.sync_every_appends)
+            .field("sync_interval", &self.sync_interval)
+            .field("pending_redaction_bytes", &self.redactor.pending_bytes())
+            .field("pending_record_kind", &self.pending_record_kind)
+            .field("v2_state", &self.v2_state)
+            .field("active_state_slot", &self.active_state_slot)
+            .field("state_slot_dirty", &self.state_slot_dirty)
+            .field("used_bytes", &self.used_bytes)
+            .field("prewrite_sync_required", &self.prewrite_sync_required)
+            .finish()
+    }
 }
 
 impl MmapScrollback {

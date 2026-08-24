@@ -9,6 +9,10 @@
 //! incarnation; nil incarnation scope is otherwise forbidden.
 
 use frankenterm_sigpipe::{catch_recoverable, RecoverablePanicSite};
+use frankenterm_term::{
+    RecoveryTerminalCheckpointV2,
+    terminalstate::checkpoint::{TerminalCheckpointLimits, TerminalCheckpointV2},
+};
 use hmac::{Hmac, KeyInit, Mac};
 use portable_pty::{PtySize, cmdbuilder::CommandBuilder};
 use sha2::{Digest as _, Sha256};
@@ -18,6 +22,8 @@ use std::panic::AssertUnwindSafe;
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::guardian_checkpoint::{LiveParserCheckpointAck, current_replay_identity_digest};
 
 pub const GUARDIAN_PROTOCOL_VERSION: u16 = 4;
 pub const GUARDIAN_AUTH_TOKEN_BYTES: usize = 32;
@@ -38,7 +44,7 @@ pub const GUARDIAN_MAX_CENSUS_SNAPSHOTS: usize = 8;
 pub const GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES: u32 = 256 * 1024;
 pub const GUARDIAN_MAX_REPLAY_RECORDS: u16 = 32;
 pub const GUARDIAN_MAX_REPLAY_WAIT_MILLIS: u16 = 1_000;
-pub const GUARDIAN_MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+pub const GUARDIAN_MAX_CHECKPOINT_BYTES: u64 = 128 * 1024 * 1024;
 pub const GUARDIAN_MAX_CHECKPOINT_CHUNKS: u32 = 1_024;
 pub const GUARDIAN_MAX_REPLAY_SNAPSHOTS_PER_CONNECTION: usize = 8;
 pub const GUARDIAN_MAX_REPLAY_SNAPSHOTS_PER_SERVICE: usize = 64;
@@ -1413,7 +1419,7 @@ impl std::fmt::Debug for GuardianCheckpointStageRequestV1 {
             .field("scope", &self.scope)
             .field("upload_id", &self.upload_id)
             .field("kind", &self.kind())
-            .field("total_bytes", &self.total_bytes)
+            .field("total_bytes", &self.descriptor.total_bytes)
             .field("chunk_bytes", &self.chunk_bytes)
             .field("total_chunks", &self.total_chunks)
             .finish_non_exhaustive()
@@ -2688,49 +2694,53 @@ impl std::fmt::Debug for GuardianCheckpointDescriptorV1 {
 }
 
 impl GuardianCheckpointDescriptorV1 {
-    /// Construct the descriptor for a checkpoint captured after an exact
-    /// durable output record. Both stable identities are recomputed from the
-    /// complete boundary and canonical terminal payload; callers never supply
-    /// an unverified content-addressed identity.
-    #[allow(clippy::too_many_arguments)]
-    pub fn for_record_artifact(
-        durable_pane_id: Uuid,
+    /// Construct the only production record-backed descriptor from the
+    /// non-constructible authority minted by the live parser/output capture.
+    /// Recomputing and comparing both stable identities here makes digest
+    /// formula drift fail closed instead of creating a second splice seam.
+    pub fn from_live_capture(
+        capture: &LiveParserCheckpointAck,
         capture_generation: u64,
-        replay_semantics_id: [u8; 32],
-        rows: u32,
-        cols: u32,
-        canonical_terminal_payload: &[u8],
-        segment_id: Uuid,
-        sequence: u64,
-        record_digest: [u8; 32],
-        committed_log_bytes: u64,
-        cumulative_plaintext_bytes: u64,
-        parser_stream_bytes: u64,
     ) -> Result<Self, GuardianProtocolError> {
-        let total_bytes = u64::try_from(canonical_terminal_payload.len())
+        let boundary = capture.boundary();
+        let terminal = capture.terminal_checkpoint();
+        let rows = u32::try_from(terminal.rows())
             .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
-        let terminal_payload_digest = checkpoint_terminal_payload_digest(
-            total_bytes,
-            canonical_terminal_payload,
-        )?;
+        let cols = u32::try_from(terminal.cols())
+            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
         let output_boundary = GuardianCheckpointOutputBoundaryV1::Record {
-            segment_id,
-            sequence,
-            record_digest,
-            committed_log_bytes,
-            cumulative_plaintext_bytes,
-            parser_stream_bytes,
+            segment_id: capture.segment_id(),
+            sequence: capture.output_sequence(),
+            record_digest: capture.output_record_digest(),
+            committed_log_bytes: capture.output_committed_log_bytes(),
+            cumulative_plaintext_bytes: capture.journal_cumulative_plaintext_bytes(),
+            parser_stream_bytes: capture.parser_stream_bytes(),
         };
-        Self::from_artifact_parts(
-            durable_pane_id,
+        let descriptor = Self::from_artifact_parts(
+            capture.durable_pane_id(),
             capture_generation,
-            replay_semantics_id,
+            boundary.replay_identity_digest(),
             rows,
             cols,
-            total_bytes,
-            terminal_payload_digest,
+            capture.terminal_payload_bytes(),
+            capture.terminal_payload_digest(),
             output_boundary,
+        )?;
+        let authoritative_boundary = GuardianOutputBoundaryIdentityDigest::from_bytes(
+            capture.output_boundary_identity_digest(),
         )
+        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        let authoritative_checkpoint = GuardianCheckpointIdentityDigest::from_bytes(
+            capture.checkpoint_artifact_identity_digest(),
+        )
+        .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        if descriptor.boundary_id != authoritative_boundary
+            || descriptor.checkpoint_id != authoritative_checkpoint
+        {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        descriptor.validate_canonical_payload(terminal.canonical_payload())?;
+        Ok(descriptor)
     }
 
     /// Construct a pre-spawn checkpoint whose durable pane identity will be
@@ -2738,11 +2748,16 @@ impl GuardianCheckpointDescriptorV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn for_genesis_artifact(
         spawn_effect_id: Uuid,
-        replay_semantics_id: [u8; 32],
-        rows: u32,
-        cols: u32,
-        canonical_terminal_payload: &[u8],
+        terminal: &RecoveryTerminalCheckpointV2,
     ) -> Result<Self, GuardianProtocolError> {
+        if terminal.parser_stream_bytes() != 0 {
+            return Err(GuardianProtocolError::InvalidReplyPayload);
+        }
+        let rows = u32::try_from(terminal.rows())
+            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        let cols = u32::try_from(terminal.cols())
+            .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
+        let canonical_terminal_payload = terminal.canonical_payload();
         let total_bytes = u64::try_from(canonical_terminal_payload.len())
             .map_err(|_| GuardianProtocolError::InvalidReplyPayload)?;
         let terminal_payload_digest = checkpoint_terminal_payload_digest(
@@ -2752,7 +2767,7 @@ impl GuardianCheckpointDescriptorV1 {
         Self::from_artifact_parts(
             Uuid::nil(),
             GUARDIAN_GENESIS_CAPTURE_GENERATION,
-            replay_semantics_id,
+            current_replay_identity_digest(),
             rows,
             cols,
             total_bytes,
@@ -3088,6 +3103,18 @@ impl GuardianCheckpointDescriptorV1 {
         canonical_terminal_payload: &[u8],
     ) -> Result<(), GuardianProtocolError> {
         self.validate()?;
+        // Admission is semantic as well as content-addressed: the terminal
+        // codec enforces its bounded current schema, semantic invariants, and
+        // byte-for-byte canonical re-encoding before a staged payload may be
+        // sealed. The descriptor itself can only be minted in production from
+        // an opaque live-capture or genesis terminal authority, which binds
+        // its geometry and parser watermark to these same canonical bytes.
+        let validated = TerminalCheckpointV2::decode_canonical_json(
+            canonical_terminal_payload,
+            TerminalCheckpointLimits::default(),
+        )
+        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        drop(validated);
         let observed_bytes = u64::try_from(canonical_terminal_payload.len())
             .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
         let observed_digest = checkpoint_terminal_payload_digest(
@@ -9208,6 +9235,20 @@ mod tests {
         decode_guardian_request(&secret(), &frame).unwrap()
     }
 
+    fn copy_request(envelope: &GuardianRequestEnvelope) -> GuardianRequestEnvelope {
+        request(
+            envelope.header.operation,
+            envelope.header.guardian_incarnation,
+            envelope.header.mux_incarnation,
+            envelope.header.request_id,
+            envelope.header.pane_id,
+            envelope.header.lease_generation,
+            envelope.header.lease_sequence,
+            envelope.header.effect_id,
+            envelope.payload(),
+        )
+    }
+
     fn apply_request(
         state: &mut GuardianProtocolState,
         request: &GuardianRequestEnvelope,
@@ -9707,8 +9748,10 @@ mod tests {
         )
         .unwrap();
         let response_frame = encode_guardian_response(&secret(), &response).unwrap();
-        let decoded = decode_guardian_response(&secret(), &response_frame).unwrap();
-        let correlated = decoded.clone().correlate(authenticated.header()).unwrap();
+        let correlated = decode_guardian_response(&secret(), &response_frame)
+            .unwrap()
+            .correlate(authenticated.header())
+            .unwrap();
         assert_eq!(
             correlated.success_reply(&authenticated).unwrap(),
             GuardianReply::GuardedStopAccepted
@@ -9726,7 +9769,9 @@ mod tests {
             b"",
         );
         assert_eq!(
-            decoded.correlate(authenticate(&different_effect).header()),
+            decode_guardian_response(&secret(), &response_frame)
+                .unwrap()
+                .correlate(authenticate(&different_effect).header()),
             Err(GuardianProtocolError::ResponseRequestMismatch)
         );
 
@@ -9865,7 +9910,7 @@ mod tests {
         assert_eq!(replay, first);
         assert_eq!(invocations.get(), 2, "exact replay must not respawn");
 
-        let mut alias_envelope = request.envelope().clone();
+        let mut alias_envelope = copy_request(request.envelope());
         alias_envelope.header.request_id = id(10);
         let alias = authenticate(&alias_envelope);
         let alias_reply = state
@@ -9968,7 +10013,7 @@ mod tests {
                 "an indeterminate exact identity must never invoke the effect again"
             );
 
-            let mut alias_envelope = request.envelope().clone();
+            let mut alias_envelope = copy_request(request.envelope());
             alias_envelope.header.request_id = id(effect_byte + 20);
             let alias = authenticate(&alias_envelope);
             assert_eq!(
@@ -9987,7 +10032,7 @@ mod tests {
             assert_eq!(invocations.get(), 1);
             assert!(state.requests.contains_key(&alias.header().request_id));
 
-            let mut conflicting_envelope = request.envelope().clone();
+            let mut conflicting_envelope = copy_request(request.envelope());
             conflicting_envelope.header.effect_id = Some(id(effect_byte + 40));
             let conflicting = authenticate(&conflicting_envelope);
             assert_eq!(
@@ -10187,7 +10232,7 @@ mod tests {
         assert_eq!(exact_replay, receipt);
         assert_eq!(invocations.get(), 1);
 
-        let mut alias_envelope = checkpoint.clone();
+        let mut alias_envelope = copy_request(&checkpoint);
         alias_envelope.header.request_id = id(10);
         let authenticated_alias = authenticate(&alias_envelope);
         let alias_receipt = state
@@ -10282,7 +10327,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(exact_replay, receipt);
-        let mut alias_envelope = checkpoint.clone();
+        let mut alias_envelope = copy_request(&checkpoint);
         alias_envelope.header.request_id = id(10);
         let authenticated_alias = authenticate(&alias_envelope);
         let alias_receipt = state
@@ -10295,7 +10340,7 @@ mod tests {
         assert_eq!(invocations.get(), 1);
 
         for index in 0..(GUARDIAN_MAX_REQUEST_ALIASES_PER_PENDING_EFFECT - 2) {
-            let mut bounded_alias = checkpoint.clone();
+            let mut bounded_alias = copy_request(&checkpoint);
             bounded_alias.header.request_id =
                 Uuid::from_u128(0x1000 + u128::try_from(index).unwrap());
             assert_eq!(
@@ -10308,7 +10353,7 @@ mod tests {
                 receipt
             );
         }
-        let mut over_alias_ceiling = checkpoint.clone();
+        let mut over_alias_ceiling = copy_request(&checkpoint);
         over_alias_ceiling.header.request_id = Uuid::from_u128(0x2000);
         assert_eq!(
             state.apply_checkpoint_transactionally(&authenticate(&over_alias_ceiling), |_| {
