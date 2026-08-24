@@ -684,7 +684,7 @@ impl GuardianSpawnPayload {
                 .map_err(|_| GuardianProtocolError::PayloadTooLarge)?
                 .to_be_bytes(),
         );
-        payload.extend_from_slice(&command);
+        payload.extend_from_slice(command.as_slice());
         Ok(payload)
     }
 
@@ -1195,7 +1195,7 @@ struct GuardianBoundedPayloadBuffer {
 }
 
 impl GuardianBoundedPayloadBuffer {
-    const fn new(max_bytes: usize) -> Self {
+    fn new(max_bytes: usize) -> Self {
         Self {
             bytes: Zeroizing::new(Vec::new()),
             max_bytes,
