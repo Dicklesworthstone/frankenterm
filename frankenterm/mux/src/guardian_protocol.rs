@@ -3020,7 +3020,7 @@ impl GuardianCheckpointDescriptorV1 {
     /// fixed-width wire descriptor. No digest formula lives in this protocol
     /// module: the checkpoint module validates the complete claimed preimage
     /// and both stable identities.
-    fn canonical_descriptor(
+    pub fn canonical_descriptor(
         self,
     ) -> Result<GuardianCheckpointArtifactDescriptorV1, GuardianProtocolError> {
         let (origin, parser_stream_bytes) = match self.output_boundary {
