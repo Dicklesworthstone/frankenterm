@@ -115,9 +115,20 @@ struct GetTcapBuilder {
     accepted_raw_name_bytes: usize,
     discarding_current: bool,
     discarding_all: bool,
+    pending_sequence_error: Option<crate::StringSequenceError>,
 }
 
 impl GetTcapBuilder {
+    fn record_sequence_error(&mut self, error: crate::StringSequenceError) {
+        if self.pending_sequence_error.is_none() {
+            self.pending_sequence_error = Some(error);
+        }
+    }
+
+    fn take_sequence_error(&mut self) -> Option<crate::StringSequenceError> {
+        self.pending_sequence_error.take()
+    }
+
     fn flush(&mut self) {
         if self.discarding_all {
             self.current.clear();
@@ -136,6 +147,10 @@ impl GetTcapBuilder {
                 "XtGetTcap names exceeded {} limit; discarding further names",
                 MAX_TCAP_NAMES,
             );
+            self.record_sequence_error(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::XtGetTcap,
+                maximum: MAX_TCAP_NAMES,
+            });
             self.discarding_all = true;
             self.current.clear();
             return;
@@ -144,6 +159,10 @@ impl GetTcapBuilder {
             log::warn!(
                 "XtGetTcap aggregate name input overflowed its byte counter; discarding further names"
             );
+            self.record_sequence_error(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::XtGetTcap,
+                maximum: MAX_TCAP_TOTAL_BYTES,
+            });
             self.discarding_all = true;
             self.current.clear();
             return;
@@ -153,6 +172,10 @@ impl GetTcapBuilder {
                 "XtGetTcap aggregate name input exceeded {} byte limit; discarding the current and further names",
                 MAX_TCAP_TOTAL_BYTES,
             );
+            self.record_sequence_error(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::XtGetTcap,
+                maximum: MAX_TCAP_TOTAL_BYTES,
+            });
             self.discarding_all = true;
             self.current.clear();
             return;
@@ -160,6 +183,14 @@ impl GetTcapBuilder {
         let decoded = hex::decode(&self.current)
             .map(|s| String::from_utf8_lossy(&s).to_string())
             .unwrap_or_else(|_| String::from_utf8_lossy(&self.current).to_string());
+        if self.names.try_reserve_exact(1).is_err() {
+            self.record_sequence_error(crate::StringSequenceError::AllocationFailed {
+                kind: crate::StringSequenceKind::XtGetTcap,
+            });
+            self.discarding_all = true;
+            self.current.clear();
+            return;
+        }
         self.names.push(decoded);
         self.accepted_raw_name_bytes = next_total;
         self.current.clear();
@@ -174,6 +205,10 @@ impl GetTcapBuilder {
                     "XtGetTcap name exceeded {} byte limit; discarding the overlong name",
                     MAX_TCAP_CURRENT_BYTES,
                 );
+                self.record_sequence_error(crate::StringSequenceError::LimitExceeded {
+                    kind: crate::StringSequenceKind::XtGetTcap,
+                    maximum: MAX_TCAP_CURRENT_BYTES,
+                });
                 self.current.clear();
                 self.discarding_current = true;
             } else if self
@@ -185,6 +220,16 @@ impl GetTcapBuilder {
                     "XtGetTcap aggregate name input exceeded {} byte limit; discarding the current and further names",
                     MAX_TCAP_TOTAL_BYTES,
                 );
+                self.record_sequence_error(crate::StringSequenceError::LimitExceeded {
+                    kind: crate::StringSequenceKind::XtGetTcap,
+                    maximum: MAX_TCAP_TOTAL_BYTES,
+                });
+                self.current.clear();
+                self.discarding_all = true;
+            } else if self.current.try_reserve_exact(1).is_err() {
+                self.record_sequence_error(crate::StringSequenceError::AllocationFailed {
+                    kind: crate::StringSequenceKind::XtGetTcap,
+                });
                 self.current.clear();
                 self.discarding_all = true;
             } else {
@@ -193,9 +238,9 @@ impl GetTcapBuilder {
         }
     }
 
-    pub fn finish(mut self) -> Vec<String> {
+    pub fn finish(mut self) -> (Vec<String>, Option<crate::StringSequenceError>) {
         self.flush();
-        self.names
+        (self.names, self.pending_sequence_error)
     }
 }
 
@@ -207,6 +252,7 @@ struct ParseState {
     get_tcap: Option<GetTcapBuilder>,
     #[cfg(feature = "tmux_cc")]
     tmux_state: Option<RefCell<crate::tmux_cc::Parser>>,
+    pending_string_sequence_error: Option<crate::StringSequenceError>,
     /// Round-5 D2 (ft-round5-gauntlet-lw0s7.12): when set, [`Performer`]'s
     /// CSI/OSC dispatch uses the table-driven fast decoders ([`CSI::parse_fast`]
     /// / [`OperatingSystemCommand::parse_fast`]) before the generic parser.
@@ -244,7 +290,7 @@ pub struct Parser {
 /// change that alters the interpretation of retained raw terminal bytes must
 /// change this value so an older checkpoint fails closed instead of silently
 /// reconstructing different terminal state.
-pub const RECOVERY_CHECKPOINT_PARSER_ID: &str = "frankenterm.escape-parser.recovery-ground.v1";
+pub const RECOVERY_CHECKPOINT_PARSER_ID: &str = "frankenterm.escape-parser.recovery-ground.v2";
 
 impl Default for Parser {
     fn default() -> Self {
@@ -254,15 +300,39 @@ impl Default for Parser {
 
 impl Parser {
     pub fn new() -> Self {
+        Self::new_with_max_string_sequence_bytes(crate::DEFAULT_MAX_STRING_SEQUENCE_BYTES)
+    }
+
+    /// Construct a streaming parser with an explicit OSC/APC retained-byte
+    /// limit. The parser drops the whole over-limit command and exposes a
+    /// sticky content-free failure through [`Self::take_string_sequence_error`].
+    pub fn new_with_max_string_sequence_bytes(max_string_sequence_bytes: usize) -> Self {
         let state = ParseState {
             table_dispatch: default_table_dispatch(),
             ..Default::default()
         };
         Self {
-            state_machine: VTParser::new(),
+            state_machine: VTParser::new_with_max_string_sequence_bytes(
+                max_string_sequence_bytes,
+            ),
             state: RefCell::new(state),
             print_batching: default_print_batching(),
         }
+    }
+
+    /// Consume the first retained control-string resource failure not yet
+    /// observed by the caller. Replay and other fail-closed consumers must call
+    /// this after every parse operation before applying the emitted action
+    /// batch.
+    pub fn take_string_sequence_error(&mut self) -> Option<crate::StringSequenceError> {
+        self.state_machine
+            .take_string_sequence_error()
+            .or_else(|| {
+                self.state
+                    .borrow_mut()
+                    .pending_string_sequence_error
+                    .take()
+            })
     }
 
     /// Returns whether this parser can be replaced by a fresh parser at the
@@ -350,10 +420,21 @@ impl Parser {
     /// advance with tmux parser, bypass VTParse
     #[cfg(feature = "tmux_cc")]
     fn advance_tmux_bytes(&mut self, bytes: &[u8]) -> crate::Result<Vec<Event>> {
-        let parser_state = self.state.borrow();
-        let tmux_state = parser_state.tmux_state.as_ref().unwrap();
-        let mut tmux_parser = tmux_state.borrow_mut();
-        return tmux_parser.advance_bytes(bytes);
+        let (result, sequence_error) = {
+            let parser_state = self.state.borrow();
+            let tmux_state = parser_state.tmux_state.as_ref().unwrap();
+            let mut tmux_parser = tmux_state.borrow_mut();
+            let result = tmux_parser.advance_bytes(bytes);
+            let sequence_error = tmux_parser.take_sequence_error();
+            (result, sequence_error)
+        };
+        if let Some(error) = sequence_error {
+            let mut state = self.state.borrow_mut();
+            if state.pending_string_sequence_error.is_none() {
+                state.pending_string_sequence_error = Some(error);
+            }
+        }
+        result
     }
 
     pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F) {
@@ -681,32 +762,61 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
             return;
         }
         if self.state.dcs.is_some() {
-            let mut over_limit = false;
+            let mut sequence_error = None;
             if let Some(dcs) = self.state.dcs.as_mut() {
-                if dcs.data.len() < MAX_SHORT_DCS_BYTES {
-                    dcs.data.push(data);
+                if dcs.data.len() >= MAX_SHORT_DCS_BYTES {
+                    sequence_error = Some(crate::StringSequenceError::LimitExceeded {
+                        kind: crate::StringSequenceKind::ShortDeviceControl,
+                        maximum: MAX_SHORT_DCS_BYTES,
+                    });
+                } else if dcs.data.try_reserve_exact(1).is_err() {
+                    sequence_error = Some(crate::StringSequenceError::AllocationFailed {
+                        kind: crate::StringSequenceKind::ShortDeviceControl,
+                    });
                 } else {
-                    over_limit = true;
+                    dcs.data.push(data);
                 }
             }
 
-            if over_limit {
+            if let Some(error) = sequence_error {
                 self.state.discarding_short_dcs = true;
                 self.state.dcs.take();
+                if self.state.pending_string_sequence_error.is_none() {
+                    self.state.pending_string_sequence_error = Some(error);
+                }
                 log::warn!(
-                    "short DCS payload exceeded {} bytes; discarding the command until DCS terminator",
-                    MAX_SHORT_DCS_BYTES
+                    "short DCS payload violated its bounded retention policy; discarding the command until DCS terminator"
                 );
             }
         } else if let Some(sixel) = self.state.sixel.as_mut() {
             sixel.push(data);
+            if let Some(error) = sixel.take_sequence_error() {
+                if self.state.pending_string_sequence_error.is_none() {
+                    self.state.pending_string_sequence_error = Some(error);
+                }
+            }
         } else if let Some(tcap) = self.state.get_tcap.as_mut() {
             tcap.push(data);
+            if let Some(error) = tcap.take_sequence_error() {
+                if self.state.pending_string_sequence_error.is_none() {
+                    self.state.pending_string_sequence_error = Some(error);
+                }
+            }
         } else {
             #[cfg(feature = "tmux_cc")]
             if let Some(tmux_state) = &self.state.tmux_state {
-                let mut tmux_parser = tmux_state.borrow_mut();
-                match tmux_parser.advance_byte(data) {
+                let (result, sequence_error) = {
+                    let mut tmux_parser = tmux_state.borrow_mut();
+                    let result = tmux_parser.advance_byte(data);
+                    let sequence_error = tmux_parser.take_sequence_error();
+                    (result, sequence_error)
+                };
+                if let Some(error) = sequence_error {
+                    if self.state.pending_string_sequence_error.is_none() {
+                        self.state.pending_string_sequence_error = Some(error);
+                    }
+                }
+                match result {
                     Ok(optional_events) => {
                         if let Some(tmux_event) = optional_events {
                             (self.callback)(Action::DeviceControl(DeviceControlMode::TmuxEvents(
@@ -715,7 +825,6 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                         }
                     }
                     Err(_) => {
-                        drop(tmux_parser);
                         self.state.tmux_state = None; // drop tmux state
                     }
                 }
@@ -736,11 +845,22 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
             ));
         } else if let Some(mut sixel) = self.state.sixel.take() {
             sixel.finish();
+            if let Some(error) = sixel.take_sequence_error() {
+                if self.state.pending_string_sequence_error.is_none() {
+                    self.state.pending_string_sequence_error = Some(error);
+                }
+            }
             if sixel.should_emit() {
                 (self.callback)(Action::Sixel(Box::new(sixel.sixel)));
             }
         } else if let Some(tcap) = self.state.get_tcap.take() {
-            (self.callback)(Action::XtGetTcap(tcap.finish()));
+            let (names, error) = tcap.finish();
+            if let Some(error) = error {
+                if self.state.pending_string_sequence_error.is_none() {
+                    self.state.pending_string_sequence_error = Some(error);
+                }
+            }
+            (self.callback)(Action::XtGetTcap(names));
         } else {
             (self.callback)(Action::DeviceControl(DeviceControlMode::Exit));
         }
@@ -878,8 +998,53 @@ mod test {
     fn recovery_checkpoint_parser_identity_is_versioned_and_nonempty() {
         assert_eq!(
             RECOVERY_CHECKPOINT_PARSER_ID,
-            "frankenterm.escape-parser.recovery-ground.v1"
+            "frankenterm.escape-parser.recovery-ground.v2"
         );
+    }
+
+    #[test]
+    fn string_sequence_limit_error_is_exposed_for_fail_closed_callers() {
+        let mut parser = Parser::new_with_max_string_sequence_bytes(4);
+        let mut actions = Vec::new();
+
+        parser.parse(b"\x1b]ab", |action| actions.push(action));
+        parser.parse(b"cde\x07", |action| actions.push(action));
+
+        assert!(actions.is_empty());
+        assert_eq!(
+            parser.take_string_sequence_error(),
+            Some(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::OperatingSystemCommand,
+                maximum: 4,
+            })
+        );
+        assert_eq!(parser.take_string_sequence_error(), None);
+        assert!(parser.is_recovery_ground());
+    }
+
+    #[test]
+    fn sixel_retained_limit_error_is_exposed_for_fail_closed_callers() {
+        let mut parser = Parser::new();
+        let max_retained_bytes = core::mem::size_of::<crate::SixelData>() * 2;
+        let mut actions = Vec::new();
+
+        parser.parse(b"\x1bPq", |action| actions.push(action));
+        parser.state.borrow_mut().sixel = Some(SixelBuilder::new_with_max_retained_bytes(
+            &[],
+            max_retained_bytes,
+        ));
+        parser.parse(b"???\x9c", |action| actions.push(action));
+
+        assert!(actions.is_empty());
+        assert_eq!(
+            parser.take_string_sequence_error(),
+            Some(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::Sixel,
+                maximum: max_retained_bytes,
+            })
+        );
+        assert_eq!(parser.take_string_sequence_error(), None);
+        assert!(parser.is_recovery_ground());
     }
 
     // <https://github.com/markbt/streampager/issues/57>
@@ -1529,6 +1694,14 @@ mod test {
 
         assert_eq!(1, short_dcs.len());
         assert_eq!(b"OK".to_vec(), short_dcs[0].data);
+        assert_eq!(
+            p.take_string_sequence_error(),
+            Some(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::ShortDeviceControl,
+                maximum: MAX_SHORT_DCS_BYTES,
+            })
+        );
+        assert_eq!(p.take_string_sequence_error(), None);
     }
 
     #[test]
@@ -1562,6 +1735,14 @@ mod test {
         assert_eq!("TN", tcap_results[0][0]);
         // Second XtGetTcap: verify parser recovered correctly
         assert_eq!(vec!["TN".to_string()], tcap_results[1]);
+        assert_eq!(
+            p.take_string_sequence_error(),
+            Some(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::XtGetTcap,
+                maximum: MAX_TCAP_CURRENT_BYTES,
+            })
+        );
+        assert_eq!(p.take_string_sequence_error(), None);
     }
 
     #[test]
@@ -1598,6 +1779,14 @@ mod test {
         assert_eq!(MAX_TCAP_NAMES, tcap_results[0].len());
         // Second XtGetTcap: parser recovered
         assert_eq!(vec!["TN".to_string()], tcap_results[1]);
+        assert_eq!(
+            p.take_string_sequence_error(),
+            Some(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::XtGetTcap,
+                maximum: MAX_TCAP_NAMES,
+            })
+        );
+        assert_eq!(p.take_string_sequence_error(), None);
     }
 
     #[test]
@@ -1629,6 +1818,14 @@ mod test {
         assert_eq!(first_name_bytes / 2, tcap_results[0][0].len());
         assert!(tcap_results[0][0].bytes().all(|byte| byte == b'D'));
         assert_eq!(&["TN".to_string()], tcap_results[1].as_slice());
+        assert_eq!(
+            p.take_string_sequence_error(),
+            Some(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::XtGetTcap,
+                maximum: MAX_TCAP_TOTAL_BYTES,
+            })
+        );
+        assert_eq!(p.take_string_sequence_error(), None);
     }
 
     #[test]

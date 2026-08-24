@@ -312,6 +312,43 @@ const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC: usize = 64;
 const MAX_PARAMS: usize = 256;
 
+/// Default upper bound for the bytes retained by one OSC or APC string.
+///
+/// The parser is streaming, so an unterminated string can span arbitrarily
+/// many calls to [`VTParser::parse`]. Keeping this limit inside the parser is
+/// therefore essential: bounding individual input chunks does not bound the
+/// parser's retained state. Callers with a stricter protocol budget can use
+/// [`VTParser::new_with_max_string_sequence_bytes`].
+pub const DEFAULT_MAX_STRING_SEQUENCE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Identifies the string sequence whose retained payload was rejected.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum StringSequenceKind {
+    OperatingSystemCommand,
+    ApplicationProgramCommand,
+    Sixel,
+    ShortDeviceControl,
+    XtGetTcap,
+    TmuxControl,
+}
+
+/// Content-free failure reported after the parser drops an oversized string.
+///
+/// The failure is sticky until consumed with
+/// [`VTParser::take_string_sequence_error`], so a caller cannot miss an error
+/// merely because another complete sequence followed it in the same input
+/// chunk.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum StringSequenceError {
+    LimitExceeded {
+        kind: StringSequenceKind,
+        maximum: usize,
+    },
+    AllocationFailed {
+        kind: StringSequenceKind,
+    },
+}
+
 struct OscState {
     #[cfg(any(feature = "std", feature = "alloc"))]
     buffer: Vec<u8>,
@@ -320,14 +357,29 @@ struct OscState {
     param_indices: [usize; MAX_OSC],
     num_params: usize,
     full: bool,
+    discarding: bool,
 }
 
 impl OscState {
-    fn put(&mut self, param: char) {
+    fn put(
+        &mut self,
+        param: char,
+        max_string_sequence_bytes: usize,
+    ) -> Option<StringSequenceError> {
+        if self.discarding {
+            return None;
+        }
+
         if param == ';' {
             match self.num_params {
                 MAX_OSC => {
                     self.full = true;
+                    self.buffer.clear();
+                    self.discarding = true;
+                    return Some(StringSequenceError::LimitExceeded {
+                        kind: StringSequenceKind::OperatingSystemCommand,
+                        maximum: MAX_OSC,
+                    });
                 }
                 num => {
                     self.param_indices[num.saturating_sub(1)] = self.buffer.len();
@@ -336,24 +388,45 @@ impl OscState {
             }
         } else if !self.full {
             let mut buf = [0u8; 8];
+            let encoded = param.encode_utf8(&mut buf).as_bytes();
+            if encoded.len()
+                > max_string_sequence_bytes.saturating_sub(self.buffer.len())
+            {
+                self.buffer.clear();
+                self.discarding = true;
+                return Some(StringSequenceError::LimitExceeded {
+                    kind: StringSequenceKind::OperatingSystemCommand,
+                    maximum: max_string_sequence_bytes,
+                });
+            }
+
             #[cfg(any(feature = "std", feature = "alloc"))]
-            self.buffer
-                .extend_from_slice(param.encode_utf8(&mut buf).as_bytes());
+            {
+                if self.buffer.try_reserve_exact(encoded.len()).is_err() {
+                    self.buffer.clear();
+                    self.discarding = true;
+                    return Some(StringSequenceError::AllocationFailed {
+                        kind: StringSequenceKind::OperatingSystemCommand,
+                    });
+                }
+                self.buffer.extend_from_slice(encoded);
+            }
 
             #[cfg(all(not(feature = "std"), not(feature = "alloc")))]
-            if self
-                .buffer
-                .extend_from_slice(param.encode_utf8(&mut buf).as_bytes())
-                .is_err()
-            {
-                self.full = true;
-                return;
+            if self.buffer.extend_from_slice(encoded).is_err() {
+                self.buffer.clear();
+                self.discarding = true;
+                return Some(StringSequenceError::AllocationFailed {
+                    kind: StringSequenceKind::OperatingSystemCommand,
+                });
             }
 
             if self.num_params == 0 {
                 self.num_params = 1;
             }
         }
+
+        None
     }
 }
 
@@ -373,6 +446,11 @@ pub struct VTParser {
     params_full: bool,
     #[cfg(any(feature = "std", feature = "alloc"))]
     apc_data: Vec<u8>,
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    apc_discarding: bool,
+
+    max_string_sequence_bytes: usize,
+    pending_string_sequence_error: Option<StringSequenceError>,
 
     utf8_parser: Utf8Parser,
     utf8_return_state: State,
@@ -444,7 +522,18 @@ impl core::fmt::Display for CsiParam {
 impl VTParser {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::new_with_max_string_sequence_bytes(DEFAULT_MAX_STRING_SEQUENCE_BYTES)
+    }
+
+    /// Construct a parser with an explicit per-OSC/APC retained-byte limit.
+    ///
+    /// A value of zero permits empty strings and rejects the first payload
+    /// byte. In allocation-free builds, the effective OSC limit is also
+    /// capped by the fixed heapless buffer capacity.
+    pub fn new_with_max_string_sequence_bytes(max_string_sequence_bytes: usize) -> Self {
         let param_indices = [0usize; MAX_OSC];
+        #[cfg(all(not(feature = "std"), not(feature = "alloc")))]
+        let max_string_sequence_bytes = max_string_sequence_bytes.min(MAX_OSC * 16);
 
         Self {
             state: State::Ground,
@@ -459,6 +548,7 @@ impl VTParser {
                 param_indices,
                 num_params: 0,
                 full: false,
+                discarding: false,
             },
 
             params: [CsiParam::default(); MAX_PARAMS],
@@ -469,6 +559,27 @@ impl VTParser {
             utf8_parser: Utf8Parser::new(),
             #[cfg(any(feature = "std", feature = "alloc"))]
             apc_data: Vec::new(),
+            #[cfg(any(feature = "std", feature = "alloc"))]
+            apc_discarding: false,
+            max_string_sequence_bytes,
+            pending_string_sequence_error: None,
+        }
+    }
+
+    /// Return the configured per-OSC/APC retained-byte limit.
+    #[must_use]
+    pub fn max_string_sequence_bytes(&self) -> usize {
+        self.max_string_sequence_bytes
+    }
+
+    /// Consume the first string-sequence error not yet observed by the caller.
+    pub fn take_string_sequence_error(&mut self) -> Option<StringSequenceError> {
+        self.pending_string_sequence_error.take()
+    }
+
+    fn record_string_sequence_error(&mut self, error: StringSequenceError) {
+        if self.pending_string_sequence_error.is_none() {
+            self.pending_string_sequence_error = Some(error);
         }
     }
 
@@ -532,12 +643,14 @@ impl VTParser {
                 self.ignored_excess_intermediates = false;
                 self.osc.num_params = 0;
                 self.osc.full = false;
+                self.osc.discarding = false;
                 self.num_params = 0;
                 self.params_full = false;
                 self.current_param.take();
                 #[cfg(any(feature = "std", feature = "alloc"))]
                 {
                     self.apc_data.clear();
+                    self.apc_discarding = false;
                     self.apc_data.shrink_to_fit();
                     self.osc.buffer.clear();
                     self.osc.buffer.shrink_to_fit();
@@ -620,11 +733,18 @@ impl VTParser {
                 self.osc.buffer.shrink_to_fit();
                 self.osc.num_params = 0;
                 self.osc.full = false;
+                self.osc.discarding = false;
             }
-            Action::OscPut => self.osc.put(param as char),
+            Action::OscPut => {
+                if let Some(error) = self.osc.put(param as char, self.max_string_sequence_bytes) {
+                    self.record_string_sequence_error(error);
+                }
+            }
 
             Action::OscEnd => {
-                if self.osc.num_params == 0 {
+                if self.osc.discarding {
+                    self.osc.buffer.clear();
+                } else if self.osc.num_params == 0 {
                     actor.osc_dispatch(&[]);
                 } else {
                     let mut params: [&[u8]; MAX_OSC] = [b""; MAX_OSC];
@@ -647,16 +767,38 @@ impl VTParser {
                 #[cfg(any(feature = "std", feature = "alloc"))]
                 {
                     self.apc_data.clear();
+                    self.apc_discarding = false;
                     self.apc_data.shrink_to_fit();
                 }
             }
             Action::ApcPut => {
                 #[cfg(any(feature = "std", feature = "alloc"))]
-                self.apc_data.push(param);
+                if !self.apc_discarding {
+                    if self.apc_data.len() >= self.max_string_sequence_bytes {
+                        self.apc_data.clear();
+                        self.apc_discarding = true;
+                        self.record_string_sequence_error(StringSequenceError::LimitExceeded {
+                            kind: StringSequenceKind::ApplicationProgramCommand,
+                            maximum: self.max_string_sequence_bytes,
+                        });
+                    } else if self.apc_data.try_reserve_exact(1).is_err() {
+                        self.apc_data.clear();
+                        self.apc_discarding = true;
+                        self.record_string_sequence_error(StringSequenceError::AllocationFailed {
+                            kind: StringSequenceKind::ApplicationProgramCommand,
+                        });
+                    } else {
+                        self.apc_data.push(param);
+                    }
+                }
             }
             Action::ApcEnd => {
                 #[cfg(any(feature = "std", feature = "alloc"))]
-                actor.apc_dispatch(core::mem::take(&mut self.apc_data));
+                if self.apc_discarding {
+                    self.apc_data.clear();
+                } else {
+                    actor.apc_dispatch(core::mem::take(&mut self.apc_data));
+                }
             }
 
             Action::Utf8 => self.next_utf8(actor, param),
@@ -714,7 +856,11 @@ impl VTParser {
 
             match self.utf8_return_state {
                 State::Ground => actor.print(c),
-                State::OscString => self.osc.put(c),
+                State::OscString => {
+                    if let Some(error) = self.osc.put(c, self.max_string_sequence_bytes) {
+                        self.record_string_sequence_error(error);
+                    }
+                }
                 state => panic!("unreachable state {:?}", state),
             };
             self.state = self.utf8_return_state;
@@ -847,15 +993,41 @@ mod test {
     fn test_osc_too_many_params() {
         let fields = (0..MAX_OSC + 2).map(|i| i.to_string()).collect::<Vec<_>>();
         let input = format!("\x1b]{}\x07", fields.join(";"));
-        let actions = parse_as_vec(input.as_bytes());
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+
+        parser.parse(input.as_bytes(), &mut actor);
+
+        assert_eq!(actor.into_vec(), Vec::new());
+        assert_eq!(
+            parser.take_string_sequence_error(),
+            Some(StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::OperatingSystemCommand,
+                maximum: MAX_OSC,
+            })
+        );
+    }
+
+    #[test]
+    fn test_osc_accepts_exact_parameter_limit() {
+        let fields = (0..MAX_OSC).map(|i| i.to_string()).collect::<Vec<_>>();
+        let input = format!("\x1b]{}\x07", fields.join(";"));
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+
+        parser.parse(input.as_bytes(), &mut actor);
+
+        let actions = actor.into_vec();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            VTAction::OscDispatch(parsed_fields) => {
-                let fields: Vec<_> = fields.into_iter().map(|s| s.as_bytes().to_vec()).collect();
-                assert_eq!(parsed_fields.as_slice(), &fields[0..MAX_OSC]);
-            }
-            other => panic!("Expected OscDispatch but got {:?}", other),
-        }
+        let VTAction::OscDispatch(parsed_fields) = &actions[0] else {
+            panic!("expected OSC dispatch at the exact parameter limit");
+        };
+        let expected: Vec<_> = fields
+            .into_iter()
+            .map(|field| field.as_bytes().to_vec())
+            .collect();
+        assert_eq!(parsed_fields, &expected);
+        assert_eq!(parser.take_string_sequence_error(), None);
     }
 
     #[test]
@@ -863,6 +1035,73 @@ mod test {
         assert_eq!(
             parse_as_vec(b"\x1b]\x07"),
             vec![VTAction::OscDispatch(vec![])]
+        );
+    }
+
+    #[test]
+    fn osc_string_limit_accepts_exact_payload() {
+        let mut parser = VTParser::new_with_max_string_sequence_bytes(4);
+        let mut actor = CollectingVTActor::default();
+
+        parser.parse(b"\x1b]ab;cd\x07", &mut actor);
+
+        assert_eq!(
+            actor.into_vec(),
+            vec![VTAction::OscDispatch(vec![b"ab".to_vec(), b"cd".to_vec()])]
+        );
+        assert_eq!(parser.take_string_sequence_error(), None);
+    }
+
+    #[test]
+    fn oversized_osc_is_discarded_across_parse_calls_without_partial_dispatch() {
+        let mut parser = VTParser::new_with_max_string_sequence_bytes(4);
+        let mut actor = CollectingVTActor::default();
+
+        parser.parse(b"\x1b]ab", &mut actor);
+        parser.parse(b"cd", &mut actor);
+        assert_eq!(parser.osc.buffer.len(), 4);
+        parser.parse(b"e", &mut actor);
+        assert_eq!(parser.osc.buffer.len(), 0);
+        assert!(parser.osc.discarding);
+
+        for _ in 0..32 {
+            parser.parse(b"more-data", &mut actor);
+            assert_eq!(parser.osc.buffer.len(), 0);
+        }
+        parser.parse(b"\x07", &mut actor);
+        assert!(parser.is_ground());
+
+        // A later valid sequence is dispatched, while the earlier error remains
+        // sticky until the caller explicitly observes it.
+        parser.parse(b"\x1b]ok\x07", &mut actor);
+        assert_eq!(
+            actor.into_vec(),
+            vec![VTAction::OscDispatch(vec![b"ok".to_vec()])]
+        );
+        assert_eq!(
+            parser.take_string_sequence_error(),
+            Some(StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::OperatingSystemCommand,
+                maximum: 4,
+            })
+        );
+        assert_eq!(parser.take_string_sequence_error(), None);
+    }
+
+    #[test]
+    fn osc_string_limit_counts_encoded_utf8_bytes() {
+        let mut parser = VTParser::new_with_max_string_sequence_bytes(1);
+        let mut actor = CollectingVTActor::default();
+
+        parser.parse("\x1b]\u{e9}\x07".as_bytes(), &mut actor);
+
+        assert_eq!(actor.into_vec(), Vec::new());
+        assert_eq!(
+            parser.take_string_sequence_error(),
+            Some(StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::OperatingSystemCommand,
+                maximum: 1,
+            })
         );
     }
 
@@ -1114,6 +1353,50 @@ mod test {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn apc_string_limit_accepts_exact_payload() {
+        let mut parser = VTParser::new_with_max_string_sequence_bytes(4);
+        let mut actor = CollectingVTActor::default();
+
+        parser.parse(b"\x1b_Gabc\x9c", &mut actor);
+
+        assert_eq!(
+            actor.into_vec(),
+            vec![VTAction::ApcDispatch(b"Gabc".to_vec())]
+        );
+        assert_eq!(parser.take_string_sequence_error(), None);
+    }
+
+    #[test]
+    fn oversized_apc_is_discarded_across_parse_calls_without_partial_dispatch() {
+        let mut parser = VTParser::new_with_max_string_sequence_bytes(4);
+        let mut actor = CollectingVTActor::default();
+
+        parser.parse(b"\x1b_Gab", &mut actor);
+        parser.parse(b"c", &mut actor);
+        assert_eq!(parser.apc_data.len(), 4);
+        parser.parse(b"d", &mut actor);
+        assert_eq!(parser.apc_data.len(), 0);
+        assert!(parser.apc_discarding);
+
+        for _ in 0..32 {
+            parser.parse(b"more-data", &mut actor);
+            assert_eq!(parser.apc_data.len(), 0);
+        }
+        parser.parse(b"\x9c", &mut actor);
+
+        assert!(parser.is_ground());
+        assert_eq!(actor.into_vec(), Vec::new());
+        assert_eq!(
+            parser.take_string_sequence_error(),
+            Some(StringSequenceError::LimitExceeded {
+                kind: StringSequenceKind::ApplicationProgramCommand,
+                maximum: 4,
+            })
+        );
+        assert_eq!(parser.take_string_sequence_error(), None);
     }
 
     #[test]

@@ -855,6 +855,8 @@ pub fn parse_layout(layout: &str) -> Result<Vec<WindowLayout>> {
 pub struct Parser {
     buffer: Vec<u8>,
     begun: Option<Guarded>,
+    discarding_line: bool,
+    pending_sequence_error: Option<crate::StringSequenceError>,
 }
 
 impl Parser {
@@ -862,26 +864,60 @@ impl Parser {
         Self {
             buffer: vec![],
             begun: None,
+            discarding_line: false,
+            pending_sequence_error: None,
+        }
+    }
+
+    pub fn take_sequence_error(&mut self) -> Option<crate::StringSequenceError> {
+        self.pending_sequence_error.take()
+    }
+
+    fn record_sequence_error(&mut self, error: crate::StringSequenceError) {
+        if self.pending_sequence_error.is_none() {
+            self.pending_sequence_error = Some(error);
         }
     }
 
     pub fn advance_byte(&mut self, c: u8) -> Result<Option<Event>> {
+        if self.discarding_line {
+            if c == b'\n' {
+                self.discarding_line = false;
+                self.buffer.clear();
+            }
+            return Ok(None);
+        }
+
         if c == b'\n' {
             self.process_line()
         } else {
-            // [ft-kfy99] Drop the pre-newline line if it exceeds
-            // MAX_LINE_LEN. Without this cap, an upstream that never
-            // sends a newline would grow self.buffer without bound.
-            // We also drop any active begun-block so the next legitimate
-            // %begin isn't appended to the discarded tail.
+            // [ft-kfy99] Discard the complete pre-newline line if it exceeds
+            // MAX_LINE_LEN. Retaining the tail after clearing the prefix would
+            // reinterpret attacker-selected suffix bytes as a fresh tmux
+            // command when the newline arrives.
             if self.buffer.len() >= MAX_LINE_LEN {
                 log::warn!(
                     "tmux CC line exceeded {} byte cap with no newline; \
-                     discarding buffer and dropping any active begun block",
+                     discarding through newline and dropping any active begun block",
                     MAX_LINE_LEN
                 );
                 self.buffer.clear();
                 self.begun.take();
+                self.discarding_line = true;
+                self.record_sequence_error(crate::StringSequenceError::LimitExceeded {
+                    kind: crate::StringSequenceKind::TmuxControl,
+                    maximum: MAX_LINE_LEN,
+                });
+                return Ok(None);
+            }
+            if self.buffer.try_reserve_exact(1).is_err() {
+                self.buffer.clear();
+                self.begun.take();
+                self.discarding_line = true;
+                self.record_sequence_error(crate::StringSequenceError::AllocationFailed {
+                    kind: crate::StringSequenceKind::TmuxControl,
+                });
+                return Ok(None);
             }
             self.buffer.push(c);
             Ok(None)
@@ -912,6 +948,7 @@ impl Parser {
 
     fn process_guarded_line(&mut self) -> Result<Option<Event>> {
         let line = std::str::from_utf8(&self.buffer)?;
+        let mut sequence_error = None;
         let result = match parse_line(&self.buffer) {
             Ok(Event::End {
                 timestamp,
@@ -977,9 +1014,25 @@ impl Parser {
                     );
                     begun.error = true;
                     begun.output.clear();
-                    begun.output.push_str(
-                        "tmux control response exceeded the bounded guarded-output limit",
-                    );
+                    let message =
+                        "tmux control response exceeded the bounded guarded-output limit";
+                    if begun.output.try_reserve_exact(message.len()).is_ok() {
+                        begun.output.push_str(message);
+                    }
+                    sequence_error = Some(crate::StringSequenceError::LimitExceeded {
+                        kind: crate::StringSequenceKind::TmuxControl,
+                        maximum: MAX_GUARDED_OUTPUT_LEN,
+                    });
+                } else if begun
+                    .output
+                    .try_reserve_exact(line.len().saturating_add(1))
+                    .is_err()
+                {
+                    begun.error = true;
+                    begun.output.clear();
+                    sequence_error = Some(crate::StringSequenceError::AllocationFailed {
+                        kind: crate::StringSequenceKind::TmuxControl,
+                    });
                 } else {
                     begun.output.push_str(line);
                     begun.output.push('\n');
@@ -987,6 +1040,9 @@ impl Parser {
                 None
             }
         };
+        if let Some(error) = sequence_error {
+            self.record_sequence_error(error);
+        }
         self.buffer.clear();
         return Ok(result);
     }
@@ -1352,6 +1408,14 @@ here
             guarded.output.len() < 128,
             "overflow error must not retain the oversized response",
         );
+        assert_eq!(
+            parser.take_sequence_error(),
+            Some(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::TmuxControl,
+                maximum: MAX_GUARDED_OUTPUT_LEN,
+            })
+        );
+        assert_eq!(parser.take_sequence_error(), None);
     }
 
     #[test]
@@ -1396,28 +1460,15 @@ here
         );
     }
 
-    // [ft-kfy99] An upstream that never sends a newline must not be
-    // able to grow the parser's pre-line buffer without bound. Feed
-    // MAX_LINE_LEN + some bytes without a newline and verify:
-    //   1. advance_bytes never errors on the overflow discard path.
-    //   2. no events fire (no newline means no complete line).
-    //   3. the internal buffer stays at/below MAX_LINE_LEN, never
-    //      growing past it (the whole point of the fix).
-    //
-    // We deliberately do NOT assert post-discard parse recovery on the
-    // SAME parser — the `%sessions-changed\n` path would first see the
-    // 32-byte 'x' tail prefix still in the buffer and parse_line would
-    // bail on the mixed junk. That's the parser's existing (and
-    // documented) per-line-failure contract; ft-kfy99 is scoped to the
-    // memory-exhaustion defense, not to buffer-reset-on-parse-error.
+    // [ft-kfy99] An upstream that never sends a newline must not be able to
+    // grow the parser's pre-line buffer without bound. Once the cap is crossed,
+    // the complete tail is discarded through newline so attacker-selected
+    // suffix bytes cannot be reinterpreted as a fresh command.
     #[test]
     fn ft_kfy99_advance_byte_caps_line_buffer_without_newline() {
         let mut parser = Parser::new();
-        // Feed a small excess over the cap so we exercise the discard
-        // path once without materializing a huge chunk. The bound is
-        // on `self.buffer`, not on how many bytes we push — after
-        // each overflow the buffer is cleared and starts filling
-        // again, so len stays <= MAX_LINE_LEN at all times.
+        // Feed a small excess over the cap so we exercise the discard path once
+        // without materializing an unnecessarily larger test input.
         let payload = vec![b'x'; MAX_LINE_LEN + 32];
         let events = parser.advance_bytes(&payload).expect(
             "ft-kfy99: advance_byte must discard overflowing buffer \
@@ -1427,16 +1478,27 @@ here
             events.is_empty(),
             "no newline means no complete line, so no events should fire; got {events:?}"
         );
-        assert!(
-            parser.buffer.len() <= MAX_LINE_LEN,
-            "ft-kfy99: buffer grew past MAX_LINE_LEN ({} > {})",
-            parser.buffer.len(),
-            MAX_LINE_LEN,
-        );
+        assert!(parser.buffer.is_empty());
+        assert!(parser.discarding_line);
         assert!(
             parser.begun.is_none(),
             "ft-kfy99: the overflow path must drop any active begun-block \
              so a stale %begin doesn't poison the next %end"
+        );
+        assert_eq!(
+            parser.take_sequence_error(),
+            Some(crate::StringSequenceError::LimitExceeded {
+                kind: crate::StringSequenceKind::TmuxControl,
+                maximum: MAX_LINE_LEN,
+            })
+        );
+        assert_eq!(parser.take_sequence_error(), None);
+
+        assert_eq!(Vec::<Event>::new(), parser.advance_string("\n").unwrap());
+        assert!(!parser.discarding_line);
+        assert_eq!(
+            vec![Event::SessionsChanged],
+            parser.advance_string("%sessions-changed\n").unwrap()
         );
     }
 
