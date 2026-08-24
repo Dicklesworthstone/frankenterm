@@ -790,6 +790,12 @@ impl GuardianService {
         // number of worker wake calls represented by one poll event.
         self.runtime.handle_output_completions();
         self.handle_input_completions();
+        // Replay only after every connection event in this readiness batch and
+        // every available input-authority restoration has been observed.  In
+        // particular, `finish_connection` must only queue: replaying from the
+        // middle of the loop above could retire a mux before a co-ready delayed
+        // Hello publishes its later lifecycle-observation epoch.
+        self.replay_deferred_mux_retirements();
         self.expire_unauthenticated_connections();
         self.runtime.reap_children_once();
         Ok(())
@@ -1124,7 +1130,6 @@ impl GuardianService {
                 GuardianRuntimeInputCompletionState::Empty
                 | GuardianRuntimeInputCompletionState::Disconnected => break,
             };
-            self.replay_deferred_mux_retirements();
             let token = completion.route.connection_token;
             let Some(mut connection) = self.connections.remove(&token) else {
                 // The originating peer disconnected. Runtime restoration and
@@ -1176,7 +1181,6 @@ impl GuardianService {
             self.transport_failures = self.transport_failures.saturating_add(1);
             return;
         }
-        self.replay_deferred_mux_retirements();
     }
 
     /// Replay only a readiness-loop-owned final-disconnect observation whose

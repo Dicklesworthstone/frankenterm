@@ -1937,10 +1937,11 @@ impl LiveScrollbackSpillSink {
     fn append_wal_effective_generation(
         wal: &LiveScrollbackAppendWalV1,
     ) -> anyhow::Result<wezterm_term::config::ScrollbackSnapshotGeneration> {
-        Ok(Self::append_wal_supersession(wal)?
-            .map_or(Self::append_wal_target_generation(wal)?, |supersession| {
-                supersession.generation
-            }))
+        if let Some(supersession) = Self::append_wal_supersession(wal)? {
+            Ok(supersession.generation)
+        } else {
+            Self::append_wal_target_generation(wal)
+        }
     }
 
     fn validate_append_wal_identity(
@@ -4077,6 +4078,11 @@ impl LiveScrollbackSpillSink {
                     sink.manifest_path.display()
                 )
             })?;
+        }
+        if let Err(error) = sink.advance_authenticated_append_wal_supersession() {
+            log::warn!(
+                "deferred retained append WAL supersession acknowledgement during cold open: {error:#}"
+            );
         }
         Ok(sink)
     }
@@ -9356,6 +9362,178 @@ mod tests {
                 "{cut:?} duplicated or omitted the authenticated append"
             );
         }
+    }
+
+    #[test]
+    fn authenticated_append_wal_supersession_recovers_ack_crash_and_advances_generations() {
+        let dir = tempfile::tempdir().expect("create WAL supersession fixture");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 41_000,
+            domain_id: 3,
+            durable_pane_id: [206; 16],
+            command_description: "append-wal-supersession".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create WAL supersession sink");
+        let attributes = CellAttributes::blank();
+        let rows = vec![
+            Line::from_text("supersession-row-a", &attributes, 1, None),
+            Line::from_text("supersession-row-b", &attributes, 2, None),
+        ];
+        assert!(sink.store_scrollback_line(10, &rows[0], 8));
+        assert!(sink.store_scrollback_line(11, &rows[1], 8));
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
+            .expect("derive supersession WAL path");
+        let original = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .expect("read original consumed WAL")
+            .expect("original consumed WAL exists");
+        assert!(LiveScrollbackSpillSink::append_wal_supersession(&original)
+            .expect("parse original WAL supersession")
+            .is_none());
+        let original_generation = sink
+            .lock_state("read original supersession generation")
+            .expect("lock original supersession state")
+            .snapshot_generation();
+        let first_prefix = wezterm_term::config::ScrollbackPrefix::from_slices(
+            Some(10),
+            12,
+            &rows,
+            &[],
+        )
+        .expect("construct first WAL supersession replacement");
+        let first_replacement = sink
+            .replace_scrollback_prefix(Some(original_generation), first_prefix, 8)
+            .expect("publish first WAL supersession replacement");
+        let first_manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read first superseding manifest")
+            .expect("first superseding manifest exists");
+        let first_retired = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .expect("read first retired WAL")
+            .expect("first retired WAL remains present");
+        assert!(LiveScrollbackSpillSink::append_wal_supersession_matches_manifest(
+            &first_retired,
+            &first_manifest,
+        )
+        .expect("bind first WAL retirement marker"));
+        assert_eq!(first_retired.encrypted_record, original.encrypted_record);
+        assert_eq!(
+            first_retired.encrypted_record_sha256,
+            original.encrypted_record_sha256
+        );
+
+        // Crash cut: the replacement manifest is durable but acknowledgement
+        // rewrites have not advanced the retained WAL evidence yet.
+        overwrite_private_append_wal_fixture(&wal_path, &original);
+        drop(sink);
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("recover replacement-before-WAL-acknowledgement crash cut");
+        let second_prefix = wezterm_term::config::ScrollbackPrefix::from_slices(
+            Some(10),
+            12,
+            &rows,
+            &[],
+        )
+        .expect("construct successive WAL supersession replacement");
+        let second_replacement = reopened
+            .replace_scrollback_prefix(
+                Some(first_replacement.generation()),
+                second_prefix,
+                8,
+            )
+            .expect("publish successive WAL supersession replacement");
+        let second_manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+            .expect("read successive superseding manifest")
+            .expect("successive superseding manifest exists");
+        let second_retired = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .expect("read successively retired WAL")
+            .expect("successively retired WAL remains present");
+        assert!(LiveScrollbackSpillSink::append_wal_supersession_matches_manifest(
+            &second_retired,
+            &second_manifest,
+        )
+        .expect("bind successive WAL retirement marker"));
+        assert_eq!(
+            second_replacement.generation(),
+            reopened
+                .lock_state("read successive supersession generation")
+                .expect("lock successive supersession state")
+                .snapshot_generation()
+        );
+        assert_eq!(second_retired.encrypted_record, original.encrypted_record);
+
+        reopened
+            .clear_scrollback()
+            .expect("publish clear across retained WAL evidence");
+        let cleared_manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+            .expect("read WAL-superseding clear manifest")
+            .expect("WAL-superseding clear manifest exists");
+        let cleared_retired = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .expect("read clear-retired WAL")
+            .expect("clear-retired WAL evidence remains present");
+        assert!(LiveScrollbackSpillSink::append_wal_supersession_matches_manifest(
+            &cleared_retired,
+            &cleared_manifest,
+        )
+        .expect("bind clear WAL retirement marker"));
+        assert_eq!(cleared_retired.encrypted_record, original.encrypted_record);
+        assert!(std::fs::symlink_metadata(&wal_path)
+            .expect("retained WAL evidence path remains published")
+            .is_file());
+    }
+
+    #[test]
+    fn append_wal_supersession_metadata_requires_guardian_authentication() {
+        let dir = tempfile::tempdir().expect("create WAL supersession tamper fixture");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 41_001,
+            domain_id: 3,
+            durable_pane_id: [207; 16],
+            command_description: "append-wal-supersession-tamper".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create WAL supersession tamper sink");
+        let attributes = CellAttributes::blank();
+        let rows = vec![
+            Line::from_text("supersession-tamper-a", &attributes, 1, None),
+            Line::from_text("supersession-tamper-b", &attributes, 2, None),
+        ];
+        assert!(sink.store_scrollback_line(10, &rows[0], 8));
+        assert!(sink.store_scrollback_line(11, &rows[1], 8));
+        let generation = sink
+            .lock_state("read supersession tamper generation")
+            .expect("lock supersession tamper state")
+            .snapshot_generation();
+        let prefix = wezterm_term::config::ScrollbackPrefix::from_slices(
+            Some(10),
+            12,
+            &rows,
+            &[],
+        )
+        .expect("construct supersession tamper replacement");
+        sink.replace_scrollback_prefix(Some(generation), prefix, 8)
+            .expect("publish supersession tamper replacement");
+        let wal_path = LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
+            .expect("derive supersession tamper WAL path");
+        let mut tampered = LiveScrollbackSpillSink::read_append_wal(&wal_path)
+            .expect("read supersession tamper WAL")
+            .expect("supersession tamper WAL exists");
+        tampered.superseding_revision = Some(
+            tampered
+                .superseding_revision
+                .expect("supersession marker has a revision")
+                .checked_add(1)
+                .expect("supersession tamper revision fits"),
+        );
+        tampered.wal_sha256 = LiveScrollbackSpillSink::append_wal_checksum(&tampered)
+            .expect("recompute public checksum after supersession mutation");
+        overwrite_private_append_wal_fixture(&wal_path, &tampered);
+        drop(sink);
+        let error = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect_err("unauthenticated WAL supersession metadata must fail closed");
+        assert!(
+            format!("{error:#}").contains("append WAL"),
+            "supersession tamper error remains source-specific: {error:#}"
+        );
     }
 
     #[test]
