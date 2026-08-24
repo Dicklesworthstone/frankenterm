@@ -1,5 +1,6 @@
 use crate::background::{BackgroundLayer, Gradient};
 use crate::bell::{AudibleBell, EasingFunction, VisualBell};
+use crate::cell::validate_cell_widths;
 use crate::color::{
     ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, WindowFrameConfig,
 };
@@ -1132,7 +1133,7 @@ pub struct Config {
     #[dynamic(default)]
     pub treat_east_asian_ambiguous_width_as_wide: bool,
 
-    #[dynamic(default)]
+    #[dynamic(default, validate = "validate_cell_widths")]
     pub cell_widths: Option<Vec<CellWidth>>,
 
     #[dynamic(default = "default_true")]

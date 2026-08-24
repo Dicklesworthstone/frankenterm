@@ -940,6 +940,19 @@ impl CellAttributes {
         self.fat.as_ref().and_then(|fat| fat.hyperlink.as_ref())
     }
 
+    /// Returns whether this attribute set carries any out-of-band image
+    /// attachments.
+    ///
+    /// This intentionally does not clone the image descriptors.  Persistence
+    /// preflights use it to reject unsupported graphics before allocating a
+    /// terminal checkpoint projection.
+    #[cfg(feature = "use_image")]
+    pub fn has_image_attachments(&self) -> bool {
+        self.fat
+            .as_ref()
+            .is_some_and(|fat| !fat.image.is_empty())
+    }
+
     /// Returns the list of attached images in z-index order.
     /// Returns None if there are no attached images; will
     /// never return Some(vec![]).
@@ -1224,14 +1237,18 @@ impl core::clone::Clone for TeenyString {
         if Self::is_marker_bit_set(self.0) {
             Self(self.0)
         } else {
-            Self::from_str(self.str(), None, None)
+            // Heap-backed cells can carry an explicit width that differs from
+            // the host's current Unicode tables.  Recomputing here silently
+            // changed terminal geometry when a Line/Cell was cloned (including
+            // for persistence).  Preserve the authoritative stored width.
+            Self::from_str(self.str(), Some(self.width()), None)
         }
     }
 }
 
 impl core::cmp::PartialEq for TeenyString {
     fn eq(&self, rhs: &Self) -> bool {
-        self.as_bytes().eq(rhs.as_bytes())
+        self.width() == rhs.width() && self.as_bytes().eq(rhs.as_bytes())
     }
 }
 impl core::cmp::Eq for TeenyString {}
@@ -1350,6 +1367,11 @@ impl Cell {
         &mut self.attrs
     }
 }
+
+/// Absolute source-level work bound for configured Unicode cell-width
+/// overrides.  Configuration validation counts the expanded ranges (including
+/// overlap) against this cap before constructing the lookup map.
+pub const MAX_CUSTOM_CELL_WIDTH_EXPANSION: usize = 262_144;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnicodeVersion {

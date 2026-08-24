@@ -164,6 +164,23 @@ impl Hyperlink {
         }
     }
 
+    /// Reconstruct a hyperlink from a capability-free semantic checkpoint.
+    ///
+    /// Ordinary OSC parsing should continue to use `new_with_params`; this
+    /// constructor exists because implicit-rule provenance affects whether a
+    /// restored line may be rescanned and must therefore survive persistence.
+    pub fn new_with_params_and_implicit<S: Into<String>>(
+        uri: S,
+        params: HashMap<String, String>,
+        implicit: bool,
+    ) -> Self {
+        Self {
+            uri: uri.into(),
+            params,
+            implicit,
+        }
+    }
+
     pub fn parse(osc: &[&[u8]]) -> Result<Option<Hyperlink>> {
         ensure!(osc.len() == 3, "wrong param count");
         if osc[1].is_empty() && osc[2].is_empty() {
@@ -191,7 +208,13 @@ impl Hyperlink {
 impl core::fmt::Display for Hyperlink {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(f, "8;")?;
-        for (idx, (k, v)) in self.params.iter().enumerate() {
+        let mut params: Vec<_> = self.params.iter().collect();
+        params.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
+            left_key
+                .cmp(right_key)
+                .then_with(|| left_value.cmp(right_value))
+        });
+        for (idx, (k, v)) in params.into_iter().enumerate() {
             if idx > 0 {
                 write!(f, ":")?;
             }
@@ -224,6 +247,24 @@ mod tests {
         assert_eq!(link.uri(), "https://example.com");
         assert!(link.is_implicit());
         assert!(link.params().is_empty());
+    }
+
+    #[test]
+    fn display_orders_params_canonically() {
+        let mut first = HashMap::new();
+        first.insert("zeta".to_string(), "last".to_string());
+        first.insert("alpha".to_string(), "first".to_string());
+        let mut second = HashMap::new();
+        second.insert("alpha".to_string(), "first".to_string());
+        second.insert("zeta".to_string(), "last".to_string());
+
+        let first = Hyperlink::new_with_params("https://example.com", first);
+        let second = Hyperlink::new_with_params("https://example.com", second);
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(
+            first.to_string(),
+            "8;alpha=first:zeta=last;https://example.com"
+        );
     }
 
     #[test]

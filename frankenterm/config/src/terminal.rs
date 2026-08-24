@@ -2,8 +2,11 @@
 
 use crate::{configuration, ConfigHandle, NewlineCanon};
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::config::{BidiMode, ScrollbackSpillSink};
+use frankenterm_term::config::{
+    BidiMode, RecoveryActivationLease, ScrollbackSpillSink, TerminalConfigurationRevision,
+};
 use frankenterm_term::MonospaceKpCostModel;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use termwiz::cell::UnicodeVersion;
 
@@ -57,16 +60,54 @@ fn scrollback_spill_sink_for(
 
 #[derive(Debug)]
 pub struct TermConfig {
+    recovery_activation_gate: Mutex<()>,
     config: Mutex<Option<ConfigHandle>>,
     client_palette: Mutex<Option<ColorPalette>>,
+    overlay_generation: AtomicUsize,
     scrollback_spill_sink: Option<Arc<dyn ScrollbackSpillSink>>,
+}
+
+struct TermConfigRecoveryActivationLease<'config> {
+    _guard: MutexGuard<'config, ()>,
+}
+
+impl std::fmt::Debug for TermConfigRecoveryActivationLease<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TermConfigRecoveryActivationLease")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecoveryActivationLease for TermConfigRecoveryActivationLease<'_> {}
+
+fn bump_overlay_generation(generation: &AtomicUsize) {
+    let mut current = generation.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).unwrap_or_else(|| {
+            panic!(
+                "terminal configuration overlay generation exhausted; refusing to reuse an identity"
+            )
+        });
+        match generation.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 impl TermConfig {
     pub fn new() -> Self {
         Self {
+            recovery_activation_gate: Mutex::new(()),
             config: Mutex::new(None),
             client_palette: Mutex::new(None),
+            overlay_generation: AtomicUsize::new(0),
             scrollback_spill_sink: None,
         }
     }
@@ -85,16 +126,20 @@ impl TermConfig {
             command_description,
         });
         Self {
+            recovery_activation_gate: Mutex::new(()),
             config: Mutex::new(None),
             client_palette: Mutex::new(None),
+            overlay_generation: AtomicUsize::new(0),
             scrollback_spill_sink,
         }
     }
 
     pub fn with_config(config: ConfigHandle) -> Self {
         Self {
+            recovery_activation_gate: Mutex::new(()),
             config: Mutex::new(Some(config)),
             client_palette: Mutex::new(None),
+            overlay_generation: AtomicUsize::new(0),
             scrollback_spill_sink: None,
         }
     }
@@ -104,19 +149,32 @@ impl TermConfig {
         scrollback_spill_sink: Option<Arc<dyn ScrollbackSpillSink>>,
     ) -> Self {
         Self {
+            recovery_activation_gate: Mutex::new(()),
             config: Mutex::new(Some(config)),
             client_palette: Mutex::new(None),
+            overlay_generation: AtomicUsize::new(0),
             scrollback_spill_sink,
         }
     }
 
     pub fn set_config(&self, config: ConfigHandle) {
-        let _previous = lock_terminal_mutex(&self.config, "terminal config").replace(config);
+        let _activation = lock_terminal_mutex(
+            &self.recovery_activation_gate,
+            "terminal recovery activation gate",
+        );
+        let mut current = lock_terminal_mutex(&self.config, "terminal config");
+        bump_overlay_generation(&self.overlay_generation);
+        let _previous = current.replace(config);
     }
 
     pub fn set_client_palette(&self, palette: ColorPalette) {
-        let _previous =
-            lock_terminal_mutex(&self.client_palette, "terminal client palette").replace(palette);
+        let _activation = lock_terminal_mutex(
+            &self.recovery_activation_gate,
+            "terminal recovery activation gate",
+        );
+        let mut current = lock_terminal_mutex(&self.client_palette, "terminal client palette");
+        bump_overlay_generation(&self.overlay_generation);
+        let _previous = current.replace(palette);
     }
 
     fn configuration(&self) -> ConfigHandle {
@@ -134,6 +192,39 @@ impl TermConfig {
 impl frankenterm_term::TerminalConfiguration for TermConfig {
     fn generation(&self) -> usize {
         self.configuration().generation()
+    }
+
+    fn revision(&self) -> TerminalConfigurationRevision {
+        loop {
+            let overlay_generation = self.overlay_generation.load(Ordering::Acquire);
+            let base_generation = self.configuration().generation();
+            if self.overlay_generation.load(Ordering::Acquire) == overlay_generation {
+                return TerminalConfigurationRevision::new(base_generation, overlay_generation);
+            }
+        }
+    }
+
+    fn acquire_recovery_activation_lease(&self) -> Box<dyn RecoveryActivationLease + '_> {
+        let activation = lock_terminal_mutex(
+            &self.recovery_activation_gate,
+            "terminal recovery activation gate",
+        );
+
+        // A pane created before its first explicit config assignment otherwise
+        // consults the reloadable global on every getter. Pin the exact current
+        // handle while the mutation gate is held so the lease also excludes a
+        // global reload from changing semantics between verification and
+        // installation. This does not bump the overlay revision because the
+        // effective value is unchanged at the pinning instant.
+        let mut current = lock_terminal_mutex(&self.config, "terminal config");
+        if current.is_none() {
+            *current = Some(configuration());
+        }
+        drop(current);
+
+        Box::new(TermConfigRecoveryActivationLease {
+            _guard: activation,
+        })
     }
 
     fn scrollback_size(&self) -> usize {
@@ -322,6 +413,42 @@ mod tests {
         fn retained_scrollback_bytes(&self) -> usize {
             1
         }
+
+        fn snapshot_scrollback(
+            &self,
+            _expected_newest_exclusive: frankenterm_term::StableRowIndex,
+            _limits: frankenterm_term::config::ScrollbackSnapshotLimits,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackSnapshot,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn replace_scrollback_prefix(
+            &self,
+            _expected_generation: Option<
+                frankenterm_term::config::ScrollbackSnapshotGeneration,
+            >,
+            _prefix: frankenterm_term::config::ScrollbackPrefix<'_>,
+            _max_retained_rows: usize,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackReplaceCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Err(frankenterm_term::config::ScrollbackSpillError::StorageUnavailable)
+        }
+
+        fn clear_scrollback(
+            &self,
+        ) -> Result<
+            frankenterm_term::config::ScrollbackClearCommit,
+            frankenterm_term::config::ScrollbackSpillError,
+        > {
+            Ok(frankenterm_term::config::ScrollbackClearCommit::new(
+                frankenterm_term::config::ScrollbackSnapshotGeneration::new([0; 16], 0),
+            ))
+        }
     }
 
     fn overridden_config_for_test(overrides: Value) -> ConfigHandle {
@@ -475,6 +602,112 @@ mod tests {
         let palette = ColorPalette::default();
         term_config.set_client_palette(palette.clone());
         assert_eq!(term_config.color_palette(), palette);
+    }
+
+    #[test]
+    fn term_config_revision_tracks_same_generation_overlays() {
+        let handle = ConfigHandle::default_config();
+        let term_config = TermConfig::with_config(handle.clone());
+        let initial = term_config.revision();
+
+        term_config.set_config(handle);
+        let after_same_generation_config_swap = term_config.revision();
+        assert_ne!(after_same_generation_config_swap, initial);
+
+        term_config.set_client_palette(ColorPalette::default());
+        assert_ne!(term_config.revision(), after_same_generation_config_swap);
+    }
+
+    #[test]
+    fn recovery_activation_lease_excludes_every_overlay_setter() {
+        use std::sync::TryLockError;
+        use std::time::{Duration, Instant};
+
+        fn wait_until_setter_owns_activation_gate(term_config: &TermConfig) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match term_config.recovery_activation_gate.try_lock() {
+                    Err(TryLockError::WouldBlock) => return,
+                    Err(TryLockError::Poisoned(_)) => {
+                        panic!("terminal recovery activation gate was poisoned")
+                    }
+                    Ok(guard) => drop(guard),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "setter never acquired the shared recovery activation gate",
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        let term_config = Arc::new(TermConfig::with_config(ConfigHandle::default_config()));
+
+        let revision_before_config = term_config.overlay_generation.load(Ordering::Relaxed);
+        let lease = term_config.acquire_recovery_activation_lease();
+        let config_guard = lock_terminal_mutex(&term_config.config, "config setter exclusion test");
+        let config_setter_config = Arc::clone(&term_config);
+        let config_setter = std::thread::spawn(move || {
+            config_setter_config.set_config(ConfigHandle::default_config());
+        });
+        assert_eq!(
+            term_config.overlay_generation.load(Ordering::Relaxed),
+            revision_before_config,
+            "config mutation must not cross the held activation lease",
+        );
+        drop(lease);
+        wait_until_setter_owns_activation_gate(&term_config);
+        assert_eq!(
+            term_config.overlay_generation.load(Ordering::Relaxed),
+            revision_before_config,
+            "config revision cannot advance before the protected value is mutable",
+        );
+        drop(config_guard);
+        config_setter.join().expect("config setter thread joins");
+
+        let revision_before_palette = term_config.overlay_generation.load(Ordering::Relaxed);
+        let lease = term_config.acquire_recovery_activation_lease();
+        let palette_guard =
+            lock_terminal_mutex(&term_config.client_palette, "palette setter exclusion test");
+        let palette_config = Arc::clone(&term_config);
+        let palette_setter = std::thread::spawn(move || {
+            palette_config.set_client_palette(ColorPalette::default());
+        });
+        assert_eq!(
+            term_config.overlay_generation.load(Ordering::Relaxed),
+            revision_before_palette,
+            "palette mutation must not cross the held activation lease",
+        );
+        drop(lease);
+        wait_until_setter_owns_activation_gate(&term_config);
+        assert_eq!(
+            term_config.overlay_generation.load(Ordering::Relaxed),
+            revision_before_palette,
+            "palette revision cannot advance before the protected value is mutable",
+        );
+        drop(palette_guard);
+        palette_setter.join().expect("palette setter thread joins");
+    }
+
+    #[test]
+    fn exhausted_overlay_revision_refuses_mutation_before_value_changes() {
+        let term_config = TermConfig::new();
+        term_config
+            .overlay_generation
+            .store(usize::MAX, Ordering::Relaxed);
+
+        let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            term_config.set_client_palette(ColorPalette::default());
+        }));
+        assert!(attempted.is_err());
+        assert!(
+            lock_terminal_mutex(
+                &term_config.client_palette,
+                "terminal client palette exhaustion test",
+            )
+            .is_none(),
+            "revision exhaustion must leave the prior semantic value untouched",
+        );
     }
 
     #[test]

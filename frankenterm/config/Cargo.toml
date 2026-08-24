@@ -48,6 +48,7 @@ termwiz = { workspace=true, features=["use_serde"] }
 toml.workspace = true
 umask.workspace = true
 frankenterm-bidi.workspace = true
+frankenterm-cell.workspace = true
 frankenterm-config-derive.workspace = true
 frankenterm-dynamic.workspace = true
 frankenterm-input-types.workspace = true

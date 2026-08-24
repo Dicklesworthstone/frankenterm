@@ -77,24 +77,52 @@ impl Default for KittyImageState {
 // cap to assert the rejection path without constructing a
 // 16 MiB+ payload.
 impl KittyImageState {
-    /// Whether no out-of-band Kitty state would be lost by the v1 terminal
-    /// checkpoint policy. Screen-attached image cells are checked separately;
-    /// this covers incomplete transmissions, reusable image IDs, and placement
-    /// bookkeeping that line serialization alone cannot reconstruct.
+    /// Build the capability-free Kitty shell used by checkpoint restore.
+    ///
+    /// Checkpoint v1 admits only quiescent Kitty state, so restore must not
+    /// construct or retain any image payload, placement, or partial transfer.
+    /// It does retain the allocation high-water mark and installs the replay
+    /// configuration's resource limits before the terminal becomes reachable.
     #[cfg(feature = "use_serde")]
-    pub(crate) fn is_empty_for_checkpoint(&self) -> bool {
-        self.accumulator.is_empty()
+    pub(crate) fn quiescent_for_checkpoint_restore(
+        image_budget_bytes: usize,
+        max_transmission_bytes: usize,
+        max_image_id: u32,
+    ) -> Self {
+        let mut state = Self::default();
+        state.image_budget_bytes = image_budget_bytes;
+        state.set_max_transmission_bytes(max_transmission_bytes);
+        state.restore_quiescent_checkpoint_high_water(max_image_id);
+        state
+    }
+
+    /// Return the image-ID allocation high-water mark only when no active
+    /// out-of-band Kitty state would be lost by checkpointing. Screen-attached
+    /// image cells are checked separately; this covers incomplete
+    /// transmissions, reusable image IDs, and placement bookkeeping that line
+    /// serialization alone cannot reconstruct.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn checkpoint_high_water_if_quiescent(&self) -> Option<u32> {
+        (self.accumulator.is_empty()
             && self.accumulator_encoded_bytes == 0
-            && self.max_image_id == 0
             && self.number_to_id.is_empty()
             && self.id_to_data.is_empty()
             && self.placements.is_empty()
-            && self.used_memory == 0
+            && self.used_memory == 0)
+            .then_some(self.max_image_id)
+    }
+
+    /// Restore the ID-allocation high-water mark after the checkpoint validator
+    /// has proved that no live Kitty image/transmission state is present.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn restore_quiescent_checkpoint_high_water(&mut self, max_image_id: u32) {
+        debug_assert!(self.checkpoint_high_water_if_quiescent().is_some());
+        self.max_image_id = max_image_id;
     }
 
     #[cfg(all(test, feature = "use_serde"))]
     pub(crate) fn mark_nonempty_for_checkpoint_test(&mut self) {
-        self.max_image_id = 1;
+        self.used_memory = 1;
     }
 
     /// Override the per-image transmission-size cap.

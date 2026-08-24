@@ -310,6 +310,32 @@ impl ScreenOrAlt {
         self.screen.set_config(config);
         self.alt_screen.set_config(config);
     }
+
+    #[cfg(feature = "use_serde")]
+    fn install_prepared_config(
+        &mut self,
+        config: &Arc<dyn TerminalConfiguration>,
+        resize_wrap_policy: crate::screen::ResizeWrapPolicy,
+    ) {
+        self.screen
+            .install_prepared_config(config, resize_wrap_policy);
+        self.alt_screen
+            .install_prepared_config(config, resize_wrap_policy);
+    }
+
+    #[cfg(feature = "use_serde")]
+    fn activate_recovered_scrollback(
+        &mut self,
+        config: &Arc<dyn TerminalConfiguration>,
+    ) -> Result<(), crate::config::ScrollbackActivationError> {
+        // Validate every non-primary invariant before the primary screen may
+        // publish a durable replacement. After that publication succeeds, the
+        // remaining operations are infallible marker/config transitions.
+        self.alt_screen.preflight_recovery_without_scrollback()?;
+        self.screen.activate_recovered_scrollback(config)?;
+        self.alt_screen.finish_recovery_without_scrollback();
+        Ok(())
+    }
 }
 
 /// Manages the state for the terminal
@@ -439,6 +465,7 @@ pub struct TerminalState {
     term_version: String,
 
     writer: BufWriter<ThreadedWriter>,
+    writer_is_inert: bool,
 
     image_cache: lru::LruCache<[u8; 32], Arc<ImageData>>,
     sixel_scrolls_right: bool,
@@ -528,8 +555,22 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
 /// back-pressure when there is a lot of data to read,
 /// and we're in control of the write side, which represents
 /// input from the interactive user, or pastes.
-struct ThreadedWriter {
-    sender: Sender<WriterMessage>,
+enum ThreadedWriter {
+    Live { sender: Sender<WriterMessage> },
+    Inert,
+    Failed,
+}
+
+#[cfg(feature = "use_serde")]
+pub(crate) struct PreparedTerminalWriter(BufWriter<ThreadedWriter>);
+
+#[cfg(feature = "use_serde")]
+pub(crate) struct PreparedRecoveryConfiguration {
+    config: Arc<dyn TerminalConfiguration>,
+    resize_wrap_policy: crate::screen::ResizeWrapPolicy,
+    kitty_image_budget_bytes: usize,
+    kitty_image_max_transmission_bytes: usize,
+    refreshed_unicode_version: Option<UnicodeVersion>,
 }
 
 enum WriterMessage {
@@ -538,16 +579,32 @@ enum WriterMessage {
 }
 
 impl ThreadedWriter {
-    fn new(mut writer: Box<dyn std::io::Write + Send>) -> Self {
-        let (sender, receiver) = channel::<WriterMessage>();
+    fn new(writer: Box<dyn std::io::Write + Send>) -> Self {
+        match Self::try_new(writer) {
+            Ok(writer) => writer,
+            Err(err) => {
+                log::error!("failed to spawn terminal threaded writer: {err:#}");
+                Self::Failed
+            }
+        }
+    }
 
-        if let Err(err) = std::thread::Builder::new()
-            .name("terminal-threaded-writer".to_string())
+    fn try_new(mut writer: Box<dyn std::io::Write + Send>) -> std::io::Result<Self> {
+        let (sender, receiver) = channel::<WriterMessage>();
+        const THREAD_NAME: &str = "terminal-threaded-writer";
+        let mut thread_name = String::new();
+        thread_name
+            .try_reserve_exact(THREAD_NAME.len())
+            .map_err(|_| std::io::Error::other("terminal writer name allocation failed"))?;
+        thread_name.push_str(THREAD_NAME);
+
+        std::thread::Builder::new()
+            .name(thread_name)
             .spawn(move || {
                 while let Ok(msg) = receiver.recv() {
                     match msg {
                         WriterMessage::Data(buf) => {
-                            if writer.write(&buf).is_err() {
+                            if writer.write_all(&buf).is_err() {
                                 break;
                             }
                         }
@@ -561,31 +618,55 @@ impl ThreadedWriter {
                         }
                     }
                 }
-            })
-        {
-            log::error!("failed to spawn terminal threaded writer: {err:#}");
-        }
+            })?;
 
-        Self { sender }
+        Ok(Self::Live { sender })
+    }
+
+    const fn inert() -> Self {
+        Self::Inert
     }
 }
 
 impl std::io::Write for ThreadedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.sender
-            .send(WriterMessage::Data(buf.to_vec()))
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
-        Ok(buf.len())
+        match self {
+            Self::Live { sender } => {
+                let mut owned = Vec::new();
+                owned.try_reserve_exact(buf.len()).map_err(|_| {
+                    std::io::Error::other("terminal writer allocation failed")
+                })?;
+                owned.extend_from_slice(buf);
+                sender
+                    .send(WriterMessage::Data(owned))
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
+                Ok(buf.len())
+            }
+            Self::Inert => Ok(buf.len()),
+            Self::Failed => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "terminal writer is unavailable",
+            )),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let (ack_sender, ack_receiver) = channel();
-        self.sender
-            .send(WriterMessage::Flush(ack_sender))
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
-        ack_receiver
-            .recv()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?
+        match self {
+            Self::Live { sender } => {
+                let (ack_sender, ack_receiver) = channel();
+                sender
+                    .send(WriterMessage::Flush(ack_sender))
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
+                ack_receiver
+                    .recv()
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?
+            }
+            Self::Inert => Ok(()),
+            Self::Failed => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "terminal writer is unavailable",
+            )),
+        }
     }
 }
 
@@ -600,9 +681,49 @@ impl TerminalState {
         term_version: &str,
         writer: Box<dyn std::io::Write + Send>,
     ) -> TerminalState {
-        let writer = BufWriter::new(ThreadedWriter::new(writer));
+        Self::new_with_writer(
+            size,
+            config,
+            term_program,
+            term_version,
+            ThreadedWriter::new(writer),
+            false,
+        )
+    }
+
+    fn new_with_writer(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        writer: ThreadedWriter,
+        writer_is_inert: bool,
+    ) -> TerminalState {
         let seqno = 1;
         let screen = ScreenOrAlt::new(size, &config, seqno, config.bidi_mode());
+        Self::new_with_prebuilt_screen(
+            size,
+            config,
+            term_program,
+            term_version,
+            writer,
+            writer_is_inert,
+            seqno,
+            screen,
+        )
+    }
+
+    fn new_with_prebuilt_screen(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        writer: ThreadedWriter,
+        writer_is_inert: bool,
+        seqno: SequenceNo,
+        screen: ScreenOrAlt,
+    ) -> TerminalState {
+        let writer = BufWriter::new(writer);
 
         let color_map = default_color_map();
 
@@ -667,6 +788,7 @@ impl TerminalState {
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
             writer,
+            writer_is_inert,
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
             kitty_img: {
@@ -688,6 +810,79 @@ impl TerminalState {
             bidi_hint: None,
             progress: Progress::default(),
         }
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn prepare_inert_writer(
+        &self,
+        writer: Box<dyn std::io::Write + Send>,
+    ) -> std::io::Result<PreparedTerminalWriter> {
+        if !self.writer_is_inert {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "terminal writer is already live",
+            ));
+        }
+        // Capacity zero avoids an infallible allocation in the activation
+        // transaction. ThreadedWriter already owns the asynchronous buffering
+        // boundary and fallibly allocates each outbound message.
+        Ok(PreparedTerminalWriter(BufWriter::with_capacity(
+            0,
+            ThreadedWriter::try_new(writer)?,
+        )))
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn prepare_recovery_configuration(
+        &self,
+        config: Arc<dyn TerminalConfiguration>,
+    ) -> PreparedRecoveryConfiguration {
+        let previous_unicode_version = self.config.unicode_version();
+        let should_refresh_unicode_version = self.unicode_version_stack.is_empty()
+            && self.unicode_version == previous_unicode_version;
+        let refreshed_unicode_version =
+            should_refresh_unicode_version.then(|| config.unicode_version());
+        let resize_wrap_policy =
+            crate::screen::ResizeWrapPolicy::from_terminal_configuration(config.as_ref());
+        let kitty_image_budget_bytes = config.kitty_image_budget_bytes();
+        let kitty_image_max_transmission_bytes = config.kitty_image_max_transmission_bytes();
+        PreparedRecoveryConfiguration {
+            config,
+            resize_wrap_policy,
+            kitty_image_budget_bytes,
+            kitty_image_max_transmission_bytes,
+            refreshed_unicode_version,
+        }
+    }
+
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn finish_recovery_activation(
+        &mut self,
+        prepared_config: PreparedRecoveryConfiguration,
+        prepared_writer: PreparedTerminalWriter,
+    ) -> Result<(), crate::config::ScrollbackActivationError> {
+        self.screen
+            .activate_recovered_scrollback(&prepared_config.config)?;
+        self.screen.install_prepared_config(
+            &prepared_config.config,
+            prepared_config.resize_wrap_policy,
+        );
+        self.kitty_img.image_budget_bytes = prepared_config.kitty_image_budget_bytes;
+        self.kitty_img
+            .set_max_transmission_bytes(prepared_config.kitty_image_max_transmission_bytes);
+        if let Some(unicode_version) = prepared_config.refreshed_unicode_version {
+            self.unicode_version = unicode_version;
+        }
+        self.config = prepared_config.config;
+        let inert = std::mem::replace(&mut self.writer, prepared_writer.0);
+        self.writer_is_inert = false;
+        drop(inert);
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "use_serde"))]
+    pub(crate) fn writer_is_inert_for_test(&self) -> bool {
+        self.writer_is_inert
     }
 
     pub fn enable_conpty_quirks(&mut self) {
@@ -837,7 +1032,10 @@ impl TerminalState {
         // we need to ensure that we increment the seqno in
         // order to correctly invalidate the display
         self.increment_seqno();
-        self.erase_in_display(EraseInDisplay::EraseScrollback);
+        if let Err(error) = self.screen_mut().erase_scrollback() {
+            log::error!("refused scrollback-and-viewport erase: {error}");
+            return;
+        }
 
         let row_index = self.screen.phys_row(self.cursor.y);
         let rows = self
@@ -860,7 +1058,9 @@ impl TerminalState {
         // we need to ensure that we increment the seqno in
         // order to correctly invalidate the display
         self.increment_seqno();
-        self.screen_mut().erase_scrollback();
+        if let Err(error) = self.screen_mut().erase_scrollback() {
+            log::error!("refused scrollback erase: {error}");
+        }
     }
 
     /// Returns true if the associated application has enabled any of the
@@ -2307,7 +2507,9 @@ impl TerminalState {
             }
             EraseInDisplay::EraseDisplay => 0..rows,
             EraseInDisplay::EraseScrollback => {
-                self.screen_mut().erase_scrollback();
+                if let Err(error) = self.screen_mut().erase_scrollback() {
+                    log::error!("refused escape-sequence scrollback erase: {error}");
+                }
                 return;
             }
         };

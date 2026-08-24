@@ -69,6 +69,7 @@ impl<'a> CellRef<'a> {
 
     pub fn compute_shape_hash<H: Hasher>(&self, hasher: &mut H) {
         self.str().hash(hasher);
+        self.width().hash(hasher);
         self.attrs().compute_shape_hash(hasher);
     }
 }
@@ -250,6 +251,28 @@ mod test {
         cr.compute_shape_hash(&mut h1);
         cr.compute_shape_hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn cellref_shape_hash_includes_authoritative_width() {
+        let attrs = CellAttributes::default();
+        let narrow = CellRef::ClusterRef {
+            cell_index: 0,
+            text: "X",
+            width: 1,
+            attrs: &attrs,
+        };
+        let wide = CellRef::ClusterRef {
+            cell_index: 0,
+            text: "X",
+            width: 2,
+            attrs: &attrs,
+        };
+        let mut narrow_hash = SipHasher::new();
+        let mut wide_hash = SipHasher::new();
+        narrow.compute_shape_hash(&mut narrow_hash);
+        wide.compute_shape_hash(&mut wide_hash);
+        assert_ne!(narrow_hash.finish(), wide_hash.finish());
     }
 
     #[test]
