@@ -2526,6 +2526,39 @@ mod tests {
         (descriptor, segment, output, capture)
     }
 
+    fn record_stage_binding(
+        descriptor: GuardianCheckpointArtifactDescriptorV1,
+        generation: u64,
+    ) -> GuardianCheckpointStageBindingV1 {
+        let pane_id = descriptor
+            .origin()
+            .durable_pane_id()
+            .expect("record descriptor pane");
+        let scope = GuardianCheckpointStageScopeV1::pane(pane_id, generation)
+            .expect("construct pane staging scope");
+        GuardianCheckpointStageBindingV1::from_protocol_capture(
+            scope,
+            descriptor,
+            generation,
+        )
+        .expect("bind exact protocol capture generation")
+    }
+
+    fn record_seal_witness(
+        descriptor: &GuardianCheckpointArtifactDescriptorV1,
+        segment: GuardianOutputSegmentIdentity,
+        output: GuardianOutputAppendReceipt,
+        capture: &LiveParserCheckpointAck,
+    ) -> GuardianCheckpointValidatedSealWitnessV1 {
+        descriptor
+            .validated_record_seal_witness(
+                capture.terminal_checkpoint().canonical_payload(),
+                segment,
+                output,
+            )
+            .expect("validate exact record-backed seal authority")
+    }
+
     fn synchronized_outputs(
         pane: Uuid,
         payloads: &[&[u8]],
@@ -3381,30 +3414,22 @@ mod tests {
     #[test]
     fn checkpoint_cipher_round_trips_every_typed_record_and_fixed_header() {
         let plaintext = b"bounded checkpoint staging plaintext";
-        let (descriptor, _, _, _) = record_descriptor();
-        let scope = GuardianCheckpointStageScopeV1::pane(
-            descriptor
-                .origin()
-                .durable_pane_id()
-                .expect("record descriptor pane"),
-            7,
-        )
-        .expect("construct pane staging scope");
+        let (descriptor, segment, output, capture) = record_descriptor();
+        let binding = record_stage_binding(descriptor, 7);
+        let witness = record_seal_witness(&descriptor, segment, output, &capture);
         let upload_id = Uuid::new_v4();
         let publication_id = Uuid::new_v4();
         let contexts = [
             GuardianCheckpointStageRecordContextV1::candidate_metadata(
-                scope,
+                &binding,
                 upload_id,
-                &descriptor,
                 publication_id,
                 plaintext,
             )
             .expect("construct candidate metadata context"),
             GuardianCheckpointStageRecordContextV1::chunk(
-                scope,
+                &binding,
                 upload_id,
-                &descriptor,
                 publication_id,
                 0,
                 0,
@@ -3412,9 +3437,9 @@ mod tests {
             )
             .expect("construct chunk context"),
             GuardianCheckpointStageRecordContextV1::seal_manifest(
-                scope,
+                &binding,
+                &witness,
                 upload_id,
-                &descriptor,
                 publication_id,
                 plaintext,
             )
@@ -3448,9 +3473,10 @@ mod tests {
                 GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
             )
             .expect("reconstruct bounded fixed-layout record");
+            assert_ne!(reconstructed.context(), context);
             assert!(matches!(
                 cipher.seal(reconstructed.context(), plaintext),
-                Err(GuardianCheckpointCipherError::UntrustedPersistedContext)
+                Err(GuardianCheckpointCipherError::InvalidKindAuthority)
             ));
             let opened: Zeroizing<Vec<u8>> = cipher
                 .open(
@@ -3471,15 +3497,41 @@ mod tests {
         let wrong_pane_scope = GuardianCheckpointStageScopeV1::pane(Uuid::new_v4(), 7)
             .expect("construct wrong pane scope");
         assert!(matches!(
-            GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            GuardianCheckpointStageBindingV1::from_protocol_capture(
                 wrong_pane_scope,
-                Uuid::new_v4(),
-                &record_descriptor,
-                Uuid::new_v4(),
-                plaintext,
+                record_descriptor,
+                7,
             ),
             Err(GuardianCheckpointCipherError::DescriptorScopeMismatch)
         ));
+        let pane_id = record_descriptor
+            .origin()
+            .durable_pane_id()
+            .expect("record descriptor pane");
+        let pane_scope = GuardianCheckpointStageScopeV1::pane(pane_id, 7)
+            .expect("construct exact pane scope");
+        assert!(matches!(
+            GuardianCheckpointStageBindingV1::from_protocol_capture(
+                pane_scope,
+                record_descriptor,
+                8,
+            ),
+            Err(GuardianCheckpointCipherError::CaptureGenerationMismatch)
+        ));
+        let pane_binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
+            pane_scope,
+            record_descriptor,
+            7,
+        )
+        .expect("accept exact pane capture generation");
+        assert_eq!(
+            pane_binding
+                .boundary_identity_digest()
+                .expect("binding boundary identity"),
+            record_descriptor
+                .recompute_boundary_identity_digest()
+                .expect("stable descriptor boundary")
+        );
 
         let spawn_effect_id = Uuid::new_v4();
         let terminal = terminal_checkpoint();
@@ -3491,10 +3543,23 @@ mod tests {
             .expect("construct Genesis descriptor");
         let genesis_scope = GuardianCheckpointStageScopeV1::genesis(spawn_effect_id)
             .expect("construct Genesis scope");
-        let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+        assert!(matches!(
+            GuardianCheckpointStageBindingV1::from_protocol_capture(
+                genesis_scope,
+                genesis_descriptor,
+                GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION + 1,
+            ),
+            Err(GuardianCheckpointCipherError::GenesisCaptureGenerationMismatch)
+        ));
+        let genesis_binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
             genesis_scope,
+            genesis_descriptor,
+            GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION,
+        )
+        .expect("bind reserved Genesis capture generation");
+        let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            &genesis_binding,
             Uuid::new_v4(),
-            &genesis_descriptor,
             Uuid::new_v4(),
             plaintext,
         )
@@ -3512,12 +3577,10 @@ mod tests {
         let wrong_genesis_scope = GuardianCheckpointStageScopeV1::genesis(Uuid::new_v4())
             .expect("construct wrong Genesis scope");
         assert!(matches!(
-            GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            GuardianCheckpointStageBindingV1::from_protocol_capture(
                 wrong_genesis_scope,
-                Uuid::new_v4(),
-                &genesis_descriptor,
-                Uuid::new_v4(),
-                plaintext,
+                genesis_descriptor,
+                GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION,
             ),
             Err(GuardianCheckpointCipherError::DescriptorScopeMismatch)
         ));
