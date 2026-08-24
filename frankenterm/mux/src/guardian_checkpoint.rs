@@ -3600,22 +3600,14 @@ mod tests {
         const CONTEXT_CHUNK_INDEX_OFFSET: usize = HEADER_CONTEXT_OFFSET + 128;
         const CONTEXT_CHUNK_OFFSET_OFFSET: usize = HEADER_CONTEXT_OFFSET + 136;
         const CONTEXT_PLAINTEXT_BYTES_OFFSET: usize = HEADER_CONTEXT_OFFSET + 144;
-        const CONTEXT_PLAINTEXT_DIGEST_OFFSET: usize = HEADER_CONTEXT_OFFSET + 152;
+        const FORMER_CLEAR_DIGEST_OFFSET: usize = HEADER_CONTEXT_OFFSET + 152;
 
         let plaintext = b"phase-a AAD mutation fixture";
         let (descriptor, _, _, _) = record_descriptor();
-        let scope = GuardianCheckpointStageScopeV1::pane(
-            descriptor
-                .origin()
-                .durable_pane_id()
-                .expect("record descriptor pane"),
-            7,
-        )
-        .expect("construct pane scope");
+        let binding = record_stage_binding(descriptor, 7);
         let context = GuardianCheckpointStageRecordContextV1::chunk(
-            scope,
+            &binding,
             Uuid::new_v4(),
-            &descriptor,
             Uuid::new_v4(),
             0,
             0,
@@ -3625,6 +3617,7 @@ mod tests {
         let cipher = checkpoint_stage_cipher(0x33);
         let record = cipher.seal(context, plaintext).expect("seal AAD fixture");
         let header = record.fixed_header();
+        assert_eq!(&header[FORMER_CLEAR_DIGEST_OFFSET..], &[0; 32]);
         let aad = checkpoint_stage_record_aad(cipher.key_id(), &context);
         let expected_domain = b"frankenterm.guardian-checkpoint-phase-a-record.v1\0";
         assert_eq!(&aad[..expected_domain.len()], expected_domain);
@@ -3636,6 +3629,7 @@ mod tests {
             &aad[expected_domain.len() + 4..expected_domain.len() + 12],
             &cipher.key_id()
         );
+        assert_eq!(&aad[aad.len() - 32..], &[0; 32]);
 
         for offset in [
             CONTEXT_KIND_OFFSET,
@@ -3647,7 +3641,6 @@ mod tests {
             CONTEXT_PUBLICATION_OFFSET,
             CONTEXT_CHUNK_INDEX_OFFSET,
             CONTEXT_CHUNK_OFFSET_OFFSET,
-            CONTEXT_PLAINTEXT_DIGEST_OFFSET,
         ] {
             assert_authenticated_header_mutation_fails(
                 &cipher,
@@ -3680,10 +3673,22 @@ mod tests {
                     .copy_from_slice(&shorter.to_le_bytes());
                 mutated_ciphertext.truncate(
                     usize::try_from(shorter).expect("fixture length fits usize")
+                        + CHECKPOINT_STAGE_INNER_TRAILER_BYTES
                         + CHECKPOINT_STAGE_AEAD_TAG_BYTES,
                 );
             },
         );
+
+        let mut clear_digest_mutation = header;
+        clear_digest_mutation[FORMER_CLEAR_DIGEST_OFFSET] = 1;
+        assert!(matches!(
+            GuardianEncryptedCheckpointStageRecordV1::from_persisted(
+                &clear_digest_mutation,
+                record.ciphertext().to_vec(),
+                GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES,
+            ),
+            Err(GuardianCheckpointCipherError::InvalidFixedHeader)
+        ));
 
         let mut wrong_version = header;
         wrong_version[8..12].copy_from_slice(
@@ -3706,19 +3711,11 @@ mod tests {
     fn checkpoint_cipher_rejects_wrong_key_context_nonce_and_ciphertext() {
         let plaintext = b"authenticated checkpoint record";
         let (descriptor, _, _, _) = record_descriptor();
-        let scope = GuardianCheckpointStageScopeV1::pane(
-            descriptor
-                .origin()
-                .durable_pane_id()
-                .expect("record descriptor pane"),
-            9,
-        )
-        .expect("construct pane scope");
+        let binding = record_stage_binding(descriptor, 9);
         let upload_id = Uuid::new_v4();
         let context = GuardianCheckpointStageRecordContextV1::chunk(
-            scope,
+            &binding,
             upload_id,
-            &descriptor,
             Uuid::new_v4(),
             0,
             0,
@@ -3741,9 +3738,8 @@ mod tests {
         ));
 
         let wrong_context = GuardianCheckpointStageRecordContextV1::chunk(
-            scope,
+            &binding,
             Uuid::new_v4(),
-            &descriptor,
             context.publication_id(),
             0,
             0,
@@ -3795,18 +3791,10 @@ mod tests {
     fn checkpoint_record_reconstruction_is_strictly_bounded() {
         let plaintext = b"bounded persisted checkpoint record";
         let (descriptor, _, _, _) = record_descriptor();
-        let scope = GuardianCheckpointStageScopeV1::pane(
-            descriptor
-                .origin()
-                .durable_pane_id()
-                .expect("record descriptor pane"),
-            11,
-        )
-        .expect("construct pane scope");
+        let binding = record_stage_binding(descriptor, 11);
         let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
-            scope,
+            &binding,
             Uuid::new_v4(),
-            &descriptor,
             Uuid::new_v4(),
             plaintext,
         )
@@ -3817,9 +3805,8 @@ mod tests {
         let oversized_plaintext = Zeroizing::new(vec![0x5a; oversized_bytes]);
         assert!(matches!(
             GuardianCheckpointStageRecordContextV1::candidate_metadata(
-                scope,
+                &binding,
                 Uuid::new_v4(),
-                &descriptor,
                 Uuid::new_v4(),
                 oversized_plaintext.as_slice(),
             ),
@@ -3923,19 +3910,13 @@ mod tests {
     #[test]
     fn checkpoint_cipher_uses_fresh_random_nonces() {
         let plaintext = b"random nonce checkpoint fixture";
-        let (descriptor, _, _, _) = record_descriptor();
-        let scope = GuardianCheckpointStageScopeV1::pane(
-            descriptor
-                .origin()
-                .durable_pane_id()
-                .expect("record descriptor pane"),
-            13,
-        )
-        .expect("construct pane scope");
+        let (descriptor, segment, output, capture) = record_descriptor();
+        let binding = record_stage_binding(descriptor, 13);
+        let witness = record_seal_witness(&descriptor, segment, output, &capture);
         let context = GuardianCheckpointStageRecordContextV1::seal_manifest(
-            scope,
+            &binding,
+            &witness,
             Uuid::new_v4(),
-            &descriptor,
             Uuid::new_v4(),
             plaintext,
         )
@@ -3967,18 +3948,10 @@ mod tests {
     fn checkpoint_record_debug_is_content_free() {
         let plaintext = b"CHECKPOINT-PLAINTEXT-MUST-NOT-APPEAR";
         let (descriptor, _, _, _) = record_descriptor();
-        let scope = GuardianCheckpointStageScopeV1::pane(
-            descriptor
-                .origin()
-                .durable_pane_id()
-                .expect("record descriptor pane"),
-            15,
-        )
-        .expect("construct pane scope");
+        let binding = record_stage_binding(descriptor, 15);
         let context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
-            scope,
+            &binding,
             Uuid::new_v4(),
-            &descriptor,
             Uuid::new_v4(),
             plaintext,
         )
@@ -3990,9 +3963,12 @@ mod tests {
 
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("CHECKPOINT-PLAINTEXT-MUST-NOT-APPEAR"));
-        assert!(!debug.contains(&hex::encode(context.plaintext_digest())));
+        let (_, plaintext_digest) =
+            checkpoint_stage_plaintext_identity(plaintext).expect("identify debug fixture");
+        assert!(!debug.contains(&hex::encode(plaintext_digest)));
         assert!(!debug.contains(&hex::encode(record.ciphertext())));
         assert!(!debug.contains(&hex::encode(&header[24..48])));
+        assert_eq!(&header[200..232], &[0; 32]);
     }
 
     #[test]
@@ -4002,27 +3978,20 @@ mod tests {
         let expected_plaintext = b"alpha-secret";
         let substituted_plaintext = b"omega-secret";
         assert_eq!(expected_plaintext.len(), substituted_plaintext.len());
-        let (descriptor, _, _, _) = record_descriptor();
-        let scope = GuardianCheckpointStageScopeV1::pane(
-            descriptor
-                .origin()
-                .durable_pane_id()
-                .expect("record descriptor pane"),
-            17,
-        )
-        .expect("construct pane scope");
+        let (descriptor, segment, output, capture) = record_descriptor();
+        let binding = record_stage_binding(descriptor, 17);
+        let witness = record_seal_witness(&descriptor, segment, output, &capture);
         let candidate_context = GuardianCheckpointStageRecordContextV1::candidate_metadata(
-            scope,
+            &binding,
             Uuid::new_v4(),
-            &descriptor,
             Uuid::new_v4(),
             expected_plaintext,
         )
         .expect("construct candidate context");
         let manifest_context = GuardianCheckpointStageRecordContextV1::seal_manifest(
-            scope,
+            &binding,
+            &witness,
             candidate_context.upload_id(),
-            &descriptor,
             candidate_context.publication_id(),
             expected_plaintext,
         )
@@ -4058,10 +4027,17 @@ mod tests {
         drop(opened);
 
         let aad = checkpoint_stage_record_aad(cipher.key_id(), &candidate_context);
+        let expected_digest = candidate_context
+            .expected_plaintext_digest
+            .expect("production context carries its encrypted digest authority");
+        let substituted_inner =
+            checkpoint_stage_inner_plaintext(substituted_plaintext, expected_digest)
+                .expect("construct authenticated inner-envelope splice fixture");
         let (nonce, ciphertext) = cipher
             .output_cipher
-            .seal_guardian_metadata(substituted_plaintext, &aad)
+            .seal_guardian_metadata(substituted_inner.as_slice(), &aad)
             .expect("construct authenticated substituted-plaintext fixture");
+        drop(substituted_inner);
         let substituted_record = GuardianEncryptedCheckpointStageRecordV1 {
             version: GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION,
             key_id: cipher.key_id(),
