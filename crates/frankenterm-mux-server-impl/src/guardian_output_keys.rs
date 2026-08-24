@@ -8,14 +8,12 @@
 //! available for historical segment recovery.
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-#[cfg(unix)]
-use cap_fs_ext::MetadataExt as CapMetadataExt;
 use cap_std::fs::{Dir as CapDir, File as CapFile, Metadata as CapMetadata};
 use cap_std::fs::OpenOptions as CapOpenOptions;
-#[cfg(unix)]
+use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
 use cap_std::fs::OpenOptionsExt as _;
 #[cfg(unix)]
-use cap_std::fs::{MetadataExt as CapUnixMetadataExt, PermissionsExt as _};
+use cap_std::fs::PermissionsExt as _;
 use mux::guardian_output_journal::{
     GuardianOutputCipher, GuardianOutputJournalError, GuardianOutputKey,
 };

@@ -158,7 +158,6 @@ pub(crate) enum ScreenCheckpointCaptureError {
     InvalidLineGeometry,
     UnsupportedGraphicsState,
     ColdScrollbackMetadataInconsistent,
-    ColdScrollbackRowMissing(StableRowIndex),
     ColdScrollbackSnapshot(ScrollbackSpillError),
     ColdScrollbackNotRecoveryGrade,
 }

@@ -89,6 +89,41 @@ fn reserve_client_main_thread(
     }
 }
 
+fn reserve_client_main_thread_until_admitted(
+    service_class: MainThreadServiceClass,
+    estimated_bytes: usize,
+    operation: &'static str,
+) -> anyhow::Result<MainThreadSpawnReservation> {
+    let mut retry_delay = Duration::from_millis(10);
+    let mut attempts = 0_u64;
+    loop {
+        match try_reserve_main_thread(service_class, estimated_bytes) {
+            MainThreadReservationOutcome::Reserved(reservation) => return Ok(reservation),
+            rejected @ (MainThreadReservationOutcome::RetryableFull(_)
+            | MainThreadReservationOutcome::RetiredGeneration(_)
+            | MainThreadReservationOutcome::Coalesced(_)
+            | MainThreadReservationOutcome::SchedulerUnavailable) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts % 100 == 0 {
+                    log::warn!(
+                        "main-thread scheduler temporarily rejected mandatory {operation}; retrying exact retained authority (attempt {attempts}): {rejected:?}"
+                    );
+                }
+                thread::sleep(retry_delay);
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(Duration::from_secs(1));
+            }
+            rejected @ (MainThreadReservationOutcome::InvalidSize(_)
+            | MainThreadReservationOutcome::AuthorityExhausted(_)) => {
+                return Err(anyhow!(
+                    "main-thread scheduler terminally rejected mandatory {operation} before task construction: {rejected:?}"
+                ));
+            }
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 #[error("Timeout")]
 struct Timeout;
@@ -8444,7 +8479,7 @@ impl Client {
                     .close_rpc_transport(&receiver, "mux client reconnect loop terminated");
                 match reconnect_dispatch_authority.resolve_current() {
                     Ok(Some(dispatch)) => {
-                        match reserve_client_main_thread(
+                        match reserve_client_main_thread_until_admitted(
                             MainThreadServiceClass::Topology,
                             CLIENT_MAIN_THREAD_TOPOLOGY_ESTIMATED_BYTES,
                             "final client detach",

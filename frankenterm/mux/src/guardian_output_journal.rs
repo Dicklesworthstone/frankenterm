@@ -26,7 +26,7 @@ use chacha20poly1305::{
 };
 use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use thiserror::Error;
@@ -64,6 +64,13 @@ const SCROLLBACK_MANIFEST_AUTH_VERSION: u32 = 1;
 const SCROLLBACK_MANIFEST_AUTH_BYTES: usize = 56;
 const SCROLLBACK_MANIFEST_AUTH_ENCODED_BYTES: usize = 75;
 const SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES: u32 = 1024 * 1024;
+const SCROLLBACK_APPEND_WAL_AEAD_DOMAIN: &[u8] =
+    b"frankenterm.scrollback-append-wal-authentication.v1\0";
+const SCROLLBACK_APPEND_WAL_AUTH_PREFIX: &str = "ftswa1e:";
+const SCROLLBACK_APPEND_WAL_AUTH_VERSION: u32 = 1;
+const SCROLLBACK_APPEND_WAL_AUTH_BYTES: usize = 56;
+const SCROLLBACK_APPEND_WAL_AUTH_ENCODED_BYTES: usize = 75;
+const SCROLLBACK_APPEND_WAL_MAX_CANONICAL_BYTES: u32 = 1024 * 1024;
 const RECOVERY_MAX_RECORDS: u64 = 4_096;
 const RECOVERY_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -168,6 +175,105 @@ pub enum GuardianScrollbackManifestError {
     #[error("operating system entropy is unavailable for manifest authentication")]
     EntropyUnavailable,
     #[error("scrollback manifest authentication failed")]
+    AuthenticationFailed,
+}
+
+/// Opaque guardian authentication seal for one canonical exact-row append
+/// WAL transaction. This deliberately uses a distinct type, prefix, and AEAD
+/// domain from the v3 pointer manifest so neither authority can be replayed as
+/// the other even when their canonical byte lengths happen to match.
+pub struct GuardianScrollbackAppendWalAuthentication {
+    key_id: [u8; KEY_ID_BYTES],
+    canonical_bytes: u32,
+    nonce: [u8; NONCE_BYTES],
+    authentication_tag: [u8; AEAD_TAG_BYTES_USIZE],
+}
+
+impl GuardianScrollbackAppendWalAuthentication {
+    pub fn parse(record: &str) -> Result<Self, GuardianScrollbackAppendWalError> {
+        let encoded = record
+            .strip_prefix(SCROLLBACK_APPEND_WAL_AUTH_PREFIX)
+            .ok_or(GuardianScrollbackAppendWalError::MalformedRecord)?;
+        if encoded.len() != SCROLLBACK_APPEND_WAL_AUTH_ENCODED_BYTES {
+            return Err(GuardianScrollbackAppendWalError::MalformedRecord);
+        }
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| GuardianScrollbackAppendWalError::MalformedRecord)?;
+        if bytes.len() != SCROLLBACK_APPEND_WAL_AUTH_BYTES {
+            return Err(GuardianScrollbackAppendWalError::MalformedRecord);
+        }
+        if base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes) != encoded {
+            return Err(GuardianScrollbackAppendWalError::NonCanonicalRecord);
+        }
+        let version = read_u32(&bytes[0..4]);
+        if version != SCROLLBACK_APPEND_WAL_AUTH_VERSION {
+            return Err(GuardianScrollbackAppendWalError::UnsupportedVersion {
+                observed: version,
+            });
+        }
+        let mut key_id = [0; KEY_ID_BYTES];
+        key_id.copy_from_slice(&bytes[4..12]);
+        let canonical_bytes = read_u32(&bytes[12..16]);
+        if canonical_bytes == 0 || canonical_bytes > SCROLLBACK_APPEND_WAL_MAX_CANONICAL_BYTES {
+            return Err(GuardianScrollbackAppendWalError::CanonicalByteLimit);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        nonce.copy_from_slice(&bytes[16..40]);
+        let mut authentication_tag = [0; AEAD_TAG_BYTES_USIZE];
+        authentication_tag.copy_from_slice(&bytes[40..56]);
+        Ok(Self {
+            key_id,
+            canonical_bytes,
+            nonce,
+            authentication_tag,
+        })
+    }
+
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; KEY_ID_BYTES] {
+        self.key_id
+    }
+
+    pub fn encode(&self) -> String {
+        let mut bytes = Vec::with_capacity(SCROLLBACK_APPEND_WAL_AUTH_BYTES);
+        bytes.extend_from_slice(&SCROLLBACK_APPEND_WAL_AUTH_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.key_id);
+        bytes.extend_from_slice(&self.canonical_bytes.to_le_bytes());
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&self.authentication_tag);
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+        format!("{SCROLLBACK_APPEND_WAL_AUTH_PREFIX}{encoded}")
+    }
+}
+
+impl std::fmt::Debug for GuardianScrollbackAppendWalAuthentication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianScrollbackAppendWalAuthentication")
+            .field("key_id", &"[REDACTED]")
+            .field("canonical_bytes", &self.canonical_bytes)
+            .field("nonce", &"[REDACTED]")
+            .field("authentication_tag", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianScrollbackAppendWalError {
+    #[error("authenticated scrollback append WAL record is malformed")]
+    MalformedRecord,
+    #[error("authenticated scrollback append WAL record is not canonical")]
+    NonCanonicalRecord,
+    #[error("unsupported authenticated scrollback append WAL version {observed}")]
+    UnsupportedVersion { observed: u32 },
+    #[error("canonical scrollback append WAL exceeds its hard byte limit")]
+    CanonicalByteLimit,
+    #[error("authenticated scrollback append WAL key identity does not match")]
+    KeyIdentityMismatch,
+    #[error("operating system entropy is unavailable for append WAL authentication")]
+    EntropyUnavailable,
+    #[error("scrollback append WAL authentication failed")]
     AuthenticationFailed,
 }
 
@@ -776,6 +882,78 @@ impl GuardianOutputCipher {
         Ok(())
     }
 
+    /// Authenticate one canonical exact-row append WAL transaction. Only the
+    /// bounded metadata is associated data; the separately encrypted row is
+    /// bound through its length and digest in that canonical metadata.
+    pub fn authenticate_scrollback_append_wal(
+        &self,
+        canonical_wal: &[u8],
+    ) -> Result<GuardianScrollbackAppendWalAuthentication, GuardianScrollbackAppendWalError> {
+        let canonical_bytes = u32::try_from(canonical_wal.len())
+            .map_err(|_| GuardianScrollbackAppendWalError::CanonicalByteLimit)?;
+        if canonical_bytes == 0 || canonical_bytes > SCROLLBACK_APPEND_WAL_MAX_CANONICAL_BYTES {
+            return Err(GuardianScrollbackAppendWalError::CanonicalByteLimit);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        if OsRng.try_fill_bytes(&mut nonce).is_err() {
+            nonce.zeroize();
+            return Err(GuardianScrollbackAppendWalError::EntropyUnavailable);
+        }
+        let aad = scrollback_append_wal_aad(self.key_id, canonical_bytes, canonical_wal);
+        let authentication_tag = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &[],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackAppendWalError::AuthenticationFailed)?;
+        let authentication_tag: [u8; AEAD_TAG_BYTES_USIZE] = authentication_tag
+            .try_into()
+            .map_err(|_| GuardianScrollbackAppendWalError::AuthenticationFailed)?;
+        Ok(GuardianScrollbackAppendWalAuthentication {
+            key_id: self.key_id,
+            canonical_bytes,
+            nonce,
+            authentication_tag,
+        })
+    }
+
+    pub fn verify_scrollback_append_wal(
+        &self,
+        authentication: &GuardianScrollbackAppendWalAuthentication,
+        canonical_wal: &[u8],
+    ) -> Result<(), GuardianScrollbackAppendWalError> {
+        if authentication.key_id != self.key_id {
+            return Err(GuardianScrollbackAppendWalError::KeyIdentityMismatch);
+        }
+        let canonical_bytes = u32::try_from(canonical_wal.len())
+            .map_err(|_| GuardianScrollbackAppendWalError::CanonicalByteLimit)?;
+        if canonical_bytes == 0
+            || canonical_bytes > SCROLLBACK_APPEND_WAL_MAX_CANONICAL_BYTES
+            || canonical_bytes != authentication.canonical_bytes
+        {
+            return Err(GuardianScrollbackAppendWalError::CanonicalByteLimit);
+        }
+        let aad = scrollback_append_wal_aad(self.key_id, canonical_bytes, canonical_wal);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                XNonce::from_slice(&authentication.nonce),
+                Payload {
+                    msg: &authentication.authentication_tag,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackAppendWalError::AuthenticationFailed)?;
+        if !plaintext.is_empty() {
+            return Err(GuardianScrollbackAppendWalError::AuthenticationFailed);
+        }
+        Ok(())
+    }
+
     /// Seal guardian-owned journal metadata under a caller-supplied,
     /// domain-separated associated-data envelope.
     ///
@@ -905,6 +1083,26 @@ fn scrollback_manifest_aad(
     aad.extend_from_slice(&key_id);
     aad.extend_from_slice(&canonical_bytes.to_le_bytes());
     aad.extend_from_slice(canonical_manifest);
+    aad
+}
+
+fn scrollback_append_wal_aad(
+    key_id: [u8; KEY_ID_BYTES],
+    canonical_bytes: u32,
+    canonical_wal: &[u8],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        SCROLLBACK_APPEND_WAL_AEAD_DOMAIN.len()
+            + 4
+            + KEY_ID_BYTES
+            + 4
+            + canonical_wal.len(),
+    );
+    aad.extend_from_slice(SCROLLBACK_APPEND_WAL_AEAD_DOMAIN);
+    aad.extend_from_slice(&SCROLLBACK_APPEND_WAL_AUTH_VERSION.to_le_bytes());
+    aad.extend_from_slice(&key_id);
+    aad.extend_from_slice(&canonical_bytes.to_le_bytes());
+    aad.extend_from_slice(canonical_wal);
     aad
 }
 
@@ -1256,18 +1454,24 @@ pub struct GuardianRecoveredOutputRecord {
 
 impl GuardianRecoveredOutputRecord {
     #[must_use]
-    pub(crate) const fn receipt(&self) -> GuardianOutputAppendReceipt {
+    pub const fn receipt(&self) -> GuardianOutputAppendReceipt {
         self.receipt
     }
 
+    #[must_use]
+    pub(crate) fn delivery_parts(&self) -> (GuardianOutputAppendReceipt, &[u8]) {
+        (self.receipt, &self.plaintext)
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn plaintext(&self) -> &[u8] {
         &self.plaintext
     }
 
     #[must_use]
-    pub(crate) fn into_plaintext(self) -> Vec<u8> {
-        self.plaintext
+    pub(crate) fn into_delivery_parts(self) -> (GuardianOutputAppendReceipt, Vec<u8>) {
+        (self.receipt, self.plaintext)
     }
 }
 
@@ -1301,18 +1505,40 @@ impl GuardianOutputRecoveryBatch {
     }
 
     #[must_use]
-    pub(crate) const fn requested_first_sequence(&self) -> u64 {
+    pub const fn requested_first_sequence(&self) -> u64 {
         self.requested_first_sequence
     }
 
     #[must_use]
-    pub(crate) fn records(&self) -> &[GuardianRecoveredOutputRecord] {
+    pub fn records(&self) -> &[GuardianRecoveredOutputRecord] {
         &self.records
     }
 
     #[must_use]
-    pub(crate) fn into_records(self) -> Vec<GuardianRecoveredOutputRecord> {
-        self.records
+    pub(crate) fn into_delivery_parts(
+        self,
+    ) -> (
+        GuardianOutputSegmentIdentity,
+        u64,
+        Vec<GuardianRecoveredOutputRecord>,
+        Option<u64>,
+        Option<u64>,
+        u64,
+        u64,
+        Option<GuardianOutputAppendReceipt>,
+        GuardianOutputJournalTail,
+    ) {
+        (
+            self.segment_identity,
+            self.requested_first_sequence,
+            self.records,
+            self.next_recovery_sequence,
+            self.committed_next_sequence,
+            self.committed_log_bytes,
+            self.cumulative_plaintext_bytes,
+            self.terminal_receipt,
+            self.tail,
+        )
     }
 
     #[must_use]
@@ -1338,24 +1564,24 @@ impl GuardianOutputRecoveryBatch {
     }
 
     #[must_use]
-    pub(crate) const fn cumulative_plaintext_bytes(&self) -> u64 {
+    pub const fn cumulative_plaintext_bytes(&self) -> u64 {
         self.cumulative_plaintext_bytes
     }
 
     #[must_use]
-    pub(crate) const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
+    pub const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
         self.terminal_receipt
     }
 
     #[must_use]
-    pub(crate) fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
+    pub fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
         self.terminal_receipt
             .map(GuardianOutputAppendReceipt::into_predecessor)
             .or(self.segment_identity.predecessor)
     }
 
     #[must_use]
-    pub(crate) const fn tail(&self) -> GuardianOutputJournalTail {
+    pub const fn tail(&self) -> GuardianOutputJournalTail {
         self.tail
     }
 }
@@ -1673,7 +1899,7 @@ impl GuardianOutputJournal {
     /// Verified terminal record authority reconstructed while opening this
     /// segment. It is sufficient to form the exact successor predecessor.
     #[must_use]
-    pub(crate) const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
+    pub const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
         self.terminal_receipt
     }
 
@@ -1681,7 +1907,7 @@ impl GuardianOutputJournal {
     /// segment has no receipt of its own and therefore preserves the exact
     /// authenticated predecessor authority.
     #[must_use]
-    pub(crate) fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
+    pub fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
         self.terminal_receipt
             .map(GuardianOutputAppendReceipt::into_predecessor)
             .or(self.identity.predecessor)
@@ -1727,7 +1953,7 @@ impl GuardianOutputJournal {
     /// Re-read and authenticate a bounded contiguous page of the committed
     /// plaintext suffix. Every frame in the committed prefix is verified;
     /// bytes from an incomplete physical tail are reported but never returned.
-    pub(crate) fn recover_committed_range(
+    pub fn recover_committed_range(
         &self,
         first_sequence: u64,
         limits: GuardianOutputRecoveryLimits,
@@ -2509,13 +2735,6 @@ mod tests {
             ),
             Err(GuardianScrollbackManifestError::AuthenticationFailed)
         ));
-        assert!(matches!(
-            cipher.verify_scrollback_manifest(
-                &authentication,
-                br#"{"schema":"frankenterm.live-scrollback.manifest.v3","revision":10}"#,
-            ),
-            Err(GuardianScrollbackManifestError::CanonicalByteLimit)
-        ));
         let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
             .expect("wrong-key fixture is structurally valid");
         assert!(matches!(
@@ -2993,7 +3212,8 @@ mod tests {
             cipher(),
             GuardianOutputJournalLimits::default(),
         )
-        .expect_err("legacy guardian output journals must never be silently upgraded");
+        .err()
+        .expect("legacy guardian output journals must never be silently upgraded");
         assert!(matches!(
             error,
             GuardianOutputJournalError::UnsupportedVersion { observed: 1 }

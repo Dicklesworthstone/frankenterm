@@ -1,7 +1,7 @@
 use crate::config::validate_domain_name;
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
 
-#[derive(Default, Debug, Clone, FromDynamic, ToDynamic)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub struct SerialDomain {
     /// The name of this specific domain.  Must be unique amongst
     /// all types of domain in the configuration file.

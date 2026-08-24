@@ -3633,7 +3633,7 @@ impl ClientDomain {
         })
         .map_err(anyhow::Error::new)??;
 
-        let bootstrap_result = async {
+        let bootstrap_result: anyhow::Result<()> = async {
             if let Some(request) = current_active_workspace_sync(&inner, mux) {
                 rpc.set_active_workspace(request)
                     .await

@@ -55,6 +55,7 @@ frankenterm-client.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds = { workspace = true, default-features = false, features = ["async-asupersync"] }
 zstd.workspace = true
+thiserror.workspace = true
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [ "winuser" ]}

@@ -3,7 +3,7 @@ use frankenterm_dynamic::{FromDynamic, ToDynamic, Value};
 #[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 
-#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+#[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum ValueOrFunc {
     Value(Value),
     Func(String),
@@ -11,7 +11,7 @@ pub enum ValueOrFunc {
 #[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(ValueOrFunc);
 
-#[derive(Debug, Clone, FromDynamic, ToDynamic)]
+#[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub struct ExecDomain {
     #[dynamic(validate = "validate_domain_name")]
     pub name: String,

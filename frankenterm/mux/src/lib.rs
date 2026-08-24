@@ -61,11 +61,13 @@ use crate::client::{
     ClientId, ClientInfo, ClientRegistrationGeneration, ClientRegistrationOperationLease,
 };
 use crate::guardian_checkpoint::{
-    LiveParserCaptureAndBindError, LiveParserCheckpointAck,
-    capture_and_bind_live_parser_checkpoint,
+    GuardianCheckpointBoundary, GuardianCheckpointBoundaryError,
+    LiveParserCaptureAndBindError, LiveParserCheckpointAck, capture_and_bind_live_parser_checkpoint,
 };
 use crate::guardian_output_journal::{
-    GuardianOutputAppendReceipt, GuardianOutputSegmentIdentity,
+    GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalError,
+    GuardianOutputJournalTail, GuardianOutputPredecessor, GuardianOutputRecoveryLimits,
+    GuardianOutputSegmentIdentity, GuardianRecoveredOutputRecord,
 };
 use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
@@ -1845,7 +1847,7 @@ struct PaneRetirementCompletion {
 const LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
-pub(crate) enum LiveParserCheckpointError {
+pub enum LiveParserCheckpointError {
     #[error("live parser checkpoint timeout must be nonzero and no greater than {LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT:?}")]
     InvalidTimeout,
     #[error("pane registration is no longer current")]
@@ -1874,6 +1876,8 @@ pub(crate) enum LiveParserCheckpointError {
     GuardianDeliveryWatermarkMismatch,
     #[error("guardian output delivery cannot start after unjournaled parser bytes")]
     GuardianDeliveryStartedLate,
+    #[error("guardian output recovery page does not continue the authenticated parser cursor")]
+    GuardianRecoveryRangeMismatch,
     #[error("guardian output delivery byte accounting overflowed")]
     GuardianDeliveryOverflow,
     #[error("raw parser delivery attempted bytes without an authenticated guardian receipt")]
@@ -1914,6 +1918,106 @@ pub(crate) enum LiveParserCheckpointError {
     CompletionDisconnected,
 }
 
+/// Content-free acknowledgement for one authenticated journal recovery page
+/// delivered through the exact live parser registration.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianOutputRecoveryDelivery {
+    segment_identity: GuardianOutputSegmentIdentity,
+    requested_first_sequence: u64,
+    delivered_records: u64,
+    delivered_plaintext_bytes: u64,
+    next_recovery_sequence: Option<u64>,
+    committed_next_sequence: Option<u64>,
+    committed_log_bytes: u64,
+    cumulative_plaintext_bytes: u64,
+    terminal_predecessor: Option<GuardianOutputPredecessor>,
+    tail: GuardianOutputJournalTail,
+}
+
+impl GuardianOutputRecoveryDelivery {
+    #[must_use]
+    pub const fn segment_identity(self) -> GuardianOutputSegmentIdentity {
+        self.segment_identity
+    }
+
+    #[must_use]
+    pub const fn requested_first_sequence(self) -> u64 {
+        self.requested_first_sequence
+    }
+
+    #[must_use]
+    pub const fn delivered_records(self) -> u64 {
+        self.delivered_records
+    }
+
+    #[must_use]
+    pub const fn delivered_plaintext_bytes(self) -> u64 {
+        self.delivered_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn next_recovery_sequence(self) -> Option<u64> {
+        self.next_recovery_sequence
+    }
+
+    #[must_use]
+    pub const fn committed_next_sequence(self) -> Option<u64> {
+        self.committed_next_sequence
+    }
+
+    #[must_use]
+    pub const fn committed_log_bytes(self) -> u64 {
+        self.committed_log_bytes
+    }
+
+    #[must_use]
+    pub const fn cumulative_plaintext_bytes(self) -> u64 {
+        self.cumulative_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn terminal_predecessor(self) -> Option<GuardianOutputPredecessor> {
+        self.terminal_predecessor
+    }
+
+    #[must_use]
+    pub const fn tail(self) -> GuardianOutputJournalTail {
+        self.tail
+    }
+}
+
+impl std::fmt::Debug for GuardianOutputRecoveryDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianOutputRecoveryDelivery")
+            .field("segment_identity", &self.segment_identity)
+            .field("requested_first_sequence", &self.requested_first_sequence)
+            .field("delivered_records", &self.delivered_records)
+            .field("delivered_plaintext_bytes", &self.delivered_plaintext_bytes)
+            .field("next_recovery_sequence", &self.next_recovery_sequence)
+            .field("committed_next_sequence", &self.committed_next_sequence)
+            .field("committed_log_bytes", &self.committed_log_bytes)
+            .field("cumulative_plaintext_bytes", &self.cumulative_plaintext_bytes)
+            .field("terminal_predecessor", &self.terminal_predecessor)
+            .field("tail", &self.tail)
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianOutputRecoveryDeliveryError {
+    #[error("authenticated guardian output journal recovery failed")]
+    Journal(#[from] GuardianOutputJournalError),
+    #[error("guardian checkpoint boundary did not match authenticated journal recovery")]
+    CheckpointBoundary(#[from] GuardianCheckpointBoundaryError),
+    #[error("guardian output recovery could not be admitted to the exact live parser")]
+    LiveParser(#[from] LiveParserCheckpointError),
+    #[error("guardian output recovery could not publish exact bytes to the live parser")]
+    ParserDelivery(#[source] std::io::Error),
+    #[error("guardian output recovery page is internally inconsistent: {0}")]
+    InvalidPage(&'static str),
+}
+
 #[derive(Clone, Copy)]
 struct LiveParserGuardianCursor {
     segment_id: uuid::Uuid,
@@ -1928,6 +2032,7 @@ struct LiveParserAuthorizedDelivery {
     cursor: LiveParserGuardianCursor,
     payload: Arc<[u8]>,
 }
+
 impl LiveParserGuardianCursor {
     fn matches_receipt(
         self,
@@ -1995,10 +2100,10 @@ impl LiveParserCheckpointState {
     }
 }
 
-
 struct LiveParserCheckpointControl {
     state: Mutex<LiveParserCheckpointState>,
     delivery_gate: Condvar,
+    data_writer: Mutex<Option<FileDescriptor>>,
     wake_writer: Mutex<Option<FileDescriptor>>,
 }
 
@@ -2085,22 +2190,33 @@ impl LiveParserCheckpointControl {
         Self {
             state: Mutex::new(LiveParserCheckpointState::new(registration_wire_identity)),
             delivery_gate: Condvar::new(),
+            data_writer: Mutex::new(None),
             wake_writer: Mutex::new(None),
         }
     }
 
-    fn attach_wake_writer(&self, writer: FileDescriptor) -> Result<(), LiveParserCheckpointError> {
-        let mut wake_writer = self.wake_writer.lock();
+    fn attach_reader_channels(
+        &self,
+        data_writer: FileDescriptor,
+        checkpoint_wake_writer: FileDescriptor,
+    ) -> Result<(), LiveParserCheckpointError> {
+        let mut current_data_writer = self.data_writer.lock();
+        let mut current_wake_writer = self.wake_writer.lock();
         let mut state = self.state.lock();
         if state.dead {
             return Err(LiveParserCheckpointError::ReaderDead);
         }
-        if state.attached || wake_writer.is_some() {
+        if state.attached || current_data_writer.is_some() || current_wake_writer.is_some() {
             return Err(LiveParserCheckpointError::ReaderUnavailable);
         }
-        *wake_writer = Some(writer);
+        *current_data_writer = Some(data_writer);
+        *current_wake_writer = Some(checkpoint_wake_writer);
         state.attached = true;
         Ok(())
+    }
+
+    fn close_data_writer(&self) {
+        self.data_writer.lock().take();
     }
 
     fn wake_parser(&self) {
@@ -2454,6 +2570,79 @@ impl LiveParserCheckpointControl {
         }
         self.delivery_gate.notify_all();
     }
+
+    fn seed_guardian_recovery_cursor(
+        &self,
+        durable_pane_id: uuid::Uuid,
+        segment: GuardianOutputSegmentIdentity,
+        output: GuardianOutputAppendReceipt,
+    ) -> Result<(), LiveParserCheckpointError> {
+        let mut state = self.state.lock();
+        if !state.attached {
+            return Err(LiveParserCheckpointError::ReaderUnavailable);
+        }
+        if state.dead {
+            return Err(LiveParserCheckpointError::ReaderDead);
+        }
+        if let Some(reason) = state.poison {
+            return Err(LiveParserCheckpointError::Poisoned(reason));
+        }
+        if state.delivery_call_in_flight || state.socket_write_in_flight {
+            return Err(LiveParserCheckpointError::DeliveryWriteInFlight);
+        }
+        if state.pending.is_some() {
+            return Err(LiveParserCheckpointError::CheckpointBusy);
+        }
+        if state.guardian_mode
+            || state.guardian_cursor.is_some()
+            || state.authorized_delivery.is_some()
+            || state.delivered_bytes != 0
+            || state.parsed_bytes != 0
+        {
+            return Err(LiveParserCheckpointError::GuardianDeliveryStartedLate);
+        }
+        if segment.durable_pane_id() != durable_pane_id
+            || segment.segment_id() != output.segment_id()
+            || output.sequence() < segment.first_sequence()
+        {
+            return Err(LiveParserCheckpointError::GuardianDeliveryIdentityMismatch);
+        }
+        state.guardian_mode = true;
+        state.guardian_cursor = Some(LiveParserGuardianCursor {
+            segment_id: output.segment_id(),
+            output_sequence: output.sequence(),
+            output_record_digest: output.record_digest(),
+            output_committed_log_bytes: output.committed_log_bytes(),
+            journal_cumulative_plaintext_bytes: output.cumulative_plaintext_bytes(),
+            // A restored terminal begins a fresh external parser incarnation.
+            // Its parser watermark is therefore zero at the checkpoint even
+            // though the pane-lifetime journal watermark remains monotonic.
+            parser_global_endpoint: 0,
+        });
+        Ok(())
+    }
+
+    fn guardian_recovery_cursor(
+        &self,
+    ) -> Result<LiveParserGuardianCursor, LiveParserCheckpointError> {
+        let state = self.state.lock();
+        if state.dead {
+            return Err(LiveParserCheckpointError::ReaderDead);
+        }
+        if let Some(reason) = state.poison {
+            return Err(LiveParserCheckpointError::Poisoned(reason));
+        }
+        if state.delivery_call_in_flight || state.socket_write_in_flight {
+            return Err(LiveParserCheckpointError::DeliveryWriteInFlight);
+        }
+        if state.authorized_delivery.is_some() {
+            return Err(LiveParserCheckpointError::GuardianDeliveryBusy);
+        }
+        state
+            .guardian_cursor
+            .ok_or(LiveParserCheckpointError::GuardianDeliveryUnavailable)
+    }
+
     fn authorize_guardian_delivery(
         &self,
         durable_pane_id: uuid::Uuid,
@@ -2748,7 +2937,6 @@ impl LiveParserCheckpointControl {
                 "parser byte watermark exceeded counted socket delivery",
             ));
         }
-
     }
 
     fn ready_checkpoint_target(&self) -> Result<Option<u64>, LiveParserCheckpointError> {
@@ -2769,7 +2957,6 @@ impl LiveParserCheckpointControl {
         Ok((state.delivered_bytes == pending.target && state.parsed_bytes == pending.target)
             .then_some(pending.target))
     }
-
 
     fn reject_ready_checkpoint(&self, error: LiveParserCheckpointError) {
         {
@@ -2807,7 +2994,15 @@ impl LiveParserCheckpointControl {
         }
     }
 
-    fn write_delivered_bytes(
+    fn write_delivered_bytes(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut writer = self.data_writer.lock();
+        let writer = writer.as_mut().ok_or_else(|| {
+            std::io::Error::other(LiveParserCheckpointError::ReaderUnavailable.to_string())
+        })?;
+        self.write_delivered_bytes_with_writer(writer, bytes)
+    }
+
+    fn write_delivered_bytes_with_writer(
         &self,
         writer: &mut FileDescriptor,
         bytes: &[u8],
@@ -2963,9 +3158,25 @@ fn wait_for_parser_socket_writable(writer: &FileDescriptor) -> std::io::Result<(
         match poll(&mut readiness, None) {
             Ok(0) => {}
             Ok(_) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+            Err(error) if filedescriptor_error_is_interrupted(&error) => {}
+            Err(error) => return Err(filedescriptor_error_into_io(error)),
         }
+    }
+}
+
+fn filedescriptor_error_is_interrupted(error: &filedescriptor::Error) -> bool {
+    match error {
+        filedescriptor::Error::Poll(source) | filedescriptor::Error::Io(source) => {
+            source.kind() == std::io::ErrorKind::Interrupted
+        }
+        _ => false,
+    }
+}
+
+fn filedescriptor_error_into_io(error: filedescriptor::Error) -> std::io::Error {
+    match error {
+        filedescriptor::Error::Poll(source) | filedescriptor::Error::Io(source) => source,
+        other => std::io::Error::other(other),
     }
 }
 
@@ -3837,23 +4048,18 @@ mod pane_registration_handle {
         }
 
         /// Register one authenticated guardian receipt as the exact next byte
-        /// span this reader may publish to its parser socket. The future
-        /// guardian journal caller must invoke this for every receipt, before
+        /// span this reader may publish to its parser socket. Guardian journal
+        /// delivery invokes this for every receipt, before
         /// delivering that receipt's exact owned bytes; receipt length alone is
         /// insufficient, and raw PTY delivery never synthesizes this authority.
-        #[allow(
-            dead_code,
-            reason = "production guardian journal delivery caller lands after the protocol effect"
-        )]
-        pub(crate) fn authorize_guardian_output_delivery(
+        pub fn authorize_guardian_output_delivery(
             &self,
             segment: GuardianOutputSegmentIdentity,
             output: GuardianOutputAppendReceipt,
             payload: Arc<[u8]>,
         ) -> Result<u64, LiveParserCheckpointError> {
-            let (operation, pane, mux) = self
-                .resolve_current()
-                .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+            let pane = Arc::clone(&self.pane);
+            let mux = Arc::clone(&self.owner);
             let durable_pane_id = pane
                 .durable_pane_id()
                 .map(uuid::Uuid::from_bytes)
@@ -3877,12 +4083,404 @@ mod pane_registration_handle {
                             && Arc::ptr_eq(&registered.generation, &self.generation)
                     })
             };
-            drop(operation);
             if remains_current {
                 Ok(endpoint)
             } else {
                 Err(LiveParserCheckpointError::StaleRegistration)
             }
+        }
+
+        fn validate_guardian_recovery_page(
+            segment: GuardianOutputSegmentIdentity,
+            requested_first_sequence: u64,
+            records: &[GuardianRecoveredOutputRecord],
+            previous: Option<LiveParserGuardianCursor>,
+            next_recovery_sequence: Option<u64>,
+            committed_next_sequence: Option<u64>,
+            committed_log_bytes: u64,
+            cumulative_plaintext_bytes: u64,
+            terminal_receipt: Option<GuardianOutputAppendReceipt>,
+        ) -> Result<(), GuardianOutputRecoveryDeliveryError> {
+            let base_cumulative = segment
+                .predecessor()
+                .map_or(0, GuardianOutputPredecessor::cumulative_plaintext_bytes);
+            let expected_first = match previous {
+                Some(previous) => {
+                    let expected = previous.output_sequence.checked_add(1).ok_or(
+                        GuardianOutputRecoveryDeliveryError::InvalidPage(
+                            "the current parser cursor exhausted output sequence space",
+                        ),
+                    )?;
+                    if previous.segment_id != segment.segment_id() {
+                        let predecessor = segment.predecessor().ok_or(
+                            GuardianOutputRecoveryDeliveryError::InvalidPage(
+                                "a recovery segment rollover omitted its predecessor",
+                            ),
+                        )?;
+                        if predecessor.segment_id() != previous.segment_id
+                            || predecessor.last_sequence() != previous.output_sequence
+                            || predecessor.terminal_record_digest()
+                                != previous.output_record_digest
+                            || predecessor.committed_log_bytes()
+                                != previous.output_committed_log_bytes
+                            || predecessor.cumulative_plaintext_bytes()
+                                != previous.journal_cumulative_plaintext_bytes
+                            || segment.first_sequence() != expected
+                        {
+                            return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                                "the recovery segment predecessor does not match the live cursor",
+                            ));
+                        }
+                    }
+                    expected
+                }
+                None => requested_first_sequence,
+            };
+            if requested_first_sequence != expected_first {
+                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "the requested recovery sequence does not continue the live cursor",
+                ));
+            }
+
+            let mut expected_sequence = expected_first;
+            let mut previous_sequence = None;
+            let mut previous_cumulative = match previous {
+                Some(cursor) => cursor.journal_cumulative_plaintext_bytes,
+                None => match records.first() {
+                    Some(first) => {
+                        let first = first.receipt();
+                        let before_first = first
+                            .cumulative_plaintext_bytes()
+                            .checked_sub(u64::from(first.payload_bytes()))
+                            .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                                "the first recovery receipt underflows its plaintext watermark",
+                            ))?;
+                        if before_first < base_cumulative
+                            || (requested_first_sequence == segment.first_sequence()
+                                && before_first != base_cumulative)
+                        {
+                            return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                                "the first recovery receipt has an invalid prior watermark",
+                            ));
+                        }
+                        before_first
+                    }
+                    None => base_cumulative,
+                },
+            };
+            let mut previous_log_bytes = previous
+                .filter(|cursor| cursor.segment_id == segment.segment_id())
+                .map(|cursor| cursor.output_committed_log_bytes);
+            for record in records {
+                let (receipt, plaintext) = record.delivery_parts();
+                if receipt.segment_id() != segment.segment_id()
+                    || receipt.sequence() != expected_sequence
+                    || !receipt.matches_payload(plaintext)
+                {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "a recovered record does not match its authenticated sequence or payload",
+                    ));
+                }
+                let expected_cumulative = previous_cumulative
+                    .checked_add(u64::from(receipt.payload_bytes()))
+                    .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "recovery plaintext accounting overflowed",
+                    ))?;
+                if receipt.cumulative_plaintext_bytes() != expected_cumulative {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "a recovered record breaks the pane-lifetime plaintext watermark",
+                    ));
+                }
+                if previous_log_bytes.is_some_and(|previous| {
+                    receipt.committed_log_bytes() <= previous
+                }) {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "a recovered record does not advance the segment log endpoint",
+                    ));
+                }
+                previous_sequence = Some(receipt.sequence());
+                previous_cumulative = receipt.cumulative_plaintext_bytes();
+                previous_log_bytes = Some(receipt.committed_log_bytes());
+                expected_sequence = receipt.sequence().checked_add(1).unwrap_or(0);
+            }
+
+            if let Some(next) = next_recovery_sequence {
+                let last = previous_sequence.ok_or(
+                    GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "an empty recovery page cannot advertise a continuation",
+                    ),
+                )?;
+                if last.checked_add(1) != Some(next)
+                    || committed_next_sequence.is_some_and(|committed| next >= committed)
+                {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "the recovery page continuation is not an exact interior cursor",
+                    ));
+                }
+            } else if let Some(last) = previous_sequence {
+                if last.checked_add(1) != committed_next_sequence {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "a terminal recovery page does not reach the committed endpoint",
+                    ));
+                }
+            } else if committed_next_sequence != Some(requested_first_sequence) {
+                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "an empty recovery page is not positioned at the committed endpoint",
+                ));
+            }
+
+            match terminal_receipt {
+                Some(terminal) => {
+                    if terminal.segment_id() != segment.segment_id()
+                        || terminal.sequence().checked_add(1) != committed_next_sequence
+                        || terminal.committed_log_bytes() != committed_log_bytes
+                        || terminal.cumulative_plaintext_bytes() != cumulative_plaintext_bytes
+                    {
+                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                            "the recovery page aggregate does not match its terminal receipt",
+                        ));
+                    }
+                    let terminal_was_already_delivered = records.is_empty()
+                        && previous.is_some_and(|cursor| {
+                            cursor.segment_id == terminal.segment_id()
+                                && cursor.output_sequence == terminal.sequence()
+                                && cursor.output_record_digest == terminal.record_digest()
+                                && cursor.output_committed_log_bytes
+                                    == terminal.committed_log_bytes()
+                                && cursor.journal_cumulative_plaintext_bytes
+                                    == terminal.cumulative_plaintext_bytes()
+                        });
+                    if next_recovery_sequence.is_none()
+                        && previous_sequence != Some(terminal.sequence())
+                        && !terminal_was_already_delivered
+                    {
+                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                            "a terminal recovery page omits its authenticated terminal record",
+                        ));
+                    }
+                }
+                None => {
+                    if committed_next_sequence != Some(segment.first_sequence())
+                        || cumulative_plaintext_bytes != base_cumulative
+                    {
+                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                            "an empty segment recovery aggregate is inconsistent",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn deliver_guardian_recovery_records(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            records: Vec<GuardianRecoveredOutputRecord>,
+            skip_records: usize,
+        ) -> Result<(u64, u64), GuardianOutputRecoveryDeliveryError> {
+            let mut delivered_records = 0_u64;
+            let mut delivered_plaintext_bytes = 0_u64;
+            for record in records.into_iter().skip(skip_records) {
+                let (receipt, plaintext) = record.into_delivery_parts();
+                let plaintext_bytes = u64::try_from(plaintext.len()).map_err(|_| {
+                    GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "recovered plaintext length does not fit delivery accounting",
+                    )
+                })?;
+                let payload = Arc::<[u8]>::from(plaintext);
+                self.authorize_guardian_output_delivery(
+                    segment,
+                    receipt,
+                    Arc::clone(&payload),
+                )?;
+                self.generation
+                    .live_parser_checkpoint
+                    .write_delivered_bytes(payload.as_ref())
+                    .map_err(GuardianOutputRecoveryDeliveryError::ParserDelivery)?;
+                delivered_records = delivered_records.checked_add(1).ok_or(
+                    GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "recovery record delivery count overflowed",
+                    ),
+                )?;
+                delivered_plaintext_bytes = delivered_plaintext_bytes
+                    .checked_add(plaintext_bytes)
+                    .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "recovery plaintext delivery count overflowed",
+                    ))?;
+            }
+            Ok((delivered_records, delivered_plaintext_bytes))
+        }
+
+        fn recovery_delivery_receipt(
+            segment_identity: GuardianOutputSegmentIdentity,
+            requested_first_sequence: u64,
+            delivered_records: u64,
+            delivered_plaintext_bytes: u64,
+            next_recovery_sequence: Option<u64>,
+            committed_next_sequence: Option<u64>,
+            committed_log_bytes: u64,
+            cumulative_plaintext_bytes: u64,
+            terminal_receipt: Option<GuardianOutputAppendReceipt>,
+            tail: GuardianOutputJournalTail,
+        ) -> GuardianOutputRecoveryDelivery {
+            GuardianOutputRecoveryDelivery {
+                segment_identity,
+                requested_first_sequence,
+                delivered_records,
+                delivered_plaintext_bytes,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_predecessor: terminal_receipt
+                    .map(GuardianOutputAppendReceipt::into_predecessor)
+                    .or(segment_identity.predecessor()),
+                tail,
+            }
+        }
+
+        /// Authenticate the checkpoint record from a reopened journal, seed a
+        /// fresh parser incarnation at that exact model boundary, and deliver
+        /// only the later records in the first bounded recovery page. Callers
+        /// must retain the pane-reader start gate until this method and every
+        /// required continuation page have committed.
+        pub fn recover_guardian_output_from_checkpoint(
+            &self,
+            journal: &GuardianOutputJournal,
+            boundary: &GuardianCheckpointBoundary,
+            canonical_terminal_payload: &[u8],
+            limits: GuardianOutputRecoveryLimits,
+        ) -> Result<GuardianOutputRecoveryDelivery, GuardianOutputRecoveryDeliveryError> {
+            let batch = journal.recover_committed_range(boundary.output_sequence(), limits)?;
+            let (
+                segment_identity,
+                requested_first_sequence,
+                records,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+                tail,
+            ) = batch.into_delivery_parts();
+            if segment_identity != journal.identity()
+                || requested_first_sequence != boundary.output_sequence()
+            {
+                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "checkpoint recovery did not begin at the requested journal identity",
+                ));
+            }
+            Self::validate_guardian_recovery_page(
+                segment_identity,
+                requested_first_sequence,
+                &records,
+                None,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+            )?;
+            let checkpoint_receipt = records
+                .first()
+                .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "checkpoint recovery omitted the authenticated checkpoint record",
+                ))?
+                .receipt();
+            let durable_pane_id = self
+                .pane
+                .durable_pane_id()
+                .map(uuid::Uuid::from_bytes)
+                .ok_or(LiveParserCheckpointError::MissingDurablePaneIdentity)?;
+            boundary.validate_for_restore(
+                durable_pane_id,
+                segment_identity,
+                checkpoint_receipt,
+                canonical_terminal_payload,
+            )?;
+            self.generation
+                .live_parser_checkpoint
+                .seed_guardian_recovery_cursor(
+                    durable_pane_id,
+                    segment_identity,
+                    checkpoint_receipt,
+                )?;
+            let (delivered_records, delivered_plaintext_bytes) = self
+                .deliver_guardian_recovery_records(segment_identity, records, 1)?;
+            Ok(Self::recovery_delivery_receipt(
+                segment_identity,
+                requested_first_sequence,
+                delivered_records,
+                delivered_plaintext_bytes,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+                tail,
+            ))
+        }
+
+        /// Reopen, authenticate, and deliver one exact continuation page after
+        /// `recover_guardian_output_from_checkpoint` seeded this parser.
+        pub fn recover_and_deliver_guardian_output_page(
+            &self,
+            journal: &GuardianOutputJournal,
+            first_sequence: u64,
+            limits: GuardianOutputRecoveryLimits,
+        ) -> Result<GuardianOutputRecoveryDelivery, GuardianOutputRecoveryDeliveryError> {
+            let previous = self
+                .generation
+                .live_parser_checkpoint
+                .guardian_recovery_cursor()?;
+            let expected_first = previous.output_sequence.checked_add(1).ok_or(
+                LiveParserCheckpointError::GuardianRecoveryRangeMismatch,
+            )?;
+            if first_sequence != expected_first {
+                return Err(LiveParserCheckpointError::GuardianRecoveryRangeMismatch.into());
+            }
+            let batch = journal.recover_committed_range(first_sequence, limits)?;
+            let (
+                segment_identity,
+                requested_first_sequence,
+                records,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+                tail,
+            ) = batch.into_delivery_parts();
+            if segment_identity != journal.identity() {
+                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "continuation recovery changed journal identity",
+                ));
+            }
+            Self::validate_guardian_recovery_page(
+                segment_identity,
+                requested_first_sequence,
+                &records,
+                Some(previous),
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+            )?;
+            let (delivered_records, delivered_plaintext_bytes) = self
+                .deliver_guardian_recovery_records(segment_identity, records, 0)?;
+            Ok(Self::recovery_delivery_receipt(
+                segment_identity,
+                requested_first_sequence,
+                delivered_records,
+                delivered_plaintext_bytes,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+                tail,
+            ))
         }
 
         /// Freeze this exact live parser registration at the authenticated
@@ -3903,9 +4501,8 @@ mod pane_registration_handle {
             if timeout.is_zero() || timeout > LIVE_PARSER_CHECKPOINT_MAX_TIMEOUT {
                 return Err(LiveParserCheckpointError::InvalidTimeout);
             }
-            let (operation, pane, mux) = self
-                .resolve_current()
-                .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+            let pane = Arc::clone(&self.pane);
+            let mux = Arc::clone(&self.owner);
             let durable_pane_id = pane
                 .durable_pane_id()
                 .map(uuid::Uuid::from_bytes)
@@ -3951,17 +4548,10 @@ mod pane_registration_handle {
                         })
                 };
                 if !remains_current {
-                    drop(operation);
                     return Err(LiveParserCheckpointError::StaleRegistration);
                 }
             }
-            drop(operation);
             result
-        }
-
-        #[cfg(test)]
-        pub(super) fn live_parser_test_generation(&self) -> Arc<PaneRegistrationGeneration> {
-            Arc::clone(&self.generation)
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -4598,6 +5188,46 @@ mod pane_registration_handle {
                 _operation: operation,
                 _domain_operation: domain_operation,
             })
+        }
+
+        #[cfg(test)]
+        pub(super) fn live_parser_test_generation(&self) -> Arc<PaneRegistrationGeneration> {
+            Arc::clone(&self.generation)
+        }
+
+        #[cfg(test)]
+        pub(super) fn authorize_guardian_output_delivery(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            output: GuardianOutputAppendReceipt,
+            payload: Arc<[u8]>,
+        ) -> Result<u64, LiveParserCheckpointError> {
+            let owner = self
+                .generation
+                .owner
+                .upgrade()
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+            self.operation_guard(&owner)
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?
+                .authorize_guardian_output_delivery(segment, output, payload)
+        }
+
+        #[cfg(test)]
+        pub(super) fn capture_live_parser_checkpoint(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            output: GuardianOutputAppendReceipt,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+        ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
+            let owner = self
+                .generation
+                .owner
+                .upgrade()
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+            self.operation_guard(&owner)
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?
+                .capture_live_parser_checkpoint(segment, output, limits, timeout)
         }
 
         /// Resolve the exact owner for mux-internal topology transactions.
@@ -9241,7 +9871,7 @@ fn parse_buffered_data(
                 }
                 continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if filedescriptor_error_is_interrupted(&error) => continue,
             Err(_) => {
                 dead.store(true, Ordering::Release);
                 generation.live_parser_checkpoint.mark_dead();
@@ -9616,7 +10246,6 @@ fn read_from_pane_pty(
     generation: Arc<PaneRegistrationGeneration>,
     banner: Option<String>,
     mut reader: Box<dyn std::io::Read>,
-    mut tx: FileDescriptor,
     dead: Arc<AtomicBool>,
     parser_done: std::sync::mpsc::Receiver<()>,
 ) {
@@ -9632,7 +10261,7 @@ fn read_from_pane_pty(
     if let Some(banner) = banner {
         if let Err(err) = generation
             .live_parser_checkpoint
-            .write_delivered_bytes(&mut tx, banner.as_bytes())
+            .write_delivered_bytes(banner.as_bytes())
         {
             error!(
                 "read_pty failed to write banner to parser: pane {} {:?}",
@@ -9657,7 +10286,7 @@ fn read_from_pane_pty(
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
                 if let Err(err) = generation
                     .live_parser_checkpoint
-                    .write_delivered_bytes(&mut tx, &buf[..size])
+                    .write_delivered_bytes(&buf[..size])
                 {
                     error!(
                         "read_pty failed to write to parser: pane {} {:?}",
@@ -9673,7 +10302,7 @@ fn read_from_pane_pty(
     // buffered actions. Do not retire the generation until that final flush
     // completes; otherwise very short-lived commands can lose their last
     // frame when EOF races exact-generation cleanup.
-    drop(tx);
+    generation.live_parser_checkpoint.close_data_writer();
     let _ = parser_done.recv();
 
     let exit_behavior = exit_behavior.unwrap_or_else(|| configuration().exit_behavior);
@@ -13618,9 +14247,9 @@ impl Mux {
                 .with_context(|| format!("make pane {pane_id} checkpoint reader nonblocking"))?;
             generation
                 .live_parser_checkpoint
-                .attach_wake_writer(checkpoint_wake_tx)
+                .attach_reader_channels(tx, checkpoint_wake_tx)
                 .map_err(|error| {
-                    anyhow!("attach pane {pane_id} checkpoint control channel: {error}")
+                    anyhow!("attach pane {pane_id} parser data/control channels: {error}")
                 })?;
             let banner = self.banner.read().clone();
             let weak_pane = Arc::downgrade(pane);
@@ -13725,7 +14354,6 @@ impl Mux {
                                     reader_generation,
                                     banner,
                                     reader,
-                                    tx,
                                     reader_dead,
                                     parser_done_rx,
                                 );
@@ -20323,7 +20951,6 @@ mod tests {
         pane: Arc<dyn Pane>,
         registration: PaneRegistrationHandle,
         generation: Arc<PaneRegistrationGeneration>,
-        writer: Arc<StdMutex<Option<FileDescriptor>>>,
         parser_thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -20361,8 +20988,8 @@ mod tests {
                 .expect("make test checkpoint wake reader nonblocking");
             generation
                 .live_parser_checkpoint
-                .attach_wake_writer(wake_writer)
-                .expect("attach test checkpoint control");
+                .attach_reader_channels(data_writer, wake_writer)
+                .expect("attach test parser data/control channels");
             let parser_generation = Arc::clone(&generation);
             let parser_pane = Arc::downgrade(&pane);
             let parser_dead = Arc::clone(&generation.reader_dead);
@@ -20384,7 +21011,6 @@ mod tests {
                 pane,
                 registration,
                 generation,
-                writer: Arc::new(StdMutex::new(Some(data_writer))),
                 parser_thread: Some(parser_thread),
             }
         }
@@ -20405,13 +21031,9 @@ mod tests {
         }
 
         fn write(&self, payload: &[u8]) -> std::io::Result<()> {
-            let mut writer = self.writer.lock().unwrap_or_else(|error| error.into_inner());
             self.generation
                 .live_parser_checkpoint
-                .write_delivered_bytes(
-                    writer.as_mut().expect("test parser writer remains live"),
-                    payload,
-                )
+                .write_delivered_bytes(payload)
         }
 
         fn capture(
@@ -20451,10 +21073,7 @@ mod tests {
 
     impl Drop for LiveParserTestHarness {
         fn drop(&mut self) {
-            self.writer
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
+            self.generation.live_parser_checkpoint.close_data_writer();
             if let Some(parser_thread) = self.parser_thread.take() {
                 let _ = parser_thread.join();
             }
@@ -20679,7 +21298,7 @@ mod tests {
         });
 
         control
-            .write_delivered_bytes(&mut writer, &payload)
+            .write_delivered_bytes_with_writer(&mut writer, &payload)
             .expect("deliver payload through forced socket backpressure");
         assert_eq!(
             parser.join().expect("backpressure parser does not panic"),
@@ -20730,19 +21349,12 @@ mod tests {
             Err(LiveParserCheckpointError::CheckpointBusy)
         ));
 
-        let writer = Arc::clone(&harness.writer);
         let control = Arc::clone(&harness.generation.live_parser_checkpoint);
         let (writer_started_tx, writer_started_rx) = std::sync::mpsc::sync_channel(1);
         let (writer_done_tx, writer_done_rx) = std::sync::mpsc::sync_channel(1);
         let post_target_writer = std::thread::spawn(move || {
             writer_started_tx.send(()).expect("report writer start");
-            let result = {
-                let mut writer = writer.lock().unwrap_or_else(|error| error.into_inner());
-                control.write_delivered_bytes(
-                    writer.as_mut().expect("parser writer remains live"),
-                    b"post-target",
-                )
-            };
+            let result = control.write_delivered_bytes(b"post-target");
             writer_done_tx.send(result).expect("report writer result");
         });
         writer_started_rx
@@ -20935,11 +21547,7 @@ mod tests {
             assert!(Instant::now() < deadline, "checkpoint request was not registered");
             std::thread::yield_now();
         }
-        harness
-            .writer
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        harness.generation.live_parser_checkpoint.close_data_writer();
         assert!(matches!(
             capture_thread.join().expect("capture thread does not panic"),
             Err(LiveParserCheckpointError::IncompleteBoundary { .. })

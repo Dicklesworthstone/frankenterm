@@ -3283,6 +3283,7 @@ impl TerminalCheckpointV2 {
     }
 
     /// Capture every supported semantic field or reject unsupported graphics state.
+    #[cfg(test)]
     pub(crate) fn capture(terminal: &TerminalState) -> Result<Self, TerminalCheckpointError> {
         Self::capture_with_limits(terminal, TerminalCheckpointLimits::default())
     }
@@ -4296,7 +4297,6 @@ pub enum TerminalCheckpointError {
         reason: &'static str,
     },
     ColdScrollbackMetadataInconsistent,
-    ColdScrollbackRowMissing(StableRowIndex),
     ColdScrollbackSnapshot(crate::config::ScrollbackSpillError),
     ColdScrollbackNotRecoveryGrade,
     InvalidCurrentDirectory,
@@ -4338,9 +4338,6 @@ impl From<crate::screen::ScreenCheckpointCaptureError> for TerminalCheckpointErr
             }
             crate::screen::ScreenCheckpointCaptureError::ColdScrollbackMetadataInconsistent => {
                 Self::ColdScrollbackMetadataInconsistent
-            }
-            crate::screen::ScreenCheckpointCaptureError::ColdScrollbackRowMissing(row) => {
-                Self::ColdScrollbackRowMissing(row)
             }
             crate::screen::ScreenCheckpointCaptureError::ColdScrollbackSnapshot(error) => {
                 Self::ColdScrollbackSnapshot(error)
@@ -4385,10 +4382,6 @@ impl std::fmt::Display for TerminalCheckpointError {
             }
             Self::ColdScrollbackMetadataInconsistent => formatter.write_str(
                 "terminal checkpoint cold scrollback metadata changed or is inconsistent",
-            ),
-            Self::ColdScrollbackRowMissing(row) => write!(
-                formatter,
-                "terminal checkpoint cold scrollback row {row} could not be hydrated"
             ),
             Self::ColdScrollbackSnapshot(error) => {
                 write!(formatter, "terminal checkpoint cold scrollback snapshot failed: {error}")
@@ -4916,7 +4909,7 @@ mod tests {
 
     #[test]
     fn canonical_restore_roundtrips_complete_semantic_projection() {
-        let config: Arc<dyn TerminalConfiguration> = Arc::new(RichCheckpointTestConfig);
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(RichCheckpointTestConfig);
         let mut terminal = Terminal::new(
             TerminalSize {
                 rows: 24,
@@ -4978,7 +4971,7 @@ mod tests {
     #[test]
     fn writer_preparation_failure_returns_the_complete_retryable_inert_model() {
         let limits = TerminalCheckpointLimits::default();
-        let config: Arc<dyn TerminalConfiguration> = Arc::new(RichCheckpointTestConfig);
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(RichCheckpointTestConfig);
         let mut live = Terminal::new(
             TerminalSize::default(),
             Arc::clone(&config),
@@ -5020,7 +5013,7 @@ mod tests {
     fn malformed_published_receipt_poisons_activation_without_writer_swap_or_retry() {
         let limits = TerminalCheckpointLimits::default();
         let sink = Arc::new(MalformedReplacementReceiptSink::default());
-        let capture_config: Arc<dyn TerminalConfiguration> =
+        let capture_config: Arc<dyn TerminalConfiguration + Send + Sync> =
             Arc::new(ReplacementActivationConfig {
                 tier_enabled: false,
                 sink: Arc::clone(&sink),
@@ -5037,12 +5030,16 @@ mod tests {
         }
         let checkpoint = TerminalCheckpointV2::capture_with_limits(&live, limits)
             .expect("capture resident-only recovery fixture");
+        let canonical = checkpoint
+            .to_canonical_json(limits)
+            .expect("encode resident-only recovery fixture");
         let activation_config: Arc<dyn TerminalConfiguration> =
             Arc::new(ReplacementActivationConfig {
                 tier_enabled: true,
                 sink: Arc::clone(&sink),
             });
-        let inert = checkpoint
+        let inert = TerminalCheckpointV2::decode_canonical_json(&canonical, limits)
+            .expect("validate resident-only recovery fixture")
             .restore_inert(activation_config)
             .expect("restore retiering fixture off topology");
 

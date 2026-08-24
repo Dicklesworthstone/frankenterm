@@ -420,6 +420,41 @@ impl MainThreadSpawnReservation {
     {
         admitted_local_task(self.binding, self.permit, future, self.high_priority)
     }
+
+    /// Transfer this exact admission to a callback that constructs a local
+    /// future on the main thread.
+    ///
+    /// `async_task::spawn_local` binds its runnable to the thread that creates
+    /// it.  A background admission coordinator must therefore not call
+    /// [`Self::spawn_local`] directly, even though the runnable will later be
+    /// queued to the main thread.  This method first schedules a small `Send`
+    /// bootstrap under the reserved admission.  The bootstrap executes on the
+    /// main thread and hands the same non-cloneable reservation to `factory`,
+    /// which may then safely call [`Self::spawn_local`].  No second scheduler
+    /// slot is acquired during the handoff.
+    pub fn handoff_to_main_thread_local<F>(self, factory: F) -> MainThreadSpawnedTask<()>
+    where
+        F: FnOnce(MainThreadSpawnReservation) + Send + 'static,
+    {
+        let admission = self.permit.receipt();
+        let binding = Arc::clone(&self.binding);
+        let wake_binding = Arc::clone(&binding);
+        let high_priority = self.high_priority;
+        let (runnable, task) = async_task::spawn(
+            async move {
+                factory(self);
+            },
+            move |runnable| {
+                let _receipt = wake_binding.schedule(runnable, admission, high_priority);
+            },
+        );
+        let initial_enqueue = binding.schedule(runnable, admission, high_priority);
+        MainThreadSpawnedTask {
+            task,
+            admission,
+            initial_enqueue,
+        }
+    }
 }
 
 impl<R> MainThreadSpawnedTask<R> {
@@ -3436,6 +3471,56 @@ mod tests {
         assert_eq!(exec.admission_snapshot().active_tasks, 1);
         drop(occupying_reservation);
         assert_eq!(exec.admission_snapshot().active_tasks, 0);
+    }
+
+    #[test]
+    fn reserved_admission_handoffs_to_a_main_thread_local_future_without_a_second_slot() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let exec =
+            SimpleExecutor::try_with_limits(MainThreadAdmissionLimits::new(1, 64, 0, 0).unwrap())
+                .unwrap();
+        let reservation = match try_reserve_main_thread(MainThreadServiceClass::Topology, 32) {
+            MainThreadReservationOutcome::Reserved(reservation) => reservation,
+            outcome => panic!("expected exact handoff reservation, got {outcome:?}"),
+        };
+        let main_thread = std::thread::current().id();
+        let factory_ran = Arc::new(AtomicBool::new(false));
+        let local_future_ran = Arc::new(AtomicBool::new(false));
+        let factory_ran_in_task = Arc::clone(&factory_ran);
+        let local_future_ran_in_task = Arc::clone(&local_future_ran);
+
+        std::thread::spawn(move || {
+            assert_ne!(std::thread::current().id(), main_thread);
+            reservation
+                .handoff_to_main_thread_local(move |reservation| {
+                    assert_eq!(std::thread::current().id(), main_thread);
+                    factory_ran_in_task.store(true, Ordering::Release);
+                    reservation
+                        .spawn_local(async move {
+                            local_future_ran_in_task.store(true, Ordering::Release);
+                        })
+                        .detach();
+                })
+                .detach();
+        })
+        .join()
+        .expect("background admission coordinator must not panic");
+
+        assert_eq!(exec.admission_snapshot().active_tasks, 1);
+        assert_eq!(exec.queue_snapshot().depth, 1);
+        assert!(exec.try_tick().expect("bootstrap must be queued"));
+        assert!(factory_ran.load(Ordering::Acquire));
+        assert!(!local_future_ran.load(Ordering::Acquire));
+        assert_eq!(
+            exec.admission_snapshot().active_tasks,
+            1,
+            "the same task-lifetime permit must survive the handoff"
+        );
+        assert_eq!(exec.queue_snapshot().depth, 1);
+        assert!(exec.try_tick().expect("local future must be queued"));
+        assert!(local_future_ran.load(Ordering::Acquire));
+        assert_eq!(exec.admission_snapshot().active_tasks, 0);
+        assert_eq!(exec.queue_snapshot().depth, 0);
     }
 
     #[test]

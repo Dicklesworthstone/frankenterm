@@ -85,8 +85,17 @@ Compare: <https://github.com/Dicklesworthstone/frankenterm/compare/v0.15.1...mai
   the transport's internal reconnect budget cannot silently drop it. Config
   reload reconciles every independent domain/default while exact old
   generations drain, retries same-name client-to-raw transitions, and fences
-  stale or scheduler-rejected reload generations. Corrupt optional state fails
-  visibly and leaves only explicit
+  stale or scheduler-rejected reload generations. Main-thread admission
+  saturation is retained by one serialized `Idle`/`Starting`/`Running`
+  coordinator; only a successfully created worker counts as a retry handoff,
+  and its retirement is linearized with newer request publication so neither
+  thread-creation failure nor a cross-atomic lost wakeup can turn a promised
+  reconnect into a no-op. A config reload publishes a fail-closed validation
+  gate before revoking both the old admission request and supervisor epochs.
+  Automatic dialing cannot consume that config until the exact newest
+  generation passes aggregate reconciliation; invalid, duplicate, stale, or
+  terminally rejected generations remain visibly blocked until a later valid
+  reload converges. Corrupt optional state fails visibly and leaves only explicit
   `connect_automatically = true` configuration eligible for automatic dialing.
 - Keeps attached remote-domain reconnect supervision alive indefinitely by
   default with capped backoff and one reused connection window. The finite

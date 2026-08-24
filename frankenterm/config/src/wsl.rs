@@ -5,7 +5,7 @@ use frankenterm_dynamic::{FromDynamic, ToDynamic};
 use luahelper::impl_lua_conversion_dynamic;
 use std::collections::HashMap;
 
-#[derive(Default, Debug, Clone, FromDynamic, ToDynamic)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub struct WslDomain {
     #[dynamic(validate = "validate_domain_name")]
     pub name: String,

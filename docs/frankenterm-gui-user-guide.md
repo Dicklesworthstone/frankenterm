@@ -216,7 +216,15 @@ Hot configuration reload retires an old exact client-domain generation before
 publishing its replacement, but continues adding unrelated domains and a safe
 default while that guard drains. It retries the newest configuration until the
 same-name fence clears, including a client-to-raw domain transition; a stale
-reload generation cannot overwrite a newer one.
+reload generation cannot overwrite a newer one. Reload notification first
+publishes a fail-closed validation gate and revokes both the old scheduler
+request and supervisor epochs. Automatic connection cannot read or dial from
+the new domain configuration until that exact generation passes aggregate
+reconciliation. An invalid or duplicate configuration therefore leaves the
+last live registry intact and automatic reconnect visibly paused; fixing and
+successfully reloading the configuration resumes it. Temporary main-thread
+scheduler saturation is retained by one serialized retry coordinator, and a
+thread that failed to start is never reported as a pending reconnect.
 
 The preference is stored under FrankenTerm's mode-0700 private data directory
 in two alternating, mode-0600 checksummed files. It stores only

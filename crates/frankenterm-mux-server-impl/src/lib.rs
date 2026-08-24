@@ -7,7 +7,7 @@ use mux::domain::{Domain, LocalDomain};
 use mux::ssh::RemoteSshDomain;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, MutexGuard};
@@ -67,7 +67,31 @@ const LIVE_SCROLLBACK_CLEAR_EPOCH_DOMAIN: &[u8] =
     b"frankenterm.live-scrollback-clear-epoch.v1\0";
 const LIVE_SCROLLBACK_LOGICAL_LEDGER_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.live-scrollback-logical-ledger.v3\0";
+const LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1: &str =
+    "frankenterm.live-scrollback-append-wal.v1";
+const LIVE_SCROLLBACK_APPEND_WAL_NAME: &str = ".append-wal.v1.json";
+const LIVE_SCROLLBACK_APPEND_WAL_STAGE_NAME: &str = ".append-wal.v1.installing";
+const LIVE_SCROLLBACK_APPEND_WAL_RECORD_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.live-scrollback-append-wal-record.v1\0";
+const LIVE_SCROLLBACK_APPEND_WAL_TARGET_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.live-scrollback-append-wal-target.v1\0";
+const LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const LIVE_SCROLLBACK_MUTATION_LOCK_NAME: &str = ".mutation-lock.v3";
+
+fn configured_ssh_domains(config: &ConfigHandle) -> Vec<config::SshDomain> {
+    config
+        .ssh_domains()
+        .into_iter()
+        .map(|mut domain| {
+            // Freeze the top-level fallback into each exact generation.
+            // Otherwise a reload that changes only `ssh_backend` leaves
+            // `None == None` in the domain snapshot while changing the
+            // effective transport used by both raw and multiplexed SSH.
+            domain.ssh_backend.get_or_insert(config.ssh_backend);
+            domain
+        })
+        .collect()
+}
 
 pub fn configured_client_domains(config: &config::ConfigHandle) -> Vec<ClientDomainConfig> {
     let mut domains = vec![];
@@ -75,9 +99,9 @@ pub fn configured_client_domains(config: &config::ConfigHandle) -> Vec<ClientDom
         domains.push(ClientDomainConfig::Unix(unix_dom.clone()));
     }
 
-    for ssh_dom in config.ssh_domains() {
+    for ssh_dom in configured_ssh_domains(config) {
         if ssh_dom.multiplexing == SshMultiplexing::WezTerm {
-            domains.push(ClientDomainConfig::Ssh(ssh_dom.clone()));
+            domains.push(ClientDomainConfig::Ssh(ssh_dom));
         }
     }
 
@@ -85,6 +109,155 @@ pub fn configured_client_domains(config: &config::ConfigHandle) -> Vec<ClientDom
         domains.push(ClientDomainConfig::Tls(tls_client.clone()));
     }
     domains
+}
+
+#[derive(Clone)]
+enum ConfiguredRawDomain {
+    Ssh(config::SshDomain),
+    Wsl(config::WslDomain),
+    Exec(config::ExecDomain),
+    Serial(config::SerialDomain),
+}
+
+impl ConfiguredRawDomain {
+    fn name(&self) -> &str {
+        match self {
+            Self::Ssh(domain) => &domain.name,
+            Self::Wsl(domain) => &domain.name,
+            Self::Exec(domain) => &domain.name,
+            Self::Serial(domain) => &domain.name,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Ssh(_) => "raw SSH",
+            Self::Wsl(_) => "WSL",
+            Self::Exec(_) => "exec",
+            Self::Serial(_) => "serial",
+        }
+    }
+
+    fn matches_registration(&self, registered: &mux::DomainOperationGuard) -> bool {
+        match self {
+            Self::Ssh(expected) => registered
+                .downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|current| current.matches_configuration(expected)),
+            Self::Wsl(expected) => registered
+                .downcast_ref::<LocalDomain>()
+                .is_some_and(|current| current.matches_wsl_configuration(expected)),
+            Self::Exec(expected) => registered
+                .downcast_ref::<LocalDomain>()
+                .is_some_and(|current| current.matches_exec_configuration(expected)),
+            Self::Serial(expected) => registered
+                .downcast_ref::<LocalDomain>()
+                .is_some_and(|current| current.matches_serial_configuration(expected)),
+        }
+    }
+
+    fn instantiate(&self) -> anyhow::Result<Arc<dyn Domain>> {
+        match self {
+            Self::Ssh(domain) => Ok(Arc::new(RemoteSshDomain::with_configured_ssh_domain(
+                domain,
+            )?)),
+            Self::Wsl(domain) => Ok(Arc::new(LocalDomain::new_wsl(domain.clone())?)),
+            Self::Exec(domain) => Ok(Arc::new(LocalDomain::new_exec_domain(domain.clone())?)),
+            Self::Serial(domain) => {
+                Ok(Arc::new(LocalDomain::new_configured_serial_domain(
+                    domain.clone(),
+                )?))
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConfiguredRawDomains {
+    ordered: Vec<ConfiguredRawDomain>,
+    by_name: BTreeMap<String, usize>,
+}
+
+impl ConfiguredRawDomains {
+    fn insert(&mut self, domain: ConfiguredRawDomain) -> anyhow::Result<()> {
+        let name = domain.name().to_string();
+        anyhow::ensure!(
+            !self.by_name.contains_key(&name),
+            "configured domain name {name:?} is duplicated across raw transport entries"
+        );
+        let index = self.ordered.len();
+        self.ordered.push(domain);
+        self.by_name.insert(name, index);
+        Ok(())
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    fn get(&self, name: &str) -> Option<&ConfiguredRawDomain> {
+        self.by_name
+            .get(name)
+            .and_then(|index| self.ordered.get(*index))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ConfiguredRawDomain> {
+        self.ordered.iter()
+    }
+}
+
+fn configured_raw_domains(config: &config::ConfigHandle) -> anyhow::Result<ConfiguredRawDomains> {
+    let mut domains = ConfiguredRawDomains::default();
+    for ssh in configured_ssh_domains(config) {
+        if ssh.multiplexing == SshMultiplexing::None {
+            domains.insert(ConfiguredRawDomain::Ssh(ssh))?;
+        }
+    }
+    for wsl in config.wsl_domains() {
+        domains.insert(ConfiguredRawDomain::Wsl(wsl))?;
+    }
+    for exec in &config.exec_domains {
+        domains.insert(ConfiguredRawDomain::Exec(exec.clone()))?;
+    }
+    for serial in &config.serial_ports {
+        domains.insert(ConfiguredRawDomain::Serial(serial.clone()))?;
+    }
+    Ok(domains)
+}
+
+fn is_configured_raw_registration(registered: &mux::DomainOperationGuard) -> bool {
+    registered
+        .downcast_ref::<RemoteSshDomain>()
+        .is_some_and(RemoteSshDomain::is_configuration_owned)
+        || registered
+            .downcast_ref::<LocalDomain>()
+            .is_some_and(LocalDomain::is_configuration_owned)
+}
+
+fn retire_configured_registration(
+    mux: &Arc<Mux>,
+    registered: &mux::DomainOperationGuard,
+) -> anyhow::Result<()> {
+    let domain_id = registered.domain_id();
+    let domain_name = registered.domain_name().to_string();
+    if let Some(client) = registered.downcast_ref::<ClientDomain>() {
+        client.perform_detach();
+    } else {
+        anyhow::ensure!(
+            is_configured_raw_registration(registered),
+            "refusing to retire runtime-owned domain {domain_name:?} during configuration reconciliation"
+        );
+        if mux.domain_was_detached_if_guard(registered) {
+            return Ok(());
+        }
+    }
+
+    match mux.get_domain_by_name(&domain_name) {
+        None => Ok(()),
+        Some(current) if current.domain_id() != domain_id => Ok(()),
+        Some(_) => anyhow::bail!(
+            "configured domain {domain_name:?} remained live after exact-generation retirement"
+        ),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,20 +318,25 @@ pub fn reconcile_client_domain_config(
     let domain_name = expected.name();
 
     if let Some(registered) = mux.get_domain_by_name(domain_name) {
-        let client = registered.downcast_ref::<ClientDomain>().ok_or_else(|| {
-            anyhow::anyhow!(
-                "configured client domain {domain_name:?} collides with a live non-client domain"
-            )
-        })?;
-        if client.reconcile_configuration(expected) {
-            return Ok(ConfiguredClientDomainReconcileOutcome::Current);
+        if let Some(client) = registered.downcast_ref::<ClientDomain>() {
+            if client.reconcile_configuration(expected) {
+                return Ok(ConfiguredClientDomainReconcileOutcome::Current);
+            }
+
+            // `perform_detach` retires only this admitted registration. A newer
+            // same-name generation cannot be removed by the stale guard.
+            retire_configured_registration(mux, &registered)?;
+            return Ok(ConfiguredClientDomainReconcileOutcome::PendingRetirement);
         }
 
-        // `perform_detach` retires only this admitted registration. A newer
-        // same-name generation cannot be removed by the stale guard.
-        client.perform_detach();
-        drop(registered);
-        return Ok(ConfiguredClientDomainReconcileOutcome::PendingRetirement);
+        if is_configured_raw_registration(&registered) {
+            retire_configured_registration(mux, &registered)?;
+            return Ok(ConfiguredClientDomainReconcileOutcome::PendingRetirement);
+        }
+
+        anyhow::bail!(
+            "configured client domain {domain_name:?} collides with a live runtime-owned domain"
+        );
     }
 
     let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(expected.clone(), mux)?);
@@ -172,6 +350,7 @@ pub fn reconcile_client_domain_config(
         Err(error) => Err(anyhow::Error::new(error)),
     }
 }
+
 struct LiveScrollbackSpillSink {
     pane_id: u64,
     active_ledger_pane_id: std::sync::atomic::AtomicU64,
@@ -312,6 +491,71 @@ struct LiveScrollbackManifestV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     guardian_manifest_authentication: Option<String>,
     manifest_sha256: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveScrollbackAppendWalV1 {
+    schema: String,
+    durable_pane_id: String,
+    ledger_pane_id: u64,
+    predecessor_content_epoch: String,
+    predecessor_revision: u64,
+    predecessor_manifest_sha256: String,
+    target_content_epoch: String,
+    target_revision: u64,
+    initial_stable_row: wezterm_term::StableRowIndex,
+    newest_stable_row_exclusive: wezterm_term::StableRowIndex,
+    appended_stable_row: wezterm_term::StableRowIndex,
+    appended_sequence: u64,
+    max_retained_rows: u64,
+    target_oldest_sequence: u64,
+    target_next_sequence: u64,
+    target_record_count: u64,
+    target_retained_record_bytes: u64,
+    encrypted_record_bytes: u64,
+    encrypted_record_sha256: String,
+    target_record_set_sha256: String,
+    encrypted_record: String,
+    guardian_authentication: Option<String>,
+    wal_sha256: String,
+}
+
+impl std::fmt::Debug for LiveScrollbackAppendWalV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveScrollbackAppendWalV1")
+            .field("schema", &self.schema)
+            .field("durable_pane_id", &"[REDACTED]")
+            .field("ledger_pane_id", &self.ledger_pane_id)
+            .field("predecessor_content_epoch", &"[REDACTED]")
+            .field("predecessor_revision", &self.predecessor_revision)
+            .field("predecessor_manifest_sha256", &"[REDACTED]")
+            .field("target_content_epoch", &"[REDACTED]")
+            .field("target_revision", &self.target_revision)
+            .field("initial_stable_row", &self.initial_stable_row)
+            .field(
+                "newest_stable_row_exclusive",
+                &self.newest_stable_row_exclusive,
+            )
+            .field("appended_stable_row", &self.appended_stable_row)
+            .field("appended_sequence", &self.appended_sequence)
+            .field("max_retained_rows", &self.max_retained_rows)
+            .field("target_oldest_sequence", &self.target_oldest_sequence)
+            .field("target_next_sequence", &self.target_next_sequence)
+            .field("target_record_count", &self.target_record_count)
+            .field(
+                "target_retained_record_bytes",
+                &self.target_retained_record_bytes,
+            )
+            .field("encrypted_record_bytes", &self.encrypted_record_bytes)
+            .field("encrypted_record_sha256", &"[REDACTED]")
+            .field("target_record_set_sha256", &"[REDACTED]")
+            .field("encrypted_record", &"[REDACTED]")
+            .field("guardian_authentication", &"[REDACTED]")
+            .field("wal_sha256", &"[REDACTED]")
+            .finish()
+    }
 }
 
 fn live_scrollback_manifest_generation(
@@ -633,6 +877,7 @@ fn verify_live_scrollback_logical_ledger_digest_from_snapshot(
     );
     Ok(observed)
 }
+
 fn live_scrollback_cleared_manifest_is_canonical(
     manifest: &LiveScrollbackManifestV1,
 ) -> bool {
@@ -642,6 +887,115 @@ fn live_scrollback_cleared_manifest_is_canonical(
         && manifest.oldest_seq.is_none()
         && manifest.retained_rows == 0
         && manifest.next_seq == 0
+}
+
+fn live_scrollback_append_wal_record_digest(record: &str) -> anyhow::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(LIVE_SCROLLBACK_APPEND_WAL_RECORD_DIGEST_DOMAIN);
+    update_scrollback_digest_bytes(&mut hasher, record.as_bytes())?;
+    Ok(hasher.finalize().into())
+}
+
+fn decode_live_scrollback_canonical_digest(
+    encoded: &str,
+    field: &'static str,
+) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        encoded.len() == 64
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "{field} is not canonical lowercase hex"
+    );
+    let mut digest = [0; 32];
+    hex::decode_to_slice(encoded, &mut digest)
+        .with_context(|| format!("decode {field}"))?;
+    Ok(digest)
+}
+
+fn decode_live_scrollback_epoch(
+    encoded: &str,
+    field: &'static str,
+) -> anyhow::Result<[u8; 16]> {
+    anyhow::ensure!(
+        encoded.len() == 32
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "{field} is not canonical lowercase hex"
+    );
+    let mut epoch = [0; 16];
+    hex::decode_to_slice(encoded, &mut epoch).with_context(|| format!("decode {field}"))?;
+    anyhow::ensure!(epoch != [0; 16], "{field} is the reserved zero epoch");
+    Ok(epoch)
+}
+
+fn live_scrollback_append_wal_target_digest<F>(
+    wal: &LiveScrollbackAppendWalV1,
+    mut record_at: F,
+) -> anyhow::Result<([u8; 32], u64)>
+where
+    F: FnMut(u64) -> anyhow::Result<String>,
+{
+    let mut durable_pane_id = [0; 16];
+    hex::decode_to_slice(&wal.durable_pane_id, &mut durable_pane_id)
+        .context("decode append WAL durable pane identity")?;
+    let mut predecessor_epoch = [0; 16];
+    hex::decode_to_slice(
+        &wal.predecessor_content_epoch,
+        &mut predecessor_epoch,
+    )
+    .context("decode append WAL predecessor epoch")?;
+    let mut target_epoch = [0; 16];
+    hex::decode_to_slice(&wal.target_content_epoch, &mut target_epoch)
+        .context("decode append WAL target epoch")?;
+    let mut hasher = Sha256::new();
+    hasher.update(LIVE_SCROLLBACK_APPEND_WAL_TARGET_DIGEST_DOMAIN);
+    hasher.update(1_u32.to_le_bytes());
+    hasher.update(durable_pane_id);
+    hasher.update(wal.ledger_pane_id.to_le_bytes());
+    hasher.update(predecessor_epoch);
+    hasher.update(wal.predecessor_revision.to_le_bytes());
+    hasher.update(target_epoch);
+    hasher.update(wal.target_revision.to_le_bytes());
+    hasher.update(
+        i64::try_from(wal.initial_stable_row)
+            .map_err(|_| anyhow::anyhow!("append WAL initial stable row exceeds i64"))?
+            .to_le_bytes(),
+    );
+    hasher.update(
+        i64::try_from(wal.newest_stable_row_exclusive)
+            .map_err(|_| anyhow::anyhow!("append WAL newest stable row exceeds i64"))?
+            .to_le_bytes(),
+    );
+    hasher.update(wal.target_oldest_sequence.to_le_bytes());
+    hasher.update(wal.target_next_sequence.to_le_bytes());
+    hasher.update(wal.target_record_count.to_le_bytes());
+    hasher.update(wal.max_retained_rows.to_le_bytes());
+
+    let expected_next = wal
+        .target_oldest_sequence
+        .checked_add(wal.target_record_count)
+        .ok_or_else(|| anyhow::anyhow!("append WAL target sequence range overflows"))?;
+    anyhow::ensure!(
+        expected_next == wal.target_next_sequence,
+        "append WAL target sequence range is inconsistent"
+    );
+    let mut retained_record_bytes = 0_u64;
+    for sequence in wal.target_oldest_sequence..wal.target_next_sequence {
+        let record = record_at(sequence)?;
+        retained_record_bytes = retained_record_bytes
+            .checked_add(
+                u64::try_from(record.len())
+                    .map_err(|_| anyhow::anyhow!("append WAL record length exceeds u64"))?,
+            )
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("append WAL target byte count overflows"))?;
+        hasher.update(sequence.to_le_bytes());
+        update_scrollback_digest_bytes(&mut hasher, record.as_bytes())?;
+    }
+    hasher.update(retained_record_bytes.to_le_bytes());
+    Ok((hasher.finalize().into(), retained_record_bytes))
 }
 
 struct LiveScrollbackFilesystemMutationLease {
@@ -717,6 +1071,7 @@ fn acquire_live_scrollback_filesystem_mutation_lease(
     }
     Ok(LiveScrollbackFilesystemMutationLease { file })
 }
+
 #[derive(Debug)]
 struct LiveScrollbackManifestPublishError {
     outcome_indeterminate: bool,
@@ -1074,6 +1429,7 @@ impl LiveScrollbackSpillSink {
         pane_id_bytes.copy_from_slice(&digest[..8]);
         Ok(u64::from_le_bytes(pane_id_bytes) | (1_u64 << 63))
     }
+
     fn manifest_checksum(manifest: &LiveScrollbackManifestV1) -> anyhow::Result<String> {
         use sha2::{Digest as _, Sha256};
 
@@ -1090,6 +1446,167 @@ impl LiveScrollbackSpillSink {
         canonical.guardian_manifest_authentication = None;
         canonical.manifest_sha256.clear();
         serde_json::to_vec(&canonical).context("serialize canonical scrollback manifest")
+    }
+
+    fn append_wal_path(manifest_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+        Ok(manifest_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("scrollback manifest path has no parent"))?
+            .join(LIVE_SCROLLBACK_APPEND_WAL_NAME))
+    }
+
+    fn append_wal_stage_path(manifest_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+        Ok(manifest_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("scrollback manifest path has no parent"))?
+            .join(LIVE_SCROLLBACK_APPEND_WAL_STAGE_NAME))
+    }
+
+    fn append_wal_checksum(wal: &LiveScrollbackAppendWalV1) -> anyhow::Result<String> {
+        let mut canonical = wal.clone();
+        canonical.wal_sha256.clear();
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?)))
+    }
+
+    fn append_wal_authentication_bytes(
+        wal: &LiveScrollbackAppendWalV1,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut canonical = wal.clone();
+        canonical.encrypted_record.clear();
+        canonical.guardian_authentication = None;
+        canonical.wal_sha256.clear();
+        serde_json::to_vec(&canonical).context("serialize canonical scrollback append WAL")
+    }
+
+    fn validate_append_wal_identity(
+        wal: &LiveScrollbackAppendWalV1,
+        durable_pane_id: [u8; 16],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            wal.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V1,
+            "unsupported live scrollback append WAL schema"
+        );
+        let expected_durable_pane_id = uuid::Uuid::from_bytes(durable_pane_id)
+            .simple()
+            .to_string();
+        anyhow::ensure!(
+            wal.durable_pane_id == expected_durable_pane_id,
+            "live scrollback append WAL belongs to another durable pane"
+        );
+        let predecessor_epoch = decode_live_scrollback_epoch(
+            &wal.predecessor_content_epoch,
+            "append WAL predecessor epoch",
+        )?;
+        let target_epoch =
+            decode_live_scrollback_epoch(&wal.target_content_epoch, "append WAL target epoch")?;
+        anyhow::ensure!(
+            target_epoch == predecessor_epoch
+                && wal.target_revision
+                    == wal
+                        .predecessor_revision
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("append WAL predecessor is exhausted"))?,
+            "append WAL target is not the exact predecessor successor"
+        );
+        decode_live_scrollback_canonical_digest(
+            &wal.predecessor_manifest_sha256,
+            "append WAL predecessor manifest digest",
+        )?;
+        let record_digest = decode_live_scrollback_canonical_digest(
+            &wal.encrypted_record_sha256,
+            "append WAL encrypted-record digest",
+        )?;
+        decode_live_scrollback_canonical_digest(
+            &wal.target_record_set_sha256,
+            "append WAL target record-set digest",
+        )?;
+        anyhow::ensure!(
+            wal.encrypted_record_bytes == u64::try_from(wal.encrypted_record.len())?
+                && wal.encrypted_record_bytes != 0
+                && wal.encrypted_record_bytes <= LIVE_SCROLLBACK_APPEND_WAL_MAX_BYTES,
+            "append WAL encrypted-record length is invalid"
+        );
+        anyhow::ensure!(
+            live_scrollback_append_wal_record_digest(&wal.encrypted_record)? == record_digest,
+            "append WAL encrypted-record digest mismatch"
+        );
+        anyhow::ensure!(
+            wal.max_retained_rows != 0
+                && wal.target_record_count != 0
+                && wal.target_record_count <= wal.max_retained_rows
+                && wal.target_retained_record_bytes != 0
+                && wal.target_retained_record_bytes
+                    <= LIVE_SCROLLBACK_REPLACEMENT_MAX_COMMITTED_BYTES,
+            "append WAL target retention bounds are invalid"
+        );
+        let target_next_sequence = wal
+            .appended_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("append WAL sequence is exhausted"))?;
+        anyhow::ensure!(
+            wal.target_next_sequence == target_next_sequence
+                && wal.target_oldest_sequence
+                    .checked_add(wal.target_record_count)
+                    == Some(wal.target_next_sequence),
+            "append WAL target sequence interval is inconsistent"
+        );
+        let stable_offset = wezterm_term::StableRowIndex::try_from(wal.appended_sequence)
+            .map_err(|_| anyhow::anyhow!("append WAL sequence exceeds stable-row range"))?;
+        let appended_stable_row = wal
+            .initial_stable_row
+            .checked_add(stable_offset)
+            .ok_or_else(|| anyhow::anyhow!("append WAL stable-row identity overflows"))?;
+        let newest_offset = wezterm_term::StableRowIndex::try_from(wal.target_next_sequence)
+            .map_err(|_| anyhow::anyhow!("append WAL endpoint exceeds stable-row range"))?;
+        anyhow::ensure!(
+            wal.appended_stable_row == appended_stable_row
+                && wal.newest_stable_row_exclusive
+                    == wal
+                        .initial_stable_row
+                        .checked_add(newest_offset)
+                        .ok_or_else(|| anyhow::anyhow!("append WAL endpoint overflows"))?,
+            "append WAL stable-row interval is inconsistent"
+        );
+        let parsed = mux::guardian_output_journal::GuardianEncryptedScrollbackRow::parse(
+            &wal.encrypted_record,
+        )
+        .context("parse append WAL exact row")?;
+        let identity = parsed.identity();
+        anyhow::ensure!(
+            identity.durable_pane_id() == durable_pane_id
+                && identity.content_epoch() == target_epoch
+                && identity.revision() == wal.target_revision
+                && identity.stable_row() == i64::try_from(wal.appended_stable_row)?
+                && identity.sequence() == wal.appended_sequence,
+            "append WAL exact row has the wrong authenticated location"
+        );
+        anyhow::ensure!(
+            wal.guardian_authentication.is_some(),
+            "append WAL guardian authentication is missing"
+        );
+        Ok(())
+    }
+
+    fn authenticate_append_wal(
+        wal: &LiveScrollbackAppendWalV1,
+        keyring: &guardian_output_keys::GuardianOutputKeyring,
+    ) -> anyhow::Result<()> {
+        let authentication =
+            mux::guardian_output_journal::GuardianScrollbackAppendWalAuthentication::parse(
+                wal.guardian_authentication
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("append WAL authentication is missing"))?,
+            )
+            .context("parse append WAL guardian authentication")?;
+        let cipher = keyring
+            .cipher_for_key_id(authentication.key_id())
+            .context("load historical append WAL guardian key")?;
+        cipher
+            .verify_scrollback_append_wal(
+                &authentication,
+                &Self::append_wal_authentication_bytes(wal)?,
+            )
+            .context("authenticate exact-row append WAL")
     }
 
     fn manifest_ledger_pane_id(manifest: &LiveScrollbackManifestV1) -> anyhow::Result<u64> {
@@ -1347,6 +1864,7 @@ impl LiveScrollbackSpillSink {
         );
         Ok(())
     }
+
     fn validate_persisted_records(
         store: &frankenterm_core::storage::mmap_store::MmapScrollbackStore,
         pane_id: u64,
@@ -2111,6 +2629,7 @@ impl LiveScrollbackSpillSink {
             .ok_or_else(|| anyhow::anyhow!("scrollback manifest path has no parent"))?;
         Ok(parent.join("manifest.json.installing-v3"))
     }
+
     fn persist_manifest(
         &self,
         publication_state: &'static str,
@@ -2610,6 +3129,7 @@ impl LiveScrollbackSpillSink {
         drop(store);
         self.revalidate_snapshot_manifest(&manifest)
     }
+
     fn lock_state(
         &self,
         context: &str,
@@ -3131,6 +3651,15 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             Ok(state) => *state,
             Err(_) => return false,
         };
+        // A checksum-only v1/v2 manifest cannot authorize appending newly
+        // encrypted rows. Mixing an exact row into that unauthenticated
+        // lineage would leave its location metadata mutable and could later
+        // be mistaken for a recovery-grade generation. Existing legacy rows
+        // remain readable/exportable; an explicit authenticated clear is the
+        // only operation here that establishes a fresh exact lineage.
+        if !current_state.authenticated_manifest {
+            return false;
+        }
         let stage_path = match Self::deterministic_manifest_stage_path(&self.manifest_path) {
             Ok(path) => path,
             Err(_) => return false,
@@ -4979,6 +5508,97 @@ fn add_configured_domain_or_defer(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfiguredRawDomainReconcileOutcome {
+    Current,
+    Registered,
+    PendingRetirement,
+}
+
+fn reconcile_raw_domain_config(
+    mux: &Arc<Mux>,
+    expected: &ConfiguredRawDomain,
+) -> anyhow::Result<ConfiguredRawDomainReconcileOutcome> {
+    let domain_name = expected.name();
+    if let Some(registered) = mux.get_domain_by_name(domain_name) {
+        if expected.matches_registration(&registered) {
+            return Ok(ConfiguredRawDomainReconcileOutcome::Current);
+        }
+        if registered.is::<ClientDomain>() || is_configured_raw_registration(&registered) {
+            retire_configured_registration(mux, &registered)?;
+            return Ok(ConfiguredRawDomainReconcileOutcome::PendingRetirement);
+        }
+        anyhow::bail!(
+            "configured {} domain {domain_name:?} collides with a live runtime-owned domain",
+            expected.kind(),
+        );
+    }
+
+    let domain = expected.instantiate()?;
+    let mut pending = Vec::new();
+    add_configured_domain_or_defer(mux, &domain, &mut pending)?;
+    if pending.is_empty() {
+        Ok(ConfiguredRawDomainReconcileOutcome::Registered)
+    } else {
+        Ok(ConfiguredRawDomainReconcileOutcome::PendingRetirement)
+    }
+}
+
+fn validate_desired_domain_collisions(
+    mux: &Arc<Mux>,
+    desired_client_names: &BTreeSet<String>,
+    desired_raw_domains: &ConfiguredRawDomains,
+) -> anyhow::Result<()> {
+    for registered in mux.iter_domains() {
+        let name = registered.domain_name();
+        if !desired_client_names.contains(name) && !desired_raw_domains.contains_key(name) {
+            continue;
+        }
+        anyhow::ensure!(
+            registered.is::<ClientDomain>() || is_configured_raw_registration(&registered),
+            "configured domain {name:?} collides with a live runtime-owned domain"
+        );
+    }
+    Ok(())
+}
+
+fn validate_requested_default_domain(
+    mux: &Arc<Mux>,
+    desired_client_names: &BTreeSet<String>,
+    desired_raw_domains: &ConfiguredRawDomains,
+    default_name: Option<&String>,
+    is_standalone_mux: bool,
+) -> anyhow::Result<()> {
+    let Some(name) = default_name else {
+        return Ok(());
+    };
+    let key = if is_standalone_mux {
+        "default_mux_server_domain"
+    } else {
+        "default_domain"
+    };
+
+    if desired_client_names.contains(name) {
+        anyhow::ensure!(
+            !is_standalone_mux,
+            "default_mux_server_domain cannot be set to a client domain!"
+        );
+        return Ok(());
+    }
+    if desired_raw_domains.contains_key(name) {
+        return Ok(());
+    }
+
+    let Some(registered) = mux.get_domain_by_name(name) else {
+        anyhow::bail!("configured {key}={name:?} does not match any registered domain");
+    };
+    anyhow::ensure!(
+        !registered.is::<ClientDomain>() && !is_configured_raw_registration(&registered),
+        "configured {key}={name:?} names a configuration-owned domain absent from the desired configuration"
+    );
+    Ok(())
+}
+
 fn update_mux_domains_impl(
     config: &ConfigHandle,
     is_standalone_mux: bool,
@@ -4989,20 +5609,67 @@ fn update_mux_domains_impl(
         .iter()
         .map(|client| client.name().to_string())
         .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        desired_client_names.len() == client_configs.len(),
+        "configured client domain names must be unique"
+    );
+    let desired_raw_domains = configured_raw_domains(config)?;
+    if let Some(duplicate) = desired_client_names
+        .iter()
+        .find(|name| desired_raw_domains.contains_key(name))
+    {
+        anyhow::bail!(
+            "configured domain name {duplicate:?} is duplicated across client and raw transports"
+        );
+    }
 
-    // ClientDomain is the configuration-owned, replaceable transport domain.
-    // Close admission to any generation removed from the new desired set
-    // before publishing additions. Exact operation guards continue fencing
-    // destructive cleanup, but the retired name cannot be dialed again.
+    // Fail before mutation for a desired configured name that is occupied by
+    // a runtime-created domain. Only domains carrying explicit configuration
+    // ownership may participate in transport replacement.
+    validate_desired_domain_collisions(&mux, &desired_client_names, &desired_raw_domains)?;
+    validate_requested_default_domain(
+        &mux,
+        &desired_client_names,
+        &desired_raw_domains,
+        if is_standalone_mux {
+            config.default_mux_server_domain.as_ref()
+        } else {
+            config.default_domain.as_ref()
+        },
+        is_standalone_mux,
+    )?;
+
+    let mut pending_retirements = Vec::new();
+
+    // Reconcile every configuration-owned transport class symmetrically.
+    // Logical retirement closes name-based admission immediately; the exact
+    // operation guard retained by this sweep fences destructive cleanup until
+    // this iteration ends. Runtime-created domains are deliberately excluded.
     for registered in mux.iter_domains() {
-        if let Some(client) = registered.downcast_ref::<ClientDomain>() {
-            if !desired_client_names.contains(registered.domain_name()) {
-                client.perform_detach();
+        let domain_name = registered.domain_name().to_string();
+        if registered.is::<ClientDomain>() {
+            if desired_client_names.contains(&domain_name) {
+                continue;
             }
+        } else if is_configured_raw_registration(&registered) {
+            if desired_raw_domains
+                .get(&domain_name)
+                .is_some_and(|expected| expected.matches_registration(&registered))
+            {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        retire_configured_registration(&mux, &registered)?;
+        if desired_client_names.contains(&domain_name)
+            || desired_raw_domains.contains_key(&domain_name)
+        {
+            pending_retirements.push(domain_name);
         }
     }
 
-    let mut pending_retirements = Vec::new();
     for client_config in &client_configs {
         let domain_name = client_config.name().to_string();
         match reconcile_client_domain_config(&mux, client_config)? {
@@ -5017,44 +5684,14 @@ fn update_mux_domains_impl(
         }
     }
 
-    for ssh_dom in config.ssh_domains() {
-        if ssh_dom.multiplexing != SshMultiplexing::None {
-            continue;
+    for raw_config in desired_raw_domains.iter() {
+        match reconcile_raw_domain_config(&mux, raw_config)? {
+            ConfiguredRawDomainReconcileOutcome::Current
+            | ConfiguredRawDomainReconcileOutcome::Registered => {}
+            ConfiguredRawDomainReconcileOutcome::PendingRetirement => {
+                pending_retirements.push(raw_config.name().to_string());
+            }
         }
-
-        if mux.get_domain_by_name(&ssh_dom.name).is_some() {
-            continue;
-        }
-
-        let domain: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain(&ssh_dom)?);
-        add_configured_domain_or_defer(&mux, &domain, &mut pending_retirements)?;
-    }
-
-    for wsl_dom in config.wsl_domains() {
-        if mux.get_domain_by_name(&wsl_dom.name).is_some() {
-            continue;
-        }
-
-        let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_wsl(wsl_dom.clone())?);
-        add_configured_domain_or_defer(&mux, &domain, &mut pending_retirements)?;
-    }
-
-    for exec_dom in &config.exec_domains {
-        if mux.get_domain_by_name(&exec_dom.name).is_some() {
-            continue;
-        }
-
-        let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_exec_domain(exec_dom.clone())?);
-        add_configured_domain_or_defer(&mux, &domain, &mut pending_retirements)?;
-    }
-
-    for serial in &config.serial_ports {
-        if mux.get_domain_by_name(&serial.name).is_some() {
-            continue;
-        }
-
-        let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_serial_domain(serial.clone())?);
-        add_configured_domain_or_defer(&mux, &domain, &mut pending_retirements)?;
     }
 
     if is_standalone_mux {
@@ -5105,7 +5742,7 @@ pub static PKI: std::sync::LazyLock<pki::Pki> =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::{Config, SshDomain};
+    use config::{Config, ExecDomain, SerialDomain, SshDomain, WslDomain};
     use std::sync::MutexGuard;
     use termwiz::cell::CellAttributes;
     use wezterm_term::Line;
@@ -5166,9 +5803,28 @@ mod tests {
         config.unix_domains.clear();
         config.tls_clients.clear();
         config.ssh_domains = Some(ssh_domains);
+        config.wsl_domains = Some(Vec::new());
+        config.exec_domains.clear();
+        config.serial_ports.clear();
         configure(&mut config);
         config::use_this_configuration(config);
         config::configuration()
+    }
+
+    fn wait_for_domain_reconciliation(config: &ConfigHandle) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match reconcile_mux_domains(config)? {
+                MuxDomainUpdateOutcome::Converged => return Ok(()),
+                MuxDomainUpdateOutcome::PendingRetirements { .. } => {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "configured domain replacement did not converge after exact guards drained"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     fn reset_test_state() {
@@ -6146,6 +6802,26 @@ mod tests {
         assert_eq!(manifest.oldest_seq, Some(0));
         assert_eq!(manifest.retained_rows, 1);
         assert_eq!(manifest.next_seq, 1);
+        let rejected = Line::from_text("must-not-mix-into-legacy", &CellAttributes::blank(), 3, None);
+        assert!(
+            !reopened.store_scrollback_line(23, &rejected, 8),
+            "a checksum-only legacy lineage must remain read-only"
+        );
+        assert_eq!(
+            LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+                .expect("re-read retained legacy manifest")
+                .expect("retained legacy manifest still exists"),
+            manifest,
+            "a rejected legacy append must not republish or relabel the manifest"
+        );
+        assert_eq!(
+            reopened
+                .lock_store("test rejected legacy append")
+                .expect("test legacy store lock")
+                .line_count(reopened.pane_id),
+            3,
+            "a rejected legacy append must not mutate stored rows"
+        );
         let mixed_snapshot = reopened
             .snapshot_scrollback(
                 23,
@@ -6381,7 +7057,24 @@ mod tests {
         assert_eq!(export.next_seq, 2);
         assert!(!export.source_content_mutated);
         assert_eq!(export.exact_semantic_records, 2);
- @ours
+        assert_eq!(export.legacy_non_recovery_grade_records, 0);
+        assert_eq!(export.pre_persistence_redaction_not_applied_records, 2);
+        assert_eq!(
+            export.legacy_redaction_attested_but_unauthenticated_records,
+            0
+        );
+        assert_eq!(export.raw_legacy_redaction_unknown_records, 0);
+        assert_eq!(
+            export.pre_persistence_redaction_not_applied_records
+                + export.legacy_redaction_attested_but_unauthenticated_records
+                + export.raw_legacy_redaction_unknown_records,
+            export.retained_rows
+        );
+        assert_eq!(
+            export.legacy_redaction_attested_but_unauthenticated_records
+                + export.raw_legacy_redaction_unknown_records,
+            export.legacy_non_recovery_grade_records
+        );
         assert!(export.redaction_applied_during_export);
 
         let log_after = std::fs::metadata(&log_path).expect("log metadata after export");
@@ -7384,6 +8077,549 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_reconciliation_retries_raw_to_client_same_name_transition()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let initial_raw = SshDomain {
+            name: "raw-to-client".to_string(),
+            remote_address: "shell.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let initial_handle = make_test_handle(vec![initial_raw]);
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&initial_handle)?;
+        let retirement_barrier = mux
+            .get_domain_by_name("raw-to-client")
+            .expect("initial raw generation is registered");
+        let retired_id = retirement_barrier.domain_id();
+
+        let replacement_client = SshDomain {
+            name: "raw-to-client".to_string(),
+            remote_address: "mux.example:22".to_string(),
+            multiplexing: SshMultiplexing::WezTerm,
+            ..SshDomain::default()
+        };
+        let replacement_handle = make_test_handle(vec![replacement_client]);
+        assert_eq!(
+            reconcile_configured_client_domain(
+                &replacement_handle,
+                &mux,
+                "raw-to-client",
+            )?,
+            ConfiguredClientDomainReconcileOutcome::PendingRetirement,
+            "raw-to-client replacement must retire instead of colliding",
+        );
+        assert!(
+            mux.get_domain_by_name("raw-to-client").is_none(),
+            "logical retirement must close stale raw transport admission"
+        );
+
+        drop(retirement_barrier);
+        wait_for_domain_reconciliation(&replacement_handle)?;
+        let replacement = mux
+            .get_domain_by_name("raw-to-client")
+            .expect("client replacement is registered");
+        assert_ne!(replacement.domain_id(), retired_id);
+        assert!(replacement.is::<ClientDomain>());
+        assert!(replacement.downcast_ref::<RemoteSshDomain>().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_replaces_changed_config_for_every_raw_domain_class()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let first_ssh = SshDomain {
+            name: "changed-raw-ssh".to_string(),
+            remote_address: "old-ssh.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let first_wsl = WslDomain {
+            name: "changed-wsl".to_string(),
+            distribution: Some("OldDistro".to_string()),
+            username: Some("old-user".to_string()),
+            default_cwd: Some("/old".into()),
+            default_prog: Some(vec!["old-shell".to_string()]),
+        };
+        let first_exec = ExecDomain {
+            name: "changed-exec".to_string(),
+            fixup_command: "old-fixup".to_string(),
+            label: None,
+        };
+        let first_serial = SerialDomain {
+            name: "changed-serial".to_string(),
+            port: Some("test-old-port".to_string()),
+            baud: Some(9_600),
+        };
+        let first_handle = make_test_handle_with(vec![first_ssh], |config| {
+            config.wsl_domains = Some(vec![first_wsl]);
+            config.exec_domains = vec![first_exec];
+            config.serial_ports = vec![first_serial];
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&first_handle)?;
+
+        let barriers = [
+            "changed-raw-ssh",
+            "changed-wsl",
+            "changed-exec",
+            "changed-serial",
+        ]
+        .into_iter()
+        .map(|name| {
+            mux.get_domain_by_name(name)
+                .unwrap_or_else(|| panic!("initial {name} generation is registered"))
+        })
+        .collect::<Vec<_>>();
+        let retired_ids = barriers
+            .iter()
+            .map(|domain| (domain.domain_name().to_string(), domain.domain_id()))
+            .collect::<BTreeMap<_, _>>();
+
+        let replacement_ssh = SshDomain {
+            name: "changed-raw-ssh".to_string(),
+            remote_address: "new-ssh.example:2200".to_string(),
+            multiplexing: SshMultiplexing::None,
+            timeout: std::time::Duration::from_secs(17),
+            ..SshDomain::default()
+        };
+        let replacement_wsl = WslDomain {
+            name: "changed-wsl".to_string(),
+            distribution: Some("NewDistro".to_string()),
+            username: Some("new-user".to_string()),
+            default_cwd: Some("/new".into()),
+            default_prog: Some(vec!["new-shell".to_string()]),
+        };
+        let replacement_exec = ExecDomain {
+            name: "changed-exec".to_string(),
+            fixup_command: "new-fixup".to_string(),
+            label: Some(config::ValueOrFunc::Func("new-label".to_string())),
+        };
+        let replacement_serial = SerialDomain {
+            name: "changed-serial".to_string(),
+            port: Some("test-new-port".to_string()),
+            baud: Some(115_200),
+        };
+        let expected_ssh = replacement_ssh.clone();
+        let expected_wsl = replacement_wsl.clone();
+        let expected_exec = replacement_exec.clone();
+        let expected_serial = replacement_serial.clone();
+        let replacement_handle = make_test_handle_with(vec![replacement_ssh], |config| {
+            config.wsl_domains = Some(vec![replacement_wsl]);
+            config.exec_domains = vec![replacement_exec];
+            config.serial_ports = vec![replacement_serial];
+        });
+
+        assert_eq!(
+            reconcile_mux_domains(&replacement_handle)?,
+            MuxDomainUpdateOutcome::PendingRetirements {
+                domain_names: vec![
+                    "changed-exec".to_string(),
+                    "changed-raw-ssh".to_string(),
+                    "changed-serial".to_string(),
+                    "changed-wsl".to_string(),
+                ],
+            }
+        );
+        for name in retired_ids.keys() {
+            assert!(
+                mux.get_domain_by_name(name).is_none(),
+                "stale {name} generation must become inadmissible immediately"
+            );
+        }
+
+        drop(barriers);
+        wait_for_domain_reconciliation(&replacement_handle)?;
+
+        let ssh = mux
+            .get_domain_by_name("changed-raw-ssh")
+            .expect("replacement raw SSH generation exists");
+        assert_ne!(ssh.domain_id(), retired_ids["changed-raw-ssh"]);
+        assert!(
+            ssh.downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|domain| domain.matches_configuration(&expected_ssh))
+        );
+
+        let wsl = mux
+            .get_domain_by_name("changed-wsl")
+            .expect("replacement WSL generation exists");
+        assert_ne!(wsl.domain_id(), retired_ids["changed-wsl"]);
+        assert!(
+            wsl.downcast_ref::<LocalDomain>()
+                .is_some_and(|domain| domain.matches_wsl_configuration(&expected_wsl))
+        );
+
+        let exec = mux
+            .get_domain_by_name("changed-exec")
+            .expect("replacement exec generation exists");
+        assert_ne!(exec.domain_id(), retired_ids["changed-exec"]);
+        assert!(
+            exec.downcast_ref::<LocalDomain>()
+                .is_some_and(|domain| domain.matches_exec_configuration(&expected_exec))
+        );
+
+        let serial = mux
+            .get_domain_by_name("changed-serial")
+            .expect("replacement serial generation exists");
+        assert_ne!(serial.domain_id(), retired_ids["changed-serial"]);
+        assert!(
+            serial
+                .downcast_ref::<LocalDomain>()
+                .is_some_and(|domain| domain.matches_serial_configuration(&expected_serial))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_replaces_ssh_domains_when_global_backend_changes()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let raw = SshDomain {
+            name: "backend-raw".to_string(),
+            remote_address: "raw-backend.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ssh_backend: None,
+            ..SshDomain::default()
+        };
+        let client = SshDomain {
+            name: "backend-client".to_string(),
+            remote_address: "client-backend.example:22".to_string(),
+            multiplexing: SshMultiplexing::WezTerm,
+            ssh_backend: None,
+            ..SshDomain::default()
+        };
+        let first_handle =
+            make_test_handle_with(vec![raw.clone(), client.clone()], |config| {
+                config.ssh_backend = config::SshBackend::LibSsh;
+            });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&first_handle)?;
+
+        let barriers = ["backend-raw", "backend-client"]
+            .into_iter()
+            .map(|name| {
+                mux.get_domain_by_name(name)
+                    .unwrap_or_else(|| panic!("initial {name} generation exists"))
+            })
+            .collect::<Vec<_>>();
+        let retired_ids = barriers
+            .iter()
+            .map(|domain| (domain.domain_name().to_string(), domain.domain_id()))
+            .collect::<BTreeMap<_, _>>();
+
+        let replacement_handle = make_test_handle_with(vec![raw.clone(), client], |config| {
+            config.ssh_backend = config::SshBackend::Ssh2;
+        });
+        assert_eq!(
+            reconcile_mux_domains(&replacement_handle)?,
+            MuxDomainUpdateOutcome::PendingRetirements {
+                domain_names: vec!["backend-client".to_string(), "backend-raw".to_string()],
+            }
+        );
+        assert!(mux.get_domain_by_name("backend-raw").is_none());
+        assert!(mux.get_domain_by_name("backend-client").is_none());
+
+        drop(barriers);
+        wait_for_domain_reconciliation(&replacement_handle)?;
+
+        let mut expected_raw = raw;
+        expected_raw.ssh_backend = Some(config::SshBackend::Ssh2);
+        let replacement_raw = mux
+            .get_domain_by_name("backend-raw")
+            .expect("raw SSH backend successor exists");
+        assert_ne!(replacement_raw.domain_id(), retired_ids["backend-raw"]);
+        assert!(
+            replacement_raw
+                .downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|domain| domain.matches_configuration(&expected_raw))
+        );
+
+        let expected_client = configured_client_domains(&replacement_handle)
+            .into_iter()
+            .find(|domain| domain.name() == "backend-client")
+            .expect("normalized client SSH configuration exists");
+        let replacement_client = mux
+            .get_domain_by_name("backend-client")
+            .expect("client SSH backend successor exists");
+        assert_ne!(
+            replacement_client.domain_id(),
+            retired_ids["backend-client"]
+        );
+        assert!(
+            replacement_client
+                .downcast_ref::<ClientDomain>()
+                .is_some_and(|domain| domain.reconcile_configuration(&expected_client))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_retries_cross_raw_kind_transition()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let initial_wsl = WslDomain {
+            name: "cross-raw-kind".to_string(),
+            distribution: Some("OldDistro".to_string()),
+            username: None,
+            default_cwd: None,
+            default_prog: None,
+        };
+        let initial_handle = make_test_handle_with(Vec::new(), |config| {
+            config.wsl_domains = Some(vec![initial_wsl]);
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&initial_handle)?;
+        let retirement_barrier = mux
+            .get_domain_by_name("cross-raw-kind")
+            .expect("initial WSL generation exists");
+        let retired_id = retirement_barrier.domain_id();
+
+        let replacement_exec = ExecDomain {
+            name: "cross-raw-kind".to_string(),
+            fixup_command: "exec-replacement".to_string(),
+            label: None,
+        };
+        let expected_exec = replacement_exec.clone();
+        let replacement_handle = make_test_handle_with(Vec::new(), |config| {
+            config.exec_domains = vec![replacement_exec];
+        });
+        assert_eq!(
+            reconcile_mux_domains(&replacement_handle)?,
+            MuxDomainUpdateOutcome::PendingRetirements {
+                domain_names: vec!["cross-raw-kind".to_string()],
+            }
+        );
+        assert!(mux.get_domain_by_name("cross-raw-kind").is_none());
+
+        drop(retirement_barrier);
+        wait_for_domain_reconciliation(&replacement_handle)?;
+        let replacement = mux
+            .get_domain_by_name("cross-raw-kind")
+            .expect("exec successor exists");
+        assert_ne!(replacement.domain_id(), retired_id);
+        let local = replacement
+            .downcast_ref::<LocalDomain>()
+            .expect("exec successor is a local domain");
+        assert!(local.matches_exec_configuration(&expected_exec));
+        assert!(!local.matches_wsl_configuration(&WslDomain {
+            name: "cross-raw-kind".to_string(),
+            distribution: Some("OldDistro".to_string()),
+            username: None,
+            default_cwd: None,
+            default_prog: None,
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_logically_removes_deleted_raw_domain_classes()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let raw_ssh = SshDomain {
+            name: "deleted-raw-ssh".to_string(),
+            remote_address: "deleted.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let wsl = WslDomain {
+            name: "deleted-wsl".to_string(),
+            distribution: Some("DeletedDistro".to_string()),
+            username: None,
+            default_cwd: None,
+            default_prog: None,
+        };
+        let exec = ExecDomain {
+            name: "deleted-exec".to_string(),
+            fixup_command: "deleted-fixup".to_string(),
+            label: None,
+        };
+        let serial = SerialDomain {
+            name: "deleted-serial".to_string(),
+            port: Some("deleted-test-port".to_string()),
+            baud: Some(9_600),
+        };
+        let initial_handle = make_test_handle_with(vec![raw_ssh], |config| {
+            config.wsl_domains = Some(vec![wsl]);
+            config.exec_domains = vec![exec];
+            config.serial_ports = vec![serial];
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let local_id = local_domain.domain_id();
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&initial_handle)?;
+
+        let deleted_names = [
+            "deleted-raw-ssh",
+            "deleted-wsl",
+            "deleted-exec",
+            "deleted-serial",
+        ];
+        let retirement_barriers = deleted_names
+            .iter()
+            .map(|name| {
+                mux.get_domain_by_name(name)
+                    .unwrap_or_else(|| panic!("initial {name} generation exists"))
+            })
+            .collect::<Vec<_>>();
+        let empty_handle = make_test_handle(Vec::new());
+        assert_eq!(
+            reconcile_mux_domains(&empty_handle)?,
+            MuxDomainUpdateOutcome::Converged,
+            "deletion needs no same-name successor and converges after logical retirement"
+        );
+        for name in deleted_names {
+            assert!(
+                mux.get_domain_by_name(name).is_none(),
+                "deleted configured domain {name} must not remain addressable"
+            );
+        }
+        assert_eq!(
+            mux.get_domain_by_name("local")
+                .expect("runtime local domain is preserved")
+                .domain_id(),
+            local_id
+        );
+        drop(retirement_barriers);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_preserves_runtime_created_raw_domains()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+
+        let runtime_ssh_config = SshDomain {
+            name: "runtime-raw-ssh".to_string(),
+            remote_address: "runtime.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let runtime_ssh: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain(
+            &runtime_ssh_config,
+        )?);
+        let runtime_ssh_id = runtime_ssh.domain_id();
+        mux.add_domain(&runtime_ssh)?;
+
+        let runtime_serial_config = SerialDomain {
+            name: "runtime-serial".to_string(),
+            port: Some("runtime-test-port".to_string()),
+            baud: Some(57_600),
+        };
+        let runtime_serial: Arc<dyn Domain> = Arc::new(LocalDomain::new_serial_domain(
+            runtime_serial_config,
+        )?);
+        let runtime_serial_id = runtime_serial.domain_id();
+        mux.add_domain(&runtime_serial)?;
+
+        let unrelated_reload = make_test_handle(Vec::new());
+        assert_eq!(
+            reconcile_mux_domains(&unrelated_reload)?,
+            MuxDomainUpdateOutcome::Converged
+        );
+        assert_eq!(
+            mux.get_domain_by_name("runtime-raw-ssh")
+                .expect("unrelated reload preserves ad-hoc SSH domain")
+                .domain_id(),
+            runtime_ssh_id
+        );
+        assert_eq!(
+            mux.get_domain_by_name("runtime-serial")
+                .expect("unrelated reload preserves ad-hoc serial domain")
+                .domain_id(),
+            runtime_serial_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_refuses_to_adopt_runtime_raw_ssh_as_configured()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let runtime_ssh_config = SshDomain {
+            name: "runtime-raw-collision".to_string(),
+            remote_address: "runtime.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        let runtime_ssh: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain(
+            &runtime_ssh_config,
+        )?);
+        let runtime_ssh_id = runtime_ssh.domain_id();
+        mux.add_domain(&runtime_ssh)?;
+
+        let conflicting_reload = make_test_handle(vec![runtime_ssh_config]);
+        let error = reconcile_mux_domains(&conflicting_reload)
+            .expect_err("runtime raw SSH must not be adopted as configuration-owned");
+        assert!(format!("{error:#}").contains("runtime-owned"));
+        let preserved = mux
+            .get_domain_by_name("runtime-raw-collision")
+            .expect("runtime raw SSH remains live after rejected reload");
+        assert_eq!(preserved.domain_id(), runtime_ssh_id);
+        assert!(
+            preserved
+                .downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|domain| !domain.is_configuration_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_refuses_to_replace_runtime_owned_local_domain()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let local_id = local_domain.domain_id();
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        let conflicting_wsl = WslDomain {
+            name: "local".to_string(),
+            distribution: Some("MustNotReplaceRuntime".to_string()),
+            username: None,
+            default_cwd: None,
+            default_prog: None,
+        };
+        let handle = make_test_handle_with(Vec::new(), |config| {
+            config.wsl_domains = Some(vec![conflicting_wsl]);
+        });
+
+        let error = reconcile_mux_domains(&handle)
+            .expect_err("runtime-owned local domain collision must fail before retirement");
+        assert!(format!("{error:#}").contains("runtime-owned"));
+        assert_eq!(
+            mux.get_domain_by_name("local")
+                .expect("runtime local domain remains live")
+                .domain_id(),
+            local_id
+        );
+        Ok(())
+    }
+
+    #[test]
     fn aggregate_reconciliation_retries_client_to_raw_same_name_transition()
     -> anyhow::Result<()> {
         let _state = ScopedTestState::acquire();
@@ -7402,6 +8638,7 @@ mod tests {
         let retirement_barrier = mux
             .get_domain_by_name("client-to-raw")
             .expect("initial client generation is registered");
+        let retired_id = retirement_barrier.domain_id();
 
         let replacement_raw = SshDomain {
             name: "client-to-raw".to_string(),
@@ -7409,6 +8646,7 @@ mod tests {
             multiplexing: SshMultiplexing::None,
             ..SshDomain::default()
         };
+        let expected_raw = replacement_raw.clone();
         let replacement_handle =
             make_test_handle_with(vec![replacement_raw], |config| {
                 config.default_domain = Some("client-to-raw".to_string());
@@ -7439,8 +8677,15 @@ mod tests {
         let replacement = mux
             .get_domain_by_name("client-to-raw")
             .expect("raw replacement is registered");
+        assert_ne!(replacement.domain_id(), retired_id);
         assert!(replacement.is::<RemoteSshDomain>());
         assert!(replacement.downcast_ref::<ClientDomain>().is_none());
+        assert!(
+            replacement
+                .downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|domain| domain.matches_configuration(&expected_raw)),
+            "replacement must capture the desired raw transport configuration"
+        );
         assert_eq!(mux.default_domain()?.domain_name(), "client-to-raw");
         Ok(())
     }

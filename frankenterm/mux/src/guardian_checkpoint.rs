@@ -190,8 +190,6 @@ impl GuardianCheckpointBoundary {
         self.output_record_digest
     }
 
-    /// Authenticated plaintext endpoint within `segment_id`. This is not the
-    /// parser-global watermark: segment rollover resets this counter.
     #[must_use]
     pub const fn output_committed_log_bytes(&self) -> u64 {
         self.output_committed_log_bytes
@@ -544,6 +542,7 @@ pub(crate) fn capture_and_bind_live_parser_checkpoint(
     )
     .map_err(LiveParserCaptureAndBindError::Boundary)
 }
+
 fn live_parser_boundary_digest(
     registration_wire_identity: [u8; 16],
     boundary: &GuardianCheckpointBoundary,

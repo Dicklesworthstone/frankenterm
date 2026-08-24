@@ -1,6 +1,6 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
-use frankenterm_escape_parser::parser::Parser;
+use frankenterm_escape_parser::parser::{Parser, RecoveryGroundBoundary};
 #[cfg(feature = "use_serde")]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -734,7 +734,7 @@ impl Terminal {
     #[cfg(feature = "use_serde")]
     pub fn capture_recovery_checkpoint_at_external_parser_ground(
         &self,
-        ground: frankenterm_escape_parser::parser::RecoveryGroundBoundary<'_>,
+        ground: RecoveryGroundBoundary<'_>,
         limits: crate::terminalstate::checkpoint::TerminalCheckpointLimits,
     ) -> Result<RecoveryTerminalCheckpointV2, RecoveryTerminalCheckpointError> {
         self.capture_recovery_checkpoint_at_stream_watermark(ground.stream_bytes(), limits)
@@ -904,7 +904,7 @@ mod tests {
             max_replay_actions_per_record: 4,
             ..crate::terminalstate::checkpoint::TerminalCheckpointLimits::default()
         };
-        let config: Arc<dyn TerminalConfiguration> = Arc::new(PropTermConfig);
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(PropTermConfig);
         let terminal = Terminal::new(
             TerminalSize::default(),
             Arc::clone(&config),
