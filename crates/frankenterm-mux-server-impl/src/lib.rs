@@ -142,11 +142,15 @@ impl ConfiguredRawDomain {
 
     fn instantiate(&self) -> anyhow::Result<Arc<dyn Domain>> {
         match self {
-            Self::Ssh(domain) => Ok(Arc::new(RemoteSshDomain::with_ssh_domain(domain)?)),
+            Self::Ssh(domain) => Ok(Arc::new(RemoteSshDomain::with_configured_ssh_domain(
+                domain,
+            )?)),
             Self::Wsl(domain) => Ok(Arc::new(LocalDomain::new_wsl(domain.clone())?)),
             Self::Exec(domain) => Ok(Arc::new(LocalDomain::new_exec_domain(domain.clone())?)),
             Self::Serial(domain) => {
-                Ok(Arc::new(LocalDomain::new_serial_domain(domain.clone())?))
+                Ok(Arc::new(LocalDomain::new_configured_serial_domain(
+                    domain.clone(),
+                )?))
             }
         }
     }
@@ -206,7 +210,9 @@ fn configured_raw_domains(config: &config::ConfigHandle) -> anyhow::Result<Confi
 }
 
 fn is_configured_raw_registration(registered: &mux::DomainOperationGuard) -> bool {
-    registered.is::<RemoteSshDomain>()
+    registered
+        .downcast_ref::<RemoteSshDomain>()
+        .is_some_and(RemoteSshDomain::is_configuration_owned)
         || registered
             .downcast_ref::<LocalDomain>()
             .is_some_and(LocalDomain::is_configuration_owned)
@@ -8039,6 +8045,463 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_reconciliation_retries_raw_to_client_same_name_transition()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let initial_raw = SshDomain {
+            name: "raw-to-client".to_string(),
+            remote_address: "shell.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let initial_handle = make_test_handle(vec![initial_raw]);
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&initial_handle)?;
+        let retirement_barrier = mux
+            .get_domain_by_name("raw-to-client")
+            .expect("initial raw generation is registered");
+        let retired_id = retirement_barrier.domain_id();
+
+        let replacement_client = SshDomain {
+            name: "raw-to-client".to_string(),
+            remote_address: "mux.example:22".to_string(),
+            multiplexing: SshMultiplexing::WezTerm,
+            ..SshDomain::default()
+        };
+        let replacement_handle = make_test_handle(vec![replacement_client]);
+        assert_eq!(
+            reconcile_configured_client_domain(
+                &replacement_handle,
+                &mux,
+                "raw-to-client",
+            )?,
+            ConfiguredClientDomainReconcileOutcome::PendingRetirement,
+            "raw-to-client replacement must retire instead of colliding",
+        );
+        assert!(
+            mux.get_domain_by_name("raw-to-client").is_none(),
+            "logical retirement must close stale raw transport admission"
+        );
+
+        drop(retirement_barrier);
+        wait_for_domain_reconciliation(&replacement_handle)?;
+        let replacement = mux
+            .get_domain_by_name("raw-to-client")
+            .expect("client replacement is registered");
+        assert_ne!(replacement.domain_id(), retired_id);
+        assert!(replacement.is::<ClientDomain>());
+        assert!(replacement.downcast_ref::<RemoteSshDomain>().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_replaces_changed_config_for_every_raw_domain_class()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let first_ssh = SshDomain {
+            name: "changed-raw-ssh".to_string(),
+            remote_address: "old-ssh.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let first_wsl = WslDomain {
+            name: "changed-wsl".to_string(),
+            distribution: Some("OldDistro".to_string()),
+            username: Some("old-user".to_string()),
+            default_cwd: Some("/old".into()),
+            default_prog: Some(vec!["old-shell".to_string()]),
+        };
+        let first_exec = ExecDomain {
+            name: "changed-exec".to_string(),
+            fixup_command: "old-fixup".to_string(),
+            label: None,
+        };
+        let first_serial = SerialDomain {
+            name: "changed-serial".to_string(),
+            port: Some("test-old-port".to_string()),
+            baud: Some(9_600),
+        };
+        let first_handle = make_test_handle_with(vec![first_ssh], |config| {
+            config.wsl_domains = Some(vec![first_wsl]);
+            config.exec_domains = vec![first_exec];
+            config.serial_ports = vec![first_serial];
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&first_handle)?;
+
+        let barriers = [
+            "changed-raw-ssh",
+            "changed-wsl",
+            "changed-exec",
+            "changed-serial",
+        ]
+        .into_iter()
+        .map(|name| {
+            mux.get_domain_by_name(name)
+                .unwrap_or_else(|| panic!("initial {name} generation is registered"))
+        })
+        .collect::<Vec<_>>();
+        let retired_ids = barriers
+            .iter()
+            .map(|domain| (domain.domain_name().to_string(), domain.domain_id()))
+            .collect::<BTreeMap<_, _>>();
+
+        let replacement_ssh = SshDomain {
+            name: "changed-raw-ssh".to_string(),
+            remote_address: "new-ssh.example:2200".to_string(),
+            multiplexing: SshMultiplexing::None,
+            timeout: std::time::Duration::from_secs(17),
+            ..SshDomain::default()
+        };
+        let replacement_wsl = WslDomain {
+            name: "changed-wsl".to_string(),
+            distribution: Some("NewDistro".to_string()),
+            username: Some("new-user".to_string()),
+            default_cwd: Some("/new".into()),
+            default_prog: Some(vec!["new-shell".to_string()]),
+        };
+        let replacement_exec = ExecDomain {
+            name: "changed-exec".to_string(),
+            fixup_command: "new-fixup".to_string(),
+            label: Some(config::ValueOrFunc::Func("new-label".to_string())),
+        };
+        let replacement_serial = SerialDomain {
+            name: "changed-serial".to_string(),
+            port: Some("test-new-port".to_string()),
+            baud: Some(115_200),
+        };
+        let expected_ssh = replacement_ssh.clone();
+        let expected_wsl = replacement_wsl.clone();
+        let expected_exec = replacement_exec.clone();
+        let expected_serial = replacement_serial.clone();
+        let replacement_handle = make_test_handle_with(vec![replacement_ssh], |config| {
+            config.wsl_domains = Some(vec![replacement_wsl]);
+            config.exec_domains = vec![replacement_exec];
+            config.serial_ports = vec![replacement_serial];
+        });
+
+        assert_eq!(
+            reconcile_mux_domains(&replacement_handle)?,
+            MuxDomainUpdateOutcome::PendingRetirements {
+                domain_names: vec![
+                    "changed-exec".to_string(),
+                    "changed-raw-ssh".to_string(),
+                    "changed-serial".to_string(),
+                    "changed-wsl".to_string(),
+                ],
+            }
+        );
+        for name in retired_ids.keys() {
+            assert!(
+                mux.get_domain_by_name(name).is_none(),
+                "stale {name} generation must become inadmissible immediately"
+            );
+        }
+
+        drop(barriers);
+        wait_for_domain_reconciliation(&replacement_handle)?;
+
+        let ssh = mux
+            .get_domain_by_name("changed-raw-ssh")
+            .expect("replacement raw SSH generation exists");
+        assert_ne!(ssh.domain_id(), retired_ids["changed-raw-ssh"]);
+        assert!(
+            ssh.downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|domain| domain.matches_configuration(&expected_ssh))
+        );
+
+        let wsl = mux
+            .get_domain_by_name("changed-wsl")
+            .expect("replacement WSL generation exists");
+        assert_ne!(wsl.domain_id(), retired_ids["changed-wsl"]);
+        assert!(
+            wsl.downcast_ref::<LocalDomain>()
+                .is_some_and(|domain| domain.matches_wsl_configuration(&expected_wsl))
+        );
+
+        let exec = mux
+            .get_domain_by_name("changed-exec")
+            .expect("replacement exec generation exists");
+        assert_ne!(exec.domain_id(), retired_ids["changed-exec"]);
+        assert!(
+            exec.downcast_ref::<LocalDomain>()
+                .is_some_and(|domain| domain.matches_exec_configuration(&expected_exec))
+        );
+
+        let serial = mux
+            .get_domain_by_name("changed-serial")
+            .expect("replacement serial generation exists");
+        assert_ne!(serial.domain_id(), retired_ids["changed-serial"]);
+        assert!(
+            serial
+                .downcast_ref::<LocalDomain>()
+                .is_some_and(|domain| domain.matches_serial_configuration(&expected_serial))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_retries_cross_raw_kind_transition()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let initial_wsl = WslDomain {
+            name: "cross-raw-kind".to_string(),
+            distribution: Some("OldDistro".to_string()),
+            username: None,
+            default_cwd: None,
+            default_prog: None,
+        };
+        let initial_handle = make_test_handle_with(Vec::new(), |config| {
+            config.wsl_domains = Some(vec![initial_wsl]);
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&initial_handle)?;
+        let retirement_barrier = mux
+            .get_domain_by_name("cross-raw-kind")
+            .expect("initial WSL generation exists");
+        let retired_id = retirement_barrier.domain_id();
+
+        let replacement_exec = ExecDomain {
+            name: "cross-raw-kind".to_string(),
+            fixup_command: "exec-replacement".to_string(),
+            label: None,
+        };
+        let expected_exec = replacement_exec.clone();
+        let replacement_handle = make_test_handle_with(Vec::new(), |config| {
+            config.exec_domains = vec![replacement_exec];
+        });
+        assert_eq!(
+            reconcile_mux_domains(&replacement_handle)?,
+            MuxDomainUpdateOutcome::PendingRetirements {
+                domain_names: vec!["cross-raw-kind".to_string()],
+            }
+        );
+        assert!(mux.get_domain_by_name("cross-raw-kind").is_none());
+
+        drop(retirement_barrier);
+        wait_for_domain_reconciliation(&replacement_handle)?;
+        let replacement = mux
+            .get_domain_by_name("cross-raw-kind")
+            .expect("exec successor exists");
+        assert_ne!(replacement.domain_id(), retired_id);
+        let local = replacement
+            .downcast_ref::<LocalDomain>()
+            .expect("exec successor is a local domain");
+        assert!(local.matches_exec_configuration(&expected_exec));
+        assert!(!local.matches_wsl_configuration(&WslDomain {
+            name: "cross-raw-kind".to_string(),
+            distribution: Some("OldDistro".to_string()),
+            username: None,
+            default_cwd: None,
+            default_prog: None,
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_logically_removes_deleted_raw_domain_classes()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let raw_ssh = SshDomain {
+            name: "deleted-raw-ssh".to_string(),
+            remote_address: "deleted.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let wsl = WslDomain {
+            name: "deleted-wsl".to_string(),
+            distribution: Some("DeletedDistro".to_string()),
+            username: None,
+            default_cwd: None,
+            default_prog: None,
+        };
+        let exec = ExecDomain {
+            name: "deleted-exec".to_string(),
+            fixup_command: "deleted-fixup".to_string(),
+            label: None,
+        };
+        let serial = SerialDomain {
+            name: "deleted-serial".to_string(),
+            port: Some("deleted-test-port".to_string()),
+            baud: Some(9_600),
+        };
+        let initial_handle = make_test_handle_with(vec![raw_ssh], |config| {
+            config.wsl_domains = Some(vec![wsl]);
+            config.exec_domains = vec![exec];
+            config.serial_ports = vec![serial];
+        });
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let local_id = local_domain.domain_id();
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        update_mux_domains(&initial_handle)?;
+
+        let deleted_names = [
+            "deleted-raw-ssh",
+            "deleted-wsl",
+            "deleted-exec",
+            "deleted-serial",
+        ];
+        let retirement_barriers = deleted_names
+            .iter()
+            .map(|name| {
+                mux.get_domain_by_name(name)
+                    .unwrap_or_else(|| panic!("initial {name} generation exists"))
+            })
+            .collect::<Vec<_>>();
+        let empty_handle = make_test_handle(Vec::new());
+        assert_eq!(
+            reconcile_mux_domains(&empty_handle)?,
+            MuxDomainUpdateOutcome::Converged,
+            "deletion needs no same-name successor and converges after logical retirement"
+        );
+        for name in deleted_names {
+            assert!(
+                mux.get_domain_by_name(name).is_none(),
+                "deleted configured domain {name} must not remain addressable"
+            );
+        }
+        assert_eq!(
+            mux.get_domain_by_name("local")
+                .expect("runtime local domain is preserved")
+                .domain_id(),
+            local_id
+        );
+        drop(retirement_barriers);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_preserves_runtime_created_raw_domains()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+
+        let runtime_ssh_config = SshDomain {
+            name: "runtime-raw-ssh".to_string(),
+            remote_address: "runtime.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let runtime_ssh: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain(
+            &runtime_ssh_config,
+        )?);
+        let runtime_ssh_id = runtime_ssh.domain_id();
+        mux.add_domain(&runtime_ssh)?;
+
+        let runtime_serial_config = SerialDomain {
+            name: "runtime-serial".to_string(),
+            port: Some("runtime-test-port".to_string()),
+            baud: Some(57_600),
+        };
+        let runtime_serial: Arc<dyn Domain> = Arc::new(LocalDomain::new_serial_domain(
+            runtime_serial_config,
+        )?);
+        let runtime_serial_id = runtime_serial.domain_id();
+        mux.add_domain(&runtime_serial)?;
+
+        let unrelated_reload = make_test_handle(Vec::new());
+        assert_eq!(
+            reconcile_mux_domains(&unrelated_reload)?,
+            MuxDomainUpdateOutcome::Converged
+        );
+        assert_eq!(
+            mux.get_domain_by_name("runtime-raw-ssh")
+                .expect("unrelated reload preserves ad-hoc SSH domain")
+                .domain_id(),
+            runtime_ssh_id
+        );
+        assert_eq!(
+            mux.get_domain_by_name("runtime-serial")
+                .expect("unrelated reload preserves ad-hoc serial domain")
+                .domain_id(),
+            runtime_serial_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_refuses_to_adopt_runtime_raw_ssh_as_configured()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let runtime_ssh_config = SshDomain {
+            name: "runtime-raw-collision".to_string(),
+            remote_address: "runtime.example:22".to_string(),
+            multiplexing: SshMultiplexing::None,
+            ..SshDomain::default()
+        };
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        let runtime_ssh: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain(
+            &runtime_ssh_config,
+        )?);
+        let runtime_ssh_id = runtime_ssh.domain_id();
+        mux.add_domain(&runtime_ssh)?;
+
+        let conflicting_reload = make_test_handle(vec![runtime_ssh_config]);
+        let error = reconcile_mux_domains(&conflicting_reload)
+            .expect_err("runtime raw SSH must not be adopted as configuration-owned");
+        assert!(format!("{error:#}").contains("runtime-owned"));
+        let preserved = mux
+            .get_domain_by_name("runtime-raw-collision")
+            .expect("runtime raw SSH remains live after rejected reload");
+        assert_eq!(preserved.domain_id(), runtime_ssh_id);
+        assert!(
+            preserved
+                .downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|domain| !domain.is_configuration_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_reconciliation_refuses_to_replace_runtime_owned_local_domain()
+    -> anyhow::Result<()> {
+        let _state = ScopedTestState::acquire();
+
+        let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+        let local_id = local_domain.domain_id();
+        let mux = Arc::new(Mux::new(Some(local_domain)));
+        Mux::set_mux(&mux);
+        let conflicting_wsl = WslDomain {
+            name: "local".to_string(),
+            distribution: Some("MustNotReplaceRuntime".to_string()),
+            username: None,
+            default_cwd: None,
+            default_prog: None,
+        };
+        let handle = make_test_handle_with(Vec::new(), |config| {
+            config.wsl_domains = Some(vec![conflicting_wsl]);
+        });
+
+        let error = reconcile_mux_domains(&handle)
+            .expect_err("runtime-owned local domain collision must fail before retirement");
+        assert!(format!("{error:#}").contains("runtime-owned"));
+        assert_eq!(
+            mux.get_domain_by_name("local")
+                .expect("runtime local domain remains live")
+                .domain_id(),
+            local_id
+        );
+        Ok(())
+    }
+
+    #[test]
     fn aggregate_reconciliation_retries_client_to_raw_same_name_transition()
     -> anyhow::Result<()> {
         let _state = ScopedTestState::acquire();
@@ -8057,6 +8520,7 @@ mod tests {
         let retirement_barrier = mux
             .get_domain_by_name("client-to-raw")
             .expect("initial client generation is registered");
+        let retired_id = retirement_barrier.domain_id();
 
         let replacement_raw = SshDomain {
             name: "client-to-raw".to_string(),
@@ -8064,6 +8528,7 @@ mod tests {
             multiplexing: SshMultiplexing::None,
             ..SshDomain::default()
         };
+        let expected_raw = replacement_raw.clone();
         let replacement_handle =
             make_test_handle_with(vec![replacement_raw], |config| {
                 config.default_domain = Some("client-to-raw".to_string());
@@ -8094,8 +8559,15 @@ mod tests {
         let replacement = mux
             .get_domain_by_name("client-to-raw")
             .expect("raw replacement is registered");
+        assert_ne!(replacement.domain_id(), retired_id);
         assert!(replacement.is::<RemoteSshDomain>());
         assert!(replacement.downcast_ref::<ClientDomain>().is_none());
+        assert!(
+            replacement
+                .downcast_ref::<RemoteSshDomain>()
+                .is_some_and(|domain| domain.matches_configuration(&expected_raw)),
+            "replacement must capture the desired raw transport configuration"
+        );
         assert_eq!(mux.default_domain()?.domain_name(), "client-to-raw");
         Ok(())
     }

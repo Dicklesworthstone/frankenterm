@@ -445,19 +445,27 @@ impl LocalDomain {
     }
 
     fn resolve_exec_domain(&self) -> Option<ExecDomain> {
-        config::configuration()
-            .exec_domains
-            .iter()
-            .find(|ed| ed.name == self.name)
-            .cloned()
+        match &self.configuration {
+            LocalDomainConfiguration::Exec(exec) => Some(exec.clone()),
+            LocalDomainConfiguration::Runtime => config::configuration()
+                .exec_domains
+                .iter()
+                .find(|exec| exec.name == self.name)
+                .cloned(),
+            LocalDomainConfiguration::Wsl(_) | LocalDomainConfiguration::Serial(_) => None,
+        }
     }
 
     fn resolve_wsl_domain(&self) -> Option<WslDomain> {
-        config::configuration()
-            .wsl_domains()
-            .iter()
-            .find(|d| d.name == self.name)
-            .cloned()
+        match &self.configuration {
+            LocalDomainConfiguration::Wsl(wsl) => Some(wsl.clone()),
+            LocalDomainConfiguration::Runtime => config::configuration()
+                .wsl_domains()
+                .iter()
+                .find(|wsl| wsl.name == self.name)
+                .cloned(),
+            LocalDomainConfiguration::Exec(_) | LocalDomainConfiguration::Serial(_) => None,
+        }
     }
 
     pub fn with_pty_system(name: &str, pty_system: Box<dyn PtySystem + Send>) -> Self {
@@ -499,6 +507,21 @@ impl LocalDomain {
     }
 
     pub fn new_serial_domain(serial_domain: SerialDomain) -> anyhow::Result<Self> {
+        Self::new_serial_domain_with_configuration(
+            serial_domain,
+            LocalDomainConfiguration::Runtime,
+        )
+    }
+
+    pub fn new_configured_serial_domain(serial_domain: SerialDomain) -> anyhow::Result<Self> {
+        let configuration = LocalDomainConfiguration::Serial(serial_domain.clone());
+        Self::new_serial_domain_with_configuration(serial_domain, configuration)
+    }
+
+    fn new_serial_domain_with_configuration(
+        serial_domain: SerialDomain,
+        configuration: LocalDomainConfiguration,
+    ) -> anyhow::Result<Self> {
         let port = serial_domain.port.as_ref().unwrap_or(&serial_domain.name);
         let mut serial = portable_pty::serial::SerialTty::new(&port);
         if let Some(baud) = serial_domain.baud {
@@ -511,7 +534,7 @@ impl LocalDomain {
         Ok(Self::with_pty_system_and_configuration(
             serial_domain.name.clone(),
             pty_system,
-            LocalDomainConfiguration::Serial(serial_domain),
+            configuration,
         ))
     }
 
@@ -1269,6 +1292,48 @@ mod tests {
                 Mux::shutdown();
             }
         }
+    }
+
+    #[test]
+    fn configured_local_generation_retains_exact_spawn_configuration()
+    -> anyhow::Result<()> {
+        let wsl = WslDomain {
+            name: "retained-wsl".to_string(),
+            distribution: Some("RetainedDistro".to_string()),
+            username: Some("retained-user".to_string()),
+            default_cwd: Some("/retained".into()),
+            default_prog: Some(vec!["retained-shell".to_string()]),
+        };
+        let wsl_domain = LocalDomain::new_wsl(wsl.clone())?;
+        assert_eq!(wsl_domain.resolve_wsl_domain(), Some(wsl));
+        assert!(wsl_domain.resolve_exec_domain().is_none());
+
+        let exec = ExecDomain {
+            name: "retained-exec".to_string(),
+            fixup_command: "retained-fixup".to_string(),
+            label: Some(ValueOrFunc::Func("retained-label".to_string())),
+        };
+        let exec_domain = LocalDomain::new_exec_domain(exec.clone())?;
+        assert_eq!(exec_domain.resolve_exec_domain(), Some(exec));
+        assert!(exec_domain.resolve_wsl_domain().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serial_domain_configuration_ownership_is_explicit() -> anyhow::Result<()> {
+        let serial = SerialDomain {
+            name: "provenance-serial".to_string(),
+            port: Some("provenance-test-port".to_string()),
+            baud: Some(38_400),
+        };
+        let runtime = LocalDomain::new_serial_domain(serial.clone())?;
+        assert!(!runtime.is_configuration_owned());
+        assert!(!runtime.matches_serial_configuration(&serial));
+
+        let configured = LocalDomain::new_configured_serial_domain(serial.clone())?;
+        assert!(configured.is_configuration_owned());
+        assert!(configured.matches_serial_configuration(&serial));
+        Ok(())
     }
 
     #[derive(Debug, Clone)]

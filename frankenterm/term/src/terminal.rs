@@ -904,7 +904,7 @@ mod tests {
             max_replay_actions_per_record: 4,
             ..crate::terminalstate::checkpoint::TerminalCheckpointLimits::default()
         };
-        let config: Arc<dyn TerminalConfiguration> = Arc::new(PropTermConfig);
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> = Arc::new(PropTermConfig);
         let terminal = Terminal::new(
             TerminalSize::default(),
             Arc::clone(&config),

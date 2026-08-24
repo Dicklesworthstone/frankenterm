@@ -1454,18 +1454,19 @@ pub struct GuardianRecoveredOutputRecord {
 
 impl GuardianRecoveredOutputRecord {
     #[must_use]
-    pub(crate) const fn receipt(&self) -> GuardianOutputAppendReceipt {
+    pub const fn receipt(&self) -> GuardianOutputAppendReceipt {
         self.receipt
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn plaintext(&self) -> &[u8] {
         &self.plaintext
     }
 
     #[must_use]
-    pub(crate) fn into_plaintext(self) -> Vec<u8> {
-        self.plaintext
+    pub(crate) fn into_delivery_parts(self) -> (GuardianOutputAppendReceipt, Vec<u8>) {
+        (self.receipt, self.plaintext)
     }
 }
 
@@ -1499,18 +1500,40 @@ impl GuardianOutputRecoveryBatch {
     }
 
     #[must_use]
-    pub(crate) const fn requested_first_sequence(&self) -> u64 {
+    pub const fn requested_first_sequence(&self) -> u64 {
         self.requested_first_sequence
     }
 
     #[must_use]
-    pub(crate) fn records(&self) -> &[GuardianRecoveredOutputRecord] {
+    pub fn records(&self) -> &[GuardianRecoveredOutputRecord] {
         &self.records
     }
 
     #[must_use]
-    pub(crate) fn into_records(self) -> Vec<GuardianRecoveredOutputRecord> {
-        self.records
+    pub(crate) fn into_delivery_parts(
+        self,
+    ) -> (
+        GuardianOutputSegmentIdentity,
+        u64,
+        Vec<GuardianRecoveredOutputRecord>,
+        Option<u64>,
+        Option<u64>,
+        u64,
+        u64,
+        Option<GuardianOutputAppendReceipt>,
+        GuardianOutputJournalTail,
+    ) {
+        (
+            self.segment_identity,
+            self.requested_first_sequence,
+            self.records,
+            self.next_recovery_sequence,
+            self.committed_next_sequence,
+            self.committed_log_bytes,
+            self.cumulative_plaintext_bytes,
+            self.terminal_receipt,
+            self.tail,
+        )
     }
 
     #[must_use]
@@ -1536,24 +1559,24 @@ impl GuardianOutputRecoveryBatch {
     }
 
     #[must_use]
-    pub(crate) const fn cumulative_plaintext_bytes(&self) -> u64 {
+    pub const fn cumulative_plaintext_bytes(&self) -> u64 {
         self.cumulative_plaintext_bytes
     }
 
     #[must_use]
-    pub(crate) const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
+    pub const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
         self.terminal_receipt
     }
 
     #[must_use]
-    pub(crate) fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
+    pub fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
         self.terminal_receipt
             .map(GuardianOutputAppendReceipt::into_predecessor)
             .or(self.segment_identity.predecessor)
     }
 
     #[must_use]
-    pub(crate) const fn tail(&self) -> GuardianOutputJournalTail {
+    pub const fn tail(&self) -> GuardianOutputJournalTail {
         self.tail
     }
 }
@@ -1871,7 +1894,7 @@ impl GuardianOutputJournal {
     /// Verified terminal record authority reconstructed while opening this
     /// segment. It is sufficient to form the exact successor predecessor.
     #[must_use]
-    pub(crate) const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
+    pub const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
         self.terminal_receipt
     }
 
@@ -1879,7 +1902,7 @@ impl GuardianOutputJournal {
     /// segment has no receipt of its own and therefore preserves the exact
     /// authenticated predecessor authority.
     #[must_use]
-    pub(crate) fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
+    pub fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
         self.terminal_receipt
             .map(GuardianOutputAppendReceipt::into_predecessor)
             .or(self.identity.predecessor)
@@ -1925,7 +1948,7 @@ impl GuardianOutputJournal {
     /// Re-read and authenticate a bounded contiguous page of the committed
     /// plaintext suffix. Every frame in the committed prefix is verified;
     /// bytes from an incomplete physical tail are reported but never returned.
-    pub(crate) fn recover_committed_range(
+    pub fn recover_committed_range(
         &self,
         first_sequence: u64,
         limits: GuardianOutputRecoveryLimits,

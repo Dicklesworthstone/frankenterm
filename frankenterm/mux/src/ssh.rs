@@ -184,8 +184,15 @@ fn format_host_verification_for_terminal(failed: HostVerificationFailed) -> Vec<
 pub struct RemoteSshDomain {
     session: Mutex<Option<Session>>,
     dom: SshDomain,
+    origin: RemoteSshDomainOrigin,
     id: DomainId,
     name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteSshDomainOrigin {
+    Runtime,
+    Configuration,
 }
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -254,13 +261,32 @@ pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap
 
 impl RemoteSshDomain {
     pub fn with_ssh_domain(dom: &SshDomain) -> anyhow::Result<Self> {
+        Self::with_ssh_domain_origin(dom, RemoteSshDomainOrigin::Runtime)
+    }
+
+    pub fn with_configured_ssh_domain(dom: &SshDomain) -> anyhow::Result<Self> {
+        Self::with_ssh_domain_origin(dom, RemoteSshDomainOrigin::Configuration)
+    }
+
+    fn with_ssh_domain_origin(
+        dom: &SshDomain,
+        origin: RemoteSshDomainOrigin,
+    ) -> anyhow::Result<Self> {
         let id = alloc_domain_id();
         Ok(Self {
             id,
             name: dom.name.clone(),
             session: Mutex::new(None),
             dom: dom.clone(),
+            origin,
         })
+    }
+
+    /// Whether this exact raw-SSH generation came from reloadable
+    /// configuration rather than an ad-hoc runtime command such as
+    /// `frankenterm ssh`.
+    pub fn is_configuration_owned(&self) -> bool {
+        self.origin == RemoteSshDomainOrigin::Configuration
     }
 
     /// Compare the complete configuration captured by this exact raw-SSH
@@ -270,7 +296,7 @@ impl RemoteSshDomain {
     /// public name would silently keep stale addresses, credentials, backend
     /// selection, commands, or timeouts after a configuration reload.
     pub fn matches_configuration(&self, expected: &SshDomain) -> bool {
-        &self.dom == expected
+        self.is_configuration_owned() && &self.dom == expected
     }
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
@@ -1416,6 +1442,19 @@ mod tests {
                 .map(String::as_str),
             domain.ssh_config_file.as_deref()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_ssh_configuration_ownership_is_explicit() -> anyhow::Result<()> {
+        let domain = test_domain("provenance.invalid");
+        let runtime = RemoteSshDomain::with_ssh_domain(&domain)?;
+        assert!(!runtime.is_configuration_owned());
+        assert!(!runtime.matches_configuration(&domain));
+
+        let configured = RemoteSshDomain::with_configured_ssh_domain(&domain)?;
+        assert!(configured.is_configuration_owned());
+        assert!(configured.matches_configuration(&domain));
         Ok(())
     }
 
