@@ -1248,7 +1248,7 @@ impl core::clone::Clone for TeenyString {
 
 impl core::cmp::PartialEq for TeenyString {
     fn eq(&self, rhs: &Self) -> bool {
-        self.as_bytes().eq(rhs.as_bytes())
+        self.width() == rhs.width() && self.as_bytes().eq(rhs.as_bytes())
     }
 }
 impl core::cmp::Eq for TeenyString {}
