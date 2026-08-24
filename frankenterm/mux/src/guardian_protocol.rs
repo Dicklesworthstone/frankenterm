@@ -84,7 +84,7 @@ const INPUT_RECEIPT_PAYLOAD_BYTES: usize = 53;
 const INPUT_EFFECT_REPLY_PAYLOAD_BYTES: usize = 21;
 const REJECTION_PAYLOAD_BYTES: usize = 6;
 const CHECKPOINT_STAGE_SCOPE_BYTES: usize = 32;
-const CHECKPOINT_STAGE_COMMON_BYTES: usize = 136;
+const CHECKPOINT_STAGE_COMMON_BYTES: usize = 64 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES;
 const CHECKPOINT_STAGE_CHUNK_FIXED_BYTES: usize = CHECKPOINT_STAGE_COMMON_BYTES + 48;
 const CHECKPOINT_STAGE_REPLY_BYTES: usize = 100;
 const REPLAY_CURSOR_BYTES: usize = 160;
@@ -95,7 +95,7 @@ const REPLAY_ACK_REPLY_BYTES: usize = 132;
 const REPLAY_PAGE_HEADER_BYTES: usize = 316;
 const REPLAY_PAGE_DIGEST_OFFSET: usize = 120;
 const REPLAY_PAGE_DIGEST_END: usize = REPLAY_PAGE_DIGEST_OFFSET + 32;
-const REPLAY_CHECKPOINT_DESCRIPTOR_BYTES: usize = 224;
+const REPLAY_CHECKPOINT_DESCRIPTOR_BYTES: usize = 272;
 const REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES: usize = REPLAY_CHECKPOINT_DESCRIPTOR_BYTES + 44;
 const REPLAY_OUTPUT_RECORDS_HEADER_BYTES: usize = 48;
 const REPLAY_OUTPUT_RECORD_FIXED_BYTES: usize = 168;
@@ -107,6 +107,15 @@ const CHECKPOINT_STAGE_WIRE_VERSION: u16 = 1;
 const REPLAY_WIRE_VERSION: u16 = 1;
 const REPLAY_CURSOR_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-cursor.v1";
 const REPLAY_PAGE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian.replay-page.v1";
+const CHECKPOINT_TERMINAL_PAYLOAD_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-terminal-payload.v1\0";
+const CHECKPOINT_OUTPUT_BOUNDARY_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-output-boundary-identity.v1\0";
+const CHECKPOINT_GENESIS_BOUNDARY_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-genesis-boundary-identity.v1\0";
+const CHECKPOINT_ARTIFACT_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-artifact-identity.v1\0";
+const CHECKPOINT_BOUNDARY_IDENTITY_VERSION: u32 = 2;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1384,9 +1393,7 @@ enum GuardianCheckpointStageBodyV1 {
 pub struct GuardianCheckpointStageRequestV1 {
     scope: GuardianCheckpointScopeV1,
     upload_id: Uuid,
-    checkpoint_id: GuardianCheckpointIdentityDigest,
-    boundary_id: GuardianOutputBoundaryIdentityDigest,
-    total_bytes: u64,
+    descriptor: GuardianCheckpointDescriptorV1,
     chunk_bytes: u32,
     total_chunks: u32,
     body: GuardianCheckpointStageBodyV1,
@@ -1410,17 +1417,13 @@ impl GuardianCheckpointStageRequestV1 {
     pub fn begin(
         scope: GuardianCheckpointScopeV1,
         upload_id: Uuid,
-        checkpoint_id: GuardianCheckpointIdentityDigest,
-        boundary_id: GuardianOutputBoundaryIdentityDigest,
-        total_bytes: u64,
+        descriptor: GuardianCheckpointDescriptorV1,
         chunk_bytes: u32,
     ) -> Result<Self, GuardianProtocolError> {
         Self::new(
             scope,
             upload_id,
-            checkpoint_id,
-            boundary_id,
-            total_bytes,
+            descriptor,
             chunk_bytes,
             GuardianCheckpointStageBodyV1::Begin,
         )
@@ -1429,9 +1432,7 @@ impl GuardianCheckpointStageRequestV1 {
     pub fn chunk(
         scope: GuardianCheckpointScopeV1,
         upload_id: Uuid,
-        checkpoint_id: GuardianCheckpointIdentityDigest,
-        boundary_id: GuardianOutputBoundaryIdentityDigest,
-        total_bytes: u64,
+        descriptor: GuardianCheckpointDescriptorV1,
         chunk_bytes: u32,
         index: u32,
         bytes: Zeroizing<Vec<u8>>,
@@ -1443,9 +1444,7 @@ impl GuardianCheckpointStageRequestV1 {
         Self::new(
             scope,
             upload_id,
-            checkpoint_id,
-            boundary_id,
-            total_bytes,
+            descriptor,
             chunk_bytes,
             GuardianCheckpointStageBodyV1::Chunk {
                 index,
@@ -1459,17 +1458,13 @@ impl GuardianCheckpointStageRequestV1 {
     pub fn seal(
         scope: GuardianCheckpointScopeV1,
         upload_id: Uuid,
-        checkpoint_id: GuardianCheckpointIdentityDigest,
-        boundary_id: GuardianOutputBoundaryIdentityDigest,
-        total_bytes: u64,
+        descriptor: GuardianCheckpointDescriptorV1,
         chunk_bytes: u32,
     ) -> Result<Self, GuardianProtocolError> {
         Self::new(
             scope,
             upload_id,
-            checkpoint_id,
-            boundary_id,
-            total_bytes,
+            descriptor,
             chunk_bytes,
             GuardianCheckpointStageBodyV1::Seal,
         )
@@ -1478,19 +1473,15 @@ impl GuardianCheckpointStageRequestV1 {
     fn new(
         scope: GuardianCheckpointScopeV1,
         upload_id: Uuid,
-        checkpoint_id: GuardianCheckpointIdentityDigest,
-        boundary_id: GuardianOutputBoundaryIdentityDigest,
-        total_bytes: u64,
+        descriptor: GuardianCheckpointDescriptorV1,
         chunk_bytes: u32,
         body: GuardianCheckpointStageBodyV1,
     ) -> Result<Self, GuardianProtocolError> {
-        let total_chunks = checkpoint_total_chunks(total_bytes, chunk_bytes)?;
+        let total_chunks = checkpoint_total_chunks(descriptor.total_bytes, chunk_bytes)?;
         let request = Self {
             scope,
             upload_id,
-            checkpoint_id,
-            boundary_id,
-            total_bytes,
+            descriptor,
             chunk_bytes,
             total_chunks,
             body,
@@ -1511,17 +1502,22 @@ impl GuardianCheckpointStageRequestV1 {
 
     #[must_use]
     pub const fn checkpoint_id(&self) -> GuardianCheckpointIdentityDigest {
-        self.checkpoint_id
+        self.descriptor.checkpoint_id
     }
 
     #[must_use]
     pub const fn boundary_id(&self) -> GuardianOutputBoundaryIdentityDigest {
-        self.boundary_id
+        self.descriptor.boundary_id
     }
 
     #[must_use]
     pub const fn total_bytes(&self) -> u64 {
-        self.total_bytes
+        self.descriptor.total_bytes
+    }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> GuardianCheckpointDescriptorV1 {
+        self.descriptor
     }
 
     #[must_use]
@@ -1593,9 +1589,7 @@ impl GuardianCheckpointStageRequestV1 {
         payload.push(0);
         self.scope.encode_into(&mut payload);
         push_uuid(&mut payload, self.upload_id);
-        payload.extend_from_slice(&self.checkpoint_id.0);
-        payload.extend_from_slice(&self.boundary_id.0);
-        payload.extend_from_slice(&self.total_bytes.to_be_bytes());
+        payload.extend_from_slice(&self.descriptor.encode());
         payload.extend_from_slice(&self.chunk_bytes.to_be_bytes());
         payload.extend_from_slice(&self.total_chunks.to_be_bytes());
         if let GuardianCheckpointStageBodyV1::Chunk {
@@ -1638,14 +1632,14 @@ impl GuardianCheckpointStageRequestV1 {
                 .ok_or(GuardianProtocolError::InvalidOperationPayload)?,
         )?;
         let upload_id = read_required_uuid(payload, 40)?;
-        let mut checkpoint_id = [0; 32];
-        checkpoint_id.copy_from_slice(&payload[56..88]);
-        let mut boundary_id = [0; 32];
-        boundary_id.copy_from_slice(&payload[88..120]);
-        let total_bytes = read_u64(payload, 120)?;
-        let chunk_bytes = read_u32(payload, 128)?;
-        let total_chunks = read_u32(payload, 132)?;
-        if checkpoint_total_chunks(total_bytes, chunk_bytes)? != total_chunks {
+        let descriptor_end = 56 + REPLAY_CHECKPOINT_DESCRIPTOR_BYTES;
+        let descriptor = GuardianCheckpointDescriptorV1::decode(
+            &payload[56..descriptor_end],
+        )
+        .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        let chunk_bytes = read_u32(payload, descriptor_end)?;
+        let total_chunks = read_u32(payload, descriptor_end + 4)?;
+        if checkpoint_total_chunks(descriptor.total_bytes, chunk_bytes)? != total_chunks {
             return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         let body = match payload[6] {
@@ -1653,11 +1647,16 @@ impl GuardianCheckpointStageRequestV1 {
                 GuardianCheckpointStageBodyV1::Begin
             }
             2 if payload.len() >= CHECKPOINT_STAGE_CHUNK_FIXED_BYTES => {
-                let index = read_u32(payload, 136)?;
-                let offset = read_u64(payload, 140)?;
+                let index = read_u32(payload, CHECKPOINT_STAGE_COMMON_BYTES)?;
+                let offset = read_u64(payload, CHECKPOINT_STAGE_COMMON_BYTES + 4)?;
                 let mut chunk_digest = [0; 32];
-                chunk_digest.copy_from_slice(&payload[148..180]);
-                let encoded_len = usize::try_from(read_u32(payload, 180)?)
+                chunk_digest.copy_from_slice(
+                    &payload[CHECKPOINT_STAGE_COMMON_BYTES + 12..CHECKPOINT_STAGE_COMMON_BYTES + 44],
+                );
+                let encoded_len = usize::try_from(read_u32(
+                    payload,
+                    CHECKPOINT_STAGE_COMMON_BYTES + 44,
+                )?)
                     .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
                 let expected = CHECKPOINT_STAGE_CHUNK_FIXED_BYTES
                     .checked_add(encoded_len)
@@ -1681,11 +1680,7 @@ impl GuardianCheckpointStageRequestV1 {
         let request = Self {
             scope,
             upload_id,
-            checkpoint_id: GuardianCheckpointIdentityDigest::from_bytes(checkpoint_id)
-                .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
-            boundary_id: GuardianOutputBoundaryIdentityDigest::from_bytes(boundary_id)
-                .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?,
-            total_bytes,
+            descriptor,
             chunk_bytes,
             total_chunks,
             body,
@@ -1697,7 +1692,12 @@ impl GuardianCheckpointStageRequestV1 {
     fn validate(&self) -> Result<(), GuardianProtocolError> {
         self.scope.validate()?;
         require_nonzero(self.upload_id, "checkpoint upload")?;
-        if checkpoint_total_chunks(self.total_bytes, self.chunk_bytes)? != self.total_chunks {
+        self.descriptor
+            .validate_stage_scope(self.scope)
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)?;
+        if checkpoint_total_chunks(self.descriptor.total_bytes, self.chunk_bytes)?
+            != self.total_chunks
+        {
             return Err(GuardianProtocolError::InvalidOperationPayload);
         }
         if let GuardianCheckpointStageBodyV1::Chunk {
@@ -1717,6 +1717,7 @@ impl GuardianCheckpointStageRequestV1 {
                 return Err(GuardianProtocolError::InvalidOperationPayload);
             }
             let remaining = self
+                .descriptor
                 .total_bytes
                 .checked_sub(*offset)
                 .ok_or(GuardianProtocolError::InvalidOperationPayload)?;
@@ -1728,6 +1729,20 @@ impl GuardianCheckpointStageRequestV1 {
             }
         }
         Ok(())
+    }
+
+    /// Validate the fully assembled canonical terminal payload before sealing
+    /// or publishing the staged artifact. Chunk digests only authenticate
+    /// transport fragments; this binds the complete plaintext to the stable
+    /// checkpoint identity carried by the descriptor.
+    pub fn validate_staged_plaintext(
+        &self,
+        canonical_terminal_payload: &[u8],
+    ) -> Result<(), GuardianProtocolError> {
+        self.validate()?;
+        self.descriptor
+            .validate_canonical_payload(canonical_terminal_payload)
+            .map_err(|_| GuardianProtocolError::InvalidOperationPayload)
     }
 
     fn validate_header(&self, header: &GuardianRequestHeader) -> Result<(), GuardianProtocolError> {
