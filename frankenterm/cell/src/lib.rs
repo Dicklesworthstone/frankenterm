@@ -1368,6 +1368,11 @@ impl Cell {
     }
 }
 
+/// Absolute source-level work bound for configured Unicode cell-width
+/// overrides.  Configuration validation counts the expanded ranges (including
+/// overlap) against this cap before constructing the lookup map.
+pub const MAX_CUSTOM_CELL_WIDTH_EXPANSION: usize = 262_144;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnicodeVersion {
     pub version: u8,
