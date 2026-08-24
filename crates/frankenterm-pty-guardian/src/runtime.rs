@@ -842,7 +842,7 @@ impl GuardianRuntime {
         false
     }
 
-    /// Restore worker-owned authorities, replay observations accumulated while
+    /// Restore worker-owned authorities, replay child exits accumulated while
     /// the protocol was absent, and yield one exact transport completion.
     pub(crate) fn try_input_completion(&mut self) -> GuardianRuntimeInputCompletionState {
         match self.input_pipeline.try_completion() {

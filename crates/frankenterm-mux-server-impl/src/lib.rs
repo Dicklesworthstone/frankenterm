@@ -2653,36 +2653,55 @@ impl LiveScrollbackSpillSink {
             if let Some(active) = Self::read_append_wal(&active_path)? {
                 let manifest = Self::read_manifest(&self.manifest_path)?
                     .ok_or_else(|| anyhow::anyhow!("active append WAL has no manifest"))?;
+                let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
+                    .simple()
+                    .to_string();
+                validate_live_scrollback_manifest_identity(
+                    &manifest,
+                    &durable_pane_id,
+                    &self.manifest_path,
+                )?;
                 {
                     let keyring = self
                         .lock_keyring("replace consumed append WAL authentication")
                         .map_err(anyhow::Error::new)?;
                     Self::validate_append_wal_identity(&active, self.durable_pane_id)?;
                     Self::authenticate_append_wal(&active, &keyring)?;
-                }
-                anyhow::ensure!(
-                    Self::append_wal_matches_target_manifest(&active, &manifest)?,
-                    "refusing to replace an unconsumed append WAL"
-                );
-                let store = self
-                    .lock_store("replace consumed append WAL target")
-                    .map_err(anyhow::Error::new)?;
-                Self::verify_append_wal_target_store(&active, &store)?;
-                if active.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 {
-                    let authority = Self::v2_append_wal_target_authority(&active)?;
                     anyhow::ensure!(
-                        authority.matches_store_facts(&store)?
-                            && expected_live_scrollback_v4_chain(&manifest)?
-                                == (authority.chain_anchor, authority.chain_tail),
-                        "consumed v2 append WAL disagrees with its published v4 authority"
+                        Self::authenticate_manifest(&manifest, &keyring)?,
+                        "active append WAL supersession manifest is not authenticated"
                     );
+                }
+                if Self::append_wal_matches_target_manifest(&active, &manifest)? {
+                    let store = self
+                        .lock_store("replace consumed append WAL target")
+                        .map_err(anyhow::Error::new)?;
+                    Self::verify_append_wal_target_store(&active, &store)?;
+                    if active.schema == LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2 {
+                        let authority = Self::v2_append_wal_target_authority(&active)?;
+                        anyhow::ensure!(
+                            authority.matches_store_facts(&store)?
+                                && expected_live_scrollback_v4_chain(&manifest)?
+                                    == (authority.chain_anchor, authority.chain_tail),
+                            "consumed v2 append WAL disagrees with its published v4 authority"
+                        );
+                    } else {
+                        Self::verify_logical_ledger_digest_from_store(
+                            &manifest,
+                            active.ledger_pane_id,
+                            &store,
+                        )
+                        .context("bind consumed append WAL before bounded-slot replacement")?;
+                    }
                 } else {
-                    Self::verify_logical_ledger_digest_from_store(
-                        &manifest,
-                        active.ledger_pane_id,
-                        &store,
-                    )
-                    .context("bind consumed append WAL before bounded-slot replacement")?;
+                    anyhow::ensure!(
+                        Self::append_wal_supersession_matches_manifest(&active, &manifest)?
+                            || Self::append_wal_is_immediately_superseded_by_manifest(
+                                &active,
+                                &manifest,
+                            )?,
+                        "refusing to replace an unconsumed or unlinked append WAL"
+                    );
                 }
             }
 
@@ -2825,6 +2844,80 @@ impl LiveScrollbackSpillSink {
             outcome_indeterminate: publication_attempted,
             source,
         })
+    }
+
+    /// Advance retained, consumed WAL evidence across one authenticated
+    /// manifest edge. This never deletes the exact-row evidence; it re-seals
+    /// the same bounded WAL with the successor manifest's generation, ledger
+    /// pointer, and digest. A crash before this acknowledgement leaves the
+    /// immediately-adjacent predecessor relation recoverable.
+    fn advance_authenticated_append_wal_supersession(&self) -> anyhow::Result<()> {
+        let active_path = Self::append_wal_path(&self.manifest_path)?;
+        let Some(active) = Self::read_append_wal(&active_path)? else {
+            return Ok(());
+        };
+        let manifest = Self::read_manifest(&self.manifest_path)?
+            .ok_or_else(|| anyhow::anyhow!("retained append WAL has no published manifest"))?;
+        let durable_pane_id = uuid::Uuid::from_bytes(self.durable_pane_id)
+            .simple()
+            .to_string();
+        validate_live_scrollback_manifest_identity(
+            &manifest,
+            &durable_pane_id,
+            &self.manifest_path,
+        )?;
+        {
+            let keyring = self
+                .lock_keyring("advance append WAL supersession authentication")
+                .map_err(anyhow::Error::new)?;
+            Self::validate_append_wal_identity(&active, self.durable_pane_id)?;
+            Self::authenticate_append_wal(&active, &keyring)?;
+            anyhow::ensure!(
+                Self::authenticate_manifest(&manifest, &keyring)?,
+                "append WAL supersession requires an authenticated manifest"
+            );
+        }
+        if Self::append_wal_matches_target_manifest(&active, &manifest)?
+            || Self::append_wal_supersession_matches_manifest(&active, &manifest)?
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Self::append_wal_is_immediately_superseded_by_manifest(&active, &manifest)?,
+            "retained append WAL is not linked to the current manifest"
+        );
+
+        let (content_epoch, revision) = live_scrollback_manifest_generation(&manifest)?
+            .ok_or_else(|| anyhow::anyhow!("superseding manifest has no generation"))?;
+        let mut advanced = active;
+        advanced.superseding_content_epoch = Some(hex::encode(content_epoch));
+        advanced.superseding_revision = Some(revision);
+        advanced.superseding_ledger_pane_id =
+            Some(Self::manifest_ledger_pane_id(&manifest)?);
+        advanced.superseding_manifest_sha256 = Some(manifest.manifest_sha256.clone());
+        advanced.guardian_authentication = Some("pending".to_string());
+        advanced.wal_sha256.clear();
+        Self::validate_append_wal_identity(&advanced, self.durable_pane_id)?;
+        advanced.guardian_authentication = None;
+        let canonical = Self::append_wal_authentication_bytes(&advanced)?;
+        {
+            let mut keyring = self
+                .lock_keyring("seal append WAL supersession")
+                .map_err(anyhow::Error::new)?;
+            let cipher = keyring
+                .latest_active_cipher()
+                .context("load guardian key for append WAL supersession")?;
+            advanced.guardian_authentication = Some(
+                cipher
+                    .authenticate_scrollback_append_wal(&canonical)
+                    .context("authenticate append WAL supersession")?
+                    .encode(),
+            );
+        }
+        Self::validate_append_wal_identity(&advanced, self.durable_pane_id)?;
+        advanced.wal_sha256 = Self::append_wal_checksum(&advanced)?;
+        self.persist_authenticated_append_wal(&advanced)
+            .map_err(anyhow::Error::new)
     }
 
     fn manifest_ledger_pane_id(manifest: &LiveScrollbackManifestV1) -> anyhow::Result<u64> {
@@ -3375,8 +3468,11 @@ impl LiveScrollbackSpillSink {
             Self::authenticate_append_wal(wal, &keyring_guard)?;
             anyhow::ensure!(
                 Self::append_wal_matches_predecessor_manifest(wal, published_manifest)?
-                    || Self::append_wal_matches_target_manifest(wal, published_manifest)?,
-                "active append WAL is not adjacent to the published manifest"
+                    || Self::append_wal_is_consumed_or_superseded(
+                        wal,
+                        published_manifest,
+                    )?,
+                "active append WAL is neither adjacent to nor authentically superseded by the published manifest"
             );
         }
         if authenticated_manifest {
@@ -3610,30 +3706,39 @@ impl LiveScrollbackSpillSink {
                     Self::validate_append_wal_identity(&staged_wal, context.durable_pane_id)?;
                     Self::authenticate_append_wal(&staged_wal, &keyring_guard)?;
                     if let Some(active_wal) = active_append_wal.as_ref() {
-                        anyhow::ensure!(
-                            Self::append_wal_matches_target_manifest(
-                                active_wal,
-                                published_manifest,
-                            )?,
-                            "staged append WAL conflicts with an unconsumed active transaction"
-                        );
-                        Self::verify_append_wal_target_store(active_wal, &store)?;
-                        Self::verify_logical_ledger_digest_from_store(
+                        if Self::append_wal_matches_target_manifest(
+                            active_wal,
                             published_manifest,
-                            active_wal.ledger_pane_id,
-                            &store,
-                        )
-                        .context("bind consumed append WAL before staged successor recovery")?;
+                        )? {
+                            Self::verify_append_wal_target_store(active_wal, &store)?;
+                            Self::verify_logical_ledger_digest_from_store(
+                                published_manifest,
+                                active_wal.ledger_pane_id,
+                                &store,
+                            )
+                            .context("bind consumed append WAL before staged successor recovery")?;
+                        } else {
+                            anyhow::ensure!(
+                                Self::append_wal_supersession_matches_manifest(
+                                    active_wal,
+                                    published_manifest,
+                                )? || Self::append_wal_is_immediately_superseded_by_manifest(
+                                    active_wal,
+                                    published_manifest,
+                                )?,
+                                "staged append WAL conflicts with an unconsumed active transaction"
+                            );
+                        }
                     }
                     anyhow::ensure!(
                         Self::append_wal_matches_predecessor_manifest(
                             &staged_wal,
                             published_manifest,
-                        )? || Self::append_wal_matches_target_manifest(
+                        )? || Self::append_wal_is_consumed_or_superseded(
                             &staged_wal,
                             published_manifest,
                         )?,
-                        "staged append WAL is not adjacent to the published generation"
+                        "staged append WAL is neither adjacent to nor authentically superseded by the published generation"
                     );
                 }
                 match std::fs::rename(&append_wal_stage_path, &append_wal_path) {
@@ -5554,6 +5659,9 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         {
             return false;
         }
+        if self.advance_authenticated_append_wal_supersession().is_err() {
+            return false;
+        }
         let clear_pending = current_state.clear_pending_physical_reclamation;
         if clear_pending {
             let Ok(mut store) = self.lock_store("store_scrollback_line reclaim committed clear")
@@ -5827,7 +5935,14 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
         drop(state);
 
         match self.persist_manifest("complete") {
-            Ok(()) => true,
+            Ok(()) => {
+                if let Err(error) = self.advance_authenticated_append_wal_supersession() {
+                    log::warn!(
+                        "deferred append WAL supersession acknowledgement after committed scrollback append: {error:#}"
+                    );
+                }
+                true
+            }
             Err(error) => {
                 if append_wal.is_some() || error.outcome_indeterminate() {
                     if let Ok(mut state) =
@@ -6201,6 +6316,8 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             previous_ledger_pane_id,
             false,
         )?;
+        self.advance_authenticated_append_wal_supersession()
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
         let logical_row_count = if previous_state.clear_manifest_published {
             0
         } else {
@@ -6502,6 +6619,12 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             return Err(ScrollbackSpillError::CommitOutcomeIndeterminate);
         }
 
+        if let Err(error) = self.advance_authenticated_append_wal_supersession() {
+            log::warn!(
+                "deferred append WAL supersession acknowledgement after committed scrollback replacement: {error:#}"
+            );
+        }
+
         // The previously published immutable ledger remains an unreachable
         // archival recovery generation. Do not overwrite or delete historical
         // ledgers until a separately authorized, authenticated GC policy can
@@ -6533,6 +6656,8 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             ledger_pane_id,
             true,
         )?;
+        self.advance_authenticated_append_wal_supersession()
+            .map_err(|_| ScrollbackSpillError::StorageUnavailable)?;
         // Prove the physical store is available before publishing a logical
         // clear. Holding this guard through publication also prevents a clear
         // manifest from becoming durable after store-lock poisoning has made
@@ -6571,6 +6696,11 @@ impl wezterm_term::config::ScrollbackSpillSink for LiveScrollbackSpillSink {
             *self.lock_state("clear_scrollback manifest rollback")? = previous;
             log::error!("failed to publish scrollback clear intent");
             return Err(ScrollbackSpillError::StorageUnavailable);
+        }
+        if let Err(error) = self.advance_authenticated_append_wal_supersession() {
+            log::warn!(
+                "deferred append WAL supersession acknowledgement after committed scrollback clear: {error:#}"
+            );
         }
         let physical_reclaimed = store.clear_pane(ledger_pane_id).is_ok();
         drop(store);
