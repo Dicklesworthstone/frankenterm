@@ -322,11 +322,13 @@ impl RemoteUpgradeRecord {
         );
         if matches!(
             self.state,
-            RemoteUpgradeState::Prepared | RemoteUpgradeState::Activating
+            RemoteUpgradeState::Prepared
+                | RemoteUpgradeState::Activating
+                | RemoteUpgradeState::RolledBack
         ) {
             anyhow::ensure!(
                 self.selector_before == self.selector_after,
-                "effect-authorization record does not preserve one exact pre-effect authority"
+                "effect-authorization or rolled-back record does not preserve one exact pre-effect authority"
             );
         }
         if self.state == RemoteUpgradeState::Committed {
@@ -759,6 +761,45 @@ impl<'root> RemoteUpgradeLedger<'root> {
         self.append_committed_record(
             attempt,
             RemoteUpgradeState::Committed,
+            before,
+            selector_after,
+            receipt,
+        )
+    }
+
+    /// Commit terminal evidence that the authorized selector effect restored
+    /// the exact selector authority observed before that effect began.
+    ///
+    /// The preceding `Activating` record is the durable effect authorization;
+    /// rollback completion therefore retains its exact attempt identity rather
+    /// than minting another authorization. A different or unresolved observed
+    /// authority is not a rollback and must be recorded as `Indeterminate` by
+    /// the caller instead.
+    pub(crate) fn record_rolled_back(
+        &mut self,
+        selector_after: SelectorAuthority,
+    ) -> anyhow::Result<RemoteUpgradeRecord> {
+        let authorization = self
+            .latest
+            .as_ref()
+            .context("selector rollback has no committed activation authorization")?;
+        anyhow::ensure!(
+            authorization.state == RemoteUpgradeState::Activating,
+            "selector rollback is not preceded by Activating authority"
+        );
+        anyhow::ensure!(
+            selector_after == authorization.selector_before,
+            "selector rollback did not restore the exact committed pre-effect authority"
+        );
+        let before = authorization.selector_before.clone();
+        let attempt = authorization.attempt;
+        let receipt = format!(
+            "FT_REMOTE_UPGRADE_TRANSACTION_V1={}:rolled_back:{}\n",
+            self.claim.transaction_id, self.claim.generation_id
+        );
+        self.append_committed_record(
+            attempt,
+            RemoteUpgradeState::RolledBack,
             before,
             selector_after,
             receipt,
@@ -1618,6 +1659,31 @@ mod tests {
             .collect()
     }
 
+    fn authorize_activation_from_pending(ledger: &mut RemoteUpgradeLedger<'_>) {
+        ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization")
+            .consume_publication()
+            .expect("consume publication permit");
+        ledger
+            .commit_pending_live_owner(
+                SelectorAuthority::Missing,
+                format!(
+                    "FT_REMOTE_GENERATION_PUBLICATION_V1={}:pending_activation_lease\n",
+                    ledger.claim.generation_id
+                ),
+            )
+            .expect("commit PendingLiveOwner publication outcome");
+        let permit = ledger
+            .authorize_selector_from_pending(SelectorAuthority::Missing)
+            .expect("commit Activating selector authorization");
+        let (transaction_id, allow_existing_artifact) = permit
+            .consume_selector()
+            .expect("consume selector effect permit");
+        assert_eq!(transaction_id, TRANSACTION_ID);
+        assert!(!allow_existing_artifact);
+    }
+
     #[test]
     fn committed_marker_replays_exact_pending_receipt_and_claims_transaction_id() {
         let (fixture, root, effective_uid) = root_fixture();
@@ -1668,6 +1734,178 @@ mod tests {
         assert_eq!(names.iter().filter(|name| name.starts_with("claim-")).count(), 1);
         assert_eq!(names.iter().filter(|name| name.starts_with("record-")).count(), 2);
         assert_eq!(names.iter().filter(|name| name.starts_with("commit-")).count(), 2);
+    }
+
+    #[test]
+    fn rolled_back_outcome_is_durable_terminal_and_preserves_authorized_attempt() {
+        let (_fixture, root, effective_uid) = root_fixture();
+        let upgrade_claim = claim('a');
+        let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim.clone())
+            .expect("create rollback transaction claim");
+        authorize_activation_from_pending(&mut ledger);
+        let activating = ledger.latest().expect("Activating authorization").clone();
+        assert_eq!(activating.state(), RemoteUpgradeState::Activating);
+        assert_eq!(activating.sequence, 3);
+        assert_eq!(activating.attempt, 2);
+        assert_eq!(activating.selector_before(), &SelectorAuthority::Missing);
+        let names_before = transaction_names(&ledger);
+
+        let rolled_back = ledger
+            .record_rolled_back(SelectorAuthority::Missing)
+            .expect("commit exact rolled-back selector outcome");
+        assert_eq!(rolled_back.state(), RemoteUpgradeState::RolledBack);
+        assert_eq!(rolled_back.sequence, activating.sequence + 1);
+        assert_eq!(rolled_back.attempt, activating.attempt);
+        assert_eq!(rolled_back.selector_before(), activating.selector_before());
+        assert_eq!(rolled_back.selector_after(), activating.selector_before());
+        assert_eq!(
+            rolled_back.receipt(),
+            format!(
+                "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:rolled_back:{}\n",
+                "a".repeat(64)
+            )
+        );
+        assert_eq!(
+            transaction_names(&ledger).len(),
+            names_before.len() + 2,
+            "rollback completion must append exactly one record and one commit marker"
+        );
+
+        let mut replay = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim)
+            .expect("reopen exact rolled-back transaction");
+        assert_eq!(replay.latest(), Some(&rolled_back));
+        let terminal_names = transaction_names(&replay);
+        let error = replay
+            .record_indeterminate(
+                SelectorAuthority::Missing,
+                SelectorAuthority::Missing,
+                format!(
+                    "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:indeterminate:{}\n",
+                    "a".repeat(64)
+                ),
+            )
+            .expect_err("RolledBack must remain terminal");
+        assert!(error
+            .to_string()
+            .contains("illegal remote upgrade transaction state transition"));
+        assert_eq!(transaction_names(&replay), terminal_names);
+    }
+
+    #[test]
+    fn rollback_requires_activating_authority_without_namespace_mutation() {
+        let (_fixture, root, effective_uid) = root_fixture();
+        let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+            .expect("create rollback precondition transaction");
+        let unstarted_names = transaction_names(&ledger);
+        let unstarted_error = ledger
+            .record_rolled_back(SelectorAuthority::Missing)
+            .expect_err("rollback without any authorization must fail");
+        assert!(unstarted_error
+            .to_string()
+            .contains("no committed activation authorization"));
+        assert_eq!(transaction_names(&ledger), unstarted_names);
+
+        ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization")
+            .consume_publication()
+            .expect("consume publication permit");
+        let prepared_names = transaction_names(&ledger);
+        let prepared_error = ledger
+            .record_rolled_back(SelectorAuthority::Missing)
+            .expect_err("Prepared publication authority cannot authorize rollback");
+        assert!(prepared_error
+            .to_string()
+            .contains("not preceded by Activating authority"));
+        assert_eq!(ledger.latest().expect("Prepared remains").state(), RemoteUpgradeState::Prepared);
+        assert_eq!(transaction_names(&ledger), prepared_names);
+    }
+
+    #[test]
+    fn rollback_refuses_changed_or_unresolved_authority_without_mutation() {
+        let (_fixture, root, effective_uid) = root_fixture();
+        let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+            .expect("create rollback authority transaction");
+        ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization")
+            .consume_publication()
+            .expect("consume publication permit");
+        ledger
+            .authorize_selector_after_publication(SelectorAuthority::Missing)
+            .expect("commit Activating selector authorization")
+            .consume_selector()
+            .expect("consume selector effect permit");
+        let names_before = transaction_names(&ledger);
+        let changed = SelectorAuthority::selected(
+            &"d".repeat(64),
+            Path::new(&format!("generations/{}", "d".repeat(64))),
+            41,
+            43,
+        )
+        .expect("create different resolved selector authority");
+
+        for observed in [changed, SelectorAuthority::unresolved_post_effect()] {
+            let error = ledger
+                .record_rolled_back(observed)
+                .expect_err("non-restored authority must not become RolledBack");
+            assert!(error
+                .to_string()
+                .contains("did not restore the exact committed pre-effect authority"));
+            assert_eq!(transaction_names(&ledger), names_before);
+            assert_eq!(
+                ledger.latest().expect("Activating remains").state(),
+                RemoteUpgradeState::Activating
+            );
+        }
+    }
+
+    #[test]
+    fn rolled_back_record_validation_rejects_forged_changed_authority() {
+        let (_fixture, root, effective_uid) = root_fixture();
+        let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+            .expect("create forged rollback transaction");
+        ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization")
+            .consume_publication()
+            .expect("consume publication permit");
+        ledger
+            .authorize_selector_after_publication(SelectorAuthority::Missing)
+            .expect("commit Activating selector authorization")
+            .consume_selector()
+            .expect("consume selector effect permit");
+        let authorization = ledger.latest().expect("Activating authorization");
+        let changed = SelectorAuthority::selected(
+            &"d".repeat(64),
+            Path::new(&format!("generations/{}", "d".repeat(64))),
+            47,
+            53,
+        )
+        .expect("create forged post-rollback authority");
+        let forged = RemoteUpgradeRecord {
+            schema: RECORD_SCHEMA.to_string(),
+            transaction_id: ledger.claim.transaction_id.clone(),
+            claim_sha256: ledger.claim_sha256.clone(),
+            claim: ledger.claim.clone(),
+            sequence: authorization.sequence + 1,
+            attempt: authorization.attempt,
+            state: RemoteUpgradeState::RolledBack,
+            generation_id: ledger.claim.generation_id.clone(),
+            selector_before: authorization.selector_before.clone(),
+            selector_after: changed,
+            receipt: format!(
+                "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:rolled_back:{}\n",
+                ledger.claim.generation_id
+            ),
+        };
+
+        let error = forged
+            .canonical_bytes(&ledger.claim, &ledger.claim_sha256)
+            .expect_err("forged changed authority must fail canonical record validation");
+        assert!(error
+            .to_string()
+            .contains("rolled-back record does not preserve one exact pre-effect authority"));
     }
 
     #[test]

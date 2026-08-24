@@ -3368,10 +3368,40 @@ mod tests {
         descriptor
             .validate_record_authority(segment, first)
             .expect("accept exact verified receipt");
+        descriptor
+            .validated_record_seal_witness(
+                capture.terminal_checkpoint().canonical_payload(),
+                segment,
+                first,
+            )
+            .expect("mint seal authority only from the exact payload and receipt");
         assert_eq!(
             descriptor.validate_record_authority(segment, second),
             Err(GuardianCheckpointBoundaryError::VerifiedOutputIdentityMismatch)
         );
+        assert!(matches!(
+            descriptor.validated_record_seal_witness(
+                capture.terminal_checkpoint().canonical_payload(),
+                segment,
+                second,
+            ),
+            Err(GuardianCheckpointBoundaryError::VerifiedOutputIdentityMismatch)
+        ));
+
+        let payload_splice = terminal_checkpoint_with(24, 80, "guardian-checkpoint-tesz");
+        assert_eq!(
+            payload_splice.canonical_payload().len(),
+            capture.terminal_checkpoint().canonical_payload().len(),
+            "seal-witness splice must isolate payload content identity"
+        );
+        assert!(matches!(
+            descriptor.validated_record_seal_witness(
+                payload_splice.canonical_payload(),
+                segment,
+                first,
+            ),
+            Err(GuardianCheckpointBoundaryError::TerminalPayloadDigestMismatch)
+        ));
     }
 
     fn checkpoint_stage_cipher(seed: u8) -> GuardianCheckpointCipher {
@@ -3474,6 +3504,13 @@ mod tests {
             )
             .expect("reconstruct bounded fixed-layout record");
             assert_ne!(reconstructed.context(), context);
+            let mut authority_mutation = context;
+            authority_mutation.authority =
+                GuardianCheckpointStageContextAuthorityV1::PersistedClaim;
+            assert_ne!(authority_mutation, context);
+            let mut digest_authority_mutation = context;
+            digest_authority_mutation.expected_plaintext_digest = None;
+            assert_ne!(digest_authority_mutation, context);
             assert!(matches!(
                 cipher.seal(reconstructed.context(), plaintext),
                 Err(GuardianCheckpointCipherError::InvalidKindAuthority)
@@ -3584,6 +3621,171 @@ mod tests {
             ),
             Err(GuardianCheckpointCipherError::DescriptorScopeMismatch)
         ));
+    }
+
+    #[test]
+    fn seal_manifest_requires_exact_payload_and_origin_authority() {
+        let plaintext = b"authority-gated checkpoint record";
+        let (descriptor, segment, output, capture) = record_descriptor();
+        let claimed_descriptor = GuardianCheckpointArtifactDescriptorV1::from_claimed_parts(
+            descriptor
+                .recompute_boundary_identity_digest()
+                .expect("recompute claimed boundary"),
+            descriptor
+                .recompute_checkpoint_identity_digest()
+                .expect("recompute claimed artifact"),
+            descriptor.origin(),
+            descriptor.parser_stream_bytes(),
+            descriptor.replay_identity_digest(),
+            descriptor.rows(),
+            descriptor.cols(),
+            descriptor.terminal_payload_bytes(),
+            descriptor.terminal_payload_digest(),
+        )
+        .expect("validate claimed descriptor fields");
+        let binding = record_stage_binding(claimed_descriptor, 19);
+        let upload_id = Uuid::new_v4();
+        let publication_id = Uuid::new_v4();
+        let cipher = checkpoint_stage_cipher(0x73);
+
+        let candidate = GuardianCheckpointStageRecordContextV1::candidate_metadata(
+            &binding,
+            upload_id,
+            publication_id,
+            plaintext,
+        )
+        .expect("claimed descriptor authorizes candidate staging");
+        cipher
+            .seal(candidate, plaintext)
+            .expect("seal candidate under stage binding");
+        let chunk = GuardianCheckpointStageRecordContextV1::chunk(
+            &binding,
+            upload_id,
+            publication_id,
+            0,
+            0,
+            plaintext,
+        )
+        .expect("claimed descriptor authorizes chunk staging");
+        cipher
+            .seal(chunk, plaintext)
+            .expect("seal chunk under stage binding");
+
+        let manifest_without_witness = GuardianCheckpointStageRecordContextV1::from_binding(
+            GuardianCheckpointStageRecordKindV1::SealManifest,
+            &binding,
+            upload_id,
+            publication_id,
+            None,
+            plaintext,
+            GuardianCheckpointStageContextAuthorityV1::StageBinding,
+        )
+        .expect("construct manifest authority mutation");
+        assert!(matches!(
+            cipher.seal(manifest_without_witness, plaintext),
+            Err(GuardianCheckpointCipherError::InvalidKindAuthority)
+        ));
+        let candidate_with_seal_authority = GuardianCheckpointStageRecordContextV1::from_binding(
+            GuardianCheckpointStageRecordKindV1::CandidateMetadata,
+            &binding,
+            upload_id,
+            publication_id,
+            None,
+            plaintext,
+            GuardianCheckpointStageContextAuthorityV1::ValidatedSeal,
+        )
+        .expect("construct candidate authority mutation");
+        assert!(matches!(
+            cipher.seal(candidate_with_seal_authority, plaintext),
+            Err(GuardianCheckpointCipherError::InvalidKindAuthority)
+        ));
+
+        let witness = record_seal_witness(&descriptor, segment, output, &capture);
+        let manifest = GuardianCheckpointStageRecordContextV1::seal_manifest(
+            &binding,
+            &witness,
+            upload_id,
+            publication_id,
+            plaintext,
+        )
+        .expect("exact payload and receipt mint manifest authority");
+        cipher
+            .seal(manifest, plaintext)
+            .expect("seal manifest under validated witness");
+
+        let (other_descriptor, other_segment, other_output, other_capture) = record_descriptor();
+        let other_witness = record_seal_witness(
+            &other_descriptor,
+            other_segment,
+            other_output,
+            &other_capture,
+        );
+        assert!(matches!(
+            GuardianCheckpointStageRecordContextV1::seal_manifest(
+                &binding,
+                &other_witness,
+                upload_id,
+                publication_id,
+                plaintext,
+            ),
+            Err(GuardianCheckpointCipherError::SealWitnessMismatch)
+        ));
+
+        let spawn_effect_id = Uuid::new_v4();
+        let genesis_terminal = terminal_checkpoint();
+        let genesis_descriptor =
+            GuardianCheckpointArtifactDescriptorV1::from_genesis_checkpoint(
+                spawn_effect_id,
+                &genesis_terminal,
+            )
+            .expect("construct Genesis authority descriptor");
+        assert!(matches!(
+            genesis_descriptor.validated_genesis_seal_witness(
+                Uuid::new_v4(),
+                genesis_terminal.canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch)
+        ));
+        assert!(matches!(
+            descriptor.validated_genesis_seal_witness(
+                spawn_effect_id,
+                capture.terminal_checkpoint().canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority)
+        ));
+        let genesis_splice = terminal_checkpoint_with(24, 80, "guardian-checkpoint-tesz");
+        assert!(matches!(
+            genesis_descriptor.validated_genesis_seal_witness(
+                spawn_effect_id,
+                genesis_splice.canonical_payload(),
+            ),
+            Err(GuardianCheckpointBoundaryError::TerminalPayloadDigestMismatch)
+        ));
+        let genesis_witness = genesis_descriptor
+            .validated_genesis_seal_witness(
+                spawn_effect_id,
+                genesis_terminal.canonical_payload(),
+            )
+            .expect("mint exact Genesis payload and Spawn-effect authority");
+        let genesis_scope = GuardianCheckpointStageScopeV1::genesis(spawn_effect_id)
+            .expect("construct exact Genesis scope");
+        let genesis_binding = GuardianCheckpointStageBindingV1::from_protocol_capture(
+            genesis_scope,
+            genesis_descriptor,
+            GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION,
+        )
+        .expect("bind exact Genesis capture generation");
+        let genesis_manifest = GuardianCheckpointStageRecordContextV1::seal_manifest(
+            &genesis_binding,
+            &genesis_witness,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            plaintext,
+        )
+        .expect("construct exact Genesis manifest authority");
+        cipher
+            .seal(genesis_manifest, plaintext)
+            .expect("seal Genesis manifest under validated witness");
     }
 
     #[test]
