@@ -1296,6 +1296,8 @@ pub struct GuardianClient {
 struct ClientRequestWipeProbe {
     explicit_wipe: AtomicBool,
     drop_wipe: AtomicBool,
+    authenticated_input_wipe: AtomicBool,
+    encoded_frame_wipe: AtomicBool,
 }
 
 /// Owned client request whose plaintext is retired on every encoding exit.
@@ -1754,8 +1756,23 @@ impl GuardianClient {
         let mut authenticated: AuthenticatedGuardianRequest =
             decode_guardian_request(&self.secret, &frame)?;
         retire_authenticated_input_plaintext(&mut authenticated);
+        #[cfg(test)]
+        if authenticated.header().operation == GuardianOperation::Input {
+            if let Some(probe) = self.request_wipe_probe.as_ref() {
+                probe.authenticated_input_wipe.store(
+                    authenticated.payload().is_empty(),
+                    Ordering::SeqCst,
+                );
+            }
+        }
         self.stream.write_all(&frame)?;
         frame.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if let Some(probe) = self.request_wipe_probe.as_ref() {
+            probe
+                .encoded_frame_wipe
+                .store(frame.iter().all(|byte| *byte == 0), Ordering::SeqCst);
+        }
         let response_frame = read_blocking_frame(&mut self.stream)?;
         let response = decode_guardian_response(&self.secret, &response_frame)?;
         let correlated = response.correlate(authenticated.header())?;
@@ -3292,6 +3309,8 @@ mod tests {
         ));
         assert!(wipe_probe.explicit_wipe.load(Ordering::SeqCst));
         assert!(wipe_probe.drop_wipe.load(Ordering::SeqCst));
+        assert!(!wipe_probe.authenticated_input_wipe.load(Ordering::SeqCst));
+        assert!(!wipe_probe.encoded_frame_wipe.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -3355,6 +3374,8 @@ mod tests {
         ));
         assert!(wipe_probe.explicit_wipe.load(Ordering::SeqCst));
         assert!(wipe_probe.drop_wipe.load(Ordering::SeqCst));
+        assert!(wipe_probe.authenticated_input_wipe.load(Ordering::SeqCst));
+        assert!(wipe_probe.encoded_frame_wipe.load(Ordering::SeqCst));
         server.join().expect("input test server exits cleanly");
     }
 

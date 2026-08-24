@@ -9427,6 +9427,19 @@ mod tests {
         drop(sink);
         let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
             .expect("recover replacement-before-WAL-acknowledgement crash cut");
+        let reopened_manifest = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+            .expect("read crash-cut successor manifest")
+            .expect("crash-cut successor manifest exists");
+        assert_eq!(
+            reopened.active_ledger_pane_id(),
+            LiveScrollbackSpillSink::manifest_ledger_pane_id(&reopened_manifest)
+                .expect("decode crash-cut successor ledger")
+        );
+        assert_ne!(
+            reopened.active_ledger_pane_id(),
+            original.ledger_pane_id,
+            "retained superseded WAL must not become current ledger authority"
+        );
         let second_prefix = wezterm_term::config::ScrollbackPrefix::from_slices(
             Some(10),
             12,
@@ -9447,6 +9460,12 @@ mod tests {
         let second_retired = LiveScrollbackSpillSink::read_append_wal(&wal_path)
             .expect("read successively retired WAL")
             .expect("successively retired WAL remains present");
+        assert_eq!(
+            reopened.active_ledger_pane_id(),
+            LiveScrollbackSpillSink::manifest_ledger_pane_id(&second_manifest)
+                .expect("decode successive superseding ledger")
+        );
+        assert_ne!(reopened.active_ledger_pane_id(), original.ledger_pane_id);
         assert!(LiveScrollbackSpillSink::append_wal_supersession_matches_manifest(
             &second_retired,
             &second_manifest,
