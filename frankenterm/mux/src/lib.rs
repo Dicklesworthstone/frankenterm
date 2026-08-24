@@ -66,8 +66,8 @@ use crate::guardian_checkpoint::{
 };
 use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputJournal, GuardianOutputJournalError,
-    GuardianOutputJournalTail, GuardianOutputPredecessor, GuardianOutputRecoveryBatch,
-    GuardianOutputRecoveryLimits, GuardianOutputSegmentIdentity,
+    GuardianOutputJournalTail, GuardianOutputPredecessor, GuardianOutputRecoveryLimits,
+    GuardianOutputSegmentIdentity, GuardianRecoveredOutputRecord,
 };
 use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
@@ -2012,6 +2012,8 @@ pub enum GuardianOutputRecoveryDeliveryError {
     CheckpointBoundary(#[from] GuardianCheckpointBoundaryError),
     #[error("guardian output recovery could not be admitted to the exact live parser")]
     LiveParser(#[from] LiveParserCheckpointError),
+    #[error("guardian output recovery could not publish exact bytes to the live parser")]
+    ParserDelivery(#[source] std::io::Error),
     #[error("guardian output recovery page is internally inconsistent: {0}")]
     InvalidPage(&'static str),
 }
@@ -2567,6 +2569,78 @@ impl LiveParserCheckpointControl {
             }
         }
         self.delivery_gate.notify_all();
+    }
+
+    fn seed_guardian_recovery_cursor(
+        &self,
+        durable_pane_id: uuid::Uuid,
+        segment: GuardianOutputSegmentIdentity,
+        output: GuardianOutputAppendReceipt,
+    ) -> Result<(), LiveParserCheckpointError> {
+        let mut state = self.state.lock();
+        if !state.attached {
+            return Err(LiveParserCheckpointError::ReaderUnavailable);
+        }
+        if state.dead {
+            return Err(LiveParserCheckpointError::ReaderDead);
+        }
+        if let Some(reason) = state.poison {
+            return Err(LiveParserCheckpointError::Poisoned(reason));
+        }
+        if state.delivery_call_in_flight || state.socket_write_in_flight {
+            return Err(LiveParserCheckpointError::DeliveryWriteInFlight);
+        }
+        if state.pending.is_some() {
+            return Err(LiveParserCheckpointError::CheckpointBusy);
+        }
+        if state.guardian_mode
+            || state.guardian_cursor.is_some()
+            || state.authorized_delivery.is_some()
+            || state.delivered_bytes != 0
+            || state.parsed_bytes != 0
+        {
+            return Err(LiveParserCheckpointError::GuardianDeliveryStartedLate);
+        }
+        if segment.durable_pane_id() != durable_pane_id
+            || segment.segment_id() != output.segment_id()
+            || output.sequence() < segment.first_sequence()
+        {
+            return Err(LiveParserCheckpointError::GuardianDeliveryIdentityMismatch);
+        }
+        state.guardian_mode = true;
+        state.guardian_cursor = Some(LiveParserGuardianCursor {
+            segment_id: output.segment_id(),
+            output_sequence: output.sequence(),
+            output_record_digest: output.record_digest(),
+            output_committed_log_bytes: output.committed_log_bytes(),
+            journal_cumulative_plaintext_bytes: output.cumulative_plaintext_bytes(),
+            // A restored terminal begins a fresh external parser incarnation.
+            // Its parser watermark is therefore zero at the checkpoint even
+            // though the pane-lifetime journal watermark remains monotonic.
+            parser_global_endpoint: 0,
+        });
+        Ok(())
+    }
+
+    fn guardian_recovery_cursor(
+        &self,
+    ) -> Result<LiveParserGuardianCursor, LiveParserCheckpointError> {
+        let state = self.state.lock();
+        if state.dead {
+            return Err(LiveParserCheckpointError::ReaderDead);
+        }
+        if let Some(reason) = state.poison {
+            return Err(LiveParserCheckpointError::Poisoned(reason));
+        }
+        if state.delivery_call_in_flight || state.socket_write_in_flight {
+            return Err(LiveParserCheckpointError::DeliveryWriteInFlight);
+        }
+        if state.authorized_delivery.is_some() {
+            return Err(LiveParserCheckpointError::GuardianDeliveryBusy);
+        }
+        state
+            .guardian_cursor
+            .ok_or(LiveParserCheckpointError::GuardianDeliveryUnavailable)
     }
 
     fn authorize_guardian_delivery(
@@ -3974,15 +4048,11 @@ mod pane_registration_handle {
         }
 
         /// Register one authenticated guardian receipt as the exact next byte
-        /// span this reader may publish to its parser socket. The future
-        /// guardian journal caller must invoke this for every receipt, before
+        /// span this reader may publish to its parser socket. Guardian journal
+        /// delivery invokes this for every receipt, before
         /// delivering that receipt's exact owned bytes; receipt length alone is
         /// insufficient, and raw PTY delivery never synthesizes this authority.
-        #[allow(
-            dead_code,
-            reason = "production guardian journal delivery caller lands after the protocol effect"
-        )]
-        pub(crate) fn authorize_guardian_output_delivery(
+        pub fn authorize_guardian_output_delivery(
             &self,
             segment: GuardianOutputSegmentIdentity,
             output: GuardianOutputAppendReceipt,
@@ -4018,6 +4088,399 @@ mod pane_registration_handle {
             } else {
                 Err(LiveParserCheckpointError::StaleRegistration)
             }
+        }
+
+        fn validate_guardian_recovery_page(
+            segment: GuardianOutputSegmentIdentity,
+            requested_first_sequence: u64,
+            records: &[GuardianRecoveredOutputRecord],
+            previous: Option<LiveParserGuardianCursor>,
+            next_recovery_sequence: Option<u64>,
+            committed_next_sequence: Option<u64>,
+            committed_log_bytes: u64,
+            cumulative_plaintext_bytes: u64,
+            terminal_receipt: Option<GuardianOutputAppendReceipt>,
+        ) -> Result<(), GuardianOutputRecoveryDeliveryError> {
+            let base_cumulative = segment
+                .predecessor()
+                .map_or(0, GuardianOutputPredecessor::cumulative_plaintext_bytes);
+            let expected_first = match previous {
+                Some(previous) => {
+                    let expected = previous.output_sequence.checked_add(1).ok_or(
+                        GuardianOutputRecoveryDeliveryError::InvalidPage(
+                            "the current parser cursor exhausted output sequence space",
+                        ),
+                    )?;
+                    if previous.segment_id != segment.segment_id() {
+                        let predecessor = segment.predecessor().ok_or(
+                            GuardianOutputRecoveryDeliveryError::InvalidPage(
+                                "a recovery segment rollover omitted its predecessor",
+                            ),
+                        )?;
+                        if predecessor.segment_id() != previous.segment_id
+                            || predecessor.last_sequence() != previous.output_sequence
+                            || predecessor.terminal_record_digest()
+                                != previous.output_record_digest
+                            || predecessor.committed_log_bytes()
+                                != previous.output_committed_log_bytes
+                            || predecessor.cumulative_plaintext_bytes()
+                                != previous.journal_cumulative_plaintext_bytes
+                            || segment.first_sequence() != expected
+                        {
+                            return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                                "the recovery segment predecessor does not match the live cursor",
+                            ));
+                        }
+                    }
+                    expected
+                }
+                None => requested_first_sequence,
+            };
+            if requested_first_sequence != expected_first {
+                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "the requested recovery sequence does not continue the live cursor",
+                ));
+            }
+
+            let mut expected_sequence = expected_first;
+            let mut previous_sequence = None;
+            let mut previous_cumulative = match previous {
+                Some(cursor) => cursor.journal_cumulative_plaintext_bytes,
+                None => match records.first() {
+                    Some(first) => {
+                        let first = first.receipt();
+                        let before_first = first
+                            .cumulative_plaintext_bytes()
+                            .checked_sub(u64::from(first.payload_bytes()))
+                            .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                                "the first recovery receipt underflows its plaintext watermark",
+                            ))?;
+                        if before_first < base_cumulative
+                            || (requested_first_sequence == segment.first_sequence()
+                                && before_first != base_cumulative)
+                        {
+                            return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                                "the first recovery receipt has an invalid prior watermark",
+                            ));
+                        }
+                        before_first
+                    }
+                    None => base_cumulative,
+                },
+            };
+            let mut previous_log_bytes = previous
+                .filter(|cursor| cursor.segment_id == segment.segment_id())
+                .map(|cursor| cursor.output_committed_log_bytes);
+            for record in records {
+                let (receipt, plaintext) = record.delivery_parts();
+                if receipt.segment_id() != segment.segment_id()
+                    || receipt.sequence() != expected_sequence
+                    || !receipt.matches_payload(plaintext)
+                {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "a recovered record does not match its authenticated sequence or payload",
+                    ));
+                }
+                let expected_cumulative = previous_cumulative
+                    .checked_add(u64::from(receipt.payload_bytes()))
+                    .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "recovery plaintext accounting overflowed",
+                    ))?;
+                if receipt.cumulative_plaintext_bytes() != expected_cumulative {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "a recovered record breaks the pane-lifetime plaintext watermark",
+                    ));
+                }
+                if previous_log_bytes.is_some_and(|previous| {
+                    receipt.committed_log_bytes() <= previous
+                }) {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "a recovered record does not advance the segment log endpoint",
+                    ));
+                }
+                previous_sequence = Some(receipt.sequence());
+                previous_cumulative = receipt.cumulative_plaintext_bytes();
+                previous_log_bytes = Some(receipt.committed_log_bytes());
+                expected_sequence = receipt.sequence().checked_add(1).unwrap_or(0);
+            }
+
+            if let Some(next) = next_recovery_sequence {
+                let last = previous_sequence.ok_or(
+                    GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "an empty recovery page cannot advertise a continuation",
+                    ),
+                )?;
+                if last.checked_add(1) != Some(next)
+                    || committed_next_sequence.is_some_and(|committed| next >= committed)
+                {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "the recovery page continuation is not an exact interior cursor",
+                    ));
+                }
+            } else if let Some(last) = previous_sequence {
+                if last.checked_add(1) != committed_next_sequence {
+                    return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "a terminal recovery page does not reach the committed endpoint",
+                    ));
+                }
+            } else if committed_next_sequence != Some(requested_first_sequence) {
+                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "an empty recovery page is not positioned at the committed endpoint",
+                ));
+            }
+
+            match terminal_receipt {
+                Some(terminal) => {
+                    if terminal.segment_id() != segment.segment_id()
+                        || terminal.sequence().checked_add(1) != committed_next_sequence
+                        || terminal.committed_log_bytes() != committed_log_bytes
+                        || terminal.cumulative_plaintext_bytes() != cumulative_plaintext_bytes
+                    {
+                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                            "the recovery page aggregate does not match its terminal receipt",
+                        ));
+                    }
+                    let terminal_was_already_delivered = records.is_empty()
+                        && previous.is_some_and(|cursor| {
+                            cursor.segment_id == terminal.segment_id()
+                                && cursor.output_sequence == terminal.sequence()
+                                && cursor.output_record_digest == terminal.record_digest()
+                                && cursor.output_committed_log_bytes
+                                    == terminal.committed_log_bytes()
+                                && cursor.journal_cumulative_plaintext_bytes
+                                    == terminal.cumulative_plaintext_bytes()
+                        });
+                    if next_recovery_sequence.is_none()
+                        && previous_sequence != Some(terminal.sequence())
+                        && !terminal_was_already_delivered
+                    {
+                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                            "a terminal recovery page omits its authenticated terminal record",
+                        ));
+                    }
+                }
+                None => {
+                    if committed_next_sequence != Some(segment.first_sequence())
+                        || cumulative_plaintext_bytes != base_cumulative
+                    {
+                        return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                            "an empty segment recovery aggregate is inconsistent",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn deliver_guardian_recovery_records(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            records: Vec<GuardianRecoveredOutputRecord>,
+            skip_records: usize,
+        ) -> Result<(u64, u64), GuardianOutputRecoveryDeliveryError> {
+            let mut delivered_records = 0_u64;
+            let mut delivered_plaintext_bytes = 0_u64;
+            for record in records.into_iter().skip(skip_records) {
+                let (receipt, plaintext) = record.into_delivery_parts();
+                let plaintext_bytes = u64::try_from(plaintext.len()).map_err(|_| {
+                    GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "recovered plaintext length does not fit delivery accounting",
+                    )
+                })?;
+                let payload = Arc::<[u8]>::from(plaintext);
+                self.authorize_guardian_output_delivery(
+                    segment,
+                    receipt,
+                    Arc::clone(&payload),
+                )?;
+                self.generation
+                    .live_parser_checkpoint
+                    .write_delivered_bytes(payload.as_ref())
+                    .map_err(GuardianOutputRecoveryDeliveryError::ParserDelivery)?;
+                delivered_records = delivered_records.checked_add(1).ok_or(
+                    GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "recovery record delivery count overflowed",
+                    ),
+                )?;
+                delivered_plaintext_bytes = delivered_plaintext_bytes
+                    .checked_add(plaintext_bytes)
+                    .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                        "recovery plaintext delivery count overflowed",
+                    ))?;
+            }
+            Ok((delivered_records, delivered_plaintext_bytes))
+        }
+
+        fn recovery_delivery_receipt(
+            segment_identity: GuardianOutputSegmentIdentity,
+            requested_first_sequence: u64,
+            delivered_records: u64,
+            delivered_plaintext_bytes: u64,
+            next_recovery_sequence: Option<u64>,
+            committed_next_sequence: Option<u64>,
+            committed_log_bytes: u64,
+            cumulative_plaintext_bytes: u64,
+            terminal_receipt: Option<GuardianOutputAppendReceipt>,
+            tail: GuardianOutputJournalTail,
+        ) -> GuardianOutputRecoveryDelivery {
+            GuardianOutputRecoveryDelivery {
+                segment_identity,
+                requested_first_sequence,
+                delivered_records,
+                delivered_plaintext_bytes,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_predecessor: terminal_receipt
+                    .map(GuardianOutputAppendReceipt::into_predecessor)
+                    .or(segment_identity.predecessor()),
+                tail,
+            }
+        }
+
+        /// Authenticate the checkpoint record from a reopened journal, seed a
+        /// fresh parser incarnation at that exact model boundary, and deliver
+        /// only the later records in the first bounded recovery page. Callers
+        /// must retain the pane-reader start gate until this method and every
+        /// required continuation page have committed.
+        pub fn recover_guardian_output_from_checkpoint(
+            &self,
+            journal: &GuardianOutputJournal,
+            boundary: &GuardianCheckpointBoundary,
+            canonical_terminal_payload: &[u8],
+            limits: GuardianOutputRecoveryLimits,
+        ) -> Result<GuardianOutputRecoveryDelivery, GuardianOutputRecoveryDeliveryError> {
+            let batch = journal.recover_committed_range(boundary.output_sequence(), limits)?;
+            let (
+                segment_identity,
+                requested_first_sequence,
+                records,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+                tail,
+            ) = batch.into_delivery_parts();
+            if segment_identity != journal.identity()
+                || requested_first_sequence != boundary.output_sequence()
+            {
+                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "checkpoint recovery did not begin at the requested journal identity",
+                ));
+            }
+            Self::validate_guardian_recovery_page(
+                segment_identity,
+                requested_first_sequence,
+                &records,
+                None,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+            )?;
+            let checkpoint_receipt = records
+                .first()
+                .ok_or(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "checkpoint recovery omitted the authenticated checkpoint record",
+                ))?
+                .receipt();
+            let durable_pane_id = self
+                .pane
+                .durable_pane_id()
+                .map(uuid::Uuid::from_bytes)
+                .ok_or(LiveParserCheckpointError::MissingDurablePaneIdentity)?;
+            boundary.validate_for_restore(
+                durable_pane_id,
+                segment_identity,
+                checkpoint_receipt,
+                canonical_terminal_payload,
+            )?;
+            self.generation
+                .live_parser_checkpoint
+                .seed_guardian_recovery_cursor(
+                    durable_pane_id,
+                    segment_identity,
+                    checkpoint_receipt,
+                )?;
+            let (delivered_records, delivered_plaintext_bytes) = self
+                .deliver_guardian_recovery_records(segment_identity, records, 1)?;
+            Ok(Self::recovery_delivery_receipt(
+                segment_identity,
+                requested_first_sequence,
+                delivered_records,
+                delivered_plaintext_bytes,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+                tail,
+            ))
+        }
+
+        /// Reopen, authenticate, and deliver one exact continuation page after
+        /// `recover_guardian_output_from_checkpoint` seeded this parser.
+        pub fn recover_and_deliver_guardian_output_page(
+            &self,
+            journal: &GuardianOutputJournal,
+            first_sequence: u64,
+            limits: GuardianOutputRecoveryLimits,
+        ) -> Result<GuardianOutputRecoveryDelivery, GuardianOutputRecoveryDeliveryError> {
+            let previous = self
+                .generation
+                .live_parser_checkpoint
+                .guardian_recovery_cursor()?;
+            let expected_first = previous.output_sequence.checked_add(1).ok_or(
+                LiveParserCheckpointError::GuardianRecoveryRangeMismatch,
+            )?;
+            if first_sequence != expected_first {
+                return Err(LiveParserCheckpointError::GuardianRecoveryRangeMismatch.into());
+            }
+            let batch = journal.recover_committed_range(first_sequence, limits)?;
+            let (
+                segment_identity,
+                requested_first_sequence,
+                records,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+                tail,
+            ) = batch.into_delivery_parts();
+            if segment_identity != journal.identity() {
+                return Err(GuardianOutputRecoveryDeliveryError::InvalidPage(
+                    "continuation recovery changed journal identity",
+                ));
+            }
+            Self::validate_guardian_recovery_page(
+                segment_identity,
+                requested_first_sequence,
+                &records,
+                Some(previous),
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+            )?;
+            let (delivered_records, delivered_plaintext_bytes) = self
+                .deliver_guardian_recovery_records(segment_identity, records, 0)?;
+            Ok(Self::recovery_delivery_receipt(
+                segment_identity,
+                requested_first_sequence,
+                delivered_records,
+                delivered_plaintext_bytes,
+                next_recovery_sequence,
+                committed_next_sequence,
+                committed_log_bytes,
+                cumulative_plaintext_bytes,
+                terminal_receipt,
+                tail,
+            ))
         }
 
         /// Freeze this exact live parser registration at the authenticated
@@ -4089,11 +4552,6 @@ mod pane_registration_handle {
                 }
             }
             result
-        }
-
-        #[cfg(test)]
-        pub(super) fn live_parser_test_generation(&self) -> Arc<PaneRegistrationGeneration> {
-            Arc::clone(&self.generation)
         }
 
         pub fn same_registration(&self, other: &Self) -> bool {
@@ -4730,6 +5188,46 @@ mod pane_registration_handle {
                 _operation: operation,
                 _domain_operation: domain_operation,
             })
+        }
+
+        #[cfg(test)]
+        pub(super) fn live_parser_test_generation(&self) -> Arc<PaneRegistrationGeneration> {
+            Arc::clone(&self.generation)
+        }
+
+        #[cfg(test)]
+        pub(super) fn authorize_guardian_output_delivery(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            output: GuardianOutputAppendReceipt,
+            payload: Arc<[u8]>,
+        ) -> Result<u64, LiveParserCheckpointError> {
+            let owner = self
+                .generation
+                .owner
+                .upgrade()
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+            self.operation_guard(&owner)
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?
+                .authorize_guardian_output_delivery(segment, output, payload)
+        }
+
+        #[cfg(test)]
+        pub(super) fn capture_live_parser_checkpoint(
+            &self,
+            segment: GuardianOutputSegmentIdentity,
+            output: GuardianOutputAppendReceipt,
+            limits: TerminalCheckpointLimits,
+            timeout: Duration,
+        ) -> Result<LiveParserCheckpointAck, LiveParserCheckpointError> {
+            let owner = self
+                .generation
+                .owner
+                .upgrade()
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?;
+            self.operation_guard(&owner)
+                .ok_or(LiveParserCheckpointError::StaleRegistration)?
+                .capture_live_parser_checkpoint(segment, output, limits, timeout)
         }
 
         /// Resolve the exact owner for mux-internal topology transactions.

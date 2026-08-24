@@ -1458,6 +1458,11 @@ impl GuardianRecoveredOutputRecord {
         self.receipt
     }
 
+    #[must_use]
+    pub(crate) fn delivery_parts(&self) -> (GuardianOutputAppendReceipt, &[u8]) {
+        (self.receipt, &self.plaintext)
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn plaintext(&self) -> &[u8] {

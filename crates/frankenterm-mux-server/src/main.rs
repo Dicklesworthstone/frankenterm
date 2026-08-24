@@ -3,7 +3,9 @@ use clap::*;
 use config::configuration;
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
-use frankenterm_mux_server_impl::update_mux_domains_for_server;
+use frankenterm_mux_server_impl::{
+    MuxDomainUpdateOutcome, reconcile_mux_domains_for_server, update_mux_domains_for_server,
+};
 use mux::Mux;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
@@ -11,7 +13,7 @@ use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::{OsStr, OsString};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use wezterm_gui_subcommands::*;
 
@@ -25,6 +27,18 @@ use wezterm_gui_subcommands::*;
 /// signal handler installed, so SIGTERM triggered the default
 /// "terminate immediately" action and skipped cleanup.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MuxDomainConfigAdmissionRetryState {
+    Idle,
+    Starting,
+    Running,
+}
+
+static MUX_DOMAIN_CONFIG_ADMISSION_RETRY_STATE:
+    std::sync::Mutex<MuxDomainConfigAdmissionRetryState> =
+    std::sync::Mutex::new(MuxDomainConfigAdmissionRetryState::Idle);
 const FT_ATOMIC_COMPONENT_MARKER: &str = env!("FT_ATOMIC_COMPONENT_MARKER");
 
 /// [ft-gqbpk] Shared shutdown-flag handle. Tests use this to assert
@@ -309,6 +323,11 @@ fn run() -> anyhow::Result<()> {
         })
         .detach();
 
+    // Retain the subscription for the full executor lifetime. Keeping it in
+    // `async_run` dropped it as soon as startup completed, silently disabling
+    // every later domain-config reload.
+    let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
+
     while !shutdown_requested() {
         executor.tick()?;
     }
@@ -330,39 +349,276 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
-    let mux = Mux::try_get().context("mux singleton is not available")?;
-    let config = config::configuration();
-
-    update_mux_domains_for_server(&config)?;
-    let _config_subscription = config::subscribe_to_config_reload(move || {
-        match promise::spawn::try_reserve_main_thread(
-            promise::spawn::MainThreadServiceClass::Topology,
-            4 * 1024,
-        ) {
-            promise::spawn::MainThreadReservationOutcome::Reserved(reservation) => {
-                reservation
-                    .spawn(async move {
-                        if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
-                            log::error!("Error updating mux domains: {:#}", err);
-                        }
-                    })
-                    .detach();
+fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
+    config::subscribe_to_config_reload(move || {
+        // Config subscribers run while the configuration mutex is held. The
+        // admitted task reads the new handle only after this callback returns.
+        let generation = match mint_mux_domain_config_reconciliation_generation() {
+            Some(generation) => generation,
+            None => {
+                metrics::counter!(
+                    "mux.server.domain_config_reload_admission",
+                    "outcome" => "generation_exhausted"
+                )
+                .increment(1);
+                log::error!(
+                    "mux-server domain-config reconciliation generation exhausted; refusing an ambiguous reload"
+                );
+                return true;
             }
-            rejected => {
+        };
+
+        match try_admit_mux_domain_config_reconciliation(generation) {
+            MuxDomainConfigAdmission::Started => {}
+            MuxDomainConfigAdmission::Retryable(rejection) => {
+                metrics::counter!(
+                    "mux.server.domain_config_reload_admission",
+                    "outcome" => "retrying"
+                )
+                .increment(1);
+                log::warn!(
+                    "main-thread scheduler temporarily rejected mux-server domain-config reload; a single coordinator will retry the newest generation: {rejection}"
+                );
+                start_mux_domain_config_admission_retry();
+            }
+            MuxDomainConfigAdmission::Terminal(rejection) => {
                 metrics::counter!(
                     "mux.server.domain_config_reload_admission",
                     "outcome" => "terminal_rejection"
                 )
                 .increment(1);
                 log::error!(
-                    "main-thread scheduler rejected mux-domain config reload before task construction: {rejected:?}"
+                    "main-thread scheduler terminally rejected mux-server domain-config reload before task construction: {rejection}"
                 );
             }
         }
         true
-    });
+    })
+}
 
+fn mint_mux_domain_config_reconciliation_generation() -> Option<u64> {
+    MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .and_then(|previous| previous.checked_add(1))
+}
+
+fn mux_domain_config_reconciliation_is_current(generation: u64) -> bool {
+    MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire) == generation
+}
+
+enum MuxDomainConfigAdmission {
+    Started,
+    Retryable(String),
+    Terminal(String),
+}
+
+fn try_admit_mux_domain_config_reconciliation(generation: u64) -> MuxDomainConfigAdmission {
+    use promise::spawn::MainThreadReservationOutcome;
+
+    match promise::spawn::try_reserve_main_thread(
+        promise::spawn::MainThreadServiceClass::Topology,
+        16 * 1024,
+    ) {
+        MainThreadReservationOutcome::Reserved(reservation) => {
+            reservation
+                .spawn(reconcile_mux_domain_config_until_converged(generation))
+                .detach();
+            MuxDomainConfigAdmission::Started
+        }
+        rejected @ (MainThreadReservationOutcome::RetryableFull(_)
+        | MainThreadReservationOutcome::RetiredGeneration(_)
+        | MainThreadReservationOutcome::Coalesced(_)
+        | MainThreadReservationOutcome::SchedulerUnavailable) => {
+            MuxDomainConfigAdmission::Retryable(format!("{rejected:?}"))
+        }
+        rejected @ (MainThreadReservationOutcome::InvalidSize(_)
+        | MainThreadReservationOutcome::AuthorityExhausted(_)) => {
+            MuxDomainConfigAdmission::Terminal(format!("{rejected:?}"))
+        }
+    }
+}
+
+fn lock_mux_domain_config_admission_retry_state(
+) -> std::sync::MutexGuard<'static, MuxDomainConfigAdmissionRetryState> {
+    MUX_DOMAIN_CONFIG_ADMISSION_RETRY_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            log::error!(
+                "mux-server domain-config admission retry state was poisoned; recovering serialized ownership"
+            );
+            poisoned.into_inner()
+        })
+}
+
+fn ensure_mux_domain_config_admission_retry(
+    start: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut state = lock_mux_domain_config_admission_retry_state();
+    match *state {
+        MuxDomainConfigAdmissionRetryState::Running => return Ok(()),
+        MuxDomainConfigAdmissionRetryState::Starting => {
+            // The startup owner holds this mutex through thread creation.
+            // Observing STARTING after acquiring it therefore means poison
+            // recovery exposed an abandoned handoff.
+            log::error!(
+                "mux-server domain-config admission retry recovered an abandoned startup"
+            );
+            *state = MuxDomainConfigAdmissionRetryState::Idle;
+        }
+        MuxDomainConfigAdmissionRetryState::Idle => {}
+    }
+
+    *state = MuxDomainConfigAdmissionRetryState::Starting;
+    match start() {
+        Ok(()) => {
+            *state = MuxDomainConfigAdmissionRetryState::Running;
+            Ok(())
+        }
+        Err(error) => {
+            *state = MuxDomainConfigAdmissionRetryState::Idle;
+            Err(error)
+        }
+    }
+}
+
+fn finish_mux_domain_config_admission_retry(observed_generation: u64) -> bool {
+    let mut state = lock_mux_domain_config_admission_retry_state();
+    let has_newer_request =
+        MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
+            != observed_generation;
+    *state = if has_newer_request {
+        MuxDomainConfigAdmissionRetryState::Running
+    } else {
+        MuxDomainConfigAdmissionRetryState::Idle
+    };
+    has_newer_request
+}
+
+fn stop_mux_domain_config_admission_retry() {
+    *lock_mux_domain_config_admission_retry_state() =
+        MuxDomainConfigAdmissionRetryState::Idle;
+}
+
+fn start_mux_domain_config_admission_retry() {
+    if let Err(error) = ensure_mux_domain_config_admission_retry(|| {
+        thread::Builder::new()
+            .name("ft-mux-server-domain-config-admission".to_string())
+            .spawn(retry_mux_domain_config_admission)
+            .map(|_thread| ())
+    }) {
+        log::error!(
+            "failed to start mux-server domain-config admission retry coordinator: {error}"
+        );
+    }
+}
+
+fn retry_mux_domain_config_admission() {
+    let mut delay = std::time::Duration::from_millis(10);
+    let mut attempts = 0_u64;
+    loop {
+        if shutdown_requested() {
+            stop_mux_domain_config_admission_retry();
+            return;
+        }
+        let generation = MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire);
+        match try_admit_mux_domain_config_reconciliation(generation) {
+            MuxDomainConfigAdmission::Started => {
+                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
+                    != generation
+                {
+                    continue;
+                }
+                if finish_mux_domain_config_admission_retry(generation) {
+                    continue;
+                }
+                return;
+            }
+            MuxDomainConfigAdmission::Retryable(rejection) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts % 100 == 0 {
+                    log::warn!(
+                        "mux-server domain-config reconciliation is waiting for main-thread admission (attempt {attempts}): {rejection}"
+                    );
+                }
+                std::thread::sleep(delay);
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(1));
+            }
+            MuxDomainConfigAdmission::Terminal(rejection) => {
+                log::error!(
+                    "mux-server domain-config reconciliation admission became terminal: {rejection}"
+                );
+                if finish_mux_domain_config_admission_retry(generation) {
+                    delay = std::time::Duration::from_millis(10);
+                    attempts = 0;
+                    continue;
+                }
+                return;
+            }
+        }
+    }
+}
+
+async fn reconcile_mux_domain_config_until_converged(generation: u64) {
+    if !mux_domain_config_reconciliation_is_current(generation) {
+        return;
+    }
+    let config = config::configuration();
+    if !mux_domain_config_reconciliation_is_current(generation) {
+        return;
+    }
+
+    let mut retirement_round = 0_u64;
+    let mut retry_delay = std::time::Duration::from_millis(25);
+    const MAX_RECONCILIATION_DELAY: std::time::Duration =
+        std::time::Duration::from_secs(1);
+    loop {
+        if shutdown_requested() || !mux_domain_config_reconciliation_is_current(generation) {
+            return;
+        }
+        match reconcile_mux_domains_for_server(&config) {
+            Ok(MuxDomainUpdateOutcome::Converged) => {
+                metrics::counter!(
+                    "mux.server.domain_config_reload_reconciliation",
+                    "outcome" => "converged"
+                )
+                .increment(1);
+                return;
+            }
+            Ok(MuxDomainUpdateOutcome::PendingRetirements { domain_names }) => {
+                retirement_round = retirement_round.saturating_add(1);
+                if retirement_round == 1 || retirement_round % 100 == 0 {
+                    log::info!(
+                        "mux-server domain-config reload is waiting for exact domain retirements before replacement: {domain_names:?}"
+                    );
+                }
+                promise::spawn::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(MAX_RECONCILIATION_DELAY);
+            }
+            Err(error) => {
+                metrics::counter!(
+                    "mux.server.domain_config_reload_reconciliation",
+                    "outcome" => "failed"
+                )
+                .increment(1);
+                log::error!("Error reconciling mux-server domains: {error:#}");
+                return;
+            }
+        }
+    }
+}
+
+async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
+    let mux = Mux::try_get().context("mux singleton is not available")?;
+    let config = config::configuration();
+
+    update_mux_domains_for_server(&config)?;
     let domain = mux.default_domain()?;
 
     {
@@ -518,8 +774,92 @@ mod tests {
 
     fn reset_test_state() {
         config::use_test_configuration();
+        MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.store(0, Ordering::Release);
+        stop_mux_domain_config_admission_retry();
         remove_process_env_for_mux_server_startup("WEZTERM_UNIX_SOCKET");
         remove_process_env_for_mux_server_startup("FRANKENTERM_UNIX_SOCKET");
+    }
+
+    #[test]
+    fn mux_domain_config_generation_fences_stale_reconciliation() {
+        let _guard = lock_test_state();
+
+        let first = mint_mux_domain_config_reconciliation_generation()
+            .expect("first reconciliation generation");
+        assert!(mux_domain_config_reconciliation_is_current(first));
+
+        let second = mint_mux_domain_config_reconciliation_generation()
+            .expect("second reconciliation generation");
+        assert!(!mux_domain_config_reconciliation_is_current(first));
+        assert!(mux_domain_config_reconciliation_is_current(second));
+    }
+
+    #[test]
+    fn mux_domain_config_generation_exhaustion_fails_closed() {
+        let _guard = lock_test_state();
+
+        MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.store(u64::MAX - 1, Ordering::Release);
+        assert_eq!(
+            mint_mux_domain_config_reconciliation_generation(),
+            Some(u64::MAX)
+        );
+        assert_eq!(mint_mux_domain_config_reconciliation_generation(), None);
+        assert_eq!(
+            MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire),
+            u64::MAX,
+            "generation exhaustion must not wrap stale authority back to zero"
+        );
+    }
+
+    #[test]
+    fn mux_domain_config_admission_retry_serializes_startup_and_handoff() {
+        let _guard = lock_test_state();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+
+        let failed = ensure_mux_domain_config_admission_retry(|| {
+            starts.fetch_add(1, Ordering::AcqRel);
+            Err(std::io::Error::other("planted thread creation failure"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            *lock_mux_domain_config_admission_retry_state(),
+            MuxDomainConfigAdmissionRetryState::Idle,
+            "failed startup must not publish a retry handoff"
+        );
+
+        ensure_mux_domain_config_admission_retry(|| {
+            starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })
+        .expect("publish successful retry owner");
+        ensure_mux_domain_config_admission_retry(|| {
+            starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })
+        .expect("coalesce behind running retry owner");
+        assert_eq!(
+            starts.load(Ordering::Acquire),
+            2,
+            "a running retry coordinator must retain sole startup ownership"
+        );
+
+        MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.store(7, Ordering::Release);
+        assert!(!finish_mux_domain_config_admission_retry(7));
+        assert_eq!(
+            *lock_mux_domain_config_admission_retry_state(),
+            MuxDomainConfigAdmissionRetryState::Idle
+        );
+
+        ensure_mux_domain_config_admission_retry(|| Ok(()))
+            .expect("restart retry owner for newer-generation handoff");
+        MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.store(8, Ordering::Release);
+        assert!(finish_mux_domain_config_admission_retry(7));
+        assert_eq!(
+            *lock_mux_domain_config_admission_retry_state(),
+            MuxDomainConfigAdmissionRetryState::Running,
+            "new request published before retirement must retain the existing retry owner"
+        );
+        stop_mux_domain_config_admission_retry();
     }
 
     #[test]

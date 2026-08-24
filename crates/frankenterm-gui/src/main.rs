@@ -527,35 +527,50 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
         let generation = match mint_mux_domain_config_reconciliation_generation() {
             Some(generation) => generation,
             None => {
+                MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.store(u64::MAX, Ordering::Release);
+                fence_auto_connect_supervisor_authority(
+                    "an unrepresentable mux-domain configuration reload",
+                );
+                AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
                 metrics::counter!(
                     "gui.domain_config_reload_admission",
                     "outcome" => "generation_exhausted"
                 )
                 .increment(1);
-                log::error!(
-                    "mux-domain configuration reconciliation generation exhausted; refusing an ambiguous reload"
+                let error = anyhow!(
+                    "mux-domain configuration reconciliation generation exhausted; refusing an ambiguous reload and disabling automatic reconnect"
                 );
+                report_mux_domain_config_reload_failure(&error);
                 return true;
             }
         };
         // Reload callbacks run before any main-thread reconciliation admission
-        // is guaranteed. Retire both authorities synchronously here so a
-        // scheduler-saturated GUI cannot keep dialing with the configuration
-        // captured by an older automatic-connect supervisor. The main-thread
-        // task handle is dropped later by the admitted reconciliation path.
+        // is guaranteed. Publish the fail-closed validation gate and retire
+        // the live supervisor epoch synchronously so a scheduler-saturated GUI
+        // cannot keep dialing with the configuration captured by an older
+        // automatic-connect supervisor. The main-thread task handle is dropped
+        // later by the admitted reconciliation path.
+        MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.store(generation, Ordering::Release);
         fence_auto_connect_supervisor_authority("mux-domain configuration reload");
         match try_admit_mux_domain_config_reconciliation(generation) {
             MuxDomainConfigAdmission::Started => {}
             MuxDomainConfigAdmission::Retryable(rejection) => {
-                metrics::counter!(
-                    "gui.domain_config_reload_admission",
-                    "outcome" => "retrying"
-                )
-                .increment(1);
-                log::warn!(
-                    "main-thread scheduler temporarily rejected mux-domain config reload; a single coordinator will retry the newest generation: {rejection}"
-                );
-                start_mux_domain_config_admission_retry();
+                if start_mux_domain_config_admission_retry() {
+                    metrics::counter!(
+                        "gui.domain_config_reload_admission",
+                        "outcome" => "retrying"
+                    )
+                    .increment(1);
+                    log::warn!(
+                        "main-thread scheduler temporarily rejected mux-domain config reload; a single coordinator will retry the newest generation: {rejection}"
+                    );
+                } else {
+                    metrics::counter!(
+                        "gui.domain_config_reload_admission",
+                        "outcome" => "retry_start_failed"
+                    )
+                    .increment(1);
+                }
             }
             MuxDomainConfigAdmission::Terminal(rejection) => {
                 metrics::counter!(
@@ -563,9 +578,10 @@ fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
                     "outcome" => "terminal_rejection"
                 )
                 .increment(1);
-                log::error!(
-                    "main-thread scheduler terminally rejected mux-domain config reload before task construction: {rejection}"
+                let error = anyhow!(
+                    "main-thread scheduler terminally rejected mux-domain config reload before task construction: {rejection}; automatic reconnect remains fail-closed until a later valid reload converges"
                 );
+                report_mux_domain_config_reload_failure(&error);
             }
         }
         true
@@ -579,6 +595,17 @@ fn mint_mux_domain_config_reconciliation_generation() -> Option<u64> {
         })
         .ok()
         .and_then(|previous| previous.checked_add(1))
+}
+
+fn accept_exact_mux_domain_config_generation(
+    current: &AtomicU64,
+    pending: &AtomicU64,
+    generation: u64,
+) -> bool {
+    current.load(Ordering::Acquire) == generation
+        && pending
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
 }
 
 enum MuxDomainConfigAdmission {
@@ -615,10 +642,10 @@ fn try_admit_mux_domain_config_reconciliation(
     }
 }
 
-fn lock_admission_retry_coordinator(
-    state: &Mutex<AdmissionRetryCoordinatorState>,
+fn lock_admission_retry_coordinator<'a>(
+    state: &'a Mutex<AdmissionRetryCoordinatorState>,
     name: &str,
-) -> MutexGuard<'_, AdmissionRetryCoordinatorState> {
+) -> MutexGuard<'a, AdmissionRetryCoordinatorState> {
     state.lock().unwrap_or_else(|poisoned| {
         log::error!(
             "{name} admission retry coordinator state was poisoned; recovering the serialized state"
@@ -658,6 +685,16 @@ fn ensure_admission_retry_coordinator(
     }
 }
 
+fn admission_retry_coordinator_is_running(
+    state: &Mutex<AdmissionRetryCoordinatorState>,
+    name: &str,
+) -> bool {
+    matches!(
+        *lock_admission_retry_coordinator(state, name),
+        AdmissionRetryCoordinatorState::Running
+    )
+}
+
 fn finish_admission_retry_coordinator(
     state: &Mutex<AdmissionRetryCoordinatorState>,
     generation: &AtomicU64,
@@ -683,7 +720,7 @@ fn finish_mux_domain_config_admission_retry(observed_generation: u64) -> bool {
     )
 }
 
-fn start_mux_domain_config_admission_retry() {
+fn start_mux_domain_config_admission_retry() -> bool {
     if let Err(error) = ensure_admission_retry_coordinator(
         &MUX_DOMAIN_CONFIG_RECONCILIATION_ADMISSION_RETRY_STATE,
         "mux-domain config",
@@ -694,8 +731,13 @@ fn start_mux_domain_config_admission_retry() {
                 .map(|_thread| ())
         },
     ) {
-        log::error!("failed to start mux-domain config admission retry coordinator: {error}");
+        let error = anyhow!(
+            "failed to start mux-domain config admission retry coordinator: {error}; automatic reconnect remains fail-closed until a later valid reload converges"
+        );
+        report_mux_domain_config_reload_failure(&error);
+        return false;
     }
+    true
 }
 
 fn retry_mux_domain_config_admission() {
@@ -728,14 +770,15 @@ fn retry_mux_domain_config_admission() {
                     .min(std::time::Duration::from_secs(1));
             }
             MuxDomainConfigAdmission::Terminal(rejection) => {
-                log::error!(
-                    "mux-domain config reconciliation admission became terminal: {rejection}"
-                );
                 if finish_mux_domain_config_admission_retry(generation) {
                     delay = std::time::Duration::from_millis(10);
                     attempts = 0;
                     continue;
                 }
+                let error = anyhow!(
+                    "mux-domain config reconciliation admission became terminal: {rejection}; automatic reconnect remains fail-closed until a later valid reload converges"
+                );
+                report_mux_domain_config_reload_failure(&error);
                 return;
             }
         }
@@ -799,8 +842,12 @@ async fn reconcile_mux_domain_config_until_converged(
         drop(lifecycle_guards);
         match reconciliation {
             Ok(MuxDomainUpdateOutcome::Converged) => {
-                if MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION.load(Ordering::Acquire)
-                    == generation
+                let accepted_current_generation = accept_exact_mux_domain_config_generation(
+                    &MUX_DOMAIN_CONFIG_RECONCILIATION_GENERATION,
+                    &MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING,
+                    generation,
+                );
+                if accepted_current_generation
                     && AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
                 {
                     schedule_auto_connect_domains();
@@ -828,13 +875,11 @@ async fn reconcile_mux_domain_config_until_converged(
             }
             Err(error) => {
                 report_mux_domain_config_reload_failure(&error);
-                if AUTO_CONNECT_ENABLED.load(Ordering::Acquire) {
-                    // Rebuild supervision from whichever registry state
-                    // survived the failed update; leaving the old task
-                    // cancelled forever would convert one bad reload into
-                    // permanent loss of reconnect service.
-                    schedule_auto_connect_domains();
-                }
+                // Keep PENDING set for this rejected generation. The current
+                // config failed aggregate validation/reconciliation and must
+                // never be consumed piecemeal by automatic client-domain
+                // registration. A later valid reload replaces the pending
+                // generation and is the only path that resumes supervision.
                 return;
             }
         }
@@ -1112,6 +1157,7 @@ fn auto_connect_generation_is_current(
     request_generation: u64,
 ) -> bool {
     AUTO_CONNECT_ENABLED.load(Ordering::Acquire)
+        && MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire) == 0
         && AUTO_CONNECT_SUPERVISOR_GENERATION.load(Ordering::Acquire) == generation
         && AUTO_CONNECT_ADMISSION_RETRY_GENERATION.load(Ordering::Acquire)
             == request_generation
@@ -1507,21 +1553,14 @@ fn mint_auto_connect_supervisor_generation() -> Option<u64> {
 }
 
 fn fence_auto_connect_supervisor_authority(context: &str) -> bool {
-    let request_fenced = mint_auto_connect_admission_retry_generation().is_some();
     let supervisor_fenced = mint_auto_connect_supervisor_generation().is_some();
-    if request_fenced && supervisor_fenced {
+    if supervisor_fenced {
         return true;
     }
 
     AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
-    let exhausted = match (request_fenced, supervisor_fenced) {
-        (false, false) => "request and supervisor generations",
-        (false, true) => "request generation",
-        (true, false) => "supervisor generation",
-        (true, true) => unreachable!("both successful fences returned above"),
-    };
     let message = format!(
-        "automatic domain connection {exhausted} exhausted while fencing {context}; automatic connection is disabled for this process"
+        "automatic domain connection supervisor generation exhausted while fencing {context}; automatic connection is disabled for this process"
     );
     frankenterm_gui::gui_debug_log::record(
         log::Level::Error,
@@ -1534,6 +1573,17 @@ fn fence_auto_connect_supervisor_authority(context: &str) -> bool {
 }
 
 fn cancel_auto_connect_supervisor() {
+    if mint_auto_connect_admission_retry_generation().is_none() {
+        AUTO_CONNECT_ENABLED.store(false, Ordering::Release);
+        let message = "automatic domain admission request generation exhausted while fencing a cancelled supervisor; automatic connection is disabled for this process";
+        frankenterm_gui::gui_debug_log::record(
+            log::Level::Error,
+            "frankenterm_gui::auto_connect",
+            message,
+        );
+        log::error!("{message}");
+        persistent_toast_notification("Domain auto-connect unavailable", message);
+    }
     fence_auto_connect_supervisor_authority("a cancelled supervisor");
     let previous = AUTO_CONNECT_SUPERVISOR_TASK.with(|slot| slot.borrow_mut().take());
     // Drop only after releasing the RefCell borrow. Cancellation may dispose
@@ -1745,6 +1795,21 @@ fn retry_auto_connect_admission() {
             }
             return;
         }
+        let pending_config_generation =
+            MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire);
+        if pending_config_generation != 0 {
+            attempts = attempts.saturating_add(1);
+            if attempts == 1 || attempts % 100 == 0 {
+                log::warn!(
+                    "automatic domain admission is paused until mux-domain configuration generation {pending_config_generation} validates and converges (attempt {attempts})"
+                );
+            }
+            std::thread::sleep(delay);
+            delay = delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_secs(1));
+            continue;
+        }
         let Some(mux) = Mux::try_get() else {
             attempts = attempts.saturating_add(1);
             if attempts == 1 || attempts % 100 == 0 {
@@ -1803,14 +1868,21 @@ fn retry_auto_connect_admission() {
                     .min(std::time::Duration::from_secs(1));
             }
             AutoConnectSupervisorAdmission::Terminal(rejection) => {
-                log::error!(
-                    "automatic domain connection admission became terminal: {rejection}"
-                );
                 if finish_auto_connect_admission_retry(request_generation) {
                     delay = std::time::Duration::from_millis(10);
                     attempts = 0;
                     continue;
                 }
+                let message = format!(
+                    "automatic domain connection admission became terminal: {rejection}; no retry coordinator remains for this request"
+                );
+                frankenterm_gui::gui_debug_log::record(
+                    log::Level::Error,
+                    "frankenterm_gui::auto_connect",
+                    message.clone(),
+                );
+                log::error!("{message}");
+                persistent_toast_notification("Domain auto-connect unavailable", &message);
                 return;
             }
         }
@@ -1854,6 +1926,21 @@ fn schedule_auto_connect_domains_requiring(
             AutoConnectScheduleOutcome::Disabled
         };
     }
+    let pending_config_generation =
+        MUX_DOMAIN_CONFIG_RECONCILIATION_PENDING.load(Ordering::Acquire);
+    if pending_config_generation != 0 {
+        if start_auto_connect_admission_retry() {
+            log::warn!(
+                "automatic domain scheduling is retained behind pending mux-domain configuration generation {pending_config_generation}"
+            );
+            // The unvalidated configuration is not authority for an exact
+            // domain promise. A generic request is durably retained, while a
+            // named caller is told honestly that its domain is not yet in an
+            // accepted frontier.
+            return auto_connect_retry_admission_outcome(required_domain.is_none());
+        }
+        return AutoConnectScheduleOutcome::AdmissionRejected;
+    }
     let Some(mux) = Mux::try_get() else {
         log::error!("cannot schedule domain auto-connect without the mux singleton");
         // A previously scheduled task owns an Arc to its mux generation. Do
@@ -1890,6 +1977,12 @@ fn schedule_auto_connect_domains_requiring(
         .map(|domain| domain.name().to_string())
         .collect::<Vec<_>>();
     let includes_required_domain = retry_frontier_includes(&pending, required_domain);
+    if admission_retry_coordinator_is_running(
+        &AUTO_CONNECT_ADMISSION_RETRY_STATE,
+        "automatic domain connection",
+    ) {
+        return auto_connect_retry_admission_outcome(includes_required_domain);
+    }
     match try_admit_auto_connect_supervisor(
         mux,
         request_generation,
@@ -3228,6 +3321,37 @@ mod tests {
             *state.lock().expect("read retained state"),
             AdmissionRetryCoordinatorState::Running,
             "a request published before serialized retirement must retain the existing owner"
+        );
+    }
+
+    #[test]
+    fn only_exact_converged_config_generation_releases_auto_connect_gate() {
+        let current = AtomicU64::new(9);
+        let pending = AtomicU64::new(9);
+        assert!(accept_exact_mux_domain_config_generation(
+            &current, &pending, 9,
+        ));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+
+        current.store(11, Ordering::Release);
+        pending.store(11, Ordering::Release);
+        assert!(!accept_exact_mux_domain_config_generation(
+            &current, &pending, 10,
+        ));
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            11,
+            "a stale successful task must not release a newer reload's fail-closed gate"
+        );
+
+        pending.store(12, Ordering::Release);
+        assert!(!accept_exact_mux_domain_config_generation(
+            &current, &pending, 11,
+        ));
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            12,
+            "a mismatched pending generation must remain blocked"
         );
     }
 

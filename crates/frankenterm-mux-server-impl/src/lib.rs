@@ -101,7 +101,7 @@ pub fn configured_client_domains(config: &config::ConfigHandle) -> Vec<ClientDom
 
     for ssh_dom in configured_ssh_domains(config) {
         if ssh_dom.multiplexing == SshMultiplexing::WezTerm {
-            domains.push(ClientDomainConfig::Ssh(ssh_dom.clone()));
+            domains.push(ClientDomainConfig::Ssh(ssh_dom));
         }
     }
 
