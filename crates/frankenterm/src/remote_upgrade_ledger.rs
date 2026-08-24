@@ -1656,8 +1656,12 @@ mod tests {
     const TRANSACTION_ID: &str = "0123456789abcdef0123456789abcdef";
 
     fn claim(generation: char) -> RemoteUpgradeClaim {
+        claim_for(TRANSACTION_ID, generation)
+    }
+
+    fn claim_for(transaction_id: &str, generation: char) -> RemoteUpgradeClaim {
         RemoteUpgradeClaim::process_family_publication(
-            TRANSACTION_ID,
+            transaction_id,
             &generation.to_string().repeat(64),
             &"b".repeat(64),
             101,
@@ -1728,7 +1732,7 @@ mod tests {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared publication authorization")
-            .consume_publication()
+            .consume_publication(ledger)
             .expect("consume publication permit");
         ledger
             .commit_pending_live_owner(
@@ -1743,7 +1747,7 @@ mod tests {
             .authorize_selector_from_pending(SelectorAuthority::Missing)
             .expect("commit Activating selector authorization");
         let (transaction_id, allow_existing_artifact) = permit
-            .consume_selector()
+            .consume_selector(ledger)
             .expect("consume selector effect permit");
         assert_eq!(transaction_id, TRANSACTION_ID);
         assert!(!allow_existing_artifact);
@@ -1762,7 +1766,13 @@ mod tests {
         let permit = ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared authorization");
-        assert_eq!(permit.consume_publication().expect("consume permit").len(), 32);
+        assert_eq!(
+            permit
+                .consume_publication(&ledger)
+                .expect("consume permit")
+                .len(),
+            32
+        );
         ledger
             .commit_pending_live_owner(
                 SelectorAuthority::Missing,
@@ -1873,7 +1883,7 @@ mod tests {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared publication authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         let prepared_names = transaction_names(&ledger);
         let prepared_error = ledger
@@ -1897,12 +1907,12 @@ mod tests {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared publication authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         ledger
             .authorize_selector_after_publication(SelectorAuthority::Missing)
             .expect("commit Activating selector authorization")
-            .consume_selector()
+            .consume_selector(&ledger)
             .expect("consume selector effect permit");
         let names_before = transaction_names(&ledger);
         let changed_generation = "d".repeat(64);
@@ -1938,12 +1948,12 @@ mod tests {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared publication authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         ledger
             .authorize_selector_after_publication(SelectorAuthority::Missing)
             .expect("commit Activating selector authorization")
-            .consume_selector()
+            .consume_selector(&ledger)
             .expect("consume selector effect permit");
         let authorization = ledger.latest().expect("Activating authorization");
         let changed_generation = "d".repeat(64);
@@ -1989,12 +1999,12 @@ mod tests {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared publication authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         ledger
             .authorize_selector_after_publication(SelectorAuthority::Missing)
             .expect("commit Activating selector authorization")
-            .consume_selector()
+            .consume_selector(&ledger)
             .expect("consume selector effect permit");
         let authorization = ledger.latest().expect("Activating authorization");
         let wrong_generation = "d".repeat(64);
@@ -2070,7 +2080,7 @@ mod tests {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         let (orphan, bytes, digest) = pending_outcome_record(&ledger);
         let orphan_name = format!(
@@ -2113,7 +2123,7 @@ mod tests {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         let authorization = ledger.latest().expect("Prepared authorization");
         let conflicting = RemoteUpgradeRecord {
@@ -2175,7 +2185,7 @@ mod tests {
         ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         let (pending, pending_bytes, _) = pending_outcome_record(&ledger);
         let scan = ledger
@@ -2224,7 +2234,9 @@ mod tests {
         let permit = ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit Prepared authorization");
-        permit.consume_publication().expect("consume permit");
+        permit
+            .consume_publication(&ledger)
+            .expect("consume permit");
         ledger
             .commit_pending_live_owner(
                 SelectorAuthority::Missing,
@@ -2304,7 +2316,9 @@ mod tests {
         let permit = ledger
             .authorize_publication(SelectorAuthority::Missing)
             .expect("commit first Prepared authorization");
-        permit.consume_publication().expect("consume first permit");
+        permit
+            .consume_publication(&ledger)
+            .expect("consume first permit");
 
         let transaction_path = fixture
             .path()
@@ -2327,7 +2341,7 @@ mod tests {
         assert_eq!(replay.latest().expect("retry record").attempt, 3);
         assert_eq!(
             retry_permit
-                .consume_publication()
+                .consume_publication(&replay)
                 .expect("consume retry permit")
                 .len(),
             32

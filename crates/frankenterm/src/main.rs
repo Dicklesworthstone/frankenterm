@@ -81108,6 +81108,7 @@ fn activate_remote_generation_selector(
     root: &cap_std::fs::Dir,
     generations: &cap_std::fs::Dir,
     generation_id: &str,
+    ledger: &remote_upgrade_ledger::RemoteUpgradeLedger<'_>,
     permit: remote_upgrade_ledger::DurableEffectPermit,
     expected_selector_before: &remote_upgrade_ledger::SelectorAuthority,
     effective_uid: u32,
@@ -81116,6 +81117,7 @@ fn activate_remote_generation_selector(
         root,
         generations,
         generation_id,
+        ledger,
         permit,
         expected_selector_before,
         effective_uid,
@@ -81129,6 +81131,7 @@ fn activate_remote_generation_selector_with<F>(
     root: &cap_std::fs::Dir,
     generations: &cap_std::fs::Dir,
     generation_id: &str,
+    ledger: &remote_upgrade_ledger::RemoteUpgradeLedger<'_>,
     permit: remote_upgrade_ledger::DurableEffectPermit,
     expected_selector_before: &remote_upgrade_ledger::SelectorAuthority,
     effective_uid: u32,
@@ -81139,7 +81142,7 @@ where
 {
     use nix::fcntl::{RenameFlags, renameat2};
 
-    let (transaction_id, allow_existing_artifact) = permit.consume_selector()?;
+    let (transaction_id, allow_existing_artifact) = permit.consume_selector(ledger)?;
     validate_remote_generation_transaction_id(&transaction_id)?;
     revalidate_remote_generations_binding(root, generations, effective_uid)?;
     let target = PathBuf::from("generations").join(generation_id);
@@ -81546,6 +81549,7 @@ where
         &cap_std::fs::Dir,
         &cap_std::fs::Dir,
         &str,
+        &remote_upgrade_ledger::RemoteUpgradeLedger<'_>,
         remote_upgrade_ledger::DurableEffectPermit,
         &remote_upgrade_ledger::SelectorAuthority,
         u32,
@@ -81558,6 +81562,7 @@ where
         root,
         generations,
         generation_id,
+        ledger,
         permit,
         &selector_before,
         effective_uid,
@@ -81927,7 +81932,7 @@ fn publish_remote_process_family_generation(
     revalidate_remote_generation_root(request.root, &root, effective_uid)?;
     revalidate_remote_generations_binding(&root, &generations, effective_uid)?;
     ledger.revalidate_authority()?;
-    let effect_transaction_id = publication_permit.consume_publication()?;
+    let effect_transaction_id = publication_permit.consume_publication(&ledger)?;
 
     let generation_exists = match generations.symlink_metadata(&generation_id) {
         Ok(_) => true,
@@ -100333,7 +100338,7 @@ log_level = "debug"
         ledger
             .authorize_publication(remote_upgrade_ledger::SelectorAuthority::Missing)
             .expect("commit Prepared authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         let _selector_permit = ledger
             .authorize_selector_after_publication(
@@ -100391,7 +100396,7 @@ log_level = "debug"
         ledger
             .authorize_publication(remote_upgrade_ledger::SelectorAuthority::Missing)
             .expect("commit Prepared publication authorization")
-            .consume_publication()
+            .consume_publication(&ledger)
             .expect("consume publication permit");
         let transaction_path = root_path
             .join("upgrade-transactions")
@@ -100497,11 +100502,18 @@ log_level = "debug"
                 permit,
                 selector_before,
                 effective_uid,
-                |root, generations, generation_id, permit, selector_before, effective_uid| {
+                |root,
+                 generations,
+                 generation_id,
+                 ledger,
+                 permit,
+                 selector_before,
+                 effective_uid| {
                     activate_remote_generation_selector_with(
                         root,
                         generations,
                         generation_id,
+                        ledger,
                         permit,
                         selector_before,
                         effective_uid,
