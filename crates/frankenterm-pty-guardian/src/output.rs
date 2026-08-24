@@ -5273,6 +5273,53 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_stage_seal_manifest_is_exactly_400_bytes_and_digest_bound(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let spawn_effect_id = Uuid::from_u128(0x31);
+        let upload_id = Uuid::from_u128(0x32);
+        let payload = b"manifest-layout-fixture";
+        let begin = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Begin,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            8,
+            None,
+        )?;
+        let seal = checkpoint_test_genesis_request(
+            GuardianCheckpointStageKindV1::Seal,
+            spawn_effect_id,
+            upload_id,
+            payload,
+            8,
+            None,
+        )?;
+        let shape = CheckpointStageRequestShape::from_request(&begin)?;
+        let candidate_digest = [0x41; 32];
+        let chunk_set_digest = [0x42; 32];
+        let manifest = checkpoint_seal_manifest(&shape, candidate_digest, chunk_set_digest)?;
+        let seal_bytes = seal.encode()?;
+        assert_eq!(manifest.len(), CHECKPOINT_STAGE_SEAL_PLAINTEXT_BYTES);
+        assert_eq!(seal_bytes.len(), CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES);
+        assert_eq!(
+            &manifest[..CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES],
+            seal_bytes.as_slice()
+        );
+        assert_eq!(
+            &manifest[CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
+                ..CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES + 32],
+            &candidate_digest
+        );
+        assert_eq!(
+            &manifest[CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES + 32..],
+            &chunk_set_digest
+        );
+        let changed = checkpoint_seal_manifest(&shape, [0x43; 32], chunk_set_digest)?;
+        assert_ne!(manifest.as_slice(), changed.as_slice());
+        Ok(())
+    }
+
+    #[test]
     fn checkpoint_stage_begin_chunk_retry_and_gap_are_durable_and_exact(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (directory, poll, pipeline) = pipeline_with_policy(

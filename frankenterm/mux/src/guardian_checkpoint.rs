@@ -10,6 +10,10 @@
 use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputSegmentIdentity,
 };
+use crate::guardian_protocol::{
+    GuardianCheckpointScopeV1, GuardianCheckpointStageKindV1,
+    GuardianCheckpointStageRequestV1,
+};
 use crate::pane::Pane;
 use crate::{
     LiveParserCheckpointControl, LiveParserCheckpointError, PaneRegistrationGeneration,
@@ -42,22 +46,30 @@ const GENESIS_BOUNDARY_IDENTITY_DIGEST_DOMAIN: &[u8] =
 const CHECKPOINT_ARTIFACT_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-artifact-identity.v1\0";
 const CHECKPOINT_STAGE_RECORD_AEAD_DOMAIN: &[u8] =
-    b"frankenterm.guardian-checkpoint-phase-a-record.v2\0";
+    b"frankenterm.guardian-checkpoint-phase-a-record.v3\0";
 const CHECKPOINT_STAGE_PLAINTEXT_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-phase-a-plaintext.v1\0";
-const CHECKPOINT_STAGE_RECORD_MAGIC: [u8; 8] = *b"FTGCPA02";
+const CHECKPOINT_SEAL_MANIFEST_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-canonical-seal-manifest.v1\0";
+const CHECKPOINT_SEAL_OPERATION_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-checkpoint-seal-operation.v1\0";
+const CHECKPOINT_STAGE_RECORD_MAGIC: [u8; 8] = *b"FTGCPA03";
 const CHECKPOINT_STAGE_INNER_TRAILER_MAGIC: [u8; 8] = *b"FTGCPI01";
 
 /// Version of the encrypted Phase-A checkpoint staging-record format.
 ///
-/// Version 1 was source-visible with a rejected sealing-authority model. A
-/// version-2 magic, version, and AEAD domain ensure no such record can be
-/// mistaken for a record minted by the consuming-intent authority model.
-pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION: u32 = 2;
+/// Versions 1 and 2 were source-visible with rejected sealing-authority
+/// models. A version-3 magic, version, and AEAD domain ensure no record minted
+/// from caller-selected final-manifest bytes can be adopted by this format.
+pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION: u32 = 3;
 /// Exact fixed header size emitted beside one encrypted staging-record body.
 pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES: usize = 232;
 /// Hard per-record plaintext admission bound shared with checkpoint uploads.
 pub const GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES: u32 = 256 * 1024;
+/// Exact canonical Seal-request bytes bound into the encrypted manifest.
+pub const GUARDIAN_CHECKPOINT_SEAL_REQUEST_BYTES: u32 = 336;
+/// Exact canonical final-manifest bytes: Seal request plus two digests.
+pub const GUARDIAN_CHECKPOINT_SEAL_MANIFEST_BYTES: u32 = 400;
 /// Capture generation reserved for a pre-spawn Genesis checkpoint.
 pub const GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION: u64 = 1;
 
