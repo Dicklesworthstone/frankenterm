@@ -24,6 +24,7 @@ use chacha20poly1305::{
         rand_core::{OsRng, RngCore as _},
     },
 };
+use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
 use std::fs::File;
@@ -34,20 +35,391 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const FILE_MAGIC: [u8; 8] = *b"FTGOUT01";
 const RECORD_MAGIC: [u8; 8] = *b"FTGOR001";
-const FORMAT_VERSION: u32 = 1;
-const FILE_HEADER_BYTES: usize = 160;
+const FORMAT_VERSION: u32 = 3;
+const FILE_HEADER_BYTES: usize = 176;
 const RECORD_HEADER_BYTES: usize = 96;
-const FILE_HEADER_BYTES_U32: u32 = 160;
+const FILE_HEADER_BYTES_U32: u32 = 176;
 const RECORD_HEADER_BYTES_U32: u32 = 96;
-const FILE_HEADER_BYTES_U64: u64 = 160;
+const FILE_HEADER_BYTES_U64: u64 = 176;
 const RECORD_HEADER_BYTES_U64: u64 = 96;
 const KEY_ID_BYTES: usize = 8;
 const NONCE_BYTES: usize = 24;
 const AEAD_TAG_BYTES: u32 = 16;
 const AEAD_TAG_BYTES_USIZE: usize = 16;
-const FILE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-file.v1\0";
-const RECORD_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-record.v1\0";
-const RECORD_AAD_DOMAIN: &[u8] = b"frankenterm.guardian-output-aead.v1\0";
+const FILE_HEADER_AEAD_DOMAIN: &[u8] = b"frankenterm.guardian-output-file-header.v3\0";
+const RECORD_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-output-record.v3\0";
+const PLAINTEXT_DELIVERY_DIGEST_DOMAIN: &[u8] =
+    b"frankenterm.guardian-output-plaintext-delivery.v3\0";
+const RECORD_AAD_DOMAIN: &[u8] = b"frankenterm.guardian-output-aead.v3\0";
+const SCROLLBACK_ROW_AEAD_DOMAIN: &[u8] = b"frankenterm.scrollback-row-aead.v3\0";
+const SCROLLBACK_ROW_RECORD_PREFIX: &str = "ftsl3e:";
+const SCROLLBACK_ROW_FORMAT_VERSION: u32 = 3;
+const SCROLLBACK_ROW_HEADER_BYTES: usize = 96;
+const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES: u32 = 16 * 1024 * 1024;
+const SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES_USIZE: usize = 16 * 1024 * 1024;
+const SCROLLBACK_MANIFEST_AEAD_DOMAIN: &[u8] =
+    b"frankenterm.scrollback-manifest-authentication.v1\0";
+const SCROLLBACK_MANIFEST_AUTH_PREFIX: &str = "ftsma1e:";
+const SCROLLBACK_MANIFEST_AUTH_VERSION: u32 = 1;
+const SCROLLBACK_MANIFEST_AUTH_BYTES: usize = 56;
+const SCROLLBACK_MANIFEST_AUTH_ENCODED_BYTES: usize = 75;
+const SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES: u32 = 1024 * 1024;
+const RECOVERY_MAX_RECORDS: u64 = 4_096;
+const RECOVERY_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Opaque guardian authentication seal for one canonical v3 scrollback
+/// generation/pointer manifest.
+///
+/// The seal contains no manifest plaintext. Its AEAD tag authenticates the
+/// caller-supplied canonical manifest bytes as associated data under the
+/// historical key ID embedded in this record.
+pub struct GuardianScrollbackManifestAuthentication {
+    key_id: [u8; KEY_ID_BYTES],
+    canonical_bytes: u32,
+    nonce: [u8; NONCE_BYTES],
+    authentication_tag: [u8; AEAD_TAG_BYTES_USIZE],
+}
+
+impl GuardianScrollbackManifestAuthentication {
+    #[must_use]
+    pub fn has_authenticated_prefix(record: &str) -> bool {
+        record.starts_with(SCROLLBACK_MANIFEST_AUTH_PREFIX)
+    }
+
+    pub fn parse(record: &str) -> Result<Self, GuardianScrollbackManifestError> {
+        let encoded = record
+            .strip_prefix(SCROLLBACK_MANIFEST_AUTH_PREFIX)
+            .ok_or(GuardianScrollbackManifestError::MalformedRecord)?;
+        if encoded.len() != SCROLLBACK_MANIFEST_AUTH_ENCODED_BYTES {
+            return Err(GuardianScrollbackManifestError::MalformedRecord);
+        }
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| GuardianScrollbackManifestError::MalformedRecord)?;
+        if bytes.len() != SCROLLBACK_MANIFEST_AUTH_BYTES {
+            return Err(GuardianScrollbackManifestError::MalformedRecord);
+        }
+        if base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes) != encoded {
+            return Err(GuardianScrollbackManifestError::NonCanonicalRecord);
+        }
+        let version = read_u32(&bytes[0..4]);
+        if version != SCROLLBACK_MANIFEST_AUTH_VERSION {
+            return Err(GuardianScrollbackManifestError::UnsupportedVersion { observed: version });
+        }
+        let mut key_id = [0; KEY_ID_BYTES];
+        key_id.copy_from_slice(&bytes[4..12]);
+        let canonical_bytes = read_u32(&bytes[12..16]);
+        if canonical_bytes == 0 || canonical_bytes > SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES {
+            return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        nonce.copy_from_slice(&bytes[16..40]);
+        let mut authentication_tag = [0; AEAD_TAG_BYTES_USIZE];
+        authentication_tag.copy_from_slice(&bytes[40..56]);
+        Ok(Self {
+            key_id,
+            canonical_bytes,
+            nonce,
+            authentication_tag,
+        })
+    }
+
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; KEY_ID_BYTES] {
+        self.key_id
+    }
+
+    pub fn encode(&self) -> String {
+        let mut bytes = Vec::with_capacity(SCROLLBACK_MANIFEST_AUTH_BYTES);
+        bytes.extend_from_slice(&SCROLLBACK_MANIFEST_AUTH_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.key_id);
+        bytes.extend_from_slice(&self.canonical_bytes.to_le_bytes());
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&self.authentication_tag);
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+        format!("{SCROLLBACK_MANIFEST_AUTH_PREFIX}{encoded}")
+    }
+}
+
+impl std::fmt::Debug for GuardianScrollbackManifestAuthentication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianScrollbackManifestAuthentication")
+            .field("key_id", &"[REDACTED]")
+            .field("canonical_bytes", &self.canonical_bytes)
+            .field("nonce", &"[REDACTED]")
+            .field("authentication_tag", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianScrollbackManifestError {
+    #[error("authenticated scrollback manifest record is malformed")]
+    MalformedRecord,
+    #[error("authenticated scrollback manifest record is not canonical")]
+    NonCanonicalRecord,
+    #[error("unsupported authenticated scrollback manifest version {observed}")]
+    UnsupportedVersion { observed: u32 },
+    #[error("canonical scrollback manifest exceeds its hard byte limit")]
+    CanonicalByteLimit,
+    #[error("authenticated scrollback manifest key identity does not match")]
+    KeyIdentityMismatch,
+    #[error("operating system entropy is unavailable for manifest authentication")]
+    EntropyUnavailable,
+    #[error("scrollback manifest authentication failed")]
+    AuthenticationFailed,
+}
+
+/// Authenticated storage identity for one exact semantic cold-scrollback row.
+///
+/// The revision is the spill transaction revision at which the row was
+/// admitted.  A clear creates a fresh content epoch, so a ciphertext from a
+/// prior logical generation cannot be replayed into the same row/sequence.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianScrollbackRowIdentity {
+    durable_pane_id: [u8; 16],
+    content_epoch: [u8; 16],
+    revision: u64,
+    stable_row: i64,
+    sequence: u64,
+}
+
+impl GuardianScrollbackRowIdentity {
+    pub fn new(
+        durable_pane_id: [u8; 16],
+        content_epoch: [u8; 16],
+        revision: u64,
+        stable_row: i64,
+        sequence: u64,
+    ) -> Result<Self, GuardianScrollbackRowError> {
+        if durable_pane_id == [0; 16] {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "durable pane ID must be nonzero",
+            ));
+        }
+        if content_epoch == [0; 16] {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "content epoch must be nonzero",
+            ));
+        }
+        if revision == 0 {
+            return Err(GuardianScrollbackRowError::InvalidIdentity(
+                "revision must be nonzero",
+            ));
+        }
+        Ok(Self {
+            durable_pane_id,
+            content_epoch,
+            revision,
+            stable_row,
+            sequence,
+        })
+    }
+
+    #[must_use]
+    pub const fn durable_pane_id(self) -> [u8; 16] {
+        self.durable_pane_id
+    }
+
+    #[must_use]
+    pub const fn content_epoch(self) -> [u8; 16] {
+        self.content_epoch
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn stable_row(self) -> i64 {
+        self.stable_row
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+impl std::fmt::Debug for GuardianScrollbackRowIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianScrollbackRowIdentity")
+            .field("durable_pane_id", &"[REDACTED]")
+            .field("content_epoch", &"[REDACTED]")
+            .field("revision", &self.revision)
+            .field("stable_row", &self.stable_row)
+            .field("sequence", &self.sequence)
+            .finish()
+    }
+}
+
+/// Parsed, encrypted v3 cold-scrollback record.
+///
+/// Ciphertext and nonce remain private.  The only exposed field is the
+/// nonsecret key fingerprint needed for historical keyring lookup.
+pub struct GuardianEncryptedScrollbackRow {
+    key_id: [u8; KEY_ID_BYTES],
+    identity: GuardianScrollbackRowIdentity,
+    plaintext_bytes: u32,
+    nonce: [u8; NONCE_BYTES],
+    ciphertext: Vec<u8>,
+}
+
+impl GuardianEncryptedScrollbackRow {
+    #[must_use]
+    pub fn has_encrypted_prefix(record: &str) -> bool {
+        record.starts_with(SCROLLBACK_ROW_RECORD_PREFIX)
+    }
+
+    /// Parse the canonical bounded text envelope stored by the scrollback log.
+    pub fn parse(record: &str) -> Result<Self, GuardianScrollbackRowError> {
+        let encoded = record
+            .strip_prefix(SCROLLBACK_ROW_RECORD_PREFIX)
+            .ok_or(GuardianScrollbackRowError::MalformedRecord)?;
+        let maximum_binary_bytes = SCROLLBACK_ROW_HEADER_BYTES
+            .checked_add(SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES_USIZE)
+            .and_then(|bytes| bytes.checked_add(AEAD_TAG_BYTES_USIZE))
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        let maximum_encoded_bytes = maximum_binary_bytes
+            .checked_add(2)
+            .and_then(|bytes| bytes.checked_div(3))
+            .and_then(|bytes| bytes.checked_mul(4))
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        if encoded.len() > maximum_encoded_bytes {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| GuardianScrollbackRowError::MalformedRecord)?;
+        if base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes) != encoded {
+            return Err(GuardianScrollbackRowError::NonCanonicalRecord);
+        }
+        if bytes.len() < SCROLLBACK_ROW_HEADER_BYTES + AEAD_TAG_BYTES_USIZE {
+            return Err(GuardianScrollbackRowError::MalformedRecord);
+        }
+        let version = read_u32(&bytes[0..4]);
+        if version != SCROLLBACK_ROW_FORMAT_VERSION {
+            return Err(GuardianScrollbackRowError::UnsupportedVersion { observed: version });
+        }
+        let mut key_id = [0; KEY_ID_BYTES];
+        key_id.copy_from_slice(&bytes[4..12]);
+        let mut durable_pane_id = [0; 16];
+        durable_pane_id.copy_from_slice(&bytes[12..28]);
+        let mut content_epoch = [0; 16];
+        content_epoch.copy_from_slice(&bytes[28..44]);
+        let revision = read_u64(&bytes[44..52]);
+        let stable_row = read_i64(&bytes[52..60]);
+        let sequence = read_u64(&bytes[60..68]);
+        let plaintext_bytes = read_u32(&bytes[68..72]);
+        if plaintext_bytes == 0 || plaintext_bytes > SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let expected_ciphertext_bytes = usize::try_from(plaintext_bytes)
+            .map_err(|_| GuardianScrollbackRowError::ArithmeticOverflow)?
+            .checked_add(AEAD_TAG_BYTES_USIZE)
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        if bytes.len() != SCROLLBACK_ROW_HEADER_BYTES + expected_ciphertext_bytes {
+            return Err(GuardianScrollbackRowError::CiphertextLengthMismatch);
+        }
+        let identity = GuardianScrollbackRowIdentity::new(
+            durable_pane_id,
+            content_epoch,
+            revision,
+            stable_row,
+            sequence,
+        )?;
+        let mut nonce = [0; NONCE_BYTES];
+        nonce.copy_from_slice(&bytes[72..SCROLLBACK_ROW_HEADER_BYTES]);
+        Ok(Self {
+            key_id,
+            identity,
+            plaintext_bytes,
+            nonce,
+            ciphertext: bytes[SCROLLBACK_ROW_HEADER_BYTES..].to_vec(),
+        })
+    }
+
+    #[must_use]
+    pub const fn key_id(&self) -> [u8; KEY_ID_BYTES] {
+        self.key_id
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> GuardianScrollbackRowIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn plaintext_bytes(&self) -> u32 {
+        self.plaintext_bytes
+    }
+
+    /// Encode the canonical opaque storage record.
+    pub fn encode(&self) -> Result<String, GuardianScrollbackRowError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(SCROLLBACK_ROW_HEADER_BYTES + self.ciphertext.len())
+            .map_err(|_| GuardianScrollbackRowError::AllocationFailed)?;
+        bytes.extend_from_slice(&SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.key_id);
+        bytes.extend_from_slice(&self.identity.durable_pane_id);
+        bytes.extend_from_slice(&self.identity.content_epoch);
+        bytes.extend_from_slice(&self.identity.revision.to_le_bytes());
+        bytes.extend_from_slice(&self.identity.stable_row.to_le_bytes());
+        bytes.extend_from_slice(&self.identity.sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.plaintext_bytes.to_le_bytes());
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&self.ciphertext);
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+        Ok(format!("{SCROLLBACK_ROW_RECORD_PREFIX}{encoded}"))
+    }
+}
+
+impl std::fmt::Debug for GuardianEncryptedScrollbackRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianEncryptedScrollbackRow")
+            .field("key_id", &"[REDACTED]")
+            .field("identity", &self.identity)
+            .field("plaintext_bytes", &self.plaintext_bytes)
+            .field("nonce", &"[REDACTED]")
+            .field("ciphertext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GuardianScrollbackRowError {
+    #[error("invalid encrypted scrollback row identity: {0}")]
+    InvalidIdentity(&'static str),
+    #[error("encrypted scrollback row is malformed")]
+    MalformedRecord,
+    #[error("encrypted scrollback row encoding is not canonical")]
+    NonCanonicalRecord,
+    #[error("unsupported encrypted scrollback row version {observed}")]
+    UnsupportedVersion { observed: u32 },
+    #[error("encrypted scrollback row exceeds its hard byte limit")]
+    RecordByteLimit,
+    #[error("encrypted scrollback row ciphertext length is invalid")]
+    CiphertextLengthMismatch,
+    #[error("encrypted scrollback row key identity does not match")]
+    KeyIdentityMismatch,
+    #[error("encrypted scrollback row storage identity does not match")]
+    StorageIdentityMismatch,
+    #[error("encrypted scrollback row allocation failed")]
+    AllocationFailed,
+    #[error("encrypted scrollback row arithmetic overflow")]
+    ArithmeticOverflow,
+    #[error("operating system entropy is unavailable for scrollback encryption")]
+    EntropyUnavailable,
+    #[error("scrollback row encryption failed")]
+    EncryptionFailed,
+    #[error("scrollback row authentication or decryption failed")]
+    DecryptionFailed,
+}
 
 /// Hard admission limits for one immutable guardian output-log segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,7 +458,7 @@ impl GuardianOutputJournalLimits {
         }
         let minimum = FILE_HEADER_BYTES_U64
             .checked_add(RECORD_HEADER_BYTES_U64)
-            .and_then(|bytes| bytes.checked_add(1))
+            .and_then(|bytes| bytes.checked_add(u64::from(AEAD_TAG_BYTES) + 1))
             .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
         if self.max_log_bytes < minimum {
             return Err(GuardianOutputJournalError::InvalidLimits(
@@ -184,7 +556,13 @@ impl GuardianOutputKey {
     /// Compare two in-memory authorities without exposing either key.
     #[must_use]
     pub fn has_same_material(&self, other: &Self) -> bool {
-        self.bytes == other.bytes
+        self.bytes
+            .iter()
+            .zip(other.bytes.iter())
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
     }
 }
 
@@ -226,6 +604,176 @@ impl GuardianOutputCipher {
         let mut key_id = [0_u8; KEY_ID_BYTES];
         key_id.copy_from_slice(&digest[..KEY_ID_BYTES]);
         Ok(Self { cipher, key_id })
+    }
+
+    /// Seal one lossless semantic cold-scrollback row under the guardian key.
+    ///
+    /// This is deliberately narrower than a generic metadata-encryption API:
+    /// the authenticated envelope always carries the complete scrollback
+    /// storage identity and the v3 domain/version discriminator.
+    pub fn seal_scrollback_row(
+        &self,
+        identity: GuardianScrollbackRowIdentity,
+        plaintext: &[u8],
+    ) -> Result<GuardianEncryptedScrollbackRow, GuardianScrollbackRowError> {
+        let plaintext_bytes = u32::try_from(plaintext.len())
+            .map_err(|_| GuardianScrollbackRowError::RecordByteLimit)?;
+        if plaintext_bytes == 0 || plaintext_bytes > SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        if OsRng.try_fill_bytes(&mut nonce).is_err() {
+            nonce.zeroize();
+            return Err(GuardianScrollbackRowError::EntropyUnavailable);
+        }
+        let aad = scrollback_row_aad(self.key_id, identity, plaintext_bytes);
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackRowError::EncryptionFailed)?;
+        Ok(GuardianEncryptedScrollbackRow {
+            key_id: self.key_id,
+            identity,
+            plaintext_bytes,
+            nonce,
+            ciphertext,
+        })
+    }
+
+    /// Authenticate and open one exact row at its expected durable location.
+    ///
+    /// The per-record revision is authenticated from the envelope.  The
+    /// caller supplies the durable pane, content generation, stable row and
+    /// sequence from the surrounding store so cross-pane, cross-clear and
+    /// cross-row transplants fail before plaintext is returned.
+    pub fn open_scrollback_row(
+        &self,
+        record: &GuardianEncryptedScrollbackRow,
+        expected_durable_pane_id: [u8; 16],
+        expected_content_epoch: [u8; 16],
+        expected_stable_row: i64,
+        expected_sequence: u64,
+        max_plaintext_bytes: u32,
+    ) -> Result<Vec<u8>, GuardianScrollbackRowError> {
+        if record.key_id != self.key_id {
+            return Err(GuardianScrollbackRowError::KeyIdentityMismatch);
+        }
+        let identity = record.identity;
+        if identity.durable_pane_id != expected_durable_pane_id
+            || identity.content_epoch != expected_content_epoch
+            || identity.stable_row != expected_stable_row
+            || identity.sequence != expected_sequence
+        {
+            return Err(GuardianScrollbackRowError::StorageIdentityMismatch);
+        }
+        let maximum = max_plaintext_bytes.min(SCROLLBACK_ROW_MAX_PLAINTEXT_BYTES);
+        if record.plaintext_bytes == 0 || record.plaintext_bytes > maximum {
+            return Err(GuardianScrollbackRowError::RecordByteLimit);
+        }
+        let expected_ciphertext_bytes = usize::try_from(record.plaintext_bytes)
+            .map_err(|_| GuardianScrollbackRowError::ArithmeticOverflow)?
+            .checked_add(AEAD_TAG_BYTES_USIZE)
+            .ok_or(GuardianScrollbackRowError::ArithmeticOverflow)?;
+        if record.ciphertext.len() != expected_ciphertext_bytes {
+            return Err(GuardianScrollbackRowError::CiphertextLengthMismatch);
+        }
+        let aad = scrollback_row_aad(record.key_id, identity, record.plaintext_bytes);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                XNonce::from_slice(&record.nonce),
+                Payload {
+                    msg: &record.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackRowError::DecryptionFailed)?;
+        if plaintext.len()
+            != usize::try_from(record.plaintext_bytes)
+                .map_err(|_| GuardianScrollbackRowError::ArithmeticOverflow)?
+        {
+            return Err(GuardianScrollbackRowError::CiphertextLengthMismatch);
+        }
+        Ok(plaintext)
+    }
+
+    /// Authenticate one canonical v3 scrollback manifest without persisting
+    /// either generic metadata ciphertext or raw key material.
+    pub fn authenticate_scrollback_manifest(
+        &self,
+        canonical_manifest: &[u8],
+    ) -> Result<GuardianScrollbackManifestAuthentication, GuardianScrollbackManifestError> {
+        let canonical_bytes = u32::try_from(canonical_manifest.len())
+            .map_err(|_| GuardianScrollbackManifestError::CanonicalByteLimit)?;
+        if canonical_bytes == 0 || canonical_bytes > SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES {
+            return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        if OsRng.try_fill_bytes(&mut nonce).is_err() {
+            nonce.zeroize();
+            return Err(GuardianScrollbackManifestError::EntropyUnavailable);
+        }
+        let aad = scrollback_manifest_aad(self.key_id, canonical_bytes, canonical_manifest);
+        let authentication_tag = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &[],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackManifestError::AuthenticationFailed)?;
+        let authentication_tag: [u8; AEAD_TAG_BYTES_USIZE] = authentication_tag
+            .try_into()
+            .map_err(|_| GuardianScrollbackManifestError::AuthenticationFailed)?;
+        Ok(GuardianScrollbackManifestAuthentication {
+            key_id: self.key_id,
+            canonical_bytes,
+            nonce,
+            authentication_tag,
+        })
+    }
+
+    /// Verify that a canonical v3 scrollback manifest matches its guardian
+    /// authentication seal under this historical key.
+    pub fn verify_scrollback_manifest(
+        &self,
+        authentication: &GuardianScrollbackManifestAuthentication,
+        canonical_manifest: &[u8],
+    ) -> Result<(), GuardianScrollbackManifestError> {
+        if authentication.key_id != self.key_id {
+            return Err(GuardianScrollbackManifestError::KeyIdentityMismatch);
+        }
+        let canonical_bytes = u32::try_from(canonical_manifest.len())
+            .map_err(|_| GuardianScrollbackManifestError::CanonicalByteLimit)?;
+        if canonical_bytes == 0
+            || canonical_bytes > SCROLLBACK_MANIFEST_MAX_CANONICAL_BYTES
+            || canonical_bytes != authentication.canonical_bytes
+        {
+            return Err(GuardianScrollbackManifestError::CanonicalByteLimit);
+        }
+        let aad = scrollback_manifest_aad(self.key_id, canonical_bytes, canonical_manifest);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                XNonce::from_slice(&authentication.nonce),
+                Payload {
+                    msg: &authentication.authentication_tag,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| GuardianScrollbackManifestError::AuthenticationFailed)?;
+        if !plaintext.is_empty() {
+            return Err(GuardianScrollbackManifestError::AuthenticationFailed);
+        }
+        Ok(())
     }
 
     /// Seal guardian-owned journal metadata under a caller-supplied,
@@ -326,6 +874,40 @@ impl GuardianOutputCipher {
     }
 }
 
+fn scrollback_row_aad(
+    key_id: [u8; KEY_ID_BYTES],
+    identity: GuardianScrollbackRowIdentity,
+    plaintext_bytes: u32,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(SCROLLBACK_ROW_AEAD_DOMAIN.len() + 72);
+    aad.extend_from_slice(SCROLLBACK_ROW_AEAD_DOMAIN);
+    aad.extend_from_slice(&SCROLLBACK_ROW_FORMAT_VERSION.to_le_bytes());
+    aad.extend_from_slice(&key_id);
+    aad.extend_from_slice(&identity.durable_pane_id);
+    aad.extend_from_slice(&identity.content_epoch);
+    aad.extend_from_slice(&identity.revision.to_le_bytes());
+    aad.extend_from_slice(&identity.stable_row.to_le_bytes());
+    aad.extend_from_slice(&identity.sequence.to_le_bytes());
+    aad.extend_from_slice(&plaintext_bytes.to_le_bytes());
+    aad
+}
+
+fn scrollback_manifest_aad(
+    key_id: [u8; KEY_ID_BYTES],
+    canonical_bytes: u32,
+    canonical_manifest: &[u8],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        SCROLLBACK_MANIFEST_AEAD_DOMAIN.len() + 4 + KEY_ID_BYTES + 4 + canonical_manifest.len(),
+    );
+    aad.extend_from_slice(SCROLLBACK_MANIFEST_AEAD_DOMAIN);
+    aad.extend_from_slice(&SCROLLBACK_MANIFEST_AUTH_VERSION.to_le_bytes());
+    aad.extend_from_slice(&key_id);
+    aad.extend_from_slice(&canonical_bytes.to_le_bytes());
+    aad.extend_from_slice(canonical_manifest);
+    aad
+}
+
 impl std::fmt::Debug for GuardianOutputCipher {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -342,6 +924,8 @@ pub struct GuardianOutputPredecessor {
     segment_id: Uuid,
     last_sequence: u64,
     terminal_record_digest: [u8; 32],
+    cumulative_plaintext_bytes: u64,
+    committed_log_bytes: u64,
 }
 
 impl GuardianOutputPredecessor {
@@ -349,6 +933,8 @@ impl GuardianOutputPredecessor {
         segment_id: Uuid,
         last_sequence: u64,
         terminal_record_digest: [u8; 32],
+        cumulative_plaintext_bytes: u64,
+        committed_log_bytes: u64,
     ) -> Result<Self, GuardianOutputJournalError> {
         if segment_id.is_nil() {
             return Err(GuardianOutputJournalError::InvalidSegmentIdentity(
@@ -360,10 +946,26 @@ impl GuardianOutputPredecessor {
                 "predecessor sequence must be nonzero",
             ));
         }
+        if cumulative_plaintext_bytes == 0 {
+            return Err(GuardianOutputJournalError::InvalidSegmentIdentity(
+                "predecessor cumulative plaintext endpoint must be nonzero",
+            ));
+        }
+        let minimum_committed_log_bytes = FILE_HEADER_BYTES_U64
+            .checked_add(RECORD_HEADER_BYTES_U64)
+            .and_then(|bytes| bytes.checked_add(u64::from(AEAD_TAG_BYTES) + 1))
+            .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        if committed_log_bytes < minimum_committed_log_bytes {
+            return Err(GuardianOutputJournalError::InvalidSegmentIdentity(
+                "predecessor committed log endpoint cannot contain a record",
+            ));
+        }
         Ok(Self {
             segment_id,
             last_sequence,
             terminal_record_digest,
+            cumulative_plaintext_bytes,
+            committed_log_bytes,
         })
     }
 
@@ -381,6 +983,16 @@ impl GuardianOutputPredecessor {
     pub const fn terminal_record_digest(self) -> [u8; 32] {
         self.terminal_record_digest
     }
+
+    #[must_use]
+    pub const fn cumulative_plaintext_bytes(self) -> u64 {
+        self.cumulative_plaintext_bytes
+    }
+
+    #[must_use]
+    pub const fn committed_log_bytes(self) -> u64 {
+        self.committed_log_bytes
+    }
 }
 
 impl std::fmt::Debug for GuardianOutputPredecessor {
@@ -390,6 +1002,11 @@ impl std::fmt::Debug for GuardianOutputPredecessor {
             .field("segment_id", &self.segment_id)
             .field("last_sequence", &self.last_sequence)
             .field("terminal_record_digest", &"[REDACTED]")
+            .field(
+                "cumulative_plaintext_bytes",
+                &self.cumulative_plaintext_bytes,
+            )
+            .field("committed_log_bytes", &self.committed_log_bytes)
             .finish()
     }
 }
@@ -495,8 +1112,10 @@ pub struct GuardianOutputAppendReceipt {
     segment_id: Uuid,
     sequence: u64,
     payload_bytes: u32,
+    cumulative_plaintext_bytes: u64,
     committed_log_bytes: u64,
     record_digest: [u8; 32],
+    plaintext_delivery_digest: [u8; 32],
 }
 
 impl GuardianOutputAppendReceipt {
@@ -515,6 +1134,14 @@ impl GuardianOutputAppendReceipt {
         self.payload_bytes
     }
 
+    /// Exact pane-lifetime cumulative plaintext stream endpoint through this
+    /// authenticated, synchronized record. The endpoint never resets at a
+    /// segment rollover.
+    #[must_use]
+    pub const fn cumulative_plaintext_bytes(self) -> u64 {
+        self.cumulative_plaintext_bytes
+    }
+
     #[must_use]
     pub const fn committed_log_bytes(self) -> u64 {
         self.committed_log_bytes
@@ -525,12 +1152,33 @@ impl GuardianOutputAppendReceipt {
         self.record_digest
     }
 
+    /// Prove that `payload` is exactly the plaintext whose synchronized
+    /// journal append produced this receipt. The content-derived digest is
+    /// private and compared without content-dependent early exit; callers
+    /// never receive a reusable digest oracle.
+    #[must_use]
+    pub(crate) fn matches_payload(&self, payload: &[u8]) -> bool {
+        if usize::try_from(self.payload_bytes).ok() != Some(payload.len()) {
+            return false;
+        }
+        let candidate = plaintext_delivery_digest(self.segment_id, self.sequence, payload);
+        candidate
+            .iter()
+            .zip(self.plaintext_delivery_digest.iter())
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
+    }
+
     #[must_use]
     pub const fn into_predecessor(self) -> GuardianOutputPredecessor {
         GuardianOutputPredecessor {
             segment_id: self.segment_id,
             last_sequence: self.sequence,
             terminal_record_digest: self.record_digest,
+            cumulative_plaintext_bytes: self.cumulative_plaintext_bytes,
+            committed_log_bytes: self.committed_log_bytes,
         }
     }
 }
@@ -542,8 +1190,192 @@ impl std::fmt::Debug for GuardianOutputAppendReceipt {
             .field("segment_id", &self.segment_id)
             .field("sequence", &self.sequence)
             .field("payload_bytes", &self.payload_bytes)
+            .field(
+                "cumulative_plaintext_bytes",
+                &self.cumulative_plaintext_bytes,
+            )
             .field("committed_log_bytes", &self.committed_log_bytes)
             .field("record_digest", &"[REDACTED]")
+            .field("plaintext_delivery_digest", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Hard admission bounds for one authenticated suffix recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianOutputRecoveryLimits {
+    pub max_records: u64,
+    pub max_plaintext_bytes: u64,
+}
+
+impl GuardianOutputRecoveryLimits {
+    pub const HARD_MAX_RECORDS: u64 = RECOVERY_MAX_RECORDS;
+    pub const HARD_MAX_PLAINTEXT_BYTES: u64 = RECOVERY_MAX_PLAINTEXT_BYTES;
+
+    pub fn new(
+        max_records: u64,
+        max_plaintext_bytes: u64,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        Self {
+            max_records,
+            max_plaintext_bytes,
+        }
+        .validate()
+    }
+
+    fn validate(self) -> Result<Self, GuardianOutputJournalError> {
+        if self.max_records == 0 {
+            return Err(GuardianOutputJournalError::InvalidRecoveryLimits(
+                "max_records must be nonzero",
+            ));
+        }
+        if self.max_records > RECOVERY_MAX_RECORDS {
+            return Err(GuardianOutputJournalError::InvalidRecoveryLimits(
+                "max_records exceeds the hard recovery cap",
+            ));
+        }
+        if self.max_plaintext_bytes == 0 {
+            return Err(GuardianOutputJournalError::InvalidRecoveryLimits(
+                "max_plaintext_bytes must be nonzero",
+            ));
+        }
+        if self.max_plaintext_bytes > RECOVERY_MAX_PLAINTEXT_BYTES {
+            return Err(GuardianOutputJournalError::InvalidRecoveryLimits(
+                "max_plaintext_bytes exceeds the hard recovery cap",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// One exact plaintext record recovered only after digest and AEAD validation.
+pub struct GuardianRecoveredOutputRecord {
+    receipt: GuardianOutputAppendReceipt,
+    plaintext: Vec<u8>,
+}
+
+impl GuardianRecoveredOutputRecord {
+    #[must_use]
+    pub(crate) const fn receipt(&self) -> GuardianOutputAppendReceipt {
+        self.receipt
+    }
+
+    #[must_use]
+    pub(crate) fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+
+    #[must_use]
+    pub(crate) fn into_plaintext(self) -> Vec<u8> {
+        self.plaintext
+    }
+}
+
+impl std::fmt::Debug for GuardianRecoveredOutputRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianRecoveredOutputRecord")
+            .field("receipt", &self.receipt)
+            .field("plaintext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Exact bounded suffix plus authenticated terminal segment authority.
+pub struct GuardianOutputRecoveryBatch {
+    segment_identity: GuardianOutputSegmentIdentity,
+    requested_first_sequence: u64,
+    records: Vec<GuardianRecoveredOutputRecord>,
+    next_recovery_sequence: Option<u64>,
+    committed_next_sequence: Option<u64>,
+    committed_log_bytes: u64,
+    cumulative_plaintext_bytes: u64,
+    terminal_receipt: Option<GuardianOutputAppendReceipt>,
+    tail: GuardianOutputJournalTail,
+}
+
+impl GuardianOutputRecoveryBatch {
+    #[must_use]
+    pub const fn segment_identity(&self) -> GuardianOutputSegmentIdentity {
+        self.segment_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn requested_first_sequence(&self) -> u64 {
+        self.requested_first_sequence
+    }
+
+    #[must_use]
+    pub(crate) fn records(&self) -> &[GuardianRecoveredOutputRecord] {
+        &self.records
+    }
+
+    #[must_use]
+    pub(crate) fn into_records(self) -> Vec<GuardianRecoveredOutputRecord> {
+        self.records
+    }
+
+    #[must_use]
+    /// Sequence at which the next recovery page must begin when this page was
+    /// saturated. `None` means that this page reached the authenticated tail;
+    /// for a segment ending at `u64::MAX`, it is also the deliberate terminal
+    /// cursor because no exclusive successor sequence is representable.
+    pub const fn next_recovery_sequence(&self) -> Option<u64> {
+        self.next_recovery_sequence
+    }
+
+    #[must_use]
+    /// Exclusive authenticated record endpoint when representable. `None`
+    /// means that a committed record at `u64::MAX` exhausted sequence space;
+    /// it never authorizes wrapping or restarting the cursor at zero.
+    pub const fn committed_next_sequence(&self) -> Option<u64> {
+        self.committed_next_sequence
+    }
+
+    #[must_use]
+    pub const fn committed_log_bytes(&self) -> u64 {
+        self.committed_log_bytes
+    }
+
+    #[must_use]
+    pub(crate) const fn cumulative_plaintext_bytes(&self) -> u64 {
+        self.cumulative_plaintext_bytes
+    }
+
+    #[must_use]
+    pub(crate) const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
+        self.terminal_receipt
+    }
+
+    #[must_use]
+    pub(crate) fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
+        self.terminal_receipt
+            .map(GuardianOutputAppendReceipt::into_predecessor)
+            .or(self.segment_identity.predecessor)
+    }
+
+    #[must_use]
+    pub(crate) const fn tail(&self) -> GuardianOutputJournalTail {
+        self.tail
+    }
+}
+
+impl std::fmt::Debug for GuardianOutputRecoveryBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianOutputRecoveryBatch")
+            .field("segment_identity", &self.segment_identity)
+            .field("requested_first_sequence", &self.requested_first_sequence)
+            .field("record_count", &self.records.len())
+            .field("next_recovery_sequence", &self.next_recovery_sequence)
+            .field("committed_next_sequence", &self.committed_next_sequence)
+            .field("committed_log_bytes", &self.committed_log_bytes)
+            .field(
+                "cumulative_plaintext_bytes",
+                &self.cumulative_plaintext_bytes,
+            )
+            .field("terminal_receipt", &self.terminal_receipt)
+            .field("tail", &self.tail)
             .finish()
     }
 }
@@ -554,6 +1386,14 @@ pub enum GuardianOutputJournalError {
     InvalidLimits(&'static str),
     #[error("invalid guardian output segment identity: {0}")]
     InvalidSegmentIdentity(&'static str),
+    #[error("invalid guardian output recovery limits: {0}")]
+    InvalidRecoveryLimits(&'static str),
+    #[error("guardian output recovery range is outside the authenticated segment")]
+    RecoveryRangeMismatch,
+    #[error("guardian output recovery plaintext bound exceeded: {observed} > {maximum}")]
+    RecoveryPlaintextByteLimit { observed: u64, maximum: u64 },
+    #[error("guardian output recovery allocation failed")]
+    RecoveryAllocationFailed,
     #[error("invalid guardian output encryption key: {0}")]
     InvalidEncryptionKey(&'static str),
     #[error("operating system entropy is unavailable for guardian output encryption")]
@@ -586,8 +1426,10 @@ pub enum GuardianOutputJournalError {
     SegmentIdentityMismatch,
     #[error("guardian output journal encryption key identity does not match")]
     KeyIdentityMismatch,
-    #[error("guardian output journal file header digest mismatch")]
-    FileHeaderDigestMismatch,
+    #[error("guardian output journal file header authentication seal failed")]
+    FileHeaderAuthenticationSealFailed,
+    #[error("guardian output journal file header authentication failed")]
+    FileHeaderAuthenticationFailed,
     #[error("guardian output journal exceeds its byte limit: {observed} > {maximum}")]
     LogByteLimit { observed: u64, maximum: u64 },
     #[error("guardian output journal record limit {maximum} is exhausted")]
@@ -640,8 +1482,79 @@ pub enum GuardianOutputJournalError {
 struct JournalScan {
     committed_bytes: u64,
     record_count: u64,
+    cumulative_plaintext_bytes: u64,
     next_sequence: Option<u64>,
+    terminal_receipt: Option<GuardianOutputAppendReceipt>,
     tail: GuardianOutputJournalTail,
+}
+
+struct RecoveryCollector {
+    first_sequence: u64,
+    limits: GuardianOutputRecoveryLimits,
+    plaintext_bytes: u64,
+    records: Vec<GuardianRecoveredOutputRecord>,
+    next_recovery_sequence: Option<u64>,
+}
+
+impl RecoveryCollector {
+    fn new(
+        first_sequence: u64,
+        limits: GuardianOutputRecoveryLimits,
+    ) -> Result<Self, GuardianOutputJournalError> {
+        Ok(Self {
+            first_sequence,
+            limits: limits.validate()?,
+            plaintext_bytes: 0,
+            records: Vec::new(),
+            next_recovery_sequence: None,
+        })
+    }
+
+    fn observe(
+        &mut self,
+        receipt: GuardianOutputAppendReceipt,
+        plaintext: Vec<u8>,
+    ) -> Result<(), GuardianOutputJournalError> {
+        // The scanner intentionally authenticates the complete committed
+        // prefix even after the requested page saturates. At that point this
+        // method drops each just-opened plaintext before the next frame is
+        // read, so post-limit temporary allocation remains bounded to one
+        // record rather than the unreturned suffix.
+        if receipt.sequence < self.first_sequence || self.next_recovery_sequence.is_some() {
+            return Ok(());
+        }
+        let record_count = u64::try_from(self.records.len())
+            .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+        if record_count >= self.limits.max_records {
+            self.next_recovery_sequence = Some(receipt.sequence);
+            return Ok(());
+        }
+        let plaintext_bytes = u64::try_from(plaintext.len())
+            .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+        let projected_plaintext_bytes = self
+            .plaintext_bytes
+            .checked_add(plaintext_bytes)
+            .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        if projected_plaintext_bytes > self.limits.max_plaintext_bytes {
+            if self.records.is_empty() {
+                return Err(GuardianOutputJournalError::RecoveryPlaintextByteLimit {
+                    observed: projected_plaintext_bytes,
+                    maximum: self.limits.max_plaintext_bytes,
+                });
+            }
+            self.next_recovery_sequence = Some(receipt.sequence);
+            return Ok(());
+        }
+        self.records
+            .try_reserve(1)
+            .map_err(|_| GuardianOutputJournalError::RecoveryAllocationFailed)?;
+        self.records.push(GuardianRecoveredOutputRecord {
+            receipt,
+            plaintext,
+        });
+        self.plaintext_bytes = projected_plaintext_bytes;
+        Ok(())
+    }
 }
 
 /// An exclusively owned append authority for one raw-output segment.
@@ -652,7 +1565,9 @@ pub struct GuardianOutputJournal {
     limits: GuardianOutputJournalLimits,
     committed_bytes: u64,
     record_count: u64,
+    cumulative_plaintext_bytes: u64,
     next_sequence: Option<u64>,
+    terminal_receipt: Option<GuardianOutputAppendReceipt>,
     tail: GuardianOutputJournalTail,
     directory_entry_sync_required: bool,
     poisoned: bool,
@@ -684,13 +1599,30 @@ impl GuardianOutputJournal {
         }
         let initialized_new_segment = physical_bytes == 0;
         if initialized_new_segment {
-            let header = encode_file_header(identity, cipher.key_id);
+            let header = encode_file_header(identity, &cipher)?;
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&header)?;
             file.sync_all()?;
             physical_bytes = FILE_HEADER_BYTES_U64;
         }
         if physical_bytes < FILE_HEADER_BYTES_U64 {
+            // A complete header from an older on-disk format can be shorter
+            // than the authenticated v3 header.  Diagnose that condition as
+            // an explicit unsupported version instead of misclassifying it
+            // as a torn v3 file.  We only trust the version enough to reject
+            // it after the fixed magic and version prefix is physically
+            // complete; no legacy bytes are admitted or rewritten.
+            if physical_bytes >= 16 {
+                let mut prefix = [0_u8; 16];
+                file.seek(SeekFrom::Start(0))?;
+                file.read_exact(&mut prefix)?;
+                if prefix[0..8] == FILE_MAGIC {
+                    let observed = read_u32(&prefix[8..12]);
+                    if observed != FORMAT_VERSION {
+                        return Err(GuardianOutputJournalError::UnsupportedVersion { observed });
+                    }
+                }
+            }
             return Err(GuardianOutputJournalError::TornFileHeader {
                 expected: FILE_HEADER_BYTES,
                 actual: physical_bytes,
@@ -704,7 +1636,9 @@ impl GuardianOutputJournal {
             limits,
             committed_bytes: scan.committed_bytes,
             record_count: scan.record_count,
+            cumulative_plaintext_bytes: scan.cumulative_plaintext_bytes,
             next_sequence: scan.next_sequence,
+            terminal_receipt: scan.terminal_receipt,
             tail: scan.tail,
             directory_entry_sync_required: initialized_new_segment,
             poisoned: false,
@@ -727,8 +1661,30 @@ impl GuardianOutputJournal {
     }
 
     #[must_use]
+    pub const fn cumulative_plaintext_bytes(&self) -> u64 {
+        self.cumulative_plaintext_bytes
+    }
+
+    #[must_use]
     pub const fn next_sequence(&self) -> Option<u64> {
         self.next_sequence
+    }
+
+    /// Verified terminal record authority reconstructed while opening this
+    /// segment. It is sufficient to form the exact successor predecessor.
+    #[must_use]
+    pub(crate) const fn terminal_receipt(&self) -> Option<GuardianOutputAppendReceipt> {
+        self.terminal_receipt
+    }
+
+    /// Verified terminal chain authority after reopen. An empty current
+    /// segment has no receipt of its own and therefore preserves the exact
+    /// authenticated predecessor authority.
+    #[must_use]
+    pub(crate) fn terminal_predecessor(&self) -> Option<GuardianOutputPredecessor> {
+        self.terminal_receipt
+            .map(GuardianOutputAppendReceipt::into_predecessor)
+            .or(self.identity.predecessor)
     }
 
     #[must_use]
@@ -766,6 +1722,95 @@ impl GuardianOutputJournal {
         parent_directory.sync_all()?;
         self.directory_entry_sync_required = false;
         Ok(())
+    }
+
+    /// Re-read and authenticate a bounded contiguous page of the committed
+    /// plaintext suffix. Every frame in the committed prefix is verified;
+    /// bytes from an incomplete physical tail are reported but never returned.
+    pub(crate) fn recover_committed_range(
+        &self,
+        first_sequence: u64,
+        limits: GuardianOutputRecoveryLimits,
+    ) -> Result<GuardianOutputRecoveryBatch, GuardianOutputJournalError> {
+        if self.poisoned {
+            return Err(GuardianOutputJournalError::Poisoned);
+        }
+        if self.directory_entry_sync_required {
+            return Err(GuardianOutputJournalError::DirectoryEntryNotDurable);
+        }
+        if first_sequence < self.identity.first_sequence {
+            return Err(GuardianOutputJournalError::RecoveryRangeMismatch);
+        }
+        if self
+            .next_sequence
+            .is_some_and(|next_sequence| first_sequence > next_sequence)
+        {
+            return Err(GuardianOutputJournalError::RecoveryRangeMismatch);
+        }
+        let mut collector = RecoveryCollector::new(first_sequence, limits)?;
+        let mut file = self.file.try_clone()?;
+        let expected_physical_bytes = match self.tail {
+            GuardianOutputJournalTail::Clean => self.committed_bytes,
+            GuardianOutputJournalTail::Incomplete {
+                committed_bytes,
+                trailing_bytes,
+            } => {
+                if committed_bytes != self.committed_bytes {
+                    return Err(GuardianOutputJournalError::ExternalLengthChange {
+                        expected: self.committed_bytes,
+                        observed: committed_bytes,
+                    });
+                }
+                committed_bytes
+                    .checked_add(trailing_bytes)
+                    .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?
+            }
+        };
+        let physical_bytes_before = file.metadata()?.len();
+        if physical_bytes_before != expected_physical_bytes {
+            return Err(GuardianOutputJournalError::ExternalLengthChange {
+                expected: expected_physical_bytes,
+                observed: physical_bytes_before,
+            });
+        }
+        let scan = scan_journal_with_recovery(
+            &mut file,
+            physical_bytes_before,
+            self.identity,
+            &self.cipher,
+            self.limits,
+            Some(&mut collector),
+        )?;
+        let physical_bytes_after = file.metadata()?.len();
+        if physical_bytes_before != physical_bytes_after {
+            return Err(GuardianOutputJournalError::ExternalLengthChange {
+                expected: physical_bytes_before,
+                observed: physical_bytes_after,
+            });
+        }
+        if scan.committed_bytes != self.committed_bytes
+            || scan.record_count != self.record_count
+            || scan.cumulative_plaintext_bytes != self.cumulative_plaintext_bytes
+            || scan.next_sequence != self.next_sequence
+            || scan.terminal_receipt != self.terminal_receipt
+            || scan.tail != self.tail
+        {
+            return Err(GuardianOutputJournalError::ExternalLengthChange {
+                expected: self.committed_bytes,
+                observed: scan.committed_bytes,
+            });
+        }
+        Ok(GuardianOutputRecoveryBatch {
+            segment_identity: self.identity,
+            requested_first_sequence: first_sequence,
+            records: collector.records,
+            next_recovery_sequence: collector.next_recovery_sequence,
+            committed_next_sequence: scan.next_sequence,
+            committed_log_bytes: scan.committed_bytes,
+            cumulative_plaintext_bytes: scan.cumulative_plaintext_bytes,
+            terminal_receipt: scan.terminal_receipt,
+            tail: scan.tail,
+        })
     }
 
     /// Append and synchronize one nonempty raw PTY output record.
@@ -810,6 +1855,10 @@ impl GuardianOutputJournal {
             .ok_or(GuardianOutputJournalError::SequenceExhausted)?;
         let payload_bytes = u32::try_from(payload.len())
             .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?;
+        let cumulative_plaintext_bytes = self
+            .cumulative_plaintext_bytes
+            .checked_add(u64::from(payload_bytes))
+            .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
         let (nonce, ciphertext) = self
             .cipher
             .seal(self.identity, sequence, payload_bytes, payload)?;
@@ -853,6 +1902,8 @@ impl GuardianOutputJournal {
             &nonce,
             &ciphertext,
         );
+        let plaintext_delivery_digest =
+            plaintext_delivery_digest(self.identity.segment_id, sequence, payload);
         let header = encode_record_header(
             sequence,
             payload_bytes,
@@ -875,21 +1926,26 @@ impl GuardianOutputJournal {
             .record_count
             .checked_add(1)
             .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        self.cumulative_plaintext_bytes = cumulative_plaintext_bytes;
         self.next_sequence = sequence.checked_add(1);
-        Ok(GuardianOutputAppendReceipt {
+        let receipt = GuardianOutputAppendReceipt {
             segment_id: self.identity.segment_id,
             sequence,
             payload_bytes,
+            cumulative_plaintext_bytes,
             committed_log_bytes: projected_bytes,
             record_digest,
-        })
+            plaintext_delivery_digest,
+        };
+        self.terminal_receipt = Some(receipt);
+        Ok(receipt)
     }
 }
 
 fn encode_file_header(
     identity: GuardianOutputSegmentIdentity,
-    key_id: [u8; KEY_ID_BYTES],
-) -> [u8; FILE_HEADER_BYTES] {
+    cipher: &GuardianOutputCipher,
+) -> Result<[u8; FILE_HEADER_BYTES], GuardianOutputJournalError> {
     let mut header = [0_u8; FILE_HEADER_BYTES];
     header[0..8].copy_from_slice(&FILE_MAGIC);
     header[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -901,19 +1957,37 @@ fn encode_file_header(
         header[56..72].copy_from_slice(previous.segment_id.as_bytes());
         header[72..80].copy_from_slice(&previous.last_sequence.to_le_bytes());
         header[80..112].copy_from_slice(&previous.terminal_record_digest);
+        header[120..128].copy_from_slice(&previous.cumulative_plaintext_bytes.to_le_bytes());
+        header[128..136].copy_from_slice(&previous.committed_log_bytes.to_le_bytes());
     }
-    header[112..120].copy_from_slice(&key_id);
-    let mut hasher = Sha256::new();
-    hasher.update(FILE_DIGEST_DOMAIN);
-    hasher.update(&header[0..128]);
-    header[128..160].copy_from_slice(&hasher.finalize());
-    header
+    header[112..120].copy_from_slice(&cipher.key_id);
+    let mut nonce = [0_u8; NONCE_BYTES];
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| GuardianOutputJournalError::EntropyUnavailable)?;
+    let aad = file_header_aad(&header[0..136]);
+    let authentication_tag = cipher
+        .cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &[],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| GuardianOutputJournalError::FileHeaderAuthenticationSealFailed)?;
+    if authentication_tag.len() != AEAD_TAG_BYTES_USIZE {
+        return Err(GuardianOutputJournalError::FileHeaderAuthenticationSealFailed);
+    }
+    header[136..160].copy_from_slice(&nonce);
+    header[160..176].copy_from_slice(&authentication_tag);
+    Ok(header)
 }
 
 fn validate_file_header(
     header: &[u8; FILE_HEADER_BYTES],
     identity: GuardianOutputSegmentIdentity,
-    key_id: [u8; KEY_ID_BYTES],
+    cipher: &GuardianOutputCipher,
 ) -> Result<(), GuardianOutputJournalError> {
     if header[0..8] != FILE_MAGIC {
         return Err(GuardianOutputJournalError::InvalidFileMagic);
@@ -941,22 +2015,44 @@ fn validate_file_header(
             &header[56..72] == previous.segment_id.as_bytes()
                 && read_u64(&header[72..80]) == previous.last_sequence
                 && header[80..112] == previous.terminal_record_digest
+                && read_u64(&header[120..128]) == previous.cumulative_plaintext_bytes
+                && read_u64(&header[128..136]) == previous.committed_log_bytes
         }
-        None => header[56..112].iter().all(|byte| *byte == 0),
+        None => {
+            header[56..112].iter().all(|byte| *byte == 0)
+                && header[120..136].iter().all(|byte| *byte == 0)
+        }
     };
-    if !predecessor_matches || header[120..128].iter().any(|byte| *byte != 0) {
+    if !predecessor_matches {
         return Err(GuardianOutputJournalError::SegmentIdentityMismatch);
     }
-    if header[112..120] != key_id {
+    if header[112..120] != cipher.key_id {
         return Err(GuardianOutputJournalError::KeyIdentityMismatch);
     }
-    let mut hasher = Sha256::new();
-    hasher.update(FILE_DIGEST_DOMAIN);
-    hasher.update(&header[0..128]);
-    if header[128..160] != hasher.finalize()[..] {
-        return Err(GuardianOutputJournalError::FileHeaderDigestMismatch);
+    let mut nonce = [0_u8; NONCE_BYTES];
+    nonce.copy_from_slice(&header[136..160]);
+    let aad = file_header_aad(&header[0..136]);
+    let plaintext = cipher
+        .cipher
+        .decrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &header[160..176],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| GuardianOutputJournalError::FileHeaderAuthenticationFailed)?;
+    if !plaintext.is_empty() {
+        return Err(GuardianOutputJournalError::FileHeaderAuthenticationFailed);
     }
     Ok(())
+}
+
+fn file_header_aad(canonical_header: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(FILE_HEADER_AEAD_DOMAIN.len() + canonical_header.len());
+    aad.extend_from_slice(FILE_HEADER_AEAD_DOMAIN);
+    aad.extend_from_slice(canonical_header);
+    aad
 }
 
 fn encode_record_header(
@@ -987,6 +2083,7 @@ fn record_digest(
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(RECORD_DIGEST_DOMAIN);
+    hasher.update(FORMAT_VERSION.to_le_bytes());
     hasher.update(identity.durable_pane_id.as_bytes());
     hasher.update(identity.segment_id.as_bytes());
     hasher.update(sequence.to_le_bytes());
@@ -997,13 +2094,29 @@ fn record_digest(
     hasher.finalize().into()
 }
 
+fn plaintext_delivery_digest(segment_id: Uuid, sequence: u64, payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PLAINTEXT_DELIVERY_DIGEST_DOMAIN);
+    hasher.update(FORMAT_VERSION.to_le_bytes());
+    hasher.update(segment_id.as_bytes());
+    hasher.update(sequence.to_le_bytes());
+    hasher.update(
+        u64::try_from(payload.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
 fn record_aad(
     identity: GuardianOutputSegmentIdentity,
     sequence: u64,
     plaintext_bytes: u32,
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(RECORD_AAD_DOMAIN.len() + 16 + 16 + 8 + 4);
+    let mut aad = Vec::with_capacity(RECORD_AAD_DOMAIN.len() + 4 + 16 + 16 + 8 + 4);
     aad.extend_from_slice(RECORD_AAD_DOMAIN);
+    aad.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     aad.extend_from_slice(identity.durable_pane_id.as_bytes());
     aad.extend_from_slice(identity.segment_id.as_bytes());
     aad.extend_from_slice(&sequence.to_le_bytes());
@@ -1018,14 +2131,29 @@ fn scan_journal<R: Read + Seek>(
     cipher: &GuardianOutputCipher,
     limits: GuardianOutputJournalLimits,
 ) -> Result<JournalScan, GuardianOutputJournalError> {
+    scan_journal_with_recovery(reader, physical_bytes, identity, cipher, limits, None)
+}
+
+fn scan_journal_with_recovery<R: Read + Seek>(
+    reader: &mut R,
+    physical_bytes: u64,
+    identity: GuardianOutputSegmentIdentity,
+    cipher: &GuardianOutputCipher,
+    limits: GuardianOutputJournalLimits,
+    mut recovery: Option<&mut RecoveryCollector>,
+) -> Result<JournalScan, GuardianOutputJournalError> {
     reader.seek(SeekFrom::Start(0))?;
     let mut file_header = [0_u8; FILE_HEADER_BYTES];
     reader.read_exact(&mut file_header)?;
-    validate_file_header(&file_header, identity, cipher.key_id)?;
+    validate_file_header(&file_header, identity, cipher)?;
 
     let mut committed_bytes = FILE_HEADER_BYTES_U64;
     let mut record_count = 0_u64;
+    let mut cumulative_plaintext_bytes = identity
+        .predecessor
+        .map_or(0, |predecessor| predecessor.cumulative_plaintext_bytes);
     let mut next_sequence = Some(identity.first_sequence);
+    let mut terminal_receipt = None;
     while committed_bytes < physical_bytes {
         let remaining = physical_bytes
             .checked_sub(committed_bytes)
@@ -1034,7 +2162,9 @@ fn scan_journal<R: Read + Seek>(
             return Ok(JournalScan {
                 committed_bytes,
                 record_count,
+                cumulative_plaintext_bytes,
                 next_sequence,
+                terminal_receipt,
                 tail: GuardianOutputJournalTail::Incomplete {
                     committed_bytes,
                     trailing_bytes: remaining,
@@ -1104,7 +2234,9 @@ fn scan_journal<R: Read + Seek>(
             return Ok(JournalScan {
                 committed_bytes,
                 record_count,
+                cumulative_plaintext_bytes,
                 next_sequence,
+                terminal_receipt,
                 tail: GuardianOutputJournalTail::Incomplete {
                     committed_bytes,
                     trailing_bytes: remaining,
@@ -1145,18 +2277,43 @@ fn scan_journal<R: Read + Seek>(
                     .map_err(|_| GuardianOutputJournalError::ArithmeticOverflow)?,
             });
         }
-        committed_bytes = committed_bytes
+        let projected_committed_bytes = committed_bytes
             .checked_add(frame_bytes)
             .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
-        record_count = record_count
+        let projected_record_count = record_count
             .checked_add(1)
             .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        let projected_cumulative_plaintext_bytes = cumulative_plaintext_bytes
+            .checked_add(u64::from(plaintext_bytes))
+            .ok_or(GuardianOutputJournalError::ArithmeticOverflow)?;
+        let receipt = GuardianOutputAppendReceipt {
+            segment_id: identity.segment_id,
+            sequence,
+            payload_bytes: plaintext_bytes,
+            cumulative_plaintext_bytes: projected_cumulative_plaintext_bytes,
+            committed_log_bytes: projected_committed_bytes,
+            record_digest: expected_digest,
+            plaintext_delivery_digest: plaintext_delivery_digest(
+                identity.segment_id,
+                sequence,
+                &plaintext,
+            ),
+        };
+        if let Some(collector) = recovery.as_deref_mut() {
+            collector.observe(receipt, plaintext)?;
+        }
+        committed_bytes = projected_committed_bytes;
+        record_count = projected_record_count;
+        cumulative_plaintext_bytes = projected_cumulative_plaintext_bytes;
         next_sequence = sequence.checked_add(1);
+        terminal_receipt = Some(receipt);
     }
     Ok(JournalScan {
         committed_bytes,
         record_count,
+        cumulative_plaintext_bytes,
         next_sequence,
+        terminal_receipt,
         tail: GuardianOutputJournalTail::Clean,
     })
 }
@@ -1173,10 +2330,16 @@ fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(fixed)
 }
 
+fn read_i64(bytes: &[u8]) -> i64 {
+    let mut fixed = [0_u8; 8];
+    fixed.copy_from_slice(bytes);
+    i64::from_le_bytes(fixed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Write as _};
+    use std::io::{Cursor, Seek as _, Write as _};
 
     #[cfg(unix)]
     fn create_journal_file(path: &std::path::Path) -> File {
@@ -1210,12 +2373,189 @@ mod tests {
             .expect("fixture encryption key is valid")
     }
 
+    fn scrollback_identity() -> GuardianScrollbackRowIdentity {
+        GuardianScrollbackRowIdentity::new([0x42; 16], [0x24; 16], 7, -3, 11)
+            .expect("fixture scrollback identity is valid")
+    }
+
+    #[test]
+    fn encrypted_scrollback_row_roundtrips_without_plaintext_or_debug_disclosure() {
+        let plaintext = b"semantic-row-secret-with-style-width-and-link";
+        let cipher = cipher();
+        let sealed = cipher
+            .seal_scrollback_row(scrollback_identity(), plaintext)
+            .expect("seal exact row");
+        let encoded = sealed.encode().expect("encode exact row");
+        assert!(!encoded.contains("semantic-row-secret"));
+        let debug = format!("{sealed:?}");
+        assert!(!debug.contains("semantic-row-secret"));
+        assert!(!debug.contains(&hex::encode(cipher.key_id())));
+
+        let parsed = GuardianEncryptedScrollbackRow::parse(&encoded).expect("parse exact row");
+        let opened = cipher
+            .open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 1024)
+            .expect("authenticate exact row");
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn encrypted_scrollback_row_rejects_tamper_wrong_location_and_wrong_key() {
+        let cipher = cipher();
+        let sealed = cipher
+            .seal_scrollback_row(scrollback_identity(), b"authenticated row")
+            .expect("seal exact row");
+        let encoded = sealed.encode().expect("encode exact row");
+        let parsed = GuardianEncryptedScrollbackRow::parse(&encoded).expect("parse exact row");
+        assert!(matches!(
+            cipher.open_scrollback_row(&parsed, [0x43; 16], [0x24; 16], -3, 11, 1024),
+            Err(GuardianScrollbackRowError::StorageIdentityMismatch)
+        ));
+        assert!(matches!(
+            cipher.open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -2, 11, 1024),
+            Err(GuardianScrollbackRowError::StorageIdentityMismatch)
+        ));
+        let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
+            .expect("wrong-key fixture is structurally valid");
+        assert!(matches!(
+            wrong_cipher.open_scrollback_row(
+                &parsed,
+                [0x42; 16],
+                [0x24; 16],
+                -3,
+                11,
+                1024,
+            ),
+            Err(GuardianScrollbackRowError::KeyIdentityMismatch)
+        ));
+
+        let mut header_tampered =
+            GuardianEncryptedScrollbackRow::parse(&encoded).expect("reparse exact row");
+        header_tampered.identity.stable_row = -2;
+        assert!(matches!(
+            cipher.open_scrollback_row(
+                &header_tampered,
+                [0x42; 16],
+                [0x24; 16],
+                -2,
+                11,
+                1024,
+            ),
+            Err(GuardianScrollbackRowError::DecryptionFailed)
+        ));
+
+        let mut tampered = parsed;
+        tampered.ciphertext[0] ^= 0x80;
+        assert!(matches!(
+            cipher.open_scrollback_row(&tampered, [0x42; 16], [0x24; 16], -3, 11, 1024),
+            Err(GuardianScrollbackRowError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn encrypted_scrollback_row_enforces_bounded_canonical_framing() {
+        let cipher = cipher();
+        assert!(matches!(
+            cipher.seal_scrollback_row(scrollback_identity(), b""),
+            Err(GuardianScrollbackRowError::RecordByteLimit)
+        ));
+        let sealed = cipher
+            .seal_scrollback_row(scrollback_identity(), b"bounded")
+            .expect("seal bounded row");
+        let encoded = sealed.encode().expect("encode bounded row");
+        let parsed = GuardianEncryptedScrollbackRow::parse(&encoded).expect("parse bounded row");
+        assert!(matches!(
+            cipher.open_scrollback_row(&parsed, [0x42; 16], [0x24; 16], -3, 11, 6),
+            Err(GuardianScrollbackRowError::RecordByteLimit)
+        ));
+        assert!(matches!(
+            GuardianEncryptedScrollbackRow::parse(&format!("{encoded}=")),
+            Err(GuardianScrollbackRowError::MalformedRecord)
+                | Err(GuardianScrollbackRowError::NonCanonicalRecord)
+        ));
+    }
+
+    #[test]
+    fn scrollback_manifest_authentication_roundtrips_without_plaintext_or_debug_disclosure() {
+        let canonical = br#"{"schema":"frankenterm.live-scrollback.manifest.v3","secret":"FT-MANIFEST-SECRET"}"#;
+        let cipher = cipher();
+        let authentication = cipher
+            .authenticate_scrollback_manifest(canonical)
+            .expect("authenticate canonical manifest");
+        let encoded = authentication.encode();
+        assert!(!encoded.contains("FT-MANIFEST-SECRET"));
+        assert!(!format!("{authentication:?}").contains("FT-MANIFEST-SECRET"));
+        assert!(!format!("{authentication:?}").contains(&hex::encode(cipher.key_id())));
+
+        let parsed = GuardianScrollbackManifestAuthentication::parse(&encoded)
+            .expect("parse canonical authentication seal");
+        assert_eq!(parsed.encode(), encoded);
+        cipher
+            .verify_scrollback_manifest(&parsed, canonical)
+            .expect("verify canonical manifest");
+    }
+
+    #[test]
+    fn scrollback_manifest_authentication_rejects_tamper_wrong_manifest_and_wrong_key() {
+        let canonical = br#"{"schema":"frankenterm.live-scrollback.manifest.v3","revision":9}"#;
+        let cipher = cipher();
+        let mut authentication = cipher
+            .authenticate_scrollback_manifest(canonical)
+            .expect("authenticate canonical manifest");
+
+        assert!(matches!(
+            cipher.verify_scrollback_manifest(
+                &authentication,
+                br#"{"schema":"frankenterm.live-scrollback.manifest.v3","revision":8}"#,
+            ),
+            Err(GuardianScrollbackManifestError::AuthenticationFailed)
+        ));
+        let wrong_cipher = GuardianOutputCipher::try_from_key_slice(&[0x72; 32])
+            .expect("wrong-key fixture is structurally valid");
+        assert!(matches!(
+            wrong_cipher.verify_scrollback_manifest(&authentication, canonical),
+            Err(GuardianScrollbackManifestError::KeyIdentityMismatch)
+        ));
+
+        authentication.authentication_tag[0] ^= 0x80;
+        assert!(matches!(
+            cipher.verify_scrollback_manifest(&authentication, canonical),
+            Err(GuardianScrollbackManifestError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn scrollback_manifest_authentication_enforces_bounded_canonical_framing() {
+        let cipher = cipher();
+        assert!(matches!(
+            cipher.authenticate_scrollback_manifest(b""),
+            Err(GuardianScrollbackManifestError::CanonicalByteLimit)
+        ));
+        assert!(matches!(
+            GuardianScrollbackManifestAuthentication::parse(&format!(
+                "{SCROLLBACK_MANIFEST_AUTH_PREFIX}{}",
+                "A".repeat(SCROLLBACK_MANIFEST_AUTH_ENCODED_BYTES + 1)
+            )),
+            Err(GuardianScrollbackManifestError::MalformedRecord)
+        ));
+        let canonical = b"bounded manifest";
+        let encoded = cipher
+            .authenticate_scrollback_manifest(canonical)
+            .expect("authenticate bounded manifest")
+            .encode();
+        assert!(matches!(
+            GuardianScrollbackManifestAuthentication::parse(&format!("{encoded}=")),
+            Err(GuardianScrollbackManifestError::MalformedRecord)
+        ));
+    }
+
     fn journal_bytes_for(
         identity: GuardianOutputSegmentIdentity,
         records: &[&[u8]],
     ) -> Vec<u8> {
         let cipher = cipher();
-        let mut bytes = encode_file_header(identity, cipher.key_id).to_vec();
+        let mut bytes = encode_file_header(identity, &cipher)
+            .expect("fixture file-header authentication succeeds")
+            .to_vec();
         for (index, payload) in records.iter().enumerate() {
             let sequence = identity
                 .first_sequence()
@@ -1257,6 +2597,8 @@ mod tests {
             Uuid::from_bytes([0x11; 16]),
             10,
             [0x55; 32],
+            1_024,
+            4_096,
         )
         .expect("fixture predecessor is valid");
         let successor = GuardianOutputSegmentIdentity::new(
@@ -1278,6 +2620,7 @@ mod tests {
         )
         .expect("successor header must scan");
         assert_eq!(scan.next_sequence, Some(11));
+        assert_eq!(scan.cumulative_plaintext_bytes, 1_024);
 
         let gap = GuardianOutputSegmentIdentity::new(
             pane(),
@@ -1288,6 +2631,119 @@ mod tests {
         assert!(matches!(
             gap,
             Err(GuardianOutputJournalError::InvalidSegmentIdentity(_))
+        ));
+    }
+
+    #[test]
+    fn successor_cumulative_plaintext_overflow_fails_closed() {
+        let previous = GuardianOutputPredecessor::new(
+            Uuid::from_bytes([0x31; 16]),
+            7,
+            [0x45; 32],
+            u64::MAX,
+            4_096,
+        )
+        .expect("maximal cumulative endpoint is a structurally valid predecessor");
+        let successor = GuardianOutputSegmentIdentity::new(
+            pane(),
+            Uuid::from_bytes([0x32; 16]),
+            8,
+            Some(previous),
+        )
+        .expect("overflow successor identity is structurally valid");
+        let bytes = journal_bytes_for(successor, &[b"cannot overflow pane lifetime endpoint"]);
+        let mut cursor = Cursor::new(bytes.clone());
+        let error = scan_journal(
+            &mut cursor,
+            u64::try_from(bytes.len()).expect("fixture length fits u64"),
+            successor,
+            &cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect_err("cumulative plaintext overflow must fail closed");
+        assert!(matches!(
+            error,
+            GuardianOutputJournalError::ArithmeticOverflow
+        ));
+    }
+
+    #[test]
+    fn journal_limit_requires_room_for_one_nonempty_authenticated_frame() {
+        let one_byte_short = FILE_HEADER_BYTES_U64
+            + RECORD_HEADER_BYTES_U64
+            + u64::from(AEAD_TAG_BYTES);
+        let error = GuardianOutputJournalLimits {
+            max_record_bytes: 1,
+            max_log_bytes: one_byte_short,
+            max_records: 1,
+        }
+        .validate()
+        .expect_err("the byte limit must include plaintext and its AEAD tag");
+        assert!(matches!(
+            error,
+            GuardianOutputJournalError::InvalidLimits(_)
+        ));
+    }
+
+    #[test]
+    fn v3_scan_rejects_ciphertext_sealed_under_a_legacy_record_domain() {
+        let identity = identity();
+        let cipher = cipher();
+        let payload = b"format-bound guardian output";
+        let plaintext_bytes =
+            u32::try_from(payload.len()).expect("fixture payload length fits u32");
+        let nonce = [0x5a; NONCE_BYTES];
+        let mut legacy_aad = Vec::new();
+        legacy_aad.extend_from_slice(b"frankenterm.guardian-output-aead.v1\0");
+        legacy_aad.extend_from_slice(identity.durable_pane_id.as_bytes());
+        legacy_aad.extend_from_slice(identity.segment_id.as_bytes());
+        legacy_aad.extend_from_slice(&identity.first_sequence.to_le_bytes());
+        legacy_aad.extend_from_slice(&plaintext_bytes.to_le_bytes());
+        let ciphertext = cipher
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: payload,
+                    aad: &legacy_aad,
+                },
+            )
+            .expect("legacy-domain fixture encryption succeeds");
+        let ciphertext_bytes =
+            u32::try_from(ciphertext.len()).expect("fixture ciphertext length fits u32");
+        let digest = record_digest(
+            identity,
+            identity.first_sequence,
+            plaintext_bytes,
+            ciphertext_bytes,
+            &nonce,
+            &ciphertext,
+        );
+        let record_header = encode_record_header(
+            identity.first_sequence,
+            plaintext_bytes,
+            ciphertext_bytes,
+            nonce,
+            digest,
+        );
+        let mut bytes = encode_file_header(identity, &cipher)
+            .expect("v3 file header authentication succeeds")
+            .to_vec();
+        bytes.extend_from_slice(&record_header);
+        bytes.extend_from_slice(&ciphertext);
+
+        let mut cursor = Cursor::new(bytes.clone());
+        let error = scan_journal(
+            &mut cursor,
+            u64::try_from(bytes.len()).expect("fixture length fits u64"),
+            identity,
+            &cipher,
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect_err("v3 must reject a record sealed without its format-version AAD");
+        assert!(matches!(
+            error,
+            GuardianOutputJournalError::DecryptionFailed
         ));
     }
 
@@ -1304,7 +2760,10 @@ mod tests {
         let mut bytes = journal_bytes_for(source, &[b"bound to source segment"]);
         let cipher = cipher();
         bytes[0..FILE_HEADER_BYTES]
-            .copy_from_slice(&encode_file_header(target, cipher.key_id));
+            .copy_from_slice(
+                &encode_file_header(target, &cipher)
+                    .expect("target file-header authentication succeeds"),
+            );
         let mut cursor = Cursor::new(bytes.clone());
         let error = scan_journal(
             &mut cursor,
@@ -1394,18 +2853,26 @@ mod tests {
         );
         bytes[header_offset + 56..header_offset + 88].copy_from_slice(&digest);
         let mut cursor = Cursor::new(bytes.clone());
-        let error = scan_journal(
+        let mut recovery = RecoveryCollector::new(
+            1,
+            GuardianOutputRecoveryLimits::new(2, 1024)
+                .expect("fixture recovery limits are valid"),
+        )
+        .expect("fixture recovery collector is valid");
+        let error = scan_journal_with_recovery(
             &mut cursor,
             u64::try_from(bytes.len()).expect("fixture length fits u64"),
             identity,
             &cipher,
             GuardianOutputJournalLimits::default(),
+            Some(&mut recovery),
         )
         .expect_err("AEAD authentication must reject recomputed outer digest");
         assert!(matches!(
             error,
             GuardianOutputJournalError::DecryptionFailed
         ));
+        assert!(recovery.records.is_empty());
     }
 
     #[test]
@@ -1488,12 +2955,46 @@ mod tests {
             segment_id: identity().segment_id(),
             sequence: 9,
             payload_bytes: 4,
+            cumulative_plaintext_bytes: 44,
             committed_log_bytes: 128,
             record_digest: [0xab; 32],
+            plaintext_delivery_digest: [0xcd; 32],
         };
         let rendered = format!("{receipt:?}");
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("ab"));
+        assert!(!rendered.contains("cd"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_legacy_header_is_rejected_as_unsupported_without_rewrite() {
+        let directory = tempfile::tempdir().expect("create legacy journal directory");
+        let path = directory.path().join("legacy-segment.ftgout");
+        let mut legacy_header = [0_u8; 160];
+        legacy_header[0..8].copy_from_slice(&FILE_MAGIC);
+        legacy_header[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        legacy_header[12..16].copy_from_slice(&160_u32.to_le_bytes());
+        let mut file = create_journal_file(&path);
+        file.write_all(&legacy_header)
+            .expect("write complete legacy header fixture");
+        file.sync_all().expect("sync legacy header fixture");
+
+        let error = GuardianOutputJournal::open(
+            file,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect_err("legacy guardian output journals must never be silently upgraded");
+        assert!(matches!(
+            error,
+            GuardianOutputJournalError::UnsupportedVersion { observed: 1 }
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved legacy journal"),
+            legacy_header
+        );
     }
 
     #[cfg(unix)]
@@ -1523,6 +3024,12 @@ mod tests {
             .append_and_sync(payload)
             .expect("append first synchronized record");
         assert_eq!(first.sequence(), 1);
+        assert!(first.matches_payload(payload));
+        assert!(!first.matches_payload(b"FT-REAL-FILE-PLAINTEXT-MUST-NOT-APPEAS"));
+        assert_eq!(
+            first.cumulative_plaintext_bytes(),
+            u64::try_from(payload.len()).expect("fixture payload length fits u64")
+        );
         let committed_after_first = first.committed_log_bytes();
         drop(journal);
 
@@ -1550,11 +3057,475 @@ mod tests {
         assert!(!reopened.directory_entry_sync_required());
         assert_eq!(reopened.record_count(), 1);
         assert_eq!(reopened.next_sequence(), Some(2));
+        assert_eq!(reopened.terminal_receipt(), Some(first));
+        assert_eq!(
+            reopened.cumulative_plaintext_bytes(),
+            u64::try_from(payload.len()).expect("fixture payload length fits u64")
+        );
         let second = reopened
             .append_and_sync(b"second")
             .expect("append contiguous record after reopen");
         assert_eq!(second.sequence(), 2);
+        assert_eq!(
+            second.cumulative_plaintext_bytes(),
+            u64::try_from(payload.len() + b"second".len())
+                .expect("combined fixture payload length fits u64")
+        );
         assert!(second.committed_log_bytes() > committed_after_first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_recovery_is_bounded_contiguous_and_reconstructs_terminal_authority() {
+        let directory = tempfile::tempdir().expect("create recovery journal directory");
+        let path = directory.path().join("recovery.ftgout");
+        let parent = File::open(directory.path()).expect("open recovery parent directory");
+        let payloads: [&[u8]; 3] = [
+            b"FT-RECOVERY-FIRST-SECRET",
+            b"FT-RECOVERY-SECOND-SECRET",
+            b"FT-RECOVERY-THIRD-SECRET",
+        ];
+
+        let mut journal = GuardianOutputJournal::open(
+            create_journal_file(&path),
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize recovery journal");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("durably activate recovery journal");
+        let first = journal
+            .append_and_sync(payloads[0])
+            .expect("append first recovery record");
+        let second = journal
+            .append_and_sync(payloads[1])
+            .expect("append second recovery record");
+        let third = journal
+            .append_and_sync(payloads[2])
+            .expect("append terminal recovery record");
+        drop(journal);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("reopen recovery journal");
+        let reopened = GuardianOutputJournal::open(
+            file,
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("authenticate recovery journal");
+        assert_eq!(reopened.terminal_receipt(), Some(third));
+
+        let page = reopened
+            .recover_committed_range(
+                2,
+                GuardianOutputRecoveryLimits::new(1, 1024)
+                    .expect("fixture recovery limits are valid"),
+            )
+            .expect("recover one bounded page");
+        assert_eq!(page.segment_identity(), identity());
+        assert_eq!(page.requested_first_sequence(), 2);
+        assert_eq!(page.records().len(), 1);
+        assert_eq!(page.records()[0].receipt(), second);
+        assert_eq!(page.records()[0].plaintext(), payloads[1]);
+        assert!(page.records()[0].receipt().matches_payload(payloads[1]));
+        let mut same_length_wrong_payload = payloads[1].to_vec();
+        same_length_wrong_payload[0] ^= 0x01;
+        assert!(!page.records()[0]
+            .receipt()
+            .matches_payload(&same_length_wrong_payload));
+        assert_eq!(page.next_recovery_sequence(), Some(3));
+        assert_eq!(page.committed_next_sequence(), Some(4));
+        assert_eq!(page.committed_log_bytes(), third.committed_log_bytes());
+        assert_eq!(
+            page.cumulative_plaintext_bytes(),
+            third.cumulative_plaintext_bytes()
+        );
+        assert_eq!(page.terminal_receipt(), Some(third));
+        assert_eq!(page.terminal_predecessor(), Some(third.into_predecessor()));
+        assert_eq!(page.tail(), GuardianOutputJournalTail::Clean);
+        let page_debug = format!("{page:?}");
+        let record_debug = format!("{:?}", page.records()[0]);
+        for payload in payloads {
+            let plaintext = std::str::from_utf8(payload).expect("ASCII fixture");
+            assert!(!page_debug.contains(plaintext));
+            assert!(!record_debug.contains(plaintext));
+        }
+
+        let terminal_page = reopened
+            .recover_committed_range(
+                3,
+                GuardianOutputRecoveryLimits::new(2, 1024)
+                    .expect("fixture recovery limits are valid"),
+            )
+            .expect("recover terminal page");
+        assert_eq!(terminal_page.records().len(), 1);
+        assert_eq!(terminal_page.records()[0].receipt(), third);
+        assert_eq!(terminal_page.records()[0].plaintext(), payloads[2]);
+        assert_eq!(terminal_page.next_recovery_sequence(), None);
+
+        let end_page = reopened
+            .recover_committed_range(
+                4,
+                GuardianOutputRecoveryLimits::new(1, 1024)
+                    .expect("fixture recovery limits are valid"),
+            )
+            .expect("the committed endpoint is a valid empty recovery page");
+        assert!(end_page.records().is_empty());
+        assert_eq!(end_page.next_recovery_sequence(), None);
+        assert_eq!(end_page.terminal_receipt(), Some(third));
+
+        assert!(matches!(
+            reopened.recover_committed_range(
+                0,
+                GuardianOutputRecoveryLimits::new(1, 1024)
+                    .expect("fixture recovery limits are valid"),
+            ),
+            Err(GuardianOutputJournalError::RecoveryRangeMismatch)
+        ));
+        assert!(matches!(
+            reopened.recover_committed_range(
+                5,
+                GuardianOutputRecoveryLimits::new(1, 1024)
+                    .expect("fixture recovery limits are valid"),
+            ),
+            Err(GuardianOutputJournalError::RecoveryRangeMismatch)
+        ));
+        assert!(matches!(
+            GuardianOutputRecoveryLimits::new(0, 1),
+            Err(GuardianOutputJournalError::InvalidRecoveryLimits(_))
+        ));
+        assert!(matches!(
+            GuardianOutputRecoveryLimits::new(
+                GuardianOutputRecoveryLimits::HARD_MAX_RECORDS + 1,
+                1,
+            ),
+            Err(GuardianOutputJournalError::InvalidRecoveryLimits(_))
+        ));
+        assert!(matches!(
+            GuardianOutputRecoveryLimits::new(
+                1,
+                GuardianOutputRecoveryLimits::HARD_MAX_PLAINTEXT_BYTES + 1,
+            ),
+            Err(GuardianOutputJournalError::InvalidRecoveryLimits(_))
+        ));
+        assert!(matches!(
+            reopened.recover_committed_range(
+                1,
+                GuardianOutputRecoveryLimits::new(
+                    1,
+                    u64::try_from(payloads[0].len() - 1)
+                        .expect("fixture recovery byte bound fits u64"),
+                )
+                .expect("small but nonzero recovery limits are structurally valid"),
+            ),
+            Err(GuardianOutputJournalError::RecoveryPlaintextByteLimit { .. })
+        ));
+        assert_eq!(first.sequence(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_method_rejects_same_length_ciphertext_mutation_with_recomputed_outer_digest() {
+        let directory = tempfile::tempdir().expect("create mutation recovery directory");
+        let path = directory.path().join("mutation-recovery.ftgout");
+        let parent = File::open(directory.path()).expect("open mutation recovery parent");
+        let segment_identity = identity();
+        let mut journal = GuardianOutputJournal::open(
+            create_journal_file(&path),
+            segment_identity,
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize mutation recovery journal");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate mutation recovery journal");
+        journal
+            .append_and_sync(b"same-length authenticated recovery payload")
+            .expect("append mutation recovery record");
+
+        let mut bytes = std::fs::read(&path).expect("read mutation recovery journal");
+        let header_offset = FILE_HEADER_BYTES;
+        let ciphertext_offset = header_offset + RECORD_HEADER_BYTES;
+        bytes[ciphertext_offset] ^= 0x80;
+        let sequence = read_u64(&bytes[header_offset + 8..header_offset + 16]);
+        let plaintext_bytes = read_u32(&bytes[header_offset + 16..header_offset + 20]);
+        let ciphertext_bytes = read_u32(&bytes[header_offset + 20..header_offset + 24]);
+        let mut nonce = [0_u8; NONCE_BYTES];
+        nonce.copy_from_slice(&bytes[header_offset + 32..header_offset + 56]);
+        let digest = record_digest(
+            segment_identity,
+            sequence,
+            plaintext_bytes,
+            ciphertext_bytes,
+            &nonce,
+            &bytes[ciphertext_offset..],
+        );
+        bytes[header_offset + 56..header_offset + 88].copy_from_slice(&digest);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open mutation recovery journal for in-place corruption");
+        file.seek(SeekFrom::Start(0))
+            .expect("seek mutation recovery journal");
+        file.write_all(&bytes)
+            .expect("write same-length mutation recovery corruption");
+        file.sync_all()
+            .expect("synchronize mutation recovery corruption");
+        drop(file);
+
+        let error = journal
+            .recover_committed_range(
+                sequence,
+                GuardianOutputRecoveryLimits::new(1, 1024)
+                    .expect("fixture recovery limits are valid"),
+            )
+            .expect_err("the public recovery seam must repeat AEAD authentication");
+        assert!(matches!(
+            error,
+            GuardianOutputJournalError::DecryptionFailed
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maximal_sequence_is_a_terminal_nonwrapping_recovery_cursor_after_reopen() {
+        let directory = tempfile::tempdir().expect("create maximal-sequence directory");
+        let path = directory.path().join("maximal-sequence.ftgout");
+        let parent = File::open(directory.path()).expect("open maximal-sequence parent");
+        let predecessor = GuardianOutputPredecessor::new(
+            Uuid::from_bytes([0x61; 16]),
+            u64::MAX - 1,
+            [0x62; 32],
+            10,
+            4096,
+        )
+        .expect("maximal-sequence predecessor is valid");
+        let maximal_identity = GuardianOutputSegmentIdentity::new(
+            pane(),
+            Uuid::from_bytes([0x63; 16]),
+            u64::MAX,
+            Some(predecessor),
+        )
+        .expect("maximal-sequence segment is valid");
+        let mut journal = GuardianOutputJournal::open(
+            create_journal_file(&path),
+            maximal_identity,
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize maximal-sequence journal");
+        journal
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate maximal-sequence journal");
+        let terminal = journal
+            .append_and_sync(b"terminal")
+            .expect("commit the maximal representable sequence");
+        assert_eq!(terminal.sequence(), u64::MAX);
+        assert_eq!(journal.next_sequence(), None);
+        assert!(matches!(
+            journal.append_and_sync(b"must-not-wrap"),
+            Err(GuardianOutputJournalError::SequenceExhausted)
+        ));
+        drop(journal);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("reopen maximal-sequence journal");
+        let reopened = GuardianOutputJournal::open(
+            file,
+            maximal_identity,
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("authenticate maximal-sequence journal after reopen");
+        assert_eq!(reopened.next_sequence(), None);
+        assert_eq!(reopened.terminal_receipt(), Some(terminal));
+        let page = reopened
+            .recover_committed_range(
+                u64::MAX,
+                GuardianOutputRecoveryLimits::new(1, 1024)
+                    .expect("fixture recovery limits are valid"),
+            )
+            .expect("recover the terminal maximal sequence");
+        assert_eq!(page.records().len(), 1);
+        assert_eq!(page.records()[0].receipt(), terminal);
+        assert_eq!(page.records()[0].plaintext(), b"terminal");
+        assert_eq!(page.next_recovery_sequence(), None);
+        assert_eq!(page.committed_next_sequence(), None);
+        assert_eq!(page.terminal_predecessor(), Some(terminal.into_predecessor()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_lifetime_cumulative_endpoint_survives_rollover_reopen_and_predecessor_tamper() {
+        let directory = tempfile::tempdir().expect("create rollover journal directory");
+        let first_path = directory.path().join("rollover-first.ftgout");
+        let successor_path = directory.path().join("rollover-successor.ftgout");
+        let parent = File::open(directory.path()).expect("open rollover parent directory");
+
+        let mut first_segment = GuardianOutputJournal::open(
+            create_journal_file(&first_path),
+            identity(),
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize first rollover segment");
+        first_segment
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate first rollover segment");
+        let first_receipt = first_segment
+            .append_and_sync(b"pane-lifetime-before-rollover")
+            .expect("append predecessor record");
+        let predecessor = first_receipt.into_predecessor();
+        drop(first_segment);
+
+        let successor_identity = GuardianOutputSegmentIdentity::new(
+            pane(),
+            Uuid::from_bytes([0x26; 16]),
+            2,
+            Some(predecessor),
+        )
+        .expect("construct exact successor identity");
+        let mut successor = GuardianOutputJournal::open(
+            create_journal_file(&successor_path),
+            successor_identity,
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("initialize successor segment");
+        assert_eq!(
+            successor.cumulative_plaintext_bytes(),
+            first_receipt.cumulative_plaintext_bytes()
+        );
+        assert_eq!(successor.terminal_receipt(), None);
+        assert_eq!(successor.terminal_predecessor(), Some(predecessor));
+        successor
+            .sync_parent_directory_and_activate(&parent)
+            .expect("activate successor segment");
+        let successor_payload = b"pane-lifetime-after-rollover";
+        let successor_receipt = successor
+            .append_and_sync(successor_payload)
+            .expect("append successor record");
+        assert_eq!(
+            successor_receipt.cumulative_plaintext_bytes(),
+            first_receipt
+                .cumulative_plaintext_bytes()
+                .checked_add(
+                    u64::try_from(successor_payload.len())
+                        .expect("successor fixture length fits u64"),
+                )
+                .expect("fixture cumulative endpoint does not overflow")
+        );
+        drop(successor);
+
+        let reopened = GuardianOutputJournal::open(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&successor_path)
+                .expect("reopen successor journal"),
+            successor_identity,
+            cipher(),
+            GuardianOutputJournalLimits::default(),
+        )
+        .expect("authenticate reopened successor journal");
+        assert_eq!(reopened.terminal_receipt(), Some(successor_receipt));
+        assert_eq!(
+            reopened.cumulative_plaintext_bytes(),
+            successor_receipt.cumulative_plaintext_bytes()
+        );
+
+        let wrong_cumulative_predecessor = GuardianOutputPredecessor::new(
+            predecessor.segment_id(),
+            predecessor.last_sequence(),
+            predecessor.terminal_record_digest(),
+            predecessor
+                .cumulative_plaintext_bytes()
+                .checked_add(1)
+                .expect("fixture cumulative endpoint has headroom"),
+            predecessor.committed_log_bytes(),
+        )
+        .expect("tampered predecessor remains structurally valid");
+        let wrong_cumulative_identity = GuardianOutputSegmentIdentity::new(
+            pane(),
+            successor_identity.segment_id(),
+            2,
+            Some(wrong_cumulative_predecessor),
+        )
+        .expect("wrong cumulative identity is structurally valid");
+        assert!(matches!(
+            GuardianOutputJournal::open(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&successor_path)
+                    .expect("open successor for wrong-cumulative check"),
+                wrong_cumulative_identity,
+                cipher(),
+                GuardianOutputJournalLimits::default(),
+            ),
+            Err(GuardianOutputJournalError::SegmentIdentityMismatch)
+        ));
+
+        let wrong_log_predecessor = GuardianOutputPredecessor::new(
+            predecessor.segment_id(),
+            predecessor.last_sequence(),
+            predecessor.terminal_record_digest(),
+            predecessor.cumulative_plaintext_bytes(),
+            predecessor
+                .committed_log_bytes()
+                .checked_add(1)
+                .expect("fixture log endpoint has headroom"),
+        )
+        .expect("wrong log predecessor remains structurally valid");
+        let wrong_log_identity = GuardianOutputSegmentIdentity::new(
+            pane(),
+            successor_identity.segment_id(),
+            2,
+            Some(wrong_log_predecessor),
+        )
+        .expect("wrong log identity is structurally valid");
+        assert!(matches!(
+            GuardianOutputJournal::open(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&successor_path)
+                    .expect("open successor for wrong-log check"),
+                wrong_log_identity,
+                cipher(),
+                GuardianOutputJournalLimits::default(),
+            ),
+            Err(GuardianOutputJournalError::SegmentIdentityMismatch)
+        ));
+
+        let mut tampered_bytes = std::fs::read(&successor_path)
+            .expect("read successor bytes for header tamper check");
+        tampered_bytes[120..128].copy_from_slice(
+            &wrong_cumulative_predecessor
+                .cumulative_plaintext_bytes()
+                .to_le_bytes(),
+        );
+        let mut tampered_cursor = Cursor::new(tampered_bytes.clone());
+        assert!(matches!(
+            scan_journal(
+                &mut tampered_cursor,
+                u64::try_from(tampered_bytes.len()).expect("fixture length fits u64"),
+                wrong_cumulative_identity,
+                &cipher(),
+                GuardianOutputJournalLimits::default(),
+            ),
+            Err(GuardianOutputJournalError::FileHeaderAuthenticationFailed)
+        ));
     }
 
     #[cfg(unix)]
@@ -1611,6 +3582,24 @@ mod tests {
                 committed_bytes,
                 trailing_bytes: 3,
             } if committed_bytes == receipt.committed_log_bytes()
+        ));
+        let recovery = reopened
+            .recover_committed_range(
+                1,
+                GuardianOutputRecoveryLimits::new(2, 1024)
+                    .expect("fixture recovery limits are valid"),
+            )
+            .expect("recover only the authenticated prefix before a torn tail");
+        assert_eq!(recovery.records().len(), 1);
+        assert_eq!(recovery.records()[0].receipt(), receipt);
+        assert_eq!(recovery.records()[0].plaintext(), b"committed");
+        assert_eq!(recovery.terminal_receipt(), Some(receipt));
+        assert!(matches!(
+            recovery.tail(),
+            GuardianOutputJournalTail::Incomplete {
+                trailing_bytes: 3,
+                ..
+            }
         ));
         assert!(matches!(
             reopened.append_and_sync(b"must-not-overwrite-tail"),

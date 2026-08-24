@@ -2,10 +2,12 @@
 //!
 //! An input intent and then `AcceptedNotDurable` are synchronized before any
 //! bytes may become observable to a child PTY. The caller then refines that
-//! conservative marker to `Durable`, or to `KnownNotApplied` only when it can
-//! prove that zero bytes became observable. A crash after the accepted marker
-//! is never interpreted as permission to replay input; recovery retains the
-//! ambiguous effect and takeover stays fenced.
+//! conservative marker to `DurableFull`, to an exact `DurablePrefix`, or to
+//! `KnownNotApplied` only when it can prove that zero bytes became observable.
+//! A crash after the accepted marker is never interpreted as permission to
+//! replay input; recovery retains the ambiguous effect and takeover stays
+//! fenced. A durable prefix is terminal for the exact request: retries return
+//! its original receipt and must never apply the known prefix again.
 //!
 //! Raw input is never persisted. Even its payload digest is encrypted because
 //! hashes of small key events are enumerable. The fixed-size encrypted records
@@ -14,7 +16,10 @@
 //! provisioning remain service-layer responsibilities.
 
 use crate::guardian_output_journal::{GuardianOutputCipher, GuardianOutputJournalError};
-use crate::guardian_protocol::{GuardianInputEffectIdentity, InputEffectState};
+use crate::guardian_protocol::{
+    GUARDIAN_MAX_INPUT_BYTES, GuardianInputEffectIdentity, GuardianProtocolError,
+    GuardianProtocolState, GuardianReply, InputEffectState,
+};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -22,9 +27,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use thiserror::Error;
 use uuid::Uuid;
 
-const FILE_MAGIC: [u8; 8] = *b"FTGINP01";
-const RECORD_MAGIC: [u8; 8] = *b"FTGIR001";
-const FORMAT_VERSION: u32 = 1;
+const FILE_MAGIC: [u8; 8] = *b"FTGINP02";
+const RECORD_MAGIC: [u8; 8] = *b"FTGIR002";
+const LEGACY_FILE_MAGIC_V1: [u8; 8] = *b"FTGINP01";
+const FORMAT_VERSION: u32 = 2;
 const FILE_HEADER_BYTES: usize = 128;
 const FILE_HEADER_BYTES_U32: u32 = 128;
 const FILE_HEADER_BYTES_U64: u64 = 128;
@@ -38,9 +44,9 @@ const RECORD_CIPHERTEXT_BYTES_U32: u32 = 152;
 const RECORD_BYTES_U64: u64 = 248;
 const NONCE_BYTES: usize = 24;
 const KEY_ID_BYTES: usize = 8;
-const FILE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-input-file.v1\0";
-const RECORD_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-input-record.v1\0";
-const RECORD_AAD_DOMAIN: &[u8] = b"frankenterm.guardian-input-aead.v1\0";
+const FILE_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-input-file.v2\0";
+const RECORD_DIGEST_DOMAIN: &[u8] = b"frankenterm.guardian-input-record.v2\0";
+const RECORD_AAD_DOMAIN: &[u8] = b"frankenterm.guardian-input-aead.v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardianInputJournalLimits {
@@ -52,18 +58,26 @@ pub struct GuardianInputJournalLimits {
 
 impl Default for GuardianInputJournalLimits {
     fn default() -> Self {
+        let max_input_bytes = u32::try_from(GUARDIAN_MAX_INPUT_BYTES)
+            .expect("guardian protocol input bound fits in u32");
         Self {
             max_log_bytes: 256 * 1024 * 1024,
             max_records: 1_000_000,
             max_effects: 65_536,
-            max_input_bytes: 1024 * 1024,
+            max_input_bytes,
         }
     }
 }
 
 impl GuardianInputJournalLimits {
     fn validate(self) -> Result<Self, GuardianInputJournalError> {
-        if self.max_records == 0 || self.max_effects == 0 || self.max_input_bytes == 0 {
+        let protocol_max_input_bytes = u32::try_from(GUARDIAN_MAX_INPUT_BYTES)
+            .map_err(|_| GuardianInputJournalError::InvalidLimits)?;
+        if self.max_records == 0
+            || self.max_effects == 0
+            || self.max_input_bytes == 0
+            || self.max_input_bytes > protocol_max_input_bytes
+        {
             return Err(GuardianInputJournalError::InvalidLimits);
         }
         let minimum = FILE_HEADER_BYTES_U64
@@ -80,17 +94,123 @@ impl GuardianInputJournalLimits {
 pub enum GuardianInputDisposition {
     Intent,
     AcceptedNotDurable,
-    Durable,
+    DurableFull,
+    DurablePrefix { applied_bytes: u32 },
     KnownNotApplied,
 }
 
 impl GuardianInputDisposition {
+    #[must_use]
+    pub const fn applied_prefix_bytes(self) -> Option<u32> {
+        match self {
+            Self::DurablePrefix { applied_bytes } => Some(applied_bytes),
+            Self::Intent
+            | Self::AcceptedNotDurable
+            | Self::DurableFull
+            | Self::KnownNotApplied => None,
+        }
+    }
+
+    const fn tag(self) -> GuardianInputDispositionTag {
+        match self {
+            Self::Intent => GuardianInputDispositionTag::Intent,
+            Self::AcceptedNotDurable => GuardianInputDispositionTag::AcceptedNotDurable,
+            Self::DurableFull => GuardianInputDispositionTag::DurableFull,
+            Self::DurablePrefix { .. } => GuardianInputDispositionTag::DurablePrefix,
+            Self::KnownNotApplied => GuardianInputDispositionTag::KnownNotApplied,
+        }
+    }
+
+    const fn stored_applied_bytes(self) -> u32 {
+        match self {
+            Self::DurablePrefix { applied_bytes } => applied_bytes,
+            Self::Intent
+            | Self::AcceptedNotDurable
+            | Self::DurableFull
+            | Self::KnownNotApplied => 0,
+        }
+    }
+
+    const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::DurableFull | Self::DurablePrefix { .. } | Self::KnownNotApplied
+        )
+    }
+
+    fn from_stored(
+        tag: GuardianInputDispositionTag,
+        applied_bytes: u32,
+        input_bytes: u32,
+    ) -> Result<Self, GuardianInputJournalError> {
+        let disposition = match (tag, applied_bytes) {
+            (GuardianInputDispositionTag::Intent, 0) => Self::Intent,
+            (GuardianInputDispositionTag::AcceptedNotDurable, 0) => Self::AcceptedNotDurable,
+            (GuardianInputDispositionTag::DurableFull, 0) => Self::DurableFull,
+            (GuardianInputDispositionTag::KnownNotApplied, 0) => Self::KnownNotApplied,
+            (GuardianInputDispositionTag::DurablePrefix, applied_bytes) => {
+                Self::DurablePrefix { applied_bytes }
+            }
+            _ => return Err(GuardianInputJournalError::InvalidAppliedByteCount),
+        };
+        disposition.validate_for_input_bytes(input_bytes)?;
+        Ok(disposition)
+    }
+
+    fn validate_for_input_bytes(
+        self,
+        input_bytes: u32,
+    ) -> Result<(), GuardianInputJournalError> {
+        if input_bytes == 0 {
+            return Err(GuardianInputJournalError::InvalidInputLength);
+        }
+        if matches!(
+            self,
+            Self::DurablePrefix { applied_bytes }
+                if applied_bytes == 0 || applied_bytes >= input_bytes
+        ) {
+            return Err(GuardianInputJournalError::InvalidAppliedByteCount);
+        }
+        Ok(())
+    }
+
+    /// Return the conservative protocol state required while recovering this
+    /// durable journal state.
+    ///
+    /// `Intent` is safely `KnownNotApplied` because the ordering contract
+    /// forbids the PTY call until a later `AcceptedNotDurable` record is
+    /// synchronized. An accepted marker remains pending and must never be
+    /// replayed after a crash.
+    #[must_use]
+    pub const fn recovery_protocol_state(self) -> InputEffectState {
+        match self {
+            Self::Intent | Self::KnownNotApplied => InputEffectState::KnownNotApplied,
+            Self::AcceptedNotDurable => InputEffectState::AcceptedNotDurable,
+            Self::DurableFull => InputEffectState::DurableFull,
+            Self::DurablePrefix { applied_bytes } => {
+                InputEffectState::DurablePrefix { applied_bytes }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianInputDispositionTag {
+    Intent,
+    AcceptedNotDurable,
+    DurableFull,
+    DurablePrefix,
+    KnownNotApplied,
+}
+
+impl GuardianInputDispositionTag {
     const fn to_wire(self) -> u8 {
         match self {
             Self::Intent => 1,
             Self::AcceptedNotDurable => 2,
-            Self::Durable => 3,
-            Self::KnownNotApplied => 4,
+            Self::DurableFull => 3,
+            Self::DurablePrefix => 4,
+            Self::KnownNotApplied => 5,
         }
     }
 
@@ -98,25 +218,10 @@ impl GuardianInputDisposition {
         match value {
             1 => Ok(Self::Intent),
             2 => Ok(Self::AcceptedNotDurable),
-            3 => Ok(Self::Durable),
-            4 => Ok(Self::KnownNotApplied),
+            3 => Ok(Self::DurableFull),
+            4 => Ok(Self::DurablePrefix),
+            5 => Ok(Self::KnownNotApplied),
             _ => Err(GuardianInputJournalError::InvalidDisposition { observed: value }),
-        }
-    }
-
-    /// Return the conservative protocol state required while recovering this
-    /// durable journal state.
-    ///
-    /// `Intent` is safely terminal-rejected because the ordering contract
-    /// forbids the PTY call until a later `AcceptedNotDurable` record is
-    /// synchronized. An accepted marker remains pending and must never be
-    /// replayed after a crash.
-    #[must_use]
-    pub const fn recovery_protocol_state(self) -> InputEffectState {
-        match self {
-            Self::Intent | Self::KnownNotApplied => InputEffectState::TerminalRejected,
-            Self::AcceptedNotDurable => InputEffectState::AcceptedNotDurable,
-            Self::Durable => InputEffectState::DurableEffect,
         }
     }
 }
@@ -179,6 +284,170 @@ impl std::fmt::Debug for GuardianInputJournalReceipt {
     }
 }
 
+/// Distinguishes a newly synchronized journal transition from reconciliation.
+///
+/// A caller may obtain a non-cloneable [`GuardianInputWritePermit`] only for a
+/// newly synchronized `AcceptedNotDurable` transition in the one newly
+/// admitted protocol transaction. A reconciled append never yields a permit;
+/// it returns the current receipt so a retry cannot infer fresh authority from
+/// an older intent or accepted-phase receipt.
+#[derive(Debug, Eq, PartialEq)]
+pub struct GuardianInputJournalAppend {
+    identity: GuardianInputEffectIdentity,
+    receipt: GuardianInputJournalReceipt,
+    newly_committed: bool,
+}
+
+/// Opaque one-shot journal authority for the first PTY write attempt.
+///
+/// The future live PTY adapter must consume this value together with the newly
+/// admitted protocol transaction. It is intentionally neither `Clone` nor
+/// `Copy`, and external callers cannot construct it.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "the guardian input write permit must be consumed by the one PTY write attempt"]
+pub struct GuardianInputWritePermit {
+    identity: GuardianInputEffectIdentity,
+}
+
+/// Opaque journal-to-protocol authority for one exact terminal disposition.
+///
+/// The applied prefix is carried inside the private receipt and therefore
+/// cannot diverge between durable publication and protocol completion.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "the terminal input permit must reconcile the exact durable disposition"]
+pub struct GuardianInputTerminalPermit {
+    identity: GuardianInputEffectIdentity,
+    receipt: GuardianInputJournalReceipt,
+}
+
+impl GuardianInputJournalAppend {
+    const fn committed(
+        identity: GuardianInputEffectIdentity,
+        receipt: GuardianInputJournalReceipt,
+    ) -> Self {
+        Self {
+            identity,
+            receipt,
+            newly_committed: true,
+        }
+    }
+
+    const fn reconciled(
+        identity: GuardianInputEffectIdentity,
+        receipt: GuardianInputJournalReceipt,
+    ) -> Self {
+        Self {
+            identity,
+            receipt,
+            newly_committed: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> GuardianInputJournalReceipt {
+        self.receipt
+    }
+
+    #[must_use]
+    pub const fn is_newly_committed(&self) -> bool {
+        self.newly_committed
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> GuardianInputDisposition {
+        self.receipt().disposition()
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> GuardianInputEffectIdentity {
+        self.identity
+    }
+
+    /// Consume the append result and return its one-shot PTY-write permit.
+    ///
+    /// The caller must also be executing the newly admitted protocol effect;
+    /// a reconciled append can never authorize a PTY write.
+    #[must_use]
+    pub fn into_first_pty_write_permit(self) -> Option<GuardianInputWritePermit> {
+        let Self {
+            identity,
+            receipt,
+            newly_committed,
+        } = self;
+        (newly_committed
+            && matches!(
+                receipt.disposition,
+                GuardianInputDisposition::AcceptedNotDurable
+            ))
+        .then_some(GuardianInputWritePermit { identity })
+    }
+
+    /// Consume the append result into an exact terminal protocol permit.
+    ///
+    /// Both newly committed and reconciled terminal records may complete the
+    /// protocol idempotently. Intent and ambiguous acceptance never can.
+    #[must_use]
+    pub fn into_terminal_protocol_permit(self) -> Option<GuardianInputTerminalPermit> {
+        let Self {
+            identity,
+            receipt,
+            newly_committed: _,
+        } = self;
+        receipt
+            .disposition
+            .is_terminal()
+            .then_some(GuardianInputTerminalPermit { identity, receipt })
+    }
+}
+
+impl GuardianInputWritePermit {
+    /// Exact authenticated identity that a consuming live writer must use.
+    #[must_use]
+    pub const fn identity(&self) -> GuardianInputEffectIdentity {
+        self.identity
+    }
+}
+
+impl GuardianInputTerminalPermit {
+    #[must_use]
+    pub const fn identity(&self) -> GuardianInputEffectIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> GuardianInputJournalReceipt {
+        self.receipt
+    }
+
+    #[must_use]
+    pub const fn protocol_state(&self) -> InputEffectState {
+        self.receipt.disposition.recovery_protocol_state()
+    }
+
+    /// Consume this exact durable result and complete the protocol once.
+    pub fn reconcile_protocol(
+        self,
+        protocol: &mut GuardianProtocolState,
+    ) -> Result<GuardianReply, GuardianProtocolError> {
+        match self.receipt.disposition {
+            GuardianInputDisposition::DurableFull => {
+                protocol.mark_input_durable_full(self.identity)
+            }
+            GuardianInputDisposition::DurablePrefix { applied_bytes } => {
+                protocol.mark_input_durable_prefix(self.identity, applied_bytes)
+            }
+            GuardianInputDisposition::KnownNotApplied => {
+                protocol.mark_input_known_not_applied(self.identity)
+            }
+            GuardianInputDisposition::Intent | GuardianInputDisposition::AcceptedNotDurable => {
+                Err(GuardianProtocolError::StateInvariantViolation(
+                    "input-terminal-permit-disposition",
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct RecoveredGuardianInputEffect {
     identity: GuardianInputEffectIdentity,
@@ -217,14 +486,16 @@ impl RecoveredGuardianInputEffect {
     }
 
     #[must_use]
-    pub const fn receipt_for(
+    pub fn receipt_for(
         &self,
         disposition: GuardianInputDisposition,
     ) -> Option<GuardianInputJournalReceipt> {
         match disposition {
             GuardianInputDisposition::Intent => Some(self.intent_receipt),
             GuardianInputDisposition::AcceptedNotDurable => self.accepted_receipt,
-            GuardianInputDisposition::Durable | GuardianInputDisposition::KnownNotApplied => {
+            GuardianInputDisposition::DurableFull
+            | GuardianInputDisposition::DurablePrefix { .. }
+            | GuardianInputDisposition::KnownNotApplied => {
                 if self.disposition == disposition {
                     self.terminal_receipt
                 } else {
@@ -255,6 +526,8 @@ pub enum GuardianInputJournalError {
     InvalidIdentity,
     #[error("guardian input byte length must be nonzero and within the configured limit")]
     InvalidInputLength,
+    #[error("guardian durable input prefix length is invalid for the authenticated input length")]
+    InvalidAppliedByteCount,
     #[error("guardian input journal arithmetic overflow")]
     ArithmeticOverflow,
     #[error("guardian input journal sequence space is exhausted")]
@@ -267,6 +540,10 @@ pub enum GuardianInputJournalError {
     TornFileHeader { expected: usize, actual: u64 },
     #[error("guardian input journal file magic is invalid")]
     InvalidFileMagic,
+    #[error(
+        "guardian input journal v1 has an ambiguous fieldless durable disposition and requires conservative offline migration"
+    )]
+    LegacyV1DispositionAmbiguous,
     #[error("unsupported guardian input journal version {observed}")]
     UnsupportedVersion { observed: u32 },
     #[error("guardian input journal file header length is invalid: {observed}")]
@@ -502,12 +779,14 @@ impl GuardianInputJournal {
     pub fn append_intent_and_sync(
         &mut self,
         identity: GuardianInputEffectIdentity,
-        input_bytes: u32,
-    ) -> Result<GuardianInputJournalReceipt, GuardianInputJournalError> {
-        self.validate_identity(identity, input_bytes)?;
+    ) -> Result<GuardianInputJournalAppend, GuardianInputJournalError> {
+        self.validate_identity(identity)?;
         if let Some(existing) = self.effects.get(&identity.effect_id()) {
-            if existing.identity == identity && existing.input_bytes == input_bytes {
-                return Ok(existing.intent_receipt);
+            if existing.identity == identity && existing.input_bytes == identity.input_bytes() {
+                return Ok(GuardianInputJournalAppend::reconciled(
+                    existing.identity,
+                    existing.receipt(),
+                ));
             }
             return Err(GuardianInputJournalError::EffectIdentityConflict);
         }
@@ -517,7 +796,8 @@ impl GuardianInputJournal {
             });
         }
         validate_monotonic_input(self.last_input_identity, identity)?;
-        self.append_record(identity, input_bytes, GuardianInputDisposition::Intent)
+        self.append_record(identity, GuardianInputDisposition::Intent)
+            .map(|receipt| GuardianInputJournalAppend::committed(identity, receipt))
     }
 
     /// Synchronize one exact state transition for an already durable intent.
@@ -525,7 +805,7 @@ impl GuardianInputJournal {
         &mut self,
         identity: GuardianInputEffectIdentity,
         disposition: GuardianInputDisposition,
-    ) -> Result<GuardianInputJournalReceipt, GuardianInputJournalError> {
+    ) -> Result<GuardianInputJournalAppend, GuardianInputJournalError> {
         if disposition == GuardianInputDisposition::Intent {
             return Err(GuardianInputJournalError::InvalidTransition {
                 from: GuardianInputDisposition::Intent,
@@ -540,21 +820,29 @@ impl GuardianInputJournal {
         if existing.identity != identity {
             return Err(GuardianInputJournalError::EffectIdentityConflict);
         }
-        if let Some(receipt) = existing.receipt_for(disposition) {
-            return Ok(receipt);
+        disposition.validate_for_input_bytes(existing.input_bytes)?;
+        if existing.disposition == disposition
+            || (existing.disposition.is_terminal()
+                && disposition == GuardianInputDisposition::AcceptedNotDurable)
+        {
+            return Ok(GuardianInputJournalAppend::reconciled(
+                existing.identity,
+                existing.receipt(),
+            ));
         }
         validate_transition(existing.disposition, disposition)?;
-        self.append_record(identity, existing.input_bytes, disposition)
+        self.append_record(identity, disposition)
+            .map(|receipt| GuardianInputJournalAppend::committed(identity, receipt))
     }
 
     fn validate_identity(
         &self,
         identity: GuardianInputEffectIdentity,
-        input_bytes: u32,
     ) -> Result<(), GuardianInputJournalError> {
         if identity.pane_id() != self.durable_pane_id {
             return Err(GuardianInputJournalError::PaneIdentityMismatch);
         }
+        let input_bytes = identity.input_bytes();
         if input_bytes == 0 || input_bytes > self.limits.max_input_bytes {
             return Err(GuardianInputJournalError::InvalidInputLength);
         }
@@ -564,7 +852,6 @@ impl GuardianInputJournal {
     fn append_record(
         &mut self,
         identity: GuardianInputEffectIdentity,
-        input_bytes: u32,
         disposition: GuardianInputDisposition,
     ) -> Result<GuardianInputJournalReceipt, GuardianInputJournalError> {
         if self.poisoned {
@@ -603,7 +890,9 @@ impl GuardianInputJournal {
             });
         }
 
-        let plaintext = encode_plaintext(identity, input_bytes, self.terminal_record_digest);
+        let input_bytes = identity.input_bytes();
+        disposition.validate_for_input_bytes(input_bytes)?;
+        let plaintext = encode_plaintext(identity, disposition, self.terminal_record_digest);
         let header_prefix = encode_record_header_prefix(journal_sequence, disposition);
         let aad = record_aad(self.durable_pane_id, &header_prefix);
         let (nonce, ciphertext) = self
@@ -620,6 +909,24 @@ impl GuardianInputJournal {
             &ciphertext,
         );
         let header = encode_record_header(header_prefix, nonce, record_digest);
+        let receipt = GuardianInputJournalReceipt {
+            journal_sequence,
+            effect_id: identity.effect_id(),
+            disposition,
+            committed_log_bytes: projected_bytes,
+            record_digest,
+        };
+        let recovered = advance_effect(
+            self.effects.get(&identity.effect_id()).cloned(),
+            identity,
+            input_bytes,
+            disposition,
+            receipt,
+        )?;
+        let next_record_count = self
+            .record_count
+            .checked_add(1)
+            .ok_or(GuardianInputJournalError::ArithmeticOverflow)?;
         let result = (|| -> std::io::Result<()> {
             #[cfg(test)]
             self.fail_append_if_injected(InjectedAppendFault::BeforeWrite)?;
@@ -641,18 +948,8 @@ impl GuardianInputJournal {
             self.poisoned = true;
             return Err(GuardianInputJournalError::Io(error));
         }
-        let receipt = GuardianInputJournalReceipt {
-            journal_sequence,
-            effect_id: identity.effect_id(),
-            disposition,
-            committed_log_bytes: projected_bytes,
-            record_digest,
-        };
         self.committed_bytes = projected_bytes;
-        self.record_count = self
-            .record_count
-            .checked_add(1)
-            .ok_or(GuardianInputJournalError::ArithmeticOverflow)?;
+        self.record_count = next_record_count;
         self.next_journal_sequence = journal_sequence.checked_add(1);
         self.terminal_record_digest = record_digest;
         if disposition == GuardianInputDisposition::Intent {
@@ -662,13 +959,6 @@ impl GuardianInputJournal {
                 identity.sequence(),
             ));
         }
-        let recovered = advance_effect(
-            self.effects.get(&identity.effect_id()).cloned(),
-            identity,
-            input_bytes,
-            disposition,
-            receipt,
-        )?;
         self.effects.insert(identity.effect_id(), recovered);
         Ok(receipt)
     }
@@ -705,7 +995,8 @@ fn validate_transition(
             GuardianInputDisposition::KnownNotApplied
         ) | (
             GuardianInputDisposition::AcceptedNotDurable,
-            GuardianInputDisposition::Durable
+            GuardianInputDisposition::DurableFull
+                | GuardianInputDisposition::DurablePrefix { .. }
         ) | (
             GuardianInputDisposition::AcceptedNotDurable,
             GuardianInputDisposition::KnownNotApplied
@@ -741,7 +1032,9 @@ fn advance_effect(
         }
         (
             Some(mut effect),
-            GuardianInputDisposition::Durable | GuardianInputDisposition::KnownNotApplied,
+            GuardianInputDisposition::DurableFull
+            | GuardianInputDisposition::DurablePrefix { .. }
+            | GuardianInputDisposition::KnownNotApplied,
         ) => {
             effect.disposition = disposition;
             effect.terminal_receipt = Some(receipt);
@@ -770,6 +1063,9 @@ fn validate_file_header(
     durable_pane_id: Uuid,
     key_id: [u8; KEY_ID_BYTES],
 ) -> Result<(), GuardianInputJournalError> {
+    if header[0..8] == LEGACY_FILE_MAGIC_V1 {
+        return Err(GuardianInputJournalError::LegacyV1DispositionAmbiguous);
+    }
     if header[0..8] != FILE_MAGIC {
         return Err(GuardianInputJournalError::InvalidFileMagic);
     }
@@ -808,7 +1104,7 @@ fn encode_record_header_prefix(
     let mut prefix = [0_u8; 32];
     prefix[0..8].copy_from_slice(&RECORD_MAGIC);
     prefix[8..12].copy_from_slice(&RECORD_HEADER_BYTES_U32.to_le_bytes());
-    prefix[12] = disposition.to_wire();
+    prefix[12] = disposition.tag().to_wire();
     prefix[16..24].copy_from_slice(&journal_sequence.to_le_bytes());
     prefix[24..28].copy_from_slice(&RECORD_PLAINTEXT_BYTES_U32.to_le_bytes());
     prefix[28..32].copy_from_slice(&RECORD_CIPHERTEXT_BYTES_U32.to_le_bytes());
@@ -829,7 +1125,7 @@ fn encode_record_header(
 
 fn encode_plaintext(
     identity: GuardianInputEffectIdentity,
-    input_bytes: u32,
+    disposition: GuardianInputDisposition,
     previous_digest: [u8; 32],
 ) -> [u8; RECORD_PLAINTEXT_BYTES] {
     let mut plaintext = [0_u8; RECORD_PLAINTEXT_BYTES];
@@ -838,7 +1134,8 @@ fn encode_plaintext(
     plaintext[24..32].copy_from_slice(&identity.sequence().to_le_bytes());
     plaintext[32..48].copy_from_slice(identity.effect_id().as_bytes());
     plaintext[48..80].copy_from_slice(&identity.payload_sha256());
-    plaintext[80..84].copy_from_slice(&input_bytes.to_le_bytes());
+    plaintext[80..84].copy_from_slice(&identity.input_bytes().to_le_bytes());
+    plaintext[84..88].copy_from_slice(&disposition.stored_applied_bytes().to_le_bytes());
     plaintext[104..136].copy_from_slice(&previous_digest);
     plaintext
 }
@@ -931,7 +1228,7 @@ fn scan_journal(
                 offset: committed_bytes,
             });
         }
-        let disposition = GuardianInputDisposition::from_wire(header[12])?;
+        let disposition_tag = GuardianInputDispositionTag::from_wire(header[12])?;
         let journal_sequence = read_u64(&header[16..24]);
         let expected_sequence = next_journal_sequence
             .ok_or(GuardianInputJournalError::JournalSequenceExhausted)?;
@@ -957,7 +1254,7 @@ fn scan_journal(
         let plaintext = cipher
             .open_guardian_metadata(&nonce, &ciphertext, &aad)
             .map_err(|_| GuardianInputJournalError::RecordAuthenticationFailed)?;
-        if plaintext.len() != RECORD_PLAINTEXT_BYTES || plaintext[84..104].iter().any(|b| *b != 0)
+        if plaintext.len() != RECORD_PLAINTEXT_BYTES || plaintext[88..104].iter().any(|b| *b != 0)
         {
             return Err(GuardianInputJournalError::NonCanonicalRecord {
                 offset: committed_bytes,
@@ -968,11 +1265,16 @@ fn scan_journal(
                 sequence: journal_sequence,
             });
         }
-        let identity = decode_identity(durable_pane_id, &plaintext)?;
         let input_bytes = read_u32(&plaintext[80..84]);
         if input_bytes == 0 || input_bytes > limits.max_input_bytes {
             return Err(GuardianInputJournalError::InvalidInputLength);
         }
+        let disposition = GuardianInputDisposition::from_stored(
+            disposition_tag,
+            read_u32(&plaintext[84..88]),
+            input_bytes,
+        )?;
+        let identity = decode_identity(durable_pane_id, input_bytes, &plaintext)?;
         let existing = effects.get(&identity.effect_id()).cloned();
         match (existing.as_ref(), disposition) {
             (None, GuardianInputDisposition::Intent) => {
@@ -1027,6 +1329,7 @@ fn scan_journal(
 
 fn decode_identity(
     durable_pane_id: Uuid,
+    input_bytes: u32,
     plaintext: &[u8],
 ) -> Result<GuardianInputEffectIdentity, GuardianInputJournalError> {
     let mux_incarnation = Uuid::from_slice(&plaintext[0..16])
@@ -1041,6 +1344,7 @@ fn decode_identity(
         read_u64(&plaintext[16..24]),
         read_u64(&plaintext[24..32]),
         effect_id,
+        input_bytes,
         payload_sha256,
     )
     .map_err(|_| GuardianInputJournalError::InvalidIdentity)
@@ -1073,34 +1377,84 @@ mod tests {
     }
 
     fn identity(sequence: u64, effect_byte: u8, payload_byte: u8) -> GuardianInputEffectIdentity {
+        identity_with_input_bytes(sequence, effect_byte, payload_byte, 4)
+    }
+
+    fn identity_with_input_bytes(
+        sequence: u64,
+        effect_byte: u8,
+        payload_byte: u8,
+        input_bytes: u32,
+    ) -> GuardianInputEffectIdentity {
         GuardianInputEffectIdentity::new(
             pane(),
             Uuid::from_bytes([0x52; 16]),
             3,
             sequence,
             Uuid::from_bytes([effect_byte; 16]),
+            input_bytes,
             [payload_byte; 32],
         )
         .expect("valid fixture identity")
     }
 
+    fn assert_reconciled(
+        append: GuardianInputJournalAppend,
+        expected_receipt: GuardianInputJournalReceipt,
+    ) {
+        assert!(!append.is_newly_committed());
+        let identity = append.identity();
+        assert_eq!(append.receipt(), expected_receipt);
+        if expected_receipt.disposition().is_terminal() {
+            let permit = append
+                .into_terminal_protocol_permit()
+                .expect("terminal reconciliation yields exact protocol permit");
+            assert_eq!(permit.identity(), identity);
+            assert_eq!(permit.receipt(), expected_receipt);
+            assert_eq!(
+                permit.protocol_state(),
+                expected_receipt.disposition().recovery_protocol_state()
+            );
+        } else {
+            assert!(append.into_first_pty_write_permit().is_none());
+        }
+    }
+
     #[test]
     fn recovery_mapping_never_replays_an_accepted_input() {
+        let default_limits = GuardianInputJournalLimits::default();
+        assert_eq!(
+            default_limits.max_input_bytes,
+            u32::try_from(GUARDIAN_MAX_INPUT_BYTES).unwrap()
+        );
+        assert!(matches!(
+            GuardianInputJournalLimits {
+                max_input_bytes: default_limits.max_input_bytes + 1,
+                ..default_limits
+            }
+            .validate(),
+            Err(GuardianInputJournalError::InvalidLimits)
+        ));
         assert_eq!(
             GuardianInputDisposition::Intent.recovery_protocol_state(),
-            InputEffectState::TerminalRejected
+            InputEffectState::KnownNotApplied
         );
         assert_eq!(
             GuardianInputDisposition::KnownNotApplied.recovery_protocol_state(),
-            InputEffectState::TerminalRejected
+            InputEffectState::KnownNotApplied
         );
         assert_eq!(
             GuardianInputDisposition::AcceptedNotDurable.recovery_protocol_state(),
             InputEffectState::AcceptedNotDurable
         );
         assert_eq!(
-            GuardianInputDisposition::Durable.recovery_protocol_state(),
-            InputEffectState::DurableEffect
+            GuardianInputDisposition::DurableFull.recovery_protocol_state(),
+            InputEffectState::DurableFull
+        );
+        assert_eq!(
+            GuardianInputDisposition::DurablePrefix { applied_bytes: 2 }
+                .recovery_protocol_state(),
+            InputEffectState::DurablePrefix { applied_bytes: 2 }
         );
     }
 
@@ -1147,15 +1501,36 @@ mod tests {
         journal
             .sync_parent_directory_and_activate(&open_directory(temp.path()))
             .expect("activate journal");
-        let intent_receipt = journal
-            .append_intent_and_sync(input, 9)
+        let intent_append = journal
+            .append_intent_and_sync(input)
             .expect("persist intent");
-        let accepted_receipt = journal
+        assert!(intent_append.is_newly_committed());
+        let intent_receipt = intent_append.receipt();
+        assert!(intent_append.into_first_pty_write_permit().is_none());
+        let accepted_append = journal
             .append_disposition_and_sync(input, GuardianInputDisposition::AcceptedNotDurable)
             .expect("persist accepted marker");
-        let durable = journal
-            .append_disposition_and_sync(input, GuardianInputDisposition::Durable)
+        assert!(accepted_append.is_newly_committed());
+        let accepted_receipt = accepted_append.receipt();
+        let write_permit = accepted_append
+            .into_first_pty_write_permit()
+            .expect("fresh accepted marker yields one bound write permit");
+        assert_eq!(write_permit.identity(), input);
+        let accepted_retry = journal
+            .append_disposition_and_sync(input, GuardianInputDisposition::AcceptedNotDurable)
+            .expect("reconcile accepted marker acknowledgement loss");
+        assert_reconciled(accepted_retry, accepted_receipt);
+        let durable_append = journal
+            .append_disposition_and_sync(input, GuardianInputDisposition::DurableFull)
             .expect("persist durable marker");
+        assert!(durable_append.is_newly_committed());
+        let durable = durable_append.receipt();
+        let durable_permit = durable_append
+            .into_terminal_protocol_permit()
+            .expect("durable full yields exact protocol permit");
+        assert_eq!(durable_permit.identity(), input);
+        assert_eq!(durable_permit.receipt(), durable);
+        assert_eq!(durable_permit.protocol_state(), InputEffectState::DurableFull);
         drop(journal);
 
         let physical = std::fs::read(&path).expect("read physical bytes");
@@ -1180,24 +1555,32 @@ mod tests {
         {
             let recovered = reopened.effect(input.effect_id()).expect("effect recovered");
             assert_eq!(recovered.identity(), input);
-            assert_eq!(recovered.disposition(), GuardianInputDisposition::Durable);
+            assert_eq!(recovered.disposition(), GuardianInputDisposition::DurableFull);
             assert_eq!(recovered.receipt(), durable);
+            assert_eq!(
+                recovered.receipt_for(GuardianInputDisposition::Intent),
+                Some(intent_receipt)
+            );
+            assert_eq!(
+                recovered.receipt_for(GuardianInputDisposition::AcceptedNotDurable),
+                Some(accepted_receipt)
+            );
             assert!(!format!("{recovered:?}").contains(&"a7".repeat(32)));
         }
-        assert_eq!(
+        assert_reconciled(
             reopened
-                .append_intent_and_sync(input, 9)
+                .append_intent_and_sync(input)
                 .expect("reconcile original intent"),
-            intent_receipt
+            durable,
         );
-        assert_eq!(
+        assert_reconciled(
             reopened
                 .append_disposition_and_sync(
                     input,
                     GuardianInputDisposition::AcceptedNotDurable,
                 )
                 .expect("reconcile original accepted marker"),
-            accepted_receipt
+            durable,
         );
         assert_eq!(reopened.record_count(), 3);
     }
@@ -1218,10 +1601,12 @@ mod tests {
         journal
             .sync_parent_directory_and_activate(&open_directory(temp.path()))
             .expect("activate journal");
-        journal.append_intent_and_sync(input, 1).expect("intent");
-        let terminal = journal
+        journal.append_intent_and_sync(input).expect("intent");
+        let terminal_append = journal
             .append_disposition_and_sync(input, GuardianInputDisposition::KnownNotApplied)
             .expect("terminal disposition");
+        assert!(terminal_append.is_newly_committed());
+        let terminal = terminal_append.receipt();
         drop(journal);
 
         let mut reopened = GuardianInputJournal::open(
@@ -1234,8 +1619,121 @@ mod tests {
         let retry = reopened
             .append_disposition_and_sync(input, GuardianInputDisposition::KnownNotApplied)
             .expect("idempotent retry");
-        assert_eq!(retry, terminal);
+        assert_reconciled(retry, terminal);
         assert_eq!(reopened.record_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_prefix_is_exact_bounded_and_idempotent_across_reopen() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let path = temp.path().join("input.journal");
+        let input = identity_with_input_bytes(7, 0x71, 0xb7, 6);
+        let mut journal = GuardianInputJournal::open(
+            create_file(&path),
+            pane(),
+            cipher(),
+            GuardianInputJournalLimits::default(),
+        )
+        .expect("initialize journal");
+        journal
+            .sync_parent_directory_and_activate(&open_directory(temp.path()))
+            .expect("activate journal");
+        journal.append_intent_and_sync(input).expect("intent");
+        journal
+            .append_disposition_and_sync(input, GuardianInputDisposition::AcceptedNotDurable)
+            .expect("accepted marker");
+
+        let before_invalid_count = journal.record_count();
+        for invalid in [0_u32, input.input_bytes(), input.input_bytes() + 1] {
+            assert!(matches!(
+                journal.append_disposition_and_sync(
+                    input,
+                    GuardianInputDisposition::DurablePrefix {
+                        applied_bytes: invalid,
+                    },
+                ),
+                Err(GuardianInputJournalError::InvalidAppliedByteCount)
+            ));
+            assert_eq!(journal.record_count(), before_invalid_count);
+        }
+
+        let disposition = GuardianInputDisposition::DurablePrefix { applied_bytes: 3 };
+        let prefix_append = journal
+            .append_disposition_and_sync(input, disposition)
+            .expect("persist exact durable prefix");
+        assert!(prefix_append.is_newly_committed());
+        let prefix_receipt = prefix_append.receipt();
+        let prefix_permit = prefix_append
+            .into_terminal_protocol_permit()
+            .expect("durable prefix yields exact protocol permit");
+        assert_eq!(prefix_permit.identity(), input);
+        assert_eq!(prefix_permit.receipt(), prefix_receipt);
+        assert_eq!(
+            prefix_permit.protocol_state(),
+            InputEffectState::DurablePrefix { applied_bytes: 3 }
+        );
+        assert_eq!(prefix_receipt.disposition(), disposition);
+        assert_eq!(disposition.applied_prefix_bytes(), Some(3));
+        let terminal_record_count = journal.record_count();
+        assert_reconciled(
+            journal
+                .append_disposition_and_sync(input, disposition)
+                .expect("retry exact terminal prefix"),
+            prefix_receipt,
+        );
+        assert_eq!(journal.record_count(), terminal_record_count);
+        assert!(matches!(
+            journal.append_disposition_and_sync(
+                input,
+                GuardianInputDisposition::DurablePrefix { applied_bytes: 2 },
+            ),
+            Err(GuardianInputJournalError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            journal.append_disposition_and_sync(input, GuardianInputDisposition::DurableFull),
+            Err(GuardianInputJournalError::InvalidTransition { .. })
+        ));
+        drop(journal);
+
+        let mut reopened = GuardianInputJournal::open(
+            open_file(&path),
+            pane(),
+            cipher(),
+            GuardianInputJournalLimits::default(),
+        )
+        .expect("recover exact durable prefix");
+        let recovered = reopened.effect(input.effect_id()).expect("effect recovered");
+        assert_eq!(recovered.identity(), input);
+        assert_eq!(recovered.input_bytes(), 6);
+        assert_eq!(recovered.disposition(), disposition);
+        assert_eq!(
+            recovered.disposition().recovery_protocol_state(),
+            InputEffectState::DurablePrefix { applied_bytes: 3 }
+        );
+        assert_eq!(recovered.receipt(), prefix_receipt);
+        assert_reconciled(
+            reopened
+                .append_intent_and_sync(input)
+                .expect("reconcile prefix through repeated begin"),
+            prefix_receipt,
+        );
+        assert_reconciled(
+            reopened
+                .append_disposition_and_sync(
+                    input,
+                    GuardianInputDisposition::AcceptedNotDurable,
+                )
+                .expect("reconcile prefix through repeated acceptance"),
+            prefix_receipt,
+        );
+        assert_reconciled(
+            reopened
+                .append_disposition_and_sync(input, disposition)
+                .expect("reconcile prefix publication acknowledgement loss"),
+            prefix_receipt,
+        );
+        assert_eq!(reopened.record_count(), terminal_record_count);
     }
 
     #[cfg(unix)]
@@ -1254,7 +1752,7 @@ mod tests {
         journal
             .sync_parent_directory_and_activate(&open_directory(temp.path()))
             .expect("activate journal");
-        journal.append_intent_and_sync(input, 2).expect("intent");
+        journal.append_intent_and_sync(input).expect("intent");
         drop(journal);
 
         let mut journal = GuardianInputJournal::open(
@@ -1270,7 +1768,7 @@ mod tests {
                 .expect("intent recovered")
                 .disposition()
                 .recovery_protocol_state(),
-            InputEffectState::TerminalRejected
+            InputEffectState::KnownNotApplied
         );
         journal
             .append_disposition_and_sync(input, GuardianInputDisposition::AcceptedNotDurable)
@@ -1310,7 +1808,7 @@ mod tests {
                 .expect("terminal effect recovered")
                 .disposition()
                 .recovery_protocol_state(),
-            InputEffectState::TerminalRejected
+            InputEffectState::KnownNotApplied
         );
     }
 
@@ -1330,7 +1828,7 @@ mod tests {
         journal
             .sync_parent_directory_and_activate(&open_directory(complete.path()))
             .expect("activate complete fixture");
-        journal.append_intent_and_sync(input, 2).expect("intent");
+        journal.append_intent_and_sync(input).expect("intent");
         journal
             .append_disposition_and_sync(input, GuardianInputDisposition::AcceptedNotDurable)
             .expect("accepted marker");
@@ -1340,26 +1838,8 @@ mod tests {
         let second_record_end = committed_prefix + RECORD_HEADER_BYTES + RECORD_CIPHERTEXT_BYTES;
         assert_eq!(physical.len(), second_record_end);
 
-        let cuts = [
-            1_usize,
-            8,
-            12,
-            13,
-            16,
-            24,
-            32,
-            55,
-            56,
-            87,
-            88,
-            95,
-            96,
-            97,
-            96 + RECORD_CIPHERTEXT_BYTES / 2,
-            RECORD_HEADER_BYTES + RECORD_CIPHERTEXT_BYTES - 1,
-        ];
         let cuts_dir = tempfile::tempdir().expect("create crash-cut tempdir");
-        for trailing_bytes in cuts {
+        for trailing_bytes in 1..(RECORD_HEADER_BYTES + RECORD_CIPHERTEXT_BYTES) {
             let path = cuts_dir.path().join(format!("cut-{trailing_bytes}.journal"));
             let cut = committed_prefix + trailing_bytes;
             let mut file = create_file(&path);
@@ -1387,7 +1867,7 @@ mod tests {
             assert_eq!(effect.disposition(), GuardianInputDisposition::Intent);
             assert_eq!(
                 effect.disposition().recovery_protocol_state(),
-                InputEffectState::TerminalRejected
+                InputEffectState::KnownNotApplied
             );
             assert!(matches!(
                 recovered.append_disposition_and_sync(
@@ -1400,6 +1880,76 @@ mod tests {
                 std::fs::metadata(&path).expect("crash-cut metadata").len(),
                 u64::try_from(cut).expect("fixture cut fits u64")
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_terminal_record_cuts_preserve_ambiguous_acceptance_not_a_prefix() {
+        let complete = tempfile::tempdir().expect("create complete fixture tempdir");
+        let complete_path = complete.path().join("input.journal");
+        let input = identity_with_input_bytes(7, 0x72, 0xb8, 6);
+        let mut journal = GuardianInputJournal::open(
+            create_file(&complete_path),
+            pane(),
+            cipher(),
+            GuardianInputJournalLimits::default(),
+        )
+        .expect("initialize complete fixture");
+        journal
+            .sync_parent_directory_and_activate(&open_directory(complete.path()))
+            .expect("activate complete fixture");
+        journal.append_intent_and_sync(input).expect("intent");
+        journal
+            .append_disposition_and_sync(input, GuardianInputDisposition::AcceptedNotDurable)
+            .expect("accepted marker");
+        journal
+            .append_disposition_and_sync(
+                input,
+                GuardianInputDisposition::DurablePrefix { applied_bytes: 2 },
+            )
+            .expect("durable prefix");
+        drop(journal);
+
+        let physical = std::fs::read(&complete_path).expect("read complete fixture");
+        let accepted_prefix = FILE_HEADER_BYTES + 2 * (RECORD_HEADER_BYTES + RECORD_CIPHERTEXT_BYTES);
+        let cuts = tempfile::tempdir().expect("create terminal crash-cut tempdir");
+        for trailing_bytes in 1..(RECORD_HEADER_BYTES + RECORD_CIPHERTEXT_BYTES) {
+            let path = cuts.path().join(format!("terminal-cut-{trailing_bytes}.journal"));
+            let cut = accepted_prefix + trailing_bytes;
+            let mut file = create_file(&path);
+            file.write_all(&physical[..cut]).expect("write terminal crash cut");
+            file.sync_all().expect("sync terminal crash cut");
+            drop(file);
+
+            let mut recovered = GuardianInputJournal::open(
+                open_file(&path),
+                pane(),
+                cipher(),
+                GuardianInputJournalLimits::default(),
+            )
+            .expect("recover accepted prefix before incomplete terminal record");
+            assert!(matches!(
+                recovered.tail(),
+                GuardianInputJournalTail::Incomplete {
+                    committed_bytes,
+                    trailing_bytes: observed,
+                } if committed_bytes == u64::try_from(accepted_prefix).unwrap()
+                    && observed == u64::try_from(trailing_bytes).unwrap()
+            ));
+            let effect = recovered.effect(input.effect_id()).expect("accepted effect retained");
+            assert_eq!(effect.disposition(), GuardianInputDisposition::AcceptedNotDurable);
+            assert_eq!(
+                effect.disposition().recovery_protocol_state(),
+                InputEffectState::AcceptedNotDurable
+            );
+            assert!(matches!(
+                recovered.append_disposition_and_sync(
+                    input,
+                    GuardianInputDisposition::DurablePrefix { applied_bytes: 2 },
+                ),
+                Err(GuardianInputJournalError::IncompleteTail)
+            ));
         }
     }
 
@@ -1426,7 +1976,7 @@ mod tests {
             journal
                 .sync_parent_directory_and_activate(&open_directory(temp.path()))
                 .expect("activate fault fixture");
-            journal.append_intent_and_sync(input, 2).expect("intent");
+            journal.append_intent_and_sync(input).expect("intent");
             let committed_intent_bytes = journal.committed_bytes();
             journal.inject_append_fault(fault);
             assert!(matches!(
@@ -1499,6 +2049,8 @@ mod tests {
                         receipt.disposition(),
                         GuardianInputDisposition::AcceptedNotDurable
                     );
+                    assert!(!receipt.is_newly_committed());
+                    assert!(receipt.into_first_pty_write_permit().is_none());
                     assert_eq!(recovered.record_count(), before_retry);
                 }
             }
@@ -1525,7 +2077,7 @@ mod tests {
         journal
             .sync_parent_directory_and_activate(&open_directory(temp.path()))
             .expect("activate journal");
-        journal.append_intent_and_sync(input, 1).expect("intent");
+        journal.append_intent_and_sync(input).expect("intent");
         journal
             .append_disposition_and_sync(input, GuardianInputDisposition::AcceptedNotDurable)
             .expect("accepted marker");
@@ -1535,7 +2087,7 @@ mod tests {
 
         let durable_input = identity(8, 0x6a, 0xaf);
         journal
-            .append_intent_and_sync(durable_input, 1)
+            .append_intent_and_sync(durable_input)
             .expect("second intent");
         journal
             .append_disposition_and_sync(
@@ -1544,7 +2096,7 @@ mod tests {
             )
             .expect("second accepted marker");
         journal
-            .append_disposition_and_sync(durable_input, GuardianInputDisposition::Durable)
+            .append_disposition_and_sync(durable_input, GuardianInputDisposition::DurableFull)
             .expect("durable result");
         assert!(matches!(
             journal.append_disposition_and_sync(
@@ -1571,7 +2123,7 @@ mod tests {
         journal
             .sync_parent_directory_and_activate(&open_directory(temp.path()))
             .expect("activate journal");
-        journal.append_intent_and_sync(input, 3).expect("intent");
+        journal.append_intent_and_sync(input).expect("intent");
         drop(journal);
         let committed = std::fs::metadata(&path).expect("metadata").len();
         let mut physical = std::fs::OpenOptions::new()
@@ -1619,7 +2171,7 @@ mod tests {
         journal
             .sync_parent_directory_and_activate(&open_directory(temp.path()))
             .expect("activate journal");
-        journal.append_intent_and_sync(input, 1).expect("intent");
+        journal.append_intent_and_sync(input).expect("intent");
         drop(journal);
         assert!(matches!(
             GuardianInputJournal::open(
@@ -1680,6 +2232,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn legacy_v1_journal_is_preserved_and_rejected_as_ambiguous() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let path = temp.path().join("input.journal");
+        let mut legacy_header = encode_file_header(pane(), cipher().key_id());
+        legacy_header[..8].copy_from_slice(&LEGACY_FILE_MAGIC_V1);
+        legacy_header[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        let mut file = create_file(&path);
+        file.write_all(&legacy_header).expect("write legacy header");
+        file.sync_all().expect("sync legacy header");
+        drop(file);
+
+        assert!(matches!(
+            GuardianInputJournal::open(
+                open_file(&path),
+                pane(),
+                cipher(),
+                GuardianInputJournalLimits::default(),
+            ),
+            Err(GuardianInputJournalError::LegacyV1DispositionAmbiguous)
+        ));
+        let preserved = std::fs::read(&path).expect("read preserved legacy header");
+        assert_eq!(preserved.as_slice(), legacy_header.as_slice());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recomputed_outer_digest_cannot_bypass_aead_authentication() {
         let temp = tempfile::tempdir().expect("create tempdir");
         let path = temp.path().join("input.journal");
@@ -1694,7 +2272,7 @@ mod tests {
         journal
             .sync_parent_directory_and_activate(&open_directory(temp.path()))
             .expect("activate journal");
-        journal.append_intent_and_sync(input, 1).expect("intent");
+        journal.append_intent_and_sync(input).expect("intent");
         drop(journal);
 
         let mut physical = std::fs::read(&path).expect("read journal bytes");
@@ -1731,6 +2309,82 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn same_length_terminal_record_splice_cannot_change_the_applied_prefix() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let path = temp.path().join("input.journal");
+        let first = identity_with_input_bytes(7, 0x73, 0xb9, 6);
+        let second = identity_with_input_bytes(8, 0x74, 0xba, 6);
+        let mut journal = GuardianInputJournal::open(
+            create_file(&path),
+            pane(),
+            cipher(),
+            GuardianInputJournalLimits::default(),
+        )
+        .expect("initialize journal");
+        journal
+            .sync_parent_directory_and_activate(&open_directory(temp.path()))
+            .expect("activate journal");
+        for (input, applied_bytes) in [(first, 2_u32), (second, 3_u32)] {
+            journal.append_intent_and_sync(input).expect("intent");
+            journal
+                .append_disposition_and_sync(
+                    input,
+                    GuardianInputDisposition::AcceptedNotDurable,
+                )
+                .expect("accepted marker");
+            journal
+                .append_disposition_and_sync(
+                    input,
+                    GuardianInputDisposition::DurablePrefix { applied_bytes },
+                )
+                .expect("terminal prefix");
+        }
+        drop(journal);
+
+        let mut physical = std::fs::read(&path).expect("read journal bytes");
+        let record_bytes = RECORD_HEADER_BYTES + RECORD_CIPHERTEXT_BYTES;
+        let destination = FILE_HEADER_BYTES + 2 * record_bytes;
+        let source = FILE_HEADER_BYTES + 5 * record_bytes;
+        assert_eq!(physical[destination + 12], physical[source + 12]);
+
+        let mut source_nonce = [0_u8; NONCE_BYTES];
+        source_nonce.copy_from_slice(&physical[source + 32..source + 56]);
+        let mut source_ciphertext = [0_u8; RECORD_CIPHERTEXT_BYTES];
+        source_ciphertext.copy_from_slice(
+            &physical[source + RECORD_HEADER_BYTES..source + record_bytes],
+        );
+        physical[destination + 32..destination + 56].copy_from_slice(&source_nonce);
+        physical[destination + RECORD_HEADER_BYTES..destination + record_bytes]
+            .copy_from_slice(&source_ciphertext);
+
+        let mut destination_prefix = [0_u8; 32];
+        destination_prefix.copy_from_slice(&physical[destination..destination + 32]);
+        let digest = record_digest(
+            pane(),
+            &destination_prefix,
+            &source_nonce,
+            &source_ciphertext,
+        );
+        physical[destination + 56..destination + 88].copy_from_slice(&digest);
+        let mut file = open_file(&path);
+        file.seek(SeekFrom::Start(0)).expect("seek journal start");
+        file.write_all(&physical).expect("write spliced journal");
+        file.sync_all().expect("sync spliced journal");
+        drop(file);
+
+        assert!(matches!(
+            GuardianInputJournal::open(
+                open_file(&path),
+                pane(),
+                cipher(),
+                GuardianInputJournalLimits::default(),
+            ),
+            Err(GuardianInputJournalError::RecordAuthenticationFailed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn external_length_change_poison_is_sticky() {
         let temp = tempfile::tempdir().expect("create tempdir");
         let path = temp.path().join("input.journal");
@@ -1751,12 +2405,12 @@ mod tests {
         external.write_all(&[0]).expect("change length");
         external.sync_all().expect("sync external byte");
         assert!(matches!(
-            journal.append_intent_and_sync(identity(7, 0x66, 0xac), 1),
+            journal.append_intent_and_sync(identity(7, 0x66, 0xac)),
             Err(GuardianInputJournalError::ExternalLengthChange { .. })
         ));
         assert!(journal.is_poisoned());
         assert!(matches!(
-            journal.append_intent_and_sync(identity(8, 0x67, 0xad), 1),
+            journal.append_intent_and_sync(identity(8, 0x67, 0xad)),
             Err(GuardianInputJournalError::Poisoned)
         ));
     }
@@ -1781,23 +2435,23 @@ mod tests {
         .expect("initialize bounded journal");
         let first = identity(7, 0x68, 0xae);
         assert!(matches!(
-            journal.append_intent_and_sync(first, 1),
+            journal.append_intent_and_sync(first),
             Err(GuardianInputJournalError::DirectoryEntryNotDurable)
         ));
         journal
             .sync_parent_directory_and_activate(&open_directory(temp.path()))
             .expect("activate journal");
         assert!(matches!(
-            journal.append_intent_and_sync(first, 5),
+            journal.append_intent_and_sync(identity_with_input_bytes(7, 0x68, 0xae, 5)),
             Err(GuardianInputJournalError::InvalidInputLength)
         ));
-        journal.append_intent_and_sync(first, 1).expect("first intent");
+        journal.append_intent_and_sync(first).expect("first intent");
         assert!(matches!(
-            journal.append_intent_and_sync(identity(6, 0x69, 0xaf), 1),
+            journal.append_intent_and_sync(identity(6, 0x69, 0xaf)),
             Err(GuardianInputJournalError::NonMonotonicInputIdentity)
         ));
         journal
-            .append_intent_and_sync(identity(8, 0x69, 0xaf), 1)
+            .append_intent_and_sync(identity(8, 0x69, 0xaf))
             .expect("second monotonic intent consumes final record");
         assert!(matches!(
             journal.append_disposition_and_sync(
