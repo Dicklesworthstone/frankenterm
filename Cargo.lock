@@ -4538,6 +4538,7 @@ dependencies = [
  "termwiz 0.24.0",
  "unicode-normalization",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -7502,6 +7503,7 @@ dependencies = [
  "serial2",
  "sha2 0.11.0",
  "shell-words",
+ "syn 2.0.119",
  "tempfile",
  "terminfo",
  "termwiz 0.24.0",
