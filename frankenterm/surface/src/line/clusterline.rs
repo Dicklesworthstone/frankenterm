@@ -13,6 +13,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use zeroize::Zeroize;
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
@@ -105,7 +106,12 @@ impl ClusteredLine {
     }
 
     pub fn to_cell_vec(&self) -> Vec<Cell> {
-        let mut cells = vec![];
+        // A growing Vec bitwise-moves initialized Cells into each replacement
+        // allocation.  Inline TeenyString bytes would then remain in the old
+        // allocation without running Cell::drop.  Count the exact materialized
+        // width first so the plaintext-bearing Cell buffer never reallocates.
+        let cell_count = self.iter().map(|cell| cell.width()).sum();
+        let mut cells = Vec::with_capacity(cell_count);
 
         for c in self.iter() {
             cells.push(c.as_cell());
@@ -422,7 +428,19 @@ impl ClusteredLine {
             }
         }
     }
+
+    fn wipe_owned_text(&mut self) {
+        self.text.zeroize();
+    }
 }
+
+impl Drop for ClusteredLine {
+    fn drop(&mut self) {
+        self.wipe_owned_text();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for ClusteredLine {}
 
 pub(crate) struct ClusterLineCellIter<'a> {
     graphemes: Graphemes<'a>,
@@ -558,5 +576,36 @@ mod test {
         assert!(only_wide_space.clusters.is_empty());
         assert!(only_wide_space.is_double_wide.is_none());
         assert_eq!(only_wide_space.iter().count(), 0);
+    }
+
+    #[test]
+    fn to_cell_vec_allocates_the_exact_materialized_cell_count() {
+        let mut line = ClusteredLine::new();
+        line.append_grapheme("a", 1, CellAttributes::default());
+        line.append_grapheme("\u{4e2d}", 2, CellAttributes::default());
+
+        let cells = line.to_cell_vec();
+
+        assert_eq!(cells.len(), 3);
+        assert_eq!(
+            cells.capacity(),
+            cells.len(),
+            "materialization must not grow a plaintext-bearing Cell buffer"
+        );
+    }
+
+    #[test]
+    fn clustered_line_wipes_owned_text_in_place() {
+        fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        require_zeroize_on_drop::<ClusteredLine>();
+
+        let mut line = ClusteredLine::new();
+        line.append_ascii_run("semantic terminal text", CellAttributes::default());
+        let capacity = line.text.capacity();
+
+        line.wipe_owned_text();
+
+        assert!(line.text.is_empty());
+        assert_eq!(line.text.capacity(), capacity);
     }
 }

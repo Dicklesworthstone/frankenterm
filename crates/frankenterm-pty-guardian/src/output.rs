@@ -388,14 +388,14 @@ impl CheckpointStageRequestShape {
         }
     }
 
-    fn begin_payload(&self) -> Result<Vec<u8>, GuardianProtocolError> {
+    fn begin_payload(&self) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
         GuardianCheckpointStageRequestV1::begin(
             self.scope,
             self.upload_id,
             self.descriptor,
             self.chunk_bytes,
         )?
-        .encode()
+        .into_zeroizing_payload()
     }
 }
 
@@ -1093,7 +1093,7 @@ impl GuardianCheckpointStageStore {
             return Err(GuardianCheckpointStageStoreError::Conflict);
         }
         let shape = CheckpointStageRequestShape::from_request(request)?;
-        let begin_payload = Zeroizing::new(shape.begin_payload()?);
+        let begin_payload = shape.begin_payload()?;
         if begin_payload.len() != CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES {
             return Err(GuardianCheckpointStageStoreError::Poisoned);
         }
@@ -2083,7 +2083,7 @@ fn checkpoint_inspect_upload(
         // deterministic upload stays quarantined for a fresh upload identity.
         return Err(GuardianCheckpointStageStoreError::Poisoned);
     }
-    let begin_payload = Zeroizing::new(shape.begin_payload()?);
+    let begin_payload = shape.begin_payload()?;
     let (candidate_context, candidate_plaintext) = checkpoint_open_record(
         inner,
         candidate,
@@ -5068,7 +5068,10 @@ mod tests {
         checkpoint_hasher.update(terminal_digest);
         let checkpoint_digest: [u8; 32] = checkpoint_hasher.finalize().into();
 
-        let mut wire = vec![0_u8; CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES];
+        let mut wire = Zeroizing::new(vec![
+            0_u8;
+            CHECKPOINT_STAGE_CANDIDATE_PLAINTEXT_BYTES
+        ]);
         wire[..4].copy_from_slice(b"GCS1");
         wire[4..6].copy_from_slice(&1_u16.to_be_bytes());
         wire[6] = match kind {
@@ -5223,7 +5226,7 @@ mod tests {
             None,
         )?;
         let shape = CheckpointStageRequestShape::from_request(&begin)?;
-        let begin_payload = Zeroizing::new(shape.begin_payload()?);
+        let begin_payload = shape.begin_payload()?;
         let candidate_identity =
             GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
                 &begin_payload,
@@ -5243,7 +5246,7 @@ mod tests {
             None,
         )?;
         let changed_shape = CheckpointStageRequestShape::from_request(&changed_begin)?;
-        let changed_begin_payload = Zeroizing::new(changed_shape.begin_payload()?);
+        let changed_begin_payload = changed_shape.begin_payload()?;
         let changed_candidate_identity =
             GuardianCheckpointCandidateIdentityV1::from_canonical_begin_plaintext(
                 &changed_begin_payload,

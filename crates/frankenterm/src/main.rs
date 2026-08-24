@@ -94028,7 +94028,7 @@ recorder_backend = "rusqlite"
     fn mux_dump_verifier_recomputes_embedded_payload_checksum() {
         let dir = tempfile::tempdir().expect("dump tempdir");
         let path = dir.path().join("mux-dump.json");
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "schema_version": 1,
             "created_at_epoch_ms": 1,
             "source": {

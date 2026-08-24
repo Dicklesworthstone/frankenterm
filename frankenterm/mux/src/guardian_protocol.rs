@@ -358,6 +358,16 @@ impl GuardianRequestEnvelope {
         }
     }
 
+    /// Move an already-sensitive payload into the request without passing it
+    /// through an ordinary `Vec` allocation or copying its bytes.
+    #[must_use]
+    pub fn from_zeroizing_payload(
+        header: GuardianRequestHeader,
+        payload: Zeroizing<Vec<u8>>,
+    ) -> Self {
+        Self { header, payload }
+    }
+
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
@@ -1401,6 +1411,14 @@ fn zeroizing_sha256_digest(bytes: &[u8]) -> Zeroizing<[u8; 32]> {
     digest
 }
 
+fn zeroizing_vec_from_slice(bytes: &[u8]) -> Zeroizing<Vec<u8>> {
+    // Allocate before copying so sensitive bytes first enter the allocation
+    // only after it has a zeroizing owner.
+    let mut owned = Zeroizing::new(Vec::with_capacity(bytes.len()));
+    owned.extend_from_slice(bytes);
+    owned
+}
+
 fn checkpoint_chunk_digest_matches(observed: &[u8], expected: &[u8]) -> bool {
     if observed.len() != 32 || expected.len() != 32 {
         return false;
@@ -1646,8 +1664,38 @@ impl GuardianCheckpointStageRequestV1 {
         }
     }
 
+    /// Encode metadata-only Begin/Seal requests.
+    ///
+    /// A Chunk owns terminal plaintext and its content-derived digest, so the
+    /// borrow-based encoder rejects it rather than creating repeatable raw
+    /// `Vec` copies. Chunk callers must consume the request through
+    /// [`Self::into_zeroizing_payload`].
     pub fn encode(&self) -> Result<Vec<u8>, GuardianProtocolError> {
         self.validate()?;
+        if matches!(&self.body, GuardianCheckpointStageBodyV1::Chunk(_)) {
+            return Err(GuardianProtocolError::CheckpointStageChunkRequiresConsumingEncoding);
+        }
+        let capacity = self.encoded_capacity()?;
+        let mut payload = Vec::with_capacity(capacity);
+        self.encode_into(&mut payload, capacity)?;
+        Ok(payload)
+    }
+
+    /// Consume a Stage request into one zeroizing wire allocation.
+    ///
+    /// This is the sole encoder for Chunk requests. Consuming `self` prevents
+    /// repeated plaintext/digest copies from the same delivery capability.
+    pub fn into_zeroizing_payload(
+        self,
+    ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+        self.validate()?;
+        let capacity = self.encoded_capacity()?;
+        let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
+        self.encode_into(&mut payload, capacity)?;
+        Ok(payload)
+    }
+
+    fn encoded_capacity(&self) -> Result<usize, GuardianProtocolError> {
         let extra = match &self.body {
             GuardianCheckpointStageBodyV1::Chunk(chunk) => chunk.bytes.len(),
             GuardianCheckpointStageBodyV1::Begin | GuardianCheckpointStageBodyV1::Seal => 0,
@@ -1663,7 +1711,14 @@ impl GuardianCheckpointStageRequestV1 {
         if capacity > GUARDIAN_MAX_PAYLOAD_BYTES {
             return Err(GuardianProtocolError::PayloadTooLarge);
         }
-        let mut payload = Vec::with_capacity(capacity);
+        Ok(capacity)
+    }
+
+    fn encode_into(
+        &self,
+        payload: &mut Vec<u8>,
+        capacity: usize,
+    ) -> Result<(), GuardianProtocolError> {
         payload.extend_from_slice(&CHECKPOINT_STAGE_PAYLOAD_MAGIC);
         payload.extend_from_slice(&CHECKPOINT_STAGE_WIRE_VERSION.to_be_bytes());
         payload.push(match &self.body {
@@ -1672,8 +1727,8 @@ impl GuardianCheckpointStageRequestV1 {
             GuardianCheckpointStageBodyV1::Seal => 3,
         });
         payload.push(0);
-        self.scope.encode_into(&mut payload);
-        push_uuid(&mut payload, self.upload_id);
+        self.scope.encode_into(payload);
+        push_uuid(payload, self.upload_id);
         payload.extend_from_slice(&self.descriptor.encode());
         payload.extend_from_slice(&self.chunk_bytes.to_be_bytes());
         payload.extend_from_slice(&self.total_chunks.to_be_bytes());
@@ -1693,7 +1748,7 @@ impl GuardianCheckpointStageRequestV1 {
                 "checkpoint-stage-encoded-size",
             ));
         }
-        Ok(payload)
+        Ok(())
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, GuardianProtocolError> {
@@ -1743,7 +1798,8 @@ impl GuardianCheckpointStageRequestV1 {
                 if payload.len() != expected {
                     return Err(GuardianProtocolError::InvalidOperationPayload);
                 }
-                let bytes = Zeroizing::new(payload[CHECKPOINT_STAGE_CHUNK_FIXED_BYTES..].to_vec());
+                let bytes =
+                    zeroizing_vec_from_slice(&payload[CHECKPOINT_STAGE_CHUNK_FIXED_BYTES..]);
                 GuardianCheckpointStageBodyV1::Chunk(GuardianCheckpointStageChunkDeliveryV1 {
                     index,
                     offset,
@@ -4532,7 +4588,8 @@ fn decode_replay_page_body(
             if REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES.checked_add(chunk_len) != Some(payload.len()) {
                 return Err(GuardianProtocolError::InvalidReplyPayload);
             }
-            let bytes = Zeroizing::new(payload[REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES..].to_vec());
+            let bytes =
+                zeroizing_vec_from_slice(&payload[REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES..]);
             let chunk = GuardianCheckpointChunkDelivery {
                 descriptor,
                 offset,
@@ -4608,7 +4665,7 @@ fn decode_replay_page_body(
                 )?;
                 let record = GuardianReplayRecordDelivery::new(
                     metadata,
-                    Zeroizing::new(plaintext.to_vec()),
+                    zeroizing_vec_from_slice(plaintext),
                 )?;
                 if record.plaintext_digest != plaintext_digest {
                     return Err(GuardianProtocolError::InvalidReplyPayload);
@@ -6472,6 +6529,8 @@ pub enum GuardianProtocolError {
     CheckpointOutcomeIndeterminate,
     #[error("guardian checkpoint acknowledgement does not match the pending publication identity")]
     CheckpointIdentityMismatch,
+    #[error("guardian checkpoint Stage chunks require the consuming zeroizing encoder")]
+    CheckpointStageChunkRequiresConsumingEncoding,
     #[error("guardian replay responses require the consuming typed delivery API")]
     ReplayRequiresConsumingDelivery,
 }
@@ -6541,7 +6600,10 @@ impl GuardianRejectionCode {
             | GuardianProtocolError::InvalidRejectionPayload
             | GuardianProtocolError::InvalidOperationPayload
             | GuardianProtocolError::InvalidCheckpointIntent
-            | GuardianProtocolError::CheckpointRequiresTypedTransaction => Self::InvalidRequest,
+            | GuardianProtocolError::CheckpointRequiresTypedTransaction
+            | GuardianProtocolError::CheckpointStageChunkRequiresConsumingEncoding => {
+                Self::InvalidRequest
+            }
             GuardianProtocolError::ReplayRequiresConsumingDelivery => Self::InvalidRequest,
         }
     }
@@ -8787,7 +8849,7 @@ pub fn decode_guardian_request(
     };
     let request = GuardianRequestEnvelope {
         header,
-        payload: Zeroizing::new(payload.to_vec()),
+        payload: zeroizing_vec_from_slice(payload),
     };
     validate_request_envelope(&request)?;
     Ok(AuthenticatedGuardianRequest {
@@ -8913,7 +8975,7 @@ pub fn decode_guardian_response(
             lease_sequence: read_u64(frame, 148)?,
             effect_id: read_optional_uuid(frame, 156)?,
         },
-        payload: Zeroizing::new(payload.to_vec()),
+        payload: zeroizing_vec_from_slice(payload),
     };
     validate_response_envelope(&response)?;
     Ok(AuthenticatedGuardianResponse(response))
@@ -9451,6 +9513,32 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn request_zeroizing(
+        operation: GuardianOperation,
+        guardian: Uuid,
+        mux: Uuid,
+        request_id: Uuid,
+        pane_id: Option<Uuid>,
+        generation: u64,
+        sequence: u64,
+        effect_id: Option<Uuid>,
+        payload: Zeroizing<Vec<u8>>,
+    ) -> GuardianRequestEnvelope {
+        let header = GuardianRequestHeader::new(
+            operation,
+            guardian,
+            mux,
+            request_id,
+            pane_id,
+            generation,
+            sequence,
+            effect_id,
+            &payload,
+        );
+        GuardianRequestEnvelope::from_zeroizing_payload(header, payload)
+    }
+
     fn authenticate(request: &GuardianRequestEnvelope) -> AuthenticatedGuardianRequest {
         let frame = encode_guardian_request(&secret(), request).unwrap();
         decode_guardian_request(&secret(), &frame).unwrap()
@@ -9572,12 +9660,12 @@ mod tests {
             vec![
                 GuardianReplayRecordDelivery::new(
                     first_metadata,
-                    Zeroizing::new(first_plaintext.to_vec()),
+                    zeroizing_vec_from_slice(first_plaintext),
                 )
                 .unwrap(),
                 GuardianReplayRecordDelivery::new(
                     second_metadata,
-                    Zeroizing::new(second_plaintext.to_vec()),
+                    zeroizing_vec_from_slice(second_plaintext),
                 )
                 .unwrap(),
             ],
@@ -13653,26 +13741,31 @@ mod tests {
             chunk_bytes,
         )
         .unwrap();
-        let begin_wire = begin.encode().unwrap();
+        let begin_total_chunks = begin.total_chunks();
+        let mut begin_wire: Zeroizing<Vec<u8>> = begin.into_zeroizing_payload().unwrap();
         let decoded_begin = GuardianCheckpointStageRequestV1::decode(&begin_wire).unwrap();
         assert_eq!(decoded_begin.kind(), GuardianCheckpointStageKindV1::Begin);
         assert_eq!(decoded_begin.descriptor(), descriptor);
-        assert_eq!(decoded_begin.total_chunks(), begin.total_chunks());
+        assert_eq!(decoded_begin.total_chunks(), begin_total_chunks);
 
         let first_len = usize::try_from(chunk_bytes)
             .unwrap()
             .min(canonical.len());
-        let chunk_plaintext = canonical[..first_len].to_vec();
+        let chunk_plaintext = zeroizing_vec_from_slice(&canonical[..first_len]);
         let chunk = GuardianCheckpointStageRequestV1::chunk(
             scope,
             upload_id,
             descriptor,
             chunk_bytes,
             0,
-            Zeroizing::new(chunk_plaintext.clone()),
+            chunk_plaintext,
         )
         .unwrap();
-        let chunk_wire = chunk.encode().unwrap();
+        assert!(matches!(
+            chunk.encode(),
+            Err(GuardianProtocolError::CheckpointStageChunkRequiresConsumingEncoding)
+        ));
+        let mut chunk_wire: Zeroizing<Vec<u8>> = chunk.into_zeroizing_payload().unwrap();
         let decoded_chunk = GuardianCheckpointStageRequestV1::decode(&chunk_wire).unwrap();
         assert_eq!(decoded_chunk.kind(), GuardianCheckpointStageKindV1::Chunk);
         assert_eq!(decoded_chunk.chunk_position().unwrap().0, 0);
@@ -13681,9 +13774,12 @@ mod tests {
         assert_eq!(decoded_chunk.position(), (0, 0));
         assert_eq!(
             decoded_chunk.chunk_digest(),
-            zeroizing_sha256_digest(&chunk_plaintext).as_slice()
+            zeroizing_sha256_digest(&canonical[..first_len]).as_slice()
         );
-        assert_eq!(decoded_chunk.into_bytes().as_slice(), chunk_plaintext);
+        assert_eq!(
+            decoded_chunk.into_bytes().as_slice(),
+            &canonical[..first_len]
+        );
 
         let seal = GuardianCheckpointStageRequestV1::seal(
             scope,
@@ -13693,7 +13789,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seal.validate_staged_plaintext(canonical), Ok(()));
-        let mut same_length_payload_mutation = canonical.to_vec();
+        let mut same_length_payload_mutation = zeroizing_vec_from_slice(canonical);
         let last = same_length_payload_mutation.len() - 1;
         same_length_payload_mutation[last] ^= 1;
         assert_eq!(
@@ -13701,23 +13797,24 @@ mod tests {
             Err(GuardianProtocolError::InvalidOperationPayload)
         );
 
-        let mut digest_mutation = chunk_wire.clone();
-        digest_mutation[CHECKPOINT_STAGE_COMMON_BYTES + 12] ^= 1;
-        assert_eq!(
-            GuardianCheckpointStageRequestV1::decode(&digest_mutation),
-            Err(GuardianProtocolError::InvalidOperationPayload),
+        let digest_offset = CHECKPOINT_STAGE_COMMON_BYTES + 12;
+        chunk_wire[digest_offset] ^= 1;
+        assert!(
+            matches!(
+                GuardianCheckpointStageRequestV1::decode(&chunk_wire),
+                Err(GuardianProtocolError::InvalidOperationPayload)
+            ),
             "the authenticated chunk digest cannot diverge from the owned plaintext"
         );
-        let mut chunk_mutation = chunk_wire;
-        *chunk_mutation.last_mut().unwrap() ^= 1;
+        chunk_wire[digest_offset] ^= 1;
+        *chunk_wire.last_mut().unwrap() ^= 1;
         assert!(matches!(
-            GuardianCheckpointStageRequestV1::decode(&chunk_mutation),
+            GuardianCheckpointStageRequestV1::decode(&chunk_wire),
             Err(GuardianProtocolError::InvalidOperationPayload)
         ));
-        let mut reserved_mutation = begin_wire;
-        reserved_mutation[7] = 1;
+        begin_wire[7] = 1;
         assert!(matches!(
-            GuardianCheckpointStageRequestV1::decode(&reserved_mutation),
+            GuardianCheckpointStageRequestV1::decode(&begin_wire),
             Err(GuardianProtocolError::InvalidOperationPayload)
         ));
 
@@ -13856,9 +13953,9 @@ mod tests {
             chunk_bytes,
         )
         .unwrap()
-        .encode()
+        .into_zeroizing_payload()
         .unwrap();
-        let begin = authenticate(&request(
+        let begin = authenticate(&request_zeroizing(
             GuardianOperation::CheckpointStage,
             guardian,
             mux,
@@ -13867,7 +13964,7 @@ mod tests {
             generation,
             0,
             None,
-            &begin_payload,
+            begin_payload,
         ));
         let ready = GuardianCheckpointStageReplyV1::Ready {
             upload_id,
@@ -13913,12 +14010,12 @@ mod tests {
             descriptor,
             chunk_bytes,
             0,
-            Zeroizing::new(canonical[..first_len].to_vec()),
+            zeroizing_vec_from_slice(&canonical[..first_len]),
         )
         .unwrap()
-        .encode()
+        .into_zeroizing_payload()
         .unwrap();
-        let chunk = authenticate(&request(
+        let chunk = authenticate(&request_zeroizing(
             GuardianOperation::CheckpointStage,
             guardian,
             mux,
@@ -13927,7 +14024,7 @@ mod tests {
             generation,
             0,
             None,
-            &chunk_payload,
+            chunk_payload,
         ));
         let progress = GuardianCheckpointStageReplyV1::Progress {
             upload_id,
@@ -13969,9 +14066,9 @@ mod tests {
             chunk_bytes,
         )
         .unwrap()
-        .encode()
+        .into_zeroizing_payload()
         .unwrap();
-        let seal = authenticate(&request(
+        let seal = authenticate(&request_zeroizing(
             GuardianOperation::CheckpointStage,
             guardian,
             mux,
@@ -13980,7 +14077,7 @@ mod tests {
             generation,
             0,
             None,
-            &seal_payload,
+            seal_payload,
         ));
         let sealed = GuardianCheckpointStageReplyV1::Sealed {
             upload_id,
@@ -14314,13 +14411,17 @@ mod tests {
         assert_eq!(records.previous_record_digest(), [0x55; 32]);
         assert_eq!(records.record_count(), 2);
         assert_eq!(records.plaintext_bytes(), 11);
-        let mut plaintext = Vec::new();
+        let mut plaintext = Zeroizing::new(Vec::new());
         let metadata = records
             .into_records()
             .into_iter()
-            .map(|record| record.write_all_bounded(&mut plaintext, 4_096).unwrap())
+            .map(|record| {
+                record
+                    .write_all_bounded(&mut *plaintext, 4_096)
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
-        assert_eq!(plaintext, b"first\nlast\n");
+        assert_eq!(plaintext.as_slice(), b"first\nlast\n");
         assert_eq!(
             metadata
                 .iter()
@@ -14331,7 +14432,7 @@ mod tests {
         assert_eq!(metadata[0].predecessor().unwrap().last_sequence(), 7);
         assert_eq!(metadata[1].cumulative_plaintext_bytes(), 523);
 
-        let mut page_digest_mutation = replay_output_page(
+        let mut page_digest_mutation: Zeroizing<Vec<u8>> = replay_output_page(
             pane,
             generation,
             snapshot_id,
@@ -14517,7 +14618,7 @@ mod tests {
                     GuardianCheckpointChunkDelivery::new(
                         descriptor,
                         u64::try_from(offset).unwrap(),
-                        Zeroizing::new(canonical[offset..end].to_vec()),
+                        zeroizing_vec_from_slice(&canonical[offset..end]),
                     )
                     .unwrap(),
                 ),
@@ -14624,16 +14725,16 @@ mod tests {
         else {
             panic!("exact checkpoint replay must begin with checkpoint bytes");
         };
-        let expected_chunk = canonical[..chunk.byte_len()].to_vec();
+        let expected_chunk = zeroizing_vec_from_slice(&canonical[..chunk.byte_len()]);
         let expected_chunk_digest = zeroizing_sha256_digest(&expected_chunk);
         assert_eq!(chunk.chunk_digest(), expected_chunk_digest.as_slice());
-        let mut delivered_chunk = Vec::new();
+        let mut delivered_chunk = Zeroizing::new(Vec::new());
         let (_, offset, delivered_bytes) = chunk
-            .write_all_bounded(&mut delivered_chunk, 4_096)
+            .write_all_bounded(&mut *delivered_chunk, 4_096)
             .unwrap();
         assert_eq!(offset, 0);
         assert_eq!(usize::try_from(delivered_bytes).unwrap(), expected_chunk.len());
-        assert_eq!(delivered_chunk, expected_chunk);
+        assert_eq!(delivered_chunk.as_slice(), expected_chunk.as_slice());
 
         assert!(matches!(
             GuardianResponseEnvelope::replay_page(&exact, checkpoint_page(1)),
@@ -14930,6 +15031,25 @@ mod tests {
         assert!(source.contains("#[derive(PartialEq)]\npub struct GuardianSpawnPayload"));
         assert!(!source.contains("#[derive(Clone, PartialEq)]\npub struct GuardianSpawnPayload"));
         assert!(source.matches("payload: Zeroizing<Vec<u8>>").count() >= 2);
+        assert!(source.contains(concat!(
+            "fn zeroizing_vec_from_slice(bytes: &[u8]) -> ",
+            "Zeroizing<Vec<u8>>"
+        )));
+        assert!(source.contains(
+            "pub fn into_zeroizing_payload(\n        self,\n    ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError>"
+        ));
+        assert!(source.contains(concat!(
+            "let mut payload = Zeroizing::new(",
+            "Vec::with_capacity(capacity));"
+        )));
+        assert!(source.contains(concat!(
+            ") -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {\n",
+            "        self.body.validate()?;\n        let body_bytes = self.encode_body()?;"
+        )));
+        assert!(source.contains(concat!(
+            "fn encode_body(&self) -> Result<",
+            "Zeroizing<Vec<u8>>, GuardianProtocolError>"
+        )));
         assert!(source.contains("impl Drop for GuardianRequestEnvelope"));
         assert!(source.contains("impl Drop for GuardianResponseEnvelope"));
         for forbidden in [
@@ -14938,6 +15058,24 @@ mod tests {
             "#[derive(Clone, Eq, PartialEq)]\npub struct GuardianResponseEnvelope",
             "#[derive(Clone, Eq, PartialEq)]\npub struct AuthenticatedGuardianResponse",
             "#[derive(Clone, Eq, PartialEq)]\npub struct CorrelatedGuardianResponse",
+        ] {
+            assert!(!source.contains(forbidden));
+        }
+        for forbidden in [
+            concat!(
+                "let chunk_plaintext = canonical[..first_len]",
+                ".to_vec();"
+            ),
+            concat!("let chunk_wire = chunk.", "encode().unwrap();"),
+            concat!("let mut digest_mutation = chunk_wire", ".clone();"),
+            concat!(
+                "payload[CHECKPOINT_STAGE_CHUNK_FIXED_BYTES..]",
+                ".to_vec()"
+            ),
+            concat!(
+                "payload[REPLAY_CHECKPOINT_CHUNK_FIXED_BYTES..]",
+                ".to_vec()"
+            ),
         ] {
             assert!(!source.contains(forbidden));
         }

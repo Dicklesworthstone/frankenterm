@@ -59,6 +59,7 @@ rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true
 sha2 = { workspace = true, features = ["zeroize"] }
+static_assertions = "1.1.0"
 serial2.workspace = true
 shell-words.workspace = true
 terminfo.workspace = true
@@ -91,7 +92,6 @@ criterion = "0.8.2"
 k9.workspace = true
 promise = { workspace = true, features = ["test-support"] }
 proptest = "1.8.0"
-static_assertions = "1.1.0"
 syn = { workspace = true, features = ["extra-traits", "full", "visit"] }
 tempfile.workspace = true
 

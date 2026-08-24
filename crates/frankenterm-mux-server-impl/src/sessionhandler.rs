@@ -23,7 +23,7 @@ use codec::{
     ReliableKeyEventRejectionV1, ReliableKeyEventRetryV1, ReliableKeyEventTracedV1,
     ReliableKeyEventV1, ReliableKeyEventV1Response, ReliablePaneRegistrationIdentityV1,
     ReliablePaneWriteOutcomeV1, ReliablePaneWriteRejectionV1, ReliablePaneWriteRetryV1,
-    ReliablePaneWriteV1, ReliablePaneWriteV1Response, RemoveFloatingPane, RenameWorkspace, Resize,
+    ReliablePaneWriteV1Response, RemoveFloatingPane, RenameWorkspace, Resize,
     SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp,
     SendMouseEvent, SendPaste, SendPasteTracedV1, SetActiveWorkspace, SetClientId,
     SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,

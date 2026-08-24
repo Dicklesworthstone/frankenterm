@@ -18,6 +18,7 @@ ordered-float = {workspace = true, optional=true}
 sha2 = {workspace=true, optional=true}
 serde = {workspace=true, optional=true}
 thiserror = {workspace=true, optional=true}
+zeroize.workspace = true
 frankenterm-blob-leases = {workspace = true, optional=true}
 frankenterm-char-props.workspace = true
 frankenterm-color-types.workspace = true

@@ -3,8 +3,18 @@ use core::hash::{Hash, Hasher};
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
+use zeroize::Zeroize;
 
 use crate::allocate::*;
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+std::thread_local! {
+    static HYPERLINK_WIPE_INVOCATIONS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
 
 fn percent_encode_byte(f: &mut core::fmt::Formatter, byte: u8) -> core::fmt::Result {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -203,7 +213,29 @@ impl Hyperlink {
             Ok(Some(Hyperlink::new_with_params(uri, params)))
         }
     }
+
+    fn wipe_owned_text(&mut self) {
+        self.uri.zeroize();
+        // `HashMap` is a `BTreeMap` alias in the no_std build.  Taking and
+        // consuming the map is the common, allocation-free full-drain path for
+        // both representations and gives us owned access to every string.
+        for (mut key, mut value) in core::mem::take(&mut self.params) {
+            key.zeroize();
+            value.zeroize();
+        }
+
+        #[cfg(test)]
+        HYPERLINK_WIPE_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    }
 }
+
+impl Drop for Hyperlink {
+    fn drop(&mut self) {
+        self.wipe_owned_text();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Hyperlink {}
 
 impl core::fmt::Display for Hyperlink {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -232,6 +264,11 @@ impl core::fmt::Display for Hyperlink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
+
+    fn hyperlink_wipe_invocations() -> usize {
+        HYPERLINK_WIPE_INVOCATIONS.with(|count| count.get())
+    }
 
     #[test]
     fn new_creates_non_implicit_link() {
@@ -309,6 +346,47 @@ mod tests {
         let link = Hyperlink::new_with_id("https://example.com", "id1");
         let cloned = link.clone();
         assert_eq!(link, cloned);
+    }
+
+    #[test]
+    fn wipe_owned_text_clears_uri_and_every_param() {
+        fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        require_zeroize_on_drop::<Hyperlink>();
+
+        let mut params = HashMap::new();
+        params.insert("identity".to_string(), "sensitive-value".to_string());
+        params.insert("class".to_string(), "private".to_string());
+        let mut link = Hyperlink::new_with_params("secret://terminal/session", params);
+        let before = hyperlink_wipe_invocations();
+
+        link.wipe_owned_text();
+
+        assert!(link.uri().is_empty());
+        assert!(link.params().is_empty());
+        assert_eq!(hyperlink_wipe_invocations(), before + 1);
+    }
+
+    #[test]
+    fn arc_only_runs_hyperlink_wipe_for_the_final_owner() {
+        let mut params = HashMap::new();
+        params.insert("identity".to_string(), "sensitive-value".to_string());
+        params.insert("class".to_string(), "private".to_string());
+        let first = Arc::new(Hyperlink::new_with_params(
+            "secret://terminal/session",
+            params,
+        ));
+        let retained = Arc::clone(&first);
+        let before = hyperlink_wipe_invocations();
+
+        drop(first);
+
+        assert_eq!(hyperlink_wipe_invocations(), before);
+        assert_eq!(retained.uri(), "secret://terminal/session");
+        assert_eq!(retained.params().len(), 2);
+
+        drop(retained);
+
+        assert_eq!(hyperlink_wipe_invocations(), before + 1);
     }
 
     #[test]

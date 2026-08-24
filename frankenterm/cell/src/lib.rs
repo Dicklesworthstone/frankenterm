@@ -26,6 +26,7 @@ use frankenterm_dynamic::{FromDynamic, ToDynamic};
 pub use frankenterm_escape_parser::osc::Hyperlink;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::{Zeroize, Zeroizing};
 
 extern crate alloc;
 use crate::alloc::string::ToString;
@@ -1014,7 +1015,7 @@ fn deserialize_teenystring<'de, D>(deserializer: D) -> Result<TeenyString, D::Er
 where
     D: Deserializer<'de>,
 {
-    let text = String::deserialize(deserializer)?;
+    let text = Zeroizing::new(String::deserialize(deserializer)?);
     Ok(TeenyString::from_str(&text, None, None))
 }
 
@@ -1044,9 +1045,27 @@ where
 /// strings).
 struct TeenyString(u64);
 struct TeenyStringHeap {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
     width: usize,
 }
+
+impl TeenyStringHeap {
+    fn wipe_owned_bytes(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl Drop for TeenyStringHeap {
+    fn drop(&mut self) {
+        // `Zeroizing` repeats this operation when its field drops.  Keeping
+        // the explicit call here makes the heap owner's destruction contract
+        // local and leaves no interval between owner Drop and field Drop in
+        // which terminal text remains live.
+        self.wipe_owned_bytes();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for TeenyStringHeap {}
 
 impl TeenyString {
     const fn marker_mask() -> u64 {
@@ -1159,7 +1178,7 @@ impl TeenyString {
             Self(word)
         } else {
             let vec = Box::new(TeenyStringHeap {
-                bytes: bytes.to_vec(),
+                bytes: Zeroizing::new(bytes.to_vec()),
                 width,
             });
             let ptr = Box::into_raw(vec);
@@ -1221,16 +1240,27 @@ impl TeenyString {
             unsafe { (*heap).bytes.as_slice() }
         }
     }
+
+    fn wipe_inline_storage(&mut self) {
+        debug_assert!(Self::is_marker_bit_set(self.0));
+        self.0.zeroize();
+    }
 }
 
 impl Drop for TeenyString {
     fn drop(&mut self) {
-        if !Self::is_marker_bit_set(self.0) {
-            let vec = unsafe { Box::from_raw(self.0 as *mut usize as *mut TeenyStringHeap) };
-            drop(vec);
+        if Self::is_marker_bit_set(self.0) {
+            self.wipe_inline_storage();
+        } else {
+            let ptr = self.0 as *mut usize as *mut TeenyStringHeap;
+            self.0.zeroize();
+            let heap = unsafe { Box::from_raw(ptr) };
+            drop(heap);
         }
     }
 }
+
+impl zeroize::ZeroizeOnDrop for TeenyString {}
 
 impl core::clone::Clone for TeenyString {
     fn clone(&self) -> Self {
@@ -2305,6 +2335,40 @@ mod test {
         let s = TeenyString::from_str("a long string that goes on heap", None, None);
         let c = s.clone();
         assert_eq!(s.str(), c.str());
+        assert_ne!(s.0, c.0, "heap-backed clones must own distinct buffers");
+        drop(s);
+        assert_eq!(c.str(), "a long string that goes on heap");
+    }
+
+    #[test]
+    fn teeny_string_inline_wipe_clears_the_packed_word() {
+        let mut s = TeenyString::from_str("secret", None, None);
+        assert!(TeenyString::is_marker_bit_set(s.0));
+
+        s.wipe_inline_storage();
+
+        assert_eq!(s.0, 0, "inline terminal text must be overwritten");
+        // Restore a valid empty-of-secret inline representation so the normal
+        // Drop path can run at scope exit after this direct helper probe.
+        s.0 = TeenyString::space().0;
+    }
+
+    #[test]
+    fn teeny_string_heap_owner_wipes_its_guarded_buffer() {
+        fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        require_zeroize_on_drop::<TeenyString>();
+        require_zeroize_on_drop::<TeenyStringHeap>();
+
+        let mut heap = TeenyStringHeap {
+            bytes: Zeroizing::new(b"semantic terminal text".to_vec()),
+            width: 1,
+        };
+        let capacity = heap.bytes.capacity();
+
+        heap.wipe_owned_bytes();
+
+        assert!(heap.bytes.is_empty());
+        assert_eq!(heap.bytes.capacity(), capacity);
     }
 
     #[test]

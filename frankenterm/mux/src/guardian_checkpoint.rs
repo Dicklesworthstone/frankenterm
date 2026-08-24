@@ -11,7 +11,8 @@ use crate::guardian_output_journal::{
     GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputSegmentIdentity,
 };
 use crate::guardian_protocol::{
-    GuardianCheckpointScopeV1, GuardianCheckpointStageKindV1,
+    GuardianCheckpointChunkDelivery, GuardianCheckpointScopeV1,
+    GuardianCheckpointStageChunkDeliveryV1, GuardianCheckpointStageKindV1,
     GuardianCheckpointStageRequestV1,
 };
 use crate::pane::Pane;
@@ -3347,16 +3348,39 @@ pub enum GuardianCheckpointBoundaryError {
     TerminalPayloadDigestMismatch,
 }
 
+// These assertions are deliberately compiled in every mux build. Keeping
+// them outside `cfg(test)` closes the configuration seam where a production-
+// only `Clone`/`Copy` implementation could otherwise coexist with a green
+// unit-test build.
+static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedStageAssemblyV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedManifestAuthorityV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointStageSealIntentV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedManifestOperationV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointManifestRetryCapabilityV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointManifestSealCapabilitiesV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(LiveParserCaptureAuthority: Clone, Copy);
+static_assertions::assert_not_impl_any!(LiveParserCheckpointAck: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);
+static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);
+static_assertions::assert_impl_all!(Sha256: zeroize::ZeroizeOnDrop);
+static_assertions::assert_impl_all!(Zeroizing<[u8; 32]>: zeroize::ZeroizeOnDrop);
+static_assertions::assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);
+static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);
+static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);
+static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::ZeroizeOnDrop);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::guardian_output_journal::{
         GuardianOutputCipher, GuardianOutputJournal, GuardianOutputJournalLimits,
     };
-    use crate::guardian_protocol::{
-        GuardianCheckpointChunkDelivery, GuardianCheckpointDescriptorV1,
-        GuardianCheckpointStageChunkDeliveryV1,
-    };
+    use crate::guardian_protocol::GuardianCheckpointDescriptorV1;
     use frankenterm_term::terminalstate::checkpoint::TerminalCheckpointLimits;
     use frankenterm_term::{
         RecoveryTerminalCheckpointV2, Terminal, TerminalConfiguration, TerminalSize,
@@ -3364,7 +3388,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs::File;
     use std::sync::Arc;
-    use static_assertions::{assert_impl_all, assert_not_impl_any};
     use syn::visit::{self, Visit};
     use tempfile::tempdir;
 
@@ -3382,31 +3405,6 @@ mod tests {
         "LiveParserCaptureAuthority",
         "LiveParserCheckpointAck",
     ];
-
-    assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointValidatedStageAssemblyV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointValidatedManifestAuthorityV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointStageSealIntentV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointValidatedManifestOperationV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointManifestRetryCapabilityV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointManifestSealCapabilitiesV1: Clone, Copy);
-    assert_not_impl_any!(LiveParserCaptureAuthority: Clone, Copy);
-    assert_not_impl_any!(LiveParserCheckpointAck: Clone, Copy);
-    // These protocol-owned plaintext holders have their complete field and
-    // constructor inventory in guardian_protocol.rs. This module adds a
-    // compiler-grounded boundary assertion because both are consumed by the
-    // checkpoint storage/cipher path whose authority surface is frozen below.
-    assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);
-    assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);
-    assert_impl_all!(Sha256: zeroize::ZeroizeOnDrop);
-    assert_impl_all!(Zeroizing<[u8; 32]>: zeroize::ZeroizeOnDrop);
-    assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);
-    assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);
-    assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);
-    assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::ZeroizeOnDrop);
 
     #[derive(Clone, Debug, PartialEq)]
     struct AuthorityFieldSurface {
@@ -3491,6 +3489,12 @@ mod tests {
         syn::parse_str(item).expect("parse frozen production use item")
     }
 
+    fn expected_item_macro(item: &str) -> syn::Macro {
+        syn::parse_str::<syn::ItemMacro>(item)
+            .expect("parse frozen production item macro")
+            .mac
+    }
+
     #[derive(Default)]
     struct AuthoritySurfaceAstInventory {
         derives: Vec<String>,
@@ -3505,7 +3509,7 @@ mod tests {
         return_sites: Vec<String>,
         construction_sites: Vec<String>,
         aliases_or_storage: Vec<String>,
-        item_macros: Vec<String>,
+        item_macros: Vec<syn::Macro>,
         expression_macros: Vec<AuthorityMacroSurface>,
         uses: Vec<syn::ItemUse>,
         modules: Vec<String>,
@@ -4019,9 +4023,7 @@ mod tests {
         }
 
         fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
-            self.item_macros.push(
-                Self::path_name(&item.mac.path).unwrap_or_else(|| "<anonymous>".to_owned()),
-            );
+            self.item_macros.push(item.mac.clone());
             visit::visit_item_macro(self, item);
         }
 
@@ -4132,6 +4134,709 @@ mod tests {
             }
             visit::visit_expr_path(self, path);
         }
+    }
+
+    const PROTOCOL_DELIVERY_CRITICAL_TYPES: &[&str] = &[
+        "GuardianCheckpointStageChunkDeliveryV1",
+        "GuardianCheckpointChunkDelivery",
+        "GuardianCheckpointChunkNonDuplicable",
+    ];
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ProtocolDeliveryStructSurface {
+        name: String,
+        visibility: String,
+        fields: syn::Fields,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ProtocolDeliveryStorageSurface {
+        kind: String,
+        owner: String,
+        slot: String,
+        visibility: String,
+        ty: syn::Type,
+    }
+
+    #[derive(Default)]
+    struct ProtocolDeliveryAstInventory {
+        structs: Vec<ProtocolDeliveryStructSurface>,
+        derives: Vec<String>,
+        impls: Vec<String>,
+        methods: Vec<AuthorityMethodSurface>,
+        return_sites: Vec<String>,
+        construction_sites: Vec<String>,
+        storage: Vec<ProtocolDeliveryStorageSurface>,
+        protected_uses: Vec<syn::ItemUse>,
+        type_aliases: Vec<syn::ItemType>,
+        impl_associated_types: Vec<(String, syn::ImplItemType)>,
+        trait_associated_types: Vec<syn::TraitItemType>,
+        typed_storage: Vec<String>,
+        protected_associated_items: Vec<String>,
+        clone_like_factories: Vec<AuthorityMethodSurface>,
+        conditional_surfaces: Vec<String>,
+        out_of_line_modules: Vec<String>,
+        item_macros: Vec<syn::Macro>,
+        unexpected_macros: Vec<syn::Macro>,
+        projection_sites: Vec<String>,
+        unexpected_attributes: Vec<String>,
+        unexpected_derives: Vec<String>,
+        current_impl_owner: Option<String>,
+        current_function: Option<String>,
+    }
+
+    impl ProtocolDeliveryAstInventory {
+        fn protected(name: &str) -> bool {
+            PROTOCOL_DELIVERY_CRITICAL_TYPES.contains(&name)
+        }
+
+        fn path_label(path: &syn::Path) -> String {
+            path.segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::")
+        }
+
+        fn direct_type_name(ty: &syn::Type) -> Option<String> {
+            let syn::Type::Path(path) = ty else {
+                return None;
+            };
+            path.path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+        }
+
+        fn parse_meta_list(list: &syn::MetaList) -> Option<Vec<syn::Meta>> {
+            list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .ok()
+            .map(|items| items.into_iter().collect())
+        }
+
+        // True only when the cfg expression cannot be enabled with
+        // `cfg(test) == false`. Unknown platform/features remain conservative.
+        fn cfg_false_in_every_production_build(meta: &syn::Meta) -> bool {
+            match meta {
+                syn::Meta::Path(path) => path.is_ident("test"),
+                syn::Meta::List(list) if list.path.is_ident("all") => {
+                    Self::parse_meta_list(list).is_some_and(|nested| {
+                        nested
+                            .iter()
+                            .any(Self::cfg_false_in_every_production_build)
+                    })
+                }
+                syn::Meta::List(list) if list.path.is_ident("any") => {
+                    Self::parse_meta_list(list).is_some_and(|nested| {
+                        !nested.is_empty()
+                            && nested
+                                .iter()
+                                .all(Self::cfg_false_in_every_production_build)
+                    })
+                }
+                syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+            }
+        }
+
+        fn cfg_test_only(attributes: &[syn::Attribute]) -> bool {
+            attributes.iter().any(|attribute| {
+                attribute.path().is_ident("cfg")
+                    && attribute
+                        .parse_args::<syn::Meta>()
+                        .is_ok_and(|meta| Self::cfg_false_in_every_production_build(&meta))
+            })
+        }
+
+        fn type_names(ty: &syn::Type, owner: Option<&str>) -> Vec<String> {
+            struct TypeVisitor<'a> {
+                owner: Option<&'a str>,
+                names: BTreeSet<String>,
+            }
+            impl<'ast> Visit<'ast> for TypeVisitor<'_> {
+                fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+                    for segment in &path.path.segments {
+                        let name = if segment.ident == "Self" {
+                            self.owner.unwrap_or("Self").to_owned()
+                        } else {
+                            segment.ident.to_string()
+                        };
+                        if ProtocolDeliveryAstInventory::protected(&name) {
+                            self.names.insert(name);
+                        }
+                    }
+                    visit::visit_type_path(self, path);
+                }
+            }
+            let mut visitor = TypeVisitor {
+                owner,
+                names: BTreeSet::new(),
+            };
+            visitor.visit_type(ty);
+            visitor.names.into_iter().collect()
+        }
+
+        fn signature_names(
+            signature: &syn::Signature,
+            owner: Option<&str>,
+        ) -> Vec<String> {
+            let mut names = BTreeSet::new();
+            for input in &signature.inputs {
+                let ty = match input {
+                    syn::FnArg::Receiver(receiver) => receiver.ty.as_ref(),
+                    syn::FnArg::Typed(argument) => argument.ty.as_ref(),
+                };
+                names.extend(Self::type_names(ty, owner));
+            }
+            if let syn::ReturnType::Type(_, ty) = &signature.output {
+                names.extend(Self::type_names(ty, owner));
+            }
+            names.into_iter().collect()
+        }
+
+        fn return_names(
+            output: &syn::ReturnType,
+            owner: Option<&str>,
+        ) -> Vec<String> {
+            let syn::ReturnType::Type(_, ty) = output else {
+                return Vec::new();
+            };
+            Self::type_names(ty, owner)
+        }
+
+        fn duplicate_like(name: &str) -> bool {
+            let name = name.to_ascii_lowercase();
+            ["clone", "copy", "duplicat", "replicat", "fork", "repeat"]
+                .iter()
+                .any(|needle| name.contains(needle))
+                || name == "to_owned"
+        }
+
+        fn record_signature(
+            &mut self,
+            owner: Option<&str>,
+            signature: &syn::Signature,
+            visibility: &syn::Visibility,
+        ) {
+            let owner_label = owner.unwrap_or("<free>");
+            let surface = AuthorityMethodSurface {
+                owner: owner_label.to_owned(),
+                visibility: AuthoritySurfaceAstInventory::visibility(visibility),
+                cfg_test: false,
+                signature: signature.clone(),
+            };
+            if Self::protected(owner_label)
+                || !Self::signature_names(signature, owner).is_empty()
+            {
+                self.methods.push(surface.clone());
+            }
+            if Self::duplicate_like(&signature.ident.to_string()) {
+                self.clone_like_factories.push(surface);
+            }
+            for returned in Self::return_names(&signature.output, owner) {
+                self.return_sites.push(format!(
+                    "{returned}@{owner_label}::{}:{}:production",
+                    signature.ident,
+                    AuthoritySurfaceAstInventory::visibility(visibility)
+                ));
+            }
+        }
+
+        fn record_conditional(&mut self, label: &str, attributes: &[syn::Attribute]) {
+            for attribute in attributes {
+                if attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr") {
+                    self.conditional_surfaces
+                        .push(format!("{label}:{}", Self::path_label(attribute.path())));
+                }
+            }
+        }
+
+        fn record_construction(&mut self, constructed: &str) {
+            self.construction_sites.push(format!(
+                "{constructed}@{}::{}",
+                self.current_impl_owner.as_deref().unwrap_or("<free>"),
+                self.current_function.as_deref().unwrap_or("<item>")
+            ));
+        }
+
+        fn constructed_name(&self, path: &syn::Path) -> Option<String> {
+            path.segments.iter().find_map(|segment| {
+                if segment.ident == "Self" {
+                    self.current_impl_owner
+                        .as_ref()
+                        .filter(|owner| Self::protected(owner))
+                        .cloned()
+                } else {
+                    let name = segment.ident.to_string();
+                    Self::protected(&name).then_some(name)
+                }
+            })
+        }
+
+        fn use_tree_mentions_protected(tree: &syn::UseTree) -> bool {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    Self::protected(&path.ident.to_string())
+                        || Self::use_tree_mentions_protected(&path.tree)
+                }
+                syn::UseTree::Name(name) => Self::protected(&name.ident.to_string()),
+                syn::UseTree::Rename(rename) => {
+                    Self::protected(&rename.ident.to_string())
+                        || Self::protected(&rename.rename.to_string())
+                }
+                syn::UseTree::Group(group) => {
+                    group.items.iter().any(Self::use_tree_mentions_protected)
+                }
+                syn::UseTree::Glob(_) => false,
+            }
+        }
+
+        fn validate_derive_meta(meta: &syn::Meta, unexpected: &mut Vec<String>) {
+            let syn::Meta::List(list) = meta else {
+                unexpected.push("malformed-derive".to_owned());
+                return;
+            };
+            let Some(derives) = Self::parse_meta_list(list) else {
+                unexpected.push("malformed-derive".to_owned());
+                return;
+            };
+            const ALLOWED: &[&str] = &[
+                "Clone",
+                "Copy",
+                "Debug",
+                "Default",
+                "Eq",
+                "Error",
+                "Hash",
+                "PartialEq",
+                "Zeroize",
+                "ZeroizeOnDrop",
+            ];
+            for derive in derives {
+                let syn::Meta::Path(path) = derive else {
+                    unexpected.push("malformed-derive-entry".to_owned());
+                    continue;
+                };
+                let name = path
+                    .segments
+                    .last()
+                    .map_or_else(|| "<anonymous>".to_owned(), |segment| segment.ident.to_string());
+                if path.segments.len() != 1 || !ALLOWED.contains(&name.as_str()) {
+                    unexpected.push(name);
+                }
+            }
+        }
+
+        fn validate_cfg_attr(meta: &syn::Meta, unexpected: &mut Vec<String>) {
+            let syn::Meta::List(list) = meta else {
+                unexpected.push("malformed-cfg-attr".to_owned());
+                return;
+            };
+            let Some(nested) = Self::parse_meta_list(list) else {
+                unexpected.push("malformed-cfg-attr".to_owned());
+                return;
+            };
+            for effect in nested.iter().skip(1) {
+                let path = effect.path();
+                let name = path
+                    .segments
+                    .last()
+                    .map_or_else(|| "<anonymous>".to_owned(), |segment| segment.ident.to_string());
+                const INERT: &[&str] = &[
+                    "allow", "cfg", "derive", "doc", "error", "from", "must_use",
+                    "repr", "source",
+                ];
+                if path.segments.len() != 1 || !INERT.contains(&name.as_str()) {
+                    unexpected.push(name);
+                } else if name == "derive" {
+                    Self::validate_derive_meta(effect, unexpected);
+                } else if name == "cfg_attr" {
+                    Self::validate_cfg_attr(effect, unexpected);
+                }
+            }
+        }
+
+        fn type_mentions_protected(ty: &syn::Type, owner: Option<&str>) -> bool {
+            !Self::type_names(ty, owner).is_empty()
+        }
+
+        fn record_typed_storage(&mut self, kind: &str, owner: &str, ty: &syn::Type) {
+            if Self::type_mentions_protected(ty, Some(owner)) {
+                self.typed_storage.push(format!("{kind}:{owner}"));
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for ProtocolDeliveryAstInventory {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            if item.content.is_none() {
+                self.out_of_line_modules.push(item.ident.to_string());
+            }
+            visit::visit_item_mod(self, item);
+        }
+
+        fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+            let name = attribute
+                .path()
+                .segments
+                .last()
+                .map_or_else(|| "<anonymous>".to_owned(), |segment| segment.ident.to_string());
+            const INERT: &[&str] = &[
+                "allow", "cfg", "cfg_attr", "derive", "doc", "error", "from", "must_use",
+                "repr", "source", "test",
+            ];
+            if attribute.path().segments.len() != 1 || !INERT.contains(&name.as_str()) {
+                self.unexpected_attributes.push(name);
+            } else if name == "derive" {
+                Self::validate_derive_meta(&attribute.meta, &mut self.unexpected_derives);
+            } else if name == "cfg_attr" {
+                Self::validate_cfg_attr(&attribute.meta, &mut self.unexpected_attributes);
+            }
+            visit::visit_attribute(self, attribute);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if Self::use_tree_mentions_protected(&item.tree) {
+                self.protected_uses.push(item.clone());
+            }
+            visit::visit_item_use(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            let owner = item.ident.to_string();
+            if Self::protected(&owner) {
+                self.structs.push(ProtocolDeliveryStructSurface {
+                    name: owner.clone(),
+                    visibility: AuthoritySurfaceAstInventory::visibility(&item.vis),
+                    fields: item.fields.clone(),
+                });
+                for derived in AuthoritySurfaceAstInventory::derive_names(&item.attrs) {
+                    self.derives.push(format!("{owner}:{derived}"));
+                }
+                self.record_conditional(&format!("struct:{owner}"), &item.attrs);
+            } else {
+                for (index, field) in item.fields.iter().enumerate() {
+                    if Self::type_mentions_protected(&field.ty, Some(&owner)) {
+                        self.storage.push(ProtocolDeliveryStorageSurface {
+                            kind: "struct".to_owned(),
+                            owner: owner.clone(),
+                            slot: field.ident.as_ref().map_or_else(
+                                || format!("<unnamed:{index}>"),
+                                ToString::to_string,
+                            ),
+                            visibility: AuthoritySurfaceAstInventory::visibility(&field.vis),
+                            ty: field.ty.clone(),
+                        });
+                        self.record_conditional(&format!("struct:{owner}"), &item.attrs);
+                    }
+                }
+            }
+            visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            let owner = item.ident.to_string();
+            for variant in &item.variants {
+                for (index, field) in variant.fields.iter().enumerate() {
+                    if Self::type_mentions_protected(&field.ty, Some(&owner)) {
+                        self.storage.push(ProtocolDeliveryStorageSurface {
+                            kind: "enum".to_owned(),
+                            owner: owner.clone(),
+                            slot: format!("{}:<unnamed:{index}>", variant.ident),
+                            visibility: AuthoritySurfaceAstInventory::visibility(&field.vis),
+                            ty: field.ty.clone(),
+                        });
+                        self.record_conditional(&format!("enum:{owner}"), &item.attrs);
+                    }
+                }
+            }
+            visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            let owner = item.ident.to_string();
+            for field in &item.fields.named {
+                if Self::type_mentions_protected(&field.ty, Some(&owner)) {
+                    self.storage.push(ProtocolDeliveryStorageSurface {
+                        kind: "union".to_owned(),
+                        owner: owner.clone(),
+                        slot: field
+                            .ident
+                            .as_ref()
+                            .map_or_else(|| "<unnamed>".to_owned(), ToString::to_string),
+                        visibility: AuthoritySurfaceAstInventory::visibility(&field.vis),
+                        ty: field.ty.clone(),
+                    });
+                    self.record_conditional(&format!("union:{owner}"), &item.attrs);
+                }
+            }
+            visit::visit_item_union(self, item);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if Self::cfg_test_only(&item.attrs) {
+                return;
+            }
+            let owner = Self::direct_type_name(&item.self_ty);
+            if let Some(owner) = owner.as_deref().filter(|name| Self::protected(name)) {
+                let implemented = item.trait_.as_ref().map_or_else(
+                    || "<inherent>".to_owned(),
+                    |(_, path, _)| Self::path_label(path),
+                );
+                self.impls.push(format!("{owner}:{implemented}"));
+                self.record_conditional(&format!("impl:{owner}:{implemented}"), &item.attrs);
+            }
+            let previous_owner = self.current_impl_owner.clone();
+            self.current_impl_owner = owner;
+            visit::visit_item_impl(self, item);
+            self.current_impl_owner = previous_owner;
+        }
+
+        fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+            if Self::cfg_test_only(&function.attrs) {
+                return;
+            }
+            let owner = self.current_impl_owner.clone();
+            self.record_signature(owner.as_deref(), &function.sig, &function.vis);
+            if owner.as_deref().is_some_and(Self::protected) {
+                self.record_conditional(
+                    &format!(
+                        "method:{}::{}",
+                        owner.as_deref().unwrap_or("<unknown>"),
+                        function.sig.ident
+                    ),
+                    &function.attrs,
+                );
+            }
+            let previous_function = self.current_function.replace(function.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, function);
+            self.current_function = previous_function;
+        }
+
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            if Self::cfg_test_only(&function.attrs) {
+                return;
+            }
+            self.record_signature(None, &function.sig, &function.vis);
+            let previous_function = self.current_function.replace(function.sig.ident.to_string());
+            visit::visit_item_fn(self, function);
+            self.current_function = previous_function;
+        }
+
+        fn visit_trait_item_fn(&mut self, function: &'ast syn::TraitItemFn) {
+            self.record_signature(None, &function.sig, &syn::Visibility::Inherited);
+            visit::visit_trait_item_fn(self, function);
+        }
+
+        fn visit_foreign_item_fn(&mut self, function: &'ast syn::ForeignItemFn) {
+            self.record_signature(None, &function.sig, &function.vis);
+            visit::visit_foreign_item_fn(self, function);
+        }
+
+        fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+            if let Some(constructed) = self.constructed_name(&expression.path) {
+                self.record_construction(&constructed);
+            }
+            visit::visit_expr_struct(self, expression);
+        }
+
+        fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = expression.func.as_ref() {
+                if let Some(constructed) = self.constructed_name(&path.path) {
+                    self.record_construction(&constructed);
+                }
+            }
+            visit::visit_expr_call(self, expression);
+        }
+
+        fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+            if expression.qself.is_some() {
+                self.projection_sites.push(format!(
+                    "{}::{}",
+                    self.current_impl_owner.as_deref().unwrap_or("<free>"),
+                    self.current_function.as_deref().unwrap_or("<item>")
+                ));
+            }
+            if expression.path.segments.len() == 1 {
+                let name = expression.path.segments[0].ident.to_string();
+                if name == "GuardianCheckpointChunkNonDuplicable"
+                    || (name == "Self"
+                        && self
+                            .current_impl_owner
+                            .as_deref()
+                            .is_some_and(Self::protected))
+                {
+                    let constructed = if name == "Self" {
+                        self.current_impl_owner
+                            .as_deref()
+                            .unwrap_or("Self")
+                            .to_owned()
+                    } else {
+                        name
+                    };
+                    self.record_construction(&constructed);
+                }
+            }
+            visit::visit_expr_path(self, expression);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if !Self::cfg_test_only(&item.attrs) {
+                self.type_aliases.push(item.clone());
+            }
+            visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+            self.record_typed_storage("static", &item.ident.to_string(), &item.ty);
+            visit::visit_item_static(self, item);
+        }
+
+        fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+            self.record_typed_storage("const", &item.ident.to_string(), &item.ty);
+            visit::visit_item_const(self, item);
+        }
+
+        fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
+            let owner = self.current_impl_owner.as_deref().unwrap_or("<unknown>");
+            if Self::protected(owner) {
+                self.protected_associated_items
+                    .push(format!("const:{owner}::{}", item.ident));
+            }
+            self.record_typed_storage("impl-const", owner, &item.ty);
+            visit::visit_impl_item_const(self, item);
+        }
+
+        fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+            let owner = self
+                .current_impl_owner
+                .as_deref()
+                .unwrap_or("<unknown>")
+                .to_owned();
+            if Self::protected(&owner) {
+                self.protected_associated_items
+                    .push(format!("type:{owner}::{}", item.ident));
+            }
+            self.record_typed_storage("impl-type", &owner, &item.ty);
+            self.impl_associated_types.push((owner, item.clone()));
+            visit::visit_impl_item_type(self, item);
+        }
+
+        fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
+            if item
+                .default
+                .as_ref()
+                .is_some_and(|(_, ty)| Self::type_mentions_protected(ty, None))
+            {
+                self.typed_storage
+                    .push(format!("trait-type:{}", item.ident));
+            }
+            self.trait_associated_types.push(item.clone());
+            visit::visit_trait_item_type(self, item);
+        }
+
+        fn visit_impl_item_macro(&mut self, item: &'ast syn::ImplItemMacro) {
+            if self
+                .current_impl_owner
+                .as_deref()
+                .is_some_and(Self::protected)
+            {
+                self.protected_associated_items.push(format!(
+                    "macro:{}",
+                    self.current_impl_owner.as_deref().unwrap_or("<unknown>")
+                ));
+            }
+            visit::visit_impl_item_macro(self, item);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            self.item_macros.push(item.mac.clone());
+            visit::visit_item_macro(self, item);
+        }
+
+        fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
+            let path = Self::path_label(&invocation.path);
+            const BUILTINS: &[&str] = &[
+                "debug_assert", "debug_assert_eq", "format", "matches", "unreachable",
+            ];
+            let production_assertion = matches!(
+                path.as_str(),
+                "static_assertions::assert_not_impl_any"
+                    | "static_assertions::assert_impl_all"
+            );
+            if !production_assertion
+                && (invocation.path.segments.len() != 1 || !BUILTINS.contains(&path.as_str()))
+            {
+                self.unexpected_macros.push(invocation.clone());
+            }
+            visit::visit_macro(self, invocation);
+        }
+
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            let self_projection = path.qself.is_none()
+                && path.path.segments.len() > 1
+                && path
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|segment| segment.ident == "Self");
+            if path.qself.is_some() || self_projection {
+                self.projection_sites.push(format!(
+                    "{}::{}",
+                    self.current_impl_owner.as_deref().unwrap_or("<free>"),
+                    self.current_function.as_deref().unwrap_or("<item>")
+                ));
+            }
+            visit::visit_type_path(self, path);
+        }
+    }
+
+    fn expected_protocol_delivery_struct(source: &str) -> ProtocolDeliveryStructSurface {
+        let item: syn::ItemStruct =
+            syn::parse_str(source).expect("parse frozen protocol delivery struct");
+        ProtocolDeliveryStructSurface {
+            name: item.ident.to_string(),
+            visibility: AuthoritySurfaceAstInventory::visibility(&item.vis),
+            fields: item.fields,
+        }
+    }
+
+    fn expected_protocol_delivery_storage(
+        kind: &str,
+        owner: &str,
+        slot: &str,
+        ty: &str,
+    ) -> ProtocolDeliveryStorageSurface {
+        ProtocolDeliveryStorageSurface {
+            kind: kind.to_owned(),
+            owner: owner.to_owned(),
+            slot: slot.to_owned(),
+            visibility: "private".to_owned(),
+            ty: syn::parse_str(ty).expect("parse frozen protocol delivery storage type"),
+        }
+    }
+
+    fn sort_protocol_delivery_structs(structs: &mut [ProtocolDeliveryStructSurface]) {
+        structs.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+
+    fn sort_protocol_delivery_storage(storage: &mut [ProtocolDeliveryStorageSurface]) {
+        storage.sort_by(|left, right| {
+            (&left.kind, &left.owner, &left.slot).cmp(&(&right.kind, &right.owner, &right.slot))
+        });
     }
 
     #[derive(Debug)]
@@ -6605,7 +7310,7 @@ mod tests {
                     "use crate::guardian_output_journal::{GuardianOutputAppendReceipt, GuardianOutputCipher, GuardianOutputSegmentIdentity};",
                 ),
                 expected_use(
-                    "use crate::guardian_protocol::{GuardianCheckpointScopeV1, GuardianCheckpointStageKindV1, GuardianCheckpointStageRequestV1};",
+                    "use crate::guardian_protocol::{GuardianCheckpointChunkDelivery, GuardianCheckpointScopeV1, GuardianCheckpointStageChunkDeliveryV1, GuardianCheckpointStageKindV1, GuardianCheckpointStageRequestV1};",
                 ),
                 expected_use("use crate::pane::Pane;"),
                 expected_use(
@@ -6650,7 +7355,32 @@ mod tests {
         assert_eq!(inventory.expression_macros, expected_expression_macros);
 
         assert_eq!(inventory.aliases_or_storage, Vec::<String>::new());
-        assert_eq!(inventory.item_macros, Vec::<String>::new());
+        assert_eq!(
+            inventory.item_macros,
+            vec![
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointGenesisSpawnPermitV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointCandidateIdentityV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetIdentityV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointOrderedChunkSetBuilderV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedStageAssemblyV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedManifestAuthorityV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageSealIntentV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointValidatedManifestOperationV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointManifestRetryCapabilityV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointManifestSealCapabilitiesV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(LiveParserCaptureAuthority: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(LiveParserCheckpointAck: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageRequestV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointStageChunkDeliveryV1: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_not_impl_any!(GuardianCheckpointChunkDelivery: Clone, Copy);"),
+                expected_item_macro("static_assertions::assert_impl_all!(Sha256: zeroize::ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_impl_all!(Zeroizing<[u8; 32]>: zeroize::ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_impl_all!(Zeroizing<Vec<u8>>: zeroize::ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_impl_all!(RecoveryTerminalCheckpointV2: zeroize::ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointStageChunkDeliveryV1: zeroize::ZeroizeOnDrop);"),
+                expected_item_macro("static_assertions::assert_impl_all!(GuardianCheckpointChunkDelivery: zeroize::ZeroizeOnDrop);"),
+            ]
+        );
         assert_eq!(inventory.modules, Vec::<String>::new());
         assert_eq!(inventory.traits, Vec::<String>::new());
         assert_eq!(inventory.associated_items, Vec::<String>::new());

@@ -19,6 +19,7 @@ ordered-float.workspace = true
 serde = {workspace=true, optional=true}
 siphasher.workspace = true
 unicode-segmentation.workspace = true
+zeroize.workspace = true
 frankenterm-bidi.workspace = true
 frankenterm-blob-leases = {workspace=true, optional=true}
 frankenterm-cell = {workspace = true}

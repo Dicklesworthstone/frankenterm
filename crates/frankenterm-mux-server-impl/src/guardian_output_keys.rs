@@ -12,12 +12,9 @@ use cap_std::fs::{Dir as CapDir, File as CapFile, Metadata as CapMetadata};
 #[cfg(not(target_os = "wasi"))]
 use cap_std::fs::DirBuilder as CapDirBuilder;
 use cap_std::fs::OpenOptions as CapOpenOptions;
-use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
 use cap_std::fs::OpenOptionsExt as _;
 #[cfg(unix)]
-use cap_std::fs::{
-    DirBuilderExt as _, MetadataExt as CapUnixMetadataExt, PermissionsExt as _,
-};
+use cap_std::fs::{DirBuilderExt as _, MetadataExt as CapUnixMetadataExt, PermissionsExt as _};
 #[cfg(windows)]
 use cap_std::fs::MetadataExt as CapWindowsMetadataExt;
 use mux::guardian_output_journal::{
