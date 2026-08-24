@@ -9226,6 +9226,13 @@ fn require_reply_len(payload: &[u8], expected: usize) -> Result<(), GuardianProt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ProtocolCheckpointConfig;
+
+    impl TerminalConfiguration for ProtocolCheckpointConfig {}
 
     fn id(byte: u8) -> Uuid {
         Uuid::from_bytes([byte; 16])
@@ -9233,6 +9240,52 @@ mod tests {
 
     fn secret() -> GuardianSecret {
         GuardianSecret::from_bytes([0x5a; GUARDIAN_AUTH_TOKEN_BYTES]).unwrap()
+    }
+
+    fn terminal_checkpoint() -> RecoveryTerminalCheckpointV2 {
+        Terminal::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(ProtocolCheckpointConfig),
+            "FrankenTerm",
+            "guardian-protocol-test",
+            Box::new(Vec::<u8>::new()),
+        )
+        .capture_recovery_checkpoint(TerminalCheckpointLimits::default())
+        .expect("capture canonical protocol checkpoint fixture")
+    }
+
+    fn record_checkpoint_descriptor(
+        pane_id: Uuid,
+        generation: u64,
+        canonical_payload: &[u8],
+    ) -> GuardianCheckpointDescriptorV1 {
+        let total_bytes = u64::try_from(canonical_payload.len()).unwrap();
+        let terminal_payload_digest =
+            checkpoint_terminal_payload_digest(total_bytes, canonical_payload).unwrap();
+        GuardianCheckpointDescriptorV1::from_artifact_parts(
+            pane_id,
+            generation,
+            current_replay_identity_digest(),
+            24,
+            80,
+            total_bytes,
+            terminal_payload_digest,
+            GuardianCheckpointOutputBoundaryV1::Record {
+                segment_id: id(90),
+                sequence: 7,
+                record_digest: [0x55; 32],
+                committed_log_bytes: 4_096,
+                cumulative_plaintext_bytes: 512,
+                parser_stream_bytes: 512,
+            },
+        )
+        .unwrap()
     }
 
     fn request(
@@ -13349,5 +13402,213 @@ mod tests {
             sequence_state.mark_exited(pane, 137),
             Err(GuardianProtocolError::PaneTerminal)
         );
+    }
+
+    #[test]
+    fn checkpoint_stage_is_canonical_bounded_and_binds_full_artifact_identity() {
+        let pane = id(70);
+        let generation = 3;
+        let terminal = terminal_checkpoint();
+        let canonical = terminal.canonical_payload();
+        let descriptor = record_checkpoint_descriptor(pane, generation, canonical);
+        assert_eq!(descriptor.durable_pane_id(), Some(pane));
+        assert_eq!(descriptor.capture_generation(), generation);
+        assert_eq!(descriptor.total_bytes(), canonical.len() as u64);
+        assert_eq!(descriptor.validate_canonical_payload(canonical), Ok(()));
+
+        let scope = GuardianCheckpointScopeV1::Pane {
+            pane_id: pane,
+            generation,
+        };
+        let upload_id = id(71);
+        let chunk_bytes = 1_024;
+        let begin = GuardianCheckpointStageRequestV1::begin(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+        )
+        .unwrap();
+        let begin_wire = begin.encode().unwrap();
+        let decoded_begin = GuardianCheckpointStageRequestV1::decode(&begin_wire).unwrap();
+        assert_eq!(decoded_begin.kind(), GuardianCheckpointStageKindV1::Begin);
+        assert_eq!(decoded_begin.descriptor(), descriptor);
+        assert_eq!(decoded_begin.total_chunks(), begin.total_chunks());
+
+        let first_len = usize::try_from(chunk_bytes)
+            .unwrap()
+            .min(canonical.len());
+        let chunk_plaintext = canonical[..first_len].to_vec();
+        let chunk = GuardianCheckpointStageRequestV1::chunk(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+            0,
+            Zeroizing::new(chunk_plaintext.clone()),
+        )
+        .unwrap();
+        let chunk_wire = chunk.encode().unwrap();
+        let decoded_chunk = GuardianCheckpointStageRequestV1::decode(&chunk_wire).unwrap();
+        assert_eq!(decoded_chunk.kind(), GuardianCheckpointStageKindV1::Chunk);
+        assert_eq!(decoded_chunk.chunk_position().unwrap().0, 0);
+        assert_eq!(
+            decoded_chunk.into_chunk_bytes().unwrap().as_slice(),
+            chunk_plaintext
+        );
+
+        let seal = GuardianCheckpointStageRequestV1::seal(
+            scope,
+            upload_id,
+            descriptor,
+            chunk_bytes,
+        )
+        .unwrap();
+        assert_eq!(seal.validate_staged_plaintext(canonical), Ok(()));
+        let mut same_length_payload_mutation = canonical.to_vec();
+        let last = same_length_payload_mutation.len() - 1;
+        same_length_payload_mutation[last] ^= 1;
+        assert_eq!(
+            seal.validate_staged_plaintext(&same_length_payload_mutation),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+
+        let mut chunk_mutation = chunk_wire;
+        *chunk_mutation.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            GuardianCheckpointStageRequestV1::decode(&chunk_mutation),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+        let mut reserved_mutation = begin_wire;
+        reserved_mutation[7] = 1;
+        assert!(matches!(
+            GuardianCheckpointStageRequestV1::decode(&reserved_mutation),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+
+        let mut descriptor_wire = descriptor.encode();
+        descriptor_wire[107] ^= 1;
+        assert_eq!(
+            GuardianCheckpointDescriptorV1::decode(&descriptor_wire),
+            Err(GuardianProtocolError::InvalidReplyPayload),
+            "a geometry mutation without a matching stable identity must fail"
+        );
+
+        let mut recomputed_geometry_splice = descriptor;
+        recomputed_geometry_splice.rows += 1;
+        recomputed_geometry_splice.checkpoint_id = checkpoint_artifact_identity(
+            recomputed_geometry_splice.boundary_id,
+            recomputed_geometry_splice.replay_semantics_id,
+            recomputed_geometry_splice.rows,
+            recomputed_geometry_splice.cols,
+            recomputed_geometry_splice.total_bytes,
+            recomputed_geometry_splice.terminal_payload_digest,
+            recomputed_geometry_splice.output_boundary,
+        )
+        .unwrap();
+        assert_eq!(recomputed_geometry_splice.validate(), Ok(()));
+        assert_eq!(
+            recomputed_geometry_splice.validate_canonical_payload(canonical),
+            Err(GuardianProtocolError::InvalidOperationPayload),
+            "semantic decode must reject claimed geometry even after the claimant recomputes its ID"
+        );
+
+        assert!(matches!(
+            GuardianCheckpointStageRequestV1::begin(
+                GuardianCheckpointScopeV1::Pane {
+                    pane_id: pane,
+                    generation: generation + 1,
+                },
+                upload_id,
+                descriptor,
+                chunk_bytes,
+            ),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+        assert_eq!(
+            checkpoint_total_chunks(GUARDIAN_MAX_CHECKPOINT_BYTES + 1, chunk_bytes),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+        assert_eq!(
+            checkpoint_total_chunks(1, 0),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        );
+    }
+
+    #[test]
+    fn genesis_stage_requires_exact_spawn_generation_and_zero_parser_watermark() {
+        let terminal = terminal_checkpoint();
+        assert_eq!(terminal.parser_stream_bytes(), 0);
+        let spawn_effect_id = id(72);
+        let descriptor = GuardianCheckpointDescriptorV1::for_genesis_artifact(
+            spawn_effect_id,
+            &terminal,
+        )
+        .unwrap();
+        assert_eq!(descriptor.capture_generation(), GUARDIAN_GENESIS_CAPTURE_GENERATION);
+        assert_eq!(descriptor.durable_pane_id(), None);
+        assert!(matches!(
+            descriptor.output_boundary(),
+            GuardianCheckpointOutputBoundaryV1::Genesis {
+                spawn_effect_id: observed,
+                parser_stream_bytes: 0,
+            } if observed == spawn_effect_id
+        ));
+        let scope = GuardianCheckpointScopeV1::Genesis { spawn_effect_id };
+        GuardianCheckpointStageRequestV1::begin(scope, id(73), descriptor, 1_024).unwrap();
+
+        let mut wrong_generation = descriptor;
+        wrong_generation.capture_generation += 1;
+        assert!(matches!(
+            GuardianCheckpointStageRequestV1::begin(scope, id(73), wrong_generation, 1_024),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+
+        let mut impossible_parser = descriptor;
+        impossible_parser.output_boundary = GuardianCheckpointOutputBoundaryV1::Genesis {
+            spawn_effect_id,
+            parser_stream_bytes: 1,
+        };
+        assert!(matches!(
+            GuardianCheckpointStageRequestV1::begin(scope, id(73), impossible_parser, 1_024),
+            Err(GuardianProtocolError::InvalidOperationPayload)
+        ));
+
+        let mut unsupported_semantics = descriptor;
+        unsupported_semantics.replay_semantics_id[0] ^= 1;
+        unsupported_semantics.checkpoint_id = checkpoint_artifact_identity(
+            unsupported_semantics.boundary_id,
+            unsupported_semantics.replay_semantics_id,
+            unsupported_semantics.rows,
+            unsupported_semantics.cols,
+            unsupported_semantics.total_bytes,
+            unsupported_semantics.terminal_payload_digest,
+            unsupported_semantics.output_boundary,
+        )
+        .unwrap();
+        assert_eq!(
+            unsupported_semantics.validate(),
+            Err(GuardianProtocolError::InvalidReplyPayload),
+            "a self-consistent but unsupported replay semantics identity must fail"
+        );
+    }
+
+    #[test]
+    fn plaintext_bearing_protocol_owners_are_nonclone_and_zeroizing_by_contract() {
+        let source = include_str!("guardian_protocol.rs");
+        assert!(source.contains("#[derive(PartialEq)]\npub struct GuardianSpawnPayload"));
+        assert!(!source.contains("#[derive(Clone, PartialEq)]\npub struct GuardianSpawnPayload"));
+        assert!(source.matches("payload: Zeroizing<Vec<u8>>").count() >= 2);
+        assert!(source.contains("impl Drop for GuardianRequestEnvelope"));
+        assert!(source.contains("impl Drop for GuardianResponseEnvelope"));
+        for forbidden in [
+            "#[derive(Clone, Eq, PartialEq)]\npub struct GuardianRequestEnvelope",
+            "#[derive(Clone, Eq, PartialEq)]\npub struct AuthenticatedGuardianRequest",
+            "#[derive(Clone, Eq, PartialEq)]\npub struct GuardianResponseEnvelope",
+            "#[derive(Clone, Eq, PartialEq)]\npub struct AuthenticatedGuardianResponse",
+            "#[derive(Clone, Eq, PartialEq)]\npub struct CorrelatedGuardianResponse",
+        ] {
+            assert!(!source.contains(forbidden));
+        }
     }
 }
