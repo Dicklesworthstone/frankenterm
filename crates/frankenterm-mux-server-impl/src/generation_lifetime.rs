@@ -17,10 +17,15 @@ const PROCESS_FAMILY_DIRECTORY: &str = "process-family";
 const GENERATIONS_DIRECTORY: &str = "generations";
 #[cfg(any(target_os = "linux", test))]
 const MUX_SERVER_FILENAME: &str = "frankenterm-mux-server";
-#[cfg(target_os = "linux")]
-const LIFETIME_LEASE_FILENAME: &str = ".lifetime-lease.v1";
 #[cfg(any(target_os = "linux", test))]
 const GENERATION_ID_HEX_LEN: usize = 64;
+
+/// Canonical generation-local lifetime-lease filename shared by publishers
+/// and managed mux-server consumers.
+pub const MANAGED_GENERATION_LIFETIME_LEASE_FILENAME: &str = ".lifetime-lease.v1";
+
+/// Canonical Unix permission mode for the generation lifetime lease.
+pub const MANAGED_GENERATION_LIFETIME_LEASE_MODE: u32 = 0o600;
 
 /// Content-free filesystem identity suitable for a readiness receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -461,7 +466,7 @@ fn validate_lease_snapshot(
 ) -> Result<(), GenerationLifetimeError> {
     if snapshot.kind != rustix::fs::FileType::RegularFile
         || snapshot.owner != expected_owner
-        || snapshot.mode != 0o600
+        || snapshot.mode != MANAGED_GENERATION_LIFETIME_LEASE_MODE
         || snapshot.link_count != 1
         || snapshot.byte_len != 0
         || snapshot.identity.device != expected_device
@@ -606,7 +611,7 @@ fn acquire_linux_managed_generation_lifetime(
 
     let lifetime_lease = open_regular_file_at_nofollow(
         &generation,
-        Path::new(LIFETIME_LEASE_FILENAME),
+        Path::new(MANAGED_GENERATION_LIFETIME_LEASE_FILENAME),
         "open generation lifetime lease",
     )?;
     let executable = open_regular_file_at_nofollow(
@@ -618,7 +623,7 @@ fn acquire_linux_managed_generation_lifetime(
     let lease_before = snapshot_file(&lifetime_lease, "inspect generation lifetime lease")?;
     let lease_named_before = snapshot_named(
         &generation,
-        Path::new(LIFETIME_LEASE_FILENAME),
+        Path::new(MANAGED_GENERATION_LIFETIME_LEASE_FILENAME),
         "inspect named generation lifetime lease",
     )?;
     validate_lease_snapshot(
@@ -675,7 +680,7 @@ fn acquire_linux_managed_generation_lifetime(
     let lease_after = snapshot_file(&lifetime_lease, "re-inspect locked lifetime lease")?;
     let lease_named_after = snapshot_named(
         &generation,
-        Path::new(LIFETIME_LEASE_FILENAME),
+        Path::new(MANAGED_GENERATION_LIFETIME_LEASE_FILENAME),
         "re-inspect named lifetime lease after lock",
     )?;
     validate_lease_snapshot(
@@ -799,20 +804,22 @@ mod linux_tests {
         let generation = generations.join(TEST_GENERATION_ID);
         std::fs::create_dir_all(&generation).expect("create managed fixture directories");
         let executable = generation.join(MUX_SERVER_FILENAME);
-        let lease = generation.join(LIFETIME_LEASE_FILENAME);
+        let lease = generation.join(MANAGED_GENERATION_LIFETIME_LEASE_FILENAME);
         create_file(&executable, b"fixture mux executable", 0o500);
 
         match lease_shape {
-            LeaseFixtureShape::Regular => create_file(&lease, b"", 0o600),
+            LeaseFixtureShape::Regular => {
+                create_file(&lease, b"", MANAGED_GENERATION_LIFETIME_LEASE_MODE);
+            }
             LeaseFixtureShape::Missing => {}
             LeaseFixtureShape::Symlink => {
                 let target = generation.join("lease-target");
-                create_file(&target, b"", 0o600);
+                create_file(&target, b"", MANAGED_GENERATION_LIFETIME_LEASE_MODE);
                 std::os::unix::fs::symlink("lease-target", &lease)
                     .expect("create lifetime lease symlink fixture");
             }
             LeaseFixtureShape::HardLinked => {
-                create_file(&lease, b"", 0o600);
+                create_file(&lease, b"", MANAGED_GENERATION_LIFETIME_LEASE_MODE);
                 std::fs::hard_link(&lease, generation.join("lease-alias"))
                     .expect("create lifetime lease hard-link fixture");
             }
@@ -929,7 +936,11 @@ mod linux_tests {
         std::fs::create_dir_all(&generation).expect("create real generation fixture");
         let executable = generation.join(MUX_SERVER_FILENAME);
         create_file(&executable, b"fixture mux executable", 0o500);
-        create_file(&generation.join(LIFETIME_LEASE_FILENAME), b"", 0o600);
+        create_file(
+            &generation.join(MANAGED_GENERATION_LIFETIME_LEASE_FILENAME),
+            b"",
+            MANAGED_GENERATION_LIFETIME_LEASE_MODE,
+        );
         std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o500))
             .expect("seal real generation directory");
         std::fs::set_permissions(&real_generations, std::fs::Permissions::from_mode(0o700))

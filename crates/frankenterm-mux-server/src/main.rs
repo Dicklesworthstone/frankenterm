@@ -214,6 +214,11 @@ fn main() {
         std::process::exit(1);
     }
     wezterm_blob_leases::clear_storage();
+    // Detached listener threads may still be settling. Never run the lease
+    // destructor while this process exists; the kernel releases every pinned
+    // descriptor and the shared flock atomically during process teardown.
+    std::hint::black_box(&generation_lifetime);
+    std::process::exit(0);
 }
 
 fn run(
@@ -846,13 +851,20 @@ mod tests {
         let success_cleanup = main_source
             .rfind("wezterm_blob_leases::clear_storage();")
             .expect("success path clears blob storage");
+        let success_retention = main_source
+            .find("std::hint::black_box(&generation_lifetime);")
+            .expect("success path visibly retains generation lifetime guard");
+        let success_exit = main_source
+            .find("std::process::exit(0);")
+            .expect("success path exits without running the guard destructor");
         assert!(owner < run_call);
         assert!(run_call < error_cleanup);
         assert!(error_cleanup < error_log);
         assert!(error_log < process_exit);
         assert!(process_exit < success_cleanup);
+        assert!(success_cleanup < success_retention);
+        assert!(success_retention < success_exit);
         assert_ne!(error_cleanup, success_cleanup);
-        assert!(!main_source.contains("drop(generation_lifetime)"));
 
         let run_source = &source[run_start..];
         let parse = run_source.find("let opts = Opt::parse();").expect("parse opts");
