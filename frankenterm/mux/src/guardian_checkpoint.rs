@@ -27,7 +27,7 @@ use termwiz::escape::parser::RECOVERY_CHECKPOINT_PARSER_ID;
 use termwiz::escape::{parser::RecoveryGroundBoundary, Action};
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const REPLAY_IDENTITY_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-replay-identity.v1\0";
@@ -46,6 +46,7 @@ const CHECKPOINT_STAGE_RECORD_AEAD_DOMAIN: &[u8] =
 const CHECKPOINT_STAGE_PLAINTEXT_DIGEST_DOMAIN: &[u8] =
     b"frankenterm.guardian-checkpoint-phase-a-plaintext.v1\0";
 const CHECKPOINT_STAGE_RECORD_MAGIC: [u8; 8] = *b"FTGCPA01";
+const CHECKPOINT_STAGE_INNER_TRAILER_MAGIC: [u8; 8] = *b"FTGCPI01";
 
 /// Version of the encrypted Phase-A checkpoint staging-record format.
 pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION: u32 = 1;
@@ -53,11 +54,15 @@ pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_VERSION: u32 = 1;
 pub const GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES: usize = 232;
 /// Hard per-record plaintext admission bound shared with checkpoint uploads.
 pub const GUARDIAN_CHECKPOINT_STAGE_MAX_PLAINTEXT_BYTES: u32 = 256 * 1024;
+/// Capture generation reserved for a pre-spawn Genesis checkpoint.
+pub const GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION: u64 = 1;
 
 const CHECKPOINT_STAGE_CONTEXT_BYTES: usize = 184;
 const CHECKPOINT_STAGE_KEY_ID_BYTES: usize = 8;
 const CHECKPOINT_STAGE_NONCE_BYTES: usize = 24;
 const CHECKPOINT_STAGE_AEAD_TAG_BYTES: usize = 16;
+const CHECKPOINT_STAGE_INNER_TRAILER_BYTES: usize = 48;
+const CHECKPOINT_STAGE_INNER_TRAILER_VERSION: u32 = 1;
 const CHECKPOINT_STAGE_MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const CHECKPOINT_STAGE_MAX_CHUNKS: u32 = 1_024;
 
@@ -620,6 +625,76 @@ impl std::fmt::Debug for GuardianCheckpointArtifactDescriptorV1 {
     }
 }
 
+/// Nonconstructible authority proving that one complete checkpoint payload is
+/// eligible for final publication.
+///
+/// A record-backed witness is minted only after canonical payload validation
+/// and reconciliation with the exact guardian-verified segment and receipt. A
+/// Genesis witness instead proves the same payload against the exact Spawn
+/// effect embedded in its stable origin.
+pub struct GuardianCheckpointValidatedSealWitnessV1 {
+    boundary_identity_digest: [u8; 32],
+    checkpoint_identity_digest: [u8; 32],
+}
+
+impl GuardianCheckpointArtifactDescriptorV1 {
+    pub fn validated_record_seal_witness(
+        &self,
+        canonical_terminal_payload: &[u8],
+        verified_segment: GuardianOutputSegmentIdentity,
+        verified_output: GuardianOutputAppendReceipt,
+    ) -> Result<GuardianCheckpointValidatedSealWitnessV1, GuardianCheckpointBoundaryError> {
+        self.validate_canonical_payload(
+            canonical_terminal_payload,
+            TerminalCheckpointLimits::default(),
+        )?;
+        self.validate_record_authority(verified_segment, verified_output)?;
+        self.mint_validated_seal_witness()
+    }
+
+    pub fn validated_genesis_seal_witness(
+        &self,
+        expected_spawn_effect_id: Uuid,
+        canonical_terminal_payload: &[u8],
+    ) -> Result<GuardianCheckpointValidatedSealWitnessV1, GuardianCheckpointBoundaryError> {
+        match self.origin.kind {
+            GuardianCheckpointOriginKindV1::Genesis { spawn_effect_id }
+                if spawn_effect_id == expected_spawn_effect_id
+                    && !expected_spawn_effect_id.is_nil() => {}
+            GuardianCheckpointOriginKindV1::Genesis { .. } => {
+                return Err(GuardianCheckpointBoundaryError::GenesisEffectIdentityMismatch);
+            }
+            GuardianCheckpointOriginKindV1::Record { .. } => {
+                return Err(GuardianCheckpointBoundaryError::RecordHasNoGenesisAuthority);
+            }
+        }
+        self.validate_canonical_payload(
+            canonical_terminal_payload,
+            TerminalCheckpointLimits::default(),
+        )?;
+        self.mint_validated_seal_witness()
+    }
+
+    fn mint_validated_seal_witness(
+        &self,
+    ) -> Result<GuardianCheckpointValidatedSealWitnessV1, GuardianCheckpointBoundaryError> {
+        Ok(GuardianCheckpointValidatedSealWitnessV1 {
+            boundary_identity_digest: self.recompute_boundary_identity_digest()?,
+            checkpoint_identity_digest: self.recompute_checkpoint_identity_digest()?,
+        })
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointValidatedSealWitnessV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointValidatedSealWitnessV1")
+            .field("boundary_identity_digest", &"[REDACTED]")
+            .field("checkpoint_identity_digest", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Semantic role of one encrypted Phase-A checkpoint staging record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -760,9 +835,98 @@ impl std::fmt::Debug for GuardianCheckpointStageScopeV1 {
     }
 }
 
+/// Opaque bridge from a protocol checkpoint descriptor and stage scope into
+/// storage authority.
+///
+/// The protocol's capture generation is deliberately excluded from stable
+/// checkpoint digests, but it must exactly match the live pane scope before
+/// any bytes can be staged. Genesis is pinned to the one reserved generation
+/// and the exact Spawn effect already carried by the canonical descriptor.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuardianCheckpointStageBindingV1 {
+    scope: GuardianCheckpointStageScopeV1,
+    descriptor: GuardianCheckpointArtifactDescriptorV1,
+}
+
+impl GuardianCheckpointStageBindingV1 {
+    pub fn from_protocol_capture(
+        scope: GuardianCheckpointStageScopeV1,
+        descriptor: GuardianCheckpointArtifactDescriptorV1,
+        protocol_capture_generation: u64,
+    ) -> Result<Self, GuardianCheckpointCipherError> {
+        scope.validate_descriptor(&descriptor)?;
+        match scope.kind {
+            GuardianCheckpointStageScopeKindV1::Pane { generation, .. }
+                if generation == protocol_capture_generation
+                    && protocol_capture_generation > 0 => {}
+            GuardianCheckpointStageScopeKindV1::Pane { .. } => {
+                return Err(GuardianCheckpointCipherError::CaptureGenerationMismatch);
+            }
+            GuardianCheckpointStageScopeKindV1::Genesis { .. }
+                if protocol_capture_generation
+                    == GUARDIAN_CHECKPOINT_GENESIS_STAGE_GENERATION => {}
+            GuardianCheckpointStageScopeKindV1::Genesis { .. } => {
+                return Err(GuardianCheckpointCipherError::GenesisCaptureGenerationMismatch);
+            }
+        }
+        descriptor
+            .recompute_boundary_identity_digest()
+            .map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)?;
+        descriptor
+            .recompute_checkpoint_identity_digest()
+            .map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)?;
+        Ok(Self { scope, descriptor })
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> GuardianCheckpointStageScopeV1 {
+        self.scope
+    }
+
+    fn boundary_identity_digest(&self) -> Result<[u8; 32], GuardianCheckpointCipherError> {
+        self.descriptor
+            .recompute_boundary_identity_digest()
+            .map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)
+    }
+
+    fn checkpoint_identity_digest(&self) -> Result<[u8; 32], GuardianCheckpointCipherError> {
+        self.descriptor
+            .recompute_checkpoint_identity_digest()
+            .map_err(|_| GuardianCheckpointCipherError::InvalidDescriptor)
+    }
+
+    fn validate_seal_witness(
+        &self,
+        witness: &GuardianCheckpointValidatedSealWitnessV1,
+    ) -> Result<(), GuardianCheckpointCipherError> {
+        if checkpoint_stage_digests_match(
+            self.boundary_identity_digest()?,
+            witness.boundary_identity_digest,
+        ) && checkpoint_stage_digests_match(
+            self.checkpoint_identity_digest()?,
+            witness.checkpoint_identity_digest,
+        ) {
+            Ok(())
+        } else {
+            Err(GuardianCheckpointCipherError::SealWitnessMismatch)
+        }
+    }
+}
+
+impl std::fmt::Debug for GuardianCheckpointStageBindingV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianCheckpointStageBindingV1")
+            .field("scope", &self.scope)
+            .field("descriptor", &self.descriptor)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum GuardianCheckpointStageContextAuthorityV1 {
-    CanonicalDescriptor,
+    StageBinding,
+    ValidatedSeal,
     PersistedClaim,
 }
 
