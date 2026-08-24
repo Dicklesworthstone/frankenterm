@@ -42,7 +42,6 @@ pub struct GuardianRuntimeConfig {
     max_output_bytes_per_pane: usize,
     max_total_output_bytes: usize,
     first_pty_token: usize,
-    max_pending_mux_retirements: usize,
 }
 
 impl GuardianRuntimeConfig {
@@ -51,7 +50,6 @@ impl GuardianRuntimeConfig {
         max_output_bytes_per_pane: usize,
         max_total_output_bytes: usize,
         first_pty_token: usize,
-        max_pending_mux_retirements: usize,
     ) -> Result<Self, GuardianProtocolError> {
         let Some(possible_output_bytes) = max_panes.checked_mul(max_output_bytes_per_pane) else {
             return Err(GuardianProtocolError::CapacityExhausted);
@@ -63,7 +61,6 @@ impl GuardianRuntimeConfig {
             || max_total_output_bytes > possible_output_bytes
             || first_pty_token == 0
             || first_pty_token.checked_add(max_panes).is_none()
-            || max_pending_mux_retirements == 0
         {
             return Err(GuardianProtocolError::CapacityExhausted);
         }
@@ -72,7 +69,6 @@ impl GuardianRuntimeConfig {
             max_output_bytes_per_pane,
             max_total_output_bytes,
             first_pty_token,
-            max_pending_mux_retirements,
         })
     }
 }
@@ -208,17 +204,58 @@ pub(crate) enum GuardianRuntimeInputCompletionState {
     Disconnected,
 }
 
-/// A last-connection observation that must not outlive a later authenticated
-/// connection for the same mux incarnation.
+/// Owned authenticated request whose plaintext is wiped on every exit path.
 ///
-/// Connection generations are allocated monotonically by the single transport
-/// readiness loop.  Binding a deferred retirement to the generation that
-/// disconnected lets a later successful Hello cancel only stale work; an
-/// older or replayed observation can never cancel a newer retirement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingMuxRetirement {
-    mux_incarnation: Uuid,
-    disconnected_connection_generation: u64,
+/// The worker still wipes immediately after the PTY write, but correctness no
+/// longer depends on reaching that manual fast path: busy rejection, queue
+/// failure, authority restoration, panic recovery, and ordinary drop all pass
+/// through this guard.
+struct OwnedInputRequest {
+    request: AuthenticatedGuardianRequest,
+    #[cfg(test)]
+    wipe_probe: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl OwnedInputRequest {
+    fn new(request: AuthenticatedGuardianRequest) -> Self {
+        Self {
+            request,
+            #[cfg(test)]
+            wipe_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_wipe_probe(&mut self, probe: Option<Arc<std::sync::atomic::AtomicBool>>) {
+        self.wipe_probe = probe;
+    }
+}
+
+impl std::ops::Deref for OwnedInputRequest {
+    type Target = AuthenticatedGuardianRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl std::ops::DerefMut for OwnedInputRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
+    }
+}
+
+impl Drop for OwnedInputRequest {
+    fn drop(&mut self) {
+        self.request.zeroize_payload();
+        #[cfg(test)]
+        if let Some(probe) = self.wipe_probe.as_ref() {
+            probe.store(
+                self.request.payload().is_empty(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
 }
 
 struct InputJob {
@@ -227,7 +264,7 @@ struct InputJob {
     protocol: GuardianProtocolState,
     writer: Box<dyn Write + Send>,
     journal: GuardianPaneInputJournal,
-    request: AuthenticatedGuardianRequest,
+    request: OwnedInputRequest,
 }
 
 struct InputJobExecution {
@@ -476,11 +513,12 @@ pub struct GuardianRuntime {
     orphaned_input_authority:
         Option<(Box<dyn Write + Send>, GuardianPaneInputJournal)>,
     pending_child_exits: Vec<(Uuid, i32)>,
-    pending_mux_retirements: Vec<PendingMuxRetirement>,
     output_pipeline_failed: bool,
     output_rearm_cursor: OutputRearmCursor,
     indeterminate_effect: bool,
     counters: GuardianRuntimeCounters,
+    #[cfg(test)]
+    input_request_wipe_probe: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl GuardianRuntime {
@@ -494,10 +532,6 @@ impl GuardianRuntime {
         let mut pending_child_exits = Vec::new();
         pending_child_exits
             .try_reserve_exact(config.max_panes)
-            .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
-        let mut pending_mux_retirements = Vec::new();
-        pending_mux_retirements
-            .try_reserve_exact(config.max_pending_mux_retirements)
             .map_err(|_| GuardianProtocolError::CapacityExhausted)?;
         let input_pipeline = GuardianInputPipeline::new(completion_waker)?;
         Ok(Self {
@@ -514,11 +548,12 @@ impl GuardianRuntime {
             input_pipeline_failed: false,
             orphaned_input_authority: None,
             pending_child_exits,
-            pending_mux_retirements,
             output_pipeline_failed: false,
             output_rearm_cursor: OutputRearmCursor::default(),
             indeterminate_effect: false,
             counters: GuardianRuntimeCounters::default(),
+            #[cfg(test)]
+            input_request_wipe_probe: None,
         })
     }
 

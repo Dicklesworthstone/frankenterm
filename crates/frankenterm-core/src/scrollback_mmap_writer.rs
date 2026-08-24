@@ -704,13 +704,20 @@ impl MmapScrollback {
             })?;
         }
 
-        self.v2_state = committed_state;
-        self.used_bytes = prepared_used_bytes.checked_add(total_len).ok_or_else(|| {
+        let committed_used_bytes = prepared_used_bytes.checked_add(total_len).ok_or_else(|| {
             MmapScrollbackError::V2Integrity {
                 path: self.path.clone(),
                 reason: "v2 used-byte accounting overflow",
             }
         })?;
+        if committed_used_bytes > self.header.capacity_bytes {
+            return Err(MmapScrollbackError::V2Integrity {
+                path: self.path.clone(),
+                reason: "v2 append plan exceeds ring capacity",
+            });
+        }
+        self.v2_state = committed_state;
+        self.used_bytes = committed_used_bytes;
         self.header.write_cursor_bytes = u64::from(self.v2_state.tail);
         self.header.total_bytes_written = self.header.total_bytes_written.saturating_add(total_len);
         self.header.redactions_applied = self
@@ -721,7 +728,8 @@ impl MmapScrollback {
             self.v2_state = rollback_state;
             self.used_bytes = rollback_used_bytes;
             self.header.write_cursor_bytes = u64::from(self.v2_state.tail);
-            self.header.total_bytes_written = self.header.total_bytes_written.saturating_sub(total_len);
+            self.header.total_bytes_written =
+                self.header.total_bytes_written.saturating_sub(total_len);
             self.header.redactions_applied = self
                 .header
                 .redactions_applied
@@ -852,6 +860,13 @@ impl MmapScrollback {
             state.wrap_at = capacity_u32;
             used_bytes = 0;
             return Ok((state, used_bytes, false));
+        }
+
+        while usize::try_from(state.record_count).unwrap_or(usize::MAX)
+            >= HARD_MAX_LINEAR_RECORDS
+        {
+            self.evict_oldest_from_plan(&mut state, &mut used_bytes)?;
+            evicted = true;
         }
 
         loop {

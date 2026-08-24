@@ -7834,6 +7834,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authenticated_v3_cold_open_migrates_to_v4_only_on_successor_publication() {
+        let dir = tempfile::tempdir().expect("create v3 migration fixture");
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 40_500,
+            domain_id: 3,
+            durable_pane_id: [205; 16],
+            command_description: "v3-to-v4-cold-migration".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create v3 migration sink");
+        let attributes = CellAttributes::blank();
+        assert!(sink.store_scrollback_line(
+            10,
+            &Line::from_text("v3-predecessor", &attributes, 1, None),
+            8,
+        ));
+        let mut legacy = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read v4 fixture manifest")
+            .expect("v4 fixture manifest exists");
+        legacy.schema = LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3.to_string();
+        legacy.chain_anchor_sha256 = None;
+        legacy.chain_tail_sha256 = None;
+        legacy.logical_ledger_sha256 = None;
+        legacy.guardian_manifest_authentication = None;
+        legacy.manifest_sha256.clear();
+        let ledger_pane_id = sink.active_ledger_pane_id();
+        let digest = {
+            let store = sink
+                .lock_store("construct v3 migration digest")
+                .expect("lock v3 migration store");
+            LiveScrollbackSpillSink::logical_ledger_digest_from_store(
+                &legacy,
+                ledger_pane_id,
+                &store,
+            )
+            .expect("construct exact v3 logical digest")
+        };
+        legacy.logical_ledger_sha256 = Some(hex::encode(digest));
+        let canonical = LiveScrollbackSpillSink::manifest_authentication_bytes(&legacy)
+            .expect("serialize v3 migration authority");
+        let mut keyring = sink
+            .lock_keyring("authenticate v3 migration fixture")
+            .expect("lock v3 migration keyring");
+        let cipher = keyring
+            .latest_active_cipher()
+            .expect("load v3 migration key");
+        legacy.guardian_manifest_authentication = Some(
+            cipher
+                .authenticate_scrollback_manifest(&canonical)
+                .expect("authenticate v3 migration fixture")
+                .encode(),
+        );
+        drop(keyring);
+        legacy.manifest_sha256 = LiveScrollbackSpillSink::manifest_checksum(&legacy)
+            .expect("checksum v3 migration fixture");
+        overwrite_private_manifest_fixture(&sink.manifest_path, &legacy);
+        drop(sink);
+
+        let reopened = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("cold-open authenticated v3 fixture");
+        let still_v3 = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+            .expect("reread cold-open v3 manifest")
+            .expect("cold-open v3 manifest exists");
+        assert_eq!(still_v3.schema, LIVE_SCROLLBACK_MANIFEST_SCHEMA_V3);
+        assert!(reopened.store_scrollback_line(
+            11,
+            &Line::from_text("v4-successor", &attributes, 2, None),
+            8,
+        ));
+        let migrated = LiveScrollbackSpillSink::read_manifest(&reopened.manifest_path)
+            .expect("read migrated v4 manifest")
+            .expect("migrated v4 manifest exists");
+        assert_eq!(migrated.schema, LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
+        assert!(migrated.logical_ledger_sha256.is_none());
+        assert!(migrated.chain_anchor_sha256.is_some());
+        assert!(migrated.chain_tail_sha256.is_some());
+    }
+
     fn write_private_stage_fixture(path: &std::path::Path, bytes: &[u8]) {
         let mut options = std::fs::OpenOptions::new();
         options.create_new(true).write(true);
