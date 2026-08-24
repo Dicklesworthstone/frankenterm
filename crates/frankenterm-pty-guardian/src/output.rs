@@ -1763,12 +1763,17 @@ fn checkpoint_open_record(
     let identity = FileIdentity::capture(&metadata_before, Some(entry.bytes));
     let mut header = [0_u8; GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES];
     file.read_exact(&mut header).map_err(|error| {
-        GuardianCheckpointStageStoreError::io("checkpoint-record-header-read", error)
+        if error.kind() == ErrorKind::UnexpectedEof {
+            GuardianCheckpointStageStoreError::Poisoned
+        } else {
+            GuardianCheckpointStageStoreError::io("checkpoint-record-header-read", error)
+        }
     })?;
     let ciphertext_bytes = GuardianEncryptedCheckpointStageRecordV1::persisted_ciphertext_bytes(
         &header,
         max_plaintext_bytes,
-    )?;
+    )
+    .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     let exact_file_bytes = u64::try_from(GUARDIAN_CHECKPOINT_STAGE_RECORD_HEADER_BYTES)
         .ok()
         .and_then(|header_bytes| {
@@ -1786,7 +1791,11 @@ fn checkpoint_open_record(
         .map_err(|_| GuardianCheckpointStageStoreError::Allocation)?;
     ciphertext.resize(ciphertext_bytes, 0);
     file.read_exact(&mut ciphertext).map_err(|error| {
-        GuardianCheckpointStageStoreError::io("checkpoint-record-ciphertext-read", error)
+        if error.kind() == ErrorKind::UnexpectedEof {
+            GuardianCheckpointStageStoreError::Poisoned
+        } else {
+            GuardianCheckpointStageStoreError::io("checkpoint-record-ciphertext-read", error)
+        }
     })?;
     let metadata_after = file.metadata().map_err(|error| {
         GuardianCheckpointStageStoreError::io("checkpoint-record-final-metadata", error)
@@ -1808,12 +1817,14 @@ fn checkpoint_open_record(
         &header,
         ciphertext,
         max_plaintext_bytes,
-    )?;
+    )
+    .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     let context = record.context();
     checkpoint_validate_context_path(entry, &context)?;
     let plaintext = inner
         .cipher
-        .open(&context, &record, max_plaintext_bytes)?;
+        .open(&context, &record, max_plaintext_bytes)
+        .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?;
     Ok((context, plaintext))
 }
 
@@ -1821,7 +1832,12 @@ fn checkpoint_validate_context_path(
     entry: &CheckpointStageCensusEntry,
     context: &GuardianCheckpointStageRecordContextV1,
 ) -> Result<(), GuardianCheckpointStageStoreError> {
-    if context.scope() != entry.key.scope.stage_scope()?
+    if context.scope()
+        != entry
+            .key
+            .scope
+            .stage_scope()
+            .map_err(|_| GuardianCheckpointStageStoreError::Poisoned)?
         || context.upload_id() != entry.key.upload_id
     {
         return Err(GuardianCheckpointStageStoreError::Poisoned);

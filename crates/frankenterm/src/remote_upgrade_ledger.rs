@@ -396,8 +396,8 @@ enum DurableEffectKind {
 
 /// One committed authorization for one external effect.
 ///
-/// Deliberately not `Clone`: completion consumes the permit, preventing a
-/// caller from using one committed authorization for multiple effects.
+/// Deliberately not `Clone`: entering the external effect consumes the permit,
+/// preventing a caller from using one committed authorization more than once.
 pub(crate) struct DurableEffectPermit {
     transaction_id: String,
     claim_sha256: String,
@@ -1809,6 +1809,213 @@ mod tests {
         assert_eq!(names.iter().filter(|name| name.starts_with("claim-")).count(), 1);
         assert_eq!(names.iter().filter(|name| name.starts_with("record-")).count(), 2);
         assert_eq!(names.iter().filter(|name| name.starts_with("commit-")).count(), 2);
+    }
+
+    #[test]
+    fn ordinary_effect_permits_consume_only_against_exact_latest_authority() {
+        let (_fixture, root, effective_uid) = root_fixture();
+        let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+            .expect("create valid permit transaction");
+        let publication_permit = ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization");
+        assert_eq!(
+            publication_permit
+                .consume_publication(&ledger)
+                .expect("consume current publication permit")
+                .len(),
+            32
+        );
+
+        let selector_permit = ledger
+            .authorize_selector_after_publication(SelectorAuthority::Missing)
+            .expect("commit Activating selector authorization");
+        let (transaction_id, allow_existing_artifact) = selector_permit
+            .consume_selector(&ledger)
+            .expect("consume current selector permit");
+        assert_eq!(transaction_id, TRANSACTION_ID);
+        assert!(!allow_existing_artifact);
+
+        let retry_permit = ledger
+            .reauthorize_selector(SelectorAuthority::Missing)
+            .expect("commit a fresh Activating retry authorization");
+        let (retry_transaction_id, retry_allows_existing_artifact) = retry_permit
+            .consume_selector(&ledger)
+            .expect("consume current selector retry permit");
+        assert_eq!(retry_transaction_id, TRANSACTION_ID);
+        assert!(retry_allows_existing_artifact);
+    }
+
+    #[test]
+    fn effect_permit_rejects_wrong_kind_ledger_and_claim() {
+        const OTHER_TRANSACTION_ID: &str = "fedcba9876543210fedcba9876543210";
+
+        let (_fixture, root, effective_uid) = root_fixture();
+        let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+            .expect("create wrong-kind permit transaction");
+        let wrong_kind = ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization");
+        let wrong_kind_error = wrong_kind
+            .consume_selector(&ledger)
+            .expect_err("publication permit must not authorize a selector effect");
+        assert!(wrong_kind_error
+            .to_string()
+            .contains("not a valid one-shot authorization"));
+
+        let wrong_ledger = ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit a fresh Prepared publication authorization");
+        let other_ledger = RemoteUpgradeLedger::open(
+            &root,
+            effective_uid,
+            claim_for(OTHER_TRANSACTION_ID, 'd'),
+        )
+        .expect("create different durable ledger claim");
+        let wrong_ledger_error = wrong_ledger
+            .consume_publication(&other_ledger)
+            .expect_err("permit must not cross durable ledger claims");
+        assert!(wrong_ledger_error
+            .to_string()
+            .contains("belongs to a different remote upgrade ledger claim"));
+
+        let mut wrong_claim = ledger
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit another Prepared publication authorization");
+        wrong_claim.claim_sha256 = "f".repeat(64);
+        let wrong_claim_error = wrong_claim
+            .consume_publication(&ledger)
+            .expect_err("permit with a substituted claim digest must fail");
+        assert!(wrong_claim_error
+            .to_string()
+            .contains("not a valid one-shot authorization"));
+    }
+
+    #[test]
+    fn same_process_terminal_advancement_invalidates_retained_permits() {
+        {
+            let (_fixture, root, effective_uid) = root_fixture();
+            let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+                .expect("create Indeterminate stale-permit transaction");
+            let stale_publication = ledger
+                .authorize_publication(SelectorAuthority::Missing)
+                .expect("commit Prepared publication authorization");
+            ledger
+                .record_indeterminate(
+                    SelectorAuthority::Missing,
+                    SelectorAuthority::Missing,
+                    format!(
+                        "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:indeterminate:{}\n",
+                        "a".repeat(64)
+                    ),
+                )
+                .expect("advance transaction to Indeterminate");
+            let names_before = transaction_names(&ledger);
+            let error = stale_publication
+                .consume_publication(&ledger)
+                .expect_err("terminal Indeterminate must invalidate publication permit");
+            assert!(error
+                .to_string()
+                .contains("authorization is no longer the latest committed authority"));
+            assert_eq!(transaction_names(&ledger), names_before);
+        }
+
+        {
+            let (_fixture, root, effective_uid) = root_fixture();
+            let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+                .expect("create RolledBack stale-permit transaction");
+            ledger
+                .authorize_publication(SelectorAuthority::Missing)
+                .expect("commit Prepared publication authorization")
+                .consume_publication(&ledger)
+                .expect("consume current publication permit");
+            let stale_selector = ledger
+                .authorize_selector_after_publication(SelectorAuthority::Missing)
+                .expect("commit Activating selector authorization");
+            ledger
+                .record_rolled_back(SelectorAuthority::Missing)
+                .expect("advance transaction to RolledBack");
+            let names_before = transaction_names(&ledger);
+            let error = stale_selector
+                .consume_selector(&ledger)
+                .expect_err("terminal RolledBack must invalidate selector permit");
+            assert!(error
+                .to_string()
+                .contains("authorization is no longer the latest committed authority"));
+            assert_eq!(transaction_names(&ledger), names_before);
+        }
+
+        {
+            let (_fixture, root, effective_uid) = root_fixture();
+            let mut ledger = RemoteUpgradeLedger::open(&root, effective_uid, claim('a'))
+                .expect("create Committed stale-permit transaction");
+            ledger
+                .authorize_publication(SelectorAuthority::Missing)
+                .expect("commit Prepared publication authorization")
+                .consume_publication(&ledger)
+                .expect("consume current publication permit");
+            let stale_selector = ledger
+                .authorize_selector_after_publication(SelectorAuthority::Missing)
+                .expect("commit Activating selector authorization");
+            let generation_id = "a".repeat(64);
+            let target = format!("generations/{generation_id}");
+            let selector_after = SelectorAuthority::selected(
+                &generation_id,
+                Path::new(&target),
+                67,
+                71,
+            )
+            .expect("create committed selector authority");
+            ledger
+                .commit_current(
+                    selector_after,
+                    format!(
+                        "FT_REMOTE_GENERATION_PUBLICATION_V1={generation_id}:current:generations/{generation_id}\n"
+                    ),
+                )
+                .expect("advance transaction to Committed");
+            let names_before = transaction_names(&ledger);
+            let error = stale_selector
+                .consume_selector(&ledger)
+                .expect_err("terminal Committed must invalidate selector permit");
+            assert!(error
+                .to_string()
+                .contains("authorization is no longer the latest committed authority"));
+            assert_eq!(transaction_names(&ledger), names_before);
+        }
+    }
+
+    #[test]
+    fn cross_open_durable_advancement_invalidates_retained_permit() {
+        let (_fixture, root, effective_uid) = root_fixture();
+        let upgrade_claim = claim('a');
+        let mut original =
+            RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim.clone())
+                .expect("create original stale-permit ledger");
+        let stale_permit = original
+            .authorize_publication(SelectorAuthority::Missing)
+            .expect("commit Prepared publication authorization");
+        let mut advancing = RemoteUpgradeLedger::open(&root, effective_uid, upgrade_claim)
+            .expect("open the same durable transaction independently");
+        advancing
+            .record_indeterminate(
+                SelectorAuthority::Missing,
+                SelectorAuthority::Missing,
+                format!(
+                    "FT_REMOTE_UPGRADE_TRANSACTION_V1={TRANSACTION_ID}:indeterminate:{}\n",
+                    "a".repeat(64)
+                ),
+            )
+            .expect("advance independently opened transaction to Indeterminate");
+        let names_before = transaction_names(&advancing);
+
+        let error = stale_permit
+            .consume_publication(&original)
+            .expect_err("cross-open durable advancement must invalidate retained permit");
+        assert!(error
+            .to_string()
+            .contains("committed authority changed after it was pinned"));
+        assert_eq!(transaction_names(&advancing), names_before);
     }
 
     #[test]
