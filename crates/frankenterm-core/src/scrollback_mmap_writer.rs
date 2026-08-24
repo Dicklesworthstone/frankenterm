@@ -2765,6 +2765,27 @@ mod tests {
             .expect("secure test dir");
     }
 
+    fn append_test_payload(
+        writer: &mut MmapScrollback,
+        kind: RecordKind,
+        payload: &[u8],
+    ) -> MmapAppendReport {
+        writer
+            .append_redacted_payload(
+                kind,
+                RedactionResult {
+                    bytes: payload.to_vec(),
+                    evidence: BytesRedactionEvidence {
+                        original_input_bytes: payload.len() as u64,
+                        decoded_input_text_bytes: payload.len() as u64,
+                        redacted_output_bytes: payload.len() as u64,
+                        ..BytesRedactionEvidence::default()
+                    },
+                },
+            )
+            .expect("append test payload")
+    }
+
     /// Regression: a corrupt/oversized header must not drive an unbounded
     /// payload allocation. We hand-craft a 264-byte file whose header claims a
     /// ~5 GB write cursor and whose single record header claims a u32::MAX
@@ -2932,11 +2953,9 @@ mod tests {
     #[test]
     fn writer_safely_migrates_legacy_directory_and_leaf_modes() {
         let dir = test_dir("legacy-mode-migration");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config = MmapScrollbackConfig::new(&dir, "legacy-mode").with_cap_bytes(4096);
-        std::fs::write(config.bin_path(), []).unwrap();
-        std::fs::write(config.lock_path(), []).unwrap();
+        drop(MmapScrollback::open(config.clone()).unwrap());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(config.bin_path(), std::fs::Permissions::from_mode(0o644))
             .unwrap();
         std::fs::set_permissions(config.lock_path(), std::fs::Permissions::from_mode(0o644))
@@ -3321,34 +3340,43 @@ mod tests {
     }
 
     #[test]
-    fn cap_is_honored_by_wrapping_cursor_inside_ring() {
+    fn v2_wrap_preserves_surviving_records_in_logical_order() {
         let dir = test_dir("cap");
         let mut writer = MmapScrollback::open(
             MmapScrollbackConfig::new(&dir, "pane-cap")
-                .with_cap_bytes(32)
+                .with_cap_bytes(400)
                 .with_sync_every_appends(1),
         )
         .expect("open writer");
 
-        writer
-            .append(RecordKind::Text, b"1234567890")
-            .expect("append one");
-        writer
-            .append(RecordKind::Text, b"abcdefghijklmnopqrstuvwxyz")
-            .expect("append two");
+        let a = vec![b'a'; 40];
+        let b = vec![b'b'; 40];
+        let c = vec![b'c'; 100];
+        let d = vec![b'd'; 40];
+        append_test_payload(&mut writer, RecordKind::Text, &a);
+        append_test_payload(&mut writer, RecordKind::Osc, &b);
+        append_test_payload(&mut writer, RecordKind::Csi, &c);
+        append_test_payload(&mut writer, RecordKind::Clear, &d);
 
-        assert!(writer.header().write_cursor_bytes <= 32);
+        assert_eq!(writer.v2_state.generation, 1);
+        assert!(writer.header().write_cursor_bytes < 400);
         assert_eq!(
             std::fs::metadata(writer.path()).expect("metadata").len(),
-            HEADER_SIZE as u64 + 32
+            HEADER_SIZE as u64 + 400
         );
         let path = writer.path().to_path_buf();
         writer.sync().unwrap();
         drop(writer);
         let snapshot = read_linear_records(&path, test_read_limits()).unwrap();
         assert_eq!(snapshot.completeness, LinearRecordCompleteness::Complete);
-        assert_eq!(snapshot.records.len(), 1);
-        assert_eq!(snapshot.records[0].1, b"cdefghijklmnopqrstuvwxyz".to_vec());
+        assert_eq!(
+            snapshot.records,
+            vec![
+                (RecordKind::Osc, b),
+                (RecordKind::Csi, c),
+                (RecordKind::Clear, d),
+            ]
+        );
     }
 
     #[test]
@@ -3528,11 +3556,18 @@ mod tests {
             MmapScrollbackConfig::new(&dir, "configured-pane").with_cap_bytes(4096);
         let mismatched = ScrollbackHeader::new([0x7f; 32], 4096, 0).encode();
         write_private(&config.bin_path(), &mismatched);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(config.bin_path())
+            .unwrap()
+            .set_len(HEADER_SIZE as u64 + 4096)
+            .unwrap();
+        let before = std::fs::read(config.bin_path()).unwrap();
 
         let error = MmapScrollback::open(config.clone()).unwrap_err();
 
         assert!(matches!(error, MmapScrollbackError::UnsafeReadSource { .. }));
-        assert_eq!(std::fs::read(config.bin_path()).unwrap(), mismatched);
+        assert_eq!(std::fs::read(config.bin_path()).unwrap(), before);
     }
 
     #[test]

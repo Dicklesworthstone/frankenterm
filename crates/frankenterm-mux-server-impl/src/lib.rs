@@ -3084,9 +3084,7 @@ impl LiveScrollbackSpillSink {
                 let sequence = oldest_sequence
                     .checked_add(offset)
                     .ok_or_else(|| anyhow::anyhow!("logical ledger sequence overflows"))?;
-                let record = store.line_at(pane_id, sequence)?.ok_or_else(|| {
-                    anyhow::anyhow!("logical ledger is missing sequence {sequence}")
-                })?;
+                let record = live_scrollback_authority_record_at(store, pane_id, sequence)?;
                 hasher.observe(sequence, &record)?;
             }
         }
@@ -7750,6 +7748,90 @@ mod tests {
         (dir, context, sink, wal, appended)
     }
 
+    fn reset_authority_record_reads() {
+        LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(|reads| reads.set(0));
+    }
+
+    fn authority_record_reads() -> u64 {
+        LIVE_SCROLLBACK_AUTHORITY_RECORD_READS.with(std::cell::Cell::get)
+    }
+
+    fn later_append_authority_reads(retained_rows: usize, target_retention: usize) -> u64 {
+        let dir = tempfile::tempdir().expect("create incremental-authority fixture");
+        let identity_byte = u8::try_from(retained_rows).unwrap_or(201);
+        let context = config::ScrollbackSpillSinkContext {
+            pane_id: 40_000_u64
+                .checked_add(u64::try_from(retained_rows).expect("fixture row count fits u64"))
+                .expect("fixture pane identity fits u64"),
+            domain_id: 3,
+            durable_pane_id: [identity_byte; 16],
+            command_description: "incremental-authority-counter".to_string(),
+        };
+        let sink = LiveScrollbackSpillSink::new(dir.path().to_path_buf(), &context)
+            .expect("create incremental-authority sink");
+        let attributes = CellAttributes::blank();
+        for row in 0..retained_rows {
+            assert!(sink.store_scrollback_line(
+                isize::try_from(row).expect("fixture stable row fits isize"),
+                &Line::from_text(
+                    &format!("incremental-authority-row-{row}"),
+                    &attributes,
+                    row,
+                    None,
+                ),
+                retained_rows,
+            ));
+        }
+        reset_authority_record_reads();
+        assert!(sink.store_scrollback_line(
+            isize::try_from(retained_rows).expect("fixture stable row fits isize"),
+            &Line::from_text(
+                "incremental-authority-measured-row",
+                &attributes,
+                retained_rows,
+                None,
+            ),
+            target_retention,
+        ));
+        let reads = authority_record_reads();
+        let manifest = LiveScrollbackSpillSink::read_manifest(&sink.manifest_path)
+            .expect("read measured v4 manifest")
+            .expect("measured v4 manifest exists");
+        assert_eq!(manifest.schema, LIVE_SCROLLBACK_MANIFEST_SCHEMA_V4);
+        let wal = LiveScrollbackSpillSink::read_append_wal(
+            &LiveScrollbackSpillSink::append_wal_path(&sink.manifest_path)
+                .expect("derive measured append WAL path"),
+        )
+        .expect("read measured v2 append WAL")
+        .expect("measured v2 append WAL exists");
+        assert_eq!(wal.schema, LIVE_SCROLLBACK_APPEND_WAL_SCHEMA_V2);
+        reads
+    }
+
+    #[test]
+    fn v4_later_append_authority_reads_are_constant_independent_of_retained_count() {
+        let short = later_append_authority_reads(8, 16);
+        let long = later_append_authority_reads(128, 256);
+        assert_eq!(short, 2, "later append reads only prior/current WAL target rows");
+        assert_eq!(long, short, "retained row count must not affect steady append reads");
+    }
+
+    #[test]
+    fn v4_prefix_eviction_reads_exactly_the_affected_prefix_plus_constant_receipts() {
+        let retained_rows = 128_usize;
+        let target_retention = 16_usize;
+        let evicted = retained_rows
+            .checked_add(1)
+            .and_then(|rows| rows.checked_sub(target_retention))
+            .expect("fixture eviction arithmetic is valid");
+        let reads = later_append_authority_reads(retained_rows, target_retention);
+        assert_eq!(
+            reads,
+            u64::try_from(evicted).expect("fixture eviction count fits u64") + 2,
+            "prefix eviction may read each evicted row once and only constant receipt rows"
+        );
+    }
+
     fn write_private_stage_fixture(path: &std::path::Path, bytes: &[u8]) {
         let mut options = std::fs::OpenOptions::new();
         options.create_new(true).write(true);
@@ -7965,7 +8047,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_logical_ledger_digest_rejects_reorder_duplication_and_omission() {
+    fn authenticated_incremental_chain_rejects_reorder_duplication_and_omission() {
         let dir = tempfile::tempdir().expect("temp logical-ledger digest dir");
         let context = config::ScrollbackSpillSinkContext {
             pane_id: 797,
@@ -8011,26 +8093,30 @@ mod tests {
         drop(store);
         assert_eq!(records[0].len(), records[1].len());
         assert_eq!(records[1].len(), records[2].len());
-        let digest_for = |candidate_records: &[String]| {
-            live_scrollback_logical_ledger_digest_from_records(
-                &manifest,
-                ledger_pane_id,
-                manifest.oldest_seq,
-                manifest.next_seq,
-                manifest
-                    .retained_record_bytes
-                    .expect("v3 retained-record bytes"),
-                manifest
-                    .committed_log_bytes
-                    .expect("v3 committed-log bytes"),
-                manifest
-                    .committed_sequence_bytes
-                    .expect("v3 committed-sequence bytes"),
-                candidate_records,
-            )
+        let (anchor, expected) = expected_live_scrollback_v4_chain(&manifest)
+            .expect("decode authenticated incremental chain");
+        let digest_for = |candidate_records: &[String]| -> anyhow::Result<[u8; 32]> {
+            anyhow::ensure!(
+                u64::try_from(candidate_records.len())? == manifest.retained_rows,
+                "candidate record count disagrees with v4 manifest"
+            );
+            let oldest = manifest
+                .oldest_seq
+                .ok_or_else(|| anyhow::anyhow!("v4 test ledger has no oldest sequence"))?;
+            let mut tail = anchor;
+            for (offset, record) in candidate_records.iter().enumerate() {
+                let sequence = oldest
+                    .checked_add(u64::try_from(offset)?)
+                    .ok_or_else(|| anyhow::anyhow!("v4 test sequence overflows"))?;
+                tail = live_scrollback_incremental_chain_next(
+                    tail,
+                    ledger_pane_id,
+                    sequence,
+                    record,
+                )?;
+            }
+            Ok(tail)
         };
-        let expected = expected_live_scrollback_logical_ledger_digest(&manifest)
-            .expect("decode authenticated logical-ledger digest");
         assert_eq!(digest_for(&records).expect("hash canonical ledger"), expected);
 
         let mut reordered = records.clone();
