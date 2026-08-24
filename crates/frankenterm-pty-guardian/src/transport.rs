@@ -3271,6 +3271,7 @@ mod tests {
         assert!(service_source.contains(".retire_disconnected_mux(retirement.mux_incarnation)"));
         assert!(!service_source.contains("active_mux_connections"));
         assert!(!service_source.contains("observe_connected_mux"));
+        assert!(!service_source.contains("accept_generation"));
     }
 
     #[test]
