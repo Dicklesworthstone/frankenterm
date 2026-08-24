@@ -598,6 +598,9 @@ impl GuardianResponseEnvelope {
         request: &AuthenticatedGuardianRequest,
         reply: &GuardianReply,
     ) -> Result<Self, GuardianProtocolError> {
+        if request.header.operation == GuardianOperation::Replay {
+            return Err(GuardianProtocolError::ReplayRequiresConsumingDelivery);
+        }
         let payload = Zeroizing::new(reply.encode_for_operation(request.header.operation)?);
         let response = Self {
             header: GuardianResponseHeader::new(
@@ -1533,7 +1536,7 @@ impl GuardianCheckpointStageRequestV1 {
 
     #[must_use]
     pub const fn kind(&self) -> GuardianCheckpointStageKindV1 {
-        match self.body {
+        match &self.body {
             GuardianCheckpointStageBodyV1::Begin => GuardianCheckpointStageKindV1::Begin,
             GuardianCheckpointStageBodyV1::Chunk { .. } => GuardianCheckpointStageKindV1::Chunk,
             GuardianCheckpointStageBodyV1::Seal => GuardianCheckpointStageKindV1::Seal,
@@ -1582,7 +1585,7 @@ impl GuardianCheckpointStageRequestV1 {
         let mut payload = Vec::with_capacity(capacity);
         payload.extend_from_slice(&CHECKPOINT_STAGE_PAYLOAD_MAGIC);
         payload.extend_from_slice(&CHECKPOINT_STAGE_WIRE_VERSION.to_be_bytes());
-        payload.push(match self.body {
+        payload.push(match &self.body {
             GuardianCheckpointStageBodyV1::Begin => 1,
             GuardianCheckpointStageBodyV1::Chunk { .. } => 2,
             GuardianCheckpointStageBodyV1::Seal => 3,
@@ -3814,8 +3817,6 @@ impl GuardianReplayPageDelivery {
             || self.header.generation == 0
             || self.header.snapshot_id.is_nil()
             || digest_is_zero(self.header.snapshot_digest)
-            || (!digest_is_zero(self.header.page_digest)
-                && self.header.page_digest == self.header.snapshot_digest)
             || self.body.plaintext_bytes()? > GUARDIAN_MAX_RECOVERY_PLAINTEXT_BYTES
             || self.body.is_terminal() != self.header.next_cursor.is_none()
         {
@@ -3870,12 +3871,52 @@ impl GuardianReplayPageDelivery {
                     return Err(GuardianProtocolError::InvalidReplyPayload);
                 }
                 if let GuardianReplaySelectorV1::Resume {
+                    checkpoint_id,
                     next_sequence,
                     previous_record_digest,
-                    ..
                 } = selector
                 {
+                    if matches!(
+                        &self.body,
+                        GuardianReplayPageBodyDelivery::CheckpointChunk(_)
+                            | GuardianReplayPageBodyDelivery::SnapshotExpired { .. }
+                    ) || matches!(
+                        &self.body,
+                        GuardianReplayPageBodyDelivery::Compacted {
+                            requested_checkpoint,
+                            ..
+                        } if *requested_checkpoint != checkpoint_id
+                    ) {
+                        return Err(GuardianProtocolError::InvalidReplyPayload);
+                    }
                     validate_page_start(&self.body, next_sequence, previous_record_digest)?;
+                } else if let GuardianReplaySelectorV1::ExactCheckpoint { checkpoint_id } =
+                    selector
+                {
+                    let identity_matches = match &self.body {
+                        GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
+                            chunk.descriptor.checkpoint_id == checkpoint_id
+                        }
+                        GuardianReplayPageBodyDelivery::Compacted {
+                            requested_checkpoint,
+                            ..
+                        } => *requested_checkpoint == checkpoint_id,
+                        GuardianReplayPageBodyDelivery::Gap { .. } => true,
+                        GuardianReplayPageBodyDelivery::Complete {
+                            checkpoint_id: observed,
+                            ..
+                        } => *observed == checkpoint_id,
+                        GuardianReplayPageBodyDelivery::OutputRecords(_)
+                        | GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => false,
+                    };
+                    if !identity_matches {
+                        return Err(GuardianProtocolError::InvalidReplyPayload);
+                    }
+                } else if matches!(
+                    &self.body,
+                    GuardianReplayPageBodyDelivery::SnapshotExpired { .. }
+                ) {
+                    return Err(GuardianProtocolError::InvalidReplyPayload);
                 }
             }
             GuardianReplayRequestV1::Continue { cursor } => {
@@ -3945,8 +3986,14 @@ fn validate_page_start(
                 return Err(GuardianProtocolError::InvalidReplyPayload);
             }
         }
-        GuardianReplayPageBodyDelivery::CheckpointChunk(_)
-        | GuardianReplayPageBodyDelivery::Compacted { .. }
+        GuardianReplayPageBodyDelivery::CheckpointChunk(chunk) => {
+            if chunk.descriptor.suffix_start()
+                != Some((expected_sequence, expected_previous_digest))
+            {
+                return Err(GuardianProtocolError::InvalidReplyPayload);
+            }
+        }
+        GuardianReplayPageBodyDelivery::Compacted { .. }
         | GuardianReplayPageBodyDelivery::SnapshotExpired { .. } => {}
     }
     Ok(())
@@ -3965,8 +4012,14 @@ fn validate_next_cursor(
                 })?)
                 .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
             if chunk_end < chunk.descriptor.total_bytes {
+                let (sequence, digest) = chunk
+                    .descriptor
+                    .suffix_start()
+                    .ok_or(GuardianProtocolError::InvalidReplyPayload)?;
                 if next.phase != GuardianReplayPhaseV1::Checkpoint
                     || next.checkpoint_offset != chunk_end
+                    || next.next_sequence != sequence
+                    || next.previous_record_digest != digest
                 {
                     return Err(GuardianProtocolError::InvalidReplyPayload);
                 }
@@ -4270,6 +4323,9 @@ impl CorrelatedGuardianResponse {
             return Err(GuardianProtocolError::NonSuccessResponse);
         }
         let header = &self.0.header;
+        if header.operation == GuardianOperation::Replay {
+            return Err(GuardianProtocolError::ReplayRequiresConsumingDelivery);
+        }
         let request_header = &request.header;
         if header.protocol_version != request_header.protocol_version
             || header.operation != request_header.operation
@@ -5930,6 +5986,8 @@ pub enum GuardianProtocolError {
     CheckpointOutcomeIndeterminate,
     #[error("guardian checkpoint acknowledgement does not match the pending publication identity")]
     CheckpointIdentityMismatch,
+    #[error("guardian replay responses require the consuming typed delivery API")]
+    ReplayRequiresConsumingDelivery,
 }
 
 impl GuardianRejectionCode {
@@ -5998,6 +6056,7 @@ impl GuardianRejectionCode {
             | GuardianProtocolError::InvalidOperationPayload
             | GuardianProtocolError::InvalidCheckpointIntent
             | GuardianProtocolError::CheckpointRequiresTypedTransaction => Self::InvalidRequest,
+            GuardianProtocolError::ReplayRequiresConsumingDelivery => Self::InvalidRequest,
         }
     }
 }

@@ -2200,6 +2200,160 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_input_worker_wipes_before_completion_and_terminal_journal_sync() {
+        let source = include_str!("runtime.rs");
+        let worker_source = source
+            .split("fn input_worker(")
+            .nth(1)
+            .and_then(|source| source.split("fn execute_input_job").next())
+            .expect("input_worker production body is present");
+        let worker_boundary = |needle: &str| {
+            worker_source
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing input-worker boundary: {needle}"))
+        };
+        let worker_boundaries = [
+            worker_boundary("catch_guardian_input_worker_panic"),
+            worker_boundary("job.request.zeroize_payload();"),
+            worker_boundary("let completion = InputWorkerCompletion"),
+            worker_boundary("completions.send(completion)"),
+        ];
+        assert!(worker_boundaries.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let execution_source = source
+            .split("fn execute_input_job")
+            .nth(1)
+            .and_then(|source| source.split("fn input_reply_execution").next())
+            .expect("execute_input_job production body is present");
+        let execution_boundary = |needle: &str| {
+            execution_source
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing input-execution boundary: {needle}"))
+        };
+        let write_once = execution_boundary("permit.write_once");
+        let plaintext_wipe = execution_boundary("job.request.zeroize_payload();");
+        let terminal_journal_sync = execution_boundary(".complete_write");
+        assert!(write_once < plaintext_wipe);
+        assert!(plaintext_wipe < terminal_journal_sync);
+
+        let request_guard_source = source
+            .split("impl Drop for OwnedInputRequest")
+            .nth(1)
+            .and_then(|source| source.split("struct InputJob").next())
+            .expect("OwnedInputRequest drop guard is present");
+        assert!(request_guard_source.contains("self.request.zeroize_payload();"));
+    }
+
+    #[test]
+    fn saturated_input_pipeline_returns_an_owned_wipe_on_drop_request() {
+        fn take_job(
+            runtime: &mut GuardianRuntime,
+            pane_id: Uuid,
+            request: AuthenticatedGuardianRequest,
+            route: GuardianInputRoute,
+            wipe_probe: Option<Arc<InputRequestWipeProbe>>,
+        ) -> InputJob {
+            let protocol = runtime.protocol.take().expect("test protocol authority");
+            let pane = runtime.panes.get_mut(&pane_id).expect("test pane authority");
+            let writer = pane.writer.take().expect("test writer authority");
+            let journal = pane
+                .input_journal
+                .take()
+                .expect("test journal authority");
+            let mut request = OwnedInputRequest::new(request);
+            request.set_wipe_probe(wipe_probe);
+            InputJob {
+                route,
+                pane_id,
+                protocol,
+                writer,
+                journal,
+                request,
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (_first_directory, _first_poll, mut pipeline_owner, first_pane) =
+            claimed_runtime_with_writer(Box::new(BlockingWriter {
+                calls,
+                entered: entered_tx,
+                release: release_rx,
+            }));
+        let first_request = authenticated_input_request_for(
+            Uuid::from_u128(121),
+            first_pane,
+            Uuid::from_u128(122),
+            b"worker-held",
+        );
+        let first_route = input_route(11, 1, &first_request);
+        let first_job = take_job(
+            &mut pipeline_owner,
+            first_pane,
+            first_request,
+            first_route,
+            None,
+        );
+        assert!(pipeline_owner.input_pipeline.try_submit(first_job).is_ok());
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first job holds the worker");
+
+        let (_queued_directory, _queued_poll, mut queued_owner, queued_pane) =
+            claimed_runtime_with_writer(Box::new(CountingWriter {
+                calls: Arc::new(AtomicUsize::new(0)),
+                mode: TestWriteMode::Full,
+            }));
+        let queued_request = authenticated_input_request_for(
+            Uuid::from_u128(123),
+            queued_pane,
+            Uuid::from_u128(124),
+            b"queue-held",
+        );
+        let queued_route = input_route(12, 2, &queued_request);
+        let queued_job = take_job(
+            &mut queued_owner,
+            queued_pane,
+            queued_request,
+            queued_route,
+            None,
+        );
+        assert!(pipeline_owner.input_pipeline.try_submit(queued_job).is_ok());
+
+        let (_rejected_directory, _rejected_poll, mut rejected_owner, rejected_pane) =
+            claimed_runtime_with_writer(Box::new(CountingWriter {
+                calls: Arc::new(AtomicUsize::new(0)),
+                mode: TestWriteMode::Full,
+            }));
+        let rejected_probe = Arc::new(InputRequestWipeProbe::default());
+        let rejected_request = authenticated_input_request_for(
+            Uuid::from_u128(125),
+            rejected_pane,
+            Uuid::from_u128(126),
+            b"saturated-return",
+        );
+        let rejected_route = input_route(13, 3, &rejected_request);
+        let rejected_job = take_job(
+            &mut rejected_owner,
+            rejected_pane,
+            rejected_request,
+            rejected_route,
+            Some(Arc::clone(&rejected_probe)),
+        );
+        let returned = match pipeline_owner.input_pipeline.try_submit(rejected_job) {
+            Err(InputSubmitError::Saturated(job)) => job,
+            Err(InputSubmitError::Unavailable(_)) => panic!("test worker unexpectedly unavailable"),
+            Ok(()) => panic!("third job must observe the bounded queue as full"),
+        };
+        assert!(!rejected_probe.drop_wipe.load(Ordering::SeqCst));
+        drop(returned);
+        assert!(rejected_probe.drop_wipe.load(Ordering::SeqCst));
+
+        release_tx.send(()).expect("release worker-held job");
+    }
+
     fn input_reply_state(response: &GuardianResponseEnvelope) -> InputEffectState {
         let reply = GuardianReply::decode_for_operation(
             GuardianOperation::Input,
