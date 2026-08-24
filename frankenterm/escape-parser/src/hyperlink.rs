@@ -1,8 +1,10 @@
 use crate::{Result, ensure, format_err};
 use core::hash::{Hash, Hasher};
-use frankenterm_dynamic::{FromDynamic, ToDynamic};
+use frankenterm_dynamic::{
+    Error as DynamicError, FromDynamic, FromDynamicOptions, ToDynamic, Value,
+};
 #[cfg(feature = "use_serde")]
-use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
+use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::allocate::*;
@@ -13,6 +15,8 @@ extern crate std;
 #[cfg(test)]
 std::thread_local! {
     static HYPERLINK_WIPE_INVOCATIONS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static GUARDED_STRING_WIPE_INVOCATIONS: core::cell::Cell<usize> =
         const { core::cell::Cell::new(0) };
 }
 
@@ -92,14 +96,182 @@ fn decode_percent_escapes(input: &[u8]) -> Result<Zeroizing<String>> {
     }
 }
 
-#[cfg_attr(feature = "use_serde", derive(Deserialize))]
-#[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
+/// A construction-time owner for semantic hyperlink text.
+///
+/// `Hyperlink` deliberately retains ordinary `String` fields for its public
+/// API and wire shape.  This private type closes the interval between decoding
+/// a string and successfully installing it in a Drop-hardened `Hyperlink`.
+#[derive(Debug)]
+struct GuardedString(Zeroizing<String>);
+
+impl GuardedString {
+    fn new(text: String) -> Self {
+        Self(Zeroizing::new(text))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn take(&mut self) -> String {
+        core::mem::take(&mut *self.0)
+    }
+}
+
+impl Drop for GuardedString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+
+        #[cfg(test)]
+        GUARDED_STRING_WIPE_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+}
+
+impl PartialEq for GuardedString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for GuardedString {}
+
+impl PartialOrd for GuardedString {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GuardedString {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for GuardedString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for GuardedString {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+impl FromDynamic for GuardedString {
+    fn from_dynamic(
+        value: &Value,
+        options: FromDynamicOptions,
+    ) -> core::result::Result<Self, DynamicError> {
+        String::from_dynamic(value, options).map(Self::new)
+    }
+}
+
+type GuardedParams = HashMap<GuardedString, GuardedString>;
+
+#[cfg(feature = "use_serde")]
+#[derive(Deserialize)]
+#[serde(rename = "Hyperlink")]
+struct GuardedHyperlink {
+    params: GuardedParams,
+    uri: GuardedString,
+    implicit: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, ToDynamic)]
 pub struct Hyperlink {
     params: HashMap<String, String>,
     uri: String,
     /// If the link was produced by an implicit or matching rule,
     /// this field will be set to true.
     implicit: bool,
+}
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for Hyperlink {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let GuardedHyperlink {
+            params,
+            uri,
+            implicit,
+        } = GuardedHyperlink::deserialize(deserializer)?;
+        Ok(Self::from_guarded_parts(uri, params, implicit))
+    }
+}
+
+fn dynamic_field_error(field_name: &'static str, error: DynamicError) -> DynamicError {
+    // Do not use `Error::field_context` here: for small objects that helper
+    // formats the complete source object, copying the URI and parameters into
+    // a new, unguarded diagnostic String.  The conversion errors below carry
+    // type information, so this retains useful context without terminal text.
+    DynamicError::Message(format!(
+        "Error processing Hyperlink::{field_name}: {error:#}"
+    ))
+}
+
+impl FromDynamic for Hyperlink {
+    fn from_dynamic(
+        value: &Value,
+        options: FromDynamicOptions,
+    ) -> core::result::Result<Self, DynamicError> {
+        let Value::Object(object) = value else {
+            return Err(DynamicError::NoConversion {
+                source_type: value.variant_name().to_string(),
+                dest_type: "Hyperlink",
+            });
+        };
+
+        DynamicError::raise_unknown_fields(
+            options,
+            "Hyperlink",
+            object,
+            Self::possible_field_names(),
+        )?;
+        let params = GuardedParams::from_dynamic(
+            object.get_by_str("params").unwrap_or(&Value::Null),
+            options,
+        )
+        .map_err(|error| dynamic_field_error("params", error))?;
+        let uri = GuardedString::from_dynamic(
+            object.get_by_str("uri").unwrap_or(&Value::Null),
+            options,
+        )
+        .map_err(|error| dynamic_field_error("uri", error))?;
+        let implicit = bool::from_dynamic(
+            object.get_by_str("implicit").unwrap_or(&Value::Null),
+            options,
+        )
+        .map_err(|error| dynamic_field_error("implicit", error))?;
+
+        Ok(Self::from_guarded_parts(uri, params, implicit))
+    }
+}
+
+impl Clone for Hyperlink {
+    fn clone(&self) -> Self {
+        // A derived clone builds raw params before the URI; a later allocation
+        // failure would then drop those strings without a Hyperlink owner.
+        // Install each clone in the final Drop-hardened owner as it succeeds.
+        let mut cloned = Self::empty(self.implicit);
+        let mut uri = GuardedString::new(self.uri.clone());
+        cloned.uri = uri.take();
+        #[cfg(feature = "std")]
+        cloned.params.reserve(self.params.len());
+        for (key, value) in &self.params {
+            let mut key = GuardedString::new(key.clone());
+            let mut value = GuardedString::new(value.clone());
+            cloned.params.insert(key.take(), value.take());
+        }
+        cloned
+    }
 }
 
 #[cfg(feature = "use_serde")]
@@ -125,6 +297,36 @@ impl Serialize for Hyperlink {
 }
 
 impl Hyperlink {
+    fn empty(implicit: bool) -> Self {
+        Self {
+            params: HashMap::new(),
+            uri: String::new(),
+            implicit,
+        }
+    }
+
+    fn from_guarded_parts(
+        mut uri: GuardedString,
+        mut params: GuardedParams,
+        implicit: bool,
+    ) -> Self {
+        // Establish the final Drop owner before transferring any plaintext out
+        // of its guards.  For std HashMap, reserving before extraction also
+        // ensures insertion cannot reallocate the plaintext-bearing map.
+        let mut link = Self::empty(implicit);
+        link.uri = uri.take();
+        #[cfg(feature = "std")]
+        link.params.reserve(params.len());
+        for (mut key, mut value) in core::mem::take(&mut params) {
+            link.params.insert(key.take(), value.take());
+        }
+        link
+    }
+
+    pub const fn possible_field_names() -> &'static [&'static str] {
+        &["params", "uri", "implicit"]
+    }
+
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -153,11 +355,10 @@ impl Hyperlink {
     }
 
     pub fn new<S: Into<String>>(uri: S) -> Self {
-        Self {
-            uri: uri.into(),
-            params: HashMap::new(),
-            implicit: false,
-        }
+        let mut link = Self::empty(false);
+        let mut uri = GuardedString::new(uri.into());
+        link.uri = uri.take();
+        link
     }
 
     #[inline]
@@ -166,29 +367,32 @@ impl Hyperlink {
     }
 
     pub fn new_implicit<S: Into<String>>(uri: S) -> Self {
-        Self {
-            uri: uri.into(),
-            params: HashMap::new(),
-            implicit: true,
-        }
+        let mut link = Self::empty(true);
+        let mut uri = GuardedString::new(uri.into());
+        link.uri = uri.take();
+        link
     }
 
     pub fn new_with_id<S: Into<String>, S2: Into<String>>(uri: S, id: S2) -> Self {
-        let mut params = HashMap::new();
-        params.insert("id".into(), id.into());
-        Self {
-            uri: uri.into(),
-            params,
-            implicit: false,
-        }
+        let mut link = Self::new(uri);
+        let mut id = GuardedString::new(id.into());
+        #[cfg(feature = "std")]
+        link.params.reserve(1);
+        link.params.insert("id".into(), id.take());
+        link
     }
 
     pub fn new_with_params<S: Into<String>>(uri: S, params: HashMap<String, String>) -> Self {
-        Self {
-            uri: uri.into(),
+        // Install caller-owned parameters in a Drop-hardened owner before the
+        // URI conversion can fail or unwind.
+        let mut link = Self {
+            uri: String::new(),
             params,
             implicit: false,
-        }
+        };
+        let mut uri = GuardedString::new(uri.into());
+        link.uri = uri.take();
+        link
     }
 
     /// Reconstruct a hyperlink from a capability-free semantic checkpoint.
@@ -201,11 +405,14 @@ impl Hyperlink {
         params: HashMap<String, String>,
         implicit: bool,
     ) -> Self {
-        Self {
-            uri: uri.into(),
+        let mut link = Self {
+            uri: String::new(),
             params,
             implicit,
-        }
+        };
+        let mut uri = GuardedString::new(uri.into());
+        link.uri = uri.take();
+        link
     }
 
     pub fn parse(osc: &[&[u8]]) -> Result<Option<Hyperlink>> {
@@ -214,7 +421,7 @@ impl Hyperlink {
             // Clearing current hyperlink
             Ok(None)
         } else {
-            let uri = decode_percent_escapes(osc[2])?;
+            let mut uri = decode_percent_escapes(osc[2])?;
             let param_count = if osc[1].is_empty() {
                 0
             } else {
@@ -244,21 +451,17 @@ impl Hyperlink {
             }
 
             // All recoverable validation is complete.  Construct the final
-            // Drop-hardened owner before copying any guarded string into its
+            // Drop-hardened owner before transferring any guarded string into its
             // raw String fields, so a later unwind cannot bypass Hyperlink's
             // wipe contract.
-            let mut link = Hyperlink::new(uri.as_str());
+            let mut link = Hyperlink::new(core::mem::take(&mut *uri));
             #[cfg(feature = "std")]
             link.params.reserve(guarded_params.len());
-            for (key, value) in &guarded_params {
-                if let Some(final_value) = link.params.get_mut(key.as_str()) {
-                    final_value.zeroize();
-                    final_value.push_str(value.as_str());
-                    continue;
-                }
-                let final_value = link.params.entry(key.as_str().to_string()).or_default();
-                final_value.zeroize();
-                final_value.push_str(value.as_str());
+            for (key, value) in &mut guarded_params {
+                link.params.insert(
+                    core::mem::take(&mut **key),
+                    core::mem::take(&mut **value),
+                );
             }
 
             Ok(Some(link))
@@ -320,6 +523,10 @@ mod tests {
 
     fn hyperlink_wipe_invocations() -> usize {
         HYPERLINK_WIPE_INVOCATIONS.with(|count| count.get())
+    }
+
+    fn guarded_string_wipe_invocations() -> usize {
+        GUARDED_STRING_WIPE_INVOCATIONS.with(|count| count.get())
     }
 
     #[test]
@@ -396,8 +603,17 @@ mod tests {
     #[test]
     fn clone() {
         let link = Hyperlink::new_with_id("https://example.com", "id1");
+        let source_uri = link.uri.as_ptr();
+        let source_id = link.params.get("id").unwrap().as_ptr();
         let cloned = link.clone();
         assert_eq!(link, cloned);
+        assert_ne!(source_uri, cloned.uri.as_ptr());
+        assert_ne!(source_id, cloned.params.get("id").unwrap().as_ptr());
+
+        drop(link);
+
+        assert_eq!(cloned.uri(), "https://example.com");
+        assert_eq!(cloned.params().get("id"), Some(&"id1".to_string()));
     }
 
     #[test]
@@ -657,6 +873,53 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Hyperlink>(&encoded_a).expect("deserialize hyperlink"),
             a
+        );
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn serde_failure_wipes_every_successfully_decoded_guarded_field() {
+        let before = guarded_string_wipe_invocations();
+        let result = serde_json::from_str::<Hyperlink>(
+            r#"{"params":{"private-key":"private-value"},"uri":"secret://terminal/session","implicit":"not-a-bool"}"#,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            guarded_string_wipe_invocations() >= before + 3,
+            "the parameter key, value, and URI must all be wiped when a later field rejects"
+        );
+    }
+
+    #[test]
+    fn from_dynamic_failure_wipes_every_successfully_decoded_guarded_field() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            Value::String("private-key".to_string()),
+            Value::String("private-value".to_string()),
+        );
+        let mut object = BTreeMap::new();
+        object.insert(
+            Value::String("params".to_string()),
+            Value::Object(params.into()),
+        );
+        object.insert(
+            Value::String("uri".to_string()),
+            Value::String("secret://terminal/session".to_string()),
+        );
+        object.insert(
+            Value::String("implicit".to_string()),
+            Value::String("not-a-bool".to_string()),
+        );
+        let value = Value::Object(object.into());
+        let before = guarded_string_wipe_invocations();
+
+        let result = Hyperlink::from_dynamic(&value, FromDynamicOptions::default());
+
+        assert!(result.is_err());
+        assert!(
+            guarded_string_wipe_invocations() >= before + 3,
+            "dynamic parameter key, value, and URI guards must wipe on a later-field error"
         );
     }
 }

@@ -4727,8 +4727,9 @@ mod tests {
             }
             let owner = self.current_impl_owner.clone();
             self.record_signature(owner.as_deref(), &function.sig, &function.vis);
+            let function_name = function.sig.ident.to_string();
             if matches!(
-                (owner.as_deref(), function.sig.ident.to_string().as_str()),
+                (owner.as_deref(), function_name.as_str()),
                 (
                     Some("GuardianCheckpointStageChunkDeliveryV1"),
                     "into_bytes"
@@ -5377,6 +5378,67 @@ mod tests {
         sort_authority_methods(&mut expected_methods);
         assert_eq!(inventory.methods, expected_methods);
 
+        sort_protocol_ownership_methods(&mut inventory.ownership_methods);
+        let mut expected_ownership_methods = vec![
+            expected_protocol_ownership_method(
+                "GuardianCheckpointStageChunkDeliveryV1",
+                r#"
+                    pub fn into_bytes(mut self) -> Zeroizing<Vec<u8>> {
+                        std::mem::take(&mut self.bytes)
+                    }
+                "#,
+            ),
+            expected_protocol_ownership_method(
+                "GuardianCheckpointStageRequestV1",
+                r#"
+                    pub fn into_chunk(
+                        self,
+                    ) -> Result<GuardianCheckpointStageChunkDeliveryV1, GuardianProtocolError> {
+                        match self.body {
+                            GuardianCheckpointStageBodyV1::Chunk(chunk) => Ok(chunk),
+                            GuardianCheckpointStageBodyV1::Begin
+                            | GuardianCheckpointStageBodyV1::Seal => {
+                                Err(GuardianProtocolError::InvalidOperationPayload)
+                            }
+                        }
+                    }
+                "#,
+            ),
+            expected_protocol_ownership_method(
+                "GuardianCheckpointStageRequestV1",
+                r#"
+                    pub fn encode(&self) -> Result<Vec<u8>, GuardianProtocolError> {
+                        if matches!(&self.body, GuardianCheckpointStageBodyV1::Chunk(_)) {
+                            return Err(
+                                GuardianProtocolError::CheckpointStageChunkRequiresConsumingEncoding
+                            );
+                        }
+                        self.validate()?;
+                        let capacity = self.encoded_capacity()?;
+                        let mut payload = Vec::with_capacity(capacity);
+                        self.encode_into(&mut payload, capacity)?;
+                        Ok(payload)
+                    }
+                "#,
+            ),
+            expected_protocol_ownership_method(
+                "GuardianCheckpointStageRequestV1",
+                r#"
+                    pub fn into_zeroizing_payload(
+                        self,
+                    ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+                        self.validate()?;
+                        let capacity = self.encoded_capacity()?;
+                        let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
+                        self.encode_into(&mut payload, capacity)?;
+                        Ok(payload)
+                    }
+                "#,
+            ),
+        ];
+        sort_protocol_ownership_methods(&mut expected_ownership_methods);
+        assert_eq!(inventory.ownership_methods, expected_ownership_methods);
+
         inventory.return_sites.sort();
         let mut expected_return_sites = vec![
             "GuardianCheckpointChunkDelivery@GuardianCheckpointChunkDelivery::new:pub:production",
@@ -5495,10 +5557,19 @@ mod tests {
         assert_eq!(inventory.out_of_line_modules, Vec::<String>::new());
         assert_eq!(inventory.item_macros, Vec::<syn::Macro>::new());
         assert_eq!(inventory.unexpected_macros, Vec::<syn::Macro>::new());
-        assert_eq!(
-            inventory.projection_sites,
-            vec!["AuthenticatedGuardianRequest::deref".to_owned()]
-        );
+        inventory.projection_sites.sort();
+        let mut expected_projection_sites = vec![
+            "<free>::decode_guardian_request",
+            "<free>::decode_guardian_response",
+            "<free>::validate_request_envelope",
+            "<free>::validate_response_envelope",
+            "AuthenticatedGuardianRequest::deref",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        expected_projection_sites.sort();
+        assert_eq!(inventory.projection_sites, expected_projection_sites);
         assert_eq!(inventory.unexpected_attributes, Vec::<String>::new());
         assert_eq!(inventory.unexpected_derives, Vec::<String>::new());
 
@@ -5569,6 +5640,47 @@ mod tests {
         assert_eq!(duplicate_factory_inventory.clone_like_factories.len(), 1);
         assert_eq!(duplicate_factory_inventory.return_sites.len(), 1);
         assert_eq!(duplicate_factory_inventory.construction_sites.len(), 2);
+
+        let borrowed_stage_encoding_mutation = syn::parse_file(
+            r#"
+                pub struct GuardianCheckpointStageRequestV1;
+                impl GuardianCheckpointStageRequestV1 {
+                    pub fn into_zeroizing_payload(
+                        &self,
+                    ) -> Result<Vec<u8>, GuardianProtocolError> {
+                        loop {}
+                    }
+                }
+            "#,
+        )
+        .expect("parse repeatable raw Stage encoding mutation");
+        let mut borrowed_stage_encoding_inventory = ProtocolDeliveryAstInventory::default();
+        borrowed_stage_encoding_inventory.visit_file(&borrowed_stage_encoding_mutation);
+        assert_eq!(borrowed_stage_encoding_inventory.ownership_methods.len(), 1);
+        let borrowed_signature = &borrowed_stage_encoding_inventory.ownership_methods[0]
+            .1
+            .sig;
+        assert!(matches!(
+            borrowed_signature.inputs.first(),
+            Some(syn::FnArg::Receiver(receiver)) if receiver.reference.is_some()
+        ));
+        assert_ne!(
+            borrowed_stage_encoding_inventory.ownership_methods[0],
+            expected_protocol_ownership_method(
+                "GuardianCheckpointStageRequestV1",
+                r#"
+                    pub fn into_zeroizing_payload(
+                        self,
+                    ) -> Result<Zeroizing<Vec<u8>>, GuardianProtocolError> {
+                        self.validate()?;
+                        let capacity = self.encoded_capacity()?;
+                        let mut payload = Zeroizing::new(Vec::with_capacity(capacity));
+                        self.encode_into(&mut payload, capacity)?;
+                        Ok(payload)
+                    }
+                "#,
+            )
+        );
 
         let escape_surface_mutation = syn::parse_file(
             r#"

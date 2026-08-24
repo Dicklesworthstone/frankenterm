@@ -13,7 +13,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
@@ -25,8 +25,8 @@ struct Cluster {
 /// Stores line data as a contiguous string and a series of
 /// clusters of attribute data describing attributed ranges
 /// within the line
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize))]
+#[derive(Debug, PartialEq)]
 pub(crate) struct ClusteredLine {
     pub text: String,
     #[cfg_attr(
@@ -42,6 +42,42 @@ pub(crate) struct ClusteredLine {
     len: u32,
     last_cell_width: Option<NonZeroU8>,
 }
+
+/// Guards a successfully decoded text field until every later line field has
+/// also passed deserialization.
+#[cfg(feature = "use_serde")]
+struct GuardedLineText(Zeroizing<String>);
+
+#[cfg(feature = "use_serde")]
+impl GuardedLineText {
+    fn take(&mut self) -> String {
+        core::mem::take(&mut *self.0)
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for GuardedLineText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|text| Self(Zeroizing::new(text)))
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl Drop for GuardedLineText {
+    fn drop(&mut self) {
+        self.0.zeroize();
+
+        #[cfg(test)]
+        GUARDED_LINE_TEXT_WIPE_INVOCATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(test, feature = "use_serde"))]
+static GUARDED_LINE_TEXT_WIPE_INVOCATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(feature = "use_serde")]
 const MAX_DESERIALIZED_WIDE_CELL_BITS: usize = 16 * 1024 * 1024 * 8;
@@ -69,6 +105,44 @@ where
             bitset.set(idx, true);
         }
         Ok(Some(Box::new(bitset)))
+    }
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Deserialize)]
+#[serde(rename = "ClusteredLine")]
+struct GuardedClusteredLine {
+    text: GuardedLineText,
+    #[serde(deserialize_with = "deserialize_bitset")]
+    is_double_wide: Option<Box<FixedBitSet>>,
+    clusters: Vec<Cluster>,
+    len: u32,
+    last_cell_width: Option<NonZeroU8>,
+}
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for ClusteredLine {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let GuardedClusteredLine {
+            mut text,
+            is_double_wide,
+            clusters,
+            len,
+            last_cell_width,
+        } = GuardedClusteredLine::deserialize(deserializer)?;
+
+        // No fallible work remains after the text leaves its construction
+        // guard; the returned ClusteredLine becomes the Drop-hardened owner.
+        Ok(Self {
+            text: text.take(),
+            is_double_wide,
+            clusters,
+            len,
+            last_cell_width,
+        })
     }
 }
 
@@ -154,7 +228,10 @@ impl ClusteredLine {
     pub fn from_cell_vec<'a>(hint: usize, iter: impl Iterator<Item = CellRef<'a>>) -> Self {
         let mut last_cluster: Option<Cluster> = None;
         let mut is_double_wide = FixedBitSet::with_capacity(hint);
-        let mut text = String::new();
+        // Attribute cloning and cluster growth happen after text append in the
+        // loop below and may unwind.  Guard the builder from its first
+        // allocation until the complete ClusteredLine can take ownership.
+        let mut text = Zeroizing::new(String::new());
         let mut clusters = vec![];
         let mut any_double = false;
         let mut len = 0usize;
@@ -205,7 +282,7 @@ impl ClusteredLine {
         }
 
         Self {
-            text,
+            text: core::mem::take(&mut *text),
             is_double_wide: if any_double {
                 Some(Box::new(is_double_wide))
             } else {
@@ -470,6 +547,24 @@ impl Drop for ClusteredLine {
 
 impl zeroize::ZeroizeOnDrop for ClusteredLine {}
 
+impl Clone for ClusteredLine {
+    fn clone(&self) -> Self {
+        // A derived clone materializes raw text before cloning later fields.
+        // Keep that text guarded until every potentially allocating clone has
+        // succeeded and the final Drop-hardened line can take ownership.
+        let mut text = Zeroizing::new(self.text.clone());
+        let is_double_wide = self.is_double_wide.clone();
+        let clusters = self.clusters.clone();
+        Self {
+            text: core::mem::take(&mut *text),
+            is_double_wide,
+            clusters,
+            len: self.len,
+            last_cell_width: self.last_cell_width,
+        }
+    }
+}
+
 pub(crate) struct ClusterLineCellIter<'a> {
     graphemes: Graphemes<'a>,
     clusters: core::slice::Iter<'a, Cluster>,
@@ -637,5 +732,33 @@ mod test {
 
         assert!(line.text.is_empty());
         assert_eq!(line.text.capacity(), capacity);
+    }
+
+    #[test]
+    fn clustered_line_clone_owns_an_independent_text_allocation() {
+        let mut line = ClusteredLine::new();
+        line.append_ascii_run("semantic terminal text", CellAttributes::default());
+        let source_text = line.text.as_ptr();
+        let cloned = line.clone();
+
+        assert_ne!(source_text, cloned.text.as_ptr());
+        drop(line);
+        assert_eq!(cloned.text, "semantic terminal text");
+    }
+
+    #[cfg(feature = "use_serde")]
+    #[test]
+    fn serde_failure_after_text_decoding_wipes_the_guarded_text() {
+        let before = GUARDED_LINE_TEXT_WIPE_INVOCATIONS
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let result = serde_json::from_str::<ClusteredLine>(
+            r#"{"text":"semantic terminal text","is_double_wide":[],"clusters":"not-an-array","len":0,"last_cell_width":null}"#,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            GUARDED_LINE_TEXT_WIPE_INVOCATIONS.load(core::sync::atomic::Ordering::Relaxed) > before,
+            "a later-field serde error must drop and wipe the decoded text guard"
+        );
     }
 }
